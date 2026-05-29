@@ -976,6 +976,12 @@ pub enum ProviderKind {
     CloudflareWorkersAi,
     CloudflareAiGateway,
     OpenAiCompatible,
+    OpenAiCodex,
+    /// In-process faux provider used by the eval harness and tests.
+    /// Reported alongside the real provider kinds so telemetry stays
+    /// honest about which sessions touched the network and which ran
+    /// against scripted fixtures.
+    Faux,
 }
 
 impl ProviderKind {
@@ -988,6 +994,7 @@ impl ProviderKind {
             ProviderConfig::AzureOpenAi(_) => Self::AzureOpenAi,
             ProviderConfig::Bedrock(_) => Self::Bedrock,
             ProviderConfig::Ollama(_) => Self::Ollama,
+            ProviderConfig::OpenAiCodex(_) => Self::OpenAiCodex,
             ProviderConfig::OpenAiCompatible(config) => match config.preset {
                 OpenAiCompatiblePreset::OpenRouter => Self::OpenRouter,
                 OpenAiCompatiblePreset::Vercel => Self::Vercel,
@@ -1009,6 +1016,7 @@ impl ProviderKind {
                 OpenAiCompatiblePreset::CloudflareAiGateway => Self::CloudflareAiGateway,
                 OpenAiCompatiblePreset::Custom => Self::OpenAiCompatible,
             },
+            ProviderConfig::Faux(_) => Self::Faux,
         }
     }
 }

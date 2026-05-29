@@ -19,13 +19,13 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 dirs.workspace = true
-futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
+squeezy-skills.workspace = true
 squeezy-store.workspace = true
 squeezy-telemetry.workspace = true
 squeezy-tools.workspace = true
@@ -34,3 +34,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 toml_edit.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-core.workspace = true
+futures-util.workspace = true

@@ -210,7 +210,42 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
                 format!("base_url={} (no API key required)", c.base_url),
             ),
         ),
+        ProviderConfig::OpenAiCodex(_) => ("openai_codex", openai_codex_auth_check()),
         ProviderConfig::OpenAiCompatible(c) => (c.preset.as_str(), env_check(&c.api_key_env)),
+        ProviderConfig::Faux(_) => (
+            "faux",
+            (
+                Status::Ok,
+                "in-process scripted provider (no credential required)".to_string(),
+            ),
+        ),
+    }
+}
+
+/// Report whether the OAuth token file for the ChatGPT Codex provider
+/// exists. Doctor does not load or decode the token here — it only
+/// notes presence so the user knows whether to run `squeezy auth
+/// openai-codex login`.
+fn openai_codex_auth_check() -> (Status, String) {
+    let Some(home) = dirs::home_dir() else {
+        return (
+            Status::Warn,
+            "could not determine home directory; \
+             run `squeezy auth openai-codex login` to authenticate"
+                .to_string(),
+        );
+    };
+    let path = home.join(".squeezy").join("auth").join("openai-codex.json");
+    if path.exists() {
+        (Status::Ok, format!("token present at {}", path.display()))
+    } else {
+        (
+            Status::Warn,
+            format!(
+                "no token at {}; run `squeezy auth openai-codex login` to authenticate",
+                path.display()
+            ),
+        )
     }
 }
 
@@ -507,6 +542,16 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
                 .to_string(),
         ),
         ProviderConfig::Ollama(c) => probe_ollama(&client, &c.base_url).await,
+        ProviderConfig::OpenAiCodex(_) => (
+            Status::Warn,
+            "probe not implemented for ChatGPT Codex \
+             (the backend does not expose a list-models endpoint)"
+                .to_string(),
+        ),
+        ProviderConfig::Faux(_) => (
+            Status::Ok,
+            "faux provider is in-process; no remote endpoint to probe".to_string(),
+        ),
         ProviderConfig::OpenAiCompatible(c) => {
             let mut extra = Vec::new();
             for (key, value) in &c.extra_headers {

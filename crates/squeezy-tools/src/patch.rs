@@ -34,10 +34,11 @@ use std::{
 use globset::{Glob, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use similar::TextDiff;
 use squeezy_vcs::{DiffMode, DiffOptions};
 
 use crate::{
-    MAX_GRAPH_MAX_RESULTS, StagedApply, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
+    MAX_GRAPH_MAX_RESULTS, StagedApply, StagedOp, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
     ToolStatus, diff_file_json, diff_mode_str, graph_tools::graph_payload,
     graph_tools::reference_json, graph_tools::resolve_definition_candidates,
     graph_tools::symbol_json, graph_tools::symbol_summary_json, is_secret_path, make_result,
@@ -727,6 +728,18 @@ impl ToolRegistry {
             }
         }
 
+        // F01: acquire the per-realpath mutex for every path this call will
+        // touch before reading anything off disk. Locks are taken in sorted
+        // realpath order inside the helper so two concurrent `apply_patch`
+        // calls whose touch sets overlap cannot deadlock; calls whose touch
+        // sets are disjoint proceed in parallel. We lock for `dry_run` too
+        // so the preview stages against a consistent on-disk snapshot, even
+        // though no `fs::write` follows.
+        let _mutation_guard = crate::file_mutation_queue::lock_paths_for_mutation(
+            touched_paths.iter().map(|rel| self.root.join(rel)),
+        )
+        .await;
+
         // Capture the checkpoint snapshot before validation. The
         // `unified_diff` fallback (F89) shells out to `git apply` during
         // validation, which mutates the worktree directly — without an
@@ -771,6 +784,7 @@ impl ToolRegistry {
                 })
                 .collect();
             let exact_overall = staged.ops.iter().all(|op| op.exact());
+            let unified_diff = build_unified_diff(&staged);
             let content = json!({
                 "dry_run": true,
                 "plan_id": args.plan_id,
@@ -784,6 +798,7 @@ impl ToolRegistry {
                     "operations": preview_delta,
                 },
                 "delta": summary,
+                "unified_diff": unified_diff,
             });
             return make_result(
                 call,
@@ -827,6 +842,7 @@ impl ToolRegistry {
         let delta_summary = audit_delta_summary(&applied_delta);
 
         if let Some((failed_path, error, _idx)) = write_failure {
+            let unified_diff = build_unified_diff(&staged);
             let mut error_content = json!({
                 "error": format!("failed to apply op at {failed_path}: {error}"),
                 "failed_path": failed_path,
@@ -841,6 +857,7 @@ impl ToolRegistry {
                     "operations": applied_delta,
                 },
                 "delta": delta_summary,
+                "unified_diff": unified_diff,
             });
             self.append_checkpoint_to_content(
                 &mut error_content,
@@ -862,6 +879,7 @@ impl ToolRegistry {
                 None,
             );
         }
+        let unified_diff = build_unified_diff(&staged);
         let mut content = json!({
             "dry_run": false,
             "plan_id": args.plan_id,
@@ -875,6 +893,7 @@ impl ToolRegistry {
                 "operations": applied_delta,
             },
             "delta": delta_summary,
+            "unified_diff": unified_diff,
         });
         self.append_checkpoint_to_content(
             &mut content,
@@ -919,6 +938,100 @@ impl ToolRegistry {
         let mut plans = self.patch_plans.lock().ok()?;
         plans.retain(|_, plan| plan.expires_at_ms > now);
         plans.get(plan_id).cloned()
+    }
+}
+
+/// Render the changes captured in `staged` as a unified-diff blob suitable
+/// for `git apply`. Each affected file contributes one `--- a/<path>` /
+/// `+++ b/<path>` block followed by `@@` hunks. Created files use
+/// `/dev/null` as the old header; deleted files use `/dev/null` as the new
+/// header; moves are emitted as a delete + create pair so the blob can be
+/// fed through `git apply` verbatim. Binary deletes whose contents were not
+/// valid UTF-8 are skipped from the diff (they still land on disk).
+///
+/// Used by `apply_patch` to let the model verify *what was actually
+/// applied* in addition to the structured `applied_delta`.
+pub(crate) fn build_unified_diff(staged: &StagedApply) -> String {
+    let mut out = String::new();
+    for state in &staged.files {
+        if state.before == state.current {
+            continue;
+        }
+        append_file_unified_diff(
+            &mut out,
+            &state.rel,
+            &state.before,
+            &state.current,
+            false,
+            false,
+        );
+    }
+    for op in &staged.ops {
+        match op {
+            StagedOp::SearchReplace { .. } => {}
+            StagedOp::CreateFile { rel, contents, .. } => {
+                append_file_unified_diff(&mut out, rel, "", contents, true, false);
+            }
+            StagedOp::DeleteFile {
+                rel,
+                before_contents,
+                ..
+            } => {
+                if let Some(before) = before_contents.as_deref() {
+                    append_file_unified_diff(&mut out, rel, before, "", false, true);
+                }
+            }
+            StagedOp::MoveFile {
+                rel_from,
+                rel_to,
+                before_contents,
+                after_contents,
+                ..
+            } => {
+                append_file_unified_diff(&mut out, rel_from, before_contents, "", false, true);
+                append_file_unified_diff(&mut out, rel_to, "", after_contents, true, false);
+            }
+        }
+    }
+    out
+}
+
+/// Append one file's unified-diff section to `out`. `creating` swaps the
+/// `--- a/<rel>` header for `/dev/null`; `deleting` does the same for the
+/// `+++ b/<rel>` header. Both flags can be false for a normal in-place edit.
+fn append_file_unified_diff(
+    out: &mut String,
+    rel: &str,
+    before: &str,
+    after: &str,
+    creating: bool,
+    deleting: bool,
+) {
+    if before == after {
+        return;
+    }
+    let old_header = if creating {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{rel}")
+    };
+    let new_header = if deleting {
+        "/dev/null".to_string()
+    } else {
+        format!("b/{rel}")
+    };
+    let diff = TextDiff::from_lines(before, after);
+    let chunk = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&old_header, &new_header)
+        .to_string();
+    if chunk.is_empty() {
+        return;
+    }
+    out.push_str(&chunk);
+    if !out.ends_with('\n') {
+        out.push('\n');
     }
 }
 

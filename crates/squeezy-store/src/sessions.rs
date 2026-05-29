@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -28,9 +29,25 @@ pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// `events.jsonl` + `replay.jsonl`, so bumping this only requires changing
 /// the merge logic or the wire shape of `RolloutEvent` itself.
 pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
+/// Schema version stamped onto every `SessionMetadata` written via the
+/// store. A missing `schema_version` field on disk is treated as v0 (the
+/// pre-versioning shape); the reader runs [`SESSION_METADATA_MIGRATIONS`]
+/// over the raw JSON before deserialization so older `metadata.json`
+/// files keep loading after future schema changes without filename
+/// sniffing.
+pub const SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
+
+/// Rewrite the cross-project session index when it grows beyond this many
+/// bytes. Append-only writes are cheap, but unbounded growth would slow
+/// every `list_global_index` startup read, so the next call after the
+/// cap is exceeded dedupes by `session_id` and rewrites the file with
+/// the latest snapshot per session. The threshold trades a rare full
+/// rewrite for a fast hot path; at ~500B/line a 256KiB cap holds roughly
+/// 500 unique sessions before compaction kicks in.
+pub const GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -167,26 +184,150 @@ impl SessionStore {
         Some(truncated)
     }
 
+    /// Path to the cross-project session index, an append-only JSONL file
+    /// at `~/.squeezy/sessions/index.jsonl`. Per-project session roots
+    /// live under each workspace, so a global index is the only way the
+    /// resume picker can show sessions started from sibling repos.
+    /// Returns `None` when `HOME` is unset — same condition under which
+    /// the user-global memory file declines to operate.
+    pub fn global_index_path() -> Option<PathBuf> {
+        let home = env::var_os("HOME")?;
+        Some(
+            PathBuf::from(home)
+                .join(".squeezy")
+                .join("sessions")
+                .join("index.jsonl"),
+        )
+    }
+
+    /// Append a snapshot of a session to the global cross-project index.
+    /// Errors are intentionally swallowed: the index is best-effort
+    /// enrichment, the per-project session store is authoritative.
+    /// Append-only writes keep the hot path cheap; readers dedupe by
+    /// `session_id` and compaction is deferred to `list_global_index`.
+    pub fn append_global_index_entry(entry: &GlobalSessionIndexEntry) {
+        let Some(path) = Self::global_index_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(mut payload) = serde_json::to_vec(entry) else {
+            return;
+        };
+        payload.push(b'\n');
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let _ = file.write_all(&payload);
+    }
+
+    /// Read the cross-project session index, deduping by `session_id` and
+    /// keeping the entry with the largest `last_event_at_ms` for each id.
+    /// When the file exceeds [`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`], the
+    /// deduped snapshot is rewritten atomically (tmp + rename) so the
+    /// next read stays fast. Returns entries newest-first by
+    /// `started_at_ms` so callers can take a recency-prefixed slice
+    /// without re-sorting.
+    pub fn list_global_index() -> Vec<GlobalSessionIndexEntry> {
+        let Some(path) = Self::global_index_path() else {
+            return Vec::new();
+        };
+        if !path.exists() {
+            return Vec::new();
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(line) else {
+                continue;
+            };
+            match by_id.get(&entry.session_id) {
+                Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+                _ => {
+                    by_id.insert(entry.session_id.clone(), entry);
+                }
+            }
+        }
+        let should_compact = fs::metadata(&path)
+            .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
+            .unwrap_or(false);
+        if should_compact {
+            let mut entries: Vec<&GlobalSessionIndexEntry> = by_id.values().collect();
+            // Compact in oldest-first order so future appends keep the
+            // newest entries at the tail — matches how readers see time.
+            entries.sort_by_key(|entry| entry.started_at_ms);
+            let _ = rewrite_global_index(&path, &entries);
+        }
+        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+        entries
+    }
+
+    /// Append the metadata snapshot to the cross-project session index.
+    /// Failures are silent — see [`Self::append_global_index_entry`].
+    ///
+    /// Skips the write when the workspace_root is under the system temp
+    /// dir but the resolved global index lives under the user's real
+    /// HOME — that combination is unique to `cargo test` runs whose
+    /// session stores point at sandboxed workspaces but never redirected
+    /// HOME. The guard prevents test runs from polluting a developer's
+    /// `~/.squeezy/sessions/index.jsonl`; tests that want to exercise
+    /// the global index redirect HOME explicitly so the destination
+    /// also lives under temp, and the guard becomes a no-op.
+    pub(crate) fn record_global_index(metadata: &SessionMetadata) {
+        if skip_global_index_for_test_workspace(&metadata.workspace_root) {
+            return;
+        }
+        let entry = GlobalSessionIndexEntry::from_metadata(metadata, now_ms());
+        Self::append_global_index_entry(&entry);
+    }
+
+    /// Start a fresh session.
+    ///
+    /// The handle returned is in the *pending* state: no `metadata.json`
+    /// or `resume_state.json` has been written and no events.jsonl writer
+    /// thread has been spawned. The on-disk session directory is created
+    /// lazily by [`SessionHandle::ensure_live`], which is called the
+    /// first time the handle observes a substantive append (i.e. any
+    /// event whose kind is not a pure lifecycle marker like
+    /// `session_started`). Quick-exit code paths — for example
+    /// `squeezy --prompt --help`, which constructs an `Agent` and bails
+    /// before the model loop runs — therefore leave no on-disk stub
+    /// behind, while any real interaction materialises the session in
+    /// place before the first substantive event is recorded.
+    /// Start a session AND immediately materialise it to disk. Test
+    /// fixtures and any caller that expects `list_sessions` /
+    /// `SessionStore::show` to see the new session right away should
+    /// use this instead of [`SessionStore::start_session`] (which is
+    /// lazy per F12-pi-lazy-session-file-creation).
+    pub fn start_session_eager(&self, metadata: SessionMetadata) -> Result<SessionHandle> {
+        let handle = self.start_session(metadata)?;
+        handle.materialize_now()?;
+        Ok(handle)
+    }
+
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
         metadata.session_id = next_session_id();
         metadata.started_at_ms = now_ms();
         metadata.status = SessionStatus::Running;
         metadata.resume_available = true;
-        let dir = self.session_dir(&metadata.session_id);
-        fs::create_dir_all(&dir)?;
-        write_json(&dir.join("metadata.json"), &metadata)?;
-        write_json(
-            &dir.join("resume_state.json"),
-            &SessionResumeState {
-                resume_available: true,
-                ..SessionResumeState::default()
-            },
-        )?;
+        let session_id = metadata.session_id.clone();
         Ok(SessionHandle {
             store: self.clone(),
-            session_id: metadata.session_id,
+            session_id,
             counters: Arc::new(HandleCounters::default()),
-            event_writer: SessionLogWriter::spawn(self.clone(), dir),
+            state: Arc::new(InnerStateGuard {
+                inner: StdMutex::new(InnerState::Pending(Box::new(PendingState {
+                    metadata,
+                    buffered_events: Vec::new(),
+                }))),
+            }),
         })
     }
 
@@ -198,7 +339,7 @@ impl SessionStore {
         // for a session that already recorded it.
         let counters = HandleCounters::default();
         if let Ok(metadata) =
-            read_json::<SessionMetadata>(&self.session_dir(&session_id).join("metadata.json"))
+            read_session_metadata(&self.session_dir(&session_id).join("metadata.json"))
         {
             counters
                 .event_count
@@ -212,11 +353,15 @@ impl SessionStore {
                 .replay_count
                 .store(tape.events.len() as u64, Ordering::Relaxed);
         }
+        let dir = self.session_dir(&session_id);
+        let writer = SessionLogWriter::spawn(self.clone(), dir);
         SessionHandle {
             store: self.clone(),
-            session_id: session_id.clone(),
+            session_id,
             counters: Arc::new(counters),
-            event_writer: SessionLogWriter::spawn(self.clone(), self.session_dir(&session_id)),
+            state: Arc::new(InnerStateGuard {
+                inner: StdMutex::new(InnerState::Live(writer)),
+            }),
         }
     }
 
@@ -251,8 +396,13 @@ impl SessionStore {
             })?;
         metadata.parent_id = Some(parent_session_id.to_string());
         let handle = self.start_session(metadata)?;
+        // Route the parent resume snapshot through the handle so the
+        // child session materialises (creates dir, writes metadata.json,
+        // writes resume_state.json) before any sibling files are written
+        // alongside it. Fork is itself a substantive event, so deferring
+        // here would not save any disk activity.
+        handle.write_resume_state(&parent_resume)?;
         let dir = self.session_dir(handle.session_id());
-        write_json(&dir.join("resume_state.json"), &parent_resume)?;
         let parent_attachments = parent_dir.join("attachments");
         if parent_attachments.exists() {
             let child_attachments = dir.join("attachments");
@@ -297,7 +447,7 @@ impl SessionStore {
             let Ok(text) = fs::read_to_string(path) else {
                 continue;
             };
-            let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&text) else {
+            let Ok(metadata) = deserialize_session_metadata(&text) else {
                 continue;
             };
             if query.matches(&metadata) {
@@ -316,7 +466,7 @@ impl SessionStore {
                     let Ok(text) = fs::read_to_string(path) else {
                         continue;
                     };
-                    let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&text) else {
+                    let Ok(metadata) = deserialize_session_metadata(&text) else {
                         continue;
                     };
                     if query.matches(&metadata) {
@@ -354,7 +504,7 @@ impl SessionStore {
         fs::rename(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
-            && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
+            && let Ok(mut metadata) = deserialize_session_metadata(&text)
         {
             let stamp = now_ms();
             metadata.status = SessionStatus::Archived;
@@ -363,6 +513,7 @@ impl SessionStore {
                 metadata.ended_at_ms = Some(stamp);
             }
             let _ = write_json(&metadata_path, &metadata);
+            Self::record_global_index(&metadata);
         }
         Ok(())
     }
@@ -386,18 +537,32 @@ impl SessionStore {
         fs::rename(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
-            && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
+            && let Ok(mut metadata) = deserialize_session_metadata(&text)
         {
             metadata.status = SessionStatus::Completed;
             metadata.archived_at_ms = None;
             let _ = write_json(&metadata_path, &metadata);
+            Self::record_global_index(&metadata);
         }
         Ok(())
     }
 
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
         let dir = self.locate_session_dir(session_id);
-        let metadata = read_json(&dir.join("metadata.json"))?;
+        let metadata_path = dir.join("metadata.json");
+        // Lazy materialisation means a session can exist in memory (held by
+        // a live `SessionHandle`) without any on-disk footprint until its
+        // first substantive event. From the store's perspective those
+        // sessions are simply not visible; return a clean "not found"
+        // error rather than letting the underlying `read_to_string`
+        // failure surface as a generic IO error.
+        if !metadata_path.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "session {session_id} not found (no metadata.json at {})",
+                metadata_path.display(),
+            )));
+        }
+        let metadata = read_session_metadata(&metadata_path)?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
         let attachments = read_context_attachments(&dir.join("attachments"))?;
@@ -410,6 +575,25 @@ impl SessionStore {
             attachments,
             replay,
         })
+    }
+
+    /// Read just `metadata.json` for `session_id` without loading events,
+    /// the resume snapshot, attachments, or the replay tape. Used by the
+    /// CLI cross-project resume confirmation prompt where only
+    /// `metadata.cwd` is needed and pulling in megabytes of events would
+    /// be wasteful right before the TUI resumes the session anyway.
+    /// Resolves through `locate_session_dir` so archived sessions stay
+    /// readable.
+    pub fn read_metadata(&self, session_id: &str) -> Result<SessionMetadata> {
+        let dir = self.locate_session_dir(session_id);
+        let metadata_path = dir.join("metadata.json");
+        if !metadata_path.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "session {session_id} not found (no metadata.json at {})",
+                metadata_path.display(),
+            )));
+        }
+        read_json(&metadata_path)
     }
 
     pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
@@ -611,6 +795,91 @@ impl SessionStore {
         Ok(CleanupReport { archived, removed })
     }
 
+    /// Resolve a free-form session id *prefix* to the full session id of
+    /// the matching session. An exact match always wins — so a full id
+    /// is returned verbatim even if it would also be a prefix of a
+    /// longer id — and ties on the prefix produce
+    /// [`ResolveError::AmbiguousPrefix`] with every candidate listed so
+    /// the CLI can render an actionable disambiguation hint.
+    ///
+    /// Both the live root and the `archived/` subtree are searched so
+    /// `squeezy sessions resume abc12` works the same way for a recent
+    /// session and for one that has since been soft-archived. The empty
+    /// prefix is rejected as [`ResolveError::NotFound`] rather than
+    /// silently picking an arbitrary session — accidentally typing
+    /// `squeezy sessions resume ""` should fail loudly.
+    ///
+    /// Filesystem failures (permission errors, unreadable directories)
+    /// are surfaced as [`ResolveError::Io`]; missing roots are not an
+    /// error because a fresh install simply has no sessions yet.
+    pub fn resolve_session_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<String, ResolveError> {
+        if prefix.is_empty() {
+            return Err(ResolveError::NotFound {
+                prefix: prefix.to_string(),
+            });
+        }
+        let ids = self.collect_session_ids()?;
+        if let Some(exact) = ids.iter().find(|id| id.as_str() == prefix) {
+            return Ok(exact.clone());
+        }
+        let mut matches: Vec<String> = ids
+            .into_iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect();
+        matches.sort();
+        match matches.len() {
+            0 => Err(ResolveError::NotFound {
+                prefix: prefix.to_string(),
+            }),
+            1 => Ok(matches.into_iter().next().expect("len == 1")),
+            _ => Err(ResolveError::AmbiguousPrefix {
+                prefix: prefix.to_string(),
+                matches,
+            }),
+        }
+    }
+
+    /// Enumerate every session id known to this store across the live
+    /// root and the `archived/` subtree. Missing roots silently return
+    /// an empty list — a brand-new install has no sessions yet and that
+    /// should not be a hard error. The list mirrors what
+    /// [`resolve_session_id_prefix`] needs and stays intentionally tiny
+    /// (no metadata reads): the resolver only cares about directory
+    /// names.
+    fn collect_session_ids(&self) -> std::result::Result<Vec<String>, ResolveError> {
+        let mut ids = Vec::new();
+        if self.root.exists() {
+            for entry in fs::read_dir(&self.root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                if entry.file_name() == ARCHIVED_SUBDIR {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        let archived_root = self.root.join(ARCHIVED_SUBDIR);
+        if archived_root.exists() {
+            for entry in fs::read_dir(&archived_root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// Soft-delete that prefers archiving over permanent removal.
     /// Live sessions are moved into `archived/<id>/` (same path as
     /// [`archive_session`]); archived sessions are left in place because
@@ -640,7 +909,10 @@ pub struct SessionHandle {
     // avoid the read-mutate-write of `metadata.json` for routine events that
     // don't change any user-visible discovery field.
     counters: Arc<HandleCounters>,
-    event_writer: Arc<SessionLogWriter>,
+    /// Lazy materialisation state. Shared by every clone of the handle so
+    /// the first substantive append from any clone promotes the entire
+    /// session to the on-disk Live form.
+    state: Arc<InnerStateGuard>,
 }
 
 #[derive(Debug, Default)]
@@ -648,6 +920,64 @@ struct HandleCounters {
     event_count: AtomicU64,
     replay_count: AtomicU64,
     has_first_user_task: AtomicBool,
+}
+
+/// Lazy materialisation state for a `SessionHandle`.
+///
+/// A fresh session begins as [`InnerState::Pending`] — the metadata
+/// lives in memory and no `metadata.json` / `resume_state.json` has
+/// been written. The first substantive event (or an explicit
+/// materialising call such as `write_resume_state`) promotes the
+/// session to [`InnerState::Live`], at which point the on-disk
+/// session directory is created, the writer thread is spawned, and
+/// any buffered lifecycle events are flushed in arrival order.
+///
+/// Sessions opened via [`SessionStore::open_session`] start out
+/// [`InnerState::Live`] because the on-disk artefact already exists.
+#[derive(Debug)]
+struct InnerStateGuard {
+    inner: StdMutex<InnerState>,
+}
+
+#[derive(Debug)]
+enum InnerState {
+    // `PendingState` is large (it holds an entire `SessionMetadata`
+    // and a `Vec<SessionEvent>` buffer) compared to the other variants,
+    // so box it to keep `InnerState` itself a small tagged pointer.
+    // Promotion is rare enough that the extra indirection is irrelevant
+    // next to the cost of writing `metadata.json`.
+    Pending(Box<PendingState>),
+    Live(Arc<SessionLogWriter>),
+    /// Sentinel observed only inside [`SessionHandle::ensure_live`]
+    /// while the pending state is being moved out of the mutex during
+    /// promotion. The mutex is held throughout the transition so no
+    /// other caller can ever read this variant.
+    Transitioning,
+}
+
+#[derive(Debug)]
+struct PendingState {
+    /// Metadata snapshot built by `start_session`. Updated in place
+    /// by `update_metadata` while the session remains pending; written
+    /// to `metadata.json` on promotion.
+    metadata: SessionMetadata,
+    /// Lifecycle-only events (e.g. `session_started`) appended before
+    /// the session materialised. Flushed in arrival order through the
+    /// writer on promotion. The in-memory counters track them too, so
+    /// the handle's view of `event_count` stays consistent across the
+    /// promotion boundary.
+    buffered_events: Vec<SessionEvent>,
+}
+
+/// Event kinds that on their own should not promote a pending session
+/// to live: they are pure lifecycle bookkeeping and represent no real
+/// interaction. Any other kind triggers materialisation so the durable
+/// log captures it from the first byte forward.
+fn is_substantive_event_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "session_started" | "session_resumed" | "session_ended"
+    )
 }
 
 #[derive(Debug)]
@@ -863,7 +1193,7 @@ fn append_payload_once(
 
 fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
     let path = dir.join("metadata.json");
-    let mut metadata: SessionMetadata = read_json(&path)?;
+    let mut metadata = read_session_metadata(&path)?;
     update(&mut metadata);
     write_json(&path, &metadata)
 }
@@ -874,7 +1204,20 @@ impl SessionHandle {
     }
 
     pub fn metadata(&self) -> Result<SessionMetadata> {
-        let mut metadata: SessionMetadata = read_json(&self.dir().join("metadata.json"))?;
+        let pending_snapshot = {
+            let guard = self.state.inner.lock().expect("session handle state");
+            match &*guard {
+                InnerState::Pending(pending) => Some(pending.metadata.clone()),
+                InnerState::Live(_) => None,
+                InnerState::Transitioning => {
+                    unreachable!("SessionHandle observed Transitioning state outside ensure_live")
+                }
+            }
+        };
+        let mut metadata = match pending_snapshot {
+            Some(metadata) => metadata,
+            None => read_session_metadata(&self.dir().join("metadata.json"))?,
+        };
         // Surface the in-memory event_count even when we have intentionally
         // skipped writing metadata.json for routine events.
         let cached = self.counters.event_count.load(Ordering::Relaxed);
@@ -885,13 +1228,125 @@ impl SessionHandle {
     }
 
     pub fn update_metadata(&self, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
+        // Pending sessions keep their metadata fully in memory; mutate in
+        // place and let materialisation flush it to disk later.
+        {
+            let mut guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &mut *guard {
+                update(&mut pending.metadata);
+                return Ok(());
+            }
+        }
         let mut metadata = self.metadata()?;
         update(&mut metadata);
         write_json(&self.dir().join("metadata.json"), &metadata)
     }
 
+    /// Like [`Self::update_metadata`] but also refreshes the
+    /// cross-project global index entry so user-facing fields
+    /// (`display_name`, `labels`, …) become visible to the resume
+    /// picker without waiting for the next session to start. Returns
+    /// the post-update metadata snapshot. Used by user-initiated
+    /// metadata mutations (`/session rename`, `/session label`) where
+    /// the picker UX depends on the change propagating immediately.
+    ///
+    /// Internal lifecycle writes that mutate metadata as a side effect
+    /// (status transitions, calibration EMA updates, …) keep calling
+    /// [`Self::update_metadata`] directly: the global index refresh
+    /// pattern only matters when the new value affects the cross-project
+    /// picker's row label.
+    pub fn update_metadata_and_index(
+        &self,
+        update: impl FnOnce(&mut SessionMetadata),
+    ) -> Result<SessionMetadata> {
+        self.update_metadata(update)?;
+        let snapshot = self.metadata()?;
+        SessionStore::record_global_index(&snapshot);
+        Ok(snapshot)
+    }
+
     pub fn flush_events(&self) -> Result<()> {
-        self.event_writer.flush()
+        let writer = {
+            let guard = self.state.inner.lock().expect("session handle state");
+            match &*guard {
+                // Pending sessions have nothing on disk and no writer thread
+                // — a flush is a no-op rather than an error.
+                InnerState::Pending(_) => return Ok(()),
+                InnerState::Live(writer) => writer.clone(),
+                InnerState::Transitioning => unreachable!(),
+            }
+        };
+        writer.flush()
+    }
+
+    /// Promote a pending session to the live form: create the session
+    /// directory, write `metadata.json` and `resume_state.json`, record
+    /// the cross-project global index entry, spawn the events.jsonl
+    /// writer thread, and flush any buffered lifecycle events through
+    /// the writer in arrival order. No-op when the session is already
+    /// live.
+    ///
+    /// Returns an Arc clone of the writer so the caller can immediately
+    /// queue further appends without re-locking the state mutex.
+    /// Materialise a pending session to disk (writes `metadata.json` +
+    /// `resume_state.json`, records the global index entry, spawns the
+    /// writer). Idempotent on already-live sessions. Use this when a
+    /// caller wants `SessionStore::show(...)` to succeed before any
+    /// substantive event has been appended (e.g., the agent's
+    /// `show_session` API surface).
+    pub fn materialize_now(&self) -> Result<()> {
+        self.ensure_live().map(|_| ())
+    }
+
+    fn ensure_live(&self) -> Result<Arc<SessionLogWriter>> {
+        let mut guard = self.state.inner.lock().expect("session handle state");
+        match &*guard {
+            InnerState::Live(writer) => return Ok(writer.clone()),
+            InnerState::Pending(_) => {}
+            InnerState::Transitioning => {
+                unreachable!("ensure_live observed Transitioning state under its own lock")
+            }
+        }
+        let pending = match std::mem::replace(&mut *guard, InnerState::Transitioning) {
+            InnerState::Pending(pending) => pending,
+            _ => unreachable!(),
+        };
+        let dir = self.store.session_dir(&self.session_id);
+        let prepare = || -> Result<()> {
+            fs::create_dir_all(&dir)?;
+            write_json(&dir.join("metadata.json"), &pending.metadata)?;
+            write_json(
+                &dir.join("resume_state.json"),
+                &SessionResumeState {
+                    resume_available: pending.metadata.resume_available,
+                    ..SessionResumeState::default()
+                },
+            )?;
+            Ok(())
+        };
+        if let Err(error) = prepare() {
+            // Restore the pending state so the caller can retry without
+            // losing the metadata snapshot or any buffered events.
+            *guard = InnerState::Pending(pending);
+            return Err(error);
+        }
+        SessionStore::record_global_index(&pending.metadata);
+        let writer = SessionLogWriter::spawn(self.store.clone(), dir);
+        // Replay buffered lifecycle events through the writer so any
+        // pre-promotion bookkeeping (`session_started`, …) lands in
+        // events.jsonl before the substantive event that triggered
+        // promotion does. We hold the state mutex throughout, so no
+        // other caller can interleave a fresh append between the
+        // buffer flush and the state flip.
+        for event in &pending.buffered_events {
+            let payload = match serialize_event_payload(event, self.store.max_event_bytes) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            let _ = writer.append(SessionLogAppend { payload });
+        }
+        *guard = InnerState::Live(writer.clone());
+        Ok(writer)
     }
 
     /// Typed convenience wrapper for [`append_event`]. Producers that want
@@ -912,6 +1367,31 @@ impl SessionHandle {
     pub fn append_event(&self, event: SessionEvent) -> Result<()> {
         let event_kind = event.kind.clone();
         let event_summary = event.summary.clone();
+        let substantive = is_substantive_event_kind(&event_kind);
+
+        // Lifecycle-only events on a pending session do not promote the
+        // session; they are buffered in memory and either flushed at
+        // materialisation time (when a substantive event arrives) or
+        // discarded when the handle drops without ever materialising.
+        // This is what keeps quick-exit code paths — `squeezy --prompt
+        // --help` and friends — from leaving a stub session directory
+        // behind on disk.
+        if !substantive {
+            let mut guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &mut *guard {
+                let new_count = self.counters.event_count.fetch_add(1, Ordering::Relaxed) + 1;
+                pending.metadata.event_count = new_count;
+                pending.buffered_events.push(event);
+                return Ok(());
+            }
+        }
+
+        // Otherwise: substantive append (or a lifecycle event on an
+        // already-live session). Make sure the on-disk artefact exists
+        // before queueing this event, so buffered lifecycle events land
+        // in events.jsonl first and the ordering invariant holds.
+        let writer = self.ensure_live()?;
+
         let mut payload = to_json_vec(&event)?;
         if payload.len() > self.store.max_event_bytes {
             payload = to_json_vec(&SessionEvent {
@@ -924,11 +1404,12 @@ impl SessionHandle {
                     "reason": "event exceeded max_event_bytes",
                     "original_bytes": payload.len(),
                 }),
+                parent_event_sequence: event.parent_event_sequence,
             })?;
         }
         payload.push(b'\n');
 
-        self.event_writer.append(SessionLogAppend { payload })?;
+        writer.append(SessionLogAppend { payload })?;
         // Hot-path bookkeeping lives in memory: the on-disk event_count is
         // resynced lazily during `metadata()` / `update_metadata`, and the
         // metadata write below only fires when a discovery-visible field is
@@ -954,11 +1435,22 @@ impl SessionHandle {
                     metadata.latest_summary = event_summary;
                 }
             })?;
+            // Mirror the title-bearing snapshot into the cross-project
+            // index so the resume picker can surface this session from
+            // sibling repos. Cheap read of metadata.json keeps the
+            // global index decoupled from the in-memory counters.
+            if let Ok(metadata) = self.metadata() {
+                SessionStore::record_global_index(&metadata);
+            }
         }
         Ok(())
     }
 
     pub fn append_replay_event(&self, mut event: SessionReplayEvent) -> Result<()> {
+        // Replay events describe model interaction; they are always
+        // substantive enough to promote a pending session to live so
+        // the events.jsonl + replay.jsonl pair stays consistent.
+        let _ = self.ensure_live()?;
         let dir = self.dir();
         fs::create_dir_all(&dir)?;
         let path = dir.join("replay.jsonl");
@@ -992,10 +1484,33 @@ impl SessionHandle {
     }
 
     pub fn write_resume_state(&self, state: &SessionResumeState) -> Result<()> {
+        // Materialise before writing: an explicit resume checkpoint means
+        // the caller wants this persisted, so there is no benefit to
+        // continuing to defer the session directory.
+        let _ = self.ensure_live()?;
         write_json(&self.dir().join("resume_state.json"), state)
     }
 
     pub fn read_resume_state(&self) -> Result<SessionResumeState> {
+        // A pending session has no `resume_state.json` on disk yet but
+        // is implicitly resumable (no events have been recorded, so
+        // resuming yields an empty conversation). Surface that view as
+        // the default snapshot rather than erroring with "file not
+        // found".
+        let pending_snapshot = {
+            let guard = self.state.inner.lock().expect("session handle state");
+            match &*guard {
+                InnerState::Pending(pending) => Some(SessionResumeState {
+                    resume_available: pending.metadata.resume_available,
+                    ..SessionResumeState::default()
+                }),
+                InnerState::Live(_) => None,
+                InnerState::Transitioning => unreachable!(),
+            }
+        };
+        if let Some(state) = pending_snapshot {
+            return Ok(state);
+        }
         read_json(&self.dir().join("resume_state.json"))
     }
 
@@ -1007,6 +1522,18 @@ impl SessionHandle {
     /// (snap-to-checkpoint) and forward-applies only the newer events. When
     /// no checkpoint is found, replay starts from an empty conversation.
     pub fn replay_resume_state(&self) -> Result<SessionResumeState> {
+        // Pending sessions have no events.jsonl yet; surface a default
+        // empty resume state rather than letting `read_jsonl` propagate
+        // an arbitrary IO error from the missing file.
+        {
+            let guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &*guard {
+                return Ok(SessionResumeState {
+                    resume_available: pending.metadata.resume_available,
+                    ..SessionResumeState::default()
+                });
+            }
+        }
         let (events, _warnings) = read_jsonl(&self.dir().join("events.jsonl"))?;
         let mut conversation: Vec<ResumeItem> = Vec::new();
         let mut transcript: Vec<TranscriptItem> = Vec::new();
@@ -1052,6 +1579,9 @@ impl SessionHandle {
         attachment: &ContextAttachment,
         redacted_text: Option<&str>,
     ) -> Result<()> {
+        // Attaching context is substantive — the caller is asking us to
+        // pin a real piece of state alongside the session.
+        let _ = self.ensure_live()?;
         let dir = self.dir().join("attachments");
         fs::create_dir_all(&dir)?;
         let stem = attachment_file_stem(&attachment.id)?;
@@ -1063,6 +1593,15 @@ impl SessionHandle {
     }
 
     pub fn context_attachments(&self) -> Result<Vec<ContextAttachment>> {
+        // A pending session has no attachments dir on disk yet — return
+        // an empty list rather than letting the underlying `read_dir`
+        // call surface a NotFound IO error.
+        {
+            let guard = self.state.inner.lock().expect("session handle state");
+            if matches!(&*guard, InnerState::Pending(_)) {
+                return Ok(Vec::new());
+            }
+        }
         read_context_attachments(&self.dir().join("attachments"))
     }
 
@@ -1073,6 +1612,25 @@ impl SessionHandle {
         metrics: SessionMetrics,
         redactions: u64,
     ) -> Result<()> {
+        // A `finish` on a still-pending session means the session ran
+        // but never produced any substantive event (e.g. `--prompt
+        // --help`). Keep the no-stub invariant: mutate the in-memory
+        // metadata so a same-process caller still sees Completed/Failed
+        // bookkeeping, but do not promote the session to its on-disk
+        // form just to record an end timestamp.
+        {
+            let mut guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &mut *guard {
+                pending.metadata.ended_at_ms = Some(now_ms());
+                if matches!(pending.metadata.status, SessionStatus::Running) {
+                    pending.metadata.status = status;
+                }
+                pending.metadata.cost = cost;
+                pending.metadata.metrics = metrics;
+                pending.metadata.redactions = redactions;
+                return Ok(());
+            }
+        }
         self.flush_events()?;
         self.update_metadata(|metadata| {
             metadata.ended_at_ms = Some(now_ms());
@@ -1086,7 +1644,11 @@ impl SessionHandle {
             metadata.cost = cost;
             metadata.metrics = metrics;
             metadata.redactions = redactions;
-        })
+        })?;
+        if let Ok(metadata) = self.metadata() {
+            SessionStore::record_global_index(&metadata);
+        }
+        Ok(())
     }
 
     fn dir(&self) -> PathBuf {
@@ -1094,8 +1656,74 @@ impl SessionHandle {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// One line of the cross-project session index. Append-only writes are
+/// produced by [`SessionStore::record_global_index`] on session create,
+/// title-bearing event commit, finish, and archive/unarchive transitions.
+/// Readers (`list_global_index`) dedupe by `session_id` keeping the
+/// largest `last_event_at_ms`, so missing intermediate writes are
+/// tolerable — the most recent snapshot wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalSessionIndexEntry {
+    pub session_id: String,
+    pub cwd: String,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    /// Human-readable label used by the resume picker. Sourced from
+    /// `first_user_task` and falling back to `latest_summary` so freshly
+    /// started sessions that have not seen a user message yet still get
+    /// a placeholder label once any assistant turn completes.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Mirrors `SessionMetadata::display_name` so cross-project resume
+    /// picker entries (which read this index, not the per-project
+    /// `metadata.json`) can still surface the user-chosen name. Legacy
+    /// index files predate this field — `serde(default)` keeps them
+    /// loadable; the picker falls back to `title` when this is `None`.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub started_at_ms: u64,
+    pub last_event_at_ms: u64,
+    #[serde(default)]
+    pub turn_count: u64,
+    pub resume_available: bool,
+}
+
+impl GlobalSessionIndexEntry {
+    /// Project a `SessionMetadata` snapshot onto the wire shape persisted
+    /// in the global index. `last_event_at_ms` is the wall-clock moment
+    /// the snapshot was taken — each write is itself the "event" that
+    /// advances the timeline, so callers do not need a separate event
+    /// timestamp argument.
+    pub fn from_metadata(metadata: &SessionMetadata, last_event_at_ms: u64) -> Self {
+        let resume_available =
+            metadata.resume_available && !matches!(metadata.status, SessionStatus::Archived);
+        let title = metadata
+            .first_user_task
+            .clone()
+            .or_else(|| metadata.latest_summary.clone());
+        Self {
+            session_id: metadata.session_id.clone(),
+            cwd: metadata.cwd.clone(),
+            workspace_root: metadata.workspace_root.clone(),
+            repo_root: metadata.repo_root.clone(),
+            title,
+            display_name: metadata.display_name.clone(),
+            started_at_ms: metadata.started_at_ms,
+            last_event_at_ms,
+            turn_count: metadata.metrics.turns,
+            resume_available,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMetadata {
+    /// Schema version stamped on every `metadata.json`. Missing in v0
+    /// files; the reader migrates them through
+    /// `SESSION_METADATA_MIGRATIONS` and stamps the current version.
+    #[serde(default = "legacy_session_metadata_schema_version")]
+    pub schema_version: u32,
     pub session_id: String,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
@@ -1137,6 +1765,54 @@ pub struct SessionMetadata {
     /// pre-fork `metadata.json` files keep deserializing.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Human-friendly name set by the user via `/session rename <name>`.
+    /// When present, the resume picker prefers it over the inferred
+    /// `first_user_task` / `latest_summary` label so memorable sessions
+    /// stay easy to find. `serde(default)` keeps pre-rename
+    /// `metadata.json` files loadable; the absent-field case continues
+    /// to fall back to the inferred label.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Free-form labels attached by the user via `/session label <name>`.
+    /// Multiple labels coexist (`bugfix`, `payments`, `wip`, …) so the
+    /// user can group sessions across projects without renaming them.
+    /// Persisted as a `Vec<String>` so the wire shape is trivially
+    /// extensible; legacy `metadata.json` files deserialise with an
+    /// empty vec.
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+impl Default for SessionMetadata {
+    fn default() -> Self {
+        Self {
+            schema_version: SESSION_METADATA_SCHEMA_VERSION,
+            session_id: String::new(),
+            started_at_ms: 0,
+            ended_at_ms: None,
+            archived_at_ms: None,
+            cwd: String::new(),
+            workspace_root: String::new(),
+            repo_root: None,
+            branch: None,
+            provider: String::new(),
+            model: String::new(),
+            mode: SessionMode::default(),
+            status: SessionStatus::default(),
+            first_user_task: None,
+            latest_summary: None,
+            cost: CostSnapshot::default(),
+            metrics: SessionMetrics::default(),
+            redactions: 0,
+            resume_available: false,
+            resume_unavailable_reason: None,
+            event_count: 0,
+            token_calibration: squeezy_llm::TokenCalibration::default(),
+            parent_id: None,
+            display_name: None,
+            labels: Vec::new(),
+        }
+    }
 }
 
 impl SessionMetadata {
@@ -1191,6 +1867,20 @@ pub struct SessionEvent {
     pub turn_id: Option<String>,
     pub summary: Option<String>,
     pub payload: Value,
+    /// Optional pointer to the parent event's position in `events.jsonl`,
+    /// expressed as a zero-based sequence number. `None` (the default and
+    /// the wire shape for every legacy log) means the event continues the
+    /// previous one linearly, so the implicit parent is `sequence - 1`.
+    /// `Some(k)` makes the parent explicit and is used to encode branches
+    /// — re-prompting from an earlier turn creates a new event whose
+    /// parent is the earlier turn rather than the current tip, so the
+    /// resume picker can offer to navigate to either branch.
+    ///
+    /// Backward compatible: every existing log deserialises with the
+    /// field absent, and `skip_serializing_if` keeps the JSONL bytes
+    /// byte-identical for linear producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1369,7 +2059,19 @@ impl SessionEvent {
             turn_id,
             summary,
             payload,
+            parent_event_sequence: None,
         }
+    }
+
+    /// Attach an explicit parent event sequence to this event. The sequence
+    /// is the zero-based position of the parent event inside the session's
+    /// `events.jsonl`. Producers that branch off an earlier turn (for
+    /// example, re-prompting after navigating to a previous user message)
+    /// call this so the resulting tree exposes both branches.
+    #[must_use]
+    pub fn with_parent_event_sequence(mut self, sequence: u64) -> Self {
+        self.parent_event_sequence = Some(sequence);
+        self
     }
 
     /// Build a `SessionEvent` from a typed [`SessionEventKind`]. The kind
@@ -1409,8 +2111,127 @@ impl SessionEvent {
             turn_id,
             summary,
             payload,
+            parent_event_sequence: None,
         }
     }
+}
+
+/// Tip of one branch in a session's event tree. Produced by
+/// [`detect_branches`] for sessions that contain at least two branches so
+/// the resume picker can offer to navigate to either branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBranchTip {
+    /// Zero-based index of the tip event in the source `events.jsonl`. The
+    /// tip is the leaf of one branch — the most recent event on that path
+    /// from the root.
+    pub tip_sequence: u64,
+    /// Index of the deepest ancestor that has multiple children, i.e. the
+    /// event from which this branch diverged from its sibling(s). When the
+    /// fork is at the root, this is the root's sequence.
+    pub branched_from_sequence: u64,
+    /// `ts_unix_ms` recorded on the tip event. Used to sort branch tips
+    /// newest-first in the picker.
+    pub tip_ts_unix_ms: u64,
+    /// First user-message text encountered on this branch *after* the
+    /// divergence point. Lets the picker label otherwise-identical
+    /// branches with the prompt that re-opened that path. `None` when the
+    /// branch contains no user message after the fork (rare; only happens
+    /// when the tip itself sits directly on the fork).
+    pub first_message_after_branch: Option<String>,
+}
+
+/// Walk `events` as a tree and return the tips of each branch. Sessions
+/// that are purely linear — every event implicitly continues the previous
+/// one — return an empty vector, so callers can skip the branch picker UI
+/// without an extra check. When the session contains at least two leaves
+/// (i.e. two distinct branches), every leaf is reported.
+///
+/// The implicit-parent rule mirrors the serialised wire shape: an event at
+/// index `i` whose `parent_event_sequence` is `None` is assumed to descend
+/// from `i - 1`. Only events that set `parent_event_sequence = Some(k)`
+/// where `k < i - 1` participate in branching.
+pub fn detect_branches(events: &[SessionEvent]) -> Vec<EventBranchTip> {
+    if events.len() < 2 {
+        return Vec::new();
+    }
+    let len = events.len();
+    let parents: Vec<Option<u64>> = events
+        .iter()
+        .enumerate()
+        .map(|(i, event)| match event.parent_event_sequence {
+            Some(parent) if (parent as usize) < len && (parent as usize) != i => Some(parent),
+            // An explicit but out-of-range parent is treated as the implicit
+            // parent rather than panicking. Self-parent is likewise ignored.
+            _ if i == 0 => None,
+            _ => Some((i - 1) as u64),
+        })
+        .collect();
+
+    let mut child_count: Vec<u32> = vec![0; len];
+    for parent in parents.iter().flatten() {
+        let idx = *parent as usize;
+        if idx < len {
+            child_count[idx] = child_count[idx].saturating_add(1);
+        }
+    }
+
+    let leaves: Vec<u64> = (0..len)
+        .filter(|i| child_count[*i] == 0)
+        .map(|i| i as u64)
+        .collect();
+    if leaves.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut tips: Vec<EventBranchTip> = leaves
+        .iter()
+        .map(|&tip| {
+            let mut path: Vec<u64> = vec![tip];
+            let mut cur = tip as usize;
+            while let Some(parent) = parents[cur] {
+                path.push(parent);
+                cur = parent as usize;
+            }
+            path.reverse();
+
+            // Deepest ancestor on this path that has multiple children. When
+            // no internal node on the path forks (only possible if `tip`
+            // itself is the lone leaf, which `leaves.len() < 2` already
+            // guarded against), fall back to the root so callers still get
+            // a sensible divergence point.
+            let branched_from = path
+                .iter()
+                .rev()
+                .find(|&&node| child_count[node as usize] > 1)
+                .copied()
+                .unwrap_or(path[0]);
+
+            let first_message_after_branch = path
+                .iter()
+                .skip_while(|&&node| node != branched_from)
+                .skip(1)
+                .find_map(|&node| {
+                    let event = &events[node as usize];
+                    if event.kind == "user_message" {
+                        event.summary.clone()
+                    } else {
+                        None
+                    }
+                });
+
+            EventBranchTip {
+                tip_sequence: tip,
+                branched_from_sequence: branched_from,
+                tip_ts_unix_ms: events[tip as usize].ts_unix_ms,
+                first_message_after_branch,
+            }
+        })
+        .collect();
+
+    // Newest tip first so the picker surfaces the most recent branch at the
+    // top of the candidate list.
+    tips.sort_by_key(|tip| std::cmp::Reverse(tip.tip_ts_unix_ms));
+    tips
 }
 
 /// Typed view over `SessionEvent` for the well-known event kinds Squeezy
@@ -1490,6 +2311,20 @@ pub enum SessionEventKind {
         error: String,
     },
     SessionResumed,
+    /// Extension-authored sidecar event. The outer `SessionEvent.kind` is
+    /// the fixed sentinel `"custom"` so core readers can match on it and
+    /// skip the event without having to know every extension's
+    /// discriminator. `kind` carries the extension's own free-form
+    /// discriminator (e.g. `"telemetry"`, `"my_org.audit_log"`) and
+    /// `payload` is the opaque JSON the extension wants to round-trip
+    /// through `events.jsonl`. Renamed wire-side to avoid colliding
+    /// with the enum's `tag = "kind"` discriminator.
+    Custom {
+        #[serde(rename = "custom_kind")]
+        kind: String,
+        #[serde(default, rename = "custom_payload")]
+        payload: Value,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -1513,6 +2348,7 @@ impl SessionEventKind {
             Self::Cancelled => "cancelled",
             Self::Failed { .. } => "failed",
             Self::SessionResumed => "session_resumed",
+            Self::Custom { .. } => "custom",
             Self::Unknown => "unknown",
         }
     }
@@ -1578,6 +2414,14 @@ pub enum ResumeItem {
     },
     Reasoning {
         payload: squeezy_core::ReasoningPayload,
+    },
+    /// Inline image attachment captured from a `read_file` returning
+    /// PNG/JPEG/GIF/WEBP bytes. Stored as base64 so the JSON checkpoint
+    /// stays compact and human-debuggable; rehydrates into
+    /// `LlmInputItem::Image` on resume.
+    Image {
+        media_type: String,
+        data_base64: String,
     },
 }
 
@@ -1672,6 +2516,58 @@ pub struct CleanupReport {
     pub removed: Vec<String>,
 }
 
+/// Errors produced by [`SessionStore::resolve_session_id_prefix`].
+///
+/// The CLI / TUI surface bubbles these up directly so the user can see
+/// whether the typed prefix matched nothing, matched several sessions
+/// (with the conflicting ids listed for follow-up), or hit a filesystem
+/// failure while enumerating session ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// No session id starts with the supplied prefix. Also returned for
+    /// an empty prefix so accidental `--session ""` invocations fail
+    /// loudly instead of silently picking an arbitrary session.
+    NotFound { prefix: String },
+    /// More than one session id starts with the supplied prefix. The
+    /// `matches` vector carries every candidate, sorted ascending so
+    /// the disambiguation hint the CLI renders is stable across runs.
+    AmbiguousPrefix {
+        prefix: String,
+        matches: Vec<String>,
+    },
+    /// Underlying filesystem failure while enumerating session ids
+    /// (e.g. unreadable directory). Stored as a string so the error
+    /// type stays `Clone + Eq`, which makes it cheap to use in
+    /// pattern-matched tests.
+    Io(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { prefix } => {
+                write!(f, "no session matches the id prefix {prefix:?}")
+            }
+            Self::AmbiguousPrefix { prefix, matches } => {
+                write!(
+                    f,
+                    "session id prefix {prefix:?} is ambiguous; candidates: {}",
+                    matches.join(", ")
+                )
+            }
+            Self::Io(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl From<std::io::Error> for ResolveError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
 /// Soft-archive vs hard-delete policy for [`SessionStore::cleanup_with`].
 /// The CLI/TUI surfaces this as `/session-cleanup --archive` (default)
 /// vs `--purge`.
@@ -1731,9 +2627,133 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Heuristic guard for [`SessionStore::record_global_index`].
+///
+/// Returns `true` only when the workspace_root resolves under the system
+/// temp directory AND `HOME` does not. That combination is overwhelmingly
+/// a `cargo test` setup that created its session store via
+/// `temp_root(..)` but never redirected `HOME` to a test sandbox — i.e.
+/// the test is not exercising the global index and a write would pollute
+/// the developer's real `~/.squeezy/sessions/index.jsonl`.
+///
+/// Production binaries run from a real workspace (not under `temp_dir`)
+/// so the guard does not fire. Tests that *do* want to exercise the
+/// global index redirect `HOME` to a temp sandbox (see `with_home` in
+/// `sessions_tests.rs`); the bypass keeps those tests working without
+/// needing a config knob.
+fn skip_global_index_for_test_workspace(workspace_root: &str) -> bool {
+    let Ok(temp_dir) = std::env::temp_dir().canonicalize() else {
+        return false;
+    };
+    let workspace_under_temp = Path::new(workspace_root)
+        .canonicalize()
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    if !workspace_under_temp {
+        return false;
+    }
+    let home_under_temp = env::var_os("HOME")
+        .and_then(|home| Path::new(&home).canonicalize().ok())
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    !home_under_temp
+}
+
+/// Replace the global session index file with the supplied entries via a
+/// tmp + rename so concurrent readers never see a half-written file. The
+/// caller chooses the iteration order; readers re-sort by
+/// `started_at_ms`.
+fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        for entry in entries {
+            let mut payload = match serde_json::to_vec(entry) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            payload.push(b'\n');
+            file.write_all(&payload)?;
+        }
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(json_error)
+}
+
+/// Serde default for [`SessionMetadata::schema_version`]. Returns 0 — the
+/// pre-versioning ("v0") sentinel — so files written before the field
+/// existed land in [`apply_session_metadata_migrations`] at the bottom of
+/// the migration chain rather than being misread as the current version.
+fn legacy_session_metadata_schema_version() -> u32 {
+    0
+}
+
+/// Reader-side migrations applied in order. `MIGRATIONS[i]` upgrades a
+/// session metadata payload from schema version `i` to `i + 1`.
+/// [`apply_session_metadata_migrations`] reads the incoming
+/// `schema_version` (treating a missing field as 0) and runs every
+/// migration in `[from .. SESSION_METADATA_SCHEMA_VERSION)` before the
+/// final deserialization step.
+///
+/// The v0 → v1 entry is a no-op because v1 is byte-for-byte compatible
+/// with the pre-versioning shape; only the new `schema_version` field
+/// itself is added, and the reader stamps that onto the payload after
+/// the chain runs. The slot still exists so future migrations have a
+/// clear chain to extend and so the "treat missing field as v0" rule
+/// has a concrete code path.
+const SESSION_METADATA_MIGRATIONS: &[fn(&mut Value)] = &[migrate_session_metadata_v0_to_v1];
+
+fn migrate_session_metadata_v0_to_v1(_value: &mut Value) {}
+
+/// Migrate `value` in place from whatever `schema_version` it carries on
+/// disk up to [`SESSION_METADATA_SCHEMA_VERSION`], then stamp the
+/// post-migration version onto the payload so the deserialized struct
+/// reflects the upgraded shape. Forward-compatible: a payload that
+/// already declares the current (or a future) version is left alone so
+/// an older binary does not corrupt a newer file.
+fn apply_session_metadata_migrations(value: &mut Value) {
+    let from = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .map(|version| version as u32)
+        .unwrap_or(0);
+    if from >= SESSION_METADATA_SCHEMA_VERSION {
+        return;
+    }
+    let start = from as usize;
+    let end = SESSION_METADATA_SCHEMA_VERSION as usize;
+    for migration in &SESSION_METADATA_MIGRATIONS[start..end] {
+        migration(value);
+    }
+    if let Value::Object(map) = value {
+        map.insert(
+            "schema_version".to_string(),
+            Value::from(SESSION_METADATA_SCHEMA_VERSION),
+        );
+    }
+}
+
+fn deserialize_session_metadata(text: &str) -> Result<SessionMetadata> {
+    let mut value: Value = serde_json::from_str(text).map_err(json_error)?;
+    apply_session_metadata_migrations(&mut value);
+    serde_json::from_value(value).map_err(json_error)
+}
+
+fn read_session_metadata(path: &Path) -> Result<SessionMetadata> {
+    let text = fs::read_to_string(path)?;
+    deserialize_session_metadata(&text)
 }
 
 fn read_context_attachments(dir: &Path) -> Result<Vec<ContextAttachment>> {
@@ -1831,6 +2851,9 @@ fn apply_event_to_replay(
         // than conversation items; they do not modify the resume state's
         // conversation/transcript but still need to be enumerated so the
         // match is exhaustive (catches future kinds at compile time).
+        // Custom events are extension-authored sidecar data — core
+        // replay must ignore them so an extension cannot corrupt the
+        // reconstructed conversation by writing arbitrary payloads.
         SessionEventKind::ApprovalRequested { .. }
         | SessionEventKind::ApprovalDecided { .. }
         | SessionEventKind::SessionStarted
@@ -1838,6 +2861,7 @@ fn apply_event_to_replay(
         | SessionEventKind::Cancelled
         | SessionEventKind::Failed { .. }
         | SessionEventKind::SessionResumed
+        | SessionEventKind::Custom { .. }
         | SessionEventKind::Unknown => {}
     }
 }
@@ -1943,6 +2967,31 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
 
 fn to_json_vec(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(json_error)
+}
+
+/// Serialise a `SessionEvent` to its newline-terminated events.jsonl
+/// payload, applying the per-event truncation policy that `append_event`
+/// uses inline. Extracted so the lazy materialisation path can flush
+/// buffered lifecycle events through the writer without duplicating the
+/// truncation logic.
+fn serialize_event_payload(event: &SessionEvent, max_event_bytes: usize) -> Result<Vec<u8>> {
+    let mut payload = to_json_vec(event)?;
+    if payload.len() > max_event_bytes {
+        payload = to_json_vec(&SessionEvent {
+            ts_unix_ms: event.ts_unix_ms,
+            kind: event.kind.clone(),
+            turn_id: event.turn_id.clone(),
+            summary: event.summary.clone(),
+            payload: json!({
+                "truncated": true,
+                "reason": "event exceeded max_event_bytes",
+                "original_bytes": payload.len(),
+            }),
+            parent_event_sequence: event.parent_event_sequence,
+        })?;
+    }
+    payload.push(b'\n');
+    Ok(payload)
 }
 
 fn json_error(error: serde_json::Error) -> SqueezyError {

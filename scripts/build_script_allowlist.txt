@@ -1,0 +1,130 @@
+# Build-script allowlist (F15-pi)
+#
+# Every transitive Cargo dependency that ships a `build.rs` (and therefore
+# runs arbitrary code on every `cargo build`) must be listed here before
+# `scripts/check_build_scripts.py` will accept the workspace. This mirrors
+# pnpm's `allowedInstallScriptPackages` guardrail: a fresh transitive that
+# silently picks up a build script in a new release is treated as a CI
+# failure until a human audits the script.
+#
+# Workspace-local crates (members of this Cargo workspace) are not gated by
+# this file — `cargo` already surfaces those build scripts during regular
+# code review.
+#
+# Format:
+#   - One package name per line.
+#   - Optional `name@version` to pin to an exact version. Bare `name`
+#     accepts every version that resolves into the lockfile.
+#   - `#` starts a line comment. Blank lines are ignored.
+#
+# When a new entry is needed:
+#   1. Read the build.rs of the crate (and any helper modules it `include!`s).
+#   2. Confirm the script only does benign work — emitting `cargo:` directives,
+#      generating Rust sources from local templates, linking known system
+#      libraries, etc. Reject anything that downloads, executes arbitrary
+#      binaries from the network, writes outside `OUT_DIR`, or shells out to
+#      install global state.
+#   3. Add the bare crate name here (keep the file alphabetised within each
+#      section) and reference the audit reason in the PR description.
+
+# ----- Core proc-macro / type-level plumbing ---------------------------------
+proc-macro2
+quote
+rustversion
+serde
+serde_core
+serde_json
+thiserror
+zerocopy
+
+# ----- Standard-library / platform shims -------------------------------------
+crossbeam-utils
+generic-array
+getrandom
+libc
+nix
+num-traits
+parking_lot_core
+portable-atomic
+rustix
+signal-hook
+valuable
+
+# ----- HTTP / TLS / networking -----------------------------------------------
+aws-lc-rs
+aws-lc-sys
+aws-types
+httparse
+quinn
+quinn-udp
+ring
+rustls
+
+# ----- MCP / RPC -------------------------------------------------------------
+rmcp
+
+# ----- Compression / storage -------------------------------------------------
+crc32fast
+redb
+
+# ----- Markdown / Unicode data tables ---------------------------------------
+icu_normalizer_data
+icu_properties_data
+pulldown-cmark
+
+# ----- TUI / instability annotations ----------------------------------------
+instability
+
+# ----- tree-sitter parser bindings ------------------------------------------
+# Each `tree-sitter-<lang>` build.rs compiles the upstream C grammar shipped
+# inside the crate. They do not download anything; the grammar source is
+# bundled in the crate tarball.
+tree-sitter
+tree-sitter-bash
+tree-sitter-c
+tree-sitter-c-sharp
+tree-sitter-cpp
+tree-sitter-css
+tree-sitter-go
+tree-sitter-html
+tree-sitter-java
+tree-sitter-javascript
+tree-sitter-json
+tree-sitter-language
+tree-sitter-lua
+tree-sitter-php
+tree-sitter-python
+tree-sitter-ruby
+tree-sitter-rust
+tree-sitter-sequel
+tree-sitter-toml-updated
+tree-sitter-typescript
+tree-sitter-yaml
+
+# ----- JNI / wasm-bindgen / wit-bindgen scaffolding -------------------------
+# Pulled in transitively (e.g. by Bedrock / AWS SDK helpers). The build
+# scripts emit cargo metadata only.
+jni
+jni-macros
+wasm-bindgen
+wasm-bindgen-shared
+wit-bindgen
+zmij
+
+# ----- Haiku-only shim (pulled by iana-time-zone) ---------------------------
+iana-time-zone-haiku
+
+# ----- Windows linker / target shims ----------------------------------------
+# These crates exist solely to thread `-l<lib>` directives into rustc on
+# Windows. They have no Rust code path on non-Windows builds.
+winapi
+winapi-i686-pc-windows-gnu
+winapi-x86_64-pc-windows-gnu
+windows_aarch64_gnullvm
+windows_aarch64_msvc
+windows_i686_gnu
+windows_i686_gnullvm
+windows_i686_msvc
+windows_x86_64_gnu
+windows_x86_64_gnullvm
+windows_x86_64_msvc

@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     path::{Path, PathBuf},
+    process,
     time::Duration,
 };
 
@@ -18,6 +19,16 @@ pub use hardening::pre_main_hardening;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
+/// ChatGPT Plus/Pro Codex backend. Mirrors pi's `openai-codex-responses`
+/// route — the protocol is OpenAI's Responses API, but the requests go
+/// through the ChatGPT backend with the subscription's account id stamped
+/// in `chatgpt-account-id`.
+pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const DEFAULT_OPENAI_CODEX_MODEL: &str = DEFAULT_OPENAI_MODEL;
+/// Originator tag stamped on every Codex request so OpenAI can attribute
+/// traffic to squeezy in their dashboards. Matches the `originator`
+/// header pi uses (`"pi"`) but identifies squeezy specifically.
+pub const DEFAULT_OPENAI_CODEX_ORIGINATOR: &str = "squeezy";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -29,6 +40,10 @@ pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
+/// Synthetic model id for the in-process faux provider. The faux
+/// provider does not consult model registries during a request — this
+/// is purely a label that flows through cost/logging surfaces.
+pub const DEFAULT_FAUX_MODEL: &str = "faux-1";
 
 // Small-fast-model defaults per provider. Used for low-stakes background calls
 // (compaction summaries, classifier prompts, auto-approver) where flagship
@@ -99,10 +114,17 @@ pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 pub const DEFAULT_VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
-// Cloudflare Workers AI + AI Gateway. Both base URLs are templated on
-// `cloudflare_account_id` (and AI Gateway additionally on `cloudflare_gateway_id`),
-// so the static defaults below are empty — the caller must template them via
-// `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
+// Cloudflare Workers AI + AI Gateway. Both base URLs are per-account
+// (and the Gateway preset additionally per-gateway), so the default
+// templates carry `{account_id}` / `{gateway_id}` placeholders that get
+// substituted out of the matching `OpenAiCompatibleConfig` fields before
+// requests fire. The substitution lives in the LLM client
+// (`squeezy-llm::compatible`) so any user override of `base_url` that
+// keeps the placeholder syntax behaves the same as the bundled default.
+pub const DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL: &str =
+    "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
+pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL: &str =
+    "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -147,9 +169,12 @@ pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> 
 
 /// Cloudflare Workers AI's OpenAI-compatible chat completions endpoint is
 /// per-account. Returns the resolved base URL for an `account_id`, ready for
-/// `/chat/completions` to be appended.
+/// `/chat/completions` to be appended. Built on top of the canonical
+/// [`DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL`] template so callers that read
+/// the template directly (e.g. config inspectors) and callers that resolve
+/// it eagerly stay in sync.
 pub fn cloudflare_workers_ai_base_url(account_id: &str) -> String {
-    format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1")
+    DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.replace("{account_id}", account_id)
 }
 
 /// Cloudflare AI Gateway proxies any OpenAI-compatible upstream behind a
@@ -157,7 +182,9 @@ pub fn cloudflare_workers_ai_base_url(account_id: &str) -> String {
 /// OpenAI-format compatibility surface; underneath it can route to Workers AI,
 /// OpenAI, Anthropic, etc. depending on the gateway's configured upstream.
 pub fn cloudflare_ai_gateway_base_url(account_id: &str, gateway_id: &str) -> String {
-    format!("https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat")
+    DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL
+        .replace("{account_id}", account_id)
+        .replace("{gateway_id}", gateway_id)
 }
 
 pub const MODEL_SELECTION_VERSION: u32 = 1;
@@ -186,6 +213,23 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_PROVIDER_REQUEST_MAX_RETRIES: u8 = 4;
 pub const DEFAULT_PROVIDER_STREAM_MAX_RETRIES: u8 = 5;
 pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+/// Default idle timeout (ms) for sockets parked in the shared HTTP
+/// pool before reqwest evicts them. Matches reqwest's own default so
+/// the centralized factory preserves pre-F08 per-provider behavior
+/// when the user has not set a custom `[transport]` knob.
+pub const DEFAULT_PROVIDER_POOL_IDLE_TIMEOUT_MS: u64 = 90_000;
+/// Default cap on idle TCP connections kept per origin in the shared
+/// HTTP pool. `u32::MAX` is effectively unbounded (mirrors reqwest's
+/// `usize::MAX` default) so existing per-provider workloads keep
+/// reusing as many warmed sockets as they did before the dispatcher
+/// was centralized.
+pub const DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST: u32 = u32::MAX;
+/// Hard ceiling (ms) on any inter-retry sleep — including a
+/// server-supplied `Retry-After` / `Retry-After-Ms` hint. Sized at one
+/// minute so honest throttle hints (typically seconds) pass through
+/// untouched while a malicious or buggy upstream can't park the agent
+/// for hours by claiming a multi-day cooldown.
+pub const DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS: u64 = 60_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // Per-subagent-invocation budgets. No peer agent has any equivalent —
 // codex, CC, and opencode bound work per single tool call,
@@ -529,6 +573,10 @@ impl AppConfig {
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_version"))
                         .or_else(|| provider_setting(&providers, "azure", "api_version"))
                         .unwrap_or_else(|| DEFAULT_AZURE_OPENAI_API_VERSION.to_string()),
+                    deployment_name_map: provider_setting_deployment_name_map(
+                        &providers,
+                        &["azure_openai", "azure"],
+                    ),
                     transport: provider_transport_settings(&providers, &["azure_openai", "azure"]),
                 })
             }
@@ -540,6 +588,17 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_BEDROCK_REGION.to_string()),
                     base_url: get_var("BEDROCK_BASE_URL")
                         .or_else(|| provider_setting(&providers, "bedrock", "base_url")),
+                    // Pick up `AWS_BEARER_TOKEN_BEDROCK` exactly like
+                    // boto3 / aws-sdk-js do; an empty string is treated
+                    // as "unset" so a shell that exports the var but
+                    // leaves it blank falls through to the default
+                    // credential chain instead of failing with
+                    // "empty bearer token".
+                    bearer_token: get_var("AWS_BEARER_TOKEN_BEDROCK")
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    request_metadata: provider_setting_request_metadata(&providers, "bedrock")
+                        .unwrap_or_default(),
                     transport: provider_transport_settings(&providers, &["bedrock"]),
                 })
             }
@@ -563,6 +622,23 @@ impl AppConfig {
                     .or_else(|| provider_setting(&providers, "openai", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
                 transport: provider_transport_settings(&providers, &["openai"]),
+            }),
+            "openai-codex" | "openai_codex" | "chatgpt" => {
+                ProviderConfig::OpenAiCodex(OpenAiCodexConfig {
+                    base_url: get_var("OPENAI_CODEX_BASE_URL")
+                        .or_else(|| provider_setting(&providers, "openai_codex", "base_url"))
+                        .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_BASE_URL.to_string()),
+                    originator: get_var("OPENAI_CODEX_ORIGINATOR")
+                        .or_else(|| provider_setting(&providers, "openai_codex", "originator"))
+                        .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_ORIGINATOR.to_string()),
+                    transport: provider_transport_settings(&providers, &["openai_codex"]),
+                })
+            }
+            "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
+                script: get_var("SQUEEZY_FAUX_SCRIPT")
+                    .or_else(|| provider_setting(&providers, "faux", "script")),
+                name: None,
+                transport: provider_transport_settings(&providers, &["faux"]),
             }),
             other if OpenAiCompatiblePreset::parse(other).is_some() => {
                 let preset =
@@ -594,10 +670,16 @@ impl AppConfig {
                 .unwrap_or_else(|| DEFAULT_BEDROCK_MODEL.to_string()),
             ProviderConfig::Ollama(_) => provider_setting(&providers, "ollama", "default_model")
                 .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string()),
+            ProviderConfig::OpenAiCodex(_) => {
+                provider_setting(&providers, "openai_codex", "default_model")
+                    .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_MODEL.to_string())
+            }
             ProviderConfig::OpenAiCompatible(config) => {
                 provider_setting(&providers, config.preset.as_str(), "default_model")
                     .unwrap_or_else(|| config.preset.default_model().to_string())
             }
+            ProviderConfig::Faux(_) => provider_setting(&providers, "faux", "default_model")
+                .unwrap_or_else(|| DEFAULT_FAUX_MODEL.to_string()),
         };
         let profile = get_var("SQUEEZY_PROFILE")
             .or(model_settings.profile)
@@ -621,7 +703,9 @@ impl AppConfig {
             ProviderConfig::AzureOpenAi(_) => "azure_openai",
             ProviderConfig::Bedrock(_) => "bedrock",
             ProviderConfig::Ollama(_) => "ollama",
+            ProviderConfig::OpenAiCodex(_) => "openai_codex",
             ProviderConfig::OpenAiCompatible(_) => "",
+            ProviderConfig::Faux(_) => "faux",
         };
         let model = resolve_model_alias(provider_slug, &raw_model)
             .map(str::to_string)
@@ -773,11 +857,25 @@ impl AppConfig {
             &workspace_root,
             &mut get_var,
         )?;
-        let session_settings = settings.session.unwrap_or_default();
+        let mut session_settings = settings.session.unwrap_or_default();
         let session_mode = parse_session_mode(
             get_var("SQUEEZY_SESSION_MODE"),
             session_settings.mode.unwrap_or_default(),
         );
+        // `SQUEEZY_SESSION_DIR` overrides `[session].log_dir` so operators can
+        // redirect session traces (CI runners, ephemeral sandboxes, multi-user
+        // hosts) without rewriting settings.toml. Whitespace-only values are
+        // treated as unset so a stray `export SQUEEZY_SESSION_DIR=` cannot
+        // silently clear a configured directory. The CLI `--session-dir`
+        // overlay in `squeezy-cli` mutates `AppConfig.session_logs.log_dir`
+        // directly on top of this resolved value, giving the final order
+        // flag > env > config > default.
+        if let Some(raw) = get_var("SQUEEZY_SESSION_DIR") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                session_settings.log_dir = Some(PathBuf::from(trimmed));
+            }
+        }
         let mut skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
             &mut get_var,
@@ -1347,6 +1445,7 @@ impl AppConfig {
             "preamble_budget_chars = {}\n",
             self.skills.preamble_budget_chars
         ));
+        output.push_str(&format!("inline = {}\n", self.skills.inline));
         // The mode tables follow the same inline-table shape that
         // `from_table` accepts, so the inspect output round-trips when
         // pasted back into a settings file.
@@ -1460,12 +1559,20 @@ impl AppConfig {
             toml_string(self.tui.alternate_screen.as_str())
         ));
         output.push_str(&format!(
+            "synchronized_output = {}\n",
+            toml_string(self.tui.synchronized_output.as_str())
+        ));
+        output.push_str(&format!(
             "theme = {}\n",
             toml_string(self.tui.theme.as_str())
         ));
         output.push_str(&format!(
-            "show_reasoning_usage = {}\n\n",
+            "show_reasoning_usage = {}\n",
             self.tui.show_reasoning_usage
+        ));
+        output.push_str(&format!(
+            "persist_prompt_history = {}\n\n",
+            self.tui.persist_prompt_history
         ));
 
         for (name, server) in &self.mcp_servers {
@@ -1560,7 +1667,9 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
+        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -1653,6 +1762,19 @@ pub enum ProviderConfig {
     Bedrock(BedrockConfig),
     Ollama(OllamaConfig),
     OpenAiCompatible(OpenAiCompatibleConfig),
+    /// ChatGPT Plus/Pro subscription. The wire protocol is the OpenAI
+    /// Responses API; auth is an OAuth access token persisted under
+    /// `~/.squeezy/auth/openai-codex.json` rather than an env-var API
+    /// key. The credential is never carried inline in the TOML — the
+    /// settings only describe the endpoint and originator.
+    OpenAiCodex(OpenAiCodexConfig),
+    /// Deterministic in-process faux provider for tests and the eval
+    /// harness. The wire protocol is local: each `stream_response` call
+    /// pops the next scripted response from an internal queue and replays
+    /// it as a synthetic event stream. No outbound HTTP. See
+    /// `squeezy-llm`'s `FauxProvider` for the runtime behaviour and
+    /// script format.
+    Faux(FauxConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1667,6 +1789,18 @@ pub struct OpenAiCompatibleConfig {
     pub base_url: String,
     pub extra_headers: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
+    /// Cloudflare account id. Populated for the Workers AI / AI Gateway
+    /// presets so the LLM client can substitute the `{account_id}`
+    /// placeholder in `base_url` before requests fire. `None` for every
+    /// non-Cloudflare preset. `serde(default)` keeps older configs (and
+    /// hand-rolled provider configs that predate this field) deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Cloudflare AI Gateway id. Populated for the AI Gateway preset so
+    /// `{gateway_id}` in `base_url` resolves before requests fire. `None`
+    /// for the Workers AI preset and every non-Cloudflare preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
 }
 
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
@@ -1795,11 +1929,15 @@ impl OpenAiCompatiblePreset {
             Self::VLlm => DEFAULT_VLLM_BASE_URL,
             Self::LlamaCpp => DEFAULT_LLAMACPP_BASE_URL,
             // Cloudflare's base URLs are per-account (and per-gateway for the
-            // gateway preset). The caller must template them from
-            // `cloudflare_account_id` (and `cloudflare_gateway_id`); see
-            // `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
-            Self::CloudflareWorkersAi => "",
-            Self::CloudflareAiGateway => "",
+            // gateway preset). The default templates carry `{account_id}`
+            // and `{gateway_id}` placeholders that the LLM client substitutes
+            // out of `OpenAiCompatibleConfig.account_id` / `.gateway_id`
+            // before requests fire (see `substitute_url_placeholders` in
+            // `squeezy-llm::compatible`). Users who override `base_url`
+            // can keep the same placeholder syntax to route through a
+            // custom reverse proxy without re-implementing the substitution.
+            Self::CloudflareWorkersAi => DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL,
+            Self::CloudflareAiGateway => DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL,
             Self::Custom => "",
         }
     }
@@ -1933,6 +2071,19 @@ pub struct OpenAiConfig {
     pub transport: ProviderTransportConfig,
 }
 
+/// ChatGPT Plus/Pro subscription provider settings. The OAuth token
+/// itself lives outside the TOML (under `~/.squeezy/auth/openai-codex.json`
+/// with `chmod 600`); only the endpoint and the originator label are
+/// configurable here. `base_url` accepts user overrides for testing
+/// against a captive backend but defaults to the live ChatGPT Codex
+/// endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiCodexConfig {
+    pub base_url: String,
+    pub originator: String,
+    pub transport: ProviderTransportConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
@@ -1958,6 +2109,16 @@ pub struct AzureOpenAiConfig {
     pub api_key: Option<String>,
     pub base_url: String,
     pub api_version: String,
+    /// Maps logical model ids the caller uses in `[model]` (e.g. `gpt-4o`)
+    /// to the Azure-deployment name the resource actually exposes
+    /// (e.g. `my-deployment-gpt-4o`). When the body's `model` field is
+    /// built, the provider substitutes the mapped value so users can
+    /// keep stable model ids in config even when the Azure deployment
+    /// is renamed or differs between environments. An entry missing from
+    /// the map is sent through verbatim, preserving the historical
+    /// "deployment id is the model id" behavior.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deployment_name_map: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -1965,6 +2126,22 @@ pub struct AzureOpenAiConfig {
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
+    /// Optional short-lived bearer token sourced from
+    /// `AWS_BEARER_TOKEN_BEDROCK`. When present the provider routes
+    /// requests through the Bedrock HTTP bearer-auth scheme instead of
+    /// the standard AWS SigV4 credential chain — matching the
+    /// long-term "Amazon Bedrock API keys" feature that AWS's other
+    /// SDKs (boto3, JS, Java) auto-detect from the same env var. Kept
+    /// out of serialized config dumps via `redact_secret_opt` so it
+    /// never lands in TOML logs alongside the rest of `[providers.bedrock]`.
+    #[serde(default, serialize_with = "redact_secret_opt")]
+    pub bearer_token: Option<String>,
+    /// Operator-defined cost-allocation tags forwarded on every
+    /// `ConverseStream` invocation so AWS can group invocations by
+    /// team/env/project in CloudWatch + Cost Explorer.
+    /// (F16pi-bedrock-request-metadata-tags.)
+    #[serde(default)]
+    pub request_metadata: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -1977,6 +2154,47 @@ pub struct OllamaConfig {
     /// so users with portable tooling can pin Ollama to a uniform contract.
     #[serde(default)]
     pub route_style: OllamaRoute,
+    pub transport: ProviderTransportConfig,
+}
+
+/// Configuration for the in-process faux provider used by tests and the
+/// eval harness. The provider is wired through [`ProviderConfig::Faux`]
+/// so eval / integration tests can target it with a `[providers.faux]`
+/// TOML section instead of plumbing a bespoke mock through every entry
+/// point.
+///
+/// Example settings:
+///
+/// ```toml
+/// [model]
+/// provider = "faux"
+///
+/// [providers.faux]
+/// # Optional path to a TOML script file. When omitted the provider
+/// # starts empty and callers must push responses programmatically.
+/// script = "tests/fixtures/faux-script.toml"
+/// # Optional override for the provider name reported by
+/// # `LlmProvider::name` (defaults to "faux").
+/// default_model = "faux-1"
+/// ```
+///
+/// `script` is read by `squeezy-llm`'s `FauxProvider::from_config`; see
+/// that crate for the script schema (a list of `[[turn]]` entries with
+/// `text` / `thinking` / `tool_calls` / `error` / token-usage fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FauxConfig {
+    /// Path to a TOML file describing the scripted responses. Resolved
+    /// relative to the process working directory when the provider is
+    /// constructed.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Optional override for the provider name returned by
+    /// `LlmProvider::name`. Falls back to `"faux"` when unset.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Retry / timeout knobs are accepted for surface symmetry with the
+    /// real providers but ignored by the in-process faux implementation.
+    #[serde(default)]
     pub transport: ProviderTransportConfig,
 }
 
@@ -2003,11 +2221,27 @@ impl OllamaRoute {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderTransportConfig {
     pub request_max_retries: u8,
     pub stream_max_retries: u8,
     pub stream_idle_timeout_ms: u64,
+    /// Idle timeout (ms) for TCP connections sitting in the shared
+    /// HTTP pool. `0` disables eviction entirely (connections live
+    /// until the remote closes them). Mirrors pi's
+    /// `HTTP_IDLE_TIMEOUT_MS` knob — but note this controls pool
+    /// eviction; per-event SSE idle gating stays governed by
+    /// [`Self::stream_idle_timeout_ms`].
+    pub pool_idle_timeout_ms: u64,
+    /// Maximum idle TCP connections kept per origin in the shared
+    /// HTTP pool. `u32::MAX` is effectively unbounded.
+    pub pool_max_idle_per_host: u32,
+    /// Upper bound (ms) on any inter-retry sleep. The retry path
+    /// honors `Retry-After` / `Retry-After-Ms` hints from the
+    /// upstream, but clamps the resulting delay to this value so a
+    /// malicious or buggy header (e.g. `Retry-After: 999999`) can't
+    /// hang the agent indefinitely.
+    pub max_retry_delay_ms: u64,
 }
 
 impl Default for ProviderTransportConfig {
@@ -2016,6 +2250,9 @@ impl Default for ProviderTransportConfig {
             request_max_retries: DEFAULT_PROVIDER_REQUEST_MAX_RETRIES,
             stream_max_retries: DEFAULT_PROVIDER_STREAM_MAX_RETRIES,
             stream_idle_timeout_ms: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
+            pool_idle_timeout_ms: DEFAULT_PROVIDER_POOL_IDLE_TIMEOUT_MS,
+            pool_max_idle_per_host: DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST,
+            max_retry_delay_ms: DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS,
         }
     }
 }
@@ -2420,9 +2657,23 @@ pub struct ProviderSettings {
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub headers: Option<BTreeMap<String, String>>,
+    /// Bedrock only: operator-defined cost-allocation tags threaded into
+    /// every ConverseStream request via `set_request_metadata` so AWS
+    /// can group invocations by team/env/project. Non-Bedrock providers
+    /// ignore this setting.
+    pub request_metadata: Option<BTreeMap<String, String>>,
+    /// Azure OpenAI only: logical model id → Azure-deployment name. Keeps
+    /// callers' `[model]` ids stable even when the deployment is renamed
+    /// or differs between environments. See
+    /// [`AzureOpenAiConfig::deployment_name_map`] for the runtime
+    /// substitution contract.
+    pub deployment_name_map: Option<BTreeMap<String, String>>,
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
+    /// Faux-only: path to a TOML script file consumed by the in-process
+    /// faux provider. Other providers ignore this field.
+    pub script: Option<String>,
 }
 
 impl ProviderSettings {
@@ -2445,7 +2696,10 @@ impl ProviderSettings {
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
                 "headers",
+                "request_metadata",
+                "deployment_name_map",
                 "route_style",
+                "script",
             ],
             source,
             path,
@@ -2455,10 +2709,33 @@ impl ProviderSettings {
             Some(toml::Value::Table(table)) => {
                 let mut map = BTreeMap::new();
                 for (key, value) in table {
+                    let header_path = field(path, &format!("headers.{key}"));
                     let toml::Value::String(value) = value else {
                         return Err(SqueezyError::Config(format!(
-                            "{source}: {} must map to string values",
-                            field(path, &format!("headers.{key}")),
+                            "{source}: {header_path} must map to string values"
+                        )));
+                    };
+                    let resolved = resolve_shell_escape(value.clone(), source, &header_path)?;
+                    map.insert(key.clone(), resolved);
+                }
+                Some(map)
+            }
+            Some(_) => {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} must be a TOML table of string values",
+                    field(path, "headers"),
+                )));
+            }
+        };
+        let deployment_name_map = match table.get("deployment_name_map") {
+            None => None,
+            Some(toml::Value::Table(table)) => {
+                let mut map = BTreeMap::new();
+                for (key, value) in table {
+                    let entry_path = field(path, &format!("deployment_name_map.{key}"));
+                    let toml::Value::String(value) = value else {
+                        return Err(SqueezyError::Config(format!(
+                            "{source}: {entry_path} must map to string deployment names"
                         )));
                     };
                     map.insert(key.clone(), value.clone());
@@ -2467,8 +2744,8 @@ impl ProviderSettings {
             }
             Some(_) => {
                 return Err(SqueezyError::Config(format!(
-                    "{source}: {} must be a TOML table of string values",
-                    field(path, "headers"),
+                    "{source}: {} must be a TOML table of string deployment names",
+                    field(path, "deployment_name_map"),
                 )));
             }
         };
@@ -2528,7 +2805,10 @@ impl ProviderSettings {
                 &field(path, "stream_idle_timeout_ms"),
             )?,
             headers,
+            request_metadata: None,
+            deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
+            script: string_value(table, "script", source, &field(path, "script"))?,
         })
     }
 
@@ -2551,6 +2831,8 @@ impl ProviderSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.headers, next.headers);
+        replace_if_some(&mut self.route_style, next.route_style);
+        replace_if_some(&mut self.script, next.script);
     }
 }
 
@@ -5688,12 +5970,25 @@ impl WebSettings {
 pub struct SkillsSettings {
     pub user_dir: Option<PathBuf>,
     pub compat_user_dir: Option<PathBuf>,
+    /// Additional filesystem roots scanned during skill discovery. Each
+    /// entry is treated like a user-level skills directory: skills loaded
+    /// from these roots use [`SkillSource::ExtraRoot`] precedence, which
+    /// sits above the personal `user_dir` but below project-local skills
+    /// so a workspace's `.squeezy/skills/` still wins on name collisions.
+    /// Use this to point at a shared mount, network drive, or vendored
+    /// git submodule without standing up a marketplace or plugin host.
+    pub extra_roots: Vec<PathBuf>,
     pub active_budget_chars: Option<usize>,
     pub active_body_cap_chars: Option<usize>,
     pub preamble_enabled: Option<bool>,
     pub preamble_budget_chars: Option<usize>,
     pub active_budget_mode: Option<SkillsBudgetMode>,
     pub preamble_budget_mode: Option<SkillsBudgetMode>,
+    /// When `Some(true)`, restore the legacy behavior of inlining each
+    /// activated skill's full body into the system prompt. The default
+    /// (`None` / `Some(false)`) emits metadata-only blocks so the model
+    /// pays for the body only when it explicitly calls `load_skill`.
+    pub inline: Option<bool>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -5704,12 +5999,14 @@ impl SkillsSettings {
             &[
                 "user_dir",
                 "compat_user_dir",
+                "extra_roots",
                 "active_budget_chars",
                 "active_body_cap_chars",
                 "preamble_enabled",
                 "preamble_budget_chars",
                 "active_budget_mode",
                 "preamble_budget_mode",
+                "inline",
                 "config",
             ],
             source,
@@ -5722,6 +6019,12 @@ impl SkillsSettings {
                 "compat_user_dir",
                 source,
                 &field(path, "compat_user_dir"),
+            )?,
+            extra_roots: path_array_value(
+                table,
+                "extra_roots",
+                source,
+                &field(path, "extra_roots"),
             )?,
             active_budget_chars: usize_value(
                 table,
@@ -5759,6 +6062,7 @@ impl SkillsSettings {
                 source,
                 &field(path, "preamble_budget_mode"),
             )?,
+            inline: bool_value(table, "inline", source, &field(path, "inline"))?,
             config: skill_config_entries_value(table, source, &field(path, "config"))?,
         })
     }
@@ -5766,12 +6070,14 @@ impl SkillsSettings {
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.user_dir, next.user_dir);
         replace_if_some(&mut self.compat_user_dir, next.compat_user_dir);
+        self.extra_roots.extend(next.extra_roots);
         replace_if_some(&mut self.active_budget_chars, next.active_budget_chars);
         replace_if_some(&mut self.active_body_cap_chars, next.active_body_cap_chars);
         replace_if_some(&mut self.preamble_enabled, next.preamble_enabled);
         replace_if_some(&mut self.preamble_budget_chars, next.preamble_budget_chars);
         replace_if_some(&mut self.active_budget_mode, next.active_budget_mode);
         replace_if_some(&mut self.preamble_budget_mode, next.preamble_budget_mode);
+        replace_if_some(&mut self.inline, next.inline);
         self.config.extend(next.config);
     }
 }
@@ -5780,6 +6086,10 @@ pub const DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS: usize = 4_000;
 pub const DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS: usize = 16_000;
 pub const DEFAULT_SKILLS_PREAMBLE_ENABLED: bool = true;
 pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
+/// Default for `[skills] inline`. The metadata-only default keeps skill
+/// bodies out of the system prompt; users that want the legacy behavior
+/// of inlining each activated skill's body can set `[skills] inline = true`.
+pub const DEFAULT_SKILLS_INLINE: bool = false;
 /// Default fraction of `model_context_window` (in percent) consumed by the
 /// active and available-skills bundles when no explicit chars budget is set.
 /// Matches the codex reference (`SKILL_METADATA_CONTEXT_WINDOW_PERCENT=2`).
@@ -5852,6 +6162,14 @@ impl SkillsBudgetMode {
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
+    /// Additional filesystem roots walked during skill discovery. Their
+    /// skills live at [`SkillSource::ExtraRoot`] precedence, above the
+    /// personal `user_dir` and below project-local skills, so a workspace
+    /// can still override a shared catalog by dropping a same-name skill
+    /// in `.squeezy/skills/`. Non-existent entries are reported via
+    /// `tracing::warn!` at discovery time and otherwise skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_roots: Vec<PathBuf>,
     pub active_budget_chars: usize,
     pub active_body_cap_chars: usize,
     pub preamble_enabled: bool,
@@ -5864,6 +6182,11 @@ pub struct SkillsConfig {
     /// time. Falls back to `Chars(preamble_budget_chars)` when only the
     /// legacy field is set in user settings.
     pub preamble_budget_mode: SkillsBudgetMode,
+    /// When `true`, the active-skills bundle inlines each skill's full
+    /// body into the system prompt (the legacy behavior). The default
+    /// (`false`) emits metadata-only blocks; the model fetches a body on
+    /// demand via the `load_skill` tool.
+    pub inline: bool,
     /// Token budget for the active model, copied from
     /// `context_compaction.model_context_window`. `None` keeps
     /// `ContextPercent` modes dormant and forces a fall-back to
@@ -5919,6 +6242,11 @@ impl SkillsConfig {
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
+            extra_roots: settings
+                .extra_roots
+                .into_iter()
+                .map(expand_home_path)
+                .collect(),
             active_budget_chars,
             active_body_cap_chars: settings
                 .active_body_cap_chars
@@ -5929,6 +6257,7 @@ impl SkillsConfig {
             preamble_budget_chars,
             active_budget_mode,
             preamble_budget_mode,
+            inline: settings.inline.unwrap_or(DEFAULT_SKILLS_INLINE),
             model_context_window: None,
             config: settings
                 .config
@@ -5964,12 +6293,14 @@ impl Default for SkillsConfig {
         Self {
             user_dir: default_squeezy_skills_dir(),
             compat_user_dir: default_agent_compat_skills_dir(),
+            extra_roots: Vec::new(),
             active_budget_chars: DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS,
             active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
             preamble_enabled: DEFAULT_SKILLS_PREAMBLE_ENABLED,
             preamble_budget_chars: DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS,
             active_budget_mode: SkillsBudgetMode::default(),
             preamble_budget_mode: SkillsBudgetMode::default(),
+            inline: DEFAULT_SKILLS_INLINE,
             model_context_window: None,
             config: Vec::new(),
         }
@@ -6213,6 +6544,47 @@ impl TuiAlternateScreen {
     }
 }
 
+/// Controls whether the TUI wraps each frame draw in DEC mode 2026
+/// (Begin/End Synchronized Update). Capable terminals (kitty, WezTerm,
+/// Ghostty, iTerm2, Alacritty) flip the entire frame atomically, which
+/// eliminates the cell-by-cell tearing visible during fast streaming.
+/// The sequences are spec'd to be silently ignored by terminals that
+/// do not implement them, so emitting them is safe by default.
+///
+/// `Auto` enables wrapping when capability is signalled via environment
+/// (`KITTY_WINDOW_ID`, `WEZTERM_PANE`, `GHOSTTY_RESOURCES_DIR`,
+/// `ALACRITTY_LOG`, `TERM_PROGRAM` matching iTerm/WezTerm/Ghostty, or
+/// `TERM` containing `kitty`/`alacritty`/`wezterm`/`ghostty`). `Always`
+/// forces wrapping on regardless of detection (useful for terminals
+/// that do not advertise themselves but honour the sequence). `Never`
+/// disables wrapping entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiSynchronizedOutput {
+    Auto,
+    Always,
+    Never,
+}
+
+impl TuiSynchronizedOutput {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" | "on" | "true" => Some(Self::Always),
+            "never" | "off" | "false" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
 /// User-controlled palette for the TUI. `System` defers to terminal-tone
 /// detection (`COLORFGBG`); `Dark` and `Light` pin the tone but keep the
 /// default amber/gold accent identity; `Catppuccin` swaps to mauve accents
@@ -6295,6 +6667,10 @@ pub struct TuiConfig {
     pub tool_output_verbosity: ToolOutputVerbosity,
     pub transcript_default: TranscriptDefault,
     pub alternate_screen: TuiAlternateScreen,
+    /// DEC 2026 synchronized-output policy. `Auto` flips on for known
+    /// capable terminals; `Always` forces it on; `Never` disables it.
+    /// See [`TuiSynchronizedOutput`] for the capability heuristic.
+    pub synchronized_output: TuiSynchronizedOutput,
     pub show_reasoning_usage: bool,
     /// Render-time grouping of adjacent same-tool same-status calls into
     /// one card (e.g. three back-to-back `read_file` calls become "Read 3
@@ -6313,6 +6689,12 @@ pub struct TuiConfig {
     /// Off-screen attention surface (OSC 9 desktop notification / BEL).
     /// Fires on turn-complete and approval-pending; default `Off`.
     pub desktop_notifications: NotificationMethod,
+    /// Mirror the in-memory prompt-recall ring to a flat file on disk
+    /// (default `~/.squeezy/prompt_history`, XDG-compatible). Off by
+    /// default — history survives across sessions only when the user
+    /// opts in, matching shell-history conventions and avoiding any
+    /// surprise persisted plaintext for users who'd rather not have it.
+    pub persist_prompt_history: bool,
     /// User-supplied key rebindings for the TUI composer / chat surface.
     /// Keyed by an action slug (e.g. `transcript_overlay`, `page_up`);
     /// the value is a key spec like `"Ctrl+t"` or `"PageUp"`. Unknown
@@ -6340,6 +6722,9 @@ impl TuiConfig {
             alternate_screen: settings
                 .alternate_screen
                 .unwrap_or(TuiAlternateScreen::Auto),
+            synchronized_output: settings
+                .synchronized_output
+                .unwrap_or(TuiSynchronizedOutput::Auto),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
             coalesce_tool_runs: settings.coalesce_tool_runs.unwrap_or(true),
             status_line: settings.status_line,
@@ -6348,6 +6733,7 @@ impl TuiConfig {
             desktop_notifications: settings
                 .desktop_notifications
                 .unwrap_or(NotificationMethod::Off),
+            persist_prompt_history: settings.persist_prompt_history.unwrap_or(false),
             keymap: settings.keymap.unwrap_or_default(),
         }
     }
@@ -6367,12 +6753,14 @@ pub struct TuiSettings {
     pub tool_output_verbosity: Option<ToolOutputVerbosity>,
     pub transcript_default: Option<TranscriptDefault>,
     pub alternate_screen: Option<TuiAlternateScreen>,
+    pub synchronized_output: Option<TuiSynchronizedOutput>,
     pub show_reasoning_usage: Option<bool>,
     pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<TuiTheme>,
     pub desktop_notifications: Option<NotificationMethod>,
+    pub persist_prompt_history: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
 }
 
@@ -6387,12 +6775,14 @@ impl TuiSettings {
                 "tool_output_verbosity",
                 "transcript_default",
                 "alternate_screen",
+                "synchronized_output",
                 "show_reasoning_usage",
                 "coalesce_tool_runs",
                 "status_line",
                 "status_line_use_colors",
                 "theme",
                 "desktop_notifications",
+                "persist_prompt_history",
                 "keymap",
             ],
             source,
@@ -6430,6 +6820,12 @@ impl TuiSettings {
                 source,
                 &field(path, "alternate_screen"),
             )?,
+            synchronized_output: tui_synchronized_output_value(
+                table,
+                "synchronized_output",
+                source,
+                &field(path, "synchronized_output"),
+            )?,
             show_reasoning_usage: bool_value(
                 table,
                 "show_reasoning_usage",
@@ -6461,6 +6857,12 @@ impl TuiSettings {
                 source,
                 &field(path, "desktop_notifications"),
             )?,
+            persist_prompt_history: bool_value(
+                table,
+                "persist_prompt_history",
+                source,
+                &field(path, "persist_prompt_history"),
+            )?,
             keymap: string_map_value(table, "keymap", source, &field(path, "keymap"))?,
         })
     }
@@ -6472,6 +6874,7 @@ impl TuiSettings {
         replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
         replace_if_some(&mut self.transcript_default, next.transcript_default);
         replace_if_some(&mut self.alternate_screen, next.alternate_screen);
+        replace_if_some(&mut self.synchronized_output, next.synchronized_output);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
         replace_if_some(&mut self.status_line, next.status_line);
         replace_if_some(
@@ -6480,6 +6883,10 @@ impl TuiSettings {
         );
         replace_if_some(&mut self.theme, next.theme);
         replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
+        replace_if_some(
+            &mut self.persist_prompt_history,
+            next.persist_prompt_history,
+        );
         replace_if_some(&mut self.keymap, next.keymap);
     }
 }
@@ -6495,6 +6902,27 @@ pub fn default_settings_path() -> PathBuf {
         return config.join("squeezy").join("settings.toml");
     }
     PathBuf::from(".squeezy/settings.toml")
+}
+
+/// Path of the on-disk prompt-recall ring backing `[tui]
+/// .persist_prompt_history`. Prefers `$HOME/.squeezy/prompt_history`
+/// for parity with `default_settings_path`; falls back to
+/// `dirs::data_dir()/squeezy/prompt_history` (XDG-compatible:
+/// `$XDG_DATA_HOME/squeezy/prompt_history` on Linux,
+/// `%APPDATA%\squeezy\prompt_history` on Windows). Overridable with
+/// `SQUEEZY_PROMPT_HISTORY_PATH` for tests and power users who keep
+/// their dotfiles elsewhere.
+pub fn default_prompt_history_path() -> PathBuf {
+    if let Some(custom) = env::var_os("SQUEEZY_PROMPT_HISTORY_PATH") {
+        return PathBuf::from(custom);
+    }
+    if let Some(home) = home_squeezy_subpath("prompt_history") {
+        return home;
+    }
+    if let Some(data) = dirs::data_dir() {
+        return data.join("squeezy").join("prompt_history");
+    }
+    PathBuf::from(".squeezy/prompt_history")
 }
 
 pub fn default_projects_dir() -> PathBuf {
@@ -6779,6 +7207,7 @@ pub fn user_settings_template() -> &'static str {
 # preamble_budget_chars = 800         # legacy absolute cap; used only when preamble_budget_mode is unset
 # active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
 # preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
+# inline = false                      # default; emit only metadata for active skills and let the model call load_skill on demand
 #
 # [[skills.config]]
 # name = "example-skill"
@@ -6800,7 +7229,9 @@ pub fn user_settings_template() -> &'static str {
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
 # alternate_screen = "auto"     # auto | always | never
+# synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
+# persist_prompt_history = false  # mirror Up/Down prompt history to ~/.squeezy/prompt_history (XDG-compatible)
 
 # [mcp.servers.docs]
 # enabled = true
@@ -6932,6 +7363,7 @@ pub fn project_settings_template() -> &'static str {
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
 # alternate_screen = "auto"     # auto | always | never
+# synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -7145,6 +7577,7 @@ fn provider_setting(
         "route_style" => settings.route_style.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
+        "script" => settings.script.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -7157,6 +7590,33 @@ fn provider_setting_headers(
     providers.get(provider)?.headers.clone()
 }
 
+/// Resolve the Azure `deployment_name_map` from the first section in
+/// `sections` that defines it. Empty (`{}`) is treated as "not set" so a
+/// downstream config layer can still override; a missing field returns the
+/// empty map so the runtime path defaults to passthrough.
+fn provider_setting_deployment_name_map(
+    providers: &BTreeMap<String, ProviderSettings>,
+    sections: &[&str],
+) -> BTreeMap<String, String> {
+    for section in sections {
+        if let Some(map) = providers
+            .get(*section)
+            .and_then(|settings| settings.deployment_name_map.as_ref())
+            && !map.is_empty()
+        {
+            return map.clone();
+        }
+    }
+    BTreeMap::new()
+}
+
+fn provider_setting_request_metadata(
+    providers: &BTreeMap<String, ProviderSettings>,
+    provider: &str,
+) -> Option<BTreeMap<String, String>> {
+    providers.get(provider)?.request_metadata.clone()
+}
+
 fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
     match provider {
         ProviderConfig::OpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "openai"),
@@ -7164,6 +7624,7 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
         ProviderConfig::Google(cfg) => check_base_url_scheme(&cfg.base_url, "google"),
         ProviderConfig::AzureOpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "azure_openai"),
         ProviderConfig::Ollama(cfg) => check_base_url_scheme(&cfg.base_url, "ollama"),
+        ProviderConfig::OpenAiCodex(cfg) => check_base_url_scheme(&cfg.base_url, "openai_codex"),
         ProviderConfig::OpenAiCompatible(cfg) => {
             check_base_url_scheme(&cfg.base_url, cfg.preset.as_str())
         }
@@ -7171,6 +7632,9 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
             Some(url) => check_base_url_scheme(url, "bedrock"),
             None => Ok(()),
         },
+        // The faux provider runs entirely in-process; no base URL to
+        // validate.
+        ProviderConfig::Faux(_) => Ok(()),
     }
 }
 
@@ -7256,31 +7720,6 @@ fn build_openai_compatible_config(
                 .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string());
             vertex_base_url(project.trim(), location.trim())
         }
-        (OpenAiCompatiblePreset::CloudflareWorkersAi, None) => {
-            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
-                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
-                .ok_or_else(|| {
-                    SqueezyError::Config(
-                        "providers.cloudflare_workers_ai.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare Workers AI preset"
-                            .to_string(),
-                    )
-                })?;
-            cloudflare_workers_ai_base_url(account_id.trim())
-        }
-        (OpenAiCompatiblePreset::CloudflareAiGateway, None) => {
-            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
-                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
-                .ok_or_else(|| {
-                    SqueezyError::Config(
-                        "providers.cloudflare_ai_gateway.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare AI Gateway preset"
-                            .to_string(),
-                    )
-                })?;
-            let gateway_id = get_var("CLOUDFLARE_AI_GATEWAY_ID")
-                .or_else(|| provider_setting(providers, section, "cloudflare_gateway_id"))
-                .unwrap_or_else(|| DEFAULT_CLOUDFLARE_AI_GATEWAY_ID.to_string());
-            cloudflare_ai_gateway_base_url(account_id.trim(), gateway_id.trim())
-        }
         (_, None) => preset.default_base_url().to_string(),
     };
     if base_url.trim().is_empty() {
@@ -7289,6 +7728,49 @@ fn build_openai_compatible_config(
             preset.display_name()
         )));
     }
+    // Cloudflare presets carry `{account_id}` (and `{gateway_id}` for the
+    // AI Gateway preset) placeholders in their default `base_url`
+    // template; the LLM client substitutes them out of these fields
+    // right before requests fire. Required values are validated up
+    // front so misconfigurations surface at config-build time rather
+    // than producing a confusing 404 against a literal `{account_id}`
+    // URL. Aliases (`CLOUDFLARE_ACCOUNT_ID` env, `cloudflare_account_id`
+    // TOML field) match the historical settings shape so existing
+    // configs keep working.
+    let (account_id, gateway_id) = match preset {
+        OpenAiCompatiblePreset::CloudflareWorkersAi => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_workers_ai.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare Workers AI preset"
+                            .to_string(),
+                    )
+                })?;
+            (Some(account_id), None)
+        }
+        OpenAiCompatiblePreset::CloudflareAiGateway => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_ai_gateway.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare AI Gateway preset"
+                            .to_string(),
+                    )
+                })?;
+            let gateway_id = get_var("CLOUDFLARE_AI_GATEWAY_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_gateway_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_CLOUDFLARE_AI_GATEWAY_ID.to_string());
+            (Some(account_id), Some(gateway_id))
+        }
+        _ => (None, None),
+    };
     let mut extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
     // AI Gateway dual-auth: the upstream provider's API key flows in as the
     // standard `Authorization: Bearer …` (resolved by the provider), and an
@@ -7319,6 +7801,8 @@ fn build_openai_compatible_config(
         base_url,
         extra_headers,
         transport,
+        account_id,
+        gateway_id,
     }))
 }
 
@@ -7330,6 +7814,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
         ProviderConfig::AzureOpenAi(_) => &["azure_openai", "azure"],
         ProviderConfig::Bedrock(_) => &["bedrock"],
         ProviderConfig::Ollama(_) => &["ollama"],
+        ProviderConfig::OpenAiCodex(_) => &["openai_codex"],
         ProviderConfig::OpenAiCompatible(config) => match config.preset {
             OpenAiCompatiblePreset::OpenRouter => &["openrouter"],
             OpenAiCompatiblePreset::Vercel => &["vercel"],
@@ -7351,6 +7836,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::CloudflareAiGateway => &["cloudflare_ai_gateway"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
+        ProviderConfig::Faux(_) => &["faux"],
     }
 }
 
@@ -7791,6 +8277,79 @@ fn optional_table<'a>(
     }
 }
 
+// SECURITY: `resolve_shell_escape` executes arbitrary shell commands as the
+// invoking user, at config-load time. Any TOML string whose first byte is `!`
+// (after any quoting the TOML parser already stripped) is passed verbatim to
+// `/bin/sh -c` on Unix and `cmd.exe /C` on Windows. A malicious or hijacked
+// `settings.toml` therefore has the same blast radius as a malicious shell
+// rc-file: it runs before sandboxing, the agent loop, or the permission
+// engine. This is intentional so users can wire in credential helpers like
+// `!op read op://…` and `!gcloud auth …` without writing keys to disk, but it
+// means settings files must be treated as code, not data. See
+// `docs/internal/CONFIG_SHELL_ESCAPES.md` for the full guardrail note.
+fn resolve_shell_escape(value: String, source: &str, path: &str) -> Result<String> {
+    // Only the literal `!`-prefix form triggers execution; strings that merely
+    // contain `!` anywhere else are passed through unchanged, e.g.
+    // `prompt = "hello!"` or `regex = "[a-z]!\\d+"`.
+    if !value.starts_with('!') {
+        return Ok(value);
+    }
+    let command = &value[1..];
+    if command.trim().is_empty() {
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: shell escape `!` is empty; expected `!<command>`"
+        )));
+    }
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = process::Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = process::Command::new("/bin/sh");
+        c.args(["-c", command]);
+        c
+    };
+
+    let output = cmd.output().map_err(|err| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: failed to spawn shell escape `!{command}`: {err}"
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let code_part = output
+            .status
+            .code()
+            .map(|c| format!("exit code {c}"))
+            .unwrap_or_else(|| "no exit code (signal)".to_string());
+        let stderr_part = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: shell escape `!{command}` failed with {code_part}{stderr_part}"
+        )));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|err| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: shell escape `!{command}` produced non-UTF-8 stdout: {err}"
+        ))
+    })?;
+
+    // Trim a single trailing newline (the common shell-echo case) plus any
+    // additional trailing whitespace. Mirrors pi's `.trim()` behavior while
+    // staying lenient about credential helpers that emit `secret\n`.
+    Ok(stdout.trim_end().to_string())
+}
+
 fn string_value(
     table: &toml::value::Table,
     key: &str,
@@ -7799,11 +8358,13 @@ fn string_value(
 ) -> Result<Option<String>> {
     match table.get(key) {
         None => Ok(None),
-        Some(value) => value
-            .as_str()
-            .map(str::to_string)
-            .map(Some)
-            .ok_or_else(|| type_error(source, path, "string")),
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| type_error(source, path, "string"))?;
+            resolve_shell_escape(raw, source, path).map(Some)
+        }
     }
 }
 
@@ -7963,6 +8524,17 @@ fn path_value(
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
 }
 
+fn path_array_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Vec<PathBuf>> {
+    Ok(string_array_value(table, key, source, path)?
+        .map(|values| values.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default())
+}
+
 fn skills_budget_mode_value(
     table: &toml::value::Table,
     key: &str,
@@ -8057,10 +8629,12 @@ fn string_array_value(
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            value
+            let element_path = format!("{path}.{index}");
+            let raw = value
                 .as_str()
                 .map(str::to_string)
-                .ok_or_else(|| type_error(source, &format!("{path}.{index}"), "string"))
+                .ok_or_else(|| type_error(source, &element_path, "string"))?;
+            resolve_shell_escape(raw, source, &element_path)
         })
         .collect::<Result<Vec<_>>>()
         .map(Some)
@@ -8081,10 +8655,13 @@ fn string_map_value(
     values
         .iter()
         .map(|(key, value)| {
-            value
+            let entry_path = field(path, key);
+            let raw = value
                 .as_str()
-                .map(|value| (key.clone(), value.to_string()))
-                .ok_or_else(|| type_error(source, &field(path, key), "string"))
+                .map(str::to_string)
+                .ok_or_else(|| type_error(source, &entry_path, "string"))?;
+            let resolved = resolve_shell_escape(raw, source, &entry_path)?;
+            Ok((key.clone(), resolved))
         })
         .collect::<Result<BTreeMap<_, _>>>()
         .map(Some)
@@ -8403,6 +8980,22 @@ fn tui_alternate_screen_value(
             "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
         ))),
     }
+}
+
+fn tui_synchronized_output_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TuiSynchronizedOutput>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    TuiSynchronizedOutput::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI synchronized output {value:?}; expected auto, always, or never"
+        ))
+    })
 }
 
 fn tui_theme_value(
@@ -8747,7 +9340,18 @@ pub enum ContextAttachmentKind {
     Config,
     Text,
     UnsupportedBinary,
+    /// Image-shaped payload (label extension or non-canonical magic
+    /// bytes) that cannot be routed to a vision model — typically
+    /// HEIC/BMP/TIFF or a `.png` label whose body is empty/garbled.
+    /// The bytes are dropped and the attachment is marked
+    /// [`ContextAttachmentStatus::Unsupported`].
     UnsupportedImage,
+    /// Vision-routable image payload (PNG/JPEG/GIF/WEBP confirmed by
+    /// magic bytes). The raw bytes are retained on
+    /// [`ContextAttachment::image_data_base64`] so the agent can emit a
+    /// matching `LlmInputItem::Image` per turn when the active model
+    /// advertises vision capability.
+    Image,
 }
 
 impl ContextAttachmentKind {
@@ -8759,11 +9363,23 @@ impl ContextAttachmentKind {
             Self::Text => "text",
             Self::UnsupportedBinary => "unsupported_binary",
             Self::UnsupportedImage => "unsupported_image",
+            Self::Image => "image",
         }
     }
 
     pub fn is_supported_text(self) -> bool {
-        !matches!(self, Self::UnsupportedBinary | Self::UnsupportedImage)
+        !matches!(
+            self,
+            Self::UnsupportedBinary | Self::UnsupportedImage | Self::Image
+        )
+    }
+
+    /// `true` for the vision-routable [`Self::Image`] kind. Used at
+    /// request-build time to fan a single attachment out into a
+    /// `LlmInputItem::Image` so the bytes reach the provider verbatim
+    /// instead of being squashed into the user text reference block.
+    pub fn is_routable_image(self) -> bool {
+        matches!(self, Self::Image)
     }
 }
 
@@ -8801,6 +9417,19 @@ pub struct ContextAttachment {
     pub redactions: u64,
     pub preview: String,
     pub truncated: bool,
+    /// MIME type for vision-routable image attachments
+    /// (`image/{png,jpeg,gif,webp}`). `None` for text/log/binary kinds
+    /// and for label-only `UnsupportedImage` payloads whose magic
+    /// bytes did not match a canonical format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_media_type: Option<String>,
+    /// Base64-encoded original image bytes for vision-routable image
+    /// attachments. Stored alongside the JSON checkpoint so resume
+    /// rehydrates an `LlmInputItem::Image` without re-reading the
+    /// source. `None` outside the [`ContextAttachmentKind::Image`]
+    /// kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_data_base64: Option<String>,
 }
 
 impl ContextAttachment {
@@ -8818,6 +9447,15 @@ pub fn detect_context_attachment_kind(
     bytes: &[u8],
     text: Option<&str>,
 ) -> ContextAttachmentKind {
+    // Magic-byte-detected images route to the vision pipeline; the
+    // squeezy-llm providers re-encode the bytes inline for the
+    // provider's native wire format. Label-only "image-looking"
+    // payloads (extension matched but magic bytes didn't) stay
+    // `UnsupportedImage` so we don't ship garbled bytes to a model
+    // that can't decode them.
+    if detect_image_mime(bytes).is_some() {
+        return ContextAttachmentKind::Image;
+    }
     if looks_like_image(label, bytes) {
         return ContextAttachmentKind::UnsupportedImage;
     }
@@ -8837,6 +9475,35 @@ pub fn detect_context_attachment_kind(
         return ContextAttachmentKind::Config;
     }
     ContextAttachmentKind::Text
+}
+
+/// Detect the canonical image MIME type from a byte prefix using
+/// magic numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP
+/// (RIFF / WEBP container) — the set of formats the upstream vision
+/// providers (Anthropic / OpenAI / Google / Bedrock / Bedrock
+/// Claude) all accept for inline image content blocks. Returns
+/// `None` when the prefix does not match a known image format so the
+/// caller can fall back to label-only detection or to the
+/// `UnsupportedImage` path.
+///
+/// Mirrors [`squeezy_llm::infer_image_mime`] but lives in
+/// `squeezy-core` so the attachment detection layer (which is
+/// upstream of `squeezy-llm`) can short-circuit on magic bytes
+/// without depending on the LLM crate.
+pub fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 pub fn context_attachment_preview(text: &str, max_bytes: usize) -> (String, bool) {

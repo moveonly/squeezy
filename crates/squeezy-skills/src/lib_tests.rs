@@ -6,11 +6,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-// `json!` is only referenced by `#[cfg(unix)]` tests below; gate the
-// import the same way so Windows builds (which exclude those tests)
-// don't fail under `-D warnings`.
-#[cfg(unix)]
-use serde_json::json;
 use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
 use squeezy_hooks::{HookEvent, HookRegistry};
 use tracing_subscriber::fmt::MakeWriter;
@@ -211,6 +206,391 @@ fn native_project_overrides_compat_project() {
 }
 
 #[test]
+fn skill_in_extra_root_is_discovered_as_extra_root_source() {
+    // A skill that only exists under `SkillsConfig::extra_roots` must
+    // surface in the catalog with the `ExtraRoot` source so operators
+    // can see at-a-glance which shared root contributed which skill.
+    let root = temp_workspace("skills_extra_root_loads");
+    let extra = root.join("team-skills");
+    write_skill(
+        &extra.join("rust-nav"),
+        "rust-nav",
+        "Team Rust nav",
+        &["rust symbol"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        extra_roots: vec![extra],
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "rust-nav")
+        .expect("extra-root skill must surface in the catalog");
+    assert_eq!(summary.source, SkillSource::ExtraRoot);
+    assert_eq!(summary.description, "Team Rust nav");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_root_overrides_extra_root_on_same_name_collision() {
+    // The whole point of project-local skills is they win over shared
+    // catalogs. When the team-shared `extra_roots` ships a skill that
+    // collides with a workspace's `.squeezy/skills/` entry, the project
+    // copy must take precedence and the shared copy must be shadowed.
+    let root = temp_workspace("skills_extra_root_project_override");
+    let extra = root.join("team-skills");
+    write_skill(
+        &extra.join("rust-nav"),
+        "rust-nav",
+        "Team Rust nav",
+        &["team trigger"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Project Rust nav",
+        &["project trigger"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        extra_roots: vec![extra],
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "rust-nav")
+        .expect("collision must still surface a single rust-nav entry");
+    assert_eq!(summary.source, SkillSource::Project);
+    assert_eq!(summary.description, "Project Rust nav");
+    assert!(
+        logs.contains("skill name reused at higher precedence"),
+        "expected shadow warning for the extra-root copy: {logs}"
+    );
+    assert!(
+        logs.contains("overriding_source=\"project\"")
+            || logs.contains("overriding_source=project"),
+        "expected project as overriding source: {logs}"
+    );
+    assert!(
+        logs.contains("overridden_source=\"extra_root\"")
+            || logs.contains("overridden_source=extra_root"),
+        "expected extra_root as overridden source: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn missing_extra_root_warns_without_failing_discovery() {
+    // Operators commonly point `extra_roots` at a network mount or a
+    // git submodule that may not be present in every checkout. A
+    // missing entry must surface a load-time warning (so the mistake is
+    // visible) but must not prevent the remaining roots from loading.
+    let root = temp_workspace("skills_extra_root_missing_warns");
+    let present = root.join("present-team-skills");
+    write_skill(&present.join("good"), "good", "Loadable skill", &[]);
+    let missing = root.join("absent-team-skills");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        extra_roots: vec![missing.clone(), present],
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    let names: Vec<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["good"],
+        "the present extra root must still load alongside a missing one"
+    );
+    assert!(
+        logs.contains("skills.extra_roots") && logs.contains("does not exist"),
+        "expected a not-found warning for {}: {logs}",
+        missing.display()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn monorepo_root_and_package_skills_both_load_from_subdir_cwd() {
+    // Monorepo layout: skills live at the repo root *and* inside an
+    // individual package. When the agent is launched from the package
+    // (cwd = packages/foo), the catalog should surface both the
+    // package-local skill and the root-level sibling so the package can
+    // rely on shared monorepo-wide skills without copying them.
+    let monorepo = temp_workspace("skills_monorepo_root_and_package");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".squeezy/skills/root-skill"),
+        "root-skill",
+        "Shared monorepo skill",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    write_skill(
+        &package_root.join(".squeezy/skills/package-skill"),
+        "package-skill",
+        "Package-local skill",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let names: BTreeSet<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert!(
+        names.contains("root-skill"),
+        "ancestor walk must surface the monorepo-root skill from cwd={}, got {names:?}",
+        package_root.display()
+    );
+    assert!(
+        names.contains("package-skill"),
+        "cwd-local skill must still load alongside ancestor skills, got {names:?}"
+    );
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn cwd_local_skill_wins_over_same_name_skill_in_monorepo_root() {
+    // When the same skill name exists at both the package cwd and the
+    // monorepo root, the cwd-local copy must win. This is the rule that
+    // lets a package override a shared monorepo skill without renaming
+    // it: drop a same-name skill in the package's `.squeezy/skills/`
+    // and it shadows the root version for that package's cwd.
+    let monorepo = temp_workspace("skills_monorepo_cwd_wins");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".squeezy/skills/shared"),
+        "shared",
+        "Monorepo-root version",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    write_skill(
+        &package_root.join(".squeezy/skills/shared"),
+        "shared",
+        "Package-local version",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let summaries: Vec<SkillSummary> = catalog
+        .summaries()
+        .into_iter()
+        .filter(|summary| summary.name == "shared")
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "same-name skill must collapse to a single entry, got {summaries:?}"
+    );
+    let summary = &summaries[0];
+    assert_eq!(summary.description, "Package-local version");
+    assert!(
+        summary
+            .location
+            .starts_with(package_root.join(".squeezy/skills/shared")),
+        "package-local skill location should win, got {}",
+        summary.location.display()
+    );
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn ancestor_walk_picks_up_compat_agents_skills_dir() {
+    // The compat `.agents/skills/` form must also be discovered along
+    // the ancestor walk so monorepos that haven't migrated off the
+    // legacy directory still get sibling skill visibility from a
+    // package cwd.
+    let monorepo = temp_workspace("skills_monorepo_compat_ancestor");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".agents/skills/legacy"),
+        "legacy",
+        "Legacy compat ancestor skill",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    fs::create_dir_all(&package_root).expect("mkdir package");
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "legacy")
+        .expect("legacy ancestor skill must surface");
+    assert_eq!(summary.source, SkillSource::CompatProject);
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn ancestor_walk_stops_at_first_git_root() {
+    // A nested git repository (e.g. a submodule) must terminate the
+    // ancestor walk so a package never reaches into a parent
+    // repository's skill set. The closer `.git` marker is the
+    // authoritative boundary even when an outer ancestor would also
+    // qualify as a repository root.
+    let outer = temp_workspace("skills_monorepo_nested_git");
+    fs::create_dir_all(outer.join(".git")).expect("mkdir outer .git");
+    write_skill(
+        &outer.join(".squeezy/skills/outer-skill"),
+        "outer-skill",
+        "Outer repo skill that must be invisible",
+        &[],
+    );
+    let inner = outer.join("inner-repo");
+    fs::create_dir_all(inner.join(".git")).expect("mkdir inner .git");
+    write_skill(
+        &inner.join(".squeezy/skills/inner-skill"),
+        "inner-skill",
+        "Inner repo skill",
+        &[],
+    );
+    let package_root = inner.join("packages/foo");
+    fs::create_dir_all(&package_root).expect("mkdir package");
+    let config = SkillsConfig {
+        user_dir: outer.join("user-noop"),
+        compat_user_dir: outer.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let names: BTreeSet<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert!(
+        names.contains("inner-skill"),
+        "inner repo skill should still load from its own root, got {names:?}"
+    );
+    assert!(
+        !names.contains("outer-skill"),
+        "ancestor walk must stop at the inner repo's .git boundary, got {names:?}"
+    );
+
+    let _ = fs::remove_dir_all(outer);
+}
+
+#[test]
+fn ancestor_walk_respects_native_over_compat_inside_same_ancestor() {
+    // Inside a single ancestor, `.squeezy/skills/` must still win over
+    // `.agents/skills/` on same-name collision, mirroring the cwd-level
+    // precedence rule. The ancestor walk's "inner shadows outer" policy
+    // applies across ancestors only — within one ancestor the existing
+    // source precedence stays authoritative.
+    let monorepo = temp_workspace("skills_monorepo_native_over_compat");
+    fs::create_dir_all(monorepo.join(".git")).expect("mkdir .git");
+    write_skill(
+        &monorepo.join(".agents/skills/dual"),
+        "dual",
+        "Compat version",
+        &[],
+    );
+    write_skill(
+        &monorepo.join(".squeezy/skills/dual"),
+        "dual",
+        "Native version",
+        &[],
+    );
+    let package_root = monorepo.join("packages/foo");
+    fs::create_dir_all(&package_root).expect("mkdir package");
+    let config = SkillsConfig {
+        user_dir: monorepo.join("user-noop"),
+        compat_user_dir: monorepo.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&package_root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "dual")
+        .expect("ancestor skill must surface");
+    assert_eq!(summary.source, SkillSource::Project);
+    assert_eq!(summary.description, "Native version");
+
+    let _ = fs::remove_dir_all(monorepo);
+}
+
+#[test]
+fn ancestor_walk_stops_at_workspace_root_when_it_is_itself_git_root() {
+    // When the cwd is already a git root, the strict-ancestor walk
+    // must be a no-op — a checkout at `~/code/myrepo` should never
+    // reach into `~` or `/` looking for unrelated skill caches. The
+    // `ancestor_project_roots` helper enforces this by short-circuiting
+    // on `is_git_root(workspace_root)`.
+    let root = temp_workspace("skills_monorepo_no_parent_walk");
+    fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+    write_skill(
+        &root.join(".squeezy/skills/local"),
+        "local",
+        "Local skill",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let names: Vec<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["local"],
+        "no ancestor walk should run when cwd is itself a git root, got {names:?}"
+    );
+    assert!(
+        ancestor_project_roots(&root).is_empty(),
+        "ancestor list must be empty when cwd is a git root"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn explicit_and_trigger_activation_loads_lazily() {
     let root = temp_workspace("skills_activation");
     let config = SkillsConfig {
@@ -399,11 +779,15 @@ fn active_skill_render_respects_budget_and_uses_stub() {
         &[],
         &"Use the graph carefully. ".repeat(200),
     );
+    // Inline mode is the only render path that can produce a budget
+    // stub; the metadata-only default never emits the skill body so
+    // there's nothing to truncate.
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
         active_budget_chars: 700,
         active_body_cap_chars: 100,
+        inline: true,
         ..Default::default()
     };
 
@@ -418,6 +802,134 @@ fn active_skill_render_respects_budget_and_uses_stub() {
     assert!(rendered.chars().count() <= config.active_budget_chars);
     assert!(rendered.contains("truncated=\"true\""));
     assert!(rendered.contains("load_skill"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn active_skills_default_to_metadata_only_render() {
+    // Snapshot the active-skills block in the default (metadata-only)
+    // render mode and assert: (a) every skill appears as a metadata
+    // block, (b) no skill body leaks into the system prompt, (c) the
+    // model is pointed at `load_skill` for each name. This is the
+    // F03-skill-metadata-only-default contract: bodies are paid for
+    // only when the model explicitly fetches them.
+    let root = temp_workspace("skills_metadata_only_render");
+    let skills = [
+        (
+            "alpha-nav",
+            "Alpha skill description",
+            "ALPHA_BODY_MARKER must never appear in the system prompt by default.",
+        ),
+        (
+            "beta-nav",
+            "Beta skill description",
+            "BETA_BODY_MARKER must never appear in the system prompt by default.",
+        ),
+        (
+            "gamma-nav",
+            "Gamma skill description",
+            "GAMMA_BODY_MARKER must never appear in the system prompt by default.",
+        ),
+    ];
+    for (name, description, body) in &skills {
+        write_skill_with_body(
+            &root.join(".squeezy/skills").join(name),
+            name,
+            description,
+            &[],
+            body,
+        );
+    }
+
+    // Default mode: `inline` is not set, so the catalog must emit
+    // metadata-only blocks.
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_budget_chars: 16_000,
+        active_body_cap_chars: 16_000,
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    let loaded = skills
+        .iter()
+        .map(|(name, _, _)| catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let rendered = catalog
+        .render_active_skills(&loaded)
+        .expect("metadata-only render");
+
+    // Outer wrapper and per-skill name attributes are present.
+    assert!(
+        rendered.starts_with("<active_skills>"),
+        "missing <active_skills> wrapper: {rendered}"
+    );
+    assert!(
+        rendered.ends_with("</active_skills>"),
+        "missing </active_skills> wrapper: {rendered}"
+    );
+    for (name, description, body) in &skills {
+        assert!(
+            rendered.contains(&format!("name=\"{name}\"")),
+            "missing skill metadata for {name}: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("<description>{description}</description>")),
+            "missing description for {name}: {rendered}"
+        );
+        // The body must NOT appear; the model is expected to fetch it
+        // via the `load_skill` tool when needed.
+        assert!(
+            !rendered.contains(body),
+            "body marker for {name} leaked into metadata-only render: {rendered}"
+        );
+        // Instruction text references the same skill name (escaped by
+        // `xml_escape`, so quotes become `&quot;`).
+        assert!(
+            rendered.contains(&format!("name &quot;{name}&quot;")),
+            "missing load_skill instruction for {name}: {rendered}"
+        );
+    }
+    // The metadata mode marker keeps the body explicitly absent rather
+    // than relying on a truncation reason borrowed from the inline path.
+    assert!(
+        rendered.contains("body=\"omitted\""),
+        "metadata-only mode must flag bodies as omitted: {rendered}"
+    );
+    assert!(
+        !rendered.contains("<content>"),
+        "metadata-only mode must not emit any <content> body slot: {rendered}"
+    );
+    assert!(
+        rendered.contains("load_skill"),
+        "metadata-only mode must instruct the model to call load_skill: {rendered}"
+    );
+
+    // Flip the knob: with `[skills] inline = true` the legacy render
+    // must re-inline each body verbatim.
+    let inline_config = SkillsConfig {
+        inline: true,
+        ..config.clone()
+    };
+    let inline_catalog = SkillCatalog::discover(&root, &inline_config);
+    let inline_loaded = skills
+        .iter()
+        .map(|(name, _, _)| inline_catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let inline_rendered = inline_catalog
+        .render_active_skills(&inline_loaded)
+        .expect("inline render");
+    for (_, _, body) in &skills {
+        assert!(
+            inline_rendered.contains(body),
+            "inline mode must keep injecting bodies: {inline_rendered}"
+        );
+    }
+    assert!(
+        inline_rendered.contains("<content>"),
+        "inline mode must keep emitting <content>: {inline_rendered}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -448,7 +960,9 @@ fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
     // Compute the minimum-stub floor at runtime so the test budget is robust
     // against temp-path length variation across hosts. The full-description
     // aggregate is the floor plus the description chars themselves — sit
-    // between the two so the redistribute step is required.
+    // between the two so the redistribute step is required. The
+    // redistribute path is inline-mode only; the metadata-only default
+    // never falls back to per-skill description budgeting.
     let catalog = SkillCatalog::discover(
         &root,
         &SkillsConfig {
@@ -456,6 +970,7 @@ fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
             compat_user_dir: root.join("compat"),
             active_budget_chars: usize::MAX,
             active_body_cap_chars: 100,
+            inline: true,
             ..Default::default()
         },
     );
@@ -484,6 +999,7 @@ fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
         compat_user_dir: root.join("compat"),
         active_budget_chars,
         active_body_cap_chars: 100,
+        inline: true,
         ..Default::default()
     };
 
@@ -1141,13 +1657,16 @@ fn discover_applies_context_percent_budget_to_catalog() {
         &"x".repeat(20_000),
     );
     // 32K-token model gets a 2_560-char active budget; the 20K-char body
-    // can't fit so the catalog should emit a stub.
+    // can't fit so the catalog should emit a stub. The inline-mode opt
+    // in keeps this test exercising the legacy body+stub path; the
+    // metadata-only default never emits the body in the first place.
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
         active_body_cap_chars: 64_000,
         active_budget_mode: SkillsBudgetMode::ContextPercent { percent: 2.0 },
         model_context_window: Some(32_000),
+        inline: true,
         ..Default::default()
     };
 
@@ -1699,13 +2218,26 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
     registry.register(Box::new(handler));
 
     // Non-matching event does not run the script.
-    let _ = registry.dispatch(HookEvent::PostToolUse, json!({ "tool_name": "Bash" }));
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PostToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c1".into(),
+        status: "success".into(),
+    });
     assert!(!marker.exists());
     // Matching event with the wrong tool also skips.
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Edit" }));
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Edit".into(),
+        call_id: "c2".into(),
+    });
     assert!(!marker.exists());
     // Matching event with the matching tool fires.
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+        turn_id: "1".into(),
+        tool_name: "Bash".into(),
+        call_id: "c3".into(),
+    });
     assert!(marker.exists(), "expected hook to create marker file");
 
     let _ = fs::remove_dir_all(root);
@@ -1745,9 +2277,13 @@ fn skill_hook_once_self_removes_after_first_run() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(handler));
 
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
-    let _ = registry.dispatch(HookEvent::PreToolUse, json!({ "tool_name": "Bash" }));
+    for call_id in ["c1", "c2", "c3"] {
+        let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+            turn_id: "1".into(),
+            tool_name: "Bash".into(),
+            call_id: call_id.into(),
+        });
+    }
     let count = fs::read_to_string(&counter).expect("read counter");
     assert_eq!(count.trim(), "1", "once: true must fire exactly once");
 

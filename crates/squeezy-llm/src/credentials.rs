@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 use squeezy_core::{Result, SqueezyError};
+use tokio::sync::RwLock;
 
 /// Where a resolved API key came from. Used by doctor to surface the
 /// resolution source and by future migration code to act on legacy state.
@@ -374,6 +378,194 @@ fn warn_json_env_once(msg: String) {
     };
     if set.insert(msg.clone()) {
         tracing::warn!("{msg}");
+    }
+}
+
+/// Future returned by [`ApiKeySource`] methods. Boxed + pinned so the
+/// trait stays dyn-compatible (`Arc<dyn ApiKeySource>`); a same-shape
+/// alias to keep the trait signature compact and the call sites
+/// type-inferred.
+pub type ApiKeyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Pluggable supplier of an API key for an LLM provider client.
+///
+/// Provider clients hold an `Arc<dyn ApiKeySource>` instead of a bare
+/// `String` so a session that started with a short-lived token can
+/// continue past the original expiry: the auth-retry layer in
+/// [`crate::retry::send_with_auth_retry`] asks the source for the
+/// current key per HTTP attempt and, on a `401`/`403`, calls
+/// [`ApiKeySource::invalidate`] and retries once with a fresh value.
+///
+/// The default [`StaticApiKey`] implementation just hands out a
+/// constant string and treats `invalidate` as a no-op; this is the
+/// path every existing provider config (`api_key = "sk-…"`,
+/// `OPENAI_API_KEY`, the `credentials.json` fallback) takes today.
+/// [`RefreshableToken`] is the seam the OAuth subscription providers
+/// (Claude Pro/Max, ChatGPT Plus/Pro, GitHub Copilot) will fill in:
+/// it carries a rotating access token under an
+/// `Arc<RwLock<TokenState>>` so refresh runs without rebuilding the
+/// provider client.
+pub trait ApiKeySource: Send + Sync + std::fmt::Debug {
+    /// Resolve the API key to attach to the next HTTP request.
+    fn current_key<'a>(&'a self) -> ApiKeyFuture<'a, String>;
+
+    /// Mark the cached key as stale. Called by the auth-retry layer
+    /// after the provider reported `401`/`403`. Static sources ignore
+    /// this; OAuth sources clear their cached access token so the
+    /// next [`current_key`] re-runs the refresh flow.
+    fn invalidate<'a>(&'a self) -> ApiKeyFuture<'a, ()>;
+
+    /// Short label used in logs and `Debug` output. Mirrors the
+    /// `providers.<section>` key (e.g. `"anthropic"`, `"openai"`).
+    fn provider_label(&self) -> &str;
+}
+
+/// A fixed API key that never refreshes. The path every existing
+/// settings/env/credentials.json caller flows through — wraps the
+/// resolved string so the provider clients can store a single
+/// `Arc<dyn ApiKeySource>` shape.
+#[derive(Debug, Clone)]
+pub struct StaticApiKey {
+    value: String,
+    label: String,
+}
+
+impl StaticApiKey {
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+
+    pub fn into_source(self) -> Arc<dyn ApiKeySource> {
+        Arc::new(self)
+    }
+}
+
+impl ApiKeySource for StaticApiKey {
+    fn current_key<'a>(&'a self) -> ApiKeyFuture<'a, String> {
+        let value = self.value.clone();
+        Box::pin(async move { Ok(value) })
+    }
+
+    fn invalidate<'a>(&'a self) -> ApiKeyFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn provider_label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// Wrap a resolved key string in an [`ApiKeySource`] trait object.
+/// Used by every `from_config` constructor so the existing string-
+/// based credential resolution keeps working unchanged.
+pub fn static_api_key_source(value: String, label: impl Into<String>) -> Arc<dyn ApiKeySource> {
+    Arc::new(StaticApiKey::new(value, label))
+}
+
+impl From<String> for StaticApiKey {
+    fn from(value: String) -> Self {
+        Self {
+            value,
+            label: String::new(),
+        }
+    }
+}
+
+/// Mutable OAuth credential state: an access token used directly on
+/// the wire, an optional refresh token consumed by the provider's
+/// refresh endpoint, and an optional absolute expiry the refresh flow
+/// uses to decide whether the cached access token is still good.
+///
+/// The shape mirrors pi's `OAuthCredentials` so the upcoming
+/// Anthropic Pro/Max and ChatGPT Plus/Pro implementations have a
+/// natural place to land the device-code outputs. Additional
+/// provider-specific fields (account id, scope set, etc.) can ride
+/// on the implementing OAuth source rather than expanding this
+/// struct.
+#[derive(Debug, Clone)]
+pub struct TokenState {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<SystemTime>,
+}
+
+impl TokenState {
+    pub fn new(access_token: impl Into<String>) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: None,
+        }
+    }
+}
+
+/// Placeholder OAuth-backed [`ApiKeySource`]. Holds the rotating
+/// token state under an `Arc<RwLock<_>>` so a future OAuth refresh
+/// implementation can swap the access token in place without
+/// rebuilding the provider client. The current behavior is a no-op:
+/// `current_key` returns the cached access token and `invalidate` is
+/// a no-op so the trait stays compatible with provider client retry
+/// hooks landing in the same commit.
+///
+/// The actual refresh flow (Anthropic device-code, OpenAI Codex
+/// device-code, GitHub Copilot device-code, refresh-on-expiry) lands
+/// in the OAuth subscription findings; this type only establishes
+/// the indirection.
+pub struct RefreshableToken {
+    state: Arc<RwLock<TokenState>>,
+    label: String,
+}
+
+impl RefreshableToken {
+    pub fn new(state: TokenState, label: impl Into<String>) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(state)),
+            label: label.into(),
+        }
+    }
+
+    /// Shared handle to the underlying token state. The OAuth refresh
+    /// implementation needs this to swap the access token in place
+    /// after a successful refresh round-trip.
+    pub fn state_handle(&self) -> Arc<RwLock<TokenState>> {
+        self.state.clone()
+    }
+}
+
+impl std::fmt::Debug for RefreshableToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshableToken")
+            .field("label", &self.label)
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ApiKeySource for RefreshableToken {
+    fn current_key<'a>(&'a self) -> ApiKeyFuture<'a, String> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let guard = state.read().await;
+            Ok(guard.access_token.clone())
+        })
+    }
+
+    fn invalidate<'a>(&'a self) -> ApiKeyFuture<'a, ()> {
+        // OAuth refresh lands in F16pi-anthropic-oauth /
+        // F16pi-openai-codex / F16pi-github-copilot. Until then the
+        // upstream `401`/`403` propagates: the auth-retry layer calls
+        // `invalidate` (no-op here), re-reads the unchanged access
+        // token, retries once, and bubbles up the second `401` so
+        // the user sees the auth failure instead of a silent retry
+        // loop.
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn provider_label(&self) -> &str {
+        &self.label
     }
 }
 

@@ -44,14 +44,14 @@ pub struct ProvidersInfoArgs {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProviderEntry {
-    name: &'static str,
-    display_name: &'static str,
-    base_url: &'static str,
-    api_key_env: &'static str,
-    configured: bool,
-    full_tier: bool,
-    model_count: usize,
+pub(crate) struct ProviderEntry {
+    pub(crate) name: &'static str,
+    pub(crate) display_name: &'static str,
+    pub(crate) base_url: &'static str,
+    pub(crate) api_key_env: &'static str,
+    pub(crate) configured: bool,
+    pub(crate) full_tier: bool,
+    pub(crate) model_count: usize,
 }
 
 pub fn handle_providers_command(command: &ProvidersCommand) -> Result<()> {
@@ -195,7 +195,7 @@ fn canonicalize_provider_name(value: &str) -> Option<&'static str> {
     OpenAiCompatiblePreset::parse(trimmed).map(|preset| preset.as_str())
 }
 
-fn registry_entries(env_lookup: &dyn Fn(&str) -> Option<String>) -> Vec<ProviderEntry> {
+pub(crate) fn registry_entries(env_lookup: &dyn Fn(&str) -> Option<String>) -> Vec<ProviderEntry> {
     let mut entries: Vec<ProviderEntry> = BASE_PROVIDERS
         .iter()
         .map(|entry| ProviderEntry {

@@ -11,9 +11,9 @@ use crossterm::{
     Command,
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -34,17 +34,18 @@ use ratatui::{
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
-    Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    PendingConfigSwap, RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision,
-    ToolApprovalRequest,
+    Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
+    JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
+    RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
-    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiTheme,
+    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiSynchronizedOutput, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
+use squeezy_skills::PromptTemplateCatalog;
 use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
@@ -59,12 +60,15 @@ mod approval;
 mod commands;
 mod config_screen;
 mod events;
+mod fuzzy;
 mod history;
 mod input;
 mod keymap;
+mod keymap_config;
 mod mention;
 mod notification;
 mod overlay;
+mod prompt_history;
 mod prompt_queue;
 mod proposed_plan;
 mod render;
@@ -74,9 +78,12 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod terminal_writer;
 mod toast;
 pub use render::markdown::render_markdown;
-pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+pub use streaming_patch::{
+    JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
+};
 
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
@@ -101,6 +108,7 @@ use render::palette::{
 };
 #[cfg(test)]
 use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
+use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
@@ -136,6 +144,16 @@ const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
 // without needing a dedicated constant.
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
+/// DEC private mode 2026 — Begin Synchronized Update. Capable terminals
+/// buffer subsequent output and flip the cell grid atomically when they
+/// see the matching End Synchronized Update sequence. Terminals that do
+/// not implement the mode silently ignore both sequences, so emitting
+/// them is safe across the ecosystem.
+const BEGIN_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026h";
+/// DEC private mode 2026 — End Synchronized Update. Pairs with
+/// [`BEGIN_SYNCHRONIZED_UPDATE`]; capable terminals commit the buffered
+/// frame atomically on receipt.
+const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
@@ -172,6 +190,67 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+/// Resolve the user's synchronized-output policy into a runtime flag.
+/// `Auto` consults the environment for known capable terminals; the
+/// sequences themselves are spec'd as silent no-ops on terminals that
+/// do not understand them, so a false negative here only forfeits the
+/// optimisation — it never corrupts output.
+fn resolve_synchronized_output(policy: TuiSynchronizedOutput) -> bool {
+    match policy {
+        TuiSynchronizedOutput::Always => true,
+        TuiSynchronizedOutput::Never => false,
+        // Wrap `env::var_os` in a closure so the HRTB on the resolver
+        // (`for<'a> Fn(&'a str) -> _`) is satisfied — passing the bare
+        // monomorphised function pointer here trips lifetime inference.
+        TuiSynchronizedOutput::Auto => {
+            detect_synchronized_output_support_from_env(|key: &str| env::var_os(key))
+        }
+    }
+}
+
+/// Pure capability heuristic for DEC mode 2026 support based on
+/// environment-variable signals exposed by the host terminal.
+/// Factored out for testability — production calls thread
+/// [`std::env::var_os`] in; tests pass a closure backed by a fixture
+/// map so the resolver is exercised without mutating real process env.
+fn detect_synchronized_output_support_from_env<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if env_get("KITTY_WINDOW_ID").is_some()
+        || env_get("WEZTERM_PANE").is_some()
+        || env_get("WEZTERM_EXECUTABLE").is_some()
+        || env_get("GHOSTTY_RESOURCES_DIR").is_some()
+        || env_get("ALACRITTY_LOG").is_some()
+        || env_get("ALACRITTY_WINDOW_ID").is_some()
+        || env_get("ITERM_SESSION_ID").is_some()
+    {
+        return true;
+    }
+    if let Some(prog) = env_get("TERM_PROGRAM") {
+        let prog = prog.to_string_lossy().to_ascii_lowercase();
+        if matches!(
+            prog.as_str(),
+            "iterm.app" | "iterm2" | "wezterm" | "ghostty" | "kitty" | "vscode"
+        ) {
+            return true;
+        }
+    }
+    if let Some(term) = env_get("TERM") {
+        let term = term.to_string_lossy().to_ascii_lowercase();
+        if term.contains("kitty")
+            || term.contains("wezterm")
+            || term.contains("ghostty")
+            || term.contains("alacritty")
+            || term.contains("foot")
+            || term.contains("contour")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +440,8 @@ async fn run_inner(
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
     apply_theme_overrides(config.tui.theme);
-    let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
+    let mut terminal =
+        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
             ResumeStartup::Use(id) => Some(id),
@@ -466,7 +546,14 @@ async fn run_inner(
         }
         drain_pending_diff(&mut app);
 
-        app.animation_tick = app.animation_tick.wrapping_add(1);
+        // Skip the animation-tick driver while the host terminal is
+        // unfocused. Freezing the counter pins the spinner glyph and
+        // the title clock, which removes the per-frame draw work that
+        // would otherwise keep a background window's GPU and emulator
+        // pipeline busy.
+        if app.focused {
+            app.animation_tick = app.animation_tick.wrapping_add(1);
+        }
         if app.app_notifications.tick() {
             app.needs_redraw = true;
         }
@@ -552,7 +639,15 @@ fn maybe_pick_resume_session(
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
-        resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
+        // `branch_tip` is captured by the picker but not yet wired through
+        // the resume flow — the agent restarts at the most recent event in
+        // the session log. Branch-aware resume is a follow-up; the
+        // schema/picker landing first lets future producers populate
+        // `parent_event_sequence` without churn here.
+        resume_picker::ResumeChoice::Resume {
+            session_id,
+            branch_tip: _,
+        } => Ok(ResumeStartup::Use(session_id)),
         resume_picker::ResumeChoice::CrossProject {
             session_id,
             target_cwd,
@@ -896,7 +991,24 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
             app.pending_resize = true;
             Ok(false)
         }
-        _ => Ok(false),
+        // Crossterm only emits these after `EnableFocusChange` succeeded
+        // on a focus-aware terminal. Terminals that ignore the enable
+        // sequence (older xterm / Apple Terminal / SSH targets without
+        // focus reporting) simply never reach this arm, so `focused`
+        // stays `true` and animations run as before. We force a redraw
+        // on both transitions (via the unconditional `needs_redraw =
+        // true` above): focus-regain wants the spinner to catch up to
+        // wall-clock state, and focus-loss wants the final "paused"
+        // frame to land before the animation tick driver freezes so
+        // the spinner is not stuck mid-cycle when the user tabs back.
+        Event::FocusGained => {
+            app.focused = true;
+            Ok(false)
+        }
+        Event::FocusLost => {
+            app.focused = false;
+            Ok(false)
+        }
     }
 }
 
@@ -1878,81 +1990,120 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
 }
 
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
-    let mut parts = input.split_whitespace();
-    let Some(command) = parts.next() else {
-        return false;
+    let cmd = match DispatchCommand::parse(input) {
+        Ok(cmd) => cmd,
+        // Unknown heads fall through to the user-authored prompt
+        // template catalog. A match expands the template body and
+        // routes it through the regular user-turn machinery so the
+        // model sees the rendered prompt, not the literal slash text.
+        // No match keeps the legacy behaviour: the input is treated as
+        // a normal user prompt (echoed as a slash echo upstream by
+        // `reject_unknown_slash_command`).
+        Err(DispatchCommandParseError::Unknown { .. }) => {
+            return expand_prompt_template_or_fallthrough(app, agent, input);
+        }
+        Err(DispatchCommandParseError::NotASlashCommand)
+        | Err(DispatchCommandParseError::Empty) => return false,
+        // Required-arg failures preserve the pre-refactor `usage:`
+        // strings so the visible affordance is unchanged.
+        Err(DispatchCommandParseError::Usage { hint, .. }) => {
+            app.status = hint;
+            return true;
+        }
     };
-    let rest = input
-        .strip_prefix(command)
-        .map(str::trim)
-        .unwrap_or_default();
-    if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == command)
+
+    let slash = cmd.slash_name();
+    if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == slash)
         && !spec.available_during_task
         && turn_in_progress(app)
     {
-        app.status = format!("{command} unavailable during turn");
+        app.status = format!("{slash} unavailable during turn");
         return true;
     }
-    if should_echo_slash_command(command, rest) {
+
+    let rest = input.strip_prefix(slash).map(str::trim).unwrap_or_default();
+    if should_echo_slash_command(slash, rest) {
         app.push_slash_command_echo(input);
     }
-    match command {
-        "/config" => {
-            let section = if rest.is_empty() {
-                None
-            } else {
-                squeezy_core::config_schema::section_from_slug(rest)
-            };
-            toggle_config_screen(app, agent, section);
-            return true;
+
+    apply_dispatch_command(app, agent, cmd).await;
+    true
+}
+
+/// Attempt to resolve an unknown `/foo …` head against the user-
+/// authored prompt-template catalog. On a hit the rendered body is
+/// routed through the normal user-turn flow (echo + history + queue
+/// or start) so the model sees the expanded prompt; on a miss this
+/// returns `false` so the legacy "unknown command" path runs and the
+/// input becomes a regular user prompt.
+///
+/// Templates take precedence only over the *unknown* slot — built-in
+/// `DispatchCommand` heads (e.g. `/help`, `/diff`) cannot be shadowed
+/// by a same-named template file so muscle memory keeps working.
+fn expand_prompt_template_or_fallthrough(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+    let Some(expanded) = app.prompt_templates.expand(input) else {
+        return false;
+    };
+    app.push_slash_command_echo(input);
+    if app.turn_rx.is_some() {
+        app.prompt_queue.push_back(expanded);
+        app.status = format!("queued ({})", app.prompt_queue.len());
+        return true;
+    }
+    app.cancelled_prompt = Some(expanded.clone());
+    push_input_history(app, expanded.clone());
+    start_user_turn(app, agent, expanded);
+    true
+}
+
+/// Run the typed slash-command on the TUI. The parsing is done by
+/// [`DispatchCommand::parse`] in [`handle_slash_command`]; this
+/// function only routes to the existing helpers that own the TUI
+/// state. Agent-only dispatch lives on [`Agent::dispatch_command`] and
+/// is invoked by non-TUI drivers (eval, RPC).
+async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: DispatchCommand) {
+    match cmd {
+        DispatchCommand::Config { section } => {
+            let id = section
+                .as_deref()
+                .and_then(squeezy_core::config_schema::section_from_slug);
+            toggle_config_screen(app, agent, id);
         }
-        "/statusline" => {
-            toggle_status_line_setup(app);
-            return true;
-        }
-        "/plan" => {
+        DispatchCommand::Statusline => toggle_status_line_setup(app),
+        DispatchCommand::Plan { prompt } => {
             switch_mode(app, agent, Some(SessionMode::Plan), "tui_command");
-            if !rest.is_empty() {
-                let prompt = rest.to_string();
+            if let Some(prompt) = prompt {
                 app.cancelled_prompt = Some(prompt.clone());
                 clear_input(app);
                 push_input_history(app, prompt.clone());
                 start_user_turn(app, agent, prompt);
             }
-            return true;
         }
-        "/build" => {
+        DispatchCommand::Build { prompt } => {
             switch_mode(app, agent, Some(SessionMode::Build), "tui_command");
-            if !rest.is_empty() {
-                let prompt = rest.to_string();
+            if let Some(prompt) = prompt {
                 app.cancelled_prompt = Some(prompt.clone());
                 clear_input(app);
                 push_input_history(app, prompt.clone());
                 start_user_turn(app, agent, prompt);
             }
-            return true;
         }
-        "/plans" => {
-            handle_plans_command(app, rest);
-            return true;
-        }
-        "/cost" => {
+        DispatchCommand::Plans { args } => handle_plans_command(app, &args),
+        DispatchCommand::Cost => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "cost snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_cost_command(
                 &snapshot,
             )));
-            return true;
         }
-        "/context" => {
+        DispatchCommand::Context => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "context snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_context_command(
                 &snapshot,
             )));
-            return true;
         }
-        "/reviewer" => {
+        DispatchCommand::Reviewer => {
             let entries = agent.reviewer_audit_snapshot();
             if entries.is_empty() {
                 app.status = "no AI reviewer decisions recorded yet".to_string();
@@ -1963,52 +2114,40 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 &entries,
                 std::time::SystemTime::now(),
             )));
-            return true;
         }
-        "/help" => {
-            handle_help_command(app, agent, rest);
-            return true;
+        DispatchCommand::Help { topic } => {
+            handle_help_command(app, agent, topic.as_deref().unwrap_or(""));
         }
-        "/model" => {
+        DispatchCommand::Model => {
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Models),
             );
-            return true;
         }
-        "/permissions" => {
+        DispatchCommand::Permissions => {
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Permissions),
             );
-            return true;
         }
-        "/feedback" => {
-            handle_feedback_command(app, agent, rest).await;
-            return true;
+        DispatchCommand::Feedback { args } => {
+            handle_feedback_command(app, agent, &args).await;
         }
-        "/report" => {
-            handle_report_command(app, agent, rest).await;
-            return true;
+        DispatchCommand::Report { args } => {
+            handle_report_command(app, agent, &args).await;
         }
-        "/attach" => {
-            let path = input.trim_start_matches("/attach").trim();
-            if path.is_empty() {
-                app.status = "usage: /attach <path>".to_string();
-                return true;
-            }
-            match agent.attach_file_context(PathBuf::from(path)).await {
+        DispatchCommand::Attach { path } => {
+            match agent.attach_file_context(PathBuf::from(&path)).await {
                 Ok(update) => {
                     app.attachments = agent.context_attachments_snapshot().await;
                     app.status = attachment_update_status("file", &update);
                 }
                 Err(error) => app.status = format!("attach failed: {error}"),
             }
-            return true;
         }
-        "/attachments" => {
+        DispatchCommand::Attachments => {
             app.attachments = agent.context_attachments_snapshot().await;
             if app.attachments.is_empty() {
                 app.status = "no attached context".to_string();
@@ -2018,25 +2157,16 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     &app.attachments,
                 )));
             }
-            return true;
         }
-        "/detach" => {
-            let Some(id) = parts.next() else {
-                app.status = "usage: /detach <attachment_id>".to_string();
-                return true;
-            };
-            match agent.detach_context_attachment(id).await {
-                Ok(attachment) => {
-                    app.attachments = agent.context_attachments_snapshot().await;
-                    app.status = format!("detached {}", attachment.id);
-                }
-                Err(error) => app.status = format!("detach failed: {error}"),
+        DispatchCommand::Detach { id } => match agent.detach_context_attachment(&id).await {
+            Ok(attachment) => {
+                app.attachments = agent.context_attachments_snapshot().await;
+                app.status = format!("detached {}", attachment.id);
             }
-            return true;
-        }
-        "/compact" => {
-            let subcommand = parts.next().map(str::trim).unwrap_or("");
-            if subcommand.eq_ignore_ascii_case("undo") {
+            Err(error) => app.status = format!("detach failed: {error}"),
+        },
+        DispatchCommand::Compact { undo } => {
+            if undo {
                 match agent.compact_context_undo().await {
                     Ok(Some(record)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
@@ -2055,33 +2185,32 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     }
                     Err(error) => app.status = format!("compact undo failed: {error}"),
                 }
-                return true;
-            }
-            match agent.compact_context_manual().await {
-                Ok(report) => {
-                    app.context_compaction = agent.context_compaction_snapshot().await;
-                    app.context_estimate = report.record.after.clone();
-                    app.status = compaction_status_line(&report.record);
-                    app.push_log(format!(
-                        "context compacted gen={} items={} tok {}->{}",
-                        report.record.generation,
-                        report.record.dropped_items,
-                        report.record.before.estimated_tokens,
-                        report.record.after.estimated_tokens
-                    ));
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
-                         Run `/compact undo` to restore.",
-                        dropped = report.record.dropped_items,
-                        before = report.record.before.estimated_tokens,
-                        after = report.record.after.estimated_tokens,
-                    )));
+            } else {
+                match agent.compact_context_manual().await {
+                    Ok(report) => {
+                        app.context_compaction = agent.context_compaction_snapshot().await;
+                        app.context_estimate = report.record.after.clone();
+                        app.status = compaction_status_line(&report.record);
+                        app.push_log(format!(
+                            "context compacted gen={} items={} tok {}->{}",
+                            report.record.generation,
+                            report.record.dropped_items,
+                            report.record.before.estimated_tokens,
+                            report.record.after.estimated_tokens
+                        ));
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
+                             Run `/compact undo` to restore.",
+                            dropped = report.record.dropped_items,
+                            before = report.record.before.estimated_tokens,
+                            after = report.record.after.estimated_tokens,
+                        )));
+                    }
+                    Err(error) => app.status = format!("compact failed: {error}"),
                 }
-                Err(error) => app.status = format!("compact failed: {error}"),
             }
-            return true;
         }
-        "/pins" => {
+        DispatchCommand::Pins => {
             app.context_compaction = agent.context_compaction_snapshot().await;
             if app.context_compaction.pinned.is_empty() {
                 app.status = "no pinned context".to_string();
@@ -2094,11 +2223,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     &app.context_compaction,
                 )));
             }
-            return true;
         }
-        "/pin" => {
-            let target = parts.next().unwrap_or("selected");
-            match pin_source(app, target) {
+        DispatchCommand::Pin { target } => {
+            let target_str = target.as_deref().unwrap_or("selected");
+            match pin_source(app, target_str) {
                 PinSourceResult::Found(label, summary, source) => {
                     match agent.pin_context_entry(label, summary, source).await {
                         Ok(pin) => {
@@ -2115,60 +2243,25 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     app.status = "usage: /pin selected|last".to_string();
                 }
             }
-            return true;
         }
-        "/unpin" => {
-            let id = parts.next().map(str::trim).filter(|raw| !raw.is_empty());
-            let Some(id) = id else {
-                app.status = "usage: /unpin <pin_id>".to_string();
-                return true;
-            };
-            match agent.unpin_context_entry(id).await {
-                Ok(pin) => {
-                    app.context_compaction = agent.context_compaction_snapshot().await;
-                    app.status = format!("unpinned {}", pin.id);
-                }
-                Err(error) => app.status = format!("unpin failed: {error}"),
+        DispatchCommand::Unpin { id } => match agent.unpin_context_entry(&id).await {
+            Ok(pin) => {
+                app.context_compaction = agent.context_compaction_snapshot().await;
+                app.status = format!("unpinned {}", pin.id);
             }
-            return true;
+            Err(error) => app.status = format!("unpin failed: {error}"),
+        },
+        DispatchCommand::Collapse { category } => {
+            apply_collapse_expand(app, "/collapse", category.as_deref(), true);
         }
-        "/collapse" | "/expand" => {
-            let category = match parts.next() {
-                Some(value) => match parse_transcript_category(value) {
-                    Some(category) => category,
-                    None => {
-                        app.status = format!(
-                            "usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]"
-                        );
-                        return true;
-                    }
-                },
-                None => TranscriptCategory::All,
-            };
-            let collapsed = command == "/collapse";
-            let changed = set_transcript_collapsed(app, category, collapsed);
-            app.status = format!(
-                "{} {} transcript entr{}",
-                if collapsed { "collapsed" } else { "expanded" },
-                changed,
-                if changed == 1 { "y" } else { "ies" }
-            );
-            return true;
+        DispatchCommand::Expand { category } => {
+            apply_collapse_expand(app, "/expand", category.as_deref(), false);
         }
-        "/diff" => {
-            handle_slash_diff(app);
-            return true;
-        }
-        "/effort" => {
-            handle_slash_effort(app, agent, parts.next());
-            return true;
-        }
-        "/verbosity" => {
-            // Back-compat: `/verbosity concise|normal|verbose` still works as
-            // a quick set. Without an arg, opens the config screen on the
-            // Verbosity section.
-            if let Some(value) = parts.next()
-                && let Some(verbosity) = parse_response_verbosity(value)
+        DispatchCommand::Diff => handle_slash_diff(app),
+        DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
+        DispatchCommand::Verbosity { value } => {
+            if let Some(value) = value
+                && let Some(verbosity) = parse_response_verbosity(&value)
             {
                 app.response_verbosity = verbosity;
                 let mut next = agent.config_snapshot();
@@ -2178,18 +2271,17 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     format!("response verbosity → {}", verbosity.as_str()),
                     NotifySeverity::Success,
                 );
-                return true;
+                return;
             }
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Verbosity),
             );
-            return true;
         }
-        "/tool-verbosity" => {
-            if let Some(value) = parts.next()
-                && let Some(verbosity) = parse_tool_output_verbosity(value)
+        DispatchCommand::ToolVerbosity { value } => {
+            if let Some(value) = value
+                && let Some(verbosity) = parse_tool_output_verbosity(&value)
             {
                 app.tool_output_verbosity = verbosity;
                 let mut next = agent.config_snapshot();
@@ -2199,31 +2291,24 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     format!("tool output verbosity → {}", verbosity.as_str()),
                     NotifySeverity::Success,
                 );
-                return true;
+                return;
             }
             toggle_config_screen(
                 app,
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Verbosity),
             );
-            return true;
         }
-        "/theme" => {
-            let Some(raw) = parts.next() else {
-                app.status =
-                    "usage: /theme [system|dark|light|catppuccin|high-contrast]".to_string();
-                return true;
-            };
-            let Some(theme) = TuiTheme::parse(raw) else {
+        DispatchCommand::Theme { theme } => {
+            let Some(parsed) = TuiTheme::parse(&theme) else {
                 app.status = format!(
-                    "unknown theme {raw:?}; expected system, dark, light, catppuccin, or high-contrast",
+                    "unknown theme {theme:?}; expected system, dark, light, catppuccin, or high-contrast",
                 );
-                return true;
+                return;
             };
-            apply_theme_change(app, agent, theme);
-            return true;
+            apply_theme_change(app, agent, parsed);
         }
-        "/keymap" => {
+        DispatchCommand::Keymap => {
             let body = keymap::format_keymap_command(&app.keymap);
             let overrides = keymap::Action::ALL
                 .iter()
@@ -2236,149 +2321,153 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 format!("keymap ({overrides} override(s))")
             };
             app.push_transcript_item(TranscriptItem::system(body));
-            return true;
         }
-        "/tasks" | "/jobs" => {
+        DispatchCommand::Tasks | DispatchCommand::Jobs => {
             sync_jobs_from_agent(app, agent);
             let body = format_tasks_list(app, agent);
             app.status = format!("{} tasks", app.jobs.len());
             app.push_transcript_item(TranscriptItem::system(body));
-            return true;
         }
-        "/task" | "/job" => {
-            let Some(raw_id) = parts.next() else {
-                app.status = format!("usage: {command} <id>");
-                return true;
-            };
-            let Some(id) = parse_job_id(raw_id) else {
-                app.status = "task id must be a number".to_string();
-                return true;
-            };
-            sync_jobs_from_agent(app, agent);
-            match app
-                .jobs
-                .get(&id)
-                .cloned()
-                .or_else(|| agent.job_snapshot(id))
-            {
-                Some(job) => {
-                    app.status = format!("task {} {}", job.id, job.status.as_str());
-                    app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
-                }
-                None => app.status = format!("task {id} not found"),
+        DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+            apply_task_detail(app, agent, &id);
+        }
+        DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+            apply_task_cancel(app, agent, &id);
+        }
+        DispatchCommand::Sessions => match agent.list_sessions(&SessionQuery::default()) {
+            Ok(sessions) => {
+                app.status = format!("{} sessions", sessions.len());
+                app.push_transcript_item(TranscriptItem::system(
+                    sessions
+                        .into_iter()
+                        .take(10)
+                        .map(|session| {
+                            format!(
+                                "{} {} {}",
+                                session.session_id,
+                                session.status.as_str(),
+                                session
+                                    .first_user_task
+                                    .or(session.latest_summary)
+                                    .unwrap_or_default()
+                                    .replace('\n', " ")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
             }
-            return true;
-        }
-        "/task-cancel" | "/job-cancel" => {
-            let Some(raw_id) = parts.next() else {
-                app.status = format!("usage: {command} <id>");
-                return true;
-            };
-            let Some(id) = parse_job_id(raw_id) else {
-                app.status = "task id must be a number".to_string();
-                return true;
-            };
-            if agent.cancel_job(id) {
-                app.status = format!("cancelling task {id}");
-                sync_jobs_from_agent(app, agent);
+            Err(error) => app.status = format!("session list failed: {error}"),
+        },
+        DispatchCommand::Session { id } => match agent.show_session(&id) {
+            Ok(record) => {
+                app.status = format!(
+                    "session {}: {} events={} redactions={}",
+                    record.metadata.session_id,
+                    record.metadata.status.as_str(),
+                    record.metadata.event_count,
+                    record.metadata.redactions
+                );
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "{}\nstatus={} started={} branch={} task={}",
+                    record.metadata.session_id,
+                    record.metadata.status.as_str(),
+                    record.metadata.started_at_ms,
+                    record.metadata.branch.unwrap_or_else(|| "-".to_string()),
+                    record.metadata.first_user_task.unwrap_or_default()
+                )));
+            }
+            Err(error) => app.status = format!("session show failed: {error}"),
+        },
+        DispatchCommand::SessionRename { name } => {
+            let parameter = if name.trim().is_empty() {
+                None
             } else {
-                app.status = format!("task {id} not active");
-            }
-            return true;
-        }
-        "/sessions" => {
-            match agent.list_sessions(&SessionQuery::default()) {
-                Ok(sessions) => {
-                    app.status = format!("{} sessions", sessions.len());
-                    app.push_transcript_item(TranscriptItem::system(
-                        sessions
-                            .into_iter()
-                            .take(10)
-                            .map(|session| {
-                                format!(
-                                    "{} {} {}",
-                                    session.session_id,
-                                    session.status.as_str(),
-                                    session
-                                        .first_user_task
-                                        .or(session.latest_summary)
-                                        .unwrap_or_default()
-                                        .replace('\n', " ")
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ));
-                }
-                Err(error) => app.status = format!("session list failed: {error}"),
-            }
-            return true;
-        }
-        "/session" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /session <session_id>".to_string();
-                return true;
+                Some(name.clone())
             };
-            match agent.show_session(session_id) {
-                Ok(record) => {
-                    app.status = format!(
-                        "session {}: {} events={} redactions={}",
-                        record.metadata.session_id,
-                        record.metadata.status.as_str(),
-                        record.metadata.event_count,
-                        record.metadata.redactions
-                    );
+            match agent.set_session_display_name(parameter) {
+                Ok(metadata) => match metadata.display_name {
+                    Some(display) => {
+                        app.status = format!("renamed session → {display}");
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "session {} renamed to {display}",
+                            metadata.session_id
+                        )));
+                    }
+                    None => {
+                        app.status = format!("cleared session name ({})", metadata.session_id);
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "session {} display_name cleared",
+                            metadata.session_id
+                        )));
+                    }
+                },
+                Err(error) => app.status = format!("rename failed: {error}"),
+            }
+        }
+        DispatchCommand::SessionLabel { name } => match agent.add_session_label(name.clone()) {
+            Ok((metadata, added)) => {
+                let label_list = if metadata.labels.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    metadata.labels.join(", ")
+                };
+                if added {
+                    app.status = format!("labelled session #{name}");
                     app.push_transcript_item(TranscriptItem::system(format!(
-                        "{}\nstatus={} started={} branch={} task={}",
-                        record.metadata.session_id,
-                        record.metadata.status.as_str(),
-                        record.metadata.started_at_ms,
-                        record.metadata.branch.unwrap_or_else(|| "-".to_string()),
-                        record.metadata.first_user_task.unwrap_or_default()
+                        "session {} labels: {label_list}",
+                        metadata.session_id
                     )));
+                } else {
+                    app.status = format!("label #{name} already on session");
                 }
-                Err(error) => app.status = format!("session show failed: {error}"),
             }
-            return true;
-        }
-        "/fork" => {
-            match agent.fork_current().await {
-                Ok(new_id) => {
-                    app.status = format!("forked session → {new_id}");
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "/fork started session {new_id}; the original session is saved and \
-                         remains resumable via /resume."
-                    )));
+            Err(error) => app.status = format!("label failed: {error}"),
+        },
+        DispatchCommand::Fork => match agent.fork_current().await {
+            Ok(new_id) => {
+                app.status = format!("forked session → {new_id}");
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "/fork started session {new_id}; the original session is saved and \
+                     remains resumable via /resume."
+                )));
+            }
+            Err(error) => app.status = format!("fork failed: {error}"),
+        },
+        DispatchCommand::Resume { id } => switch_to_session(app, agent, &id).await,
+        DispatchCommand::SessionExport { id } => match agent.export_session(&id) {
+            Ok(value) => {
+                app.status = format!(
+                    "session export {} bytes",
+                    serde_json::to_string(&value).map_or(0, |text| text.len())
+                );
+            }
+            Err(error) => app.status = format!("session export failed: {error}"),
+        },
+        DispatchCommand::SessionExportHtml { id, path } => {
+            let target = path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{id}.html")));
+            match agent.show_session(&id).and_then(|record| {
+                squeezy_agent::export_session_to_html(
+                    &record,
+                    &squeezy_agent::ExportOpts::default(),
+                )
+                .map_err(|err| {
+                    squeezy_core::SqueezyError::Tool(format!("failed to render html: {err}"))
+                })
+                .and_then(|html| {
+                    std::fs::write(&target, &html).map_err(squeezy_core::SqueezyError::from)?;
+                    Ok(html.len())
+                })
+            }) {
+                Ok(len) => {
+                    app.status = format!("wrote {} ({} bytes)", target.display(), len);
                 }
-                Err(error) => app.status = format!("fork failed: {error}"),
+                Err(error) => app.status = format!("session export html failed: {error}"),
             }
-            return true;
         }
-        "/resume" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /resume <session_id>".to_string();
-                return true;
-            };
-            switch_to_session(app, agent, session_id).await;
-            return true;
-        }
-        "/session-export" => {
-            let Some(session_id) = parts.next() else {
-                app.status = "usage: /session-export <session_id>".to_string();
-                return true;
-            };
-            match agent.export_session(session_id) {
-                Ok(value) => {
-                    app.status = format!(
-                        "session export {} bytes",
-                        serde_json::to_string(&value).map_or(0, |text| text.len())
-                    );
-                }
-                Err(error) => app.status = format!("session export failed: {error}"),
-            }
-            return true;
-        }
-        "/session-cleanup" => {
+        DispatchCommand::SessionCleanup { args } => {
             // Pull the mode flag out of the args before the id list so
             // `--archive` / `--purge` can appear anywhere on the line.
             // `--archive` is the default; `--purge` switches to
@@ -2386,7 +2475,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             // already-archived ids named here are removed immediately).
             let mut mode = CleanupMode::Archive;
             let mut ids = Vec::new();
-            for token in parts {
+            for token in args.split_whitespace() {
                 match token {
                     "--archive" => mode = CleanupMode::Archive,
                     "--purge" => mode = CleanupMode::Purge,
@@ -2403,43 +2492,96 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 }
                 Err(error) => app.status = format!("session cleanup failed: {error}"),
             }
-            return true;
         }
-        "/copy" => {
-            match parts.next() {
-                None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
-                Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
-                Some(_) => app.status = "usage: /copy [transcript]".to_string(),
-            }
-            return true;
+        DispatchCommand::Copy { target } => match target.as_deref() {
+            None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
+            Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
+            // `DispatchCommand::parse` already rejects other values
+            // with `Usage`, but keep the arm for forward compatibility
+            // — a future variant of `/copy` would land here.
+            Some(_) => app.status = "usage: /copy [transcript]".to_string(),
+        },
+        DispatchCommand::Checkpoints => {
+            start_local_checkpoint_job(app, agent, "checkpoint_list", serde_json::json!({}))
         }
-        _ => {}
+        DispatchCommand::Undo => {
+            start_local_checkpoint_job(app, agent, "checkpoint_undo", serde_json::json!({}))
+        }
+        DispatchCommand::Checkpoint { id } => start_local_checkpoint_job(
+            app,
+            agent,
+            "checkpoint_show",
+            serde_json::json!({ "checkpoint_id": id }),
+        ),
+        DispatchCommand::RevertTurn { group_id } => start_local_checkpoint_job(
+            app,
+            agent,
+            "checkpoint_revert",
+            serde_json::json!({ "group_id": group_id }),
+        ),
     }
-    let (name, arguments) = match command {
-        "/checkpoints" => ("checkpoint_list", serde_json::json!({})),
-        "/undo" => ("checkpoint_undo", serde_json::json!({})),
-        "/checkpoint" => {
-            let Some(checkpoint_id) = parts.next() else {
-                app.status = "usage: /checkpoint <checkpoint_id>".to_string();
-                return true;
-            };
-            (
-                "checkpoint_show",
-                serde_json::json!({ "checkpoint_id": checkpoint_id }),
-            )
-        }
-        "/revert-turn" => {
-            let Some(group_id) = parts.next() else {
-                app.status = "usage: /revert-turn <turn_id>".to_string();
-                return true;
-            };
-            (
-                "checkpoint_revert",
-                serde_json::json!({ "group_id": group_id }),
-            )
-        }
-        _ => return false,
+}
+
+fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>, collapsed: bool) {
+    let category = match category {
+        Some(value) => match parse_transcript_category(value) {
+            Some(category) => category,
+            None => {
+                app.status =
+                    format!("usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]");
+                return;
+            }
+        },
+        None => TranscriptCategory::All,
     };
+    let changed = set_transcript_collapsed(app, category, collapsed);
+    app.status = format!(
+        "{} {} transcript entr{}",
+        if collapsed { "collapsed" } else { "expanded" },
+        changed,
+        if changed == 1 { "y" } else { "ies" }
+    );
+}
+
+fn apply_task_detail(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
+    let Some(id) = parse_job_id(raw_id) else {
+        app.status = "task id must be a number".to_string();
+        return;
+    };
+    sync_jobs_from_agent(app, agent);
+    match app
+        .jobs
+        .get(&id)
+        .cloned()
+        .or_else(|| agent.job_snapshot(id))
+    {
+        Some(job) => {
+            app.status = format!("task {} {}", job.id, job.status.as_str());
+            app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
+        }
+        None => app.status = format!("task {id} not found"),
+    }
+}
+
+fn apply_task_cancel(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
+    let Some(id) = parse_job_id(raw_id) else {
+        app.status = "task id must be a number".to_string();
+        return;
+    };
+    if agent.cancel_job(id) {
+        app.status = format!("cancelling task {id}");
+        sync_jobs_from_agent(app, agent);
+    } else {
+        app.status = format!("task {id} not active");
+    }
+}
+
+fn start_local_checkpoint_job(
+    app: &mut TuiApp,
+    agent: &Agent,
+    name: &'static str,
+    arguments: serde_json::Value,
+) {
     let job = agent.start_local_tool_job(ToolCall {
         call_id: format!("tui-{name}"),
         name: name.to_string(),
@@ -2447,7 +2589,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     });
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
-    true
 }
 
 /// Dispatch for `/plans [list|show|delete|set-active|open] [<id>]`.
@@ -3115,6 +3256,7 @@ fn set_transcript_collapsed(
     for entry in &mut app.transcript {
         if entry.matches_category(category) && entry.collapsed != collapsed {
             entry.collapsed = collapsed;
+            entry.bump_revision();
             changed += 1;
         }
     }
@@ -3235,6 +3377,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         return;
     };
     entry.collapsed = !entry.collapsed;
+    entry.bump_revision();
     app.status = format!(
         "{} transcript entry {} · Alt+E expand all",
         if entry.collapsed {
@@ -3279,6 +3422,7 @@ fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
         }
         if entry.collapsed != target_collapsed {
             entry.collapsed = target_collapsed;
+            entry.bump_revision();
             changed += 1;
         }
     }
@@ -5011,13 +5155,15 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             }
             None => {}
         }
-        lines.extend(format_transcript_entry_expanded(
+        lines.extend(cached_transcript_entry_lines(
+            app.render_cache_session,
             entry,
             app.selected_entry == Some(index),
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
             app.show_reasoning_usage,
+            true,
         ));
     }
     lines
@@ -5052,6 +5198,128 @@ fn format_transcript_entry_expanded(
         }
         TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
+}
+
+/// Memoise the line list for a single transcript entry across redraws.
+///
+/// Wraps the underlying `format_transcript_entry_with_width` /
+/// `format_transcript_entry_expanded` formatters with the per-entry LRU
+/// cache in `render::cache`. The cache key is `(session_id, entry_id)`;
+/// validation tags are the entry's content `revision`, the live
+/// `palette_generation`, and a fingerprint of the per-render context
+/// (selected flag, width, verbosity, outcome, show-reasoning toggle,
+/// expanded-vs-normal). On cache hit this skips re-rendering markdown,
+/// re-running tree-sitter for fenced blocks, and re-walking the entry
+/// kind — the dominant per-frame cost for a long transcript.
+///
+/// `expanded = true` selects the overlay (`Ctrl+T`) variant which
+/// forces `entry.collapsed = false`; `expanded = false` honours
+/// `entry.collapsed`. The flag is folded into `context_hash` so the
+/// overlay's expanded copy and the inline collapsed copy live as
+/// separate cache lines under the same entry id.
+///
+/// The 8 parameters mirror the surface of the two underlying formatters
+/// plus the `session_id` discriminator and the `expanded` switch; we
+/// allow `clippy::too_many_arguments` rather than introduce a struct
+/// purely as a clippy workaround.
+#[allow(clippy::too_many_arguments)]
+fn cached_transcript_entry_lines(
+    session_id: u64,
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    let palette_generation = render::palette::palette_generation();
+    let context_hash = render_context_hash(
+        selected,
+        tool_output_verbosity,
+        outcome,
+        width,
+        show_reasoning,
+        expanded,
+    );
+    render::cache::get_or_compute_entry(
+        session_id,
+        entry.id,
+        entry.revision,
+        palette_generation,
+        context_hash,
+        || {
+            if expanded {
+                format_transcript_entry_expanded(
+                    entry,
+                    selected,
+                    tool_output_verbosity,
+                    outcome,
+                    width,
+                    show_reasoning,
+                )
+            } else {
+                format_transcript_entry_with_width(
+                    entry,
+                    selected,
+                    tool_output_verbosity,
+                    outcome,
+                    width,
+                    show_reasoning,
+                )
+            }
+        },
+    )
+}
+
+/// Pack the per-render context bits into a single `u64` for the entry
+/// cache's validity check. Bits are deliberately laid out non-overlap so
+/// flipping any single dimension produces a distinct hash without a
+/// hashing pass (the cache only needs equality, not uniform
+/// distribution).
+///
+/// Layout:
+/// - bit 0:      selected
+/// - bit 1:      show_reasoning
+/// - bit 2:      expanded (overlay vs inline)
+/// - bits 4-5:   tool_output_verbosity (Compact=0, Normal=1, Verbose=2)
+/// - bit 8:      message outcome (Normal=0, Failed=1)
+/// - bits 16-31: width (0 when absent)
+/// - bit 32:     width-present sentinel (distinguishes `Some(0)` from `None`)
+fn render_context_hash(
+    selected: bool,
+    verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+    expanded: bool,
+) -> u64 {
+    let mut h: u64 = 0;
+    if selected {
+        h |= 1 << 0;
+    }
+    if show_reasoning {
+        h |= 1 << 1;
+    }
+    if expanded {
+        h |= 1 << 2;
+    }
+    let v: u64 = match verbosity {
+        ToolOutputVerbosity::Compact => 0,
+        ToolOutputVerbosity::Normal => 1,
+        ToolOutputVerbosity::Verbose => 2,
+    };
+    h |= v << 4;
+    let o: u64 = match outcome {
+        MessageOutcome::Normal => 0,
+        MessageOutcome::Failed => 1,
+    };
+    h |= o << 8;
+    if let Some(w) = width {
+        h |= (w as u64) << 16;
+        h |= 1u64 << 32;
+    }
+    h
 }
 
 fn transcript_lines_for_render(
@@ -5099,13 +5367,15 @@ fn transcript_lines_for_render(
             }
             None => {}
         }
-        lines.extend(format_transcript_entry_with_width(
+        lines.extend(cached_transcript_entry_lines(
+            app.render_cache_session,
             item,
             app.selected_entry == Some(index),
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
             app.show_reasoning_usage,
+            false,
         ));
     }
     if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
@@ -6101,7 +6371,7 @@ fn format_user_prompt_entry(
     _selected: bool,
     width: Option<u16>,
 ) -> Vec<Line<'static>> {
-    let bang_offset = bang_command_marker_offset(&item.content);
+    let bang_range = bang_command_marker_range(&item.content);
     let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
@@ -6111,7 +6381,8 @@ fn format_user_prompt_entry(
     let mut line_start = 0usize;
     lines.extend(content.into_iter().enumerate().map(|(index, line)| {
         let marker = if index == 0 { "> " } else { "  " };
-        let rendered = user_prompt_content_line(marker, line, line_start, bang_offset, width);
+        let rendered =
+            user_prompt_content_line(marker, line, line_start, bang_range.as_ref(), width);
         line_start = line_start.saturating_add(line.len()).saturating_add(1);
         rendered
     }));
@@ -6133,7 +6404,7 @@ fn user_prompt_content_line(
     marker: &'static str,
     line: &str,
     line_start: usize,
-    bang_offset: Option<usize>,
+    bang_range: Option<&std::ops::Range<usize>>,
     width: Option<u16>,
 ) -> Line<'static> {
     let text_width = line.chars().count();
@@ -6150,7 +6421,7 @@ fn user_prompt_content_line(
         .flatten();
     let style_text_at = |abs_offset: usize| -> Style {
         let base = Style::default().bg(PROMPT_BG);
-        if Some(abs_offset) == bang_offset {
+        if bang_range.is_some_and(|range| range.contains(&abs_offset)) {
             base.fg(BANG_RED)
         } else if let Some(len) = slash_len {
             if marker == "> " && abs_offset < len {
@@ -6167,10 +6438,24 @@ fn user_prompt_content_line(
     Line::from(spans)
 }
 
-fn bang_command_marker_offset(text: &str) -> Option<usize> {
-    text.char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
-        .and_then(|(offset, ch)| (ch == '!').then_some(offset))
+/// Byte range covering the leading `!` (single-bang) or `!!`
+/// (double-bang, runs locally but skips LLM context) marker after any
+/// leading whitespace, or `None` if the line is not a bang command.
+/// Returned as a range — rather than the previous single offset — so the
+/// prompt renderer can paint both bangs in `BANG_RED` for `!!cmd`.
+fn bang_command_marker_range(text: &str) -> Option<std::ops::Range<usize>> {
+    let mut chars = text.char_indices().skip_while(|(_, ch)| ch.is_whitespace());
+    let (start, first) = chars.next()?;
+    if first != '!' {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    if let Some((_, next)) = chars.next()
+        && next == '!'
+    {
+        end += next.len_utf8();
+    }
+    Some(start..end)
 }
 
 fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
@@ -8934,7 +9219,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let slash_len = parts
         .first()
         .and_then(|first| input::match_slash_command_prefix(first));
-    let bang_offset = bang_command_marker_offset(&app.input);
+    let bang_range = bang_command_marker_range(&app.input);
     let mut line_start = 0usize;
     parts
         .iter()
@@ -8957,7 +9242,10 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
                 let base = Style::default().bg(PROMPT_BG);
-                if Some(abs_offset) == bang_offset {
+                if bang_range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&abs_offset))
+                {
                     base.fg(BANG_RED)
                 } else {
                     match slash_split {
@@ -9213,10 +9501,9 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
     if popup.is_empty() {
         return Vec::new();
     }
-    popup
+    let mut lines: Vec<Line<'static>> = popup
         .matches
         .iter()
-        .take(5)
         .enumerate()
         .map(|(index, path)| {
             let selected = index == popup.selected;
@@ -9235,7 +9522,17 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 Span::styled(display, style),
             ])
         })
-        .collect()
+        .collect();
+    // `(idx/total)` footer. `total` is the pre-truncation candidate
+    // count so the user can see when more matches exist beyond the
+    // displayed window (capped at `MAX_MATCHES`).
+    let total = popup.total.max(popup.matches.len());
+    let footer = format!("  {}/{}", popup.selected + 1, total);
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+    )));
+    lines
 }
 
 fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
@@ -9959,13 +10256,21 @@ pub(crate) struct TuiApp {
     pub(crate) telemetry: TelemetryStatus,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
-    pub(crate) input_history: Vec<String>,
+    pub(crate) input_history: prompt_history::PromptHistory,
     pub(crate) input_history_index: Option<usize>,
     pub(crate) input_history_draft: String,
     pub(crate) slash_menu_index: usize,
     pub(crate) mention_popup: Option<mention::MentionPopup>,
     pub(crate) workspace_file_cache: Option<mention::WorkspaceFileCache>,
     pub(crate) overlay: Option<overlay::Overlay>,
+    /// Per-app generation counter for [`overlay::DialogHandle::open`]. Bumped
+    /// on every open so stale handles for replaced dialogs become no-ops.
+    pub(crate) overlay_next_id: u64,
+    /// Generation id of the dialog currently occupying `overlay`. `None`
+    /// when `overlay` is `None`. Maintained alongside `overlay` so the
+    /// handle pattern can distinguish "my dialog is still open" from
+    /// "someone else replaced my dialog".
+    pub(crate) overlay_active_id: Option<u64>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
     /// a scroll offset. Mirrors codex's `open_transcript_overlay` as the
@@ -9988,6 +10293,13 @@ pub(crate) struct TuiApp {
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) selected_entry: Option<usize>,
     pub(crate) next_entry_id: u64,
+    /// Per-app discriminator for the global entry render cache. Allocated
+    /// once at `TuiApp::new`; every cache lookup is `(session, entry_id)`
+    /// so two `TuiApp` instances that share the process (most notably
+    /// parallel `cargo test` runs that share the static cache) cannot
+    /// clobber each other's entries through the colliding `entry_id = 0`
+    /// they both restart from.
+    pub(crate) render_cache_session: u64,
     pub(crate) transcript_scroll_from_bottom: u16,
     pub(crate) pending_assistant: streaming::StreamingController,
     /// Streaming buffer for reasoning/thinking deltas emitted during the
@@ -10053,6 +10365,15 @@ pub(crate) struct TuiApp {
     pub(crate) last_terminal_title: Option<String>,
     pub(crate) animation_tick: u64,
     pub(crate) animation_tick_rate: Duration,
+    /// Tracks terminal-focus state for the host tty. The main loop
+    /// freezes the animation tick driver and short-circuits
+    /// [`Self::has_active_animation`] while this is `false`, so an
+    /// idle background window stops repainting its spinner and the
+    /// terminal-title clock. Driven by crossterm's `FocusGained` /
+    /// `FocusLost` events when `EnableFocusChange` is in effect.
+    /// Terminals that do not emit focus events keep this stuck at
+    /// `true`, which preserves the pre-existing animation behaviour.
+    pub(crate) focused: bool,
     /// Set by any state mutator that requires the next frame to repaint.
     /// Cleared by the main loop immediately after `draw_app`. Without
     /// this gate the loop redraws every ~50 ms and idle terminals show
@@ -10162,6 +10483,12 @@ pub(crate) struct TuiApp {
     /// the topmost (later-rendered) hit wins. Cleared at the start of
     /// every draw via `begin_frame_clickables`.
     pub(crate) clickables: std::cell::RefCell<Vec<Clickable>>,
+    /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
+    /// `<workspace>/.squeezy/prompts/`. Consulted by
+    /// [`handle_slash_command`] when the typed head isn't a built-in
+    /// `DispatchCommand`; a match expands the template body and routes
+    /// it through [`start_user_turn`] like any other typed prompt.
+    pub(crate) prompt_templates: PromptTemplateCatalog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10190,6 +10517,27 @@ pub(crate) struct Clickable {
 pub(crate) struct PendingDiffResult {
     pub(crate) logs: Vec<String>,
     pub(crate) card: Option<DiffCardData>,
+}
+
+/// Build the runtime [`keymap::KeymapResolver`] by layering the optional
+/// user-editable `~/.squeezy/keybindings.toml` on top of the
+/// `[tui.keymap]` overrides from `settings.toml`. Failures (missing
+/// `$HOME`, unreadable file, malformed TOML, reserved-key violation)
+/// emit a warning and fall back to the base overrides so a broken
+/// keybindings file never prevents the TUI from starting.
+fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResolver {
+    let user_path = keymap_config::default_keybindings_path();
+    match keymap_config::merge_user_overrides(base.clone(), user_path.as_deref()) {
+        Ok(merged) => keymap::KeymapResolver::from_overrides(&merged),
+        Err(err) => {
+            tracing::warn!(
+                target: "squeezy_tui::keymap_config",
+                error = %err,
+                "ignoring ~/.squeezy/keybindings.toml; falling back to defaults"
+            );
+            keymap::KeymapResolver::from_overrides(base)
+        }
+    }
 }
 
 impl TuiApp {
@@ -10284,6 +10632,7 @@ impl TuiApp {
         let transcript = Vec::new();
         let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
+        let keymap = build_keymap_resolver(&config.tui.keymap);
         Self {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -10307,13 +10656,24 @@ impl TuiApp {
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             input_cursor: 0,
-            input_history: Vec::new(),
+            input_history: if config.tui.persist_prompt_history {
+                prompt_history::PromptHistory::with_persistence(
+                    prompt_history::DEFAULT_PROMPT_HISTORY_CAPACITY,
+                    squeezy_core::default_prompt_history_path(),
+                )
+            } else {
+                prompt_history::PromptHistory::in_memory(
+                    prompt_history::DEFAULT_PROMPT_HISTORY_CAPACITY,
+                )
+            },
             input_history_index: None,
             input_history_draft: String::new(),
             slash_menu_index: 0,
             mention_popup: None,
             workspace_file_cache: None,
             overlay: None,
+            overlay_next_id: 0,
+            overlay_active_id: None,
             transcript_overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
@@ -10325,6 +10685,7 @@ impl TuiApp {
             transcript,
             selected_entry: None,
             next_entry_id,
+            render_cache_session: render::cache::next_session_id(),
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
             pending_reasoning: String::new(),
@@ -10350,6 +10711,11 @@ impl TuiApp {
             last_terminal_title: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
+            // Assume focused at startup. Crossterm only emits `FocusLost`
+            // after `EnableFocusChange` lands, and terminals that do not
+            // support the protocol never flip the flag — so the worst
+            // case for a non-emitter is the pre-existing behaviour.
+            focused: true,
             // Start dirty so the first iteration of the main loop paints
             // the initial frame.
             needs_redraw: true,
@@ -10384,7 +10750,7 @@ impl TuiApp {
             status_line_use_colors: config.tui.status_line_use_colors,
             status_line_setup: None,
             latest_plan_progress: None,
-            keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
+            keymap,
             pending_diff: None,
             pending_diff_started_at: None,
             prompt_queue: VecDeque::new(),
@@ -10392,7 +10758,29 @@ impl TuiApp {
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(Vec::new()),
+            prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
         }
+    }
+
+    /// Open `content` as a typed slash-command overlay and return a
+    /// [`overlay::DialogHandle`] for later manipulation. Thin convenience
+    /// wrapper around [`overlay::DialogHandle::open`] that threads
+    /// `self.overlay`, `self.overlay_next_id`, and `self.overlay_active_id`
+    /// in a single call so slash-command handlers don't need to touch
+    /// the underlying state directly.
+    #[allow(dead_code)]
+    pub(crate) fn open_overlay(
+        &mut self,
+        content: overlay::Overlay,
+        prior_focus: overlay::PriorFocus,
+    ) -> overlay::DialogHandle {
+        overlay::DialogHandle::open(
+            &mut self.overlay,
+            &mut self.overlay_next_id,
+            &mut self.overlay_active_id,
+            content,
+            prior_focus,
+        )
     }
 
     pub(crate) fn note_turn_started(&mut self) {
@@ -10466,7 +10854,18 @@ impl TuiApp {
     /// catches the case where nothing has mutated but the on-screen
     /// content is still moving (working spinner, title spinner, etc.).
     /// When neither is true the main loop skips `draw_app` entirely.
+    ///
+    /// Returns `false` whenever the host terminal reports the window
+    /// is unfocused — paired with the animation-tick gate in the main
+    /// loop this stops the spinner from repainting in the background,
+    /// which is the primary battery sink on idle laptops. State
+    /// mutations (e.g. agent events arriving while we are unfocused)
+    /// still flip `needs_redraw` and force a draw, so we never miss a
+    /// material update.
     pub(crate) fn has_active_animation(&self) -> bool {
+        if !self.focused {
+            return false;
+        }
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
             || self.pending_diff.is_some()
@@ -10652,9 +11051,31 @@ struct TranscriptEntry {
     id: u64,
     kind: TranscriptEntryKind,
     collapsed: bool,
+    /// Per-entry monotonic content revision. Starts at 0 on creation
+    /// and bumps via [`Self::bump_revision`] every time the entry's
+    /// payload or collapsed state mutates. The transcript render-line
+    /// cache (`render::cache::get_or_compute_entry`) uses this value as
+    /// the entry's invalidation tag, so streaming chunks, tool-call
+    /// coalescing, and collapse toggles all transparently invalidate
+    /// the entry's cached lines without forcing a full clear.
+    ///
+    /// All mutations of `TranscriptEntry` past initial construction
+    /// MUST call `bump_revision`; the cache's correctness contract
+    /// depends on it (F09 finding).
+    revision: u64,
 }
 
 impl TranscriptEntry {
+    /// Bump the per-entry revision. Wrapping is fine because the cache
+    /// only ever compares for equality against a previously stored
+    /// snapshot — the live counter overlapping with a long-ago value
+    /// after 2^64 mutations is not a realistic concern in a TUI
+    /// session and would, in any case, produce only a stale-cache
+    /// false-hit, not a memory-safety issue.
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     fn message(id: u64, item: TranscriptItem, transcript_default: TranscriptDefault) -> Self {
         let collapsed = transcript_default == TranscriptDefault::Compact
             && item.role != Role::Assistant
@@ -10663,6 +11084,7 @@ impl TranscriptEntry {
             id,
             kind: TranscriptEntryKind::Message(item),
             collapsed,
+            revision: 0,
         }
     }
 
@@ -10694,6 +11116,7 @@ impl TranscriptEntry {
                 repeat_count: 1,
             })),
             collapsed: collapsed_default,
+            revision: 0,
         }
     }
 
@@ -10714,6 +11137,7 @@ impl TranscriptEntry {
             // it's already a single dim line.
             collapsed: kind != LogKind::Operational
                 && transcript_default == TranscriptDefault::Compact,
+            revision: 0,
         }
     }
 
@@ -10728,6 +11152,7 @@ impl TranscriptEntry {
             // Plan cards default to fully expanded even in Compact mode
             // — the whole point of the card is to show the plan body.
             collapsed: false,
+            revision: 0,
         }
     }
 
@@ -10738,6 +11163,7 @@ impl TranscriptEntry {
             // Mirror codex's `/diff`: never truncated by default. The
             // user can still Ctrl-E to fold the body if it's huge.
             collapsed: false,
+            revision: 0,
         }
     }
 
@@ -10746,6 +11172,7 @@ impl TranscriptEntry {
             id,
             kind: TranscriptEntryKind::SlashEcho(data),
             collapsed: false,
+            revision: 0,
         }
     }
 
@@ -10763,6 +11190,7 @@ impl TranscriptEntry {
             // vanished. Users on `transcript_default = "compact"` keep the
             // collapsed shape, and Ctrl-E still toggles it either way.
             collapsed: transcript_default == TranscriptDefault::Compact,
+            revision: 0,
         }
     }
 
@@ -11002,6 +11430,11 @@ fn coalesce_tool_transcript_entry(existing: &mut TranscriptEntry, next: &Transcr
         existing_tool.repeat_count += next_tool.repeat_count;
         existing_tool.result = next_tool.result.clone();
         existing_tool.call = next_tool.call.clone();
+        // Coalesce mutates the visible payload (repeat_count badge + the
+        // most recent result body), so the cached line list for this
+        // entry is now stale. The revision bump invalidates it on the
+        // next render cycle.
+        existing.bump_revision();
         true
     } else {
         false
@@ -11172,20 +11605,34 @@ impl From<TuiAlternateScreen> for TerminalMode {
 }
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: Terminal<CrosstermBackend<TerminalWriter>>,
     mode: TerminalMode,
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
+    /// Resolved DEC 2026 synchronized-output flag. Computed once at
+    /// startup from the user's [`TuiSynchronizedOutput`] policy plus
+    /// terminal-capability detection; consulted around every frame
+    /// draw to wrap output in Begin/End Synchronized Update sequences.
+    synchronized_output: bool,
 }
 
 impl TerminalGuard {
-    fn enter(alternate_screen: TuiAlternateScreen) -> Result<Self> {
+    fn enter(
+        alternate_screen: TuiAlternateScreen,
+        synchronized_output: TuiSynchronizedOutput,
+    ) -> Result<Self> {
         let mode = TerminalMode::from(alternate_screen);
+        let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let mut stdout = io::stdout();
+        // Wrap stdout in the env-gated debug-tap writer so every
+        // subsequent ANSI sequence — startup setup, draw bytes, and
+        // teardown — is mirrored to the log when
+        // `SQUEEZY_TUI_WRITE_LOG` is set. When unset the wrapper is a
+        // thin pass-through.
+        let mut writer = TerminalWriter::from_env(io::stdout());
         let _ = execute!(
-            stdout,
+            writer,
             DisableModifyOtherKeys,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
@@ -11202,36 +11649,38 @@ impl TerminalGuard {
         match mode {
             TerminalMode::Inline => {
                 execute!(
-                    stdout,
+                    writer,
                     Print(CLEAR_SCROLLBACK_AND_VISIBLE),
                     Print(DISABLE_MOUSE_MODES),
                     DisableAlternateScroll,
-                    EnableBracketedPaste
+                    EnableBracketedPaste,
+                    EnableFocusChange
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 if mouse_capture {
-                    execute!(stdout, Print(ENABLE_MOUSE_CLICK_CAPTURE))
+                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
                         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 }
             }
             TerminalMode::AlternateScreen => {
                 execute!(
-                    stdout,
+                    writer,
                     EnterAlternateScreen,
                     Print(DISABLE_MOUSE_MODES),
                     EnableAlternateScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
-                    EnableBracketedPaste
+                    EnableBracketedPaste,
+                    EnableFocusChange
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 if mouse_capture {
-                    execute!(stdout, Print(ENABLE_MOUSE_CLICK_CAPTURE))
+                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
                         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 }
             }
         }
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(writer);
         let terminal = match mode {
             TerminalMode::Inline => Terminal::with_options(
                 backend,
@@ -11248,6 +11697,7 @@ impl TerminalGuard {
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
+            synchronized_output,
         })
     }
 
@@ -11261,15 +11711,43 @@ impl TerminalGuard {
             self.wipe_inline_viewport_for_resize()?;
         }
         self.apply_terminal_title(app)?;
-        match self.mode {
+        // DEC 2026 Begin Synchronized Update bracket. Writing it through
+        // the backend buffer puts it ahead of the cell-diff bytes that
+        // `terminal.draw` is about to emit; capable terminals start
+        // buffering at parse time and commit the whole frame when they
+        // see the matching End Synchronized Update written below.
+        // Unsupported terminals silently ignore both sequences.
+        if self.synchronized_output {
+            let _ = self
+                .terminal
+                .backend_mut()
+                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
+        }
+        // `terminal.draw` returns a value that borrows the terminal,
+        // which would block the post-draw `backend_mut` reborrow below.
+        // Collapse to `Result<(), io::Error>` immediately so the borrow
+        // ends before we reach for the backend again.
+        let draw_outcome: io::Result<()> = match self.mode {
             TerminalMode::Inline => {
                 self.flush_history(app)?;
-                self.terminal.draw(|frame| render_inline(frame, app))
+                self.terminal
+                    .draw(|frame| render_inline(frame, app))
+                    .map(|_| ())
             }
-            TerminalMode::AlternateScreen => self.terminal.draw(|frame| render(frame, app)),
+            TerminalMode::AlternateScreen => {
+                self.terminal.draw(|frame| render(frame, app)).map(|_| ())
+            }
+        };
+        // Always emit ESU (even when draw fails) so the terminal does
+        // not stay parked in a buffered-update state — the spec lets a
+        // capable terminal time the bracket out on its own, but closing
+        // it promptly keeps the visible frame in sync with our state.
+        if self.synchronized_output {
+            let backend = self.terminal.backend_mut();
+            let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
+            let _ = backend.flush();
         }
-        .map(|_| ())
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))
+        draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
@@ -11354,6 +11832,7 @@ impl Drop for TerminalGuard {
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
                     DisableBracketedPaste,
+                    DisableFocusChange,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Print("\x1b]0;\x07"),
@@ -11367,6 +11846,7 @@ impl Drop for TerminalGuard {
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
                     DisableBracketedPaste,
+                    DisableFocusChange,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Print("\x1b]0;\x07"),

@@ -803,7 +803,7 @@ fn set_elicitation_policy_persists_and_is_readable() {
 
 #[test]
 fn auto_accept_emit_audit_event() {
-    // Acceptance test for squeezy-7pc: every auto-accept must leave an audit
+    // Acceptance test for MCP auto-accept audit: every auto-accept must leave an audit
     // record so a host can observe whether a malicious server has been
     // silently confirming prompts. We exercise the helper that both the
     // ClientHandler path and operators use to push records, since the rmcp
@@ -922,7 +922,7 @@ fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn server_capabilities_surfaces_experimental_flags_from_initialize_response() {
-    // Acceptance test for squeezy-4b7.9: a server declaring
+    // Acceptance test for the MCP roots-declaration finding: a server declaring
     // `{ experimental: { "squeezy/test": {} } }` in its initialize response
     // must be reachable via `registry.server_capabilities("fixture")`. We
     // drive a legacy SSE handshake (cheaper than spawning a child process

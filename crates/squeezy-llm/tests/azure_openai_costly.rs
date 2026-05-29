@@ -41,6 +41,7 @@ async fn azure_openai_responses_streaming_costly() -> Result<()> {
         api_key: None,
         base_url,
         api_version,
+        deployment_name_map: std::collections::BTreeMap::new(),
         transport: ProviderTransportConfig::default(),
     })?;
     let request = LlmRequest {
@@ -54,6 +55,7 @@ async fn azure_openai_responses_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

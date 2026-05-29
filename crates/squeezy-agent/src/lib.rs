@@ -26,12 +26,13 @@ use squeezy_core::{
     TurnMetrics, context_attachment_preview, context_attachment_storage_text,
     default_settings_path, detect_context_attachment_kind,
 };
-use squeezy_hooks::{HookEvent, HookRegistry};
+use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
-    estimate_cost, estimate_request_context_calibrated, fetch_ollama_context_window,
+    CacheSpec, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
+    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream,
+    LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate,
+    StopReason, capabilities_for, estimate_cost, estimate_request_context_calibrated,
+    fetch_ollama_context_window,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -65,11 +66,18 @@ mod ai_reviewer;
 mod cancel;
 mod context_compaction;
 mod cost_broker;
+pub mod dispatch;
 mod exploration_compiler;
+pub mod export_html;
 mod micro_compaction;
 mod permission_persist;
 mod plan_mode;
 mod roles;
+pub mod subagent_catalog;
+
+pub use dispatch::{
+    DispatchCommand, DispatchCommandKind, DispatchCommandParseError, DispatchOutcome,
+};
 
 use cancel::{CancelErr, OrCancelExt};
 use context_compaction::{
@@ -88,7 +96,11 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
+pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
+pub use subagent_catalog::{
+    PROJECT_SUBAGENTS_DIR, SubagentCatalog, SubagentDefinition, SubagentSource, USER_SUBAGENTS_DIR,
+};
 
 // Emergency belt on tool rounds per turn — codex and opencode loop
 // unbounded; CC only caps explicit-purpose subagents (its
@@ -104,7 +116,19 @@ const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
 const DELEGATE_PLAN_TOOL_NAME: &str = "delegate_plan";
 const DELEGATE_REVIEW_TOOL_NAME: &str = "delegate_review";
+const DELEGATE_CHAIN_TOOL_NAME: &str = "delegate_chain";
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+/// Placeholder substituted in each chain step's prompt with the prior
+/// step's summary. Documented here so the constant is the single source
+/// of truth for both the tool description and the runtime substitution.
+const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
+/// Hard cap on the number of steps a single `delegate_chain` call may
+/// declare. Each step burns a full subagent lease + LLM round, so the
+/// chain is intentionally narrower than the parent agent's per-turn tool
+/// budget. Eight steps is enough to thread a non-trivial multi-stage
+/// research workflow without letting the model commit the entire turn
+/// budget to one chain.
+const DELEGATE_CHAIN_MAX_STEPS: usize = 8;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -484,9 +508,11 @@ pub struct ConversationShape {
     pub function_calls: usize,
     pub function_outputs: usize,
     pub reasoning_items: usize,
+    pub image_items: usize,
     pub text_bytes: usize,
     pub tool_output_bytes: usize,
     pub reasoning_bytes: usize,
+    pub image_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1148,6 +1174,11 @@ pub struct Agent {
     /// `Some`. Defaults to `None` for backwards compatibility — callers
     /// that need hooks install a registry via `set_hooks`.
     hooks: Option<Arc<HookRegistry>>,
+    /// Optional typed [`AgentHookBus`]. Currently consulted by
+    /// [`Agent::switch_session`] so handlers can veto a session swap
+    /// (e.g. an unsaved-work guard). Defaults to `None`; callers wire a
+    /// bus via [`Agent::set_agent_hook_bus`].
+    agent_hook_bus: Option<Arc<AgentHookBus>>,
     /// Config save queued from the config screen. Drained before each
     /// `start_turn` so the running turn (if any) finishes on the old config
     /// and the next turn picks up the new one.
@@ -1509,6 +1540,7 @@ impl Agent {
             store,
             replay,
             hooks: None,
+            agent_hook_bus: None,
             pending_swap: None,
         }
     }
@@ -1588,6 +1620,21 @@ impl Agent {
     /// dispatch entirely.
     pub fn hooks(&self) -> Option<&Arc<HookRegistry>> {
         self.hooks.as_ref()
+    }
+
+    /// Install (or clear) the typed [`AgentHookBus`] consulted on
+    /// lifecycle transitions such as [`Agent::switch_session`]. The bus
+    /// is wrapped in `Arc` so cloned agents share the same handler set.
+    /// Passing `None` removes any previously-installed bus.
+    pub fn set_agent_hook_bus(&mut self, bus: Option<Arc<AgentHookBus>>) {
+        self.agent_hook_bus = bus;
+    }
+
+    /// Borrow the currently-installed typed hook bus, if any. Returns
+    /// `None` when no bus has been installed so callers can skip
+    /// dispatch entirely.
+    pub fn agent_hook_bus(&self) -> Option<&Arc<AgentHookBus>> {
+        self.agent_hook_bus.as_ref()
     }
 
     /// Snapshot of session-scoped permission rules. Primarily intended for
@@ -1841,7 +1888,8 @@ impl Agent {
             } else {
                 None
             },
-            cache_key: self.session_prompt_cache_key(),
+            cache_key: None,
+            cache: self.session_prompt_cache_key().into(),
             tools: Arc::from(request_tool_specs(
                 &all_tool_specs,
                 mode,
@@ -1873,6 +1921,73 @@ impl Agent {
     pub fn export_session(&self, session_id: &str) -> squeezy_core::Result<Value> {
         self.flush_session_log_if_current(session_id);
         SessionStore::open(&self.config).export(session_id)
+    }
+
+    /// Set (or clear, when `name` is `None`) the active session's
+    /// `display_name`. The new value is persisted to the session's
+    /// `metadata.json` *and* refreshed in the cross-project global
+    /// index so the resume picker — both same-cwd and Tab-toggled
+    /// cross-project — surfaces the user-facing name on the next
+    /// open. Returns the post-update metadata snapshot.
+    ///
+    /// Errors when no session log is attached (session logging
+    /// disabled at startup).
+    pub fn set_session_display_name(
+        &self,
+        name: Option<String>,
+    ) -> squeezy_core::Result<SessionMetadata> {
+        let Some(handle) = self.session_log.as_ref() else {
+            return Err(SqueezyError::Agent(
+                "no active session to rename".to_string(),
+            ));
+        };
+        let normalized = name.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        handle.update_metadata_and_index(|metadata| {
+            metadata.display_name = normalized;
+        })
+    }
+
+    /// Append `label` to the active session's `labels` list, deduping
+    /// case-sensitively so muscle-memory re-runs stay no-ops. Returns
+    /// `(metadata, added)`; `added` is `false` when the label was
+    /// already present, in which case the metadata snapshot is still
+    /// returned so callers can echo the current label set.
+    ///
+    /// Empty labels are rejected so the user never accidentally
+    /// inserts a blank tag.
+    pub fn add_session_label(
+        &self,
+        label: String,
+    ) -> squeezy_core::Result<(SessionMetadata, bool)> {
+        let Some(handle) = self.session_log.as_ref() else {
+            return Err(SqueezyError::Agent(
+                "no active session to label".to_string(),
+            ));
+        };
+        let normalized = label.trim().to_string();
+        if normalized.is_empty() {
+            return Err(SqueezyError::Agent("label must not be empty".to_string()));
+        }
+        let mut added = false;
+        let snapshot = handle.update_metadata_and_index(|metadata| {
+            if metadata
+                .labels
+                .iter()
+                .any(|existing| existing == &normalized)
+            {
+                return;
+            }
+            metadata.labels.push(normalized.clone());
+            added = true;
+        })?;
+        Ok((snapshot, added))
     }
 
     pub fn prepare_feedback(&self, message: &str) -> squeezy_core::Result<PreparedFeedback> {
@@ -1957,6 +2072,30 @@ impl Agent {
         Ok(transcript)
     }
 
+    /// Swap the active session to `session_id`, consulting the typed
+    /// [`AgentHookBus`] first so handlers can veto the switch.
+    ///
+    /// Each registered [`squeezy_hooks::AgentHook::before_session_switch`]
+    /// fires in registration order; the bus short-circuits on the first
+    /// [`Decision::Deny`] and this method returns
+    /// [`SqueezyError::Agent`] without touching the in-process session
+    /// state. When no bus is installed (or every hook allows) the call
+    /// delegates to [`Agent::resume_current`], so the existing
+    /// transcript-rebuild contract is preserved.
+    pub async fn switch_session(
+        &mut self,
+        session_id: &str,
+    ) -> squeezy_core::Result<Vec<TranscriptItem>> {
+        if let Some(bus) = self.agent_hook_bus.clone()
+            && let Decision::Deny { message } = bus.before_session_switch(session_id).await
+        {
+            return Err(SqueezyError::Agent(format!(
+                "session switch to {session_id} denied by hook: {message}"
+            )));
+        }
+        self.resume_current(session_id)
+    }
+
     /// Branch the active session into a sibling session that inherits the
     /// current transcript-so-far. The parent session is left resumable on
     /// disk (status flipped to `Completed`) so the user can rewind to it via
@@ -2011,6 +2150,84 @@ impl Agent {
         Ok(new_session_id)
     }
 
+    /// Branch the active session into a sibling that lives under a
+    /// **different** workspace's project dir. Unlike [`fork_current`], the
+    /// running process keeps writing to its current session — only the new
+    /// child artifact is stamped under `target_workspace_root`'s
+    /// `.squeezy/sessions/` tree, with `metadata.cwd` /
+    /// `metadata.workspace_root` rewritten to point at the target and
+    /// `metadata.parent_id` retaining the cross-workspace lineage. The user
+    /// then opens the new session manually in the target dir, or via
+    /// `squeezy --workspace <target> sessions resume <new_id>`; this method
+    /// deliberately does **not** auto-cd the running process.
+    ///
+    /// Returns the new session id, or an error if no active session log is
+    /// attached (e.g. when session logging was disabled at startup) or the
+    /// target workspace cannot be prepared for writes.
+    pub async fn fork_into(
+        &mut self,
+        target_workspace_root: &Path,
+    ) -> squeezy_core::Result<String> {
+        let Some(parent) = self.session_log.clone() else {
+            return Err(SqueezyError::Agent("no active session to fork".to_string()));
+        };
+        // Make sure the target dir exists before we ask `SessionStore::open`
+        // to resolve `.squeezy/sessions/` against it. Without this a typo
+        // surfaces deep inside `create_dir_all` with a path that mixes the
+        // canonicalisation fallback with the user's relative input, which
+        // is much harder to diagnose than a clean "target not found".
+        fs::create_dir_all(target_workspace_root)?;
+        let target_root = fs::canonicalize(target_workspace_root)
+            .unwrap_or_else(|_| target_workspace_root.to_path_buf());
+        let parent_session_id = parent.session_id().to_string();
+        let state = self.conversation_state.lock().await.clone();
+        let resume_state = state.to_resume_state();
+        // Rewrite workspace_root in a config clone so the target store
+        // resolves `.squeezy/sessions/` (and any relative `cache.root` /
+        // `session_logs.log_dir`) against the target dir. Absolute paths in
+        // the user's config keep their original behaviour, which is the
+        // documented expectation for absolutely-rooted caches.
+        let mut target_config = self.config.clone();
+        target_config.workspace_root = target_root.clone();
+        let store = SessionStore::open(&target_config);
+        let mut metadata = SessionMetadata {
+            cost: state.cost.clone(),
+            metrics: state.metrics.clone(),
+            redactions: state.redactions,
+            token_calibration: state.token_calibration.clone(),
+            parent_id: Some(parent_session_id.clone()),
+            ..SessionMetadata::new(&target_config, self.provider.name())
+        };
+        // `SessionMetadata::new` picks `cwd` from the running process via
+        // `env::current_dir()`, which would still be repo A. Pin it to the
+        // target so `squeezy sessions resume` and the missing-cwd guard
+        // both pick the target on open.
+        metadata.cwd = target_root.display().to_string();
+        let child = store.start_session(metadata)?;
+        let new_session_id = child.session_id().to_string();
+        child.write_resume_state(&resume_state)?;
+        // Record cross-workspace fork lineage so replay / bug-report tooling
+        // and the TUI session list can attribute the child to its parent
+        // even when the two live in different project trees.
+        let _ = child.append_event(SessionEvent::new(
+            "session_forked",
+            None,
+            Some(format!(
+                "forked from {parent_session_id} into {}",
+                target_root.display()
+            )),
+            json!({
+                "parent_session_id": parent_session_id,
+                "target_workspace_root": target_root.display().to_string(),
+            }),
+        ));
+        // Deliberately do not swap `self.session_log` — the in-process agent
+        // is still bound to repo A's filesystem and tools, so we let the user
+        // open the new session manually in the target dir (or via
+        // session-id resume) rather than auto-cd-ing the running process.
+        Ok(new_session_id)
+    }
+
     pub async fn finish_session(&self, status: SessionStatus) {
         let Some(session) = &self.session_log else {
             return;
@@ -2030,6 +2247,12 @@ impl Agent {
         if let Some(session) = &self.session_log
             && session.session_id() == session_id
         {
+            // The active session may still be in the lazy-F12 Pending
+            // state if no substantive event has been appended yet.
+            // Materialise so `SessionStore::show(...)` sees a real
+            // metadata.json on disk; flush_events then catches anything
+            // buffered in the writer.
+            let _ = session.materialize_now();
             let _ = session.flush_events();
         }
     }
@@ -2043,6 +2266,28 @@ impl Agent {
             "pasted context".to_string(),
             None,
             text.into_bytes(),
+        )
+        .await
+    }
+
+    /// Byte-oriented paste path used when the incoming payload may
+    /// not be valid UTF-8 — chiefly images dropped through a
+    /// terminal's image-aware paste protocol or via direct binary
+    /// upload. The bytes flow through the same detect/redact pipeline
+    /// as [`Agent::attach_pasted_context`]; when
+    /// [`squeezy_core::detect_image_mime`] confirms a vision-routable
+    /// payload (PNG/JPEG/GIF/WEBP) the attachment is stored
+    /// [`ContextAttachmentKind::Image`] and fans into a
+    /// `LlmInputItem::Image` on the next turn.
+    pub async fn attach_pasted_bytes(
+        &self,
+        bytes: Vec<u8>,
+    ) -> squeezy_core::Result<ContextAttachmentUpdate> {
+        self.attach_context_bytes(
+            ContextAttachmentSource::Paste,
+            "pasted context".to_string(),
+            None,
+            bytes,
         )
         .await
     }
@@ -2162,56 +2407,237 @@ impl Agent {
         Ok(report)
     }
 
-    /// Dispatch an agent-side slash command (e.g. from a non-TUI
-    /// driver such as `squeezy-eval`). Only commands whose behavior
-    /// lives wholly inside `Agent` are handled here — TUI-only
-    /// commands (overlays, help text) return `Unsupported`.
-    ///
-    /// The structured outcome is suitable for embedding in JSON
-    /// transcripts; the TUI is free to render its own variant on top.
-    pub async fn dispatch_command(&self, name: &str, _args: &str) -> CommandOutcome {
-        let normalized = name.trim().trim_start_matches('/').to_ascii_lowercase();
-        match normalized.as_str() {
-            "compact" => match self.compact_context_manual().await {
-                Ok(_) => CommandOutcome::Compacted,
-                Err(err) => CommandOutcome::Error {
-                    command: normalized,
-                    message: format!("{err}"),
-                },
-            },
-            "plan" => {
+    /// Dispatch a typed slash command. Every entry in
+    /// `squeezy-tui`'s `SLASH_COMMANDS` table maps to a
+    /// [`DispatchCommand`] variant; variants whose action lives wholly
+    /// in `Agent` execute here, while variants whose effect lives in
+    /// the TUI renderer (overlays, transcript pushes, clipboard, …)
+    /// return [`DispatchOutcome::TuiOnly`] so the TUI can run its
+    /// existing helper while RPC/eval drivers see a structured value.
+    pub async fn dispatch_command(&self, cmd: DispatchCommand) -> DispatchOutcome {
+        match cmd {
+            DispatchCommand::Compact { undo } => {
+                if undo {
+                    match self.compact_context_undo().await {
+                        Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
+                        Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
+                        Err(err) => DispatchOutcome::Error {
+                            command: "/compact".into(),
+                            message: format!("{err}"),
+                        },
+                    }
+                } else {
+                    match self.compact_context_manual().await {
+                        Ok(_) => DispatchOutcome::Compacted,
+                        Err(err) => DispatchOutcome::Error {
+                            command: "/compact".into(),
+                            message: format!("{err}"),
+                        },
+                    }
+                }
+            }
+            DispatchCommand::Plan { .. } => {
                 let changed = self.set_session_mode(SessionMode::Plan, "dispatch_command");
-                CommandOutcome::ModeChanged {
+                DispatchOutcome::ModeChanged {
                     mode: "plan".into(),
                     changed,
                 }
             }
-            "build" => {
+            DispatchCommand::Build { .. } => {
                 let changed = self.set_session_mode(SessionMode::Build, "dispatch_command");
-                CommandOutcome::ModeChanged {
+                DispatchOutcome::ModeChanged {
                     mode: "build".into(),
                     changed,
                 }
             }
-            "cost" => {
+            DispatchCommand::Cost => {
                 let snap = self.session_accounting_snapshot().await;
-                CommandOutcome::CostSnapshot {
-                    debug: format!("{:?}", snap),
+                DispatchOutcome::CostSnapshot {
+                    debug: format!("{snap:?}"),
                 }
             }
-            // `tasks` is the canonical name; `jobs` is kept as an alias for
-            // one release so eval traces with the old vocabulary still work.
-            // See F07-cc-tasks-and-background-jobs.
-            "tasks" | "jobs" => {
+            DispatchCommand::Context => {
+                let snap = self.session_accounting_snapshot().await;
+                DispatchOutcome::ContextSnapshot {
+                    debug: format!("{snap:?}"),
+                }
+            }
+            DispatchCommand::Reviewer => {
+                let entries = self.reviewer_audit_snapshot();
+                DispatchOutcome::ReviewerSnapshot {
+                    count: entries.len(),
+                }
+            }
+            DispatchCommand::Tasks | DispatchCommand::Jobs => {
                 let jobs = self.jobs_snapshot();
-                CommandOutcome::JobsList { count: jobs.len() }
+                DispatchOutcome::JobsList { count: jobs.len() }
             }
-            "permissions" => {
+            DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+                let job_id = id.parse::<JobId>().ok();
+                let found = job_id.and_then(|id| self.job_snapshot(id)).is_some();
+                DispatchOutcome::TaskDetail { id, found }
+            }
+            DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+                let cancelled = id
+                    .parse::<JobId>()
+                    .ok()
+                    .map(|id| self.cancel_job(id))
+                    .unwrap_or(false);
+                DispatchOutcome::TaskCancel { id, cancelled }
+            }
+            DispatchCommand::Permissions => {
                 let rules = self.session_rules_snapshot();
-                CommandOutcome::PermissionsList { count: rules.len() }
+                DispatchOutcome::PermissionsList { count: rules.len() }
             }
-            other => CommandOutcome::Unsupported {
-                command: other.to_string(),
+            DispatchCommand::Attach { path } => {
+                match self.attach_file_context(PathBuf::from(&path)).await {
+                    Ok(update) => DispatchOutcome::Attached {
+                        id: update.attachment.id.clone(),
+                    },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/attach".into(),
+                        message: format!("{err}"),
+                    },
+                }
+            }
+            DispatchCommand::Detach { id } => match self.detach_context_attachment(&id).await {
+                Ok(attachment) => DispatchOutcome::Detached {
+                    id: attachment.id.clone(),
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/detach".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::Attachments => {
+                let count = self.context_attachments_snapshot().await.len();
+                DispatchOutcome::AttachmentsList { count }
+            }
+            DispatchCommand::Pins => {
+                let count = self.context_compaction_snapshot().await.pinned.len();
+                DispatchOutcome::PinsList { count }
+            }
+            DispatchCommand::Unpin { id } => match self.unpin_context_entry(&id).await {
+                Ok(pin) => DispatchOutcome::Unpinned { id: pin.id },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/unpin".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::Sessions => match self.list_sessions(&SessionQuery::default()) {
+                Ok(sessions) => DispatchOutcome::SessionsList {
+                    count: sessions.len(),
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/sessions".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::Session { id } => {
+                let exists = self.show_session(&id).is_ok();
+                DispatchOutcome::SessionDetail {
+                    session_id: id,
+                    exists,
+                }
+            }
+            DispatchCommand::SessionRename { name } => {
+                let normalized = if name.trim().is_empty() {
+                    None
+                } else {
+                    Some(name)
+                };
+                match self.set_session_display_name(normalized) {
+                    Ok(metadata) => DispatchOutcome::SessionRenamed {
+                        session_id: metadata.session_id,
+                        display_name: metadata.display_name,
+                    },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/session".into(),
+                        message: format!("{err}"),
+                    },
+                }
+            }
+            DispatchCommand::SessionLabel { name } => match self.add_session_label(name.clone()) {
+                Ok((metadata, added)) => DispatchOutcome::SessionLabelled {
+                    session_id: metadata.session_id,
+                    label: name,
+                    added,
+                    labels: metadata.labels,
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/session".into(),
+                    message: format!("{err}"),
+                },
+            },
+            DispatchCommand::SessionExport { id } => match self.export_session(&id) {
+                Ok(value) => DispatchOutcome::SessionExported {
+                    session_id: id,
+                    bytes: serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0),
+                },
+                Err(err) => DispatchOutcome::Error {
+                    command: "/session-export".into(),
+                    message: format!("{err}"),
+                },
+            },
+            // `/fork`, `/resume`, `/session-export-html`, `/session-cleanup`,
+            // `/pin`, `/checkpoint*`, `/undo`, `/revert-turn` require &mut
+            // self or interact with TUI-owned state (clipboard, transcript
+            // selection, vcs background job). The TUI keeps running those
+            // through its existing helpers; the agent dispatch records the
+            // typed entry point via `TuiOnly` so RPC drivers still see the
+            // command they invoked.
+            cmd @ (DispatchCommand::Fork
+            | DispatchCommand::Resume { .. }
+            | DispatchCommand::SessionExportHtml { .. }
+            | DispatchCommand::SessionCleanup { .. }
+            | DispatchCommand::Pin { .. }
+            | DispatchCommand::Checkpoints
+            | DispatchCommand::Checkpoint { .. }
+            | DispatchCommand::Undo
+            | DispatchCommand::RevertTurn { .. }
+            | DispatchCommand::Help { .. }
+            | DispatchCommand::Config { .. }
+            | DispatchCommand::Model
+            | DispatchCommand::Plans { .. }
+            | DispatchCommand::Copy { .. }
+            | DispatchCommand::Collapse { .. }
+            | DispatchCommand::Expand { .. }
+            | DispatchCommand::Diff
+            | DispatchCommand::Feedback { .. }
+            | DispatchCommand::Report { .. }
+            | DispatchCommand::Effort { .. }
+            | DispatchCommand::Verbosity { .. }
+            | DispatchCommand::ToolVerbosity { .. }
+            | DispatchCommand::Statusline
+            | DispatchCommand::Theme { .. }
+            | DispatchCommand::Keymap) => DispatchOutcome::TuiOnly {
+                command: cmd.slash_name().trim_start_matches('/').to_string(),
+            },
+        }
+    }
+
+    /// Convenience wrapper that parses a raw slash-prefixed string into
+    /// a [`DispatchCommand`] and dispatches it. Returns
+    /// [`DispatchOutcome::Unsupported`] for unrecognised heads (so the
+    /// eval `unsupported_slash_command` rule keeps firing) and
+    /// [`DispatchOutcome::Error`] for usage failures.
+    pub async fn dispatch_command_raw(&self, raw: &str) -> DispatchOutcome {
+        match DispatchCommand::parse(raw) {
+            Ok(cmd) => self.dispatch_command(cmd).await,
+            Err(DispatchCommandParseError::Unknown { command }) => {
+                DispatchOutcome::Unsupported { command }
+            }
+            Err(DispatchCommandParseError::Empty) => DispatchOutcome::Error {
+                command: String::new(),
+                message: "empty command".to_string(),
+            },
+            Err(DispatchCommandParseError::NotASlashCommand) => DispatchOutcome::Error {
+                command: raw.to_string(),
+                message: "expected a slash command".to_string(),
+            },
+            Err(DispatchCommandParseError::Usage { command, hint }) => DispatchOutcome::Error {
+                command,
+                message: hint,
             },
         }
     }
@@ -2406,6 +2832,62 @@ impl Agent {
         let id = self.next_context_attachment_id();
         let redacted_label = self.redactor.redact(&label).text;
         let redacted_path = path.map(|value| self.redactor.redact(&value).text);
+
+        // F18: route vision-grade image bytes into an active
+        // attachment that carries the raw payload (base64-stored so
+        // resume stays JSON-safe) so `start_turn` can fan it out into
+        // a `LlmInputItem::Image`. The provider-side
+        // `ensure_vision_support` gate still runs before any HTTP
+        // traffic — a text-only model surfaces a structured
+        // `ProviderRequest` error on the next turn rather than
+        // failing the attach.
+        if kind.is_routable_image() {
+            use base64::Engine as _;
+            let media_type = squeezy_core::detect_image_mime(&bytes)
+                .map(|mime| mime.to_string())
+                .unwrap_or_else(|| "image/png".to_string());
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let preview = format!("[{media_type} attachment, {original_bytes} bytes]");
+            let preview_bytes = preview.len();
+            let attachment = ContextAttachment {
+                id,
+                source,
+                kind,
+                status: ContextAttachmentStatus::Attached,
+                label: redacted_label,
+                path: redacted_path,
+                original_sha256,
+                redacted_sha256: None,
+                original_bytes,
+                stored_bytes: original_bytes,
+                preview_bytes,
+                redactions: 0,
+                preview,
+                truncated: false,
+                image_media_type: Some(media_type),
+                image_data_base64: Some(encoded),
+            };
+            state.context_attachments.push(attachment.clone());
+            self.persist_context_attachments(&state)?;
+            if let Some(session) = &self.session_log {
+                let _ = session.write_context_attachment(&attachment, None);
+            }
+            drop(state);
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "context_attached_image",
+                None,
+                Some(format!("attached image {}", attachment.id)),
+                json!({ "attachment": attachment.clone() }),
+            );
+            return Ok(ContextAttachmentUpdate {
+                attachment,
+                duplicate: false,
+                active: true,
+            });
+        }
+
         if !kind.is_supported_text() {
             let attachment = ContextAttachment {
                 id,
@@ -2422,6 +2904,8 @@ impl Agent {
                 redactions: 0,
                 preview: String::new(),
                 truncated: false,
+                image_media_type: None,
+                image_data_base64: None,
             };
             state.context_attachments.push(attachment.clone());
             self.persist_context_attachments(&state)?;
@@ -2465,6 +2949,8 @@ impl Agent {
             redactions: redacted.redactions,
             preview,
             truncated,
+            image_media_type: None,
+            image_data_base64: None,
         };
         state.redactions += attachment.redactions;
         state.context_attachments.push(attachment.clone());
@@ -2504,6 +2990,71 @@ impl Agent {
     fn next_context_attachment_id(&self) -> String {
         let next = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
         format!("att-{next:04}")
+    }
+
+    /// Start a fresh user turn with `input` as the first user message.
+    ///
+    /// This is the "next_turn" leg of the three-way user-input surface:
+    ///
+    /// - [`Agent::next_turn`] — start a new user turn from scratch (this
+    ///   method). Equivalent to [`Agent::start_turn`]; kept as a typed
+    ///   alias so callers can express intent ("I am starting a new turn")
+    ///   without leaking the internal `start_turn` name into call sites.
+    /// - [`Agent::follow_up`] — append an additional user message to the
+    ///   conversation without starting a new turn. Used when the user
+    ///   wants to extend the current turn with more context.
+    /// - [`Agent::steer`] — interrupt the running turn with new input.
+    ///   See the doc comment on `steer` for the current behavior.
+    ///
+    /// Returns the same [`mpsc::Receiver<AgentEvent>`] stream that
+    /// [`Agent::start_turn`] returns; callers drive the turn by
+    /// consuming events from the receiver until the turn terminates.
+    pub fn next_turn(
+        &self,
+        input: String,
+        cancel: CancellationToken,
+    ) -> mpsc::Receiver<AgentEvent> {
+        self.start_turn(input, cancel)
+    }
+
+    /// Append an additional user message to the in-flight (or next)
+    /// turn's conversation without starting a fresh turn.
+    ///
+    /// This is the "follow_up" leg of the three-way user-input surface
+    /// (see [`Agent::next_turn`] for the full taxonomy). It pushes
+    /// `text` onto the live conversation transcript so the message is
+    /// visible to the model on the *current* turn's next provider call
+    /// (or on the next turn, if no turn is currently running).
+    ///
+    /// Internally this dispatches through the same conversation-queue
+    /// path as [`Agent::queue_user_message`], which the eval driver
+    /// uses to script "interrupting user" behavior. The typed name is
+    /// preferred at new call sites because it makes the intent
+    /// ("continue the current turn") explicit.
+    pub async fn follow_up(&self, text: String) {
+        self.queue_user_message(text).await;
+    }
+
+    /// Interrupt the running turn with new user input and start a new
+    /// turn from `input`.
+    ///
+    /// This is the "steer" leg of the three-way user-input surface
+    /// (see [`Agent::next_turn`] for the full taxonomy). Semantically,
+    /// `steer` should cancel the in-flight turn (if any) and replace
+    /// it with a fresh turn whose first user message is `input`.
+    ///
+    /// TODO: mid-turn interrupt-with-new-input is not yet implemented.
+    /// The agent currently has no built-in mechanism to cancel the
+    /// running turn from inside this call; cancellation is owned by
+    /// the caller-supplied [`CancellationToken`] for the previous
+    /// `start_turn`/`next_turn` invocation, not by the agent.
+    /// Until that wiring lands, `steer` aliases [`Agent::next_turn`]:
+    /// it starts a new turn but does *not* cancel an in-flight one.
+    /// The caller remains responsible for cancelling the previous
+    /// turn's token before calling `steer` if it wants
+    /// interrupt-then-replace behavior.
+    pub fn steer(&self, input: String, cancel: CancellationToken) -> mpsc::Receiver<AgentEvent> {
+        self.next_turn(input, cancel)
     }
 
     pub fn start_turn(
@@ -2576,12 +3127,13 @@ impl Agent {
                 {
                     return;
                 }
-                if let Some(call) = local_shell_command_call(&task_title) {
+                if let Some((call, exclude_from_context)) = local_shell_command_call(&task_title) {
                     complete_local_tool_turn(
                         turn_id,
                         task_title,
                         call,
                         redacted_input.redactions,
+                        exclude_from_context,
                         LocalToolTurnDeps {
                             tx: tx.clone(),
                             provider: provider.clone(),
@@ -3178,6 +3730,7 @@ async fn complete_local_tool_turn(
     task_title: String,
     call: ToolCall,
     seed_redactions: u64,
+    exclude_from_context: bool,
     deps: LocalToolTurnDeps,
 ) {
     let LocalToolTurnDeps {
@@ -3304,10 +3857,16 @@ async fn complete_local_tool_turn(
 
     {
         let mut state = conversation_state.lock().await;
-        state.conversation.push(user_item);
-        state
-            .conversation
-            .push(LlmInputItem::AssistantText(message.content.clone()));
+        // `!!cmd` (exclude_from_context) keeps the exchange visible in the
+        // TUI transcript and the durable session log, but skips the
+        // LLM-facing `conversation` so the next model round will not
+        // replay the ad-hoc check (mirrors pi's `!!` head-commit feature).
+        if !exclude_from_context {
+            state.conversation.push(user_item);
+            state
+                .conversation
+                .push(LlmInputItem::AssistantText(message.content.clone()));
+        }
         state.transcript.push(user_transcript);
         state.transcript.push(message.clone());
         merge_cost(&mut state.cost, &cost);
@@ -3407,9 +3966,22 @@ fn refresh_mcp_tools_in_background(
     });
 }
 
-fn local_shell_command_call(input: &str) -> Option<ToolCall> {
-    let command = local_shell_command(input)?;
-    Some(ToolCall {
+/// Parsed `!cmd` or `!!cmd` prompt. The second form runs identically to the
+/// first (same direct-user shell call, same sandbox bypass) but its
+/// transcript and tool output are kept out of the LLM-facing
+/// `conversation` so ad-hoc checks like `!!git status` do not bloat
+/// future requests or the prompt cache.
+struct LocalShellCommand {
+    command: String,
+    exclude_from_context: bool,
+}
+
+fn local_shell_command_call(input: &str) -> Option<(ToolCall, bool)> {
+    let LocalShellCommand {
+        command,
+        exclude_from_context,
+    } = local_shell_command(input)?;
+    let call = ToolCall {
         call_id: "local-shell-1".to_string(),
         name: "shell".to_string(),
         arguments: json!({
@@ -3425,15 +3997,25 @@ fn local_shell_command_call(input: &str) -> Option<ToolCall> {
             // toggling `direct_user_shell` alone.
             "direct_user_shell_nonce": squeezy_tools::direct_user_shell_nonce(),
         }),
-    })
+    };
+    Some((call, exclude_from_context))
 }
 
-fn local_shell_command(input: &str) -> Option<String> {
+fn local_shell_command(input: &str) -> Option<LocalShellCommand> {
     let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.lines().count() > 1 {
         return None;
     }
-    trimmed.strip_prefix('!').and_then(nonempty_shell_command)
+    let after_first = trimmed.strip_prefix('!')?;
+    let (rest, exclude_from_context) = match after_first.strip_prefix('!') {
+        Some(stripped) => (stripped, true),
+        None => (after_first, false),
+    };
+    let command = nonempty_shell_command(rest)?;
+    Some(LocalShellCommand {
+        command,
+        exclude_from_context,
+    })
 }
 
 fn nonempty_shell_command(command: &str) -> Option<String> {
@@ -3723,30 +4305,54 @@ impl TurnRuntime {
             .map(|handle| format!("squeezy::{}", handle.session_id()))
     }
 
-    /// Fan out a `HookEvent::PreTurn` to every registered handler when
-    /// a hook registry is installed. Mutation replies are logged but
-    /// not yet applied — that wiring is deferred to a follow-up
-    /// commit so this first hooks foundation stays minimal and
-    /// strictly observational. Returns immediately when no registry
-    /// is configured so the no-hooks path costs zero allocations.
-    fn dispatch_pre_turn(&self) {
-        let Some(registry) = self.hooks.as_ref() else {
-            return;
-        };
+    /// Fan out a `HookPayload::PreTurn` to every registered handler.
+    ///
+    /// Returns the concatenation of every handler's
+    /// `{"extra_instructions": "..."}` mutate field (in registration
+    /// order, separated by blank lines). Callers append the returned
+    /// text to the per-turn instructions so PreTurn handlers can
+    /// inject preamble (timestamps, on-call context, policy reminders)
+    /// without rewriting the whole instructions string. Mutate values
+    /// without a string `extra_instructions` field are logged for audit
+    /// and otherwise ignored. Returns `None` when no registry is
+    /// configured, when the registry is empty, or when no handler
+    /// proposed an extras mutation, so the no-hooks path costs zero
+    /// allocations.
+    fn dispatch_pre_turn(&self) -> Option<String> {
+        let registry = self.hooks.as_ref()?;
         if registry.is_empty() {
-            return;
+            return None;
         }
-        let payload = json!({ "turn_index": self.turn_id.to_string() });
-        let results = registry.dispatch(HookEvent::PreTurn, payload);
+        let results = registry.dispatch(HookPayload::PreTurn {
+            turn_id: self.turn_id.to_string(),
+        });
+        let mut extra_blocks: Vec<String> = Vec::new();
         for (idx, result) in results.iter().enumerate() {
             if let Some(mutate) = result.mutate.as_ref() {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    %mutate,
-                    "PreTurn handler proposed a mutation (not yet applied)"
-                );
+                let extracted = mutate
+                    .get("extra_instructions")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                if let Some(text) = extracted {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        chars = text.chars().count(),
+                        "PreTurn handler appended extra_instructions"
+                    );
+                    extra_blocks.push(text);
+                } else {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        %mutate,
+                        "PreTurn handler proposed an unsupported mutation shape (ignored)"
+                    );
+                }
             }
             if !result.allow {
                 tracing::debug!(
@@ -3758,14 +4364,127 @@ impl TurnRuntime {
                 );
             }
         }
+        if extra_blocks.is_empty() {
+            None
+        } else {
+            Some(extra_blocks.join("\n\n"))
+        }
     }
 
-    /// Fan out a `HookEvent::PreCompact` to every registered handler
-    /// when a hook registry is installed. `before_tokens` is the
-    /// pre-compaction estimate so handlers can decide whether to log,
-    /// veto (advisory today; not yet enforced), or react. The hook is
-    /// skipped entirely when no registry is configured so the no-hooks
-    /// path stays allocation-free.
+    /// Fan out a `HookPayload::UserPromptSubmit` carrying the user
+    /// input. Handlers can rewrite the prompt by returning
+    /// `mutate = {"prompt": "..."}`; later handlers see the
+    /// rewrites by earlier ones, so the final string the loop sees
+    /// is the result of the whole chain.
+    fn dispatch_user_prompt_submit(&self, input: String) -> String {
+        let Some(registry) = self.hooks.as_ref() else {
+            return input;
+        };
+        if registry.is_empty() {
+            return input;
+        }
+        let mut current = input;
+        let results = registry.dispatch(HookPayload::UserPromptSubmit {
+            prompt: current.clone(),
+            turn_id: self.turn_id.to_string(),
+        });
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                let replacement = mutate
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                if let Some(replacement) = replacement {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        old_chars = current.chars().count(),
+                        new_chars = replacement.chars().count(),
+                        "UserPromptSubmit handler rewrote prompt"
+                    );
+                    current = replacement;
+                } else {
+                    tracing::debug!(
+                        target: "squeezy::hooks",
+                        turn_id = %self.turn_id,
+                        handler_index = idx,
+                        %mutate,
+                        "UserPromptSubmit handler proposed an unsupported mutation shape (ignored)"
+                    );
+                }
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "UserPromptSubmit handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
+        current
+    }
+
+    /// Fan out a `HookPayload::SessionStart` once per session. Fires
+    /// on the first turn of the session because hooks are installed
+    /// via [`Agent::set_hooks`] after construction — dispatching from
+    /// `Agent::new` would skip handlers the caller wires up later.
+    fn dispatch_session_start(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let session_id = self.session_id().unwrap_or_else(|| "unknown".to_string());
+        let results = registry.dispatch(HookPayload::SessionStart {
+            session_id,
+            reason: "turn_started".to_string(),
+        });
+        log_observational_results("SessionStart", self.turn_id, &results);
+    }
+
+    /// Fan out a `HookPayload::Setup` once per agent boot in this
+    /// workspace. Companion to [`TurnRuntime::dispatch_session_start`]
+    /// — handlers may install caches or run maintenance tasks
+    /// without retripping on resumes.
+    fn dispatch_setup(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let workspace = self.config.workspace_root.display().to_string();
+        let results = registry.dispatch(HookPayload::Setup {
+            workspace,
+            reason: "agent_boot".to_string(),
+        });
+        log_observational_results("Setup", self.turn_id, &results);
+    }
+
+    /// Fan out a `HookPayload::Stop` at the very end of a turn.
+    /// Audit handlers can capture turn boundaries without listening
+    /// to the `AgentEvent::Completed` channel directly.
+    fn dispatch_stop(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let results = registry.dispatch(HookPayload::Stop {
+            turn_id: self.turn_id.to_string(),
+        });
+        log_observational_results("Stop", self.turn_id, &results);
+    }
+
+    /// Fan out a `HookPayload::PreCompact` when a hook registry is
+    /// installed. `before_tokens` is the pre-compaction estimate so
+    /// handlers can decide whether to log, veto (advisory today; not
+    /// yet enforced), or react.
     fn dispatch_pre_compact(&self, before_tokens: u64) {
         let Some(registry) = self.hooks.as_ref() else {
             return;
@@ -3773,37 +4492,16 @@ impl TurnRuntime {
         if registry.is_empty() {
             return;
         }
-        let payload = json!({
-            "turn_index": self.turn_id.to_string(),
-            "before_tokens": before_tokens,
+        let results = registry.dispatch(HookPayload::PreCompact {
+            turn_id: self.turn_id.to_string(),
+            before_tokens,
         });
-        let results = registry.dispatch(HookEvent::PreCompact, payload);
-        for (idx, result) in results.iter().enumerate() {
-            if let Some(mutate) = result.mutate.as_ref() {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    %mutate,
-                    "PreCompact handler proposed a mutation (not yet applied)"
-                );
-            }
-            if !result.allow {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    message = result.message.as_deref().unwrap_or(""),
-                    "PreCompact handler returned allow=false (not yet enforced)"
-                );
-            }
-        }
+        log_observational_results("PreCompact", self.turn_id, &results);
     }
 
-    /// Fan out a `HookEvent::PostCompact` carrying the before/after
+    /// Fan out a `HookPayload::PostCompact` carrying the before/after
     /// token counts so handlers can observe how much the rewrite
-    /// shrank the conversation. Mirrors `dispatch_pre_compact` in
-    /// every other respect.
+    /// shrank the conversation.
     fn dispatch_post_compact(&self, before_tokens: u64, after_tokens: u64) {
         let Some(registry) = self.hooks.as_ref() else {
             return;
@@ -3811,35 +4509,30 @@ impl TurnRuntime {
         if registry.is_empty() {
             return;
         }
-        let payload = json!({
-            "turn_index": self.turn_id.to_string(),
-            "before_tokens": before_tokens,
-            "after_tokens": after_tokens,
+        let results = registry.dispatch(HookPayload::PostCompact {
+            turn_id: self.turn_id.to_string(),
+            before_tokens,
+            after_tokens,
         });
-        let results = registry.dispatch(HookEvent::PostCompact, payload);
-        for (idx, result) in results.iter().enumerate() {
-            if let Some(mutate) = result.mutate.as_ref() {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    %mutate,
-                    "PostCompact handler proposed a mutation (not yet applied)"
-                );
-            }
-            if !result.allow {
-                tracing::debug!(
-                    target: "squeezy::hooks",
-                    turn_id = %self.turn_id,
-                    handler_index = idx,
-                    message = result.message.as_deref().unwrap_or(""),
-                    "PostCompact handler returned allow=false (not yet enforced)"
-                );
-            }
-        }
+        log_observational_results("PostCompact", self.turn_id, &results);
     }
 
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
+        // Session-scoped hooks fire on the first turn so handlers
+        // installed via `Agent::set_hooks` *after* `Agent::new`
+        // still observe the boundary. Cheap when no hooks are
+        // registered (each helper short-circuits before building a
+        // payload).
+        if self.turn_id.get() == 1 {
+            self.dispatch_setup();
+            self.dispatch_session_start();
+        }
+        // UserPromptSubmit gives handlers a chance to rewrite the
+        // user's input before any skill activation or routing. The
+        // `mutate.prompt` field of any handler's reply replaces the
+        // in-flight prompt; the chain runs in registration order so
+        // later handlers see earlier rewrites.
+        let input = self.dispatch_user_prompt_submit(input);
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
         let base_instructions = match self.tools.format_active_skills(&activation.skills) {
@@ -3892,12 +4585,24 @@ impl TurnRuntime {
             )),
             &self.redactor,
         );
+        // F18: fan vision-routable image attachments into
+        // `LlmInputItem::Image` items so the bytes reach the provider
+        // verbatim. They sit immediately after the user text so each
+        // provider's request encoder can coalesce them into a single
+        // multimodal user message (Anthropic content blocks, OpenAI
+        // `input_image`, Bedrock `ImageBlock`, …). The provider's
+        // `ensure_vision_support` call then surfaces a structured
+        // `ProviderRequest` error if the active model lacks vision.
+        let image_items = image_input_items_for_attachments(&active_attachments);
         // Upgrade any legacy conversation items resumed from disk so the
         // invariant holds for the rest of this turn. Idempotent and
         // cheap for items already in redacted form.
         let mut conversation =
             redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
         conversation.push(user_item.clone());
+        for image_item in &image_items {
+            conversation.push(image_item.clone());
+        }
         let mut context_compaction = prior_state.context_compaction.clone();
         // PreCompact hook fires only when the auto trigger's
         // thresholds are crossed so handlers don't see a hook on every
@@ -3967,7 +4672,14 @@ impl TurnRuntime {
             None
         };
         let mut next_input = if previous_response_id.is_some() && self.config.store_responses {
-            vec![user_item.clone()]
+            // Sending only the latest user delta to the server-side
+            // store path still needs the image fan-out — the
+            // attachments are turn-scoped context the provider must
+            // see alongside the new user text.
+            let mut delta = Vec::with_capacity(1 + image_items.len());
+            delta.push(user_item.clone());
+            delta.extend(image_items.iter().cloned());
+            delta
         } else {
             conversation.clone()
         };
@@ -4163,10 +4875,16 @@ impl TurnRuntime {
         // skill append below invalidates this on a revision boundary.
         let mut instructions_cache: [Option<String>; 2] = [None, None];
         // Fire the PreTurn hook once per user turn, immediately before
-        // the first round's LLM request is built. Mutation replies are
-        // currently observational only — see `dispatch_pre_turn` for
-        // the rationale.
-        self.dispatch_pre_turn();
+        // the first round's LLM request is built. Handlers can append
+        // turn-scoped instructions via the typed mutate contract —
+        // see `dispatch_pre_turn`. The returned text is appended to
+        // `request_instructions` so the next-round builder picks it
+        // up the same way it picks up implicit skill instructions.
+        if let Some(extra) = self.dispatch_pre_turn() {
+            request_instructions.push_str("\n\n");
+            request_instructions.push_str(&extra);
+            instructions_cache = [None, None];
+        }
         // One-shot "the model promised follow-up tool use but stopped"
         // recovery latch. Set when a round ends with `finish_reason=stop`,
         // zero tool calls, AND the assistant text contains an intent
@@ -4241,7 +4959,8 @@ impl TurnRuntime {
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
-                cache_key: self.session_prompt_cache_key(),
+                cache_key: None,
+                cache: self.session_prompt_cache_key().into(),
                 tools: Arc::from(request_tool_specs(
                     &self.all_tool_specs,
                     active_mode,
@@ -4464,6 +5183,7 @@ impl TurnRuntime {
                         .await;
                         return Ok(());
                     }
+                    LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
                 }
             }
 
@@ -4831,16 +5551,27 @@ impl TurnRuntime {
             }
             seen_tool_outputs.remember_results(&results);
 
-            let outputs = results
+            // Capture each tool result's terminal status alongside its
+            // model-visible output so the post-commit `PostTool` hook
+            // below fires with the same status the agent reported for
+            // the corresponding tool round.
+            let outputs_with_status: Vec<(LlmInputItem, String, ToolStatus)> = results
                 .into_iter()
                 .map(|pending| {
                     let output = self.redactor.redact(&pending.result.model_output()).text;
-                    LlmInputItem::FunctionCallOutput {
+                    let tool_name = pending.result.tool_name.clone();
+                    let status = pending.result.status;
+                    let item = LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
-                    }
+                    };
+                    (item, tool_name, status)
                 })
-                .collect::<Vec<_>>();
+                .collect();
+            let outputs: Vec<LlmInputItem> = outputs_with_status
+                .iter()
+                .map(|(item, _, _)| item.clone())
+                .collect();
             conversation.extend(
                 tool_calls
                     .iter()
@@ -4855,6 +5586,17 @@ impl TurnRuntime {
                     tool_output_summary(output),
                     json!({ "output": resume_item_for_json(output.clone()) }),
                 );
+            }
+            // PostTool fires after every output has landed in the
+            // conversation buffer; handlers that rebuild transcript-
+            // derived state (export, audit) see the post-commit view
+            // of the turn with the same status the agent reported.
+            if let Some(registry) = self.hooks.as_ref() {
+                for (item, tool_name, status) in &outputs_with_status {
+                    if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
+                        dispatch_post_tool(registry, self.turn_id, tool_name, call_id, *status);
+                    }
+                }
             }
 
             // Mid-turn compaction (F75): if the provider reported usage
@@ -5050,6 +5792,9 @@ impl TurnRuntime {
             metrics.clone(),
         ));
         self.session_metrics.lock().await.merge_turn(metrics);
+        // Stop fires after telemetry persistence so audit handlers
+        // see the final TurnMetrics already on disk.
+        self.dispatch_stop();
     }
 
     async fn persist_turn_state(&self, input: TurnPersistInput<'_>) {
@@ -5572,6 +6317,7 @@ struct PermissionDecisionContext {
     session_log: Option<SessionHandle>,
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
     telemetry: TelemetryClient,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl PermissionDecisionContext {
@@ -5591,6 +6337,7 @@ impl PermissionDecisionContext {
             session_log: context.session_log.clone(),
             conversation_state: context.conversation_state.clone(),
             telemetry: context.telemetry.clone(),
+            hooks: context.hooks.clone(),
         }
     }
 
@@ -5890,15 +6637,6 @@ fn record_subagent_call(metrics: &mut TurnMetrics, kind: SubagentKind) {
     }
 }
 
-/// Pairs the global `subagent_failures` bump with the per-kind bucket
-/// so the totals match every early-return path in `handle_subagent_call`.
-fn record_subagent_failure(metrics: &mut TurnMetrics, kind: SubagentKind) {
-    metrics.subagent_failures += 1;
-    if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
-        bucket.failures += 1;
-    }
-}
-
 fn record_subagent_kind_execution(
     metrics: &mut TurnMetrics,
     kind: SubagentKind,
@@ -5911,6 +6649,59 @@ fn record_subagent_kind_execution(
     }
 }
 
+/// Outcome of a single subagent dispatch produced by
+/// [`run_subagent_dispatch`].
+///
+/// Carries the synthesised `ToolResult` together with the broker-mutation
+/// deltas that the parent caller must fold into its `CostBroker` after
+/// the dispatch resolves. Separating the work future from the broker
+/// mutation lets the parent fan out multiple delegate dispatches via
+/// `buffer_unordered` without two concurrent futures racing on
+/// `&mut CostBroker`.
+struct SubagentDispatchOutcome {
+    /// The user-facing result for the parent tool loop.
+    result: ToolResult,
+    /// Final summary text from the subagent's execution, or empty for
+    /// pre-execution failures. `delegate_chain` reads this verbatim when
+    /// it substitutes `{previous}` into the next step's prompt, so the
+    /// summary stays accessible without re-parsing the `ToolResult`
+    /// content JSON.
+    summary: String,
+    /// Execution metrics from a real subagent run. `Some` only when the
+    /// subagent actually ran; `None` for pre-execution failures
+    /// (subagents disabled, malformed arguments, lease cap rejection).
+    execution_metrics: Option<TurnMetrics>,
+    /// Bump the global `subagent_failures` counter post-await.
+    global_failure: bool,
+    /// Bump the per-kind `bucket.failures` counter post-await. The
+    /// historical lease-cap path bumps only the global counter, so this
+    /// stays `false` for that branch to preserve telemetry counts.
+    bucket_failure: bool,
+}
+
+/// Apply broker-mutation deltas captured by a [`SubagentDispatchOutcome`].
+///
+/// Runs serially after the concurrent dispatch resolves so two parallel
+/// delegate futures never race on `&mut CostBroker`.
+fn apply_subagent_dispatch(
+    broker: &mut CostBroker,
+    kind: SubagentKind,
+    outcome: &SubagentDispatchOutcome,
+) {
+    if let Some(metrics) = outcome.execution_metrics.as_ref() {
+        broker.metrics.merge_subagent_tool_metrics(metrics);
+        record_subagent_kind_execution(&mut broker.metrics, kind, metrics);
+    }
+    if outcome.global_failure {
+        broker.metrics.subagent_failures += 1;
+    }
+    if outcome.bucket_failure
+        && let Some(bucket) = broker.metrics.subagent_by_kind.bucket_mut(kind.as_str())
+    {
+        bucket.failures += 1;
+    }
+}
+
 async fn handle_subagent_call(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
@@ -5918,39 +6709,35 @@ async fn handle_subagent_call(
     broker: &mut CostBroker,
 ) -> ToolResult {
     record_subagent_call(&mut broker.metrics, kind);
+    let outcome = run_subagent_dispatch(context, call, kind).await;
+    apply_subagent_dispatch(broker, kind, &outcome);
+    outcome.result
+}
+
+/// Run one subagent dispatch end-to-end *without* touching the broker.
+///
+/// Identical to the prior body of `handle_subagent_call` minus the
+/// counter mutations, which are returned as a [`SubagentDispatchOutcome`]
+/// for the caller to apply once the concurrent dispatch resolves. The
+/// pre-call `subagent_calls` bump still happens in the caller before this
+/// function is awaited so the in-flight counter is always conservative.
+async fn run_subagent_dispatch(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+    kind: SubagentKind,
+) -> SubagentDispatchOutcome {
     if !context.config.subagents.enabled
         || (kind == SubagentKind::Explore && !context.config.subagents.explore_enabled)
     {
-        record_subagent_failure(&mut broker.metrics, kind);
-        return subagent_control_result(
-            call,
-            kind,
-            SubagentExecution {
-                status: ToolStatus::Denied,
-                summary: String::new(),
-                status_label: "disabled",
-                error: Some("subagent is disabled by configuration".to_string()),
-                metrics: TurnMetrics::default(),
-                supporting_receipts: Vec::new(),
-                model: subagent_model_for_kind(context.provider.name(), context.config, kind),
-                structured_output: None,
-                files_touched: Vec::new(),
-                transcript: Vec::new(),
-            },
-        );
-    }
-    let request = match parse_subagent_request(call, kind) {
-        Ok(request) => request,
-        Err(error) => {
-            record_subagent_failure(&mut broker.metrics, kind);
-            return subagent_control_result(
+        return SubagentDispatchOutcome {
+            result: subagent_control_result(
                 call,
                 kind,
                 SubagentExecution {
-                    status: ToolStatus::Error,
+                    status: ToolStatus::Denied,
                     summary: String::new(),
-                    status_label: "invalid_request",
-                    error: Some(error),
+                    status_label: "disabled",
+                    error: Some("subagent is disabled by configuration".to_string()),
                     metrics: TurnMetrics::default(),
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
@@ -5958,7 +6745,42 @@ async fn handle_subagent_call(
                     files_touched: Vec::new(),
                     transcript: Vec::new(),
                 },
-            );
+            ),
+            summary: String::new(),
+            execution_metrics: None,
+            global_failure: true,
+            bucket_failure: true,
+        };
+    }
+    let request = match parse_subagent_request(call, kind) {
+        Ok(request) => request,
+        Err(error) => {
+            return SubagentDispatchOutcome {
+                result: subagent_control_result(
+                    call,
+                    kind,
+                    SubagentExecution {
+                        status: ToolStatus::Error,
+                        summary: String::new(),
+                        status_label: "invalid_request",
+                        error: Some(error),
+                        metrics: TurnMetrics::default(),
+                        supporting_receipts: Vec::new(),
+                        model: subagent_model_for_kind(
+                            context.provider.name(),
+                            context.config,
+                            kind,
+                        ),
+                        structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
+                    },
+                ),
+                summary: String::new(),
+                execution_metrics: None,
+                global_failure: true,
+                bucket_failure: true,
+            };
         }
     };
     let child_cancel = context.cancel.child_token();
@@ -5970,7 +6792,6 @@ async fn handle_subagent_call(
     ) {
         Ok(lease) => lease,
         Err(start_error) => {
-            broker.metrics.subagent_failures += 1;
             let error_message = start_error.as_message();
             log_session_event(
                 context.session_log.as_ref(),
@@ -6004,22 +6825,32 @@ async fn handle_subagent_call(
                     active: start_error.active,
                 })
                 .await;
-            return subagent_control_result(
-                call,
-                kind,
-                SubagentExecution {
-                    status: ToolStatus::Denied,
-                    summary: String::new(),
-                    status_label: "capped",
-                    error: Some(error_message),
-                    metrics: TurnMetrics::default(),
-                    supporting_receipts: Vec::new(),
-                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
-                    structured_output: None,
-                    files_touched: Vec::new(),
-                    transcript: Vec::new(),
-                },
-            );
+            return SubagentDispatchOutcome {
+                result: subagent_control_result(
+                    call,
+                    kind,
+                    SubagentExecution {
+                        status: ToolStatus::Denied,
+                        summary: String::new(),
+                        status_label: "capped",
+                        error: Some(error_message),
+                        metrics: TurnMetrics::default(),
+                        supporting_receipts: Vec::new(),
+                        model: subagent_model_for_kind(
+                            context.provider.name(),
+                            context.config,
+                            kind,
+                        ),
+                        structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
+                    },
+                ),
+                summary: String::new(),
+                execution_metrics: None,
+                global_failure: true,
+                bucket_failure: false,
+            };
         }
     };
 
@@ -6027,6 +6858,7 @@ async fn handle_subagent_call(
         .redactor
         .redact(&compact_text(&request.prompt, 240))
         .text;
+    let subagent_id = lease.id;
     log_session_event(
         context.session_log.as_ref(),
         &context.redactor,
@@ -6039,6 +6871,9 @@ async fn handle_subagent_call(
             "thoroughness": request.thoroughness,
         }),
     );
+    if let Some(registry) = context.hooks.as_ref() {
+        dispatch_subagent_start(registry, context.turn_id, subagent_id, kind.as_str());
+    }
     let _ = context
         .tx
         .send(AgentEvent::SubagentStarted {
@@ -6057,13 +6892,17 @@ async fn handle_subagent_call(
     let child_context = context.with_cancel(child_cancel.clone());
     let execution = run_subagent(&child_context, kind, request).await;
     drop(lease);
-    broker
-        .metrics
-        .merge_subagent_tool_metrics(&execution.metrics);
-    record_subagent_kind_execution(&mut broker.metrics, kind, &execution.metrics);
-    if execution.status != ToolStatus::Success {
-        record_subagent_failure(&mut broker.metrics, kind);
+    if let Some(registry) = context.hooks.as_ref() {
+        dispatch_subagent_stop(
+            registry,
+            context.turn_id,
+            subagent_id,
+            kind.as_str(),
+            execution.status_label,
+        );
     }
+    let execution_metrics = execution.metrics.clone();
+    let status_is_failure = execution.status != ToolStatus::Success;
     let event_payload = json!({
         "agent": kind.as_str(),
         "status": execution.status_label,
@@ -6124,7 +6963,14 @@ async fn handle_subagent_call(
         }
     }
 
-    subagent_control_result(call, kind, execution)
+    let summary = execution.summary.clone();
+    SubagentDispatchOutcome {
+        result: subagent_control_result(call, kind, execution),
+        summary,
+        execution_metrics: Some(execution_metrics),
+        global_failure: status_is_failure,
+        bucket_failure: status_is_failure,
+    }
 }
 
 fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<SubagentRequest, String> {
@@ -6535,6 +7381,7 @@ async fn run_subagent_rounds(
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(tool_specs),
             store: false,
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
@@ -6614,6 +7461,7 @@ async fn run_subagent_rounds(
                         transcript: Vec::new(),
                     };
                 }
+                LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
             }
         }
 
@@ -6844,6 +7692,276 @@ fn subagent_control_result(
         content["transcript"] = json!(execution.transcript);
     }
     control_tool_result(call, execution.status, content)
+}
+
+/// One parsed step inside a `delegate_chain` invocation. Mirrors the
+/// shape of the advertised schema in [`delegate_chain_advertised_tool`].
+///
+/// `model` is currently informational — per-step model overrides are not
+/// wired through `subagent_model_for_kind` yet, so the dispatcher falls
+/// back to the configured delegate model for every step. Keeping the
+/// field on the parsed shape lets us validate the JSON contract up front
+/// and unblocks a future per-step override without another schema
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegateChainStep {
+    prompt: String,
+    scope: Option<String>,
+    model: Option<String>,
+}
+
+/// Parse the `steps` array of a `delegate_chain` call into typed
+/// [`DelegateChainStep`]s. Returns an actionable error message that
+/// surfaces to the model when the contract is violated (missing/empty
+/// `steps`, non-string fields, more than [`DELEGATE_CHAIN_MAX_STEPS`]).
+///
+/// Validation runs before any subagent leases are taken so a malformed
+/// chain never consumes the per-kind concurrency budget or bumps
+/// subagent counters mid-way through the chain.
+fn parse_delegate_chain_steps(call: &ToolCall) -> Result<Vec<DelegateChainStep>, String> {
+    let steps_value = call.arguments.get("steps").ok_or_else(|| {
+        "delegate_chain requires a `steps` array of `{prompt, model?, scope?}` objects.".to_string()
+    })?;
+    let steps_array = steps_value.as_array().ok_or_else(|| {
+        "delegate_chain `steps` must be an array of `{prompt, model?, scope?}` objects.".to_string()
+    })?;
+    if steps_array.is_empty() {
+        return Err("delegate_chain `steps` must contain at least one step.".to_string());
+    }
+    if steps_array.len() > DELEGATE_CHAIN_MAX_STEPS {
+        return Err(format!(
+            "delegate_chain `steps` may not exceed {DELEGATE_CHAIN_MAX_STEPS} steps, got {len}.",
+            len = steps_array.len()
+        ));
+    }
+    let mut steps = Vec::with_capacity(steps_array.len());
+    for (idx, raw) in steps_array.iter().enumerate() {
+        let object = raw.as_object().ok_or_else(|| {
+            format!(
+                "delegate_chain step {idx} must be a JSON object with a required `prompt` field."
+            )
+        })?;
+        let prompt = object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "delegate_chain step {idx} requires a non-empty string `prompt`. The prompt may include `{placeholder}` to substitute the prior step's summary.",
+                    placeholder = DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER,
+                )
+            })?
+            .to_string();
+        let scope = match object.get("scope") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) if value.trim().is_empty() => None,
+            Some(Value::String(value)) => Some(value.trim().to_string()),
+            Some(_) => {
+                return Err(format!(
+                    "delegate_chain step {idx} `scope` must be a string or null."
+                ));
+            }
+        };
+        let model = match object.get("model") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) if value.trim().is_empty() => None,
+            Some(Value::String(value)) => Some(value.trim().to_string()),
+            Some(_) => {
+                return Err(format!(
+                    "delegate_chain step {idx} `model` must be a string or null."
+                ));
+            }
+        };
+        steps.push(DelegateChainStep {
+            prompt,
+            scope,
+            model,
+        });
+    }
+    Ok(steps)
+}
+
+/// Substitute every literal occurrence of [`DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER`]
+/// in `template` with `previous`.
+///
+/// Done verbatim — no regex, no formatting — so a step that does not
+/// mention `{previous}` stays byte-identical and a step that mentions it
+/// multiple times sees every instance replaced. The first step's
+/// `previous` is the empty string, which mirrors how chained models in
+/// peer agents (e.g. opencode's `chain` mode) seed the placeholder for
+/// the leading step.
+fn chain_substitute_previous(template: &str, previous: &str) -> String {
+    template.replace(DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER, previous)
+}
+
+/// Roll one step's [`TurnMetrics`] into a chain-wide aggregate so the
+/// chain's synthesised `subagent_control_result` reports total tool /
+/// I/O / cost across every step. The per-step metrics are already merged
+/// into the parent broker via `apply_subagent_dispatch`; this aggregate
+/// is purely for the chain's own JSON payload.
+fn chain_accumulate_metrics(total: &mut TurnMetrics, step: &TurnMetrics) {
+    total.tool_calls += step.tool_calls;
+    total.tool_successes += step.tool_successes;
+    total.tool_errors += step.tool_errors;
+    total.tool_denials += step.tool_denials;
+    total.tool_cancellations += step.tool_cancellations;
+    total.files_scanned += step.files_scanned;
+    total.bytes_read += step.bytes_read;
+    total.matches_returned += step.matches_returned;
+    total.model_output_bytes += step.model_output_bytes;
+    total.receipt_stub_hits += step.receipt_stub_hits;
+    total.negative_receipt_hits += step.negative_receipt_hits;
+    total.spill_writes += step.spill_writes;
+    total.spill_reads += step.spill_reads;
+    total.budget_denials += step.budget_denials;
+    total.redactions += step.redactions;
+    total.record_provider(&step.provider);
+}
+
+/// Execute a `delegate_chain` call sequentially.
+///
+/// Each step is dispatched through [`run_subagent_dispatch`] as a
+/// `Delegate` subagent. The chain threads `{previous}` substitution
+/// between steps, aborts on the first non-success step, and synthesises
+/// an aggregate [`SubagentExecution`] so the parent's tool loop receives
+/// a single `subagent_control_result` describing the full chain.
+///
+/// Broker mutations are applied serially per step (chain runs in the
+/// validation loop, not the concurrent delegate batch) so the broker's
+/// per-kind bucket counts every chained subagent invocation even when
+/// the chain aborts mid-way.
+async fn handle_delegate_chain_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+    broker: &mut CostBroker,
+) -> ToolResult {
+    let steps = match parse_delegate_chain_steps(call) {
+        Ok(steps) => steps,
+        Err(error) => {
+            // Mirror the `invalid_request` shape from `run_subagent_dispatch`
+            // so the model sees the same envelope as a malformed `delegate`
+            // call. No broker mutations on this path — the parse failed
+            // before any subagent was started.
+            return subagent_control_result(
+                call,
+                SubagentKind::Delegate,
+                SubagentExecution {
+                    status: ToolStatus::Error,
+                    summary: String::new(),
+                    status_label: "invalid_request",
+                    error: Some(error),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(
+                        context.provider.name(),
+                        context.config,
+                        SubagentKind::Delegate,
+                    ),
+                    structured_output: None,
+                    files_touched: Vec::new(),
+                    transcript: Vec::new(),
+                },
+            );
+        }
+    };
+
+    let mut previous_summary = String::new();
+    let mut combined_metrics = TurnMetrics::default();
+    let mut combined_receipts: Vec<Value> = Vec::new();
+    let mut combined_files: Vec<String> = Vec::new();
+    let mut step_payloads: Vec<Value> = Vec::with_capacity(steps.len());
+    let mut chain_status = ToolStatus::Success;
+    let mut chain_status_label: &'static str = "success";
+    let mut chain_error: Option<String> = None;
+    let mut last_model = subagent_model_for_kind(
+        context.provider.name(),
+        context.config,
+        SubagentKind::Delegate,
+    );
+
+    for (step_idx, step) in steps.iter().enumerate() {
+        if context.cancel.is_cancelled() {
+            chain_status = ToolStatus::Cancelled;
+            chain_status_label = "cancelled";
+            break;
+        }
+        let substituted = chain_substitute_previous(&step.prompt, &previous_summary);
+        let mut step_args = json!({ "prompt": substituted });
+        if let Some(scope) = &step.scope {
+            step_args["scope"] = Value::String(scope.clone());
+        }
+        let step_call = ToolCall {
+            call_id: format!("{}#step_{step_idx}", call.call_id),
+            name: DELEGATE_TOOL_NAME.to_string(),
+            arguments: step_args,
+        };
+        record_subagent_call(&mut broker.metrics, SubagentKind::Delegate);
+        let outcome = run_subagent_dispatch(context, &step_call, SubagentKind::Delegate).await;
+        apply_subagent_dispatch(broker, SubagentKind::Delegate, &outcome);
+        if let Some(metrics) = outcome.execution_metrics.as_ref() {
+            chain_accumulate_metrics(&mut combined_metrics, metrics);
+        }
+        if let Some(receipts) = outcome.result.content.get("supporting_receipts").cloned()
+            && let Value::Array(items) = receipts
+        {
+            combined_receipts.extend(items);
+        }
+        if let Some(files) = outcome
+            .result
+            .content
+            .get("files_touched")
+            .and_then(Value::as_array)
+        {
+            for entry in files {
+                if let Some(path) = entry.as_str()
+                    && !combined_files.iter().any(|existing| existing == path)
+                {
+                    combined_files.push(path.to_string());
+                }
+            }
+        }
+        if let Some(model) = outcome.result.content.get("model").and_then(Value::as_str) {
+            last_model = model.to_string();
+        }
+
+        step_payloads.push(json!({
+            "step": step_idx,
+            "prompt": substituted,
+            "summary": outcome.summary,
+            "status": tool_status_label(outcome.result.status),
+            "model_hint": step.model,
+        }));
+
+        previous_summary = outcome.summary.clone();
+
+        if outcome.result.status != ToolStatus::Success {
+            chain_status = outcome.result.status;
+            chain_status_label = "chain_aborted";
+            chain_error = outcome
+                .result
+                .content
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some(format!("step {step_idx} did not complete successfully")));
+            break;
+        }
+    }
+
+    let execution = SubagentExecution {
+        status: chain_status,
+        summary: previous_summary,
+        status_label: chain_status_label,
+        error: chain_error,
+        metrics: combined_metrics,
+        supporting_receipts: combined_receipts,
+        model: last_model,
+        structured_output: Some(json!({ "chain_steps": step_payloads })),
+        files_touched: combined_files,
+        transcript: Vec::new(),
+    };
+    subagent_control_result(call, SubagentKind::Delegate, execution)
 }
 
 fn subagent_supporting_receipt(result: &ToolResult, path: Option<&str>) -> Value {
@@ -7409,6 +8527,13 @@ async fn execute_tool_calls(
     let mut approved = Vec::new();
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut recorded = vec![false; calls.len()];
+    // Buffered `delegate*` calls (excluding `delegate_chain`, which runs
+    // its own internal step sequence). The validation loop collects
+    // these so they can run concurrently bounded by
+    // `SUBAGENT_MAX_CONCURRENT` once the loop finishes, closing the gap
+    // where the lease pool advertised a 4-way budget that the
+    // single-shot dispatcher never used.
+    let mut delegate_batch_calls: Vec<(usize, ToolCall, SubagentKind)> = Vec::new();
 
     for (index, call) in calls.iter().enumerate() {
         if context.cancel.is_cancelled() {
@@ -7469,14 +8594,14 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
-        let subagent_kind = match call.name.as_str() {
-            DELEGATE_TOOL_NAME => Some(SubagentKind::Delegate),
-            EXPLORE_TOOL_NAME => Some(SubagentKind::Explore),
-            DELEGATE_PLAN_TOOL_NAME => Some(SubagentKind::Plan),
-            DELEGATE_REVIEW_TOOL_NAME => Some(SubagentKind::Review),
-            _ => None,
-        };
-        if let Some(kind) = subagent_kind {
+        if call.name == DELEGATE_CHAIN_TOOL_NAME {
+            // `delegate_chain` manages its own internal step sequencing and
+            // bookkeeping; it does NOT join the concurrent `delegate_batch`
+            // because each step would otherwise need to lock the broker
+            // mid-future. The chain still ships through the
+            // `record_and_emit_progress` flow so chain completions look
+            // identical to single delegates from the parent's telemetry
+            // perspective.
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallStarted {
@@ -7485,7 +8610,57 @@ async fn execute_tool_calls(
                     origin: context.origin,
                 })
                 .await;
-            let result = Box::pin(handle_subagent_call(&context, call, kind, broker)).await;
+            let result = Box::pin(handle_delegate_chain_call(&context, call, broker)).await;
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            continue;
+        }
+        let delegate_batch_kind = match call.name.as_str() {
+            DELEGATE_TOOL_NAME => Some(SubagentKind::Delegate),
+            DELEGATE_PLAN_TOOL_NAME => Some(SubagentKind::Plan),
+            DELEGATE_REVIEW_TOOL_NAME => Some(SubagentKind::Review),
+            _ => None,
+        };
+        if let Some(kind) = delegate_batch_kind {
+            // Pre-bump the `subagent_calls` counter before the future
+            // is spawned so the in-flight tally stays conservative even
+            // while several delegates run concurrently. Per-outcome
+            // mutations (failure counters, kind-bucket execution rollup)
+            // are deferred to `apply_subagent_dispatch` after each future
+            // resolves so concurrent futures never race on the broker.
+            record_subagent_call(&mut broker.metrics, kind);
+            delegate_batch_calls.push((index, call.clone(), kind));
+            continue;
+        }
+        if call.name == EXPLORE_TOOL_NAME {
+            // `explore` keeps the original single-shot path. The task
+            // scope only marks `delegate*` variants as parallel-safe; the
+            // explore tool stays serial so its broader research session
+            // (tool budget, exploration-state lock) doesn't have to
+            // coordinate with itself across concurrent futures.
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallStarted {
+                    turn_id: context.turn_id,
+                    call: redact_tool_call(call.clone(), &context.redactor),
+                    origin: context.origin,
+                })
+                .await;
+            let result = Box::pin(handle_subagent_call(
+                &context,
+                call,
+                SubagentKind::Explore,
+                broker,
+            ))
+            .await;
             record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
@@ -7605,6 +8780,17 @@ async fn execute_tool_calls(
                 );
             }
         }
+    }
+
+    if !delegate_batch_calls.is_empty() {
+        flush_delegate_batch(
+            &context,
+            broker,
+            &mut results,
+            &mut recorded,
+            std::mem::take(&mut delegate_batch_calls),
+        )
+        .await;
     }
 
     let mut parallel_batch = Vec::new();
@@ -7768,6 +8954,72 @@ fn cancelled_tool_result(result: &ToolResult) -> bool {
     result.status == ToolStatus::Cancelled
 }
 
+/// Fan out a batch of `delegate*` calls (sans `delegate_chain`) and
+/// resolve them concurrently bounded by [`SUBAGENT_MAX_CONCURRENT`].
+///
+/// Each future calls [`run_subagent_dispatch`] independently — the
+/// broker borrow stays serial because every future returns a
+/// [`SubagentDispatchOutcome`] that the caller folds back via
+/// [`apply_subagent_dispatch`] after collection. Pre-bumped
+/// `subagent_calls` counters happen in the validation loop before we
+/// reach this helper.
+///
+/// `recorded` mirrors the caller's tracking vec; entries are marked
+/// `true` here so the surrounding pipeline does not re-emit a deny /
+/// approval event for these slots.
+async fn flush_delegate_batch(
+    context: &ToolExecutionContext<'_>,
+    broker: &mut CostBroker,
+    results: &mut [Option<ToolResult>],
+    recorded: &mut [bool],
+    calls: Vec<(usize, ToolCall, SubagentKind)>,
+) {
+    if calls.is_empty() {
+        return;
+    }
+
+    // Emit `ToolCallStarted` for each delegate call in input order so the
+    // TUI / event subscribers still see the start lines before the model
+    // turn proceeds. The actual subagent work happens inside the
+    // buffered futures below.
+    for (_, call, _) in &calls {
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallStarted {
+                turn_id: context.turn_id,
+                call: redact_tool_call(call.clone(), &context.redactor),
+                origin: context.origin,
+            })
+            .await;
+    }
+
+    let cap = SUBAGENT_MAX_CONCURRENT.max(1);
+    let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
+        let context = context.clone();
+        async move {
+            let outcome = run_subagent_dispatch(&context, &call, kind).await;
+            (index, kind, outcome)
+        }
+    }))
+    .buffer_unordered(cap)
+    .collect::<Vec<_>>()
+    .await;
+
+    for (index, kind, outcome) in completions {
+        apply_subagent_dispatch(broker, kind, &outcome);
+        record_and_emit_progress(broker, &outcome.result, &context.tx, context.turn_id).await;
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallCompleted {
+                turn_id: context.turn_id,
+                result: outcome.result.clone(),
+            })
+            .await;
+        results[index] = Some(outcome.result);
+        recorded[index] = true;
+    }
+}
+
 async fn flush_parallel_batch(
     context: &ToolExecutionContext<'_>,
     broker: &mut CostBroker,
@@ -7852,12 +9104,13 @@ async fn flush_parallel_batch(
     }
 }
 
-/// Fan out a `HookEvent::PreToolUse` to every registered handler when
-/// a hook registry is installed. Returns the first handler-supplied
-/// deny message (in registration order) so the caller can short-circuit
-/// the tool execution with `ToolStatus::Denied`. Mutation replies are
-/// still observational — applying them is left to a follow-up commit
-/// that wires the per-tool input pipeline. Returns `None` when no
+/// Fan out a `HookPayload::PreToolUse` to every registered handler.
+///
+/// Returns the first handler-supplied deny message (in registration
+/// order) so the caller can short-circuit the tool execution with
+/// `ToolStatus::Denied`. Mutation replies are observational at this
+/// site — applying argument rewrites is deferred to the typed
+/// [`squeezy_hooks::AgentHookBus`] path. Returns `None` when no
 /// registry is configured, when the registry is empty, or when every
 /// handler returned `allow=true`, so the no-hooks path costs zero
 /// allocations.
@@ -7866,12 +9119,11 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) ->
     if registry.is_empty() {
         return None;
     }
-    let payload = json!({
-        "turn_id": context.turn_id.to_string(),
-        "tool_name": call.name,
-        "call_id": call.call_id,
+    let results = registry.dispatch(HookPayload::PreToolUse {
+        turn_id: context.turn_id.to_string(),
+        tool_name: call.name.clone(),
+        call_id: call.call_id.clone(),
     });
-    let results = registry.dispatch(HookEvent::PreToolUse, payload);
     let mut deny_message: Option<String> = None;
     for (idx, result) in results.iter().enumerate() {
         if let Some(mutate) = result.mutate.as_ref() {
@@ -7905,10 +9157,11 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) ->
     deny_message
 }
 
-/// Fan out a `HookEvent::PostToolUse` to every registered handler after
-/// a tool result is available. Same observational contract as
-/// [`dispatch_pre_tool_use`]; the payload adds `status` so audit
-/// handlers can record per-tool outcomes.
+/// Fan out a `HookPayload::PostToolUse` after a tool result is
+/// available. When the tool reported a non-success status, also
+/// fans out a [`HookPayload::PostToolUseFailure`] so failure-only
+/// handlers can filter on the discriminant without re-parsing
+/// `status`.
 fn dispatch_post_tool_use(context: &ToolExecutionContext<'_>, result: &ToolResult) {
     let Some(registry) = context.hooks.as_ref() else {
         return;
@@ -7916,34 +9169,272 @@ fn dispatch_post_tool_use(context: &ToolExecutionContext<'_>, result: &ToolResul
     if registry.is_empty() {
         return;
     }
-    let payload = json!({
-        "turn_id": context.turn_id.to_string(),
-        "tool_name": result.tool_name,
-        "call_id": result.call_id,
-        "status": tool_status_str(result.status),
+    let status_label = tool_status_str(result.status).to_string();
+    let results = registry.dispatch(HookPayload::PostToolUse {
+        turn_id: context.turn_id.to_string(),
+        tool_name: result.tool_name.clone(),
+        call_id: result.call_id.clone(),
+        status: status_label.clone(),
     });
-    let results = registry.dispatch(HookEvent::PostToolUse, payload);
-    for (idx, hook_result) in results.iter().enumerate() {
-        if let Some(mutate) = hook_result.mutate.as_ref() {
+    log_tool_observational_results(
+        "PostToolUse",
+        context.turn_id,
+        &result.tool_name,
+        &result.call_id,
+        &results,
+    );
+    if !matches!(result.status, ToolStatus::Success) {
+        let error_message = result
+            .content
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .content
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            });
+        let failure_results = registry.dispatch(HookPayload::PostToolUseFailure {
+            turn_id: context.turn_id.to_string(),
+            tool_name: result.tool_name.clone(),
+            call_id: result.call_id.clone(),
+            status: status_label,
+            error: error_message,
+        });
+        log_tool_observational_results(
+            "PostToolUseFailure",
+            context.turn_id,
+            &result.tool_name,
+            &result.call_id,
+            &failure_results,
+        );
+    }
+}
+
+/// Fan out a `HookPayload::PostTool` once each tool output is appended
+/// to the conversation. Companion to `PostToolUse` — that one fires
+/// when the tool result is computed, this one fires after the result
+/// has been committed to the conversation the model will see next
+/// round.
+fn dispatch_post_tool(
+    registry: &HookRegistry,
+    turn_id: TurnId,
+    tool_name: &str,
+    call_id: &str,
+    status: ToolStatus,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::PostTool {
+        turn_id: turn_id.to_string(),
+        tool_name: tool_name.to_string(),
+        call_id: call_id.to_string(),
+        status: tool_status_str(status).to_string(),
+    });
+    log_tool_observational_results("PostTool", turn_id, tool_name, call_id, &results);
+}
+
+/// Fan out a `HookPayload::PermissionRequest` before the permission
+/// engine renders a verdict. Audit handlers see every gated request
+/// — including those the engine auto-allows or auto-denies without
+/// surfacing an approval prompt.
+fn dispatch_permission_request(
+    registry: &HookRegistry,
+    turn_id: TurnId,
+    call: &ToolCall,
+    request: &PermissionRequest,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::PermissionRequest {
+        capability: request.capability.as_str().to_string(),
+        tool_name: call.name.clone(),
+        turn_id: turn_id.to_string(),
+        call_id: call.call_id.clone(),
+        target: Some(request.target.clone()).filter(|value| !value.is_empty()),
+    });
+    log_tool_observational_results(
+        "PermissionRequest",
+        turn_id,
+        &call.name,
+        &call.call_id,
+        &results,
+    );
+}
+
+/// Fan out a `HookPayload::PermissionDenied` whenever the verdict
+/// resolved as deny. Fires regardless of whether the deny came from
+/// the policy evaluator, the AI reviewer, a user-clicked deny, or
+/// a persistent-deny rule install.
+fn dispatch_permission_denied(
+    registry: &HookRegistry,
+    turn_id: TurnId,
+    call: &ToolCall,
+    request: &PermissionRequest,
+    reason: &str,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::PermissionDenied {
+        capability: request.capability.as_str().to_string(),
+        tool_name: call.name.clone(),
+        turn_id: turn_id.to_string(),
+        call_id: call.call_id.clone(),
+        target: Some(request.target.clone()).filter(|value| !value.is_empty()),
+        reason: reason.to_string(),
+    });
+    log_tool_observational_results(
+        "PermissionDenied",
+        turn_id,
+        &call.name,
+        &call.call_id,
+        &results,
+    );
+}
+
+/// Fan out a `HookPayload::SubagentStart` when the subagent registry
+/// hands out a fresh lease.
+fn dispatch_subagent_start(
+    registry: &HookRegistry,
+    parent_turn_id: TurnId,
+    subagent_id: u64,
+    kind: &str,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::SubagentStart {
+        subagent_id: subagent_id.to_string(),
+        kind: kind.to_string(),
+        parent_turn_id: parent_turn_id.to_string(),
+    });
+    log_subagent_observational_results(
+        "SubagentStart",
+        parent_turn_id,
+        subagent_id,
+        kind,
+        &results,
+    );
+}
+
+/// Fan out a `HookPayload::SubagentStop` after the subagent finishes
+/// (success or failure). `status_label` reuses the same vocabulary
+/// the parent agent surfaces on `AgentEvent::SubagentCompleted` /
+/// `AgentEvent::SubagentFailed`.
+fn dispatch_subagent_stop(
+    registry: &HookRegistry,
+    parent_turn_id: TurnId,
+    subagent_id: u64,
+    kind: &str,
+    status_label: &str,
+) {
+    if registry.is_empty() {
+        return;
+    }
+    let results = registry.dispatch(HookPayload::SubagentStop {
+        subagent_id: subagent_id.to_string(),
+        kind: kind.to_string(),
+        parent_turn_id: parent_turn_id.to_string(),
+        status: status_label.to_string(),
+    });
+    log_subagent_observational_results("SubagentStop", parent_turn_id, subagent_id, kind, &results);
+}
+
+fn log_observational_results(event: &'static str, turn_id: TurnId, results: &[HookResult]) {
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
             tracing::debug!(
                 target: "squeezy::hooks",
-                turn_id = %context.turn_id,
-                tool_name = %result.tool_name,
-                call_id = %result.call_id,
+                turn_id = %turn_id,
                 handler_index = idx,
+                event,
                 %mutate,
-                "PostToolUse handler proposed a mutation (not yet applied)"
+                "handler proposed a mutation (not yet applied)"
             );
         }
-        if !hook_result.allow {
+        if !result.allow {
             tracing::debug!(
                 target: "squeezy::hooks",
-                turn_id = %context.turn_id,
-                tool_name = %result.tool_name,
-                call_id = %result.call_id,
+                turn_id = %turn_id,
                 handler_index = idx,
-                message = hook_result.message.as_deref().unwrap_or(""),
-                "PostToolUse handler returned allow=false (not yet enforced)"
+                event,
+                message = result.message.as_deref().unwrap_or(""),
+                "handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+fn log_tool_observational_results(
+    event: &'static str,
+    turn_id: TurnId,
+    tool_name: &str,
+    call_id: &str,
+    results: &[HookResult],
+) {
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %turn_id,
+                tool_name = %tool_name,
+                call_id = %call_id,
+                handler_index = idx,
+                event,
+                %mutate,
+                "handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %turn_id,
+                tool_name = %tool_name,
+                call_id = %call_id,
+                handler_index = idx,
+                event,
+                message = result.message.as_deref().unwrap_or(""),
+                "handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+fn log_subagent_observational_results(
+    event: &'static str,
+    parent_turn_id: TurnId,
+    subagent_id: u64,
+    kind: &str,
+    results: &[HookResult],
+) {
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                parent_turn_id = %parent_turn_id,
+                subagent_id,
+                kind,
+                handler_index = idx,
+                event,
+                %mutate,
+                "handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                parent_turn_id = %parent_turn_id,
+                subagent_id,
+                kind,
+                handler_index = idx,
+                event,
+                message = result.message.as_deref().unwrap_or(""),
+                "handler returned allow=false (not yet enforced)"
             );
         }
     }
@@ -8382,6 +9873,13 @@ async fn permission_decision_for_request(
     call: &ToolCall,
     request: PermissionRequest,
 ) -> ApprovalDecision {
+    // PermissionRequest fires once per decision attempt, before any
+    // verdict is computed. Lets audit handlers record every gated
+    // request — including those resolved by an auto-allow rule or
+    // mode policy before the user is asked.
+    if let Some(registry) = context.hooks.as_ref() {
+        dispatch_permission_request(registry, context.turn_id, call, &request);
+    }
     let active_mode = load_session_mode(&context.session_mode);
     let session_id_for_plan_mode = context.session_id_for_plan_mode();
     let active_plan = plan_mode::latest_plan_path(
@@ -8390,6 +9888,9 @@ async fn permission_decision_for_request(
     );
     if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
+        if let Some(registry) = context.hooks.as_ref() {
+            dispatch_permission_denied(registry, context.turn_id, call, &request, &verdict.reason);
+        }
         return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
@@ -8542,6 +10043,15 @@ async fn permission_decision_for_request(
             if verdict.silent {
                 log_silent_deny(context, &request, &verdict);
             }
+            if let Some(registry) = context.hooks.as_ref() {
+                dispatch_permission_denied(
+                    registry,
+                    context.turn_id,
+                    call,
+                    &request,
+                    &verdict.reason,
+                );
+            }
             ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict))
         }
         PermissionAction::Ask => {
@@ -8584,7 +10094,11 @@ async fn permission_decision_for_request(
                 Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
             };
             if send_result.is_err() {
-                return ApprovalDecision::Denied("approval channel closed".to_string());
+                let reason = "approval channel closed".to_string();
+                if let Some(registry) = context.hooks.as_ref() {
+                    dispatch_permission_denied(registry, context.turn_id, call, &request, &reason);
+                }
+                return ApprovalDecision::Denied(reason);
             }
             let decision = match decision_rx.or_cancel(&context.cancel).await {
                 Ok(decision) => decision,
@@ -8598,7 +10112,7 @@ async fn permission_decision_for_request(
                 Some(format!("{decision:?}")),
                 json!({ "decision": format!("{decision:?}") }),
             );
-            match decision {
+            let outcome = match decision {
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
                     ApprovalDecision::Approved
                 }
@@ -8727,7 +10241,19 @@ async fn permission_decision_for_request(
                 }
                 Ok(ToolApprovalDecision::Cancelled) => ApprovalDecision::Cancelled,
                 Err(_) => ApprovalDecision::Denied("approval was not answered".to_string()),
+            };
+            // Single PermissionDenied dispatch covers every deny exit
+            // from the ask flow — user-clicked-deny, ask-rule installs
+            // that resolve as deny, persistent-deny rule installs, and
+            // the timed-out "approval was not answered" fallback.
+            // Skipped on Approved / Cancelled so handlers only see the
+            // deny half.
+            if let (Some(registry), ApprovalDecision::Denied(reason)) =
+                (context.hooks.as_ref(), &outcome)
+            {
+                dispatch_permission_denied(registry, context.turn_id, call, &request, reason);
             }
+            outcome
         }
     }
 }
@@ -9004,6 +10530,7 @@ Working target: {:?}",
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -9024,7 +10551,9 @@ Working target: {:?}",
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
             | LlmEvent::ReasoningDelta { .. }
-            | LlmEvent::ReasoningDone(_) => {}
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
     Some(parse_classifier_verdict(&text))
@@ -9271,7 +10800,16 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: spec.name,
             description: spec.description,
-            parameters: spec.parameters,
+            // LlmToolSpec is the provider-facing surface and intentionally
+            // stays a free-shape `Value` so it can be embedded directly into
+            // every provider request body. Serializing the typed
+            // [`squeezy_tools::JsonSchema`] back into a `Value` here is the
+            // only boundary point where the conversion runs; the
+            // registration-time `deny_unknown_fields` guard on
+            // [`squeezy_tools::ToolSpec::parameters`] has already rejected
+            // any first-party drift before this point.
+            parameters: serde_json::to_value(&spec.parameters)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
             strict: false,
         }),
     }
@@ -9296,6 +10834,7 @@ fn core_control_tools(
         }
         tools.push(delegate_plan_advertised_tool());
         tools.push(delegate_review_advertised_tool());
+        tools.push(delegate_chain_advertised_tool());
     }
     if session_mode == SessionMode::Plan {
         tools.push(request_user_input_advertised_tool());
@@ -9414,6 +10953,52 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
     }
 }
 
+fn delegate_chain_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: Arc::new(LlmToolSpec {
+            name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+            description: format!(
+                "Run a sequential chain of Delegate subagents. Each step's `prompt` may include the literal substring `{placeholder}`, which is replaced verbatim with the prior step's summary before the subagent is invoked. Use this when later steps must consume earlier output; for independent fanouts, issue multiple `delegate` calls in the same turn instead — they run in parallel. Chain length is capped at {max_steps} steps.",
+                placeholder = DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER,
+                max_steps = DELEGATE_CHAIN_MAX_STEPS,
+            ),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Ordered list of delegate steps to run sequentially.",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "Required: instruction for this step. May include `{previous}` to substitute the prior step's summary."
+                                },
+                                "model": {
+                                    "type": ["string", "null"],
+                                    "description": "Optional per-step model override; defaults to the parent's delegate model when omitted."
+                                },
+                                "scope": {
+                                    "type": ["string", "null"],
+                                    "description": "Optional bounded scope passed through to the subagent for this step."
+                                }
+                            },
+                            "required": ["prompt"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+            strict: false,
+        }),
+    }
+}
+
 /// Plan-mode tool that lets the model pause the turn and ask the user a
 /// clarifying multiple-choice (or free-form) question. The capability is
 /// `Read` so it survives Plan-mode tool filtering; mode gating happens at
@@ -9519,6 +11104,7 @@ fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
         DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
         DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
+        DELEGATE_CHAIN_TOOL_NAME => Some(delegate_chain_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
         REQUEST_USER_INPUT_TOOL_NAME => Some(request_user_input_advertised_tool()),
         _ => None,
@@ -9567,6 +11153,10 @@ fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
             LlmInputItem::Reasoning(payload) => {
                 shape.reasoning_items += 1;
                 shape.reasoning_bytes += payload.display_text().len();
+            }
+            LlmInputItem::Image { bytes, .. } => {
+                shape.image_items += 1;
+                shape.image_bytes += bytes.len();
             }
         }
     }
@@ -9835,6 +11425,11 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
         LlmInputItem::Reasoning(payload) => {
             LlmInputItem::Reasoning(redact_reasoning_payload(payload, redactor))
         }
+        // Image payloads are raw binary content (PNG/JPEG/...); secret
+        // detection runs on text, not pixels. Pass the bytes through
+        // unchanged so the provider's vision pipeline still receives the
+        // original image.
+        LlmInputItem::Image { media_type, bytes } => LlmInputItem::Image { media_type, bytes },
     }
 }
 
@@ -10017,6 +11612,37 @@ fn next_attachment_counter(attachments: &[ContextAttachment]) -> u64 {
         .max()
         .unwrap_or(0)
         + 1
+}
+
+/// Build the `LlmInputItem::Image` items for a turn from the agent's
+/// active context attachments. Only attachments with
+/// `kind.is_routable_image()` and a populated
+/// `image_data_base64` participate; the helper silently drops
+/// attachments missing the decoded payload (resumed legacy
+/// `UnsupportedImage` entries) so a stale persisted attachment never
+/// crashes the turn build.
+fn image_input_items_for_attachments(attachments: &[ContextAttachment]) -> Vec<LlmInputItem> {
+    use base64::Engine as _;
+    let mut items = Vec::new();
+    for attachment in attachments {
+        if !attachment.kind.is_routable_image() {
+            continue;
+        }
+        let (Some(media_type), Some(encoded)) = (
+            attachment.image_media_type.as_deref(),
+            attachment.image_data_base64.as_deref(),
+        ) else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()) else {
+            continue;
+        };
+        items.push(LlmInputItem::Image {
+            media_type: media_type.to_string(),
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        });
+    }
+    items
 }
 
 fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment]) -> String {
@@ -10253,12 +11879,13 @@ fn replay_hash(value: &impl Serialize) -> String {
 
 /// Returns a stable LlmRequest snapshot for replay-hash purposes.
 ///
-/// `cache_key` is derived from the live session id, which changes
-/// across record/replay runs, so it must be excluded from the
-/// divergence hash.
+/// The cache directive (both the legacy `cache_key` and the new `cache`
+/// field) is derived from the live session id, which changes across
+/// record/replay runs, so both must be excluded from the divergence hash.
 fn replay_request_view(request: &LlmRequest) -> LlmRequest {
     let mut view = request.clone();
     view.cache_key = None;
+    view.cache = CacheSpec::default();
     view
 }
 
@@ -10307,6 +11934,8 @@ fn tool_output_summary(item: &LlmInputItem) -> Option<String> {
 }
 
 pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     match item {
         LlmInputItem::UserText(text) => ResumeItem::UserText { text },
         LlmInputItem::AssistantText(text) => ResumeItem::AssistantText { text },
@@ -10323,6 +11952,10 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
             ResumeItem::FunctionCallOutput { call_id, output }
         }
         LlmInputItem::Reasoning(payload) => ResumeItem::Reasoning { payload },
+        LlmInputItem::Image { media_type, bytes } => ResumeItem::Image {
+            media_type,
+            data_base64: BASE64_STANDARD.encode(bytes.as_ref()),
+        },
     }
 }
 
@@ -10332,6 +11965,8 @@ fn resume_item_for_json(item: LlmInputItem) -> Value {
 }
 
 fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     match item {
         ResumeItem::UserText { text } => LlmInputItem::UserText(text),
         ResumeItem::AssistantText { text } => LlmInputItem::AssistantText(text),
@@ -10348,6 +11983,18 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
             LlmInputItem::FunctionCallOutput { call_id, output }
         }
         ResumeItem::Reasoning { payload } => LlmInputItem::Reasoning(payload),
+        ResumeItem::Image {
+            media_type,
+            data_base64,
+        } => {
+            let bytes = BASE64_STANDARD
+                .decode(data_base64.as_bytes())
+                .unwrap_or_default();
+            LlmInputItem::Image {
+                media_type,
+                bytes: std::sync::Arc::from(bytes.into_boxed_slice()),
+            }
+        }
     }
 }
 
@@ -10518,21 +12165,6 @@ impl RequestUserInputResponse {
             freeform: None,
         }
     }
-}
-
-/// Structured result of [`Agent::dispatch_command`]. Designed to be
-/// serializable for non-TUI consumers (e.g. eval traces); the TUI is
-/// free to render its own version on top.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CommandOutcome {
-    Compacted,
-    ModeChanged { mode: String, changed: bool },
-    CostSnapshot { debug: String },
-    JobsList { count: usize },
-    PermissionsList { count: usize },
-    Unsupported { command: String },
-    Error { command: String, message: String },
 }
 
 pub enum AgentEvent {

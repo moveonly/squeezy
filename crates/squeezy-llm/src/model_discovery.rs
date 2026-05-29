@@ -15,9 +15,10 @@
 //! models exist* on a given provider so the picker can show fresh listings
 //! without a release.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use squeezy_core::{Result, SqueezyError};
@@ -77,6 +78,11 @@ pub fn cache_path(provider: &str) -> Option<PathBuf> {
 
 pub fn read_cached(provider: &str) -> Option<ModelCatalog> {
     let path = cache_path(provider)?;
+    // No reader-side lock: `write_cache_to` always promotes via an
+    // atomic rename, so a concurrent writer either leaves the previous
+    // file in place or replaces it whole. The worst observable race is
+    // reading the previous TTL window's catalog, which is the same
+    // semantics callers already tolerate when the file is simply stale.
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<ModelCatalog>(&text).ok()
 }
@@ -87,13 +93,79 @@ pub fn write_cache(catalog: &ModelCatalog) -> Result<()> {
             "model discovery: cannot determine home directory for cache write".to_string(),
         )
     })?;
+    write_cache_to(&path, catalog)
+}
+
+/// Persist `catalog` to `path` under a cross-process exclusive flock on a
+/// sidecar `<path>.lock`, then promote a sibling temp file into place via
+/// an atomic rename.
+///
+/// Two squeezy invocations refreshing the same `/v1/models` catalog used
+/// to interleave their `std::fs::write` calls — one would truncate while
+/// the other was mid-write, leaving the persisted JSON either short or
+/// duplicated. The flock serialises the writers; the rename keeps
+/// readers safe without requiring them to take the lock.
+///
+/// If another process is currently holding the writer slot we return
+/// `Ok(())` without writing: catalogs are best-effort and the
+/// concurrent writer will produce an equivalent payload, so blocking
+/// startup on a peer process adds no value.
+pub(crate) fn write_cache_to(path: &Path, catalog: &ModelCatalog) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(catalog)
         .map_err(|err| SqueezyError::Config(err.to_string()))?;
-    std::fs::write(path, text)?;
+
+    let lock_path = lock_path_for(path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(err) if is_lock_contention(&err) => return Ok(()),
+        Err(err) => return Err(SqueezyError::Io(err)),
+    }
+
+    let result = write_atomic(path, text.as_bytes());
+    let _ = lock_file.unlock();
+    result
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp_path = tmp_path_for(path);
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+fn is_lock_contention(err: &std::io::Error) -> bool {
+    // `fs2::lock_contended_error()` reports the platform-specific kind
+    // (`WouldBlock` on UNIX, raw `ERROR_LOCK_VIOLATION` on Windows).
+    let contended = fs2::lock_contended_error();
+    err.kind() == contended.kind() || err.raw_os_error() == contended.raw_os_error()
 }
 
 pub async fn fetch_remote(base_url: &str, api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {

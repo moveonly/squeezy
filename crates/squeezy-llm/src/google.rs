@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -11,15 +14,16 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 #[derive(Clone)]
 pub struct GoogleProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     transport: ProviderTransportConfig,
 }
@@ -28,7 +32,7 @@ impl std::fmt::Debug for GoogleProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GoogleProvider")
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("transport", &self.transport)
             .finish()
@@ -40,19 +44,30 @@ impl GoogleProvider {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         Ok(Self {
-            client: reqwest::Client::new(),
-            api_key,
+            client: shared_client(&config.transport),
+            api_key: static_api_key_source(api_key, "google"),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             transport: config.transport,
         })
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        // Canonicalize tool-call ids and synthesize placeholders for
+        // orphan tool results BEFORE projecting to Google's
+        // `contents` array. Google identifies tool calls by `name`
+        // (no explicit id) and pairs `functionResponse` to the
+        // preceding `functionCall` by name; cross-provider replay
+        // can leave `FunctionCallOutput` items whose `call_id`
+        // doesn't appear in any prior `FunctionCall`, in which case
+        // the response gets dropped to a generic `"tool"` name and
+        // the model can't follow the conversation. Synthesizing a
+        // placeholder call keeps the pairing intact.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "systemInstruction": {
                 "parts": [{"text": request.instructions}]
             },
-            "contents": google_contents(&request.input),
+            "contents": google_contents(&normalized_input),
             "generationConfig": {},
         });
         if let Some(max_output_tokens) = request.max_output_tokens {
@@ -94,6 +109,9 @@ impl LlmProvider for GoogleProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("google") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         // Keep the API key off the URL: `reqwest::Error::Display` appends
         // `" for url ({url})"` to every transport/stream error message, so a
@@ -107,12 +125,17 @@ impl LlmProvider for GoogleProvider {
         let transport = self.transport;
 
         Box::pin(try_stream! {
-            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-                client
-                    .post(&url)
-                    .header("x-goog-api-key", &api_key)
-                    .json(&body)
-            }).await?;
+            let response = send_with_auth_retry(
+                &api_key,
+                RetryPolicy::provider_requests(transport),
+                &cancel,
+                |key| {
+                    client
+                        .post(&url)
+                        .header("x-goog-api-key", key)
+                        .json(&body)
+                },
+            ).await?;
             let status = response.status();
             let response = if status == StatusCode::OK {
                 response
@@ -129,6 +152,8 @@ impl LlmProvider for GoogleProvider {
             let mut decoder = SseDecoder::default();
             let mut last_cost = CostSnapshot::default();
             let mut last_finish_reason: Option<String> = None;
+            let mut server_model_slot: Option<String> = None;
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut saw_any = false;
             let mut reasoning_buf = GoogleReasoningBuffer::default();
             let mut bytes = response.bytes_stream();
@@ -147,14 +172,38 @@ impl LlmProvider for GoogleProvider {
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     saw_any = true;
-                    for llm_event in parse_google_event(&event, &mut last_cost, &mut last_finish_reason, &mut reasoning_buf)? {
+                    let parsed = parse_google_event(
+                        &event,
+                        &mut last_cost,
+                        &mut last_finish_reason,
+                        &mut reasoning_buf,
+                        &mut server_model_slot,
+                    )?;
+                    if let Some(server) = server_model_slot.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for llm_event in parsed {
                         yield llm_event;
                     }
                 }
             }
             for event in decoder.finish() {
                 saw_any = true;
-                for llm_event in parse_google_event(&event, &mut last_cost, &mut last_finish_reason, &mut reasoning_buf)? {
+                let parsed = parse_google_event(
+                    &event,
+                    &mut last_cost,
+                    &mut last_finish_reason,
+                    &mut reasoning_buf,
+                    &mut server_model_slot,
+                )?;
+                if let Some(server) = server_model_slot.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for llm_event in parsed {
                     yield llm_event;
                 }
             }
@@ -217,6 +266,15 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 }}],
                 }));
             }
+            LlmInputItem::Image { media_type, bytes } => contents.push(json!({
+                "role": "user",
+                "parts": [{
+                    "inlineData": {
+                        "mimeType": media_type,
+                        "data": BASE64_STANDARD.encode(bytes.as_ref()),
+                    },
+                }],
+            })),
             LlmInputItem::Reasoning(ReasoningPayload::Google {
                 summary,
                 thought_signature,
@@ -282,6 +340,7 @@ fn parse_google_event(
     cost: &mut CostSnapshot,
     last_finish_reason: &mut Option<String>,
     reasoning_buf: &mut GoogleReasoningBuffer,
+    server_model_slot: &mut Option<String>,
 ) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Google SSE JSON: {err}")))?;
@@ -291,6 +350,17 @@ fn parse_google_event(
             .and_then(Value::as_str)
             .unwrap_or("Google stream error");
         return Err(SqueezyError::ProviderStream(message.to_string()));
+    }
+    if server_model_slot.is_none()
+        && let Some(server_model) = value.get("modelVersion").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        // Google's `streamGenerateContent` echoes `modelVersion` on
+        // every chunk (the pinned snapshot id, e.g. `gemini-2.5-pro` →
+        // `gemini-2.5-pro-002`). Capture the first occurrence; the
+        // outer stream loop drains the slot and emits `ServerModel`
+        // once when the snapshot id differs from `request.model`.
+        *server_model_slot = Some(server_model.to_string());
     }
     if let Some(usage) = value.get("usageMetadata") {
         cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);

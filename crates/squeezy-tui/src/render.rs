@@ -7,3 +7,4 @@ pub(crate) mod highlight;
 pub mod markdown;
 pub(crate) mod palette;
 pub(crate) mod plan_card;
+pub mod theme;

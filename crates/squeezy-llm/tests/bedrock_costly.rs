@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::Arc;
 
@@ -26,6 +27,8 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
     let provider = BedrockProvider::from_config(&BedrockConfig {
         region,
         base_url: env::var("BEDROCK_BASE_URL").ok(),
+        bearer_token: env::var("AWS_BEARER_TOKEN_BEDROCK").ok(),
+        request_metadata: BTreeMap::new(),
         transport: ProviderTransportConfig::default(),
     })?;
     let model = env::var(MODEL_ENV)
@@ -42,6 +45,7 @@ async fn bedrock_converse_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

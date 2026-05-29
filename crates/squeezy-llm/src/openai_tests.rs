@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ fn request_body_uses_responses_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -81,6 +82,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -107,6 +109,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -148,6 +151,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -181,6 +185,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             tool_choice: None,
@@ -206,6 +211,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -229,6 +235,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -239,6 +246,258 @@ fn request_body_omits_prompt_cache_key_when_unset() {
 
     let body = OpenAiProvider::request_body(&request, "openai");
     assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn request_body_emits_prompt_cache_retention_24h_for_long_retention() {
+    // F11: `CacheRetention::Long` must surface on the OpenAI Responses
+    // wire as the top-level `prompt_cache_retention: "24h"` field. Mirrors
+    // pi's `getPromptCacheRetention`
+    // (`others/pi/packages/ai/src/providers/openai-responses.ts:48-53`).
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("squeezy::session-long".to_string()),
+            retention: crate::CacheRetention::Long,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["prompt_cache_key"], "squeezy::session-long");
+    assert_eq!(
+        body["prompt_cache_retention"], "24h",
+        "Long retention must extend OpenAI's cached-prefix lifetime to 24h"
+    );
+}
+
+#[test]
+fn request_body_clamps_prompt_cache_key_to_sixty_four_codepoints() {
+    // F11 reproducer: a 100-codepoint session id (e.g. a namespaced UUID
+    // chain) must clamp to 64 codepoints in the request body. OpenAI
+    // silently drops the field server-side when it exceeds the limit,
+    // turning every cached turn into a cache miss with zero visible
+    // error.
+    let long_key: String = "a".repeat(100);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(long_key.clone()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let emitted = body["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be emitted");
+    assert_eq!(emitted.chars().count(), 64);
+    assert_eq!(emitted, "a".repeat(64));
+}
+
+#[test]
+fn request_body_preserves_multibyte_prompt_cache_key_under_codepoint_limit() {
+    // Multibyte regression guard: 64 two-byte codepoints is 128 bytes —
+    // well over a naive byte clamp — but only 64 codepoints, so the key
+    // must round-trip unchanged.
+    let key: String = "α".repeat(64);
+    assert_eq!(key.len(), 128, "two-byte UTF-8 sanity check");
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(key.clone()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["prompt_cache_key"], key);
+}
+
+#[test]
+fn request_body_clamps_multibyte_prompt_cache_key_at_codepoint_boundary() {
+    // 65 two-byte codepoints must clamp to 64 codepoints (128 bytes),
+    // never mid-character.
+    let key: String = "α".repeat(65);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(key),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let emitted = body["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be emitted");
+    assert_eq!(emitted.chars().count(), 64);
+    assert_eq!(emitted, "α".repeat(64));
+}
+
+#[test]
+fn affinity_headers_emitted_with_cache_key_carry_full_unclamped_value() {
+    // The body field is clamped to 64 codepoints (above), but the
+    // routing headers do not share that limit — they carry the full
+    // session id so OpenAI's load balancer can pin repeat turns to the
+    // backend that warmed the cached prefix.
+    let long_key: String = "a".repeat(100);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some(long_key.clone()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let headers = OpenAiProvider::affinity_headers(&request);
+    assert_eq!(headers.len(), 2);
+    let by_name: std::collections::BTreeMap<&str, &str> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    assert_eq!(by_name.get("session_id"), Some(&long_key.as_str()));
+    assert_eq!(by_name.get("x-client-request-id"), Some(&long_key.as_str()));
+}
+
+#[test]
+fn affinity_headers_present_when_cache_spec_carries_key() {
+    // Headers must surface regardless of which slot (legacy `cache_key`
+    // vs the universal `cache.key`) carried the affinity hint.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("squeezy::session-affinity".to_string()),
+            retention: crate::CacheRetention::Long,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let headers = OpenAiProvider::affinity_headers(&request);
+    assert_eq!(headers.len(), 2);
+    for (_, value) in &headers {
+        assert_eq!(value, "squeezy::session-affinity");
+    }
+}
+
+#[test]
+fn affinity_headers_absent_when_no_cache_key() {
+    // No cache key → no affinity headers. Without this gate the OpenAI
+    // load balancer would see empty header values on every uncached
+    // request, which is meaningless overhead.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    assert!(OpenAiProvider::affinity_headers(&request).is_empty());
+}
+
+#[test]
+fn request_body_omits_prompt_cache_retention_for_short_retention() {
+    // Regression guard for the legacy-field migration path: callers that
+    // still set the deprecated `cache_key` slot get `Short` retention via
+    // `effective_cache_spec()`, which must leave `prompt_cache_retention`
+    // off the wire so the default short window applies.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["prompt_cache_key"], "squeezy::session-1");
+    assert!(body.get("prompt_cache_retention").is_none());
 }
 
 #[test]
@@ -533,6 +792,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         parallel_tool_calls: None,
@@ -566,6 +826,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
@@ -595,6 +856,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: Some(LlmOutputSchema {
@@ -624,6 +886,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
@@ -648,6 +911,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             output_schema: None,
@@ -663,4 +927,119 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             value,
         );
     }
+}
+
+#[test]
+fn request_body_encodes_image_as_input_image_data_url() {
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("what is this?".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+
+        cache: crate::CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let input = body["input"].as_array().expect("input array (text+image)");
+    assert_eq!(input.len(), 2);
+    // First entry: plain user-text message.
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"], "what is this?");
+    // Second entry: user message with one `input_image` content part
+    // carrying a data URL.
+    assert_eq!(input[1]["role"], "user");
+    let image_block = &input[1]["content"][0];
+    assert_eq!(image_block["type"], "input_image");
+    assert_eq!(image_block["detail"], "auto");
+    let url = image_block["image_url"].as_str().expect("image_url string");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "Responses image must use a data URL, got `{url}`"
+    );
+    use base64::Engine as _;
+    let encoded = url
+        .strip_prefix("data:image/png;base64,")
+        .expect("data URL prefix");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
+}
+
+#[test]
+fn azure_deployment_name_map_translates_mapped_model() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::from([
+            ("gpt-4o".to_string(), "my-deployment-gpt-4o".to_string()),
+            ("gpt-5".to_string(), "my-deployment-gpt-5".to_string()),
+        ]),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-4o"),
+        "my-deployment-gpt-4o",
+        "mapped logical id must be substituted for the Azure deployment name",
+    );
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-5"),
+        "my-deployment-gpt-5",
+    );
+}
+
+#[test]
+fn azure_deployment_name_map_passes_unmapped_model_through() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::from([(
+            "gpt-4o".to_string(),
+            "my-deployment-gpt-4o".to_string(),
+        )]),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-4o-mini"),
+        "gpt-4o-mini",
+        "unmapped model ids must pass through verbatim so deployments without \
+         an explicit mapping keep the historical contract",
+    );
+
+    let empty = squeezy_core::AzureOpenAiConfig {
+        deployment_name_map: std::collections::BTreeMap::new(),
+        ..config
+    };
+    let provider = OpenAiProvider::from_azure_config(&empty).expect("provider build");
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-4o"),
+        "gpt-4o",
+        "an empty map must not rewrite any model id",
+    );
 }

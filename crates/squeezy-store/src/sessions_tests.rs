@@ -29,7 +29,7 @@ fn session_store_lists_filters_and_exports_sessions() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -72,7 +72,7 @@ fn fork_creates_child_with_parent_id() {
     };
     let store = SessionStore::open(&config);
     let parent = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start parent");
     parent
         .write_resume_state(&SessionResumeState {
@@ -117,7 +117,7 @@ fn session_export_preserves_task_state_events() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -157,7 +157,7 @@ fn session_resume_state_preserves_context_compaction() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     let compaction = ContextCompactionState {
         generation: 2,
@@ -224,8 +224,12 @@ fn malformed_event_lines_are_counted_as_warnings() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
+    // Lazy materialisation defers the on-disk session dir until a
+    // substantive event arrives. Seed one so the test can overwrite
+    // events.jsonl with a malformed line afterwards.
+    materialise_session(&handle);
     fs::write(
         store.root().join(handle.session_id()).join("events.jsonl"),
         b"{not json}\n",
@@ -246,7 +250,7 @@ fn replay_tape_round_trips_and_exports() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     handle
@@ -288,8 +292,9 @@ fn replay_tape_counts_tampered_lines_as_warnings() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
+    materialise_session(&handle);
     fs::write(
         store.root().join(handle.session_id()).join("replay.jsonl"),
         br#"{"schema_version":1,"ts_unix_ms":1,"sequence":1,"kind":"user_message","turn_id":"1","payload_sha256":"bad","payload":{"input":"changed"}}"#,
@@ -314,7 +319,7 @@ fn bug_report_redacts_replay_tape() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_replay_event(SessionReplayEvent::new(
@@ -354,7 +359,7 @@ fn bug_report_archive_redacts_events_and_records_exclusions() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -422,7 +427,7 @@ fn context_attachments_store_redacted_text_and_export_metadata() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     let attachment = ContextAttachment {
         id: "att-0001".to_string(),
@@ -439,6 +444,8 @@ fn context_attachments_store_redacted_text_and_export_metadata() {
         redactions: 1,
         preview: "OPENAI_API_KEY=<redacted:openai_key#1 bytes=29>".to_string(),
         truncated: false,
+        image_media_type: None,
+        image_data_base64: None,
     };
 
     handle
@@ -471,7 +478,7 @@ fn finish_preserves_terminal_status_set_by_earlier_events() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     handle
@@ -508,18 +515,37 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
         .expect("start session");
 
     let metadata_path = store.root().join(handle.session_id()).join("metadata.json");
-    let mtime_after_create = fs::metadata(&metadata_path)
-        .expect("stat fresh metadata")
-        .modified()
-        .expect("mtime");
+    // Lazy materialisation: a freshly started session is in-memory only,
+    // so metadata.json must not exist until the first substantive event
+    // arrives.
+    assert!(
+        !metadata_path.exists(),
+        "metadata.json must stay absent until a substantive event arrives",
+    );
 
-    // A burst of routine events (the kinds the agent emits per tool call /
-    // tool result / approval round trip) must not touch metadata.json. Many
-    // filesystems, including APFS on macOS, have second-granularity mtimes,
-    // so we rely on a content hash plus a file-size check instead of trying
-    // to race the clock.
+    // The first substantive event materialises the on-disk session
+    // artefacts (creates the dir, writes metadata.json + resume_state.json,
+    // spawns the events.jsonl writer thread).
+    handle
+        .append_event(SessionEvent::new(
+            "tool_call",
+            Some("1".to_string()),
+            Some("tool 0".to_string()),
+            json!({"index": 0}),
+        ))
+        .expect("first substantive event must materialise");
+    assert!(
+        metadata_path.exists(),
+        "metadata.json must be written when the first substantive event arrives",
+    );
+
+    // A burst of further routine events (the kinds the agent emits per
+    // tool call / tool result / approval round trip) must not touch
+    // metadata.json. Many filesystems, including APFS on macOS, have
+    // second-granularity mtimes, so we rely on a content hash plus a
+    // file-size check instead of trying to race the clock.
     let before_bytes = fs::read(&metadata_path).expect("read metadata before");
-    for index in 0..20 {
+    for index in 1..20 {
         handle
             .append_event(SessionEvent::new(
                 "tool_call",
@@ -534,7 +560,6 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
         before_bytes, after_bytes,
         "routine events must not rewrite metadata.json",
     );
-    let _ = mtime_after_create;
 
     // event_count is still surfaced accurately via the in-memory counter so
     // `sessions show` and `sessions list` consumers see a current value even
@@ -569,7 +594,7 @@ fn session_log_writer_flushes_concurrent_events() {
     let store = SessionStore::open(&config);
     let handle = Arc::new(
         store
-            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .start_session_eager(SessionMetadata::new(&config, "test-provider"))
             .expect("start session"),
     );
 
@@ -608,7 +633,7 @@ async fn append_event_does_not_block_tokio_reactor() {
     let store = SessionStore::open(&config);
     let handle = Arc::new(
         store
-            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .start_session_eager(SessionMetadata::new(&config, "test-provider"))
             .expect("start session"),
     );
     let canary = tokio::spawn(async {
@@ -652,8 +677,13 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
     };
     let store = SessionStore::open(&config);
     let running = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start running");
+    // Both sessions need to be materialised on disk so the retention
+    // sweep can find them by reading `metadata.json`. Lazy materialisation
+    // means we have to drive at least one substantive event through each
+    // handle before backdating the on-disk timestamp.
+    materialise_session(&running);
     // Forge an ancient start time. A retention sweep would normally pick
     // this up, but the session is still Running so cleanup must skip it.
     running
@@ -662,8 +692,9 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
         })
         .expect("backdate running session");
     let completed = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start completed");
+    materialise_session(&completed);
     completed
         .finish(
             SessionStatus::Completed,
@@ -722,11 +753,16 @@ fn cleanup_excluding_skips_protected_session() {
     };
     let store = SessionStore::open(&config);
     let protected = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start protected");
     let collateral = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start collateral");
+    // Lazy materialisation means cleanup_excluding cannot find a session
+    // until it has materialised to disk. Seed both with a substantive
+    // event so the explicit-ids sweep can target them.
+    materialise_session(&protected);
+    materialise_session(&collateral);
 
     let report = store
         .cleanup_excluding(
@@ -978,14 +1014,105 @@ fn token_calibration_round_trips_through_metadata_and_global_file() {
     assert_eq!(reloaded, calibration);
 
     // The same calibration must also survive being written into a session's
-    // metadata.json and read back via `show`.
+    // metadata.json and read back via `show`. Materialise the session
+    // before dropping the handle so the on-disk metadata snapshot is
+    // visible to `SessionStore::show`.
     let mut metadata = SessionMetadata::new(&config, "openai");
     metadata.token_calibration = calibration.clone();
     let handle = store.start_session(metadata).expect("start session");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     drop(handle);
     let record = store.show(&session_id).expect("show session");
     assert_eq!(record.metadata.token_calibration, calibration);
+}
+
+#[test]
+fn session_metadata_v0_file_reads_as_v1() {
+    // Pre-versioning `metadata.json` files are missing the
+    // `schema_version` field. The reader migration framework must treat
+    // them as v0, run any registered v0 -> v1 migrations, and stamp
+    // SESSION_METADATA_SCHEMA_VERSION onto the deserialized struct so
+    // the rest of the binary sees a fully migrated value. Sibling
+    // fields must survive untouched.
+    let (_root, store, _) = open_test_store("metadata-v0-reads-as-v1");
+    let session_dir = store.root().join("v0-session");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    let v0_json = json!({
+        "session_id": "v0-session",
+        "started_at_ms": 1_700_000_000_000_u64,
+        "ended_at_ms": null,
+        "cwd": "/tmp/work",
+        "workspace_root": "/tmp/work",
+        "repo_root": null,
+        "branch": null,
+        "provider": "openai",
+        "model": "test-model",
+        "mode": "build",
+        "status": "completed",
+        "first_user_task": "hello",
+        "latest_summary": null,
+        "cost": CostSnapshot::default(),
+        "metrics": SessionMetrics::default(),
+        "redactions": 0,
+        "resume_available": false,
+        "resume_unavailable_reason": null,
+        "event_count": 7,
+        // intentionally missing: schema_version
+    });
+    assert!(
+        v0_json.get("schema_version").is_none(),
+        "v0 fixture must omit schema_version",
+    );
+    fs::write(
+        session_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&v0_json).expect("encode v0 json"),
+    )
+    .expect("write v0 metadata.json");
+
+    let record = store.show("v0-session").expect("show v0 session");
+    assert_eq!(
+        record.metadata.schema_version, SESSION_METADATA_SCHEMA_VERSION,
+        "migration must stamp the current version onto v0 payloads"
+    );
+    assert_eq!(record.metadata.session_id, "v0-session");
+    assert_eq!(record.metadata.first_user_task.as_deref(), Some("hello"));
+    assert_eq!(record.metadata.event_count, 7);
+    assert_eq!(record.metadata.provider, "openai");
+    assert_eq!(record.metadata.model, "test-model");
+}
+
+#[test]
+fn session_metadata_v1_file_reads_unchanged() {
+    // A `metadata.json` already written at the current schema version
+    // must round-trip without the migration chain mutating its payload:
+    // `apply_session_metadata_migrations` short-circuits when the
+    // incoming version already matches SESSION_METADATA_SCHEMA_VERSION,
+    // so deserialization sees the on-disk bytes as-is.
+    let (_root, store, config) = open_test_store("metadata-v1-reads-unchanged");
+    let session_dir = store.root().join("v1-session");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    let mut metadata = SessionMetadata::new(&config, "openai");
+    metadata.session_id = "v1-session".to_string();
+    metadata.started_at_ms = 1_700_000_100_000;
+    metadata.first_user_task = Some("plan the rollout".to_string());
+    metadata.event_count = 3;
+    assert_eq!(metadata.schema_version, SESSION_METADATA_SCHEMA_VERSION);
+    fs::write(
+        session_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&metadata).expect("encode v1"),
+    )
+    .expect("write v1 metadata.json");
+
+    let record = store.show("v1-session").expect("show v1 session");
+    assert_eq!(
+        record.metadata.schema_version,
+        SESSION_METADATA_SCHEMA_VERSION
+    );
+    assert_eq!(record.metadata.session_id, metadata.session_id);
+    assert_eq!(record.metadata.first_user_task, metadata.first_user_task);
+    assert_eq!(record.metadata.event_count, metadata.event_count);
+    assert_eq!(record.metadata.started_at_ms, metadata.started_at_ms);
 }
 
 fn temp_root(name: &str) -> PathBuf {
@@ -994,6 +1121,246 @@ fn temp_root(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+/// Force a pending session to materialise its on-disk artefacts so a
+/// test that exercises archive/cleanup/show semantics can rely on a
+/// real `metadata.json` + `events.jsonl` pair existing.
+///
+/// Production callers materialise implicitly the first time a
+/// substantive event lands on the handle — this helper mirrors that by
+/// queueing a single `tool_call` and waiting for the writer to drain.
+fn materialise_session(handle: &SessionHandle) {
+    handle
+        .append_event(SessionEvent::new(
+            "tool_call",
+            None,
+            Some("test materialise".to_string()),
+            json!({}),
+        ))
+        .expect("seed materialising event");
+    handle.flush_events().expect("flush seed event");
+}
+
+/// Acceptance for `F12-pi-lazy-session-file-creation`: a freshly
+/// started session must not leave any on-disk artefact behind until a
+/// substantive event arrives. Quick-exit code paths such as `squeezy
+/// --prompt --help` build an `Agent` and tear it down before any user
+/// turn runs, so the only events that ever reach the handle are
+/// lifecycle markers like `session_started`. Those must stay
+/// in-memory.
+#[test]
+fn start_session_does_not_create_disk_artefacts_until_first_substantive_event() {
+    let root = temp_root("lazy-no-disk-until-substantive");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_dir = store.root().join(handle.session_id());
+
+    assert!(
+        !session_dir.exists(),
+        "start_session must not create the on-disk session directory",
+    );
+
+    // The in-memory metadata view still works while the session stays
+    // pending — `metadata()` falls back to the cached snapshot rather
+    // than reading a non-existent file.
+    let metadata = handle.metadata().expect("metadata while pending");
+    assert_eq!(metadata.session_id, handle.session_id());
+    assert_eq!(metadata.status, SessionStatus::Running);
+    assert!(metadata.resume_available);
+
+    // A lifecycle-only event (the agent emits one of these right after
+    // `start_session_log`) is buffered in memory and must not trigger
+    // materialisation: a `squeezy --prompt --help` that exits before
+    // any real turn would otherwise leave a stub session dir behind.
+    handle
+        .append_event(SessionEvent::new(
+            "session_started",
+            None,
+            Some("session started".to_string()),
+            json!({}),
+        ))
+        .expect("buffered lifecycle event");
+    assert!(
+        !session_dir.exists(),
+        "lifecycle-only events must not materialise the session directory",
+    );
+
+    // flush_events on a pending session is a no-op; it must not race a
+    // lazy materialisation by sneaking the dir into existence.
+    handle.flush_events().expect("flush while pending");
+    assert!(
+        !session_dir.exists(),
+        "flush_events on a pending session must remain a no-op",
+    );
+
+    // The first substantive event promotes the session: dir,
+    // metadata.json, and resume_state.json all appear.
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("first task".to_string()),
+            json!({}),
+        ))
+        .expect("first substantive event must materialise");
+    handle.flush_events().expect("flush after promotion");
+
+    assert!(
+        session_dir.exists(),
+        "session dir must exist after promotion"
+    );
+    assert!(
+        session_dir.join("metadata.json").exists(),
+        "metadata.json must exist after promotion",
+    );
+    assert!(
+        session_dir.join("resume_state.json").exists(),
+        "resume_state.json must exist after promotion",
+    );
+
+    // The buffered lifecycle event lands in events.jsonl ahead of the
+    // substantive event that triggered promotion, preserving the
+    // arrival order the caller asked for.
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(
+        record
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session_started", "user_message"],
+        "buffered lifecycle event must be replayed before the promoting event",
+    );
+    assert_eq!(
+        record.metadata.first_user_task.as_deref(),
+        Some("first task")
+    );
+}
+
+/// A session that never sees a substantive event must leave no on-disk
+/// trace when its handle drops — even if the agent appended lifecycle
+/// events and called `finish` on it (mirroring the `--prompt --help`
+/// shutdown path).
+#[test]
+fn pending_session_with_only_lifecycle_events_leaves_no_disk_dir_on_drop() {
+    let root = temp_root("lazy-drop-no-disk");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let session_id = {
+        let handle = store
+            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .expect("start session");
+        handle
+            .append_event(SessionEvent::new(
+                "session_started",
+                None,
+                Some("session started".to_string()),
+                json!({}),
+            ))
+            .expect("buffered session_started");
+        handle
+            .finish(
+                SessionStatus::Completed,
+                CostSnapshot::default(),
+                SessionMetrics::default(),
+                0,
+            )
+            .expect("finish while still pending");
+        handle.session_id().to_string()
+    };
+    let session_dir = store.root().join(&session_id);
+    assert!(
+        !session_dir.exists(),
+        "a session that never saw a substantive event must leave no on-disk dir",
+    );
+    let listed = store
+        .list(&SessionQuery::default())
+        .expect("list after pending finish");
+    assert!(
+        listed
+            .iter()
+            .all(|metadata| metadata.session_id != session_id),
+        "pending-only sessions must not appear in the on-disk listing",
+    );
+}
+
+/// `SessionStore::show` is the read surface the CLI calls to inspect a
+/// session by id. When asked for a session that was started but never
+/// materialised (no `metadata.json` on disk), it must surface a clean
+/// "not found" error rather than a raw IO failure.
+#[test]
+fn show_returns_clean_not_found_for_unmaterialised_session_id() {
+    let root = temp_root("lazy-show-not-found");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_id = handle.session_id().to_string();
+    let error = store
+        .show(&session_id)
+        .expect_err("show must error on a pending-only session");
+    let message = error.to_string();
+    assert!(
+        message.contains("not found"),
+        "show should mention not-found semantics, got: {message}",
+    );
+    assert!(
+        message.contains(&session_id),
+        "show should mention the session id, got: {message}",
+    );
+}
+
+/// `write_resume_state` is an explicit "make my checkpoint durable"
+/// call. It must promote a pending session to its on-disk form so the
+/// fork path (and any other caller that explicitly persists resume
+/// state) sees a real session directory afterwards.
+#[test]
+fn write_resume_state_materialises_pending_session() {
+    let root = temp_root("lazy-write-resume-materialises");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_dir = store.root().join(handle.session_id());
+    assert!(!session_dir.exists());
+
+    handle
+        .write_resume_state(&SessionResumeState {
+            resume_available: true,
+            conversation: vec![ResumeItem::UserText {
+                text: "carry me forward".to_string(),
+            }],
+            ..SessionResumeState::default()
+        })
+        .expect("write resume promotes");
+
+    assert!(
+        session_dir.join("metadata.json").exists(),
+        "metadata.json must exist after write_resume_state",
+    );
+    let resume: SessionResumeState =
+        serde_json::from_str(&fs::read_to_string(session_dir.join("resume_state.json")).unwrap())
+            .expect("parse resume");
+    assert!(resume.resume_available);
+    assert_eq!(resume.conversation.len(), 1);
 }
 
 #[test]
@@ -1009,7 +1376,7 @@ fn replay_resume_state_without_resume_json() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -1057,7 +1424,7 @@ fn replay_snaps_to_compaction_checkpoint() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -1139,7 +1506,7 @@ fn typed_session_events_round_trip_through_event_log() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     let expected = vec![
@@ -1217,7 +1584,7 @@ fn replay_resume_state_falls_back_when_resume_json_deleted() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     // A full turn: user prompt -> tool call -> tool result -> assistant
@@ -1316,7 +1683,7 @@ fn replay_resume_state_round_trips_reasoning_items() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
 
     let openai_reasoning = ReasoningPayload::OpenAi {
@@ -1419,9 +1786,9 @@ fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
 fn archive_excludes_session_from_default_list() {
     let (_root, store, config) = open_test_store("archive-excludes");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive session");
 
@@ -1450,9 +1817,9 @@ fn archive_excludes_session_from_default_list() {
 fn cleanup_skips_archived_sessions() {
     let (_root, store, config) = open_test_store("cleanup-skips-archived");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive session");
 
@@ -1504,9 +1871,9 @@ fn cleanup_deletes_archived_sessions_past_archive_retention() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
 
@@ -1561,9 +1928,9 @@ fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
     };
     let store = SessionStore::open(&config);
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
 
@@ -1595,9 +1962,9 @@ fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
 fn remove_session_archives_live_session() {
     let (_root, store, config) = open_test_store("remove-session-archives");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     // Drop the handle so the session log writer thread shuts down
     // before we move the directory out from under it.
@@ -1625,7 +1992,7 @@ fn remove_session_archives_live_session() {
 fn archived_session_remains_readable_via_show() {
     let (_root, store, config) = open_test_store("archived-readable");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -1658,9 +2025,9 @@ fn archived_session_remains_readable_via_show() {
 fn unarchive_round_trip_restores_session() {
     let (_root, store, config) = open_test_store("unarchive-round-trip");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
     store.unarchive_session(&session_id).expect("unarchive");
@@ -1688,9 +2055,9 @@ fn unarchive_round_trip_restores_session() {
 fn archived_session_excluded_from_list_default() {
     let (_root, store, config) = open_test_store("archived-excluded-default");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive session");
 
@@ -1727,16 +2094,16 @@ fn archived_session_excluded_from_list_default() {
 fn cleanup_with_purge_hard_deletes_live_and_archived_sessions() {
     let (_root, store, config) = open_test_store("cleanup-purge");
     let live = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start live session");
-    live.flush_events().expect("flush live events");
+    materialise_session(&live);
     let live_id = live.session_id().to_string();
     drop(live);
 
     let archived = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start archived session");
-    archived.flush_events().expect("flush archived events");
+    materialise_session(&archived);
     let archived_id = archived.session_id().to_string();
     drop(archived);
     store
@@ -1784,7 +2151,7 @@ fn cleanup_with_purge_hard_deletes_live_and_archived_sessions() {
 fn bundle_rollout_trace_is_empty_when_no_logs_exist() {
     let (_root, store, config) = open_test_store("rollout-trace-empty");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     let bundle = store
         .bundle_rollout_trace(handle.session_id())
@@ -1796,7 +2163,7 @@ fn bundle_rollout_trace_is_empty_when_no_logs_exist() {
 fn bundle_rollout_trace_preserves_event_order_when_no_replay() {
     let (_root, store, config) = open_test_store("rollout-trace-events-only");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_event(SessionEvent::new(
@@ -1851,7 +2218,7 @@ fn bundle_rollout_trace_preserves_event_order_when_no_replay() {
 fn bundle_rollout_trace_emits_replay_when_no_events() {
     let (_root, store, config) = open_test_store("rollout-trace-replay-only");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
     handle
         .append_replay_event(SessionReplayEvent::new(
@@ -1910,8 +2277,14 @@ fn bundle_rollout_trace_emits_replay_when_no_events() {
 fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
     let (_root, store, config) = open_test_store("rollout-trace-merge");
     let handle = store
-        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
+    // The test fabricates events.jsonl + replay.jsonl with fixed
+    // timestamps by writing the files directly. Lazy materialisation
+    // would otherwise leave the session dir absent, so seed a single
+    // event to force the directory + writer into existence before we
+    // overwrite both logs.
+    materialise_session(&handle);
     let session_dir = store.root().join(handle.session_id());
 
     // Fabricate both logs with controlled timestamps so the merge order is
@@ -1932,6 +2305,7 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
         turn_id: Some("turn-1".to_string()),
         summary: Some("find a bug".to_string()),
         payload: json!({"text": "find a bug"}),
+        parent_event_sequence: None,
     }));
     events_jsonl.extend(event_line(&SessionEvent {
         ts_unix_ms: 300,
@@ -1939,6 +2313,7 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
         turn_id: Some("turn-1".to_string()),
         summary: Some("done".to_string()),
         payload: json!({"text": "done", "response_id": "resp_1"}),
+        parent_event_sequence: None,
     }));
     fs::write(&events_path, events_jsonl).expect("write events.jsonl");
 
@@ -2187,5 +2562,507 @@ fn memory_path_is_none_when_home_unset() {
     assert!(
         remember.is_err(),
         "remember fails loudly when HOME is unset"
+    );
+}
+
+fn raw_event(
+    ts_unix_ms: u64,
+    kind: &str,
+    summary: Option<&str>,
+    parent_event_sequence: Option<u64>,
+) -> SessionEvent {
+    SessionEvent {
+        ts_unix_ms,
+        kind: kind.to_string(),
+        turn_id: None,
+        summary: summary.map(str::to_string),
+        payload: json!({}),
+        parent_event_sequence,
+    }
+}
+
+#[test]
+fn session_event_omits_parent_when_none_on_serialise() {
+    let event = SessionEvent::new("user_message", None, Some("hi".to_string()), json!({}));
+    let body = serde_json::to_string(&event).expect("serialise");
+    assert!(
+        !body.contains("parent_event_sequence"),
+        "linear events stay byte-identical: {body}",
+    );
+}
+
+#[test]
+fn session_event_round_trips_parent_event_sequence() {
+    let event = SessionEvent::new("user_message", None, Some("retry".to_string()), json!({}))
+        .with_parent_event_sequence(2);
+    let body = serde_json::to_string(&event).expect("serialise");
+    assert!(body.contains("parent_event_sequence"));
+    let parsed: SessionEvent = serde_json::from_str(&body).expect("deserialise");
+    assert_eq!(parsed.parent_event_sequence, Some(2));
+}
+
+#[test]
+fn session_event_deserialises_legacy_payload_without_parent_field() {
+    let legacy = json!({
+        "ts_unix_ms": 1_700_000_000_000_u64,
+        "kind": "user_message",
+        "turn_id": null,
+        "summary": "legacy",
+        "payload": {"text": "legacy"},
+    });
+    let event: SessionEvent = serde_json::from_value(legacy).expect("legacy deserialise");
+    assert_eq!(event.parent_event_sequence, None);
+}
+
+#[test]
+fn detect_branches_returns_empty_for_linear_log() {
+    let events = vec![
+        raw_event(10, "user_message", Some("q1"), None),
+        raw_event(20, "assistant_completed", Some("a1"), None),
+        raw_event(30, "user_message", Some("q2"), None),
+        raw_event(40, "assistant_completed", Some("a2"), None),
+    ];
+    assert!(detect_branches(&events).is_empty());
+}
+
+#[test]
+fn detect_branches_returns_empty_for_single_or_zero_events() {
+    assert!(detect_branches(&[]).is_empty());
+    let one = vec![raw_event(10, "user_message", Some("q1"), None)];
+    assert!(detect_branches(&one).is_empty());
+}
+
+#[test]
+fn detect_branches_finds_both_paths_when_user_reprompts() {
+    // Tree (linear unless noted):
+    //   0 user "q1"
+    //   1 assistant "a1"
+    //   2 user "q2 (path A)"      -> linear child of 1
+    //   3 assistant "a2-A"
+    //   4 user "q2 (path B)"      -> branched off 1 (re-prompt)
+    //   5 assistant "a2-B"
+    let events = vec![
+        raw_event(10, "user_message", Some("q1"), None),
+        raw_event(20, "assistant_completed", Some("a1"), None),
+        raw_event(30, "user_message", Some("q2 path A"), None),
+        raw_event(40, "assistant_completed", Some("a2 A"), None),
+        raw_event(50, "user_message", Some("q2 path B"), Some(1)),
+        raw_event(60, "assistant_completed", Some("a2 B"), None),
+    ];
+
+    let tips = detect_branches(&events);
+    assert_eq!(tips.len(), 2, "two leaves expected: {tips:?}");
+
+    // Newest tip first.
+    let tip_b = &tips[0];
+    let tip_a = &tips[1];
+    assert_eq!(tip_b.tip_sequence, 5);
+    assert_eq!(tip_b.branched_from_sequence, 1);
+    assert_eq!(
+        tip_b.first_message_after_branch.as_deref(),
+        Some("q2 path B"),
+    );
+    assert_eq!(tip_a.tip_sequence, 3);
+    assert_eq!(tip_a.branched_from_sequence, 1);
+    assert_eq!(
+        tip_a.first_message_after_branch.as_deref(),
+        Some("q2 path A"),
+    );
+}
+
+#[test]
+fn detect_branches_handles_three_way_fork() {
+    // 0 -> 1 -> { 2 (linear), 3 (branch), 4 (branch) }
+    let events = vec![
+        raw_event(10, "user_message", Some("root"), None),
+        raw_event(20, "assistant_completed", Some("a1"), None),
+        raw_event(30, "user_message", Some("path-1"), None),
+        raw_event(31, "user_message", Some("path-2"), Some(1)),
+        raw_event(32, "user_message", Some("path-3"), Some(1)),
+    ];
+    let tips = detect_branches(&events);
+    assert_eq!(tips.len(), 3);
+    let sequences: Vec<u64> = tips.iter().map(|t| t.tip_sequence).collect();
+    assert!(sequences.contains(&2));
+    assert!(sequences.contains(&3));
+    assert!(sequences.contains(&4));
+    for tip in &tips {
+        assert_eq!(tip.branched_from_sequence, 1);
+    }
+}
+
+#[test]
+fn detect_branches_ignores_self_or_out_of_range_parent() {
+    // Self-parent and a forward-pointing parent are both treated as the
+    // implicit linear parent so a malformed log still produces a sane
+    // tree (and no spurious "branch").
+    let events = vec![
+        raw_event(10, "user_message", Some("q1"), None),
+        raw_event(20, "assistant_completed", Some("a1"), Some(1)),
+        raw_event(30, "user_message", Some("q2"), Some(99)),
+    ];
+    assert!(detect_branches(&events).is_empty());
+}
+
+/// Seed a session directory under the store root without going through
+/// `start_session`. The resolver only enumerates directory names, so we
+/// don't need a full event log — this keeps the prefix tests independent
+/// of `next_session_id`'s timestamp/pid format, which would otherwise
+/// make ambiguity hard to construct in a single millisecond.
+fn seed_session_dir(store: &SessionStore, id: &str) {
+    fs::create_dir_all(store.root().join(id)).expect("seed live session dir");
+}
+
+fn seed_archived_session_dir(store: &SessionStore, id: &str) {
+    fs::create_dir_all(store.root().join(super::ARCHIVED_SUBDIR).join(id))
+        .expect("seed archived session dir");
+}
+
+#[test]
+fn resolve_session_id_prefix_exact_match_wins_over_longer_ids() {
+    // An exact match must resolve to itself even when a longer id would
+    // otherwise share the same prefix. Without this guard, typing the
+    // full id of a short session would surface as ambiguous as soon as a
+    // longer id began with the same characters.
+    let (_root, store, _) = open_test_store("resolve-exact-match");
+    seed_session_dir(&store, "abc12345");
+    seed_session_dir(&store, "abc12345-extra-suffix");
+
+    let resolved = store
+        .resolve_session_id_prefix("abc12345")
+        .expect("exact match must resolve");
+    assert_eq!(resolved, "abc12345");
+}
+
+#[test]
+fn resolve_session_id_prefix_unique_prefix_resolves() {
+    // The headline ergonomics target: typing a short prefix of a unique
+    // session id resolves to the full id. Archived sessions count just
+    // like live ones so `squeezy sessions resume abc12` keeps working
+    // after the session has aged into `archived/`.
+    let (_root, store, _) = open_test_store("resolve-unique-prefix");
+    seed_session_dir(&store, "alpha-001-live");
+    seed_archived_session_dir(&store, "beta-002-archived");
+
+    assert_eq!(
+        store
+            .resolve_session_id_prefix("alph")
+            .expect("unique live prefix"),
+        "alpha-001-live",
+    );
+    assert_eq!(
+        store
+            .resolve_session_id_prefix("beta")
+            .expect("unique archived prefix"),
+        "beta-002-archived",
+    );
+}
+
+#[test]
+fn resolve_session_id_prefix_ambiguous_lists_all_candidates() {
+    // When the prefix is ambiguous the error must carry every matching
+    // candidate, sorted ascending so a downstream CLI can render a
+    // stable hint. Mixing live and archived ids in the candidate list
+    // exercises the cross-tree enumeration too.
+    let (_root, store, _) = open_test_store("resolve-ambiguous");
+    seed_session_dir(&store, "shared-001-live");
+    seed_archived_session_dir(&store, "shared-002-archived");
+    seed_session_dir(&store, "other-id");
+
+    match store.resolve_session_id_prefix("shared") {
+        Err(ResolveError::AmbiguousPrefix { prefix, matches }) => {
+            assert_eq!(prefix, "shared");
+            assert_eq!(
+                matches,
+                vec![
+                    "shared-001-live".to_string(),
+                    "shared-002-archived".to_string(),
+                ],
+            );
+        }
+        other => panic!("expected AmbiguousPrefix, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_session_id_prefix_not_found_when_no_candidate_matches() {
+    // A prefix with no live or archived match must produce NotFound,
+    // and an empty prefix must do the same so accidental `--session ""`
+    // invocations don't silently grab the first directory the OS
+    // enumerates.
+    let (_root, store, _) = open_test_store("resolve-not-found");
+    seed_session_dir(&store, "live-001");
+    seed_archived_session_dir(&store, "archived-001");
+
+    match store.resolve_session_id_prefix("zzz") {
+        Err(ResolveError::NotFound { prefix }) => assert_eq!(prefix, "zzz"),
+        other => panic!("expected NotFound for unmatched prefix, got {other:?}"),
+    }
+    match store.resolve_session_id_prefix("") {
+        Err(ResolveError::NotFound { prefix }) => assert!(prefix.is_empty()),
+        other => panic!("expected NotFound for empty prefix, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_metadata_deserialises_legacy_payload_without_display_name_or_labels() {
+    // Older `metadata.json` files predate `display_name` / `labels`.
+    // `serde(default)` keeps them loadable so a rollout can ship the
+    // new fields without rewriting on-disk session histories.
+    let legacy = json!({
+        "session_id": "sess-legacy",
+        "started_at_ms": 1_700_000_000_000_u64,
+        "ended_at_ms": null,
+        "cwd": "/work/repo",
+        "workspace_root": "/work/repo",
+        "repo_root": null,
+        "branch": null,
+        "provider": "test-provider",
+        "model": "test-model",
+        "mode": "build",
+        "status": "running",
+        "first_user_task": "carry me forward",
+        "latest_summary": null,
+        "cost": CostSnapshot::default(),
+        "metrics": SessionMetrics::default(),
+        "redactions": 0,
+        "resume_available": true,
+        "resume_unavailable_reason": null,
+        "event_count": 0,
+    });
+    let metadata: SessionMetadata =
+        serde_json::from_value(legacy).expect("legacy metadata deserialise");
+    assert!(
+        metadata.display_name.is_none(),
+        "legacy metadata must default to no display name"
+    );
+    assert!(
+        metadata.labels.is_empty(),
+        "legacy metadata must default to no labels"
+    );
+}
+
+#[test]
+fn session_metadata_round_trips_display_name_and_labels() {
+    let metadata = SessionMetadata {
+        session_id: "sess-roundtrip".to_string(),
+        cwd: "/work/repo".to_string(),
+        workspace_root: "/work/repo".to_string(),
+        display_name: Some("payments refactor".to_string()),
+        labels: vec!["bugfix".to_string(), "payments".to_string()],
+        ..SessionMetadata::default()
+    };
+    let text = serde_json::to_string(&metadata).expect("serialise");
+    let parsed: SessionMetadata = serde_json::from_str(&text).expect("deserialise");
+    assert_eq!(parsed.display_name.as_deref(), Some("payments refactor"));
+    assert_eq!(parsed.labels, vec!["bugfix", "payments"]);
+}
+
+#[test]
+fn update_metadata_and_index_persists_display_name_to_metadata_json() {
+    // End-to-end: rename a session, then re-open it and confirm the new
+    // display_name reaches the on-disk metadata.json. The global index
+    // refresh path is exercised in production but skipped here because
+    // `temp_root` lives under the OS temp dir and the index write
+    // guards against polluting `~/.squeezy/sessions/index.jsonl`.
+    let root = temp_root("update-metadata-display-name");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("seed".to_string()),
+            json!({"ok": true}),
+        ))
+        .expect("append event");
+    handle.flush_events().expect("flush");
+
+    let snapshot = handle
+        .update_metadata_and_index(|metadata| {
+            metadata.display_name = Some("payments refactor".to_string());
+            metadata.labels.push("bugfix".to_string());
+        })
+        .expect("update metadata");
+    assert_eq!(snapshot.display_name.as_deref(), Some("payments refactor"));
+    assert_eq!(snapshot.labels, vec!["bugfix".to_string()]);
+
+    let reread = store.show(handle.session_id()).expect("re-open session");
+    assert_eq!(
+        reread.metadata.display_name.as_deref(),
+        Some("payments refactor"),
+        "rename must survive a fresh metadata read"
+    );
+    assert_eq!(reread.metadata.labels, vec!["bugfix".to_string()]);
+}
+
+#[test]
+fn global_session_index_entry_propagates_display_name() {
+    let metadata = SessionMetadata {
+        session_id: "sess-index".to_string(),
+        cwd: "/work/repo".to_string(),
+        workspace_root: "/work/repo".to_string(),
+        first_user_task: Some("inferred task".to_string()),
+        display_name: Some("nice name".to_string()),
+        ..SessionMetadata::default()
+    };
+    let entry = GlobalSessionIndexEntry::from_metadata(&metadata, 42);
+    assert_eq!(entry.display_name.as_deref(), Some("nice name"));
+    assert_eq!(entry.title.as_deref(), Some("inferred task"));
+}
+
+#[test]
+fn custom_session_event_round_trips_through_event_log() {
+    // Acceptance for the extension-author surface: a `Custom` event
+    // appended via the typed API must survive the full
+    // append -> events.jsonl -> show() -> try_from_event loop with its
+    // extension-supplied `kind` discriminator and `payload` intact.
+    // Without this, any sidecar telemetry / audit data an extension
+    // attaches to a session would be silently corrupted on every reload.
+    let root = temp_root("custom-event-roundtrip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let custom = SessionEventKind::Custom {
+        kind: "my_org.audit_log".to_string(),
+        payload: json!({
+            "actor": "alice",
+            "tokens": 42,
+            "tags": ["billing", "qa"],
+            "nested": {"flag": true}
+        }),
+    };
+    handle
+        .append_typed_event(custom.clone(), Some("turn-1".to_string()), None)
+        .expect("append custom event");
+    handle.flush_events().expect("flush events");
+
+    let record = store.show(handle.session_id()).expect("show");
+    let event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "custom")
+        .expect("custom event present in events.jsonl");
+    assert_eq!(event.kind, custom.discriminator());
+    let typed = SessionEventKind::try_from_event(event).expect("typed view");
+    assert_eq!(typed, custom);
+}
+
+#[test]
+fn custom_session_events_are_ignored_by_core_readers() {
+    // Acceptance: extension-authored Custom events must not influence
+    // the conversation replay reducer or the session enumeration
+    // surface. A Custom event sitting between a user message and an
+    // assistant reply must be enumerated by `show()` (no data loss)
+    // and listed by `list()` (no broken discovery), but the replay
+    // fallback must reconstruct the conversation as if the Custom
+    // event were not there — otherwise an extension could poison the
+    // resume payload by appending arbitrary JSON.
+    let root = temp_root("custom-event-ignored");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    handle
+        .append_typed_event(
+            SessionEventKind::UserMessage {
+                text: "kick it off".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("user message");
+    handle
+        .append_typed_event(
+            SessionEventKind::Custom {
+                kind: "telemetry".to_string(),
+                payload: json!({"latency_ms": 7, "model": "test"}),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("custom event");
+    handle
+        .append_typed_event(
+            SessionEventKind::AssistantCompleted {
+                text: "done".to_string(),
+                response_id: Some("resp-1".to_string()),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("assistant completion");
+    handle.flush_events().expect("flush events");
+
+    let listed = store.list(&SessionQuery::default()).expect("list");
+    assert!(
+        listed
+            .iter()
+            .any(|metadata| metadata.session_id == handle.session_id()),
+        "list() must still surface the session even when Custom events are interleaved",
+    );
+
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(
+        record.events.len(),
+        3,
+        "show() must return every appended event, including the Custom one",
+    );
+    let custom_event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "custom")
+        .expect("custom event must round-trip through show()");
+    assert!(matches!(
+        SessionEventKind::try_from_event(custom_event),
+        Some(SessionEventKind::Custom { .. })
+    ));
+
+    let session_dir = store.root().join(handle.session_id());
+    fs::remove_file(session_dir.join("resume_state.json"))
+        .expect("delete resume_state.json to force the events.jsonl fallback");
+    let replayed = handle
+        .replay_resume_state()
+        .expect("replay reconstructs from events.jsonl");
+    assert_eq!(
+        replayed.conversation,
+        vec![
+            ResumeItem::UserText {
+                text: "kick it off".to_string(),
+            },
+            ResumeItem::AssistantText {
+                text: "done".to_string(),
+            },
+        ],
+        "Custom events must be ignored by the replay reducer",
     );
 }

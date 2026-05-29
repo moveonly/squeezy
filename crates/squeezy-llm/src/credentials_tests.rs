@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use squeezy_core::settings_writer::SettingsScope;
 
@@ -593,4 +593,89 @@ fn empty_credentials_json_env_falls_through() {
     clear_creds_pointer();
     assert_eq!(resolved.value, "via-env");
     assert_eq!(resolved.source, KeySource::Env);
+}
+
+// --- ApiKeySource trait + impls --------------------------------------------
+
+#[tokio::test]
+async fn static_api_key_returns_constant_value() {
+    let source: Arc<dyn ApiKeySource> = Arc::new(StaticApiKey::new("sk-static", "anthropic"));
+    let first = source.current_key().await.expect("current_key");
+    let second = source.current_key().await.expect("current_key");
+    assert_eq!(first, "sk-static");
+    assert_eq!(second, "sk-static");
+    assert_eq!(source.provider_label(), "anthropic");
+}
+
+#[tokio::test]
+async fn static_api_key_invalidate_is_a_no_op() {
+    let source: Arc<dyn ApiKeySource> = Arc::new(StaticApiKey::new("sk-static", "openai"));
+    source
+        .invalidate()
+        .await
+        .expect("invalidate must be infallible for static keys");
+    let after = source
+        .current_key()
+        .await
+        .expect("current_key after invalidate");
+    assert_eq!(
+        after, "sk-static",
+        "StaticApiKey must keep the same value after invalidate"
+    );
+}
+
+#[tokio::test]
+async fn refreshable_token_returns_access_token() {
+    let token = RefreshableToken::new(TokenState::new("sk-oauth-access"), "claude-pro");
+    let source: Arc<dyn ApiKeySource> = Arc::new(token);
+    let key = source.current_key().await.expect("current_key");
+    assert_eq!(key, "sk-oauth-access");
+    assert_eq!(source.provider_label(), "claude-pro");
+}
+
+#[tokio::test]
+async fn refreshable_token_state_handle_lets_subagents_rotate_in_place() {
+    // The OAuth refresh subagents land in F16pi-anthropic-oauth /
+    // F16pi-openai-codex / F16pi-github-copilot. They need to swap the
+    // access token under the same Arc so the provider client picks up
+    // the new value on the next `current_key`. Exercise that wiring
+    // here so the indirection is regression-tested even before the
+    // refresh implementations land.
+    let token = RefreshableToken::new(TokenState::new("initial"), "github-copilot");
+    let handle = token.state_handle();
+    let source: Arc<dyn ApiKeySource> = Arc::new(token);
+
+    let before = source.current_key().await.expect("before");
+    assert_eq!(before, "initial");
+
+    {
+        let mut guard = handle.write().await;
+        guard.access_token = "rotated".to_string();
+    }
+
+    let after = source.current_key().await.expect("after");
+    assert_eq!(
+        after, "rotated",
+        "RefreshableToken must observe writes through the shared state handle"
+    );
+}
+
+#[tokio::test]
+async fn refreshable_token_invalidate_is_currently_a_no_op() {
+    // Placeholder implementation contract: until the OAuth refresh
+    // subagents land, `invalidate` is a no-op and `current_key`
+    // returns the same access token. This locks the contract so the
+    // auth-retry layer can be wired in confidently against a
+    // RefreshableToken before the real refresh ships.
+    let token = RefreshableToken::new(TokenState::new("oauth-token"), "anthropic-pro");
+    let source: Arc<dyn ApiKeySource> = Arc::new(token);
+    source.invalidate().await.expect("no-op invalidate");
+    let after = source.current_key().await.expect("current_key");
+    assert_eq!(after, "oauth-token");
+}
+
+#[test]
+fn static_api_key_source_wraps_resolved_key() {
+    let source = static_api_key_source("sk-resolved".to_string(), "anthropic");
+    assert_eq!(source.provider_label(), "anthropic");
 }

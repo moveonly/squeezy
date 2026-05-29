@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use squeezy_store::{SessionMetadata, SessionStatus};
+use squeezy_store::{EventBranchTip, SessionMetadata, SessionStatus};
 
 use super::*;
 
@@ -107,6 +107,9 @@ fn summary_at(id: &str, cwd: &str) -> SessionSummary {
         turn_count: 0,
         cwd: cwd.to_string(),
         repo_root: None,
+        display_name: None,
+        labels: Vec::new(),
+        branches: Vec::new(),
     }
 }
 
@@ -140,7 +143,10 @@ fn picker_enter_on_candidate_resumes_that_session() {
     assert_eq!(state.cursor, 2); // second candidate (row 2)
     assert_eq!(
         state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::Resume("second".to_string()))
+        Some(ResumeChoice::Resume {
+            session_id: "second".to_string(),
+            branch_tip: None,
+        })
     );
 }
 
@@ -197,10 +203,47 @@ fn session_summary_label_truncates_long_prompts() {
         turn_count: 0,
         cwd: "/work/repo".to_string(),
         repo_root: None,
+        display_name: None,
+        labels: Vec::new(),
+        branches: Vec::new(),
     };
     let label = summary.label();
     assert!(label.chars().count() <= 80, "label too long: {label}");
     assert!(label.ends_with('…'), "expected ellipsis: {label}");
+}
+
+#[test]
+fn session_summary_label_prefers_display_name_when_set() {
+    // The user-set display name beats the inferred first-user-task label
+    // so memorable sessions stay easy to spot in the picker.
+    let mut summary = summary("x");
+    summary.display_name = Some("payments-refactor".to_string());
+    summary.first_user_task = Some("debug why /checkout 500s".to_string());
+    assert_eq!(summary.label(), "payments-refactor");
+}
+
+#[test]
+fn session_summary_label_falls_back_to_task_when_display_name_is_blank() {
+    // A whitespace-only display name (the user typed `/session rename
+    // "   "`) must not silently blank the row label — fall back to the
+    // inferred task instead.
+    let mut summary = summary("x");
+    summary.display_name = Some("   ".to_string());
+    summary.first_user_task = Some("inferred prompt".to_string());
+    assert_eq!(summary.label(), "inferred prompt");
+}
+
+#[test]
+fn session_summary_label_hint_renders_labels_as_hashtags() {
+    let mut summary = summary("x");
+    summary.labels = vec!["bugfix".to_string(), "payments".to_string()];
+    assert_eq!(summary.label_hint(), "#bugfix #payments");
+}
+
+#[test]
+fn session_summary_label_hint_is_empty_when_no_labels() {
+    let summary = summary("x");
+    assert!(summary.label_hint().is_empty());
 }
 
 #[test]
@@ -216,7 +259,7 @@ fn toggle_all_projects_includes_cross_cwd_sessions() {
         state
             .candidates
             .iter()
-            .map(|s| s.session_id.as_str())
+            .map(|entry| entry.session_id())
             .collect::<Vec<_>>(),
         vec!["scoped"]
     );
@@ -228,7 +271,7 @@ fn toggle_all_projects_includes_cross_cwd_sessions() {
         state
             .candidates
             .iter()
-            .map(|s| s.session_id.as_str())
+            .map(|entry| entry.session_id())
             .collect::<Vec<_>>(),
         vec!["scoped", "sibling"]
     );
@@ -266,6 +309,9 @@ fn project_hint_prefers_repo_root_basename() {
         turn_count: 0,
         cwd: "/work/other/src/deep".to_string(),
         repo_root: Some("/work/other".to_string()),
+        display_name: None,
+        labels: Vec::new(),
+        branches: Vec::new(),
     };
     assert_eq!(s.project_hint(), "other");
 }
@@ -280,6 +326,9 @@ fn project_hint_falls_back_to_cwd_tail() {
         turn_count: 0,
         cwd: "/work/sibling".to_string(),
         repo_root: None,
+        display_name: None,
+        labels: Vec::new(),
+        branches: Vec::new(),
     };
     assert_eq!(s.project_hint(), "sibling");
 }
@@ -298,4 +347,96 @@ fn filter_all_projects_keeps_cross_cwd_entries() {
             .collect::<Vec<_>>(),
         vec!["scoped", "sibling"]
     );
+}
+
+fn tip(tip_sequence: u64, branched_from: u64, ts: u64, message: &str) -> EventBranchTip {
+    EventBranchTip {
+        tip_sequence,
+        branched_from_sequence: branched_from,
+        tip_ts_unix_ms: ts,
+        first_message_after_branch: Some(message.to_string()),
+    }
+}
+
+#[test]
+fn picker_expands_branched_sessions_into_one_row_per_branch_tip() {
+    // Synthesised summary: a single session with two branches (the user
+    // re-prompted from an earlier turn). The picker should surface both
+    // paths as independent rows so each is selectable.
+    let mut branched = summary("branched");
+    branched.branches = vec![
+        tip(5, 1, 200, "path B prompt"),
+        tip(3, 1, 100, "path A prompt"),
+    ];
+    let state = ResumePickerState::new(vec![branched.clone()], cwd());
+    assert_eq!(state.candidates.len(), 2);
+    let session_ids: Vec<&str> = state
+        .candidates
+        .iter()
+        .map(|entry| entry.session_id())
+        .collect();
+    assert_eq!(session_ids, vec!["branched", "branched"]);
+    let branch_tips: Vec<Option<u64>> = state
+        .candidates
+        .iter()
+        .map(|entry| entry.branch_tip.as_ref().map(|t| t.tip_sequence))
+        .collect();
+    assert_eq!(branch_tips, vec![Some(5), Some(3)]);
+}
+
+#[test]
+fn picker_enter_on_branch_row_returns_branch_tip_in_resume_choice() {
+    let mut branched = summary("branched");
+    branched.branches = vec![tip(5, 1, 200, "path B"), tip(3, 1, 100, "path A")];
+    let mut state = ResumePickerState::new(vec![branched], cwd());
+    // [start_fresh, branch tip 5, branch tip 3]. Down twice lands on tip 3.
+    state.dispatch(press(KeyCode::Down));
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(
+        state.dispatch(press(KeyCode::Enter)),
+        Some(ResumeChoice::Resume {
+            session_id: "branched".to_string(),
+            branch_tip: Some(3),
+        })
+    );
+}
+
+#[test]
+fn picker_keeps_linear_session_as_single_row() {
+    let linear = summary("linear");
+    let state = ResumePickerState::new(vec![linear], cwd());
+    assert_eq!(state.candidates.len(), 1);
+    assert!(state.candidates[0].branch_tip.is_none());
+}
+
+#[test]
+fn picker_handles_single_branch_tip_as_linear() {
+    // detect_branches refuses to report only one tip, but if a caller ever
+    // hands us a summary with a single tip we still want to render one row
+    // rather than dropping the session entirely.
+    let mut summary = summary("one-tip");
+    summary.branches = vec![tip(2, 0, 50, "only path")];
+    let state = ResumePickerState::new(vec![summary], cwd());
+    assert_eq!(state.candidates.len(), 1);
+    assert!(state.candidates[0].branch_tip.is_none());
+}
+
+#[test]
+fn picker_expands_branches_after_tab_toggle() {
+    let mut sibling = summary_at("sibling", "/work/other");
+    sibling.branches = vec![tip(4, 1, 90, "branch B"), tip(2, 1, 70, "branch A")];
+    let state = ResumePickerState::new(vec![sibling], cwd());
+    assert!(
+        state.candidates.is_empty(),
+        "scoped view hides cross-project branches by default",
+    );
+    let mut state = state;
+    state.dispatch(press(KeyCode::Tab));
+    assert_eq!(state.candidates.len(), 2);
+    // Cross-project branched rows must still surface as CrossProject so
+    // the user gets the chdir hint rather than an in-process resume that
+    // would silently jump cwds.
+    state.dispatch(press(KeyCode::Down));
+    let choice = state.dispatch(press(KeyCode::Enter));
+    assert!(matches!(choice, Some(ResumeChoice::CrossProject { .. })));
 }

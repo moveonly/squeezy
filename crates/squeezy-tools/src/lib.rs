@@ -36,14 +36,17 @@ pub use squeezy_mcp::{
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
 use squeezy_store::{Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
-    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
-    DiffSnapshot, GitVcs, WorkspaceSnapshot, canonicalize_workspace_root, strip_verbatim_prefix,
+    CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs,
+    canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
 
+mod checkpoint_provider;
 mod checkpoints;
+mod file_mutation_queue;
 mod file_ops;
 mod graph_tools;
 mod ipc;
@@ -56,6 +59,7 @@ mod shell_output;
 mod shell_parse;
 mod shell_program;
 mod shell_sandbox;
+mod shell_spillover;
 mod specs;
 mod truncate;
 mod web;
@@ -63,6 +67,10 @@ mod web;
 mod win_job;
 mod windows_cmd;
 
+pub use checkpoint_provider::{
+    CheckpointEditContext, CheckpointProvider, CheckpointSnapshot, JournalCheckpointProvider,
+    checkpoint_record_to_json,
+};
 use checkpoints::{CheckpointRevertArgs, CheckpointShowArgs};
 use file_ops::{GlobArgs, GrepArgs, ReadFileArgs, ReadToolOutputArgs};
 use graph_tools::{
@@ -75,7 +83,11 @@ use patch::{
     render_write_file_diff,
 };
 pub use safety::{ShellPreClassification, pre_classify_shell};
-use schema::compact_tool_parameters;
+use schema::compact_typed_tool_parameters;
+pub use schema::{
+    AdditionalProperties, JsonSchema, JsonSchemaPrimitiveType, JsonSchemaType,
+    parse_lossy_tool_parameters, parse_strict_tool_parameters,
+};
 pub use shell::direct_user_shell_nonce;
 pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};
 #[cfg(test)]
@@ -182,6 +194,22 @@ impl ToolRegistryRuntime {
 pub const SQUEEZY_ASK_SOCKET_ENV: &str = "SQUEEZY_ASK_SOCKET";
 pub const SQUEEZY_ASK_CALL_ID_ENV: &str = "SQUEEZY_ASK_CALL_ID";
 
+/// Synthetic subagent control tool names that live in `squeezy-agent` but
+/// must be parallel-safe from the registry's perspective so multiple
+/// in-flight delegations in the same model turn can run concurrently.
+///
+/// `delegate_chain` is included even though its body runs steps
+/// sequentially: chaining is internal to the call, and from the parent
+/// dispatcher's view a single `delegate_chain` invocation is just another
+/// read-only synthetic tool that doesn't race with sibling navigation
+/// calls.
+pub const SUBAGENT_PARALLEL_SAFE_TOOL_NAMES: &[&str] = &[
+    "delegate",
+    "delegate_plan",
+    "delegate_review",
+    "delegate_chain",
+];
+
 pub type ShellAskFuture = Pin<Box<dyn Future<Output = ShellAskDecision> + Send>>;
 pub type ShellAskApprover = Arc<dyn Fn(ShellAskRequest) -> ShellAskFuture + Send + Sync>;
 
@@ -221,11 +249,31 @@ pub struct ToolExecutionOptions {
     pub shell_ask_approver: Option<ShellAskApprover>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-tool soft-validation hook. Runs against the raw `arguments` JSON
+/// **before** typed-struct deserialization (and before the live
+/// `#[serde(deny_unknown_fields)]` schema rejects unknown keys), so a spec
+/// can repair common spelling drift such as `"filepath"` → `"path"`,
+/// normalize `null` placeholders into missing keys, lowercase a stray
+/// enum value, etc. Hooks are advisory: returning `Err` aborts the call
+/// with an `"invalid tool arguments"` `ToolResult` analogous to a serde
+/// error, so they should only fail when a normalization *cannot* leave
+/// the JSON in a typed-deserialize-friendly shape.
+pub type PrepareArgumentsHook = fn(&mut Value) -> std::result::Result<(), String>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    pub parameters: Value,
+    /// Typed JSON-Schema fragment advertised to the model. Holding the
+    /// schema as a [`JsonSchema`] (rather than a raw [`Value`]) is the
+    /// registration-time guard against silent drift: every first-party
+    /// spec routes through [`parse_strict_tool_parameters`], so a
+    /// misspelled JSON-Schema keyword in `crate::specs` makes the spec
+    /// constructor panic at startup instead of shipping a degraded schema
+    /// to the model. External MCP schemas come in via the tolerant
+    /// [`parse_lossy_tool_parameters`] path so unknown third-party
+    /// keywords degrade gracefully to the modeled subset.
+    pub parameters: JsonSchema,
     /// The capability that approximates this tool's lowest-risk form, used at
     /// advertisement time (before any arguments are bound) to decide whether a
     /// tool should be visible to the model in a given session mode. Runtime
@@ -234,22 +282,80 @@ pub struct ToolSpec {
     /// shell → git via the shell classifier); session mode gating in the agent
     /// applies on top of both layers.
     pub capability: PermissionCapability,
+    /// Whether multiple calls to this tool in the same model turn can execute
+    /// concurrently. Read-only navigation tools (graph lookups, `read_file`,
+    /// `grep`, `glob`, …) set this to `true` so the agent dispatcher groups
+    /// them into a single `buffer_unordered` batch; tools that mutate the
+    /// workspace, run shell, or depend on observable side effects keep the
+    /// default `false` so the dispatcher serializes them and flushes any
+    /// pending parallel batch around them.
+    ///
+    /// Defaults via `#[serde(default)]` so a `ToolSpec` payload serialized by
+    /// an older Squeezy build (or a forwards-compatible deserializer such as
+    /// the MCP wire surface) still loads with the conservative `false` value.
+    #[serde(default)]
+    pub parallel_safe: bool,
+    /// Optional soft-validation hook that mutates the raw `arguments` JSON
+    /// before typed deserialization. `None` means dispatch deserializes the
+    /// arguments as-is. Never serialized — function pointers are a runtime
+    /// concern of the dispatcher, not part of the tool advertisement, and
+    /// they are deliberately excluded from [`PartialEq`] because rust does
+    /// not guarantee stable addresses across codegen units.
+    #[serde(skip)]
+    pub prepare_arguments: Option<PrepareArgumentsHook>,
 }
 
 impl ToolSpec {
     /// Apply the schema-compaction pipeline to `parameters`. Idempotent — safe
     /// to call on a spec that has already been compacted.
     pub(crate) fn with_compacted_parameters(mut self) -> Self {
-        compact_tool_parameters(&mut self.parameters);
+        compact_typed_tool_parameters(&mut self.parameters);
+        self
+    }
+
+    /// Attach a [`PrepareArgumentsHook`] to this spec. Overwrites any
+    /// previously-set hook.
+    pub(crate) fn with_prepare_arguments(mut self, hook: PrepareArgumentsHook) -> Self {
+        self.prepare_arguments = Some(hook);
         self
     }
 }
+
+impl PartialEq for ToolSpec {
+    fn eq(&self, other: &Self) -> bool {
+        // Hooks are runtime-only (see `prepare_arguments` doc): rust does
+        // not guarantee unique function-pointer addresses across codegen
+        // units, so structural equality skips that field. All
+        // model-visible and dispatcher-visible fields are compared.
+        self.name == other.name
+            && self.description == other.description
+            && self.parameters == other.parameters
+            && self.capability == other.capability
+            && self.parallel_safe == other.parallel_safe
+    }
+}
+
+impl Eq for ToolSpec {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+/// One batch in a parallel execution plan computed by
+/// [`ToolRegistry::plan_parallel_batches`]. A batch with
+/// `parallel_safe = true` may run all its calls concurrently; a batch
+/// with `parallel_safe = false` always holds exactly one call that
+/// must run alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelExecutionBatch {
+    /// Indices into the input slice, in original order.
+    pub indices: Vec<usize>,
+    /// True when every call in `indices` is safe to run concurrently
+    /// with the others in the same batch.
+    pub parallel_safe: bool,
 }
 
 /// Render a one-phrase English description of a tool call from its name
@@ -655,6 +761,7 @@ impl ToolResult {
 pub struct ToolRegistry {
     pub(crate) root: Arc<PathBuf>,
     pub(crate) output_store: Arc<ToolOutputStore>,
+    pub(crate) shell_spillover: Arc<shell_spillover::ShellSpilloverStore>,
     pub(crate) web_config: Arc<WebToolConfig>,
     pub(crate) http: Arc<dyn WebHttpClient>,
     pub(crate) graph: Arc<StdMutex<Option<GraphManager>>>,
@@ -670,6 +777,15 @@ pub struct ToolRegistry {
     /// [`ToolRegistryRuntime`].
     pub(crate) state_store: Option<Arc<SqueezyStore>>,
     pub(crate) checkpoints: Option<Arc<CheckpointStore>>,
+    /// Pluggable pre/post-edit snapshot bridge. Defaults to a
+    /// [`JournalCheckpointProvider`] wired to [`Self::checkpoints`] when
+    /// the journal is enabled; external integrations (e.g. a git-stash
+    /// snapshotter) can replace it via
+    /// [`ToolRegistry::register_checkpoint_provider`] without forking
+    /// core. The slot itself is mutable to support post-construction
+    /// registration; the inner `Arc<dyn ...>` is shared across registry
+    /// clones so a swap is visible everywhere.
+    pub(crate) checkpoint_provider: Arc<StdMutex<Option<Arc<dyn CheckpointProvider>>>>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     pub(crate) skills: Arc<SkillCatalog>,
     pub(crate) redactor: Arc<Redactor>,
@@ -684,8 +800,8 @@ pub struct ToolRegistry {
     /// F04: cache for the per-turn `specs()` advertisement. The agent calls
     /// this at least once per round for cost accounting plus once more when
     /// building the LLM request; recomputing means cloning ~30 `ToolSpec`s
-    /// with their `parameters: Value` blobs every time. The cache is
-    /// invalidated whenever MCP refresh changes the external tool set.
+    /// with their typed `parameters: JsonSchema` trees every time. The cache
+    /// is invalidated whenever MCP refresh changes the external tool set.
     cached_specs: Arc<StdMutex<Option<Arc<Vec<ToolSpec>>>>>,
     /// Plans registered by `plan_patch` and consulted by `apply_patch` to enforce
     /// the model's stated semantic neighborhood. Keyed by `plan_id`; entries
@@ -949,16 +1065,23 @@ impl ToolRegistry {
         } else {
             None
         };
+        let checkpoint_provider: Option<Arc<dyn CheckpointProvider>> =
+            checkpoints.as_ref().map(|store| {
+                Arc::new(JournalCheckpointProvider::new(Arc::clone(store)))
+                    as Arc<dyn CheckpointProvider>
+            });
         let shell_sandbox = normalize_shell_sandbox_paths(config.shell_sandbox);
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
+            shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(config.web.normalized()),
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store: state_store.clone(),
             checkpoints,
+            checkpoint_provider: Arc::new(StdMutex::new(checkpoint_provider)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
             redactor,
@@ -999,12 +1122,14 @@ impl ToolRegistry {
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
+            shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(web_config.normalized()),
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store: None,
             checkpoints: None,
+            checkpoint_provider: Arc::new(StdMutex::new(None)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
             redactor: Arc::new(Redactor::default()),
@@ -1276,7 +1401,7 @@ impl ToolRegistry {
         // through the compaction pipeline so the budget contract holds
         // uniformly regardless of how a spec was built.
         for spec in specs.iter_mut() {
-            compact_tool_parameters(&mut spec.parameters);
+            compact_typed_tool_parameters(&mut spec.parameters);
         }
         // `mcp_tool_spec` already compacts at construction; append after the
         // first-party loop to avoid double work.
@@ -1301,6 +1426,20 @@ impl ToolRegistry {
         if let Ok(mut slot) = self.cached_specs.lock() {
             *slot = None;
         }
+    }
+
+    /// Look up the optional [`PrepareArgumentsHook`] for a tool by name.
+    /// Reads from the cached spec list so this is O(N) over the current
+    /// tool catalog, which is bounded to dozens of entries; the lookup is
+    /// invoked once per tool call so the linear scan is dwarfed by the
+    /// actual tool work. Returns `None` for unknown tools (the dispatcher
+    /// will surface `unknown tool` later) and for tools that did not
+    /// declare a hook.
+    pub fn prepare_arguments_for(&self, name: &str) -> Option<PrepareArgumentsHook> {
+        self.specs()
+            .iter()
+            .find(|spec| spec.name == name)
+            .and_then(|spec| spec.prepare_arguments)
     }
 
     pub async fn refresh_mcp_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
@@ -1716,34 +1855,70 @@ impl ToolRegistry {
         preview::CatalogPreview.preview_lines(request, call, self.root.as_ref())
     }
 
+    /// Whether the call's tool is marked `parallel_safe` in its spec. The
+    /// dispatcher uses this to group consecutive safe calls into one
+    /// `buffer_unordered` batch; unsafe calls flush the pending batch and
+    /// run alone. Unknown tools fall back to `false` so a stale call name
+    /// (or a model misspelling) never opportunistically races a write.
+    ///
+    /// Reads from the cached spec list (`O(N)` over the current catalog,
+    /// bounded to dozens of entries). Going through the spec keeps the
+    /// per-tool parallelism contract single-sourced from the
+    /// `crate::specs` constructors instead of duplicating the safe-set in
+    /// a hardcoded match here.
+    ///
+    /// Synthetic subagent control tools (`delegate`, `delegate_plan`,
+    /// `delegate_review`, `delegate_chain`) live in the agent crate and
+    /// never enter the registry's `specs()` table, so the spec lookup
+    /// would always return `false` for them. They are read-only from the
+    /// dispatcher's perspective (each spawns an isolated subagent that
+    /// runs in its own LLM stream and lease slot) and the
+    /// `SUBAGENT_MAX_CONCURRENT` lease pool already caps total fanout, so
+    /// the registry promotes them to parallel-safe explicitly. This
+    /// closes the gap where multiple delegate calls in the same model
+    /// turn were serialised even though the lease pool advertised a
+    /// 4-way concurrency budget.
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
-        matches!(
-            call.name.as_str(),
-            "checkpoint_list"
-                | "checkpoint_show"
-                | "decl_search"
-                | "definition_search"
-                | "diff_context"
-                | "downstream_flow"
-                | "glob"
-                | "grep"
-                | "hierarchy"
-                | "plan_patch"
-                | "read_file"
-                | "read_slice"
-                | "read_tool_output"
-                | "reference_search"
-                | "repo_map"
-                | "symbol_context"
-                | "upstream_flow"
-                | "webfetch"
-                | "websearch"
-                | "mcp_list_resources"
-                | "mcp_list_resource_templates"
-                | "mcp_read_resource"
-                | "list_skills"
-                | "load_skill"
-        )
+        if SUBAGENT_PARALLEL_SAFE_TOOL_NAMES.contains(&call.name.as_str()) {
+            return true;
+        }
+        self.specs()
+            .iter()
+            .find(|spec| spec.name == call.name)
+            .is_some_and(|spec| spec.parallel_safe)
+    }
+
+    /// Group consecutive parallel-safe tool calls into batches so the
+    /// dispatcher can run a safe run via `buffer_unordered` and break
+    /// the run around any unsafe call.
+    ///
+    /// The result is a `Vec<ParallelExecutionBatch>` aligned to `calls`
+    /// in original order; each batch carries either a single unsafe call
+    /// (`parallel_safe = false`) or a contiguous run of safe calls
+    /// (`parallel_safe = true`, `indices.len() >= 1`). Unknown tools are
+    /// treated as unsafe (consistent with `is_parallel_safe`).
+    ///
+    /// This is the pure form of the grouping invariant the live
+    /// dispatcher implements inline in
+    /// `squeezy_agent::execute_tool_calls`, exposed here so the layout
+    /// can be unit-tested without spinning up a full agent runtime.
+    pub fn plan_parallel_batches(&self, calls: &[ToolCall]) -> Vec<ParallelExecutionBatch> {
+        let mut batches: Vec<ParallelExecutionBatch> = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            let safe = self.is_parallel_safe(call);
+            if safe
+                && let Some(last) = batches.last_mut()
+                && last.parallel_safe
+            {
+                last.indices.push(index);
+                continue;
+            }
+            batches.push(ParallelExecutionBatch {
+                indices: vec![index],
+                parallel_safe: safe,
+            });
+        }
+        batches
     }
 
     pub fn describe_call(&self, call: &ToolCall) -> String {
@@ -1860,11 +2035,13 @@ impl ToolRegistry {
             "read_tool_output" => {
                 let args =
                     serde_json::from_value::<ReadToolOutputArgs>(call.arguments.clone()).ok();
-                let handle = args
-                    .as_ref()
-                    .map(|args| args.handle.as_str())
-                    .unwrap_or("?");
-                format!("read_tool_output handle={handle:?}")
+                let handle = args.as_ref().and_then(|args| args.handle.as_deref());
+                let path = args.as_ref().and_then(|args| args.path.as_deref());
+                match (handle, path) {
+                    (Some(handle), _) => format!("read_tool_output handle={handle:?}"),
+                    (None, Some(path)) => format!("read_tool_output path={path:?}"),
+                    (None, None) => "read_tool_output target=?".to_string(),
+                }
             }
             "symbol_context" => {
                 let args = serde_json::from_value::<SymbolContextArgs>(call.arguments.clone()).ok();
@@ -2005,6 +2182,21 @@ impl ToolRegistry {
     ) -> ToolResult {
         if cancel.is_cancelled() {
             return ToolResult::cancelled(&call);
+        }
+
+        // F01: run the per-spec `prepare_arguments` hook before any
+        // downstream typed-struct deserialization. The hook can rename
+        // misspelled fields ("filepath" -> "path"), strip null
+        // placeholders, lowercase enum values, etc. — soft repairs that
+        // strengthen the silent-acceptance gap left by the typed arg
+        // structs' `deny_unknown_fields`. Hooks that return `Err` short
+        // circuit dispatch with the same shape as a serde error so the
+        // model sees a uniform "invalid tool arguments" failure.
+        let mut call = call;
+        if let Some(hook) = self.prepare_arguments_for(&call.name)
+            && let Err(err) = hook(&mut call.arguments)
+        {
+            return tool_prepare_error(&call, &err);
         }
 
         let result = if self.mcp_tool(&call.name).is_some() {
@@ -2781,6 +2973,45 @@ impl ToolRegistry {
                         }));
                         return Ok(());
                     }
+                    // F01 unicode-normalize fallback: NFKC the file + search,
+                    // then collapse smart quotes, em/en-dashes, and NBSP-class
+                    // whitespace to ASCII on both sides before re-searching.
+                    // Catches the cases the quote-only path misses — em-dash
+                    // drift from a Markdown auto-correct, NBSP injected by a
+                    // copy-paste, or NFKC-equivalent ligatures (e.g. `ﬁ` vs
+                    // `fi`). Single clean character-boundary match only; the
+                    // sha256 staleness gate still applies because the final
+                    // file is re-hashed in the commit phase.
+                    if let Some((ustart, uend, ucount)) =
+                        find_with_unicode_normalization(&state.current, search)
+                        && ucount == 1
+                    {
+                        let before_len = state.current.len();
+                        let mut new_contents = String::with_capacity(
+                            state.current.len() - (uend - ustart) + replace.len(),
+                        );
+                        new_contents.push_str(&state.current[..ustart]);
+                        new_contents.push_str(replace);
+                        new_contents.push_str(&state.current[uend..]);
+                        state.current = new_contents;
+                        let after_len = state.current.len();
+                        staged.mark_last_op_inexact(Some("unicode_normalize"));
+                        preview_ops.push(json!({
+                            "patch_index": index,
+                            "kind": "search_replace",
+                            "path": rel,
+                            "matches": ucount,
+                            "allow_multiple": allow_multiple.unwrap_or(false),
+                            "bytes_delta": after_len as i64 - before_len as i64,
+                            "fallback": "unicode_normalize",
+                            "exact": false,
+                            "preview": {
+                                "search": truncate_text(search, PATCH_SNIPPET_MAX_CHARS),
+                                "replace": truncate_text(replace, PATCH_SNIPPET_MAX_CHARS),
+                            }
+                        }));
+                        return Ok(());
+                    }
                     // Optional unified-diff fallback (F89): the search body is
                     // a unified diff; preflight against the live worktree, and
                     // if it would apply, materialise the result by reading the
@@ -3000,7 +3231,14 @@ impl ToolRegistry {
                         )?;
                     }
                 }
-                staged.push_delete(rel.clone(), abs_path, current_sha256, existing.len());
+                let before_contents = std::str::from_utf8(&existing).ok().map(str::to_string);
+                staged.push_delete(
+                    rel.clone(),
+                    abs_path,
+                    current_sha256,
+                    existing.len(),
+                    before_contents,
+                );
                 preview_ops.push(json!({
                     "patch_index": index,
                     "kind": "delete_file",
@@ -3310,6 +3548,12 @@ impl ToolRegistry {
             );
         }
 
+        // F01: serialise the read+validate+write sequence per-realpath so
+        // two concurrent `write_file` (or `apply_patch`) calls against the
+        // same file cannot interleave their sha256 check and `fs::write`,
+        // while writes to distinct files still proceed in parallel.
+        let _mutation_guard = file_mutation_queue::lock_paths_for_mutation([&path]).await;
+
         let checkpoint_before = match self.track_checkpoint_tree() {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
@@ -3343,6 +3587,29 @@ impl ToolRegistry {
             }
         }
 
+        // F14: short-circuit identical-content writes by sha256 comparison
+        // before touching the disk. The existing read above already gave us
+        // `before_sha256`; computing the proposed-content sha first lets us
+        // skip `fs::write`, `invalidate_diff_cache`, and the checkpoint
+        // append when nothing would change. Skipping the write avoids the
+        // mtime bump and the journal entry that would otherwise be recorded
+        // for a no-op edit.
+        let after_sha256 = sha256_hex(args.content.as_bytes());
+        if before_sha256.as_deref() == Some(after_sha256.as_str()) {
+            let cost = ToolCostHint {
+                bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                ..ToolCostHint::default()
+            };
+            let content = json!({
+                "path": rel.to_string_lossy(),
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+                "bytes_written": 0,
+                "noop": true,
+            });
+            return make_result(call, ToolStatus::Success, content, cost, Some(after_sha256));
+        }
+
         if let Some(parent) = path.parent()
             && let Err(err) = fs::create_dir_all(parent)
         {
@@ -3353,7 +3620,6 @@ impl ToolRegistry {
         }
         self.invalidate_diff_cache();
 
-        let after_sha256 = sha256_hex(args.content.as_bytes());
         let cost = ToolCostHint {
             bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
             output_bytes: args.content.len() as u64,
@@ -3365,6 +3631,7 @@ impl ToolRegistry {
             "before_sha256": before_sha256,
             "after_sha256": after_sha256,
             "bytes_written": args.content.len(),
+            "noop": false,
         });
         self.append_checkpoint_to_content(
             &mut content,
@@ -3417,6 +3684,12 @@ impl ToolRegistry {
                 None,
             );
         }
+
+        // F01: share the per-realpath mutex with `write_file`/`apply_patch`
+        // so a concurrent `apply_patch` on the same notebook (rejected at
+        // the redirect, but still possible in flight) cannot race with this
+        // edit.
+        let _mutation_guard = file_mutation_queue::lock_paths_for_mutation([&path]).await;
 
         let mode = args.edit_mode.unwrap_or_default();
         let before = match fs::read(&path) {
@@ -3614,36 +3887,75 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
-    pub(crate) fn track_checkpoint_tree(&self) -> Result<Option<WorkspaceSnapshot>> {
-        self.checkpoints
-            .as_ref()
-            .map(|checkpoints| checkpoints.track_tree())
-            .transpose()
+    /// Replace the currently registered [`CheckpointProvider`] (if any)
+    /// with `provider`. Returns the previously installed provider so the
+    /// caller can chain or restore.
+    ///
+    /// Intended for extensions (e.g. a git-stash bridge) that want to
+    /// take over pre/post-edit snapshotting from the built-in
+    /// [`JournalCheckpointProvider`]. The journal-backed CRUD tools
+    /// (`checkpoint_list`/`checkpoint_show`/`checkpoint_undo`/
+    /// `checkpoint_revert`) still operate against the registry's own
+    /// `CheckpointStore` — they do not route through the provider trait —
+    /// so installing a replacement does not silently break the existing
+    /// rollback surface.
+    pub fn register_checkpoint_provider(
+        &self,
+        provider: Arc<dyn CheckpointProvider>,
+    ) -> Option<Arc<dyn CheckpointProvider>> {
+        let mut slot = self
+            .checkpoint_provider
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        slot.replace(provider)
+    }
+
+    /// True when a [`CheckpointProvider`] is currently installed. Used by
+    /// edit-bearing tools (notably `shell`) to skip the workspace-tree
+    /// snapshot when no provider would consume it.
+    pub(crate) fn has_checkpoint_provider(&self) -> bool {
+        self.checkpoint_provider
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    fn checkpoint_provider(&self) -> Option<Arc<dyn CheckpointProvider>> {
+        self.checkpoint_provider
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    pub(crate) fn track_checkpoint_tree(&self) -> Result<Option<CheckpointSnapshot>> {
+        match self.checkpoint_provider() {
+            Some(provider) => provider.before_edit(),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn append_checkpoint_to_content(
         &self,
         content: &mut Value,
-        before: Option<&WorkspaceSnapshot>,
+        before: Option<&CheckpointSnapshot>,
         call: &ToolCall,
         group_id: &str,
         status: ToolStatus,
         coverage_warnings: Vec<String>,
     ) {
-        let (Some(checkpoints), Some(before)) = (self.checkpoints.as_ref(), before) else {
+        let Some(before) = before else { return };
+        let Some(provider) = self.checkpoint_provider() else {
             return;
         };
-        match checkpoints.create_checkpoint(
-            before,
-            &call.name,
-            &call.call_id,
-            group_id,
-            checkpoint_status_label(status),
+        let context = CheckpointEditContext {
+            tool_name: call.name.clone(),
+            call_id: call.call_id.clone(),
+            group_id: group_id.to_string(),
+            status: checkpoint_status_label(status),
             coverage_warnings,
-        ) {
-            Ok(Some(checkpoint)) => {
-                insert_content_field(content, "checkpoint", checkpoint_json(&checkpoint));
-            }
+        };
+        match provider.after_edit(before, &context) {
+            Ok(Some(value)) => insert_content_field(content, "checkpoint", value),
             Ok(None) => {}
             Err(err) => {
                 insert_content_field(content, "checkpoint_error", json!(err.to_string()));
@@ -3666,30 +3978,6 @@ fn checkpoint_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Stale => "stale",
         ToolStatus::Cancelled => "cancelled",
     }
-}
-
-fn checkpoint_json(record: &CheckpointRecord) -> Value {
-    let mut value = json!({
-        "id": record.id,
-        "group_id": record.group_id,
-        "tool_name": record.tool_name,
-        "call_id": record.call_id,
-        "status": record.status,
-        "summary": record.summary,
-        "files": record.files,
-    });
-    if let Some(object) = value.as_object_mut() {
-        if !record.skipped_files.is_empty() {
-            object.insert("skipped_files".to_string(), json!(record.skipped_files));
-        }
-        if !record.coverage_warnings.is_empty() {
-            object.insert(
-                "coverage_warnings".to_string(),
-                json!(record.coverage_warnings),
-            );
-        }
-    }
-    value
 }
 
 fn redact_tool_result(mut result: ToolResult, redactor: &Redactor) -> ToolResult {
@@ -4208,9 +4496,9 @@ pub(crate) fn diff_status_str(status: DiffFileStatus) -> &'static str {
 #[derive(Debug)]
 pub(crate) struct PatchFileState {
     path: PathBuf,
-    rel: String,
-    before: String,
-    current: String,
+    pub(crate) rel: String,
+    pub(crate) before: String,
+    pub(crate) current: String,
     before_sha256: String,
 }
 
@@ -4246,6 +4534,11 @@ pub(crate) enum StagedOp {
         abs_path: PathBuf,
         before_sha256: String,
         before_len: usize,
+        /// Pre-delete file contents when the file was valid UTF-8. Used by
+        /// the unified-diff output to render the deletion's `-` lines; left
+        /// as `None` for binary files (we still delete them, but they don't
+        /// appear in the textual diff).
+        before_contents: Option<String>,
     },
     MoveFile {
         rel_from: String,
@@ -4322,12 +4615,14 @@ impl StagedApply {
         abs_path: PathBuf,
         before_sha256: String,
         before_len: usize,
+        before_contents: Option<String>,
     ) {
         self.ops.push(StagedOp::DeleteFile {
             rel,
             abs_path,
             before_sha256,
             before_len,
+            before_contents,
         });
     }
 
@@ -4935,6 +5230,20 @@ pub(crate) fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolRes
     )
 }
 
+/// Sibling of [`tool_arg_error`] for hook-returned errors from
+/// [`PrepareArgumentsHook`]. Keeps the user-visible shape identical
+/// (`"invalid tool arguments: …"`) so the model cannot tell a soft
+/// pre-validation failure apart from a typed-struct deserialize failure.
+pub(crate) fn tool_prepare_error(call: &ToolCall, message: &str) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Error,
+        json!({ "error": format!("invalid tool arguments: {message}") }),
+        ToolCostHint::default(),
+        None,
+    )
+}
+
 pub(crate) fn tool_error(call: &ToolCall, err: impl ToString) -> ToolResult {
     make_result(
         call,
@@ -5172,6 +5481,105 @@ fn is_opening_quote_context(chars: &[char], index: usize) -> bool {
         ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '\u{2014}' | '\u{2013}'
     )
 }
+
+/// Per-character ASCII substitutions for the broader unicode-normalize
+/// patch fallback. Covers the typographic substitutions that auto-correct
+/// editors and Markdown tools regularly slip into source files but that the
+/// model emits as plain ASCII: smart quotes, em/en-dashes and friends, and
+/// NBSP-class whitespace. Returns `None` when the character should be
+/// emitted unchanged.
+fn map_unicode_to_ascii(ch: char) -> Option<&'static str> {
+    match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => Some("'"),
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => Some("\""),
+        '\u{2014}' => Some("--"),
+        '\u{2013}' | '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2015}' | '\u{2212}' => Some("-"),
+        '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+        | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}' => Some(" "),
+        _ => None,
+    }
+}
+
+/// Build the fuzzy buffer used by `find_with_unicode_normalization`: NFKC
+/// the input first, then substitute typographic ASCII equivalents per
+/// `map_unicode_to_ascii`. Returns the normalized bytes and a per-byte map
+/// back to original byte indices; the sentinel value at
+/// `byte_map[normalized.len()]` is the byte just past the end of the
+/// original buffer so callers can resolve match-end positions cleanly.
+///
+/// One source character may emit 0+ normalized characters because NFKC can
+/// expand (e.g. `½` → `1⁄2`) or contract (e.g. `ﬁ` → `fi`). For every byte
+/// pushed into the normalized buffer we record the *start* byte of the
+/// source character that produced it, which keeps the map monotonic and
+/// makes the resolved range a strict character-aligned slice of the
+/// original — partial-character matches are detected later via a
+/// round-trip check.
+fn unicode_normalize_with_byte_map(input: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(input.len());
+    let mut byte_map: Vec<usize> = Vec::with_capacity(input.len());
+    for (orig_idx, ch) in input.char_indices() {
+        for nch in ch.nfkc() {
+            let pre_len = normalized.len();
+            match map_unicode_to_ascii(nch) {
+                Some(text) => normalized.push_str(text),
+                None => normalized.push(nch),
+            }
+            for _ in 0..(normalized.len() - pre_len) {
+                byte_map.push(orig_idx);
+            }
+        }
+    }
+    byte_map.push(input.len());
+    (normalized, byte_map)
+}
+
+/// Locate `search` inside `content` after the broader unicode-normalize
+/// chain (NFKC + smart quotes + em/en dashes + NBSP) on both sides. Returns
+/// `(byte_start, byte_end)` pointing at the matched slice in the *original*
+/// `content`, plus the number of clean character-boundary matches — the
+/// caller refuses to apply when more than one clean match exists. Returns
+/// `None` when no clean normalized match exists, the input does not benefit
+/// from normalization, or every candidate match would slice a character.
+///
+/// "Clean" means the match boundaries in the normalized buffer correspond
+/// to character boundaries in the original. We verify by re-normalizing
+/// `content[orig_start..orig_end]` and checking it round-trips to the
+/// normalized search; partial-character matches (which can happen with
+/// NFKC expansion such as `½` → `1⁄2`) are rejected so we never replace
+/// half of a source character.
+fn find_with_unicode_normalization(content: &str, search: &str) -> Option<(usize, usize, usize)> {
+    let (normalized_search, _) = unicode_normalize_with_byte_map(search);
+    if normalized_search.is_empty() {
+        return None;
+    }
+    let (normalized, byte_map) = unicode_normalize_with_byte_map(content);
+    // Skip when normalization is a no-op on both sides — there is no
+    // typographic drift to bridge here, just an honest miss. Keeps this
+    // fallback from shadowing exact failures with redundant work.
+    if normalized.as_str() == content && normalized_search.as_str() == search {
+        return None;
+    }
+    let mut clean: Vec<(usize, usize)> = Vec::new();
+    let mut scan_from = 0;
+    while let Some(rel) = normalized[scan_from..].find(normalized_search.as_str()) {
+        let n_start = scan_from + rel;
+        let n_end = n_start + normalized_search.len();
+        scan_from = n_start + 1;
+        let orig_start = *byte_map.get(n_start)?;
+        let orig_end = *byte_map.get(n_end)?;
+        let (verify, _) = unicode_normalize_with_byte_map(&content[orig_start..orig_end]);
+        if verify == normalized_search {
+            clean.push((orig_start, orig_end));
+        }
+    }
+    if clean.is_empty() {
+        return None;
+    }
+    let (orig_start, orig_end) = clean[0];
+    Some((orig_start, orig_end, clean.len()))
+}
+
 fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<Value> {
     content
         .match_indices(search)

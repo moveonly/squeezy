@@ -1,16 +1,21 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use squeezy_core::{CostSnapshot, ProviderTransportConfig, SqueezyError};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, jitter_sample,
-    parse_retry_after, with_stream_retry,
+    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, is_terminal_quota_error,
+    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, with_stream_retry,
 };
+use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream};
 
 #[test]
@@ -19,6 +24,7 @@ fn provider_requests_policy_inherits_transport_max_retries() {
         request_max_retries: 7,
         stream_max_retries: 3,
         stream_idle_timeout_ms: 1_000,
+        ..ProviderTransportConfig::default()
     };
     let policy = RetryPolicy::provider_requests(transport);
     assert_eq!(policy.max_retries, 7);
@@ -34,6 +40,7 @@ fn provider_stream_policy_inherits_transport_stream_retries() {
         request_max_retries: 1,
         stream_max_retries: 4,
         stream_idle_timeout_ms: 1_000,
+        ..ProviderTransportConfig::default()
     };
     let policy = RetryPolicy::provider_stream(transport);
     assert_eq!(policy.max_retries, 4);
@@ -48,6 +55,7 @@ fn idle_timeout_reflects_transport_setting() {
         request_max_retries: 0,
         stream_max_retries: 0,
         stream_idle_timeout_ms: 250,
+        ..ProviderTransportConfig::default()
     };
     assert_eq!(idle_timeout(transport), Duration::from_millis(250));
 }
@@ -97,6 +105,7 @@ async fn mock_transport_drops_mid_stream_for_two_attempts_then_succeeds_on_third
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     };
     let cancel = CancellationToken::new();
     let attempts = Arc::new(Mutex::new(0u32));
@@ -151,6 +160,7 @@ async fn mock_transport_stops_retrying_once_stream_max_retries_is_exhausted() {
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     };
     let cancel = CancellationToken::new();
     let attempts = Arc::new(Mutex::new(0u32));
@@ -186,6 +196,7 @@ async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
         retry_429: false,
         retry_5xx: false,
         retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
     };
     let cancel = CancellationToken::new();
     let attempts = Arc::new(Mutex::new(0u32));
@@ -375,4 +386,537 @@ fn retry_after_falls_back_when_ms_header_is_unparseable() {
 fn retry_after_returns_none_when_no_headers_present() {
     let headers = reqwest::header::HeaderMap::new();
     assert_eq!(parse_retry_after(&headers), None);
+}
+
+#[test]
+fn malicious_retry_after_header_is_clamped_to_policy_cap() {
+    // A hostile upstream asking for ~11.5 days of cooldown must not
+    // be able to park the agent: the default cap (60s) bounds the
+    // chosen delay regardless of what the header claims.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "999999".parse().expect("header value"),
+    );
+    let parsed = parse_retry_after(&headers).expect("retry-after present");
+    assert_eq!(
+        parsed,
+        Duration::from_secs(999_999),
+        "parser must report the raw header value untouched",
+    );
+
+    let policy = RetryPolicy::provider_requests(ProviderTransportConfig::default());
+    assert_eq!(
+        policy.max_retry_delay,
+        Duration::from_secs(60),
+        "default policy must carry the 60s ceiling from ProviderTransportConfig",
+    );
+    assert_eq!(
+        parsed.min(policy.max_retry_delay),
+        Duration::from_secs(60),
+        "malicious Retry-After: 999999 must clamp to 60s",
+    );
+}
+
+#[test]
+fn retry_policy_inherits_max_retry_delay_from_transport_config() {
+    // Both the request and stream policies must carry the
+    // operator-configured ceiling so callers cannot accidentally
+    // bypass it by routing through a different policy constructor.
+    let transport = ProviderTransportConfig {
+        max_retry_delay_ms: 5_000,
+        ..ProviderTransportConfig::default()
+    };
+    let request_policy = RetryPolicy::provider_requests(transport);
+    let stream_policy = RetryPolicy::provider_stream(transport);
+    assert_eq!(request_policy.max_retry_delay, Duration::from_millis(5_000));
+    assert_eq!(stream_policy.max_retry_delay, Duration::from_millis(5_000));
+}
+
+/// Closes the protocol loop on the parse-level None tests above: when a
+/// retryable response carries neither `Retry-After-Ms` nor `Retry-After`,
+/// `send_with_retry` must fall through to the exponential `backoff` schedule
+/// rather than reconnecting immediately. Measures elapsed wall-clock between
+/// the first (429) and second (200) attempts and asserts it lands inside the
+/// jittered backoff window for `attempt = 0`.
+#[tokio::test]
+async fn send_with_retry_uses_exponential_backoff_when_no_retry_after_headers() {
+    let (addr, attempts) = spawn_status_server(vec![429, 200]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let base_delay = Duration::from_millis(120);
+    let policy = RetryPolicy {
+        max_retries: 1,
+        base_delay,
+        retry_429: true,
+        retry_5xx: false,
+        retry_transport: false,
+        max_retry_delay: Duration::from_secs(60),
+    };
+
+    let started = Instant::now();
+    let response = send_with_retry(policy, &cancel, || client.post(&url))
+        .await
+        .expect("send");
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "429 then 200 = exactly two HTTP attempts"
+    );
+
+    // `backoff(base_delay, 0)` is in `[base * (1 - JITTER_FRACTION), base * (1
+    // + JITTER_FRACTION)]`. The 5ms floor absorbs scheduler/timer imprecision
+    // on contended CI runners; the assertion still fails loudly if a
+    // regression skips the sleep entirely (elapsed would round to ~0).
+    let lower_bound = base_delay.mul_f64(1.0 - JITTER_FRACTION) - Duration::from_millis(5);
+    assert!(
+        elapsed >= lower_bound,
+        "without Retry-After headers send_with_retry must back off (elapsed = {elapsed:?}, lower bound = {lower_bound:?})",
+    );
+}
+
+// --- send_with_auth_retry --------------------------------------------------
+
+/// Test ApiKeySource that hands out a deterministic sequence of keys
+/// and counts how many times the retry layer touched it. Drives the
+/// `send_with_auth_retry` assertions below without spinning up the
+/// full OAuth flow.
+#[derive(Debug)]
+struct TestKeySource {
+    label: String,
+    keys: AsyncMutex<Vec<String>>,
+    current_key_calls: AtomicUsize,
+    invalidate_calls: AtomicUsize,
+}
+
+impl TestKeySource {
+    fn new(label: &str, keys: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
+            label: label.to_string(),
+            keys: AsyncMutex::new(keys.into_iter().rev().collect()),
+            current_key_calls: AtomicUsize::new(0),
+            invalidate_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn current_key_calls(&self) -> usize {
+        self.current_key_calls.load(Ordering::SeqCst)
+    }
+
+    fn invalidate_calls(&self) -> usize {
+        self.invalidate_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ApiKeySource for TestKeySource {
+    fn current_key<'a>(&'a self) -> ApiKeyFuture<'a, String> {
+        Box::pin(async move {
+            self.current_key_calls.fetch_add(1, Ordering::SeqCst);
+            let mut keys = self.keys.lock().await;
+            Ok(keys.pop().unwrap_or_else(|| "exhausted".to_string()))
+        })
+    }
+
+    fn invalidate<'a>(&'a self) -> ApiKeyFuture<'a, ()> {
+        Box::pin(async move {
+            self.invalidate_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    fn provider_label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// Spin a loopback TCP server that responds to each POST with a
+/// fixed status sequence. Used to drive the auth-retry happy and
+/// failure paths without depending on a live provider.
+async fn spawn_status_server(statuses: Vec<u16>) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            let status = statuses
+                .get(attempt)
+                .copied()
+                .unwrap_or_else(|| *statuses.last().expect("non-empty status list"));
+
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                500 => "Internal Server Error",
+                _ => "Status",
+            };
+            let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (addr, attempts)
+}
+
+fn auth_retry_policy() -> RetryPolicy {
+    // Disable the inner 429/5xx/transport retry budget so the test
+    // observes the auth-retry layer in isolation: every 401 returned
+    // by the mock server is forwarded straight to the auth path.
+    RetryPolicy {
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    }
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_passes_through_on_2xx() {
+    let (addr, attempts) = spawn_status_server(vec![200]).await;
+    let source = TestKeySource::new("test", vec!["good-key".to_string()]);
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "exactly one HTTP attempt"
+    );
+    assert_eq!(source.current_key_calls(), 1, "no refresh on 2xx");
+    assert_eq!(
+        source.invalidate_calls(),
+        0,
+        "invalidate must not fire on a healthy response"
+    );
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_refreshes_once_on_401() {
+    let (addr, attempts) = spawn_status_server(vec![401, 200]).await;
+    let source = TestKeySource::new(
+        "test",
+        vec!["stale-key".to_string(), "fresh-key".to_string()],
+    );
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "401 then 200 = exactly two HTTP attempts"
+    );
+    assert_eq!(
+        source.current_key_calls(),
+        2,
+        "the auth-retry layer must re-read the key after invalidate"
+    );
+    assert_eq!(source.invalidate_calls(), 1, "invalidate fires once on 401");
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_refreshes_once_on_403() {
+    let (addr, attempts) = spawn_status_server(vec![403, 200]).await;
+    let source = TestKeySource::new(
+        "test",
+        vec!["stale-key".to_string(), "fresh-key".to_string()],
+    );
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(source.invalidate_calls(), 1);
+}
+
+#[tokio::test]
+async fn send_with_auth_retry_bubbles_up_persistent_401() {
+    // Second 401 means the refresh did not actually rotate the key
+    // (or the upstream still rejects). Surface the final response
+    // unchanged so the provider's existing error formatter reports
+    // an honest auth failure instead of looping forever.
+    let (addr, attempts) = spawn_status_server(vec![401, 401]).await;
+    let source = TestKeySource::new(
+        "test",
+        vec!["stale-key".to_string(), "still-stale".to_string()],
+    );
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "the second 401 must propagate so the caller sees the auth failure"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "exactly one retry; no infinite loop"
+    );
+    assert_eq!(
+        source.invalidate_calls(),
+        1,
+        "invalidate fires exactly once even when the refresh did not help"
+    );
+}
+
+// --- terminal quota classifier -------------------------------------------
+
+/// Spin a loopback TCP server that responds to each POST with a fixed
+/// `(status, body)` pair. Used to verify that `send_with_retry` reads the
+/// body, runs the terminal-quota classifier, and either short-circuits
+/// retries or falls through to the existing backoff path.
+async fn spawn_body_server(
+    responses: Vec<(u16, String)>,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = responses
+                .get(attempt)
+                .cloned()
+                .unwrap_or_else(|| responses.last().cloned().expect("non-empty response list"));
+
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                _ => "Status",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (addr, attempts)
+}
+
+fn quota_retry_policy() -> RetryPolicy {
+    // `max_retries` is intentionally generous so a regression that fails to
+    // short-circuit terminal quotas would manifest as many attempts and a
+    // long-running test rather than a silent pass.
+    RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: true,
+        retry_5xx: false,
+        retry_transport: false,
+        max_retry_delay: Duration::from_secs(60),
+    }
+}
+
+#[tokio::test]
+async fn send_with_retry_skips_retry_on_anthropic_permission_error() {
+    // Anthropic returns "monthly usage limit reached" as a 429 wrapping a
+    // `permission_error` envelope. The retry layer must read the body, run
+    // the JSON-shape pass of the classifier, and surface the response to
+    // the caller without burning the rest of the attempt budget on sleeps.
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "permission_error",
+            "message": "Monthly usage limit reached"
+        }
+    })
+    .to_string();
+    let (addr, attempts) = spawn_body_server(vec![(429, body)]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_retry(quota_retry_policy(), &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "Anthropic permission_error must short-circuit retries",
+    );
+    let body_text = response.text().await.expect("body");
+    assert!(
+        body_text.contains("permission_error"),
+        "reconstructed response must preserve the body so the provider error \
+         formatter can surface the upstream message (saw: {body_text:?})",
+    );
+}
+
+#[tokio::test]
+async fn send_with_retry_skips_retry_on_openai_insufficient_quota() {
+    // OpenAI 429s for billing exhaustion carry `code = "insufficient_quota"`
+    // in an error envelope. The classifier recognizes both the literal
+    // substring and the JSON shape; either match must skip retries.
+    let body = serde_json::json!({
+        "error": {
+            "message": "You exceeded your current quota, please check your plan.",
+            "type": "insufficient_quota",
+            "param": null,
+            "code": "insufficient_quota",
+        }
+    })
+    .to_string();
+    let (addr, attempts) = spawn_body_server(vec![(429, body)]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_retry(quota_retry_policy(), &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "OpenAI insufficient_quota must short-circuit retries",
+    );
+}
+
+#[tokio::test]
+async fn send_with_retry_skips_retry_on_generic_monthly_usage_limit_body() {
+    // Some upstreams (and gateway shims) return a plain-text body with the
+    // marketing-friendly "Monthly usage limit reached" phrase instead of a
+    // structured error envelope. The substring pass of the classifier must
+    // catch this so the agent stops looping on a body it cannot retry past.
+    let body = "Monthly usage limit reached. Upgrade your plan to continue.";
+    let (addr, attempts) = spawn_body_server(vec![(429, body.to_string())]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_retry(quota_retry_policy(), &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "generic monthly_usage_limit body must short-circuit retries",
+    );
+
+    // Sanity-check the classifier in isolation so a future change that
+    // moves the keyword list cannot silently regress this path.
+    assert!(is_terminal_quota_error(body.as_bytes()));
+}
+
+#[tokio::test]
+async fn send_with_retry_still_retries_a_regular_transient_429() {
+    // A plain rate-limit 429 with no terminal markers in the body must
+    // still take the existing backoff/retry path. Verifies the classifier
+    // doesn't accidentally widen its match window and starve the agent of
+    // legitimate retries.
+    let transient_body = serde_json::json!({
+        "error": {
+            "message": "Rate limit exceeded, please slow down.",
+            "type": "rate_limit_error"
+        }
+    })
+    .to_string();
+    let (addr, attempts) =
+        spawn_body_server(vec![(429, transient_body), (200, "{}".to_string())]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let policy = RetryPolicy {
+        max_retries: 3,
+        base_delay: Duration::from_millis(1),
+        retry_429: true,
+        retry_5xx: false,
+        retry_transport: false,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let response = send_with_retry(policy, &cancel, || client.post(&url))
+        .await
+        .expect("send");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "non-terminal 429 must retry exactly once before succeeding",
+    );
 }

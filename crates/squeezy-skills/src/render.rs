@@ -145,6 +145,53 @@ pub fn render_active_skills(
     wrap_blocks(&rendered).filter(|out| char_count(out) <= budget_chars)
 }
 
+/// Render the active-skill block in metadata-only mode.
+///
+/// Each skill emits a `<skill body="omitted">` block containing its
+/// name, source, description, optional `when_to_use`, location, base
+/// directory, optional manifest, and an `<instruction>` telling the
+/// model to call `load_skill` when the full body is needed. No skill
+/// body is included.
+///
+/// When the aggregate exceeds `budget_chars`, lowest-priority skills
+/// are dropped (and warned) until the remaining set fits. Returns
+/// `None` if the input is empty, the budget is zero, or no metadata
+/// block fits within the budget.
+pub fn render_active_skills_metadata(
+    skills: &[LoadedSkill],
+    budget_chars: usize,
+) -> Option<String> {
+    if skills.is_empty() || budget_chars == 0 {
+        return None;
+    }
+
+    let mut survivors: Vec<&LoadedSkill> = skills.iter().collect();
+    loop {
+        if survivors.is_empty() {
+            return None;
+        }
+        let blocks: Vec<String> = survivors
+            .iter()
+            .map(|skill| skill.metadata_block())
+            .collect();
+        let rendered = wrap_blocks(&blocks)?;
+        if char_count(&rendered) <= budget_chars {
+            return Some(rendered);
+        }
+        // Drop the lowest-priority (last) skill and retry. This mirrors
+        // the inline-mode drop fallback so the metadata bundle remains
+        // bounded under a tight budget. The `?` is defensive — the
+        // earlier `is_empty` check already guarantees `Some`.
+        let dropped = survivors.pop()?;
+        warn!(
+            target: "squeezy_skills",
+            skill = %dropped.summary.name,
+            budget_chars,
+            "skill omitted from active skill metadata bundle because the budget is exhausted"
+        );
+    }
+}
+
 pub fn render_skill_preamble(
     summaries: &[SkillSummary],
     budget_chars: usize,

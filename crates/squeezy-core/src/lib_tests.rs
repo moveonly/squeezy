@@ -57,15 +57,47 @@ fn context_attachment_detection_handles_common_text_artifacts() {
 }
 
 #[test]
-fn context_attachment_detection_rejects_binary_and_images() {
+fn context_attachment_detection_routes_canonical_images_to_vision_kind() {
+    // PNG magic bytes round-trip into the routable `Image` kind so
+    // F18 paste/file attachments can fan into `LlmInputItem::Image`
+    // when the active model advertises vision.
     assert_eq!(
         detect_context_attachment_kind(Some("screenshot.png"), b"\x89PNG\r\n\x1a\nbytes", None),
+        ContextAttachmentKind::Image
+    );
+    let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+    assert_eq!(
+        detect_context_attachment_kind(Some("photo.jpg"), &jpeg, None),
+        ContextAttachmentKind::Image
+    );
+    // Label-only image-shape (e.g. `.heic`) with non-canonical body
+    // stays `UnsupportedImage` so we don't ship a non-vision payload
+    // to a provider that can't decode it.
+    assert_eq!(
+        detect_context_attachment_kind(Some("snapshot.heic"), b"not real heic bytes", None),
         ContextAttachmentKind::UnsupportedImage
     );
     assert_eq!(
         detect_context_attachment_kind(Some("blob.bin"), b"abc\0def", Some("abc\0def")),
         ContextAttachmentKind::UnsupportedBinary
     );
+}
+
+#[test]
+fn detect_image_mime_recognises_each_vision_format() {
+    assert_eq!(
+        detect_image_mime(b"\x89PNG\r\n\x1a\nrest"),
+        Some("image/png")
+    );
+    assert_eq!(detect_image_mime(b"\xff\xd8\xff\xe0"), Some("image/jpeg"));
+    assert_eq!(detect_image_mime(b"GIF87axxxx"), Some("image/gif"));
+    assert_eq!(detect_image_mime(b"GIF89axxxx"), Some("image/gif"));
+    let mut webp = Vec::new();
+    webp.extend_from_slice(b"RIFF");
+    webp.extend_from_slice(&[0, 0, 0, 0]);
+    webp.extend_from_slice(b"WEBPVP8 ");
+    assert_eq!(detect_image_mime(&webp), Some("image/webp"));
+    assert_eq!(detect_image_mime(b"plain text content"), None);
 }
 
 #[test]
@@ -496,6 +528,32 @@ compat_user_dir = "/custom/agent-skills"
     assert_eq!(
         config.skills.compat_user_dir,
         PathBuf::from("/custom/agent-skills")
+    );
+}
+
+#[test]
+fn config_reads_skill_extra_roots_from_settings_file() {
+    // Operators ship the same `extra_roots` value via a shared settings
+    // file (network drive, vendored submodule). The loader must accept a
+    // string array and pass each path through tilde expansion so a team
+    // root like `~/team-skills` resolves the same way `user_dir` would.
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+extra_roots = ["/mnt/team-skills", "~/team-skills"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(
+        config.skills.extra_roots,
+        vec![PathBuf::from("/mnt/team-skills"), home.join("team-skills"),]
     );
 }
 
@@ -2155,7 +2213,14 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
-fn cloudflare_workers_ai_preset_templates_base_url_from_account_id() {
+fn cloudflare_workers_ai_preset_carries_account_id_and_placeholder_template() {
+    // The Workers AI preset keeps the `{account_id}` placeholder in the
+    // resolved `base_url` and flows `cloudflare_account_id` through as a
+    // typed field on `OpenAiCompatibleConfig`. The substitution itself
+    // lives in the LLM client (`substitute_url_placeholders` in
+    // `squeezy-llm::compatible`) so a user override of `base_url` that
+    // keeps the placeholder syntax — say, fronting the API through a
+    // reverse proxy — gets the same treatment for free.
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "cloudflare_workers_ai".to_string(),
@@ -2185,7 +2250,20 @@ fn cloudflare_workers_ai_preset_templates_base_url_from_account_id() {
         OpenAiCompatiblePreset::CloudflareWorkersAi
     );
     assert_eq!(
-        compatible.base_url,
+        compatible.base_url, "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        "config layer must keep the placeholder template; substitution lives in the LLM client",
+    );
+    assert_eq!(
+        compatible.account_id.as_deref(),
+        Some("acct-abc"),
+        "account_id must flow through to the provider config",
+    );
+    assert_eq!(compatible.gateway_id, None);
+    // The eager helper still resolves the same URL, so any caller that
+    // reads it directly (CLI inspect output, integration tests) stays
+    // consistent with the LLM client's runtime substitution.
+    assert_eq!(
+        cloudflare_workers_ai_base_url("acct-abc"),
         "https://api.cloudflare.com/client/v4/accounts/acct-abc/ai/v1"
     );
     assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_KEY");
@@ -2207,7 +2285,7 @@ fn cloudflare_workers_ai_preset_rejects_missing_account_id() {
 }
 
 #[test]
-fn cloudflare_ai_gateway_preset_templates_base_url_and_injects_dual_auth_header() {
+fn cloudflare_ai_gateway_preset_carries_account_and_gateway_ids_and_injects_dual_auth_header() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "cloudflare_ai_gateway".to_string(),
@@ -2240,6 +2318,13 @@ fn cloudflare_ai_gateway_preset_templates_base_url_and_injects_dual_auth_header(
     );
     assert_eq!(
         compatible.base_url,
+        "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat",
+        "config layer keeps the placeholder template; substitution lives in the LLM client",
+    );
+    assert_eq!(compatible.account_id.as_deref(), Some("acct-abc"));
+    assert_eq!(compatible.gateway_id.as_deref(), Some("my-gateway"));
+    assert_eq!(
+        cloudflare_ai_gateway_base_url("acct-abc", "my-gateway"),
         "https://gateway.ai.cloudflare.com/v1/acct-abc/my-gateway/compat"
     );
     // Dual auth: standard bearer goes through `api_key_env`; gateway token is
@@ -2283,7 +2368,14 @@ fn cloudflare_ai_gateway_defaults_gateway_id_when_omitted() {
     };
     assert_eq!(
         compatible.base_url,
-        "https://gateway.ai.cloudflare.com/v1/acct-abc/default/compat"
+        "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat",
+        "template stays templated; the LLM client substitutes at provider build time",
+    );
+    assert_eq!(compatible.account_id.as_deref(), Some("acct-abc"));
+    assert_eq!(
+        compatible.gateway_id.as_deref(),
+        Some(DEFAULT_CLOUDFLARE_AI_GATEWAY_ID),
+        "missing cloudflare_gateway_id must fall back to the `default` gateway slug",
     );
     // No CF_AIG_TOKEN supplied → no `cf-aig-authorization` header injected;
     // the gateway runs in "open" / upstream-auth-only mode.
@@ -2639,6 +2731,75 @@ max_session_bytes = 5678
     assert_eq!(config.session_logs.log_retention_days, 45);
     assert_eq!(config.session_logs.max_event_bytes, 1234);
     assert_eq!(config.session_logs.max_session_bytes, 5678);
+}
+
+#[test]
+fn session_log_dir_env_var_overrides_settings_file_value() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[session]
+log_dir = ".squeezy/from-config"
+"#,
+        "test",
+    )
+    .expect("parse settings");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_SESSION_DIR" => Some("/tmp/from-env/sessions".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from("/tmp/from-env/sessions"))
+    );
+    assert!(
+        config.config_sources.iter().any(|source| source == "env"),
+        "env source should be tagged when SQUEEZY_SESSION_DIR is consumed; got {:?}",
+        config.config_sources,
+    );
+}
+
+#[test]
+fn session_log_dir_env_var_resolves_when_settings_absent() {
+    let config =
+        AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
+            "SQUEEZY_SESSION_DIR" => Some("  /var/log/squeezy  ".to_string()),
+            _ => None,
+        });
+
+    // Whitespace is trimmed so shell pipelines that append `\n` (e.g.
+    // `$(printf '%s\n' "$dir")`) don't end up writing into a literal
+    // ".../squeezy\n/" directory.
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from("/var/log/squeezy"))
+    );
+}
+
+#[test]
+fn session_log_dir_env_var_is_ignored_when_blank() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[session]
+log_dir = ".squeezy/from-config"
+"#,
+        "test",
+    )
+    .expect("parse settings");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        // A user can unset the var via `unset SQUEEZY_SESSION_DIR`, but they
+        // can also accidentally `export SQUEEZY_SESSION_DIR=` and expect the
+        // settings.toml value to remain in force.
+        "SQUEEZY_SESSION_DIR" => Some("   ".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from(".squeezy/from-config"))
+    );
 }
 
 #[test]
@@ -3112,4 +3273,139 @@ base_url = "http://192.168.1.50:8080/v1"
     let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
         .expect_err("LAN http base_url must be rejected");
     assert!(error.to_string().contains("https://"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_resolves_string_value_to_stdout() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!echo hello"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    assert_eq!(openai.api_key.as_deref(), Some("hello"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_trims_only_trailing_whitespace() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!printf '  spaced-secret  \n\n'"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    assert_eq!(openai.api_key.as_deref(), Some("  spaced-secret"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_failure_aborts_config_load_with_clear_error() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!squeezy_definitely_not_a_real_command_f07 2>/dev/null"
+"#,
+        "test",
+    )
+    .expect_err("non-zero exit must fail config load");
+    let message = err.to_string();
+    assert!(
+        message.contains("providers.openai.api_key"),
+        "error mentions key path: {message}"
+    );
+    assert!(
+        message.contains("shell escape"),
+        "error labels the failure: {message}"
+    );
+    assert!(
+        message.contains("squeezy_definitely_not_a_real_command_f07"),
+        "error includes the failing command: {message}"
+    );
+}
+
+#[test]
+fn shell_escape_does_not_trigger_when_bang_is_not_leading() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "value with ! in it"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    assert_eq!(openai.api_key.as_deref(), Some("value with ! in it"));
+}
+
+#[test]
+fn shell_escape_rejects_empty_command() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!"
+"#,
+        "test",
+    )
+    .expect_err("empty `!` must fail config load");
+    let message = err.to_string();
+    assert!(
+        message.contains("providers.openai.api_key"),
+        "error mentions key path: {message}"
+    );
+    assert!(
+        message.contains("empty"),
+        "error labels the empty command: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_applies_inside_string_array_values() {
+    // `graph.languages` is a plain `Option<Vec<String>>` read via
+    // `string_array_value`, so it exercises the per-element resolver path.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[graph]
+languages = ["!echo rust", "python"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let graph = settings.graph.expect("graph table");
+    let langs = graph.languages.expect("languages array");
+    assert_eq!(langs, vec!["rust".to_string(), "python".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_applies_inside_provider_headers_map() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+[providers.openai.headers]
+"x-static" = "literal"
+"x-dynamic" = "!echo dynamic-value"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    let headers = openai.headers.as_ref().expect("headers map");
+    assert_eq!(headers.get("x-static").map(String::as_str), Some("literal"));
+    assert_eq!(
+        headers.get("x-dynamic").map(String::as_str),
+        Some("dynamic-value")
+    );
 }

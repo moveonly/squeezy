@@ -1,4 +1,9 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -13,18 +18,24 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     ReasoningKind, ReasoningPayload,
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    openai_prompt_cache::clamp_prompt_cache_key,
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
     name: &'static str,
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     api_version: Option<String>,
+    /// Logical model id → Azure-deployment name. Populated only from
+    /// [`AzureOpenAiConfig::deployment_name_map`]; every other constructor
+    /// leaves this empty so the model id passes through verbatim.
+    deployment_name_map: BTreeMap<String, String>,
     transport: ProviderTransportConfig,
 }
 
@@ -33,9 +44,10 @@ impl std::fmt::Debug for OpenAiProvider {
         f.debug_struct("OpenAiProvider")
             .field("name", &self.name)
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("api_version", &self.api_version)
+            .field("deployment_name_map", &self.deployment_name_map)
             .field("transport", &self.transport)
             .finish()
     }
@@ -45,14 +57,13 @@ impl OpenAiProvider {
     pub fn from_config(config: &OpenAiConfig) -> Result<Self> {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            name: "openai",
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_version: None,
-            transport: config.transport,
-        })
+        Ok(Self::with_api_key_source(
+            "openai",
+            static_api_key_source(api_key, "openai"),
+            config.base_url.trim_end_matches('/').to_string(),
+            None,
+            config.transport,
+        ))
     }
 
     pub fn from_azure_config(config: &AzureOpenAiConfig) -> Result<Self> {
@@ -63,14 +74,15 @@ impl OpenAiProvider {
         }
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            name: "azure_openai",
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_version: Some(config.api_version.clone()),
-            transport: config.transport,
-        })
+        let mut provider = Self::with_api_key_source(
+            "azure_openai",
+            static_api_key_source(api_key, "azure_openai"),
+            config.base_url.trim_end_matches('/').to_string(),
+            Some(config.api_version.clone()),
+            config.transport,
+        );
+        provider.deployment_name_map = config.deployment_name_map.clone();
+        Ok(provider)
     }
 
     /// Build an OpenAI Responses-API client targeting xAI's `/responses`
@@ -90,29 +102,82 @@ impl OpenAiProvider {
         }
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            name: "xai",
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_version: None,
-            transport: config.transport,
-        })
+        Ok(Self::with_api_key_source(
+            "xai",
+            static_api_key_source(api_key, "xai"),
+            config.base_url.trim_end_matches('/').to_string(),
+            None,
+            config.transport,
+        ))
     }
 
-    fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
+    /// Construct the provider against an already-built credential
+    /// source. Used by the OpenAI Codex (ChatGPT Plus/Pro) OAuth
+    /// provider so a rotating access token can flow through the same
+    /// `/responses` HTTP path without rebuilding the client.
+    pub fn with_api_key_source(
+        name: &'static str,
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        api_version: Option<String>,
+        transport: ProviderTransportConfig,
+    ) -> Self {
+        Self {
+            name,
+            client: shared_client(&transport),
+            api_key,
+            base_url,
+            api_version,
+            deployment_name_map: BTreeMap::new(),
+            transport,
+        }
+    }
+
+    /// Resolve a caller-supplied model id to the Azure-deployment name the
+    /// provider should send in the request body. Falls back to the input
+    /// model id when no entry is present, preserving the historical
+    /// "deployment id is the model id" behavior for users who never
+    /// configured `[providers.azure_openai.deployment_name_map]`.
+    ///
+    /// The lookup is exact-match; Azure deployment ids are case-sensitive
+    /// and the surrounding registry already canonicalizes model ids to
+    /// their on-disk shape, so we do not lowercase here.
+    pub(crate) fn resolve_deployment_name<'a>(&'a self, model: &'a str) -> &'a str {
+        resolve_deployment_name(&self.deployment_name_map, model)
+    }
+
+    pub(crate) fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results BEFORE projecting to
+        // the Responses-API `input` array. The Responses backend
+        // matches `function_call_output.call_id` against the prior
+        // `function_call.call_id` in the input slice; if the user
+        // switched from Anthropic/Google/Bedrock mid-session those
+        // ids carry the upstream's shape (`toolu_…`,
+        // `google_call_…`, `tooluse_…`) and the pairing breaks even
+        // though OpenAI itself accepts the id shape.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
-            "input": openai_input(&request.input),
+            "input": openai_input(&normalized_input),
             "stream": true,
             "store": request.store,
         });
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
-        if let Some(cache_key) = &request.cache_key {
-            body["prompt_cache_key"] = json!(cache_key);
+        let cache_spec = request.effective_cache_spec();
+        if let Some(key) = cache_spec.key.as_deref() {
+            // OpenAI's Responses API silently drops `prompt_cache_key`
+            // values longer than 64 codepoints — the request succeeds
+            // but the field is ignored server-side, so every turn pays
+            // full uncached input cost while telemetry shows zero
+            // cache hits. Clamp client-side. See [`clamp_prompt_cache_key`].
+            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+        }
+        if cache_spec.retention == crate::CacheRetention::Long {
+            body["prompt_cache_retention"] = json!("24h");
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
@@ -184,6 +249,24 @@ impl OpenAiProvider {
         }
         body
     }
+
+    /// Prompt-cache affinity headers attached to every Responses request
+    /// that carries a cache key. OpenAI's load balancer uses these to
+    /// route the session to the same backend that warmed the cached
+    /// prefix; without them, repeat turns can land on a cold node and
+    /// silently miss cache even when `prompt_cache_key` matches. Mirrors
+    /// the official Codex CLI's behavior and pi's
+    /// `openai-responses.ts` (`session_id` + `x-client-request-id`).
+    ///
+    /// The header values carry the full (unclamped) cache key — the
+    /// 64-codepoint limit is specific to the body field; routing headers
+    /// have OpenAI's general (much larger) header length cap.
+    pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
+        let Some(key) = request.effective_cache_spec().key else {
+            return Vec::new();
+        };
+        vec![("session_id", key.clone()), ("x-client-request-id", key)]
+    }
 }
 
 fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
@@ -192,6 +275,19 @@ fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
         ResponseVerbosity::Normal => "medium",
         ResponseVerbosity::Verbose => "high",
     }
+}
+
+/// Translate a logical model id into an Azure-deployment id using
+/// `map`. Unmapped ids fall through verbatim so callers without a
+/// configured `deployment_name_map` keep the historical contract where
+/// `[model].name` *is* the deployment id. Split out as a free function
+/// so unit tests can exercise the substitution table without
+/// constructing a real provider/client.
+pub(crate) fn resolve_deployment_name<'a>(
+    map: &'a BTreeMap<String, String>,
+    model: &'a str,
+) -> &'a str {
+    map.get(model).map(String::as_str).unwrap_or(model)
 }
 
 fn openai_text_format(schema: &LlmOutputSchema) -> Value {
@@ -209,6 +305,9 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support(self.name) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let provider_name = self.name;
@@ -218,18 +317,43 @@ impl LlmProvider for OpenAiProvider {
             url.push_str("?api-version=");
             url.push_str(api_version);
         }
-        let body = Self::request_body(&request, provider_name);
+        let mut body = Self::request_body(&request, provider_name);
+        // Azure resources expose deployments under user-chosen ids (e.g.
+        // `my-deployment-gpt-4o`). The Responses route reads the body's
+        // `model` field as the deployment selector, so callers who keep
+        // logical OpenAI model ids in `[model]` must have them rewritten
+        // here. The map is empty for the OpenAI / Codex / xAI constructors,
+        // making this a no-op in those paths. Capability lookups above
+        // intentionally ran against the *original* `request.model` so
+        // the reasoning/effort decision still uses our static registry.
+        let deployment = self.resolve_deployment_name(&request.model);
+        if deployment != request.model.as_ref() {
+            body["model"] = json!(deployment);
+        }
+        let affinity_headers = Self::affinity_headers(&request);
 
         Box::pin(try_stream! {
-            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
+            let response = send_with_auth_retry(
+                &api_key,
+                RetryPolicy::provider_requests(transport),
+                &cancel,
+                |key| {
                     let builder = client.post(&url);
                     let builder = if provider_name == "azure_openai" {
-                        builder.header("api-key", api_key.clone())
+                        builder.header("api-key", key)
                     } else {
-                        builder.bearer_auth(api_key.clone())
+                        builder.bearer_auth(key)
                     };
+                    // Cache-affinity headers (only emitted when the
+                    // request carries a cache key) keep multi-turn
+                    // sessions pinned to the backend that warmed the
+                    // cached prefix.
+                    let builder = affinity_headers
+                        .iter()
+                        .fold(builder, |b, (name, value)| b.header(*name, value.as_str()));
                     builder.json(&body)
-                }).await?;
+                },
+            ).await?;
 
             let status = response.status();
             let response = if status == StatusCode::OK {
@@ -248,6 +372,7 @@ impl LlmProvider for OpenAiProvider {
             let mut decoder = SseDecoder::default();
             let mut saw_completed = false;
             let mut reasoning_acc = ReasoningAccumulator::default();
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -263,7 +388,13 @@ impl LlmProvider for OpenAiProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    if let Some(llm_event) = parse_openai_event(&event, &mut reasoning_acc)? {
+                    let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                    if let Some(server) = reasoning_acc.take_server_model()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    if let Some(llm_event) = parsed {
                         if matches!(llm_event, LlmEvent::Completed { .. }) {
                             saw_completed = true;
                         }
@@ -273,7 +404,13 @@ impl LlmProvider for OpenAiProvider {
             }
 
             for event in decoder.finish() {
-                if let Some(llm_event) = parse_openai_event(&event, &mut reasoning_acc)? {
+                let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                if let Some(server) = reasoning_acc.take_server_model()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                if let Some(llm_event) = parsed {
                     if matches!(llm_event, LlmEvent::Completed { .. }) {
                         saw_completed = true;
                     }
@@ -298,9 +435,17 @@ impl LlmProvider for OpenAiProvider {
 /// without the buffer the persisted `ReasoningPayload::OpenAi.summary`
 /// would be empty and the next turn's replay would drop the segment.
 #[derive(Debug, Default)]
-struct ReasoningAccumulator {
+pub(crate) struct ReasoningAccumulator {
     summary: String,
     text: String,
+    /// Stashes the server-echoed `response.model` field the first time
+    /// any event carries it (typically `response.created`). The outer
+    /// stream loop drains the value via [`Self::take_server_model`] and
+    /// feeds it to [`crate::ServerModelEcho`] so [`LlmEvent::ServerModel`]
+    /// lands additively right after [`LlmEvent::Started`]. Stays `None`
+    /// for every event that doesn't include a `response.model` field —
+    /// the loop only acts on the first observation per stream.
+    server_model: Option<String>,
 }
 
 impl ReasoningAccumulator {
@@ -316,9 +461,13 @@ impl ReasoningAccumulator {
         }
         out
     }
+
+    pub(crate) fn take_server_model(&mut self) -> Option<String> {
+        self.server_model.take()
+    }
 }
 
-fn parse_openai_event(
+pub(crate) fn parse_openai_event(
     data: &str,
     reasoning_acc: &mut ReasoningAccumulator,
 ) -> Result<Option<LlmEvent>> {
@@ -333,6 +482,24 @@ fn parse_openai_event(
         .and_then(Value::as_str)
         .unwrap_or_default();
     tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
+
+    // OpenAI Responses events embed the server-chosen model on the
+    // `response` object that ships with `response.created`,
+    // `response.in_progress`, `response.completed`, etc. Pluck it the
+    // first time we see it so the outer stream loop can compare
+    // against `request.model` and emit an additive `ServerModel`
+    // event. Repeated observations on the same stream are coalesced
+    // into a single drain in the caller via
+    // [`crate::ServerModelEcho`].
+    if reasoning_acc.server_model.is_none()
+        && let Some(server_model) = value
+            .get("response")
+            .and_then(|response| response.get("model"))
+            .and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        reasoning_acc.server_model = Some(server_model.to_string());
+    }
 
     match event_type {
         "response.output_text.delta" => {
@@ -473,6 +640,17 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
             "type": "function_call_output",
             "call_id": call_id,
             "output": output,
+        }),
+        LlmInputItem::Image { media_type, bytes } => json!({
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": format!(
+                    "data:{media_type};base64,{}",
+                    BASE64_STANDARD.encode(bytes.as_ref())
+                ),
+            }],
         }),
         LlmInputItem::Reasoning(ReasoningPayload::OpenAi {
             item_id,

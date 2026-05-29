@@ -28,6 +28,8 @@ async fn vercel_ai_gateway_chat_completions_streaming_costly() -> Result<()> {
             .unwrap_or_else(|_| PRESET.default_base_url().to_string()),
         extra_headers: BTreeMap::new(),
         transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
     })?;
     let model = env::var(MODEL_ENV)
         .or_else(|_| env::var("SQUEEZY_COSTLY_MODEL"))

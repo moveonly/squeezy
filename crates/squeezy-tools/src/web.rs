@@ -35,7 +35,7 @@ pub(crate) const MAX_WEB_SEARCH_CONTEXT_CHARS: usize = 50_000;
 pub const DEFAULT_PARALLEL_MCP_URL: &str = "https://search.parallel.ai/mcp";
 
 /// Selects which remote MCP-style websearch backend handles a query. The
-/// finding (squeezy-1ro.41) calls for pluggable providers so users can pick
+/// finding calls for pluggable providers so users can pick
 /// based on price/quality; defaulting to Exa preserves prior behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WebSearchProvider {

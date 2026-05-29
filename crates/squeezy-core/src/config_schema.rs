@@ -14,16 +14,17 @@ use crate::{
     DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
     DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
     DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV, DEFAULT_PARALLEL_MCP_URL,
-    DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES, DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
-    DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
-    DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
-    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, ProviderConfig,
-    ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity, ToolOutputVerbosity,
-    TranscriptDefault, TuiAlternateScreen,
+    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV,
+    DEFAULT_PARALLEL_MCP_URL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
+    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS, DEFAULT_SESSION_LOG_RETENTION_DAYS,
+    DEFAULT_SESSION_MAX_EVENT_BYTES, DEFAULT_SESSION_MAX_SESSION_BYTES,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
+    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_WEBSEARCH_PROVIDER,
+    OpenAiCompatiblePreset, PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
+    SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    TuiSynchronizedOutput,
 };
 
 /// When a save takes effect.
@@ -378,6 +379,7 @@ pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
 pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
+pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_MODE_OPTIONS: &[&str] = &["allow", "ask", "deny"];
 pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light", "catppuccin", "high-contrast"];
 
@@ -681,6 +683,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "persist_prompt_history",
+                toml_path: &["tui", "persist_prompt_history"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Restart,
+                get: get_persist_prompt_history,
+                set: set_persist_prompt_history,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "Mirror the prompt-recall ring (Up/Down at the composer) to `~/.squeezy/prompt_history` so prior prompts survive across sessions.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "alternate_screen",
                 toml_path: &["tui", "alternate_screen"],
                 kind: FieldKind::Enum {
@@ -692,6 +707,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "auto",
                 default: || FieldValue::Enum("auto"),
                 help: "Whether to take over the terminal screen on launch.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "synchronized_output",
+                toml_path: &["tui", "synchronized_output"],
+                kind: FieldKind::Enum {
+                    options: SYNCHRONIZED_OUTPUT_OPTIONS,
+                },
+                tier: ApplyTier::Restart,
+                get: get_synchronized_output,
+                set: set_synchronized_output,
+                default_display: "auto",
+                default: || FieldValue::Enum("auto"),
+                help: "Wrap each frame in DEC 2026 Begin/End Synchronized Update so capable terminals (kitty, WezTerm, Ghostty, iTerm2, Alacritty) flip the cell grid atomically and eliminate streaming tearing. `auto` enables when the terminal advertises support; the sequences are silently ignored elsewhere.",
                 env_override: None,
                 secret: false,
             },
@@ -1477,9 +1507,10 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     use crate::{
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
         DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL, DEFAULT_BEDROCK_REGION,
-        DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL, GoogleConfig,
-        OllamaConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
-        ProviderTransportConfig,
+        DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL,
+        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_ORIGINATOR, FauxConfig, GoogleConfig,
+        OllamaConfig, OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset,
+        OpenAiConfig, ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     cfg.provider = match s {
@@ -1489,6 +1520,13 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             transport,
         }),
+        "openai-codex" | "openai_codex" | "chatgpt" => {
+            ProviderConfig::OpenAiCodex(OpenAiCodexConfig {
+                base_url: DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
+                originator: DEFAULT_OPENAI_CODEX_ORIGINATOR.to_string(),
+                transport,
+            })
+        }
         "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
             api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
             api_key: None,
@@ -1506,16 +1544,24 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             api_key: None,
             base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
             api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
+            deployment_name_map: BTreeMap::new(),
             transport,
         }),
         "bedrock" => ProviderConfig::Bedrock(BedrockConfig {
             region: DEFAULT_BEDROCK_REGION.to_string(),
             base_url: None,
+            bearer_token: None,
+            request_metadata: BTreeMap::new(),
             transport,
         }),
         "ollama" => ProviderConfig::Ollama(OllamaConfig {
             base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
             route_style: Default::default(),
+            transport,
+        }),
+        "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
+            script: None,
+            name: None,
             transport,
         }),
         other => {
@@ -1527,6 +1573,8 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 base_url: preset.default_base_url().to_string(),
                 extra_headers: BTreeMap::new(),
                 transport,
+                account_id: None,
+                gateway_id: None,
             })
         }
     };
@@ -1542,7 +1590,9 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
+        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -1554,6 +1604,8 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "azure_openai" => DEFAULT_AZURE_OPENAI_MODEL,
         "bedrock" => DEFAULT_BEDROCK_MODEL,
         "ollama" => DEFAULT_OLLAMA_MODEL,
+        "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
+        "faux" | "mock" => crate::DEFAULT_FAUX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),
             None => DEFAULT_OPENAI_MODEL,
@@ -1815,6 +1867,19 @@ fn set_coalesce_tool_runs(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
     }
 }
 
+fn get_persist_prompt_history(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.persist_prompt_history)
+}
+fn set_persist_prompt_history(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.persist_prompt_history = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
 fn get_alternate_screen(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.tui.alternate_screen.as_str())
 }
@@ -1829,6 +1894,19 @@ fn set_alternate_screen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'
         "always" => TuiAlternateScreen::Always,
         _ => return Err("invalid alternate_screen"),
     };
+    Ok(())
+}
+
+fn get_synchronized_output(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.tui.synchronized_output.as_str())
+}
+fn set_synchronized_output(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("expects enum"),
+    };
+    cfg.tui.synchronized_output =
+        TuiSynchronizedOutput::parse(s).ok_or("invalid synchronized_output")?;
     Ok(())
 }
 

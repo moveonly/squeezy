@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -121,30 +124,68 @@ pub(crate) fn highlight_code(language_hint: Option<&str>, source: &str) -> Vec<L
     if exceeds_highlight_limits(source) {
         return plain_lines(source);
     }
-    let Some(spec) = language_spec(language_hint) else {
+    let Some(lang) = language_hint.and_then(HighlightLanguage::from_hint) else {
         return plain_lines(source);
     };
-    // `spec.name` is `&'static str`, so it can key the cache directly.
-    cache::get_or_compute_highlight(source, spec.name, || highlight_uncached(source, &spec))
+    // `LanguageSpec::name` is `&'static str`, so it can key the cache directly.
+    let name = language_spec(lang).name;
+    cache::get_or_compute_highlight(source, name, || highlight_uncached(source, lang))
 }
 
-fn highlight_uncached(source: &str, spec: &LanguageSpec) -> Vec<Line<'static>> {
-    let Ok(mut config) = HighlightConfiguration::new(
-        spec.language.clone(),
-        spec.name,
-        spec.highlights_query,
-        spec.injections_query,
-        "",
-    ) else {
+fn highlight_uncached(source: &str, lang: HighlightLanguage) -> Vec<Line<'static>> {
+    let Some(config) = highlight_config(lang) else {
         return plain_lines(source);
     };
-    config.configure(&HIGHLIGHT_NAMES);
-
     let mut highlighter = Highlighter::new();
     let Ok(events) = highlighter.highlight(&config, source.as_bytes(), None, |_| None) else {
         return plain_lines(source);
     };
     render_events(source, events, &HighlightPalette::current())
+}
+
+/// Process-lifetime cache of [`HighlightConfiguration`] keyed by language.
+///
+/// `HighlightConfiguration::new` parses the language's highlight + injection
+/// queries and `configure(&HIGHLIGHT_NAMES)` resolves capture indices against
+/// the shared name table — multi-millisecond work per call for nontrivial
+/// grammars. Hoisting the result behind an `Arc` turns every render past the
+/// first into an `Arc::clone`, which is the entire point of this finding.
+///
+/// Construction is per-entry lazy: the `LazyLock` only allocates an empty
+/// map, and each language is built on its first lookup. Our supported
+/// language set is finite (~21 entries) and bounded by the
+/// [`HighlightLanguage`] enum, so we deliberately do not impose an LRU
+/// eviction policy — once a language is built we keep it for the life of
+/// the process. Failed builds are not cached so a transient bug in a
+/// grammar still falls back to [`plain_lines`] on every call rather than
+/// silently sticking.
+fn highlight_config(lang: HighlightLanguage) -> Option<Arc<HighlightConfiguration>> {
+    static CACHE: LazyLock<Mutex<HashMap<HighlightLanguage, Arc<HighlightConfiguration>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    if let Ok(cache) = CACHE.lock()
+        && let Some(existing) = cache.get(&lang)
+    {
+        return Some(Arc::clone(existing));
+    }
+    let spec = language_spec(lang);
+    let mut config = HighlightConfiguration::new(
+        spec.language,
+        spec.name,
+        spec.highlights_query,
+        spec.injections_query,
+        "",
+    )
+    .ok()?;
+    config.configure(&HIGHLIGHT_NAMES);
+    let arc = Arc::new(config);
+    if let Ok(mut cache) = CACHE.lock() {
+        // Two threads racing the first lookup would each build a fresh
+        // config; prefer whichever entry won the insert race so subsequent
+        // callers see a stable `Arc::ptr_eq` view.
+        return Some(Arc::clone(cache.entry(lang).or_insert(arc)));
+    }
+    Some(arc)
 }
 
 pub(crate) fn exceeds_highlight_limits(source: &str) -> bool {
@@ -244,7 +285,7 @@ struct LanguageSpec {
     injections_query: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HighlightLanguage {
     Bash,
     C,
@@ -269,9 +310,8 @@ enum HighlightLanguage {
     Yaml,
 }
 
-fn language_spec(language_hint: Option<&str>) -> Option<LanguageSpec> {
-    let lang = HighlightLanguage::from_hint(language_hint?)?;
-    Some(match lang {
+fn language_spec(lang: HighlightLanguage) -> LanguageSpec {
+    match lang {
         HighlightLanguage::Bash => LanguageSpec {
             name: "bash",
             language: tree_sitter_bash::LANGUAGE.into(),
@@ -398,7 +438,7 @@ fn language_spec(language_hint: Option<&str>) -> Option<LanguageSpec> {
             highlights_query: tree_sitter_yaml::HIGHLIGHTS_QUERY,
             injections_query: "",
         },
-    })
+    }
 }
 
 impl HighlightLanguage {

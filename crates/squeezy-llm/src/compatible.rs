@@ -8,8 +8,11 @@
 //! routed through here.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -24,16 +27,19 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    openai_prompt_cache::clamp_prompt_cache_key,
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 #[derive(Clone)]
 pub struct OpenAiCompatibleProvider {
     preset: OpenAiCompatiblePreset,
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     extra_headers: BTreeMap<String, String>,
     transport: ProviderTransportConfig,
@@ -44,7 +50,7 @@ impl std::fmt::Debug for OpenAiCompatibleProvider {
         f.debug_struct("OpenAiCompatibleProvider")
             .field("preset", &self.preset)
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("extra_headers", &self.extra_headers)
             .field("transport", &self.transport)
@@ -61,6 +67,19 @@ impl OpenAiCompatibleProvider {
                 config.preset.display_name(),
             )));
         }
+        // Substitute `{account_id}` / `{gateway_id}` placeholders in the
+        // base URL before the provider locks it in. The Cloudflare presets
+        // ship templated defaults so the LLM client is the single place
+        // that knows how to resolve them; user overrides that keep the
+        // placeholder syntax (e.g. routing through a reverse proxy that
+        // mirrors the Cloudflare path shape) get the same treatment for
+        // free.
+        let resolved_base_url = substitute_url_placeholders(
+            config.base_url.trim_end_matches('/'),
+            config.preset,
+            config.account_id.as_deref(),
+            config.gateway_id.as_deref(),
+        )?;
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         let mut headers = preset_default_headers(config.preset);
@@ -69,14 +88,39 @@ impl OpenAiCompatibleProvider {
         for (key, value) in &config.extra_headers {
             headers.insert(key.clone(), value.clone());
         }
-        Ok(Self {
-            preset: config.preset,
-            client: reqwest::Client::new(),
+        Ok(Self::with_api_key_source(
+            config.preset,
+            static_api_key_source(api_key, config.preset.as_str()),
+            resolved_base_url,
+            headers,
+            config.transport,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Construct the provider against an already-built credential
+    /// source. The GitHub Copilot OAuth provider uses this path so a
+    /// rotating Bearer token can flow through the Chat-Completions
+    /// route without rebuilding the client.
+    pub fn with_api_key_source(
+        preset: OpenAiCompatiblePreset,
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        extra_headers: BTreeMap<String, String>,
+        transport: ProviderTransportConfig,
+    ) -> Self {
+        Self {
+            preset,
+            client: shared_client(&transport),
             api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            extra_headers: headers,
-            transport: config.transport,
-        })
+            base_url,
+            extra_headers,
+            transport,
+        }
     }
 
     pub fn preset(&self) -> OpenAiCompatiblePreset {
@@ -91,22 +135,38 @@ impl OpenAiCompatibleProvider {
         // Anthropic-via-aggregator routes accept the same ephemeral
         // cache_control markers as the native Anthropic API. We attach them
         // when the caller has supplied a cache_key and the destination model
-        // is namespaced under `anthropic/` (covers OpenRouter, Vercel AI
-        // Gateway, and any other aggregator that uses that namespace
-        // convention). Without this the aggregator route reports zero cached
-        // tokens, which silently inflates cost vs. a direct vendor call.
-        let cache_control =
-            if request.cache_key.is_some() && supports_anthropic_caching(&request.model) {
-                Some(json!({ "type": "ephemeral" }))
-            } else {
-                None
-            };
+        // classifies as an Anthropic-compatible flavor in the
+        // [`COMPAT_TABLE`] (covers OpenRouter, Vercel AI Gateway, and any
+        // other aggregator that exposes the `anthropic/` namespace).
+        // Without this the aggregator route reports zero cached tokens,
+        // which silently inflates cost vs. a direct vendor call.
+        //
+        // Marker placement (system tail / last user block / last stable
+        // tool) is decided centrally in `crate::cache_policy`; this
+        // adapter only emits the protocol-specific shape (`cache_control`
+        // objects on JSON content blocks and tool entries) at the spots
+        // that policy module identifies.
+        let cache_spec = request.effective_cache_spec();
+        let cache_retention = cache_spec.retention;
+        let anthropic_caching =
+            cache_retention != CacheRetention::None && supports_anthropic_caching(&request.model);
+        let cache_control = anthropic_caching.then(|| ephemeral_marker(cache_retention));
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results BEFORE the
+        // chat-completions message rewrite. Aggregator routes (PortKey
+        // + OpenRouter especially) frequently see mixed-provider ids
+        // when the user swaps models mid-session, and Anthropic-via-
+        // aggregator routes reject `tool_call_id`s that don't match
+        // the Anthropic regex + length cap. Indices computed below
+        // (cache-control breakpoint) are over the *normalized* slice
+        // so the synthetic placeholder shifts later positions
+        // accordingly.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         // Find the last user-text turn so we can mark it as the cache
         // breakpoint. Anthropic caches everything *before* a marker, so the
         // last user message is the natural place.
         let last_user_text_index = cache_control.as_ref().and_then(|_| {
-            request
-                .input
+            normalized_input
                 .iter()
                 .enumerate()
                 .rev()
@@ -115,19 +175,16 @@ impl OpenAiCompatibleProvider {
                 })
         });
 
-        let mut messages = Vec::with_capacity(request.input.len() + 1);
+        let mut messages = Vec::with_capacity(normalized_input.len() + 1);
         let trimmed_instructions = request.instructions.trim();
         if !trimmed_instructions.is_empty() {
-            if let Some(cc) = &cache_control {
+            if anthropic_caching {
                 messages.push(json!({
                     "role": "system",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": &*request.instructions,
-                            "cache_control": cc,
-                        }
-                    ],
+                    "content": json_markers::system_array_with_marker(
+                        &request.instructions,
+                        cache_retention,
+                    ),
                 }));
             } else {
                 messages.push(json!({
@@ -136,7 +193,7 @@ impl OpenAiCompatibleProvider {
                 }));
             }
         }
-        for (index, item) in request.input.iter().enumerate() {
+        for (index, item) in normalized_input.iter().enumerate() {
             let attach_cache_control = if Some(index) == last_user_text_index {
                 cache_control.as_ref()
             } else {
@@ -165,7 +222,7 @@ impl OpenAiCompatibleProvider {
             body["reasoning_effort"] = json!(effort_str);
             body["reasoning"] = json!({ "effort": effort_str });
         }
-        if let Some(cache_key) = &request.cache_key {
+        if let Some(key) = cache_spec.key.as_deref() {
             // OpenAI's Chat Completions / Responses APIs honor a top-level
             // `prompt_cache_key` that groups requests for prompt-cache
             // affinity. OpenRouter forwards the field verbatim to OpenAI-
@@ -173,26 +230,56 @@ impl OpenAiCompatibleProvider {
             // unknown body fields, so emitting it unconditionally costs
             // nothing and recovers cached-input billing for OpenAI-via-
             // OpenRouter traffic that the Anthropic-only `cache_control`
-            // path above does not cover.
-            body["prompt_cache_key"] = json!(cache_key);
+            // path above does not cover. Clamp to the 64-codepoint limit
+            // OpenAI silently enforces (long keys are dropped server-side
+            // with no error, eating every cache hit).
+            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+        }
+        if cache_retention == CacheRetention::Long {
+            // Mirror the OpenAI native provider's extended-retention opt-in
+            // so OpenAI-hosted models proxied via an aggregator (OpenRouter
+            // `openai/*`, Vercel AI Gateway, etc.) still get the 24h
+            // window. Anthropic-hosted aggregator routes have already
+            // emitted the `ttl: "1h"` marker above; OpenAI ignores
+            // `prompt_cache_retention` from non-OpenAI flavors.
+            body["prompt_cache_retention"] = json!("24h");
         }
         if !request.tools.is_empty() {
-            body["tools"] = json!(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": tool.description,
-                                "parameters": tool.parameters,
-                            }
-                        })
+            let mut tool_values: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
                     })
-                    .collect::<Vec<_>>()
-            );
+                })
+                .collect();
+            if anthropic_caching {
+                // Anthropic-via-aggregator caches the tool prefix the same
+                // way the native Anthropic API does. Without this marker
+                // the aggregator route reports zero cached tokens on
+                // every turn that re-sends the same tool list — the
+                // common multi-turn coding case. The shared cache-policy
+                // helper picks the breakpoint index (skipping any
+                // mcp__-prefixed dynamic tools the registry pushed to
+                // the tail) so this adapter and the native Anthropic
+                // adapter cannot drift on which entry gets the marker.
+                if let Some(idx) =
+                    last_stable_tool_index(request.tools.iter().map(|tool| tool.name.as_str()))
+                    && let Some(obj) = tool_values.get_mut(idx).and_then(Value::as_object_mut)
+                {
+                    obj.insert(
+                        "cache_control".to_string(),
+                        ephemeral_marker(cache_retention),
+                    );
+                }
+            }
+            body["tools"] = Value::Array(tool_values);
             // Forward `tool_choice` when the caller set one. Omitting the
             // field leaves the provider's default in place (typically
             // `auto`), which preserves historical behavior for working
@@ -210,13 +297,144 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// Coarse classification of an OpenAI-compatible model namespace.
+///
+/// The Chat-Completions transport speaks one wire shape, but each upstream
+/// vendor has small quirks (Anthropic-style `cache_control` markers,
+/// `reasoning_effort` shapes, etc.). Branching on a typed flavor instead of
+/// re-running `model.starts_with("anthropic/")` everywhere keeps the matrix
+/// reviewable and makes adding a new aggregator namespace a one-line edit
+/// to [`COMPAT_TABLE`].
+///
+/// `OpenAi`, `GoogleCompat`, `XaiCompat`, and `Generic` are descriptive
+/// today — production code only branches on `AnthropicCompat` via the
+/// `supports_cache_control` flag — but exposed so the next per-vendor
+/// branch in `request_body` has a typed slot to attach to instead of
+/// growing a fresh `starts_with` test.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompatFlavor {
+    /// Vanilla OpenAI completions/responses shape (`openai/*` via an
+    /// aggregator). Honors `prompt_cache_key`, `reasoning_effort`.
+    OpenAi,
+    /// Anthropic `/v1/messages`-style shape proxied over chat-completions
+    /// (`anthropic/*`). Honors ephemeral `cache_control` markers on text
+    /// blocks and the system prompt.
+    AnthropicCompat,
+    /// Google Gemini routed via an OpenAI-compatible aggregator
+    /// (`google/*`).
+    GoogleCompat,
+    /// xAI Grok routed via an OpenAI-compatible aggregator (`xai/*`).
+    XaiCompat,
+    /// Unknown namespace. Treated as best-effort: no cache markers, no
+    /// vendor-specific flags. Matches the historical default for any model
+    /// id that did not start with a recognized prefix.
+    Generic,
+}
+
+/// Per-namespace compatibility row. The struct mirrors pi's
+/// `OpenAICompletionsCompat` interface (`others/pi/packages/ai/src/types.ts`)
+/// in spirit: a typed set of capability flags that drive wire-shape choices
+/// without scattering substring tests across the request builder.
+///
+/// `flavor`, `supports_tool_calls`, and `supports_reasoning` are read by
+/// the unit tests in `compatible_tests.rs` and exposed for the next
+/// per-vendor branch to consume; production code today only reads
+/// `supports_cache_control`. The `#[allow(dead_code)]` keeps the typed
+/// surface intact without lying about which fields are wired up.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct CompatEntry {
+    /// Lowercase model-id prefix. Matched against `model.to_ascii_lowercase()`
+    /// so user-supplied casing does not bypass the table.
+    pub model_prefix: &'static str,
+    pub flavor: CompatFlavor,
+    /// Function-calling support. Today every recognized flavor supports
+    /// tools; the flag is here so future entries (e.g. a tool-less namespace)
+    /// can be declared without breaking the table shape.
+    pub supports_tool_calls: bool,
+    /// Whether the aggregator forwards Anthropic-style ephemeral
+    /// `cache_control` markers on text content parts. Drives the
+    /// `supports_anthropic_caching` decision in [`OpenAiCompatibleProvider::request_body`].
+    pub supports_cache_control: bool,
+    /// Whether models in this namespace honor `reasoning_effort` /
+    /// `reasoning.effort`. Currently descriptive only — the request builder
+    /// emits both shapes unconditionally because aggregators ignore unknown
+    /// fields — but exposed here so future per-flavor branching has a
+    /// single place to consult.
+    pub supports_reasoning: bool,
+}
+
+/// Single source of truth for OpenAI-compatible namespace quirks. Order
+/// matters: the table is walked top-to-bottom and the first prefix match
+/// wins, so list more-specific aggregator prefixes (e.g. a future
+/// `openrouter/anthropic/`) before broader vendor prefixes.
+///
+/// Adding a new aggregator namespace is a one-line edit: append a row and
+/// no further changes are needed in `request_body` or the stream path.
+pub(crate) static COMPAT_TABLE: &[CompatEntry] = &[
+    CompatEntry {
+        model_prefix: "anthropic/",
+        flavor: CompatFlavor::AnthropicCompat,
+        supports_tool_calls: true,
+        supports_cache_control: true,
+        supports_reasoning: true,
+    },
+    CompatEntry {
+        model_prefix: "openai/",
+        flavor: CompatFlavor::OpenAi,
+        supports_tool_calls: true,
+        supports_cache_control: false,
+        supports_reasoning: true,
+    },
+    CompatEntry {
+        model_prefix: "google/",
+        flavor: CompatFlavor::GoogleCompat,
+        supports_tool_calls: true,
+        supports_cache_control: false,
+        supports_reasoning: true,
+    },
+    CompatEntry {
+        model_prefix: "xai/",
+        flavor: CompatFlavor::XaiCompat,
+        supports_tool_calls: true,
+        supports_cache_control: false,
+        supports_reasoning: true,
+    },
+];
+
+/// Classify a model id into a [`CompatFlavor`]. Returns
+/// [`CompatFlavor::Generic`] for any namespace not represented in
+/// [`COMPAT_TABLE`], preserving the historical "fall through with best-effort
+/// defaults" behavior. Today this is exercised by the unit tests and is the
+/// recommended entry point for adding the next per-vendor branch — production
+/// code currently reads the more specific `supports_cache_control` flag
+/// directly via [`compat_entry`].
+#[allow(dead_code)]
+pub(crate) fn classify(model: &str) -> CompatFlavor {
+    compat_entry(model)
+        .map(|entry| entry.flavor)
+        .unwrap_or(CompatFlavor::Generic)
+}
+
+/// Look up the full [`CompatEntry`] for a model id, or `None` when no
+/// prefix in [`COMPAT_TABLE`] matches.
+pub(crate) fn compat_entry(model: &str) -> Option<&'static CompatEntry> {
+    let lowered = model.to_ascii_lowercase();
+    COMPAT_TABLE
+        .iter()
+        .find(|entry| lowered.starts_with(entry.model_prefix))
+}
+
+/// Whether the destination model honors Anthropic-style ephemeral
+/// `cache_control` markers on text content parts. The decision is read
+/// directly from [`COMPAT_TABLE`] so this file no longer carries an
+/// ad-hoc `starts_with("anthropic/")` substring test — see F11.
+///
+/// Direct Anthropic calls do not go through this client (the native
+/// Anthropic provider handles them with its own cache markers).
 fn supports_anthropic_caching(model: &str) -> bool {
-    // Aggregator routes that proxy Anthropic models use a `vendor/model`
-    // namespace; OpenRouter's docs treat the `anthropic/` prefix as the
-    // signal to enable cache_control. We mirror that. Direct Anthropic calls
-    // do not go through this client (the native Anthropic provider handles
-    // them with its own cache markers).
-    model.to_ascii_lowercase().starts_with("anthropic/")
+    compat_entry(model).is_some_and(|entry| entry.supports_cache_control)
 }
 
 impl LlmProvider for OpenAiCompatibleProvider {
@@ -225,6 +443,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support(self.preset.as_str()) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
@@ -246,13 +467,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let provider_label = self.preset.display_name();
 
         Box::pin(try_stream! {
-            let response = send_with_retry(
+            let response = send_with_auth_retry(
+                &api_key,
                 RetryPolicy::provider_requests(transport),
                 &cancel,
-                || {
-                    let mut builder = client.post(&url).bearer_auth(api_key.clone());
-                    for (key, value) in &extra_headers {
-                        builder = builder.header(key.as_str(), value.as_str());
+                |key| {
+                    let mut builder = client.post(&url).bearer_auth(key);
+                    for (header_key, header_value) in &extra_headers {
+                        builder = builder.header(header_key.as_str(), header_value.as_str());
                     }
                     builder.json(&body)
                 },
@@ -311,6 +533,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
             let mut decoder = SseDecoder::default();
             let mut state = StreamState::default();
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
 
             loop {
@@ -329,7 +552,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    for emitted in parse_chat_event(&event, &mut state)? {
+                    let parsed = parse_chat_event(&event, &mut state)?;
+                    if let Some(server) = state.server_model.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for emitted in parsed {
                         yield emitted;
                     }
                     if state.completed_emitted {
@@ -339,7 +568,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
 
             for event in decoder.finish() {
-                for emitted in parse_chat_event(&event, &mut state)? {
+                let parsed = parse_chat_event(&event, &mut state)?;
+                if let Some(server) = state.server_model.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for emitted in parsed {
                     yield emitted;
                 }
                 if state.completed_emitted {
@@ -427,10 +662,87 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
             "tool_call_id": call_id,
             "content": output,
         }),
+        LlmInputItem::Image { media_type, bytes } => json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": format!(
+                        "data:{media_type};base64,{}",
+                        BASE64_STANDARD.encode(bytes.as_ref())
+                    ),
+                },
+            }],
+        }),
         // Chat Completions has no signed reasoning replay format. Reasoning
         // items are rendered in the UI but skipped when replaying.
         LlmInputItem::Reasoning(_) => return None,
     })
+}
+
+/// Resolve `{account_id}` / `{gateway_id}` placeholders in an
+/// OpenAI-compatible base URL.
+///
+/// The Cloudflare Workers AI and AI Gateway presets ship base URL
+/// templates with these placeholders so the configuration layer can
+/// flow the per-account / per-gateway values through verbatim and
+/// defer substitution until the LLM client is constructed (see
+/// [`OpenAiCompatibleProvider::from_config`]). Keeping substitution
+/// here — instead of building the URL eagerly in config land — lets a
+/// user override `base_url` to point at a reverse proxy that mirrors
+/// the Cloudflare path shape without re-implementing the substitution.
+///
+/// Returns the resolved URL when every placeholder present in
+/// `template` has a corresponding non-empty value, or a
+/// [`SqueezyError::ProviderNotConfigured`] error naming the missing
+/// placeholder and the config field/env-var the user needs to set.
+/// Templates that carry no placeholders are returned unchanged, which
+/// keeps every non-Cloudflare preset on its existing zero-overhead
+/// path.
+pub(crate) fn substitute_url_placeholders(
+    template: &str,
+    preset: OpenAiCompatiblePreset,
+    account_id: Option<&str>,
+    gateway_id: Option<&str>,
+) -> Result<String> {
+    // Required-vs-optional is structural: a placeholder is "required"
+    // exactly when it appears in the template, regardless of preset.
+    // This keeps the substitution table preset-agnostic so a custom
+    // base URL with `{account_id}` on a non-Cloudflare preset still
+    // gets a helpful error instead of a literal `{account_id}` reaching
+    // the wire.
+    let section = preset.as_str();
+    let preset_label = preset.display_name();
+    let substitutions: [(&str, Option<&str>, &str, &str); 2] = [
+        (
+            "{account_id}",
+            account_id.map(str::trim).filter(|value| !value.is_empty()),
+            "cloudflare_account_id",
+            "CLOUDFLARE_ACCOUNT_ID",
+        ),
+        (
+            "{gateway_id}",
+            gateway_id.map(str::trim).filter(|value| !value.is_empty()),
+            "cloudflare_gateway_id",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ),
+    ];
+    let mut resolved = template.to_string();
+    for (placeholder, value, field, env_var) in substitutions {
+        if !resolved.contains(placeholder) {
+            continue;
+        }
+        let Some(value) = value else {
+            return Err(SqueezyError::ProviderNotConfigured(format!(
+                "providers.{section}.base_url contains the {placeholder} \
+                 placeholder but providers.{section}.{field} (or {env_var}) \
+                 is unset; the {preset_label} preset cannot resolve a request \
+                 URL without it"
+            )));
+        };
+        resolved = resolved.replace(placeholder, value);
+    }
+    Ok(resolved)
 }
 
 fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
@@ -498,6 +810,15 @@ struct StreamState {
     /// because the normalized `StopReason::EndTurn` alone can't
     /// disambiguate "clean stop" from "reasoning-only stop".
     reasoning_only_stop: bool,
+    /// Buffers the server-echoed top-level `model` field of a
+    /// chat-completions chunk the first time the stream surfaces it.
+    /// The outer `stream_response` loop drains the slot after each
+    /// `parse_chat_event` call and feeds the value into
+    /// [`crate::ServerModelEcho`] so [`LlmEvent::ServerModel`] lands
+    /// additively right after [`LlmEvent::Started`]. Stays `None` for
+    /// every later chunk because the helper short-circuits once the
+    /// echo has been latched.
+    server_model: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -709,6 +1030,17 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         state.response_id.get_or_insert_with(|| id.to_string());
+    }
+
+    if state.server_model.is_none()
+        && let Some(server_model) = value.get("model").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        // Chat-completions chunks repeat the top-level `model` field on
+        // every event. Stash the value the first time we see it; the
+        // outer stream loop drains the slot and feeds it to
+        // `ServerModelEcho`, which suppresses duplicate emissions.
+        state.server_model = Some(server_model.to_string());
     }
 
     if let Some(usage) = value.get("usage") {

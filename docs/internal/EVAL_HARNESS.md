@@ -276,11 +276,15 @@ on_tool = "grep"                  # fire mid-stream when grep is requested
 
 #### `slash_command` coverage
 
-Slash commands dispatch through `Agent::dispatch_command`. Today's
-supported set: `/compact`, `/plan`, `/build`, `/cost`, `/tasks` (alias
-`/jobs`), `/permissions`. Anything else lands as `CommandOutcome::Unsupported`,
-which surfaces as the `unsupported_slash_command` auto-finding so
-triage flags missing automation rather than silently no-op.
+Slash commands dispatch through `Agent::dispatch_command` (typed) via the
+`Agent::dispatch_command_raw` shim. Every entry in
+`squeezy-tui`'s `SLASH_COMMANDS` table is reachable; commands whose
+behaviour lives entirely in the TUI renderer (overlays, transcript pushes,
+clipboard, `/diff` snapshot) land as `DispatchOutcome::TuiOnly { command }`
+so eval traces still observe the typed entry point. Unknown heads land as
+`DispatchOutcome::Unsupported`, which surfaces as the
+`unsupported_slash_command` auto-finding so triage flags missing
+automation rather than silently no-op.
 
 ### Expect (soft checks)
 
