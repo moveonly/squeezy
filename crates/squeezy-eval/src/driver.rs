@@ -139,12 +139,32 @@ pub async fn run_scenario(
         provider_from_config(&config.provider)
             .map_err(|err| EvalError::Provider(provider_hint(err)))?
     };
-    let agent = Agent::new(config.clone(), provider);
+    let agent = Agent::new(config.clone(), provider.clone());
     let provider_name = agent.provider_name();
     let model = config.model.clone();
     let session_id = agent.session_id().unwrap_or_default();
 
-    // 3. Drive the steps.
+    // 3. Drive the steps. When `drive_tui = true`, build a
+    //    `TuiHarness` so prompt steps and the TUI-only actions
+    //    (`send_key`, `tui_*` assertions) operate against a live
+    //    `TuiApp + Agent + Terminal` instead of just the markdown
+    //    capture path.
+    let harness = if scenario.tui_capture.drive_tui {
+        let width = scenario.tui_capture.width.unwrap_or(160);
+        let height = scenario.tui_capture.height.unwrap_or(48);
+        let session_mode = config.session_mode;
+        let harness = squeezy_tui::testing::TuiHarness::new(
+            config.clone(),
+            session_mode,
+            provider.clone(),
+            width,
+            height,
+        )
+        .map_err(|err| EvalError::Internal(format!("init TuiHarness: {err}")))?;
+        Some(Arc::new(TokioMutex::new(harness)))
+    } else {
+        None
+    };
     let driver = Driver {
         agent: Arc::new(agent),
         capture: capture.clone(),
@@ -169,6 +189,7 @@ pub async fn run_scenario(
         task_snapshots: TokioMutex::new(Vec::new()),
         tui_capture: tui_capture.clone(),
         pending_overlays: TokioMutex::new(Vec::new()),
+        harness,
     };
 
     driver.dispatch_steps().await?;
@@ -480,6 +501,9 @@ fn apply_overlay(
     if let Some(v) = overlay.max_session_cost_usd_micros {
         config.max_session_cost_usd_micros = Some(v);
     }
+    if let Some(show) = overlay.show_reasoning_usage {
+        config.tui.show_reasoning_usage = show;
+    }
     Ok(())
 }
 
@@ -540,6 +564,11 @@ struct Driver {
     /// approval / elicitation / user-input events arrive. Cleared at
     /// turn-start and emitted into the next `TuiFrame`.
     pending_overlays: TokioMutex<Vec<crate::tui_capture::TuiOverlayEvent>>,
+    /// Live `TuiApp` driver. Some when `[tui_capture] drive_tui =
+    /// true`; the driver routes prompt steps and TUI-driving actions
+    /// through it instead of through `agent` directly. None for the
+    /// default markdown-only render path.
+    harness: Option<Arc<TokioMutex<squeezy_tui::testing::TuiHarness>>>,
 }
 
 impl Driver {
@@ -569,7 +598,11 @@ impl Driver {
             )?;
             match step {
                 Step::Prompt { text, wait_for } => {
-                    self.run_prompt(text, wait_for).await?;
+                    if self.harness.is_some() {
+                        self.run_prompt_through_harness(text).await?;
+                    } else {
+                        self.run_prompt(text, wait_for).await?;
+                    }
                 }
                 Step::Action(action) => match action.when() {
                     Some(_) => {
@@ -1016,51 +1049,149 @@ impl Driver {
         }
     }
 
-    async fn send_harness_key(&self, _key: &str) -> String {
-        if !self.scenario.tui_capture.drive_tui {
+    async fn run_prompt_through_harness(&self, prompt: String) -> Result<(), EvalError> {
+        let Some(harness) = self.harness.as_ref() else {
+            return Err(EvalError::Internal(
+                "run_prompt_through_harness called without a harness".into(),
+            ));
+        };
+        let mut h = harness.lock().await;
+        h.start_user_turn(prompt.clone());
+        h.pump_until_idle()
+            .await
+            .map_err(|err| EvalError::Internal(format!("harness pump: {err}")))?;
+        self.capture.record(
+            None,
+            EvalEventKind::ActionStep {
+                action: json!({"kind": "harness_prompt", "text": prompt}),
+                status: format!(
+                    "drained · {} transcript entries · status={:?}",
+                    h.transcript_entries().len(),
+                    h.status_text(),
+                ),
+            },
+        )?;
+        Ok(())
+    }
+
+    async fn send_harness_key(&self, key: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
             return "asserted_fail: send_key requires [tui_capture] drive_tui = true".into();
+        };
+        let Some(event) = squeezy_tui::testing::parse_key(key) else {
+            return format!("asserted_fail: unparseable key spec {key:?}");
+        };
+        let mut h = harness.lock().await;
+        match h.send_key(event).await {
+            Ok(_) => format!("sent {key} · status={:?}", h.status_text()),
+            Err(err) => format!("asserted_fail: send_key {key}: {err}"),
         }
-        // The harness wire-up lands in the follow-up step. This path
-        // is reachable only with `drive_tui = true`; until the
-        // `Driver` actually holds a `TuiHarness`, surface a clear
-        // pending status instead of silently no-oping.
-        "deferred: tui harness wire-up pending".into()
     }
 
-    async fn send_harness_keys(&self, _keys: &[String], _delay_ms: u64) -> String {
-        if !self.scenario.tui_capture.drive_tui {
+    async fn send_harness_keys(&self, keys: &[String], delay_ms: u64) -> String {
+        let Some(harness) = self.harness.as_ref() else {
             return "asserted_fail: send_keys requires [tui_capture] drive_tui = true".into();
+        };
+        let mut events = Vec::with_capacity(keys.len());
+        for spec in keys {
+            match squeezy_tui::testing::parse_key(spec) {
+                Some(ev) => events.push((spec.clone(), ev)),
+                None => return format!("asserted_fail: unparseable key spec {spec:?}"),
+            }
         }
-        "deferred: tui harness wire-up pending".into()
+        let mut h = harness.lock().await;
+        for (spec, event) in &events {
+            if let Err(err) = h.send_key(*event).await {
+                return format!("asserted_fail: send_key {spec}: {err}");
+            }
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+        format!("sent {} keys · status={:?}", events.len(), h.status_text())
     }
 
-    async fn assert_tui_status_contains(&self, _text: &str) -> String {
-        if !self.scenario.tui_capture.drive_tui {
+    async fn assert_tui_status_contains(&self, text: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
             return "asserted_fail: tui_status_contains requires [tui_capture] drive_tui = true"
                 .into();
+        };
+        let h = harness.lock().await;
+        let status = h.status_text();
+        if status.contains(text) {
+            "asserted_pass".into()
+        } else {
+            format!("asserted_fail: status={status:?} does not contain {text:?}")
         }
-        "deferred: tui harness wire-up pending".into()
     }
 
     async fn assert_tui_transcript_entry(
         &self,
-        _index: &TranscriptIndex,
-        _entry_kind: Option<&str>,
-        _collapsed: Option<bool>,
+        index: &TranscriptIndex,
+        entry_kind: Option<&str>,
+        collapsed: Option<bool>,
     ) -> String {
-        if !self.scenario.tui_capture.drive_tui {
+        let Some(harness) = self.harness.as_ref() else {
             return "asserted_fail: tui_transcript_entry requires [tui_capture] drive_tui = true"
                 .into();
+        };
+        let h = harness.lock().await;
+        let entries = h.transcript_entries();
+        let resolved = match index {
+            TranscriptIndex::Last => entries.last().map(|e| (entries.len() - 1, e.clone())),
+            TranscriptIndex::LastOfKind { entry_kind: kind } => entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, e)| e.kind == kind)
+                .map(|(i, e)| (i, e.clone())),
+            TranscriptIndex::Absolute { index } => entries.get(*index).map(|e| (*index, e.clone())),
+        };
+        let Some((position, entry)) = resolved else {
+            return format!(
+                "asserted_fail: no transcript entry matches {index:?} (have {} entries: {:?})",
+                entries.len(),
+                entries
+                    .iter()
+                    .map(|e| (e.kind, e.collapsed))
+                    .collect::<Vec<_>>()
+            );
+        };
+        if let Some(expected_kind) = entry_kind
+            && entry.kind != expected_kind
+        {
+            return format!(
+                "asserted_fail: entry[{position}].kind={:?} expected {expected_kind:?}",
+                entry.kind
+            );
         }
-        "deferred: tui harness wire-up pending".into()
+        if let Some(expected_collapsed) = collapsed
+            && entry.collapsed != expected_collapsed
+        {
+            return format!(
+                "asserted_fail: entry[{position}].collapsed={} expected {expected_collapsed}",
+                entry.collapsed
+            );
+        }
+        "asserted_pass".into()
     }
 
-    async fn assert_tui_frame_contains(&self, _text: &str) -> String {
-        if !self.scenario.tui_capture.drive_tui {
+    async fn assert_tui_frame_contains(&self, text: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
             return "asserted_fail: tui_frame_contains requires [tui_capture] drive_tui = true"
                 .into();
+        };
+        let mut h = harness.lock().await;
+        match h.render_frame() {
+            Ok(frame) => {
+                if frame.plain_text.contains(text) {
+                    "asserted_pass".into()
+                } else {
+                    format!("asserted_fail: frame does not contain {text:?}")
+                }
+            }
+            Err(err) => format!("asserted_fail: render: {err}"),
         }
-        "deferred: tui harness wire-up pending".into()
     }
 
     async fn run_prompt(&self, prompt: String, wait_for: WaitFor) -> Result<(), EvalError> {

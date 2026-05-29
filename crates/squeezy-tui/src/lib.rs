@@ -9961,7 +9961,7 @@ enum ClipboardTarget {
     Transcript,
 }
 
-pub(crate) trait Clipboard {
+pub(crate) trait Clipboard: Send {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String>;
 }
 

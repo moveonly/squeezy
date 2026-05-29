@@ -94,8 +94,13 @@ impl TuiHarness {
     /// queue is empty. Bounded so a stuck channel surfaces as an error
     /// rather than hanging the calling scenario.
     pub async fn pump_until_idle(&mut self) -> Result<()> {
-        const MAX_ITERATIONS: usize = 4_096;
-        for _ in 0..MAX_ITERATIONS {
+        // Bounded by wall clock, not iterations: a real LLM turn can
+        // sit between deltas for seconds. `try_recv` returns
+        // immediately when the queue is empty, so a pure-spin loop
+        // would burn its iteration budget before the first reasoning
+        // chunk even lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
             drain_job_events(&mut self.app);
             drain_agent_events(&mut self.app).await;
             let queued = if self.app.auto_drain_queue {
@@ -119,11 +124,15 @@ impl TuiHarness {
             if !queued && self.app.turn_rx.is_none() && self.app.prompt_queue.is_empty() {
                 return Ok(());
             }
-            tokio::task::yield_now().await;
+            if std::time::Instant::now() >= deadline {
+                return Err(SqueezyError::Agent(
+                    "pump_until_idle: did not reach idle within 180s".into(),
+                ));
+            }
+            // Sleep briefly so the LLM streaming task can make
+            // progress; 10 ms balances latency against CPU spin.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        Err(SqueezyError::Agent(format!(
-            "pump_until_idle: did not reach idle within {MAX_ITERATIONS} iterations"
-        )))
     }
 
     /// Inject a single key event at `handle_key`. Drains both before

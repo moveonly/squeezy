@@ -127,6 +127,11 @@ pub struct SqueezyOverlay {
     /// = $5). Scenarios that should bail at a tight session budget set
     /// this lower.
     pub max_session_cost_usd_micros: Option<u64>,
+    /// Override `tui.show_reasoning_usage`. The user's
+    /// reasoning-toggle bug only manifests with `false`: a hidden
+    /// reasoning entry can still be the Ctrl+O target.
+    #[serde(default)]
+    pub show_reasoning_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

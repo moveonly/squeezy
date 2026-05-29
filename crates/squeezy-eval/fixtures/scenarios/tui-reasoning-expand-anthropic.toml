@@ -1,0 +1,83 @@
+id = "tui-reasoning-expand-anthropic"
+title = "Reproduce: Ctrl+O on reasoning entries"
+description = """
+Drives the live TuiApp end-to-end via the eval `TuiHarness`. A real
+Anthropic call (`claude-haiku-4-5-20251001` with reasoning_effort =
+high) produces a reasoning segment in the transcript. The scenario
+then presses `Ctrl+O` and asserts on what the status bar and
+transcript state report. Used to pin the "Ctrl+O doesn't expand
+reasoning" behaviour: on main, the toggle handler picks the
+reasoning entry and silently flips its `collapsed` flag without
+producing a visible chevron change.
+
+Requires `ANTHROPIC_API_KEY`. Run with:
+
+    ANTHROPIC_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/tui-reasoning-expand-anthropic.toml
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 2000
+# Force the bug-triggering configuration: hide reasoning in the
+# rendered transcript. Now Ctrl+O still picks the reasoning entry
+# as toggle target but the flip has zero visual effect — that's the
+# "Ctrl+O does nothing" sensation the user reported.
+show_reasoning_usage = false
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+[[steps]]
+kind = "prompt"
+text = "Think about the trade-offs between a hash map and a B-tree for a small (~100 entry) keyed cache. Answer in one short sentence."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_transcript_entry"
+[steps.check.index]
+by = "last_of_kind"
+entry_kind = "reasoning"
+collapsed = true
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "transcript entry"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_transcript_entry"
+[steps.check.index]
+by = "last_of_kind"
+entry_kind = "reasoning"
+collapsed = false
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false
