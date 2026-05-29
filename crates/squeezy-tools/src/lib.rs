@@ -5,7 +5,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Condvar, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -155,6 +155,13 @@ const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+/// Upper bound a graph tool waits for the deferred
+/// `GraphManager::open_with_store` background task to finish before it
+/// falls back to `graph_unavailable_result`. Generous enough to cover
+/// cold crawls of large repos; capped so a pathological hang (e.g.
+/// fsync stall on a misconfigured filesystem) can't strand the model
+/// indefinitely.
+pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
 pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 25;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
@@ -765,6 +772,12 @@ pub struct ToolRegistry {
     pub(crate) web_config: Arc<WebToolConfig>,
     pub(crate) http: Arc<dyn WebHttpClient>,
     pub(crate) graph: Arc<StdMutex<Option<GraphManager>>>,
+    /// `(ready, cv)` paired with `graph`. Tools that need the graph wait
+    /// on the condvar with a bounded timeout when the slot is still
+    /// `None` so a background `open_with_store` (started during
+    /// construction) doesn't strand them on `graph_unavailable` while
+    /// the workspace crawl + tree-sitter init is still finishing.
+    pub(crate) graph_ready: Arc<(StdMutex<bool>, Condvar)>,
     vcs: Arc<GitVcs>,
     /// Shared persistent state store. When `None`, `read_mode=diff` with
     /// `diff_baseline=last_receipt` cannot reach any stored read snapshots and
@@ -1051,13 +1064,62 @@ impl ToolRegistry {
         // `SqueezyError::Config` here instead of silently disabling the
         // policy on every hot-path call.
         let compiled_policy = Arc::new(crawl_options.policy.compile()?);
-        let graph = GraphManager::open_with_store(
-            &root,
-            Default::default(),
-            crawl_options.clone(),
-            state_store.clone(),
-        )
-        .ok();
+        // Defer the graph open: `GraphManager::open_with_store` walks the
+        // workspace, initialises every tree-sitter grammar, and hydrates
+        // redb partitions — typically the single largest contributor to
+        // session startup. Hand that work to the blocking pool when a
+        // runtime is available so the registry (and the TUI it backs)
+        // becomes interactive immediately; graph tool calls wait on
+        // `graph_ready` up to `GRAPH_READY_WAIT` before falling back to
+        // `graph_unavailable_result`. Tests and other sync construction
+        // contexts (no current runtime) keep the synchronous open so
+        // they observe the graph deterministically.
+        let graph: Arc<StdMutex<Option<GraphManager>>> = Arc::new(StdMutex::new(None));
+        let graph_ready: Arc<(StdMutex<bool>, Condvar)> =
+            Arc::new((StdMutex::new(false), Condvar::new()));
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let graph = Arc::clone(&graph);
+                let graph_ready = Arc::clone(&graph_ready);
+                let root_for_graph = root.clone();
+                let crawl_options_for_graph = crawl_options.clone();
+                let state_store_for_graph = state_store.clone();
+                handle.spawn_blocking(move || {
+                    let opened = GraphManager::open_with_store(
+                        &root_for_graph,
+                        Default::default(),
+                        crawl_options_for_graph,
+                        state_store_for_graph,
+                    )
+                    .ok();
+                    if let Ok(mut slot) = graph.lock() {
+                        *slot = opened;
+                    }
+                    let (lock, cv) = &*graph_ready;
+                    if let Ok(mut ready) = lock.lock() {
+                        *ready = true;
+                        cv.notify_all();
+                    }
+                });
+            }
+            Err(_) => {
+                let opened = GraphManager::open_with_store(
+                    &root,
+                    Default::default(),
+                    crawl_options.clone(),
+                    state_store.clone(),
+                )
+                .ok();
+                if let Ok(mut slot) = graph.lock() {
+                    *slot = opened;
+                }
+                let (lock, cv) = &*graph_ready;
+                if let Ok(mut ready) = lock.lock() {
+                    *ready = true;
+                    cv.notify_all();
+                }
+            }
+        }
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
         let checkpoints = if config.checkpoints_enabled {
@@ -1077,7 +1139,8 @@ impl ToolRegistry {
             shell_spillover: Arc::new(shell_spillover::ShellSpilloverStore::new()),
             web_config: Arc::new(config.web.normalized()),
             http,
-            graph: Arc::new(StdMutex::new(graph)),
+            graph,
+            graph_ready,
             vcs: Arc::new(vcs),
             state_store: state_store.clone(),
             checkpoints,
@@ -1126,6 +1189,7 @@ impl ToolRegistry {
             web_config: Arc::new(web_config.normalized()),
             http,
             graph: Arc::new(StdMutex::new(graph)),
+            graph_ready: Arc::new((StdMutex::new(true), Condvar::new())),
             vcs: Arc::new(vcs),
             state_store: None,
             checkpoints: None,
@@ -1144,6 +1208,26 @@ impl ToolRegistry {
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// Block (on a `std::sync::Condvar`) for up to `max_wait` waiting
+    /// for the deferred `GraphManager::open_with_store` background task
+    /// to mark the graph slot ready. Returns whether the graph is ready
+    /// (i.e. the caller can expect `self.graph.lock().as_mut()` to be
+    /// `Some` unless the open itself failed). Callers fall back to the
+    /// existing `graph_unavailable_result` when this returns `false`.
+    pub(crate) fn wait_for_graph_ready(&self, max_wait: Duration) -> bool {
+        let (lock, cv) = &*self.graph_ready;
+        let Ok(ready) = lock.lock() else {
+            return false;
+        };
+        if *ready {
+            return true;
+        }
+        match cv.wait_timeout_while(ready, max_wait, |r| !*r) {
+            Ok((ready, _)) => *ready,
+            Err(_) => false,
+        }
     }
 
     pub(crate) fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
@@ -2659,6 +2743,7 @@ impl ToolRegistry {
             captured_unix_millis: unix_millis(),
         };
 
+        self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let report = {
             let mut graph = match self.graph.lock() {
                 Ok(graph) => graph,
