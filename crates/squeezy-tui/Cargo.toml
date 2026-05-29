@@ -12,6 +12,14 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+[features]
+# Off by default. Exposes `pub mod testing` with a `TuiHarness` that
+# drives the full TuiApp + Agent + ratatui pipeline against a
+# `TestBackend`. Consumed by `squeezy-eval` so scenarios can send key
+# events at a real `handle_key`. Release TUI binaries don't enable it,
+# so the test surface stays out of the shipped library.
+testing = []
+
 [dependencies]
 ansi-to-tui.workspace = true
 crossterm.workspace = true

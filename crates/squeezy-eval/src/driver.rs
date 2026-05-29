@@ -16,7 +16,8 @@ use squeezy_llm::provider_from_config;
 use crate::capture::{Capture, EvalEventKind};
 use crate::frames::{FrameFinish, FrameRecord, FrameWriter, ToolCallSummary};
 use crate::scenario::{
-    Action, ApprovalMatch, Assertion, EditReplace, Scenario, SqueezyOverlay, Step, WaitFor,
+    Action, ApprovalMatch, Assertion, EditReplace, Scenario, SqueezyOverlay, Step, TranscriptIndex,
+    WaitFor,
 };
 use crate::tickets::TicketDraft;
 use crate::workspace::{self, ProvisionedWorkspace};
@@ -744,6 +745,26 @@ impl Driver {
                     },
                 )?;
             }
+            Action::SendKey { key, .. } => {
+                let status = self.send_harness_key(key.as_str()).await;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
+            Action::SendKeys { keys, delay_ms, .. } => {
+                let status = self.send_harness_keys(keys, *delay_ms).await;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
             Action::DetachAttachment { id, .. } => {
                 let status = match self.agent.detach_context_attachment(id).await {
                     Ok(attachment) => format!("detached:id={}", attachment.id),
@@ -982,7 +1003,64 @@ impl Driver {
                 }
                 "asserted_pass".into()
             }
+            Assertion::TuiStatusContains { text } => self.assert_tui_status_contains(text).await,
+            Assertion::TuiTranscriptEntry {
+                index,
+                entry_kind,
+                collapsed,
+            } => {
+                self.assert_tui_transcript_entry(index, entry_kind.as_deref(), *collapsed)
+                    .await
+            }
+            Assertion::TuiFrameContains { text } => self.assert_tui_frame_contains(text).await,
         }
+    }
+
+    async fn send_harness_key(&self, _key: &str) -> String {
+        if !self.scenario.tui_capture.drive_tui {
+            return "asserted_fail: send_key requires [tui_capture] drive_tui = true".into();
+        }
+        // The harness wire-up lands in the follow-up step. This path
+        // is reachable only with `drive_tui = true`; until the
+        // `Driver` actually holds a `TuiHarness`, surface a clear
+        // pending status instead of silently no-oping.
+        "deferred: tui harness wire-up pending".into()
+    }
+
+    async fn send_harness_keys(&self, _keys: &[String], _delay_ms: u64) -> String {
+        if !self.scenario.tui_capture.drive_tui {
+            return "asserted_fail: send_keys requires [tui_capture] drive_tui = true".into();
+        }
+        "deferred: tui harness wire-up pending".into()
+    }
+
+    async fn assert_tui_status_contains(&self, _text: &str) -> String {
+        if !self.scenario.tui_capture.drive_tui {
+            return "asserted_fail: tui_status_contains requires [tui_capture] drive_tui = true"
+                .into();
+        }
+        "deferred: tui harness wire-up pending".into()
+    }
+
+    async fn assert_tui_transcript_entry(
+        &self,
+        _index: &TranscriptIndex,
+        _entry_kind: Option<&str>,
+        _collapsed: Option<bool>,
+    ) -> String {
+        if !self.scenario.tui_capture.drive_tui {
+            return "asserted_fail: tui_transcript_entry requires [tui_capture] drive_tui = true"
+                .into();
+        }
+        "deferred: tui harness wire-up pending".into()
+    }
+
+    async fn assert_tui_frame_contains(&self, _text: &str) -> String {
+        if !self.scenario.tui_capture.drive_tui {
+            return "asserted_fail: tui_frame_contains requires [tui_capture] drive_tui = true"
+                .into();
+        }
+        "deferred: tui harness wire-up pending".into()
     }
 
     async fn run_prompt(&self, prompt: String, wait_for: WaitFor) -> Result<(), EvalError> {
@@ -1622,6 +1700,13 @@ impl Driver {
                 visual_truncated: rendered.visual_truncated,
                 omitted_line_count: rendered.omitted_line_count,
                 overlays,
+                trigger: Some(crate::tui_capture::TuiFrameTrigger {
+                    kind: "turn_completed".into(),
+                    step_index: None,
+                    key: None,
+                }),
+                transcript: Vec::new(),
+                status_text: None,
             };
             writer.write(&tui_frame)?;
         }
@@ -1961,6 +2046,8 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::SwitchMode { .. } => "switch_mode",
         Action::AttachFile { .. } => "attach_file",
         Action::DetachAttachment { .. } => "detach_attachment",
+        Action::SendKey { .. } => "send_key",
+        Action::SendKeys { .. } => "send_keys",
     }
 }
 

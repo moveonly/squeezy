@@ -406,6 +406,8 @@ fn describe_action(action: &Action) -> String {
         Action::SwitchMode { mode, .. } => format!("switch_mode: {mode}"),
         Action::AttachFile { path, .. } => format!("attach_file: {}", path.display()),
         Action::DetachAttachment { id, .. } => format!("detach_attachment: {id}"),
+        Action::SendKey { key, .. } => format!("send_key: {key}"),
+        Action::SendKeys { keys, .. } => format!("send_keys: [{}]", keys.join(", ")),
     }
 }
 

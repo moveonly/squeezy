@@ -85,6 +85,9 @@ pub use streaming_patch::{
     JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
 };
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
 pub(crate) use events::{
@@ -1133,7 +1136,7 @@ fn debug_log_key_event(key: &KeyEvent) {
     );
 }
 
-async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
+pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
     }
@@ -1867,7 +1870,7 @@ fn theme_to_accent_variant(theme: TuiTheme) -> render::palette::AccentVariant {
 
 /// Apply both the tone and accent overrides for `theme` in one shot so
 /// callers don't accidentally update one and forget the other.
-fn apply_theme_overrides(theme: TuiTheme) {
+pub(crate) fn apply_theme_overrides(theme: TuiTheme) {
     render::palette::set_palette_tone_override(theme_to_tone_override(theme));
     render::palette::set_accent_variant(theme_to_accent_variant(theme));
 }
@@ -4397,7 +4400,7 @@ fn format_approval_menu_lines(
     lines
 }
 
-fn render(frame: &mut Frame<'_>, app: &TuiApp) {
+pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
@@ -4623,7 +4626,7 @@ fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 }
 
-fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
+pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
@@ -9958,7 +9961,7 @@ enum ClipboardTarget {
     Transcript,
 }
 
-trait Clipboard {
+pub(crate) trait Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String>;
 }
 
@@ -10609,8 +10612,8 @@ impl TuiApp {
         )
     }
 
-    #[cfg(test)]
-    fn new_with_clipboard(
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn new_with_clipboard(
         provider_name: &'static str,
         config: &AppConfig,
         mode: SessionMode,

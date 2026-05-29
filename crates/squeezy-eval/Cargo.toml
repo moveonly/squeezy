@@ -27,7 +27,7 @@ squeezy-core.workspace = true
 squeezy-llm.workspace = true
 squeezy-store.workspace = true
 squeezy-tools.workspace = true
-squeezy-tui.workspace = true
+squeezy-tui = { workspace = true, features = ["testing"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

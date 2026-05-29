@@ -64,6 +64,13 @@ pub struct TuiCaptureConfig {
     /// terminal. Defaults to `"dark"`.
     #[serde(default)]
     pub palette_tone: Option<String>,
+    /// When true, the driver builds a live `TuiHarness` (TuiApp +
+    /// Agent + headless terminal) and routes all agent traffic
+    /// through it. This unlocks the `send_key` / `send_keys`
+    /// actions and the `tui_*` assertions. Off by default so
+    /// existing scenarios pay no cost.
+    #[serde(default)]
+    pub drive_tui: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +276,28 @@ pub enum Action {
         #[serde(default)]
         when: Option<When>,
     },
+    /// Send a single key event into the live `TuiHarness`. Requires
+    /// `[tui_capture] drive_tui = true`. `key` uses the same dialect
+    /// as `[tui.keymap]` overrides — `"Ctrl+O"`, `"Alt+Up"`,
+    /// `"PageDown"`, `"F11"`, `"Enter"`. Validated at scenario-load
+    /// time so a typo fails parsing, not dispatch.
+    SendKey {
+        key: String,
+        #[serde(default)]
+        when: Option<When>,
+    },
+    /// Send a sequence of keys into the live `TuiHarness`. Pumps the
+    /// drain loop between each key so the harness sees the same
+    /// "between frames" state production does. Optional `delay_ms`
+    /// inserts a real sleep between keys for scenarios that need to
+    /// give an async background task time to land.
+    SendKeys {
+        keys: Vec<String>,
+        #[serde(default)]
+        delay_ms: u64,
+        #[serde(default)]
+        when: Option<When>,
+    },
 }
 
 impl Action {
@@ -287,7 +316,9 @@ impl Action {
             | Action::ApplyDiff { when, .. }
             | Action::SwitchMode { when, .. }
             | Action::AttachFile { when, .. }
-            | Action::DetachAttachment { when, .. } => when.as_ref(),
+            | Action::DetachAttachment { when, .. }
+            | Action::SendKey { when, .. }
+            | Action::SendKeys { when, .. } => when.as_ref(),
         }
     }
 }
@@ -409,6 +440,44 @@ pub enum Assertion {
         #[serde(default)]
         blocker_contains: Option<String>,
     },
+    /// The live harness's `status_text()` contains `text`. Requires
+    /// `[tui_capture] drive_tui = true`. Use to pin status-bar
+    /// feedback like `"expanded 1 of"` after a Ctrl-O.
+    TuiStatusContains { text: String },
+    /// A specific transcript entry has the expected `entry_kind`
+    /// and/or `collapsed` state. `index` picks the target — last
+    /// entry, last of a specific kind, or an absolute position.
+    /// Useful for asserting that Ctrl-O toggled the right row.
+    /// (`entry_kind` instead of `kind` to avoid collision with the
+    /// outer `#[serde(tag = "kind")]` discriminator.)
+    TuiTranscriptEntry {
+        index: TranscriptIndex,
+        #[serde(default)]
+        entry_kind: Option<String>,
+        #[serde(default)]
+        collapsed: Option<bool>,
+    },
+    /// The most recent rendered frame's `plain_text` contains `text`.
+    /// Substring match — reads the same projection the eval
+    /// `frames_tui.jsonl` records.
+    TuiFrameContains { text: String },
+}
+
+/// Selector for `Assertion::TuiTranscriptEntry`. Mirrors the way TUI
+/// tests reach for entries: by absolute position when the scenario is
+/// deterministic, by entry kind when the scenario script can vary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "by", rename_all = "snake_case")]
+pub enum TranscriptIndex {
+    /// The last transcript entry, regardless of kind.
+    Last,
+    /// The last entry whose kind tag (`"reasoning" | "tool_result" |
+    /// "message" | "log" | "plan_card" | "diff" | "slash_echo"`)
+    /// matches `entry_kind`.
+    LastOfKind { entry_kind: String },
+    /// A specific absolute index into the transcript. Out-of-bounds
+    /// produces an `asserted_fail`.
+    Absolute { index: usize },
 }
 
 /// Soft expectations evaluated at the end of the run; failures produce

@@ -58,7 +58,8 @@ pub struct TuiCell {
     pub modifiers: Vec<String>,
 }
 
-/// One record per turn, written to `frames_tui.jsonl`.
+/// One record per turn (or per key/action when `drive_tui = true`),
+/// written to `frames_tui.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiFrame {
     pub turn_id: String,
@@ -84,6 +85,55 @@ pub struct TuiFrame {
     /// into `trace.jsonl`.
     #[serde(default)]
     pub overlays: Vec<TuiOverlayEvent>,
+    /// What produced this frame. Absent on records emitted by the
+    /// pre-`drive_tui` per-turn pipeline (those are implicitly
+    /// `turn_completed`); populated for key- and action-driven
+    /// snapshots so reviewers can interleave them with turn frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TuiFrameTrigger>,
+    /// Public projection of the live transcript at frame time.
+    /// Populated only by harness-driven snapshots; the legacy
+    /// markdown-only path leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<TuiTranscriptSummary>,
+    /// Status-bar text at frame time. Toggle handlers write here
+    /// (`"expanded 1 of 3"`) so assertions can key off it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+}
+
+/// What caused a frame to be captured. `kind` distinguishes turn
+/// boundaries from explicit `send_key` / `send_keys` / other scripted
+/// actions. Action-driven frames also carry the originating index +
+/// the literal key string when applicable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiFrameTrigger {
+    /// `"turn_completed" | "key" | "action"`.
+    pub kind: String,
+    /// Zero-based index of the producing step into the scenario's
+    /// `steps` list. Absent for triggers that aren't tied to a step
+    /// (e.g. a post-mortem snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    /// The literal key spec (`"Ctrl+O"`) for `kind = "key"` frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// Public projection of one transcript entry. Mirrors
+/// `squeezy_tui::testing::TranscriptEntrySummary`; serialized into the
+/// frame record so a reviewer can read transcript state without
+/// re-running the scenario.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiTranscriptSummary {
+    /// Tag string: `"message" | "tool_result" | "log" | "plan_card" |
+    /// "diff" | "reasoning" | "slash_echo"`.
+    pub kind: String,
+    pub collapsed: bool,
+    /// Up to ~80 characters of the entry's primary text. Empty when
+    /// the entry kind has no textual primary.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
 }
 
 /// A high-level overlay-event marker. The eval driver derives these
