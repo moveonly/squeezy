@@ -3065,14 +3065,39 @@ async fn slash_attach_and_detach_update_active_context() {
 }
 
 #[tokio::test]
-async fn slash_attach_surfaces_unsupported_images() {
-    let root = temp_workspace("tui_attach_image");
+async fn slash_attach_routes_canonical_images_to_vision_kind() {
+    // F18 wires PNG/JPEG/GIF/WEBP magic-byte hits through to a
+    // routable `Image` attachment that fans into `LlmInputItem::Image`
+    // on the next turn. The TUI status surfaces the active attach
+    // instead of the legacy "unsupported file" rejection.
+    let root = temp_workspace("tui_attach_image_png");
     fs::write(root.join("shot.png"), b"\x89PNG\r\n\x1a\nimage").expect("write image");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach shot.png").await);
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.attachments[0].kind, ContextAttachmentKind::Image);
+    assert!(app.status.contains("attached file"), "{}", app.status);
+    assert!(app.status.contains("kind=image"), "{}", app.status);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_surfaces_unsupported_label_only_images() {
+    // Image-shaped labels whose bytes never trip the magic-byte sniff
+    // (HEIC/BMP/TIFF and the long tail) stay `UnsupportedImage` — the
+    // attach surfaces the legacy "unsupported file" status because no
+    // provider can decode a non-canonical payload.
+    let root = temp_workspace("tui_attach_image_heic");
+    fs::write(root.join("snap.heic"), b"not real heic content").expect("write image");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attach snap.heic").await);
     assert!(app.attachments.is_empty());
     assert!(app.status.contains("unsupported file"), "{}", app.status);
 
@@ -7603,6 +7628,8 @@ fn sample_attachment(id: &str) -> ContextAttachment {
         preview: "map · output shortened  ✖ Failed decl_search · invalid tool arguments"
             .to_string(),
         truncated: true,
+        image_media_type: None,
+        image_data_base64: None,
     }
 }
 

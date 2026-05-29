@@ -2270,6 +2270,28 @@ impl Agent {
         .await
     }
 
+    /// Byte-oriented paste path used when the incoming payload may
+    /// not be valid UTF-8 — chiefly images dropped through a
+    /// terminal's image-aware paste protocol or via direct binary
+    /// upload. The bytes flow through the same detect/redact pipeline
+    /// as [`Agent::attach_pasted_context`]; when
+    /// [`squeezy_core::detect_image_mime`] confirms a vision-routable
+    /// payload (PNG/JPEG/GIF/WEBP) the attachment is stored
+    /// [`ContextAttachmentKind::Image`] and fans into a
+    /// `LlmInputItem::Image` on the next turn.
+    pub async fn attach_pasted_bytes(
+        &self,
+        bytes: Vec<u8>,
+    ) -> squeezy_core::Result<ContextAttachmentUpdate> {
+        self.attach_context_bytes(
+            ContextAttachmentSource::Paste,
+            "pasted context".to_string(),
+            None,
+            bytes,
+        )
+        .await
+    }
+
     pub async fn attach_file_context(
         &self,
         path: PathBuf,
@@ -2810,6 +2832,62 @@ impl Agent {
         let id = self.next_context_attachment_id();
         let redacted_label = self.redactor.redact(&label).text;
         let redacted_path = path.map(|value| self.redactor.redact(&value).text);
+
+        // F18: route vision-grade image bytes into an active
+        // attachment that carries the raw payload (base64-stored so
+        // resume stays JSON-safe) so `start_turn` can fan it out into
+        // a `LlmInputItem::Image`. The provider-side
+        // `ensure_vision_support` gate still runs before any HTTP
+        // traffic — a text-only model surfaces a structured
+        // `ProviderRequest` error on the next turn rather than
+        // failing the attach.
+        if kind.is_routable_image() {
+            use base64::Engine as _;
+            let media_type = squeezy_core::detect_image_mime(&bytes)
+                .map(|mime| mime.to_string())
+                .unwrap_or_else(|| "image/png".to_string());
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let preview = format!("[{media_type} attachment, {original_bytes} bytes]");
+            let preview_bytes = preview.len();
+            let attachment = ContextAttachment {
+                id,
+                source,
+                kind,
+                status: ContextAttachmentStatus::Attached,
+                label: redacted_label,
+                path: redacted_path,
+                original_sha256,
+                redacted_sha256: None,
+                original_bytes,
+                stored_bytes: original_bytes,
+                preview_bytes,
+                redactions: 0,
+                preview,
+                truncated: false,
+                image_media_type: Some(media_type),
+                image_data_base64: Some(encoded),
+            };
+            state.context_attachments.push(attachment.clone());
+            self.persist_context_attachments(&state)?;
+            if let Some(session) = &self.session_log {
+                let _ = session.write_context_attachment(&attachment, None);
+            }
+            drop(state);
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "context_attached_image",
+                None,
+                Some(format!("attached image {}", attachment.id)),
+                json!({ "attachment": attachment.clone() }),
+            );
+            return Ok(ContextAttachmentUpdate {
+                attachment,
+                duplicate: false,
+                active: true,
+            });
+        }
+
         if !kind.is_supported_text() {
             let attachment = ContextAttachment {
                 id,
@@ -2826,6 +2904,8 @@ impl Agent {
                 redactions: 0,
                 preview: String::new(),
                 truncated: false,
+                image_media_type: None,
+                image_data_base64: None,
             };
             state.context_attachments.push(attachment.clone());
             self.persist_context_attachments(&state)?;
@@ -2869,6 +2949,8 @@ impl Agent {
             redactions: redacted.redactions,
             preview,
             truncated,
+            image_media_type: None,
+            image_data_base64: None,
         };
         state.redactions += attachment.redactions;
         state.context_attachments.push(attachment.clone());
@@ -4503,12 +4585,24 @@ impl TurnRuntime {
             )),
             &self.redactor,
         );
+        // F18: fan vision-routable image attachments into
+        // `LlmInputItem::Image` items so the bytes reach the provider
+        // verbatim. They sit immediately after the user text so each
+        // provider's request encoder can coalesce them into a single
+        // multimodal user message (Anthropic content blocks, OpenAI
+        // `input_image`, Bedrock `ImageBlock`, …). The provider's
+        // `ensure_vision_support` call then surfaces a structured
+        // `ProviderRequest` error if the active model lacks vision.
+        let image_items = image_input_items_for_attachments(&active_attachments);
         // Upgrade any legacy conversation items resumed from disk so the
         // invariant holds for the rest of this turn. Idempotent and
         // cheap for items already in redacted form.
         let mut conversation =
             redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
         conversation.push(user_item.clone());
+        for image_item in &image_items {
+            conversation.push(image_item.clone());
+        }
         let mut context_compaction = prior_state.context_compaction.clone();
         // PreCompact hook fires only when the auto trigger's
         // thresholds are crossed so handlers don't see a hook on every
@@ -4578,7 +4672,14 @@ impl TurnRuntime {
             None
         };
         let mut next_input = if previous_response_id.is_some() && self.config.store_responses {
-            vec![user_item.clone()]
+            // Sending only the latest user delta to the server-side
+            // store path still needs the image fan-out — the
+            // attachments are turn-scoped context the provider must
+            // see alongside the new user text.
+            let mut delta = Vec::with_capacity(1 + image_items.len());
+            delta.push(user_item.clone());
+            delta.extend(image_items.iter().cloned());
+            delta
         } else {
             conversation.clone()
         };
@@ -11511,6 +11612,37 @@ fn next_attachment_counter(attachments: &[ContextAttachment]) -> u64 {
         .max()
         .unwrap_or(0)
         + 1
+}
+
+/// Build the `LlmInputItem::Image` items for a turn from the agent's
+/// active context attachments. Only attachments with
+/// `kind.is_routable_image()` and a populated
+/// `image_data_base64` participate; the helper silently drops
+/// attachments missing the decoded payload (resumed legacy
+/// `UnsupportedImage` entries) so a stale persisted attachment never
+/// crashes the turn build.
+fn image_input_items_for_attachments(attachments: &[ContextAttachment]) -> Vec<LlmInputItem> {
+    use base64::Engine as _;
+    let mut items = Vec::new();
+    for attachment in attachments {
+        if !attachment.kind.is_routable_image() {
+            continue;
+        }
+        let (Some(media_type), Some(encoded)) = (
+            attachment.image_media_type.as_deref(),
+            attachment.image_data_base64.as_deref(),
+        ) else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()) else {
+            continue;
+        };
+        items.push(LlmInputItem::Image {
+            media_type: media_type.to_string(),
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        });
+    }
+    items
 }
 
 fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment]) -> String {

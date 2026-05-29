@@ -444,6 +444,8 @@ fn context_attachments_store_redacted_text_and_export_metadata() {
         redactions: 1,
         preview: "OPENAI_API_KEY=<redacted:openai_key#1 bytes=29>".to_string(),
         truncated: false,
+        image_media_type: None,
+        image_data_base64: None,
     };
 
     handle

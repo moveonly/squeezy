@@ -57,15 +57,47 @@ fn context_attachment_detection_handles_common_text_artifacts() {
 }
 
 #[test]
-fn context_attachment_detection_rejects_binary_and_images() {
+fn context_attachment_detection_routes_canonical_images_to_vision_kind() {
+    // PNG magic bytes round-trip into the routable `Image` kind so
+    // F18 paste/file attachments can fan into `LlmInputItem::Image`
+    // when the active model advertises vision.
     assert_eq!(
         detect_context_attachment_kind(Some("screenshot.png"), b"\x89PNG\r\n\x1a\nbytes", None),
+        ContextAttachmentKind::Image
+    );
+    let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+    assert_eq!(
+        detect_context_attachment_kind(Some("photo.jpg"), &jpeg, None),
+        ContextAttachmentKind::Image
+    );
+    // Label-only image-shape (e.g. `.heic`) with non-canonical body
+    // stays `UnsupportedImage` so we don't ship a non-vision payload
+    // to a provider that can't decode it.
+    assert_eq!(
+        detect_context_attachment_kind(Some("snapshot.heic"), b"not real heic bytes", None),
         ContextAttachmentKind::UnsupportedImage
     );
     assert_eq!(
         detect_context_attachment_kind(Some("blob.bin"), b"abc\0def", Some("abc\0def")),
         ContextAttachmentKind::UnsupportedBinary
     );
+}
+
+#[test]
+fn detect_image_mime_recognises_each_vision_format() {
+    assert_eq!(
+        detect_image_mime(b"\x89PNG\r\n\x1a\nrest"),
+        Some("image/png")
+    );
+    assert_eq!(detect_image_mime(b"\xff\xd8\xff\xe0"), Some("image/jpeg"));
+    assert_eq!(detect_image_mime(b"GIF87axxxx"), Some("image/gif"));
+    assert_eq!(detect_image_mime(b"GIF89axxxx"), Some("image/gif"));
+    let mut webp = Vec::new();
+    webp.extend_from_slice(b"RIFF");
+    webp.extend_from_slice(&[0, 0, 0, 0]);
+    webp.extend_from_slice(b"WEBPVP8 ");
+    assert_eq!(detect_image_mime(&webp), Some("image/webp"));
+    assert_eq!(detect_image_mime(b"plain text content"), None);
 }
 
 #[test]

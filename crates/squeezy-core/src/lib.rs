@@ -9340,7 +9340,18 @@ pub enum ContextAttachmentKind {
     Config,
     Text,
     UnsupportedBinary,
+    /// Image-shaped payload (label extension or non-canonical magic
+    /// bytes) that cannot be routed to a vision model — typically
+    /// HEIC/BMP/TIFF or a `.png` label whose body is empty/garbled.
+    /// The bytes are dropped and the attachment is marked
+    /// [`ContextAttachmentStatus::Unsupported`].
     UnsupportedImage,
+    /// Vision-routable image payload (PNG/JPEG/GIF/WEBP confirmed by
+    /// magic bytes). The raw bytes are retained on
+    /// [`ContextAttachment::image_data_base64`] so the agent can emit a
+    /// matching `LlmInputItem::Image` per turn when the active model
+    /// advertises vision capability.
+    Image,
 }
 
 impl ContextAttachmentKind {
@@ -9352,11 +9363,23 @@ impl ContextAttachmentKind {
             Self::Text => "text",
             Self::UnsupportedBinary => "unsupported_binary",
             Self::UnsupportedImage => "unsupported_image",
+            Self::Image => "image",
         }
     }
 
     pub fn is_supported_text(self) -> bool {
-        !matches!(self, Self::UnsupportedBinary | Self::UnsupportedImage)
+        !matches!(
+            self,
+            Self::UnsupportedBinary | Self::UnsupportedImage | Self::Image
+        )
+    }
+
+    /// `true` for the vision-routable [`Self::Image`] kind. Used at
+    /// request-build time to fan a single attachment out into a
+    /// `LlmInputItem::Image` so the bytes reach the provider verbatim
+    /// instead of being squashed into the user text reference block.
+    pub fn is_routable_image(self) -> bool {
+        matches!(self, Self::Image)
     }
 }
 
@@ -9394,6 +9417,19 @@ pub struct ContextAttachment {
     pub redactions: u64,
     pub preview: String,
     pub truncated: bool,
+    /// MIME type for vision-routable image attachments
+    /// (`image/{png,jpeg,gif,webp}`). `None` for text/log/binary kinds
+    /// and for label-only `UnsupportedImage` payloads whose magic
+    /// bytes did not match a canonical format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_media_type: Option<String>,
+    /// Base64-encoded original image bytes for vision-routable image
+    /// attachments. Stored alongside the JSON checkpoint so resume
+    /// rehydrates an `LlmInputItem::Image` without re-reading the
+    /// source. `None` outside the [`ContextAttachmentKind::Image`]
+    /// kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_data_base64: Option<String>,
 }
 
 impl ContextAttachment {
@@ -9411,6 +9447,15 @@ pub fn detect_context_attachment_kind(
     bytes: &[u8],
     text: Option<&str>,
 ) -> ContextAttachmentKind {
+    // Magic-byte-detected images route to the vision pipeline; the
+    // squeezy-llm providers re-encode the bytes inline for the
+    // provider's native wire format. Label-only "image-looking"
+    // payloads (extension matched but magic bytes didn't) stay
+    // `UnsupportedImage` so we don't ship garbled bytes to a model
+    // that can't decode them.
+    if detect_image_mime(bytes).is_some() {
+        return ContextAttachmentKind::Image;
+    }
     if looks_like_image(label, bytes) {
         return ContextAttachmentKind::UnsupportedImage;
     }
@@ -9430,6 +9475,35 @@ pub fn detect_context_attachment_kind(
         return ContextAttachmentKind::Config;
     }
     ContextAttachmentKind::Text
+}
+
+/// Detect the canonical image MIME type from a byte prefix using
+/// magic numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP
+/// (RIFF / WEBP container) — the set of formats the upstream vision
+/// providers (Anthropic / OpenAI / Google / Bedrock / Bedrock
+/// Claude) all accept for inline image content blocks. Returns
+/// `None` when the prefix does not match a known image format so the
+/// caller can fall back to label-only detection or to the
+/// `UnsupportedImage` path.
+///
+/// Mirrors [`squeezy_llm::infer_image_mime`] but lives in
+/// `squeezy-core` so the attachment detection layer (which is
+/// upstream of `squeezy-llm`) can short-circuit on magic bytes
+/// without depending on the LLM crate.
+pub fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 pub fn context_attachment_preview(text: &str, max_bytes: usize) -> (String, bool) {

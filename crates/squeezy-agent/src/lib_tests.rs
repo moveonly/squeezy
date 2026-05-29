@@ -712,10 +712,49 @@ async fn pasted_context_is_redacted_deduped_and_sent_as_reference() {
 }
 
 #[tokio::test]
-async fn unsupported_image_attachment_is_not_active() {
-    let root = temp_workspace("agent_context_image");
+async fn label_only_image_attachment_stays_unsupported() {
+    // `.heic` extension with non-canonical bytes is recognised as
+    // image-shaped by the label heuristic but its magic bytes never
+    // surface a vision-routable MIME, so the attachment stays
+    // `UnsupportedImage` and never reaches the next request.
+    let root = temp_workspace("agent_context_image_heic");
+    let image = root.join("snap.heic");
+    fs::write(&image, b"not real heic content").expect("write image");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let update = agent
+        .attach_file_context(PathBuf::from("snap.heic"))
+        .await
+        .expect("attach image");
+
+    assert!(!update.active);
+    assert_eq!(
+        update.attachment.kind,
+        ContextAttachmentKind::UnsupportedImage
+    );
+    assert!(update.attachment.image_data_base64.is_none());
+    assert!(agent.context_attachments_snapshot().await.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn png_file_attachment_routes_to_image_kind() {
+    // PNG magic bytes flip the detection from the legacy
+    // `UnsupportedImage` reject to the F18 `Image` kind so the file
+    // attachment becomes active and carries the bytes through to the
+    // next request.
+    let root = temp_workspace("agent_context_image_png");
     let image = root.join("screenshot.png");
-    fs::write(&image, b"\x89PNG\r\n\x1a\nimage bytes").expect("write image");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    bytes.extend_from_slice(b"trailing png payload");
+    fs::write(&image, &bytes).expect("write image");
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let config = AppConfig {
         workspace_root: root.clone(),
@@ -728,14 +767,118 @@ async fn unsupported_image_attachment_is_not_active() {
         .await
         .expect("attach image");
 
-    assert!(!update.active);
+    assert!(update.active);
+    assert_eq!(update.attachment.kind, ContextAttachmentKind::Image);
     assert_eq!(
-        update.attachment.kind,
-        ContextAttachmentKind::UnsupportedImage
+        update.attachment.image_media_type.as_deref(),
+        Some("image/png")
     );
-    assert!(agent.context_attachments_snapshot().await.is_empty());
+    assert!(update.attachment.image_data_base64.is_some());
+    let snapshot = agent.context_attachments_snapshot().await;
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].kind, ContextAttachmentKind::Image);
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn pasted_png_bytes_route_into_llm_image_input_item() {
+    // F18: bytes that arrive through the paste path (`attach_pasted_bytes`)
+    // and trip the PNG magic-byte sniff materialise as a
+    // `LlmInputItem::Image` on the next request — same wire shape the
+    // file-attached path produces, so every provider's multimodal
+    // encoder sees a single uniform input regardless of whether the
+    // image came from disk or the clipboard.
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(b"clipboard-png-payload");
+    let update = agent
+        .attach_pasted_bytes(png.clone())
+        .await
+        .expect("attach pasted png");
+    assert!(update.active);
+    assert_eq!(update.attachment.kind, ContextAttachmentKind::Image);
+    assert_eq!(
+        update.attachment.image_media_type.as_deref(),
+        Some("image/png")
+    );
+
+    let mut rx = agent.start_turn(
+        "describe the clipboard image".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    let input = &requests[0].input;
+    // The user text leads the request, the image rides immediately
+    // after — this is the order the per-provider encoders rely on to
+    // coalesce text + image into one multimodal user turn.
+    let LlmInputItem::UserText(text) = &input[0] else {
+        panic!("expected user text item, got {:?}", input[0]);
+    };
+    assert!(text.contains("describe the clipboard image"));
+    let image_item = input
+        .iter()
+        .find(|item| matches!(item, LlmInputItem::Image { .. }))
+        .expect("request must carry a LlmInputItem::Image for the pasted PNG");
+    let LlmInputItem::Image { media_type, bytes } = image_item else {
+        unreachable!("matched on Image above");
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(bytes.as_ref(), png.as_slice());
+}
+
+#[tokio::test]
+async fn non_vision_model_rejects_pasted_image_with_clear_error() {
+    // The provider boundary owns the vision gate: `ensure_vision_support`
+    // runs as the first step of every provider's `stream_response`. We
+    // build the same request shape `start_turn` would emit for a
+    // pasted PNG and call the gate against a text-only provider/model
+    // pair (deepseek-chat is registered as `vision: false`) to lock in
+    // the rejection contract end-to-end — the agent's request fans
+    // image bytes through, and a text-only model surfaces the
+    // structured `ProviderRequest` error before any HTTP traffic.
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(b"clipboard-png-payload");
+    agent
+        .attach_pasted_bytes(png)
+        .await
+        .expect("attach pasted png");
+
+    let mut rx = agent.start_turn("describe it".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().into_iter().next().expect("one request");
+    let err = request
+        .ensure_vision_support("deepseek")
+        .expect_err("non-vision model must reject image inputs");
+    let message = err.to_string();
+    assert!(
+        message.contains("does not support image inputs"),
+        "error must explain the rejection: got {message}"
+    );
+    assert!(
+        message.contains("pick a vision-capable model"),
+        "error must guide the user to a vision model: got {message}"
+    );
 }
 
 #[tokio::test]
