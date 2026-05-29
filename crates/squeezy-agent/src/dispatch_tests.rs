@@ -21,14 +21,26 @@ fn parse_help_with_and_without_topic() {
 #[test]
 fn parse_config_section_arg() {
     assert_eq!(
-        parse("/config").unwrap(),
+        parse("/options").unwrap(),
         DispatchCommand::Config { section: None }
     );
     assert_eq!(
-        parse("/config models").unwrap(),
+        parse("/options models").unwrap(),
         DispatchCommand::Config {
             section: Some("models".to_string())
         }
+    );
+    assert_eq!(
+        parse("/config permissions").unwrap(),
+        DispatchCommand::Config {
+            section: Some("permissions".to_string())
+        },
+        "/config remains a hidden compatibility alias for /options"
+    );
+    assert_eq!(
+        parse("/config").unwrap().slash_name(),
+        "/options",
+        "/options is the canonical command surfaced to users"
     );
 }
 

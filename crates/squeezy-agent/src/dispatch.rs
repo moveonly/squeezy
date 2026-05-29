@@ -174,7 +174,7 @@ impl DispatchCommand {
     pub fn slash_name(&self) -> &'static str {
         match self {
             Self::Help { .. } => "/help",
-            Self::Config { .. } => "/config",
+            Self::Config { .. } => "/options",
             Self::Model => "/model",
             Self::Permissions => "/permissions",
             Self::Plan { .. } => "/plan",
@@ -248,7 +248,7 @@ impl DispatchCommand {
             "/help" => Self::Help {
                 topic: none_if_empty(rest),
             },
-            "/config" => Self::Config {
+            "/config" | "/options" => Self::Config {
                 section: none_if_empty(rest),
             },
             "/model" => Self::Model,

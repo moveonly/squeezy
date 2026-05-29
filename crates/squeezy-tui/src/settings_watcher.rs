@@ -1,5 +1,5 @@
 //! Lightweight mtime-poll watcher for the three settings.toml tiers (user,
-//! project, local). The TUI's `/config` save path already calls
+//! project, local). The TUI's `/options` save path already calls
 //! `reload_sources_and_agent` when the user edits settings from inside the
 //! app; this watcher closes the gap for *external* edits (sed, $EDITOR, a
 //! separate Squeezy process, …) so a running session doesn't need a restart
