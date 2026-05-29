@@ -626,6 +626,25 @@ text = "Render a compact UX report with paths and exact_syntax labels."
     .unwrap()
 }
 
+fn scenario_with_scripted_shell_denial() -> Scenario {
+    toml::from_str(
+        r#"
+id = "deny"
+title = "deny"
+
+[workspace]
+local = "/tmp/repo"
+
+[[steps]]
+kind = "action"
+action = "deny"
+match = { tool = "shell" }
+reason = "expected denial"
+"#,
+    )
+    .unwrap()
+}
+
 #[test]
 fn ungrounded_citation_quiet_for_synthetic_render_sample() {
     let events = vec![
@@ -960,6 +979,29 @@ fn denied_tool_call_ux_flags_denied_tool_completion() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].rule_id, "denied_tool_call_ux");
     assert!(out[0].summary.contains("denial reason"));
+}
+
+#[test]
+fn denied_tool_call_ux_quiet_when_scenario_scripts_denial() {
+    let events = vec![EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: 8,
+        turn_id: Some("T(2)".into()),
+        kind: EvalEventKind::ToolCallCompleted {
+            result: serde_json::json!({
+                "tool_name": "shell",
+                "status": "Denied",
+                "error": "denied by scenario"
+            }),
+        },
+    }];
+    let ctx = ctx_from_events(events);
+    assert!(
+        DeniedToolCallUx
+            .check(&ctx, &scenario_with_scripted_shell_denial())
+            .is_empty()
+    );
 }
 
 fn assistant_delta(seq: u64, turn: &str, text: &str) -> EvalEvent {

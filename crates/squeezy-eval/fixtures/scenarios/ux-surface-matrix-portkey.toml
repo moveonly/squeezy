@@ -1,0 +1,67 @@
+id = "ux-surface-matrix-portkey"
+title = "Live UX surface matrix on Portkey Qwen"
+description = """
+Live cross-model fixture for broad UX/UI inspection across non-happy-path
+surfaces. Uses Portkey's OpenRouter Qwen route to ensure render and eval
+improvements are not tailored to the mock provider or one vendor transcript.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+reasoning_effort = "low"
+tool_choice = "required"
+mode = "plan"
+permission_mode = "ask"
+max_output_tokens = 4096
+instructions = "Keep fixture answers compact. For render-only prompts, output only the requested sample and keep it under 14 lines."
+
+[tui_capture]
+enabled = true
+width = 52
+height = 18
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "respond_user_input"
+decision = { action = "freeform", text = "Use a compact table, but keep path and confidence labels readable." }
+
+[[steps]]
+kind = "prompt"
+text = "Ask one UX clarifying question before rendering a compact report. Do not inspect files."
+
+[[steps]]
+kind = "action"
+action = "switch_mode"
+mode = "build"
+
+[[steps]]
+kind = "action"
+action = "deny"
+match = { tool = "shell" }
+reason = "fixture denies shell so approval UI can be inspected"
+
+[[steps]]
+kind = "prompt"
+text = "Try a harmless shell command that would need approval, then summarize the denied UX in no more than 8 lines."
+
+[[steps]]
+kind = "prompt"
+text = "Render a compact mixed markdown UX report with paths, URLs, labels, bullets, and code. Do not inspect files. Keep the report under 12 lines."
+
+[[steps]]
+kind = "prompt"
+text = "Render status-line density examples for long model names, branch names, tokens, session ids, and cost. Do not inspect files. Return exactly 6 short lines."
+
+[expect]
+max_wall_clock_seconds = 240
+max_tools_per_turn = 3
+no_tool_errors = false
+finish_reason_not = ["max_tokens"]
+
+[triage]
+enabled = false

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::{EvalEvent, EvalEventKind};
 use crate::driver::EvalError;
-use crate::scenario::Scenario;
+use crate::scenario::{Action, Scenario, Step};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1633,7 +1633,7 @@ impl Rule for DeniedToolCallUx {
     fn rule_id(&self) -> &'static str {
         "denied_tool_call_ux"
     }
-    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+    fn check(&self, ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
         let mut out = Vec::new();
         for event in &ctx.events {
             let EvalEventKind::ToolCallCompleted { result } = &event.kind else {
@@ -1651,6 +1651,9 @@ impl Rule for DeniedToolCallUx {
                 .or_else(|| result.get("name"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("tool");
+            if scenario_scripts_denial_for_tool(scenario, tool) {
+                continue;
+            }
             out.push(Finding {
                 rule_id: "denied_tool_call_ux".into(),
                 severity: Severity::Minor,
@@ -1667,6 +1670,18 @@ impl Rule for DeniedToolCallUx {
         }
         out
     }
+}
+
+fn scenario_scripts_denial_for_tool(scenario: &Scenario, tool: &str) -> bool {
+    scenario.steps.iter().any(|step| {
+        let Step::Action(Action::Deny { r#match, .. }) = step else {
+            return false;
+        };
+        r#match
+            .as_ref()
+            .and_then(|matcher| matcher.tool.as_deref())
+            .map_or(true, |expected| expected == tool)
+    })
 }
 
 // ---------- Phase 4 rules ----------

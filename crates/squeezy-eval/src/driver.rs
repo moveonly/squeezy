@@ -10,7 +10,7 @@ use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolOrigin};
-use squeezy_core::{AppConfig, PermissionMode, SessionMode};
+use squeezy_core::{AppConfig, PermissionMode, ReasoningEffort, SessionMode};
 use squeezy_llm::provider_from_config;
 
 use crate::capture::{Capture, EvalEventKind};
@@ -417,6 +417,22 @@ fn apply_overlay(
     config.workspace_root = workspace_root.to_path_buf();
     if let Some(model) = &overlay.model {
         config.model = model.clone();
+    }
+    if let Some(reasoning) = &overlay.reasoning_effort {
+        config.reasoning_effort = Some(ReasoningEffort::parse(reasoning).ok_or_else(|| {
+            EvalError::Config(format!("unknown reasoning_effort in overlay: {reasoning}"))
+        })?);
+    }
+    if let Some(choice) = &overlay.tool_choice {
+        let normalized = choice.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "auto" | "required" | "none" => config.tool_choice = Some(normalized),
+            other => {
+                return Err(EvalError::Config(format!(
+                    "unknown tool_choice in overlay: {other}"
+                )));
+            }
+        }
     }
     if let Some(instructions) = &overlay.instructions {
         config.instructions = instructions.clone();

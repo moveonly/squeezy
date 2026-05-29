@@ -1950,7 +1950,7 @@ fn save_status_line(
 
 /// Whether the transcript should show a styled banner for this slash
 /// command's invocation. Commands that open their own UI overlay
-/// (`/config`, `/statusline`, …) are silenced — the overlay is the
+/// (`/options`, `/statusline`, …) are silenced — the overlay is the
 /// affordance. Commands that route through `start_user_turn` and
 /// already produce a user-message bubble (`/help`) are also silenced
 /// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
@@ -1962,7 +1962,7 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
+        "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
         | "/expand" | "/help" => false,
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
@@ -3182,7 +3182,7 @@ fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
 /// next turn picks it up via `request_reasoning_effort`. `auto` (or `clear`,
 /// `unset`, `none`) drops the override and falls back to the model default. The
 /// command is session-scoped — to persist across runs, edit `model.reasoning_effort`
-/// via `/config`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
+/// via `/options`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
 /// surface that fact when set.
 fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
@@ -10227,7 +10227,7 @@ pub(crate) struct TuiApp {
     pub(crate) show_reasoning_usage: bool,
     /// Render-time grouping of adjacent same-tool same-status calls into
     /// one card. Mirrors `config.tui.coalesce_tool_runs` at startup;
-    /// flipped at runtime via `/config coalesce_tool_runs = …`. Default
+    /// flipped at runtime via `/options coalesce_tool_runs = …`. Default
     /// `true`. Independent of the push-time retry coalescer
     /// ([`coalesce_tool_transcript_entry`]).
     pub(crate) coalesce_tool_runs: bool,

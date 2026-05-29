@@ -1,4 +1,4 @@
-//! Full-page configuration UI invoked via `/config` or F11.
+//! Full-page options UI invoked via `/options` or F11.
 //!
 //! Layout: two scope tabs (User / Project) on top, a section sidebar on the
 //! left, a field editor on the right, and a footer hint row at the bottom.

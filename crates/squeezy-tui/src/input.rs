@@ -115,8 +115,8 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         &[PermissionCapability::Network],
     ),
     slash_args_caps(
-        "/config",
-        "open the config screen (or pass a section name)",
+        "/options",
+        "open options (or pass a section name)",
         true,
         "[section]",
         &[PermissionCapability::Edit],

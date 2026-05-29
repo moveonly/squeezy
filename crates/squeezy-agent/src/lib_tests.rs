@@ -7395,7 +7395,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
         (DispatchCommand::Keymap, "keymap"),
         (DispatchCommand::Statusline, "statusline"),
         (DispatchCommand::Help { topic: None }, "help"),
-        (DispatchCommand::Config { section: None }, "config"),
+        (DispatchCommand::Config { section: None }, "options"),
         (DispatchCommand::Model, "model"),
         (
             DispatchCommand::Plans {

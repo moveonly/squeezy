@@ -7,6 +7,10 @@ fn match_slash_command_prefix_returns_command_length() {
         match_slash_command_prefix("/help changing the model"),
         Some(5)
     );
+    assert_eq!(
+        match_slash_command_prefix("/options permissions"),
+        Some("/options".len())
+    );
 }
 
 #[test]
@@ -28,7 +32,7 @@ fn match_slash_command_prefix_prefers_longest_match() {
 fn match_slash_command_prefix_requires_word_boundary() {
     // `/helpme` is not `/help`.
     assert_eq!(match_slash_command_prefix("/helpme"), None);
-    // `/config-foo` is not `/config`.
+    // `/config` is a hidden compatibility alias, not a surfaced completion.
     assert_eq!(match_slash_command_prefix("/config-foo"), None);
 }
 
@@ -75,6 +79,10 @@ fn slash_commands_declare_expected_capabilities() {
         &[PermissionCapability::Git, PermissionCapability::Read]
     );
     assert_eq!(
+        find_command("/options").capabilities,
+        &[PermissionCapability::Edit]
+    );
+    assert_eq!(
         find_command("/model").capabilities,
         &[PermissionCapability::Edit]
     );
@@ -99,6 +107,18 @@ fn slash_commands_declare_expected_capabilities() {
             PermissionCapability::Edit,
             PermissionCapability::Destructive
         ]
+    );
+}
+
+#[test]
+fn options_is_surfaced_without_config_duplicate() {
+    assert!(
+        SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/options"),
+        "expected /options to be the visible settings command"
+    );
+    assert!(
+        !SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/config"),
+        "/config is a legacy parser alias and should not duplicate /options in the menu"
     );
 }
 
@@ -191,24 +211,23 @@ fn slash_suggestions_match_substring_not_just_prefix() {
 #[test]
 fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
     // `/co` should list prefix matches (`/cost`, `/copy`, `/collapse`,
-    // `/compact`, `/config`, `/context`) before subsequence-only hits.
+    // `/compact`, `/context`) before subsequence-only hits. `/config` is a
+    // hidden compatibility alias for `/options`, so it must not duplicate the
+    // visible settings command in the menu.
     let names = slash_suggestions("/co")
         .into_iter()
         .map(|cmd| cmd.name)
         .collect::<Vec<_>>();
-    let first_six: Vec<&str> = names.iter().take(6).copied().collect();
-    let mut expected = vec![
-        "/collapse",
-        "/compact",
-        "/config",
-        "/context",
-        "/copy",
-        "/cost",
-    ];
+    let first_five: Vec<&str> = names.iter().take(5).copied().collect();
+    let mut expected = vec!["/collapse", "/compact", "/context", "/copy", "/cost"];
     expected.sort();
-    let mut got = first_six.clone();
+    let mut got = first_five.clone();
     got.sort();
-    assert_eq!(got, expected, "first six should be /co* prefix hits");
+    assert_eq!(got, expected, "first five should be /co* prefix hits");
+    assert!(
+        !names.contains(&"/config"),
+        "/config should not be suggested alongside /options"
+    );
 }
 
 #[test]

@@ -205,6 +205,8 @@ Pinned knobs for the resolved `AppConfig`. All fields optional:
 [squeezy]
 provider = "openai"               # or "anthropic" | "google" | "azure_openai" | "bedrock" | "ollama" | "mock"
 model = "gpt-5.4-mini"
+reasoning_effort = "low"          # optional: low | medium | high | xhigh
+tool_choice = "required"          # optional: auto | required | none
 mode = "build"                    # "plan" | "build"
 permission_mode = "ask"           # "allow" | "ask" | "deny"; applied to edit/shell/web/mcp
 instructions = "..."              # optional system instructions override

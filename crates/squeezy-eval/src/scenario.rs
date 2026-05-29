@@ -103,6 +103,8 @@ pub struct GithubWorkspace {
 pub struct SqueezyOverlay {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub tool_choice: Option<String>,
     pub mode: Option<String>,
     pub permission_mode: Option<String>,
     pub instructions: Option<String>,

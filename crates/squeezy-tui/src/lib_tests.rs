@@ -1509,7 +1509,22 @@ async fn slash_plan_with_trailing_space_still_switches_mode() {
 }
 
 #[tokio::test]
-async fn slash_config_opens_screen() {
+async fn slash_options_opens_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/options".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some(), "config screen should be open");
+}
+
+#[tokio::test]
+async fn slash_config_legacy_alias_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/config".to_string());
@@ -1739,7 +1754,7 @@ async fn slash_model_opens_config_at_models_section() {
 async fn slash_config_with_section_argument_focuses_section() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/config permissions".to_string());
+    set_input(&mut app, "/options permissions".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -7698,7 +7713,7 @@ fn sample_attachment(id: &str) -> ContextAttachment {
 // ---- /verbosity inline back-compat ----
 //
 // `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
-// `/config` screen focused on the matching section; the original overlay
+// `/options` screen focused on the matching section; the original overlay
 // flow was replaced by the full editor. Section-routing coverage lives in
 // `slash_model_opens_config_at_models_section` and friends below.
 
