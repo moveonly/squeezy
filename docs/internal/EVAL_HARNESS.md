@@ -242,8 +242,8 @@ wait_for = "turn_completed"      # default; see below
 | `wait_for` | Meaning |
 |---|---|
 | `"turn_completed"` (default) | wait for `AgentEvent::Completed`/`Failed`/`Cancelled` |
-| `{ kind = "tool_call", tool = "grep" }` | record a signal event when this tool fires; do **not** cancel the turn; concurrent dispatch lives on `when.on_tool` actions |
-| `{ kind = "text_contains", text = "compiles" }` | cancel the turn the moment that substring appears in the assistant stream |
+| `{ tool_call = { tool = "grep" } }` | record a signal event when this tool fires; do **not** cancel the turn; concurrent dispatch lives on `when.on_tool` actions |
+| `{ text_contains = { text = "compiles" } }` | cancel the turn the moment that substring appears in the assistant stream |
 
 #### `action` step
 
