@@ -1338,8 +1338,8 @@ compat_user_dir = "/tmp/agent-skills"
 fn squeezy_help_refuses_unsupported_self_questions_with_public_pointers() {
     let help = SqueezyHelp::new("");
     let answer = help
-        .answer_for_input("Does Squeezy support quantum billing?")
-        .expect("squeezy self question should be handled");
+        .answer_for_input("/help quantum_billing")
+        .expect("explicit /help command should always produce an answer");
 
     assert_eq!(answer.status, HelpStatus::Unsupported);
     let rendered = answer.render_markdown();
@@ -1351,6 +1351,22 @@ fn squeezy_help_refuses_unsupported_self_questions_with_public_pointers() {
     assert!(
         rendered.contains("https://github.com/esqueezy/squeezy"),
         "{rendered}"
+    );
+}
+
+#[test]
+fn squeezy_help_falls_through_when_no_curated_topic_matches() {
+    let help = SqueezyHelp::new("");
+    // A natural-language Squeezy-self question that no curated topic answers
+    // must fall through to the model loop, not produce an `Unsupported` dump.
+    assert!(
+        help.answer_for_input("Does Squeezy support quantum billing?")
+            .is_none(),
+        "natural-language prompts without a curated topic must reach the model"
+    );
+    assert!(
+        !help::matches_squeezy_help_input("Does Squeezy support quantum billing?"),
+        "matches_squeezy_help_input must agree"
     );
 }
 
@@ -1398,8 +1414,8 @@ fn matches_squeezy_help_input_agrees_with_answer_for_input() {
     let positives = [
         "/help",
         "/help providers",
+        "/help quantum_billing",
         "How do I configure Squeezy providers?",
-        "Does Squeezy support quantum billing?",
     ];
     for input in positives {
         assert!(
@@ -1411,7 +1427,13 @@ fn matches_squeezy_help_input_agrees_with_answer_for_input() {
             "answer_for_input should accept: {input}"
         );
     }
-    let negatives = ["How do I configure serde?", "build a new tool"];
+    let negatives = [
+        "How do I configure serde?",
+        "build a new tool",
+        // Natural-language Squeezy question that no curated topic answers must
+        // fall through to the model, not produce a canned `Unsupported` dump.
+        "Does Squeezy support quantum billing?",
+    ];
     for input in negatives {
         assert!(
             !help::matches_squeezy_help_input(input),
@@ -1475,6 +1497,55 @@ fn squeezy_help_routes_agent_approach_and_tool_questions() {
     assert!(tools.citations.contains(&HelpCitation::DocsPath(
         "docs/external/TOOLS.md".to_string()
     )));
+}
+
+#[test]
+fn squeezy_help_routes_cancel_questions_to_cancel_topic() {
+    let help = SqueezyHelp::new("");
+
+    let cancel_turn = help
+        .answer_for_input("how do I cancel a squeezy turn?")
+        .expect("cancel turn answer");
+    assert_eq!(cancel_turn.status, HelpStatus::Answered);
+    assert_eq!(cancel_turn.topic, "cancel");
+    let body = cancel_turn.render_markdown();
+    assert!(body.contains("Esc"), "cancel topic must name Esc: {body}");
+    assert!(
+        body.contains("Ctrl+C") || body.contains("Ctrl-C"),
+        "cancel topic must name Ctrl+C: {body}"
+    );
+
+    // The canonical eval prompt that previously hijacked into the agent
+    // topic must now route to the cancel topic.
+    let in_flight = help
+        .answer_for_input(
+            "How do I cancel an in-flight model response in squeezy? \
+             Answer in one short sentence — name the key or command a user would press.",
+        )
+        .expect("in-flight cancel answer");
+    assert_eq!(in_flight.topic, "cancel");
+}
+
+#[test]
+fn squeezy_help_falls_through_for_wild_squeezy_questions() {
+    let help = SqueezyHelp::new("");
+    // Wild "how do I ... squeezy?" questions that no curated topic answers
+    // must return None so the model loop handles them, instead of dumping
+    // a generic topic + redacted config block.
+    let wild = [
+        "How do I make squeezy whistle?",
+        "How do I teach squeezy to bake bread?",
+    ];
+    for input in wild {
+        assert!(
+            help.answer_for_input(input).is_none(),
+            "wild squeezy prompt must reach the model: {input}"
+        );
+        assert!(
+            !help::matches_squeezy_help_input(input),
+            "matches_squeezy_help_input must agree: {input}"
+        );
+    }
 }
 
 #[test]

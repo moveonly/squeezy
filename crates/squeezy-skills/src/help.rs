@@ -109,9 +109,11 @@ impl SqueezyHelp {
         if !looks_like_squeezy_help_question(trimmed) {
             return None;
         }
-        let Some(topic) = best_topic_for_text(trimmed) else {
-            return Some(self.unsupported(trimmed));
-        };
+        // Only intercept when the prompt directly matches a curated topic via
+        // word-boundary alias or id hits. If `best_topic_for_text` cannot find
+        // a real match, let the prompt fall through to the model loop instead
+        // of dumping a generic "agent" topic + redacted config block.
+        let topic = best_topic_for_text(trimmed)?;
         Some(self.answer_definition(topic))
     }
 
@@ -192,6 +194,39 @@ struct ConfigSection {
 }
 
 const TOPICS: &[TopicDefinition] = &[
+    TopicDefinition {
+        id: "cancel",
+        title: "cancel or interrupt an in-flight Squeezy turn",
+        aliases: &[
+            "cancel",
+            "cancel turn",
+            "cancel a turn",
+            "cancel the turn",
+            "interrupt",
+            "interrupt turn",
+            "interrupt a turn",
+            "stop turn",
+            "stop a turn",
+            "abort",
+            "abort turn",
+            "kill turn",
+            "halt",
+            "esc",
+            "esc key",
+            "ctrl c",
+            "ctrl+c",
+            "keyboard shortcut",
+            "key binding",
+            "key bindings",
+            "footer hint",
+        ],
+        summary: "Press Esc or Ctrl+C while a Squeezy turn is in flight to cancel it; the same keys also cancel a pending tool approval. The composer footer shows `Ctrl-C/Esc interrupt` while a turn is running, and the request routes through `request_turn_interrupt` in the TUI event loop. There is no `/cancel` or `/stop` slash command today — the cancel surface is keyboard-only.",
+        docs: &[
+            "docs/external/AGENT_APPROACH.md",
+            "docs/external/TROUBLESHOOTING.md",
+        ],
+        config: &["tui"],
+    },
     TopicDefinition {
         id: "agent",
         title: "agent approach, modes, tools, and local-first workflow",
@@ -692,17 +727,30 @@ fn find_topic(input: &str) -> Option<&'static TopicDefinition> {
 }
 
 fn best_topic_for_text(input: &str) -> Option<&'static TopicDefinition> {
+    // Match aliases at word boundaries against the normalized prompt so a short
+    // alias like `mode` does not score on `model` and `agent` does not score on
+    // every sentence that contains a word with that substring. Substring
+    // matching is what caused the help intercept to hijack questions like
+    // "how do I cancel an in-flight model response in squeezy?" with the
+    // generic agent topic dump.
     let normalized = normalize(input);
+    let tokens: Vec<String> = normalized
+        .split_whitespace()
+        .map(|tok| clean_token(tok).to_string())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    let token_slices: Vec<&str> = tokens.iter().map(String::as_str).collect();
     let mut best = None;
     let mut best_score = 0;
     for topic in TOPICS {
         let mut score = 0;
-        if normalized.contains(topic.id) {
+        if contains_word_sequence(&token_slices, topic.id) {
             score += 3;
         }
         for alias in topic.aliases {
-            if normalized.contains(&normalize(alias)) {
-                score += alias.split_whitespace().count().max(1);
+            let alias_norm = normalize(alias);
+            if contains_word_sequence(&token_slices, &alias_norm) {
+                score += alias_norm.split_whitespace().count().max(1);
             }
         }
         if score > best_score {
@@ -711,6 +759,30 @@ fn best_topic_for_text(input: &str) -> Option<&'static TopicDefinition> {
         }
     }
     best
+}
+
+// Strips trailing/leading sentence punctuation from a token so word-boundary
+// matching ignores the `?` on `squeezy?` and the `.` on `press.`. The slash is
+// preserved so slash-command aliases like `/plan` still match.
+fn clean_token(tok: &str) -> &str {
+    tok.trim_matches(|c: char| {
+        matches!(
+            c,
+            '?' | '!' | '.' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '"' | '\'' | '`' | '—'
+        )
+    })
+}
+
+// Returns true when `needle` (already normalized) appears as a contiguous run
+// of whole tokens inside `haystack_tokens`. Empty needles never match.
+fn contains_word_sequence(haystack_tokens: &[&str], needle: &str) -> bool {
+    let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
+    if needle_tokens.is_empty() || needle_tokens.len() > haystack_tokens.len() {
+        return false;
+    }
+    haystack_tokens
+        .windows(needle_tokens.len())
+        .any(|window| window == needle_tokens.as_slice())
 }
 
 fn extract_config_sections(config_inspect: &str, wanted: &[&str]) -> Vec<ConfigSection> {
@@ -828,5 +900,8 @@ pub const APPROVAL_POLICY_DOC_PATH: &str = "docs/external/APPROVAL_POLICY.md";
 /// not apply.
 pub fn matches_squeezy_help_input(input: &str) -> bool {
     let trimmed = input.trim();
-    parse_help_command(trimmed).is_some() || looks_like_squeezy_help_question(trimmed)
+    if parse_help_command(trimmed).is_some() {
+        return true;
+    }
+    looks_like_squeezy_help_question(trimmed) && best_topic_for_text(trimmed).is_some()
 }

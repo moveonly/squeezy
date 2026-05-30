@@ -2423,8 +2423,12 @@ async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
+    // Use an explicit `/help <unknown-topic>` so the help interceptor takes the
+    // turn (it always does for slash-commands) and the curated layer returns
+    // `Unsupported`. The natural-language form is now intentionally routed to
+    // the model when no curated topic matches.
     let mut rx = agent.start_turn(
-        "Does Squeezy support quantum billing?".to_string(),
+        "/help quantum_billing".to_string(),
         CancellationToken::new(),
     );
     let mut completed = None;
