@@ -1,6 +1,6 @@
 package example.app
 
-import example.util.Names.*
+import example.util.*
 import example.services.{Greeter, FriendlyGreeter}
 import example.ext.*
 

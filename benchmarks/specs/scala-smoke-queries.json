@@ -79,7 +79,7 @@
       "text": "given",
       "symbol_kind": "Const",
       "expected_contains": [
-        "Const:"
+        "Const:intOrd"
       ]
     },
     {

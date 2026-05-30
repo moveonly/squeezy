@@ -1,6 +1,6 @@
 package example.services
 
-sealed trait Greeter {
+trait Greeter {
   def greet(name: String): String
 }
 

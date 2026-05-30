@@ -82,10 +82,13 @@ fn visit_scala_node(
     }
 
     // Multi-binding val/var: `val a, b: Int = ...` declares N symbols on one node.
+    // Skip when the enclosing scope is a function body — SemanticDB classifies
+    // those bindings as LOCAL and the comparison drops them.
     if matches!(
         node.kind(),
         "val_declaration" | "var_declaration" | "val_definition" | "var_definition"
-    ) {
+    ) && !parent_is_callable(parent_symbol.as_ref())
+    {
         let symbols = scala_multi_binding_symbols(node, ctx, parent_symbol.as_ref(), inside_inline);
         if symbols.len() > 1 {
             for symbol in symbols {
@@ -212,6 +215,21 @@ fn scala_symbol_from_node(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
 ) -> Option<ParsedSymbol> {
     let node_kind = node.kind();
+    // Bindings inside a method/function body are locals; they do not appear in
+    // SemanticDB's declaration set and squeezy must not emit them as Const /
+    // Field. Suppress for val/var/given/nested-def — the surrounding block is
+    // still traversed for call / reference extraction.
+    if matches!(
+        node_kind,
+        "val_definition"
+            | "var_definition"
+            | "given_definition"
+            | "function_definition"
+            | "function_declaration"
+    ) && parent_is_callable(parent_symbol)
+    {
+        return None;
+    }
     let (kind, is_case_class) = match node_kind {
         "class_definition" => {
             if scala_modifier_present(node, ctx.source, "case") {
@@ -355,6 +373,17 @@ fn parent_kind_is_container(parent_symbol: Option<&(SymbolId, SymbolKind)>) -> b
                 | SymbolKind::Enum
                 | SymbolKind::Module
         )
+    )
+}
+
+/// Returns true when the immediate enclosing symbol is a function or method
+/// (i.e. we are inside a callable body). Used to suppress local val / var /
+/// given / nested-def emissions that SemanticDB classifies as LOCAL and the
+/// declaration-set comparison therefore must ignore.
+fn parent_is_callable(parent_symbol: Option<&(SymbolId, SymbolKind)>) -> bool {
+    matches!(
+        parent_symbol.map(|(_, kind)| *kind),
+        Some(SymbolKind::Function | SymbolKind::Method)
     )
 }
 
@@ -1189,6 +1218,20 @@ fn extract_scala_field_reference(
     if receiver.is_empty() {
         return;
     }
+    // Emit an additional bare-name reference for the selector so
+    // `reference_search("Alice")` against `Names.Alice` resolves the leaf
+    // identifier. Without this the lookup only matches the qualified text
+    // `Names.Alice` and bench queries against the enum case (or any short
+    // member name) miss.
+    let field_span = span_from_node(field_node);
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: name.clone(),
+        kind: ReferenceKind::Identifier,
+        span: field_span,
+        provenance: Provenance::new("tree-sitter-scala", "field_expression selector"),
+    });
     // Skip the `Package.Type` style references that aren't calls. Heuristic:
     // if the receiver is an UpperCamelCase identifier path AND the field is
     // also UpperCamelCase, it's a nested type/access. We still emit the call
