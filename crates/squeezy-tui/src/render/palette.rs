@@ -49,9 +49,9 @@ pub(crate) const ACCENT_MAGENTA: Color = Color::Rgb(158, 64, 158);
 pub(crate) const INLINE_CODE_FG: Color = Color::Rgb(96, 158, 158);
 
 /// Inline-code foreground for the `model` / `@` branch. Dark rosy
-/// magenta — distinct from `Color::Magenta` (branch/path) below it and
-/// well clear of the bright `Color::LightMagenta` it replaces;
-/// luminance ~137 keeps the dark-only guardrail.
+/// magenta — distinct from `PATH_HINT` (branch/path) above and well
+/// clear of the bright `Color::LightMagenta` it replaces; luminance
+/// ~137 keeps the dark-only guardrail.
 pub(crate) const INLINE_MODEL_FG: Color = Color::Rgb(176, 110, 176);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

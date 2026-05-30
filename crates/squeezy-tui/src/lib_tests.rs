@@ -888,7 +888,7 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
     assert!(rendered.contains("[c] Execute (clean)"));
     assert!(rendered.contains("[r] Refine"));
     assert!(rendered.contains("[d] Discard"));
-    assert!(rendered.contains("[v] View"));
+    assert!(!rendered.contains("[v] View"));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1150,50 +1150,6 @@ async fn plan_choice_discard_deletes_file_and_clears_handoff() {
     assert!(app.pending_plan_choice.is_none());
     assert!(app.current_plan_id.is_none());
     assert!(app.pending_plan_handoff.is_none());
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_view_keeps_prompt_open_and_logs_path() {
-    let root = temp_workspace("plan_choice_view");
-    let plans_dir = root
-        .join(proposed_plan::PLAN_DIR)
-        .join(proposed_plan::FALLBACK_SESSION_ID);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
-    let plan_id = "plan-view0001".to_string();
-    let plan_path = plans_dir.join(format!("{plan_id}.md"));
-    fs::write(&plan_path, "step\n").expect("write plan");
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: plan_id.clone(),
-        plan_path: plan_path.clone(),
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-
-    assert!(plan_path.exists(), "view must not delete the plan file");
-    assert!(
-        app.pending_plan_choice.is_some(),
-        "View keeps the prompt open"
-    );
-    assert!(
-        app.transcript.iter().any(|entry| matches!(
-            &entry.kind,
-            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains(&plan_id)
-        )),
-        "expected a 'plan {plan_id} file:' log entry"
-    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -3604,7 +3560,7 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
         "{output}"
     );
     assert!(
-        output.contains("✔ Explored read src/lib.rs · 128B · more available"),
+        output.contains("✔ Explored read src/lib.rs · 128B · partial result"),
         "{output}"
     );
     assert!(!output.contains("plan patch"), "{output}");

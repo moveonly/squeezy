@@ -6501,6 +6501,28 @@ impl ToolOutputVerbosity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ShellDiffInline {
+    /// Render unified-diff output from shell commands in full, bypassing the
+    /// collapsed-card head/tail preview cap. Default — a `git diff` card is
+    /// only useful when every hunk is visible.
+    Full,
+    /// Keep shell-produced diffs on the same head/tail preview budget as
+    /// other shell output. For users who run `git diff` against large files
+    /// often enough that uncapped inline diffs overwhelm the transcript.
+    Folded,
+}
+
+impl ShellDiffInline {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Folded => "folded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptDefault {
     Compact,
     Expanded,
@@ -6690,6 +6712,9 @@ pub struct TuiConfig {
     /// slugs and unparseable specs are surfaced by the TUI when
     /// `/keymap` is invoked.
     pub keymap: BTreeMap<String, String>,
+    /// Whether `git diff`-style output from shell tools renders in full
+    /// (default) or stays under the collapsed-card head/tail preview cap.
+    pub shell_diff_inline: ShellDiffInline,
 }
 
 impl TuiConfig {
@@ -6724,6 +6749,7 @@ impl TuiConfig {
                 .unwrap_or(NotificationMethod::Off),
             persist_prompt_history: settings.persist_prompt_history.unwrap_or(false),
             keymap: settings.keymap.unwrap_or_default(),
+            shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Full),
         }
     }
 }
@@ -6751,6 +6777,7 @@ pub struct TuiSettings {
     pub desktop_notifications: Option<NotificationMethod>,
     pub persist_prompt_history: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
+    pub shell_diff_inline: Option<ShellDiffInline>,
 }
 
 impl TuiSettings {
@@ -6773,6 +6800,7 @@ impl TuiSettings {
                 "desktop_notifications",
                 "persist_prompt_history",
                 "keymap",
+                "shell_diff_inline",
             ],
             source,
             path,
@@ -6853,6 +6881,12 @@ impl TuiSettings {
                 &field(path, "persist_prompt_history"),
             )?,
             keymap: string_map_value(table, "keymap", source, &field(path, "keymap"))?,
+            shell_diff_inline: shell_diff_inline_value(
+                table,
+                "shell_diff_inline",
+                source,
+                &field(path, "shell_diff_inline"),
+            )?,
         })
     }
 
@@ -6877,6 +6911,7 @@ impl TuiSettings {
             next.persist_prompt_history,
         );
         replace_if_some(&mut self.keymap, next.keymap);
+        replace_if_some(&mut self.shell_diff_inline, next.shell_diff_inline);
     }
 }
 
@@ -8948,6 +8983,24 @@ fn transcript_default_value(
         "expanded" => Ok(Some(TranscriptDefault::Expanded)),
         _ => Err(SqueezyError::Config(format!(
             "{source}: {path}: invalid transcript default {value:?}; expected compact or expanded"
+        ))),
+    }
+}
+
+fn shell_diff_inline_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<ShellDiffInline>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(Some(ShellDiffInline::Full)),
+        "folded" => Ok(Some(ShellDiffInline::Folded)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid shell diff inline {value:?}; expected full or folded"
         ))),
     }
 }

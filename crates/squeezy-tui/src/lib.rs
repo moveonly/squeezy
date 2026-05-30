@@ -41,8 +41,9 @@ use squeezy_agent::{
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
-    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiSynchronizedOutput, TuiTheme,
+    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    TuiSynchronizedOutput, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_skills::PromptTemplateCatalog;
@@ -108,12 +109,12 @@ use input::{
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
-use render::palette::{
-    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
-    SUCCESS_GREEN, blend_color,
-};
 #[cfg(test)]
-use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
+use render::palette::WORKING_SHIMMER_HIGHLIGHT;
+use render::palette::{
+    self, AMBER, BANG_RED, DIFF_ADD_FG, DIFF_DEL_FG, ERROR_RED, GOLD, MODE_BUILD_GREEN,
+    MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN, blend_color,
+};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
@@ -141,6 +142,44 @@ const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 // prompt + status row and matches the picker height used by /options
 // search and the model picker.
 const SLASH_MENU_MAX_ITEMS: usize = 10;
+
+/// Process-wide override for `tui.shell_diff_inline`, pinned by the TuiApp
+/// at startup and re-applied on settings hot-reload. Encoded as `0 = Full
+/// (default)`, `1 = Folded`. A static lets the deeply-nested render path
+/// consult the setting without threading it through every formatter, the
+/// same pattern the palette uses for tone/accent overrides.
+static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+fn shell_diff_inline_setting() -> ShellDiffInline {
+    match SHELL_DIFF_INLINE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ShellDiffInline::Folded,
+        _ => ShellDiffInline::Full,
+    }
+}
+
+fn set_shell_diff_inline(setting: ShellDiffInline) {
+    let encoded = match setting {
+        ShellDiffInline::Full => 0,
+        ShellDiffInline::Folded => 1,
+    };
+    SHELL_DIFF_INLINE_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when this tool is `shell` (or `verify`, the structured-shell sibling)
+/// and its stdout looks like unified-diff output. Used by the preview-cap
+/// bypass and the BG-color renderer to treat `git diff` cards as first-class
+/// diff content the way `apply_patch` already is.
+fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
+    if !matches!(tool.result.tool_name.as_str(), "shell" | "verify") {
+        return false;
+    }
+    let stdout = tool.result.content["stdout"].as_str().unwrap_or("");
+    stdout
+        .lines()
+        .any(|line| line.starts_with("@@ -") && line.contains(" @@"))
+}
+
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 /// Enable basic button-press/release reporting (1000) with SGR
 /// coordinate encoding (1006). Required for the clickable queue
@@ -852,18 +891,6 @@ async fn apply_plan_choice(
                 ));
             }
         },
-        PlanChoiceAction::View => {
-            app.push_log(format!(
-                "plan {} file: {}",
-                pending.plan_id,
-                compact_path(&pending.plan_path)
-            ));
-            // Keep the prompt open so the user can pick another action
-            // after looking at the file.
-            let mut next = pending.clone();
-            next.selection_index = 0;
-            app.pending_plan_choice = Some(next);
-        }
     }
 }
 
@@ -891,6 +918,10 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
     apply_theme_overrides(new_cfg.tui.theme);
+    // Same pattern for the shell-diff inline preference: TuiApp keeps the
+    // canonical value, but the deep render path reads the static.
+    app.shell_diff_inline = new_cfg.tui.shell_diff_inline;
+    set_shell_diff_inline(new_cfg.tui.shell_diff_inline);
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
     if old_provider == new_provider {
@@ -5051,6 +5082,11 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 /// to its expanded form. Skips the pending-assistant tail since the
 /// overlay is a snapshot of committed transcript content.
 fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
+    // The overlay is the "Ctrl-T for full transcript" escape hatch — body
+    // content blocks (e.g. read_tool_output payloads, shell stdout/stderr)
+    // honour this verbosity, so pin Verbose to defeat the per-mode line cap
+    // even when the user has `/verbosity compact` set for inline cards.
+    let overlay_verbosity = ToolOutputVerbosity::Verbose;
     let mut lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
         match reasoning_run_info(&app.transcript, index) {
@@ -5081,7 +5117,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                     &members,
                     false,
                     app.selected_entry == Some(index),
-                    app.tool_output_verbosity,
+                    overlay_verbosity,
                     width,
                 ));
                 continue;
@@ -5092,7 +5128,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             app.render_cache_session,
             entry,
             app.selected_entry == Some(index),
-            app.tool_output_verbosity,
+            overlay_verbosity,
             message_outcome(&app.transcript, index),
             width,
             app.show_reasoning_usage,
@@ -6612,7 +6648,7 @@ fn tool_run_info(
 /// defensively for snapshot / overlay paths.
 fn tool_run_coalesce_eligible(tool: &ToolTranscript) -> bool {
     tool.repeat_count == 1
-        && !tool_bypasses_preview_cap(tool.result.tool_name.as_str())
+        && !tool_bypasses_preview_cap_for_tool(tool)
         && !tool_result_hidden_by_default(&tool.result)
 }
 
@@ -6845,12 +6881,30 @@ fn tool_bypasses_preview_cap(tool_name: &str) -> bool {
     )
 }
 
+/// Same intent as [`tool_bypasses_preview_cap`] but consults the result
+/// content too: a shell command whose stdout is a unified diff (`git diff`,
+/// `git show`, …) should render in full unless the user explicitly opted
+/// into folded shell diffs via `tui.shell_diff_inline = "folded"`. The
+/// diff IS the card; head/tail-capping it discards every hunk past the
+/// first or last five lines.
+fn tool_bypasses_preview_cap_for_tool(tool: &ToolTranscript) -> bool {
+    if tool_bypasses_preview_cap(tool.result.tool_name.as_str()) {
+        return true;
+    }
+    if matches!(shell_diff_inline_setting(), ShellDiffInline::Full)
+        && shell_output_is_unified_diff(tool)
+    {
+        return true;
+    }
+    false
+}
+
 fn collapsed_tool_preview_lines(
     tool: &ToolTranscript,
     tool_output_verbosity: ToolOutputVerbosity,
     _width: Option<u16>,
 ) -> Vec<Line<'static>> {
-    if tool_bypasses_preview_cap(tool.result.tool_name.as_str()) {
+    if tool_bypasses_preview_cap_for_tool(tool) {
         return expanded_tool_detail_lines(tool, tool_output_verbosity);
     }
     let detail = expanded_tool_detail_lines(tool, tool_output_verbosity);
@@ -7294,12 +7348,7 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
             Style::default().fg(GOLD),
         ));
     }
-    if tool.result.content["truncated"].as_bool().unwrap_or(false) {
-        spans.push(Span::styled(
-            " · more available",
-            Style::default().fg(QUIET),
-        ));
-    }
+    append_truncation_hint(&mut spans, tool);
     spans
 }
 
@@ -8006,10 +8055,15 @@ fn shell_output_block_lines(
         .unwrap_or_else(|| tool.result.tool_name.clone());
     let workdir = string_arg(&tool.result.content, "workdir").unwrap_or_else(|| ".".to_string());
     let limit = preview_limit.unwrap_or(usize::MAX);
+    let is_diff = output
+        .lines()
+        .any(|line| line.starts_with("@@ -") && line.contains(" @@"));
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
     lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
         if line.truncated_marker {
             detail_line(false, QUIET, line.text)
+        } else if is_diff {
+            shell_output_diff_line(&line.text)
         } else {
             shell_output_line(&line.text)
         }
@@ -8038,6 +8092,49 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
 fn shell_output_line(content: &str) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
     spans.extend(styled_output_spans(content));
+    Line::from(spans)
+}
+
+/// Diff-aware variant of [`shell_output_line`]. Lines that begin with `+`
+/// or `-` (but NOT `+++` / `---` file headers) get a tinted background to
+/// mirror the inline-diff styling reviewers expect from GitHub / Claude
+/// Code. Hunk headers (`@@ ... @@`) get a muted accent so the eye still
+/// finds the section breaks; everything else falls through to the default
+/// styled output.
+fn shell_output_diff_line(content: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let trimmed = content.trim_start_matches(' ');
+    let leading_ws = &content[..content.len() - trimmed.len()];
+    if !leading_ws.is_empty() {
+        spans.push(Span::raw(leading_ws.to_string()));
+    }
+    let style = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+        Style::default().fg(palette::muted_fg())
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        let mut style = Style::default().fg(DIFF_ADD_FG);
+        if let Some(bg) = palette::surface_bg(DIFF_ADD_FG) {
+            style = style.bg(bg);
+        }
+        spans.push(Span::styled("+".to_string(), style));
+        spans.push(Span::styled(rest.to_string(), style));
+        return Line::from(spans);
+    } else if let Some(rest) = trimmed.strip_prefix('-') {
+        let mut style = Style::default().fg(DIFF_DEL_FG);
+        if let Some(bg) = palette::surface_bg(DIFF_DEL_FG) {
+            style = style.bg(bg);
+        }
+        spans.push(Span::styled("-".to_string(), style));
+        spans.push(Span::styled(rest.to_string(), style));
+        return Line::from(spans);
+    } else if trimmed.starts_with("@@") {
+        Style::default()
+            .fg(palette::MODE_PURPLE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        spans.extend(styled_output_spans(trimmed));
+        return Line::from(spans);
+    };
+    spans.push(Span::styled(trimmed.to_string(), style));
     Line::from(spans)
 }
 
@@ -8364,7 +8461,26 @@ fn expanded_read_tool_output_detail_lines(
         ));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
-        lines.extend(output_block_lines("content", &content, verbosity));
+        // Spilled tool payloads are routinely hundreds of lines of raw JSON,
+        // so fold inline even on the expanded card — the overlay (which
+        // pins Verbose) still hands the full content to anyone hitting
+        // Ctrl-T. Generic `output_block_lines` stays unbounded so the
+        // existing "expand grep → see every match" behaviour is preserved.
+        let limit = match verbosity {
+            ToolOutputVerbosity::Compact => 12,
+            ToolOutputVerbosity::Normal => 40,
+            ToolOutputVerbosity::Verbose => usize::MAX,
+        };
+        if !content.trim().is_empty() {
+            lines.push(detail_line(false, QUIET, "content"));
+            for line in head_tail_lines(&content, limit) {
+                if line.truncated_marker {
+                    lines.push(detail_line(false, QUIET, line.text));
+                } else {
+                    lines.push(detail_spans_line(styled_output_spans(&line.text)));
+                }
+            }
+        }
     }
     lines
 }
@@ -8728,11 +8844,35 @@ fn path_detail_lines(
 }
 
 fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript) {
+    // Two distinct truncation modes share `cost_hint.truncated`:
+    //   * Spill: result was too large for the model context, so the full
+    //     payload was written to disk under `.squeezy/tool_outputs/<sha>`.
+    //     The model gets a handle it can pass to `read_tool_output`. The
+    //     card body shows a preview; the rest is NOT in the transcript
+    //     and Ctrl-T can't surface it, so name the file directly — that
+    //     is the only escape hatch a curious user has.
+    //   * Tool-cap: the tool itself returned a partial slice (repo_map
+    //     packet cap, decl_search row cap, etc.). The model needs to
+    //     re-query with narrower filters to see more.
+    // The old shared "more available" label promised something Ctrl-T
+    // couldn't deliver — distinguish both so the affordance matches reality.
+    let spilled = tool.result.content["spilled"].as_bool().unwrap_or(false);
+    if spilled {
+        let path = tool.result.content["on_disk_path"]
+            .as_str()
+            .map(|p| compact_path(std::path::Path::new(p)))
+            .unwrap_or_else(|| "spilled to disk".to_string());
+        spans.push(Span::styled(
+            format!(" · saved {path}"),
+            Style::default().fg(QUIET),
+        ));
+        return;
+    }
     if tool.result.cost_hint.truncated
         || tool.result.content["truncated"].as_bool().unwrap_or(false)
     {
         spans.push(Span::styled(
-            " · more available",
+            " · partial result",
             Style::default().fg(QUIET),
         ));
     }
@@ -10360,6 +10500,12 @@ pub(crate) struct TuiApp {
     /// `true`. Independent of the push-time retry coalescer
     /// ([`coalesce_tool_transcript_entry`]).
     pub(crate) coalesce_tool_runs: bool,
+    /// Mirrors `config.tui.shell_diff_inline`. The active value also lives
+    /// in the process-wide [`SHELL_DIFF_INLINE_OVERRIDE`] so the deep
+    /// render path can consult it without a parameter cascade — this
+    /// field is the source of truth for runtime mutation, the static is
+    /// derived.
+    pub(crate) shell_diff_inline: ShellDiffInline,
     pub(crate) repo: RepoStatus,
     pub(crate) permissions: PermissionStatus,
     pub(crate) telemetry: TelemetryStatus,
@@ -10773,6 +10919,10 @@ impl TuiApp {
             transcript_default: config.tui.transcript_default,
             show_reasoning_usage: config.tui.show_reasoning_usage,
             coalesce_tool_runs: config.tui.coalesce_tool_runs,
+            shell_diff_inline: {
+                set_shell_diff_inline(config.tui.shell_diff_inline);
+                config.tui.shell_diff_inline
+            },
             repo: RepoStatus::detect(config),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
@@ -11666,7 +11816,6 @@ enum PlanChoiceAction {
     ExecuteClean,
     Refine,
     Discard,
-    View,
 }
 
 struct PlanChoiceOption {
@@ -11700,12 +11849,6 @@ const PLAN_CHOICES: &[PlanChoiceOption] = &[
         label: "Discard",
         hint: "delete the plan file and dismiss this prompt",
         shortcut: 'd',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::View,
-        label: "View",
-        hint: "log the plan file path so you can open it externally",
-        shortcut: 'v',
     },
 ];
 
