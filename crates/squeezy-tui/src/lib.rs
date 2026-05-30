@@ -852,18 +852,6 @@ async fn apply_plan_choice(
                 ));
             }
         },
-        PlanChoiceAction::View => {
-            app.push_log(format!(
-                "plan {} file: {}",
-                pending.plan_id,
-                compact_path(&pending.plan_path)
-            ));
-            // Keep the prompt open so the user can pick another action
-            // after looking at the file.
-            let mut next = pending.clone();
-            next.selection_index = 0;
-            app.pending_plan_choice = Some(next);
-        }
     }
 }
 
@@ -8749,25 +8737,36 @@ fn path_detail_lines(
 fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript) {
     // Two distinct truncation modes share `cost_hint.truncated`:
     //   * Spill: result was too large for the model context, so the full
-    //     payload was written to disk and the model gets a handle it can
-    //     pass to `read_tool_output`. The card body shows a preview; the
-    //     rest is NOT in the transcript and Ctrl-T can't surface it.
+    //     payload was written to disk under `.squeezy/tool_outputs/<sha>`.
+    //     The model gets a handle it can pass to `read_tool_output`. The
+    //     card body shows a preview; the rest is NOT in the transcript
+    //     and Ctrl-T can't surface it, so name the file directly — that
+    //     is the only escape hatch a curious user has.
     //   * Tool-cap: the tool itself returned a partial slice (repo_map
     //     packet cap, decl_search row cap, etc.). The model needs to
     //     re-query with narrower filters to see more.
     // The old shared "more available" label promised something Ctrl-T
     // couldn't deliver — distinguish both so the affordance matches reality.
     let spilled = tool.result.content["spilled"].as_bool().unwrap_or(false);
-    let label = if spilled {
-        " · spilled to disk"
-    } else if tool.result.cost_hint.truncated
+    if spilled {
+        let path = tool.result.content["on_disk_path"]
+            .as_str()
+            .map(|p| compact_path(std::path::Path::new(p)))
+            .unwrap_or_else(|| "spilled to disk".to_string());
+        spans.push(Span::styled(
+            format!(" · saved {path}"),
+            Style::default().fg(QUIET),
+        ));
+        return;
+    }
+    if tool.result.cost_hint.truncated
         || tool.result.content["truncated"].as_bool().unwrap_or(false)
     {
-        " · partial result"
-    } else {
-        return;
-    };
-    spans.push(Span::styled(label, Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · partial result",
+            Style::default().fg(QUIET),
+        ));
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -11698,7 +11697,6 @@ enum PlanChoiceAction {
     ExecuteClean,
     Refine,
     Discard,
-    View,
 }
 
 struct PlanChoiceOption {
@@ -11732,12 +11730,6 @@ const PLAN_CHOICES: &[PlanChoiceOption] = &[
         label: "Discard",
         hint: "delete the plan file and dismiss this prompt",
         shortcut: 'd',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::View,
-        label: "View",
-        hint: "log the plan file path so you can open it externally",
-        shortcut: 'v',
     },
 ];
 
