@@ -2727,6 +2727,128 @@ class Handler {}
     );
 }
 
+#[test]
+fn parser_skips_swift_function_body_and_file_scope_lets() {
+    // SourceKit-LSP's `documentSymbol` reports stored properties at type
+    // scope (kind 7) but classifies file-scope and function-body
+    // `let`/`var` bindings as kind 13 (Variable) and excludes them from
+    // per-file symbol scans. Squeezy should mirror that filter so the
+    // smoke comparison does not produce spurious Field FPs (e.g.
+    // `Repository.swift:Field:trimmed` from a `let trimmed = ...` local
+    // inside `refresh()`, or `Package.swift:Field:package` from the
+    // SwiftPM manifest binding `let package = Package(...)`).
+    let source = r#"
+import Foundation
+
+let manifest = Manifest(name: "App")
+
+public final class Repo {
+    var users: [String] = []
+
+    public func refresh() {
+        let trimmed = " a ".sanitized()
+        users.append(trimmed)
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Repo.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // Type-scope stored property is kept (matches kind 7 Property).
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "users" && s.kind == SymbolKind::Field),
+        "type-scope `var users` must still emit as Field"
+    );
+    // Function-body local: dropped (matches kind 13 Variable, parent=Method).
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "trimmed" && s.kind == SymbolKind::Field),
+        "function-body local `let trimmed` must not emit as Field"
+    );
+    // File-scope binding: dropped (matches kind 13 Variable, no parent).
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "manifest" && s.kind == SymbolKind::Field),
+        "file-scope `let manifest = ...` must not emit as Field"
+    );
+}
+
+#[test]
+fn parser_skips_swift_call_function_navigation_reference() {
+    // `foo.bar()` produces both a `call_expression` and a
+    // `navigation_expression` for `foo.bar`. The call already records
+    // the method invocation as a `ParsedCall`, so the duplicate
+    // `Field`-kind reference at the suffix would double-count against
+    // SourceKit-LSP's `textDocument/references` (which ties the call to
+    // the method declaration via its index, not the raw suffix). Member
+    // access without invocation (`obj.field`) still emits the reference.
+    let source = r#"
+import Foundation
+
+extension String {
+    public func sanitized() -> String { return self }
+}
+
+public final class Repo {
+    var users: [String] = []
+    public func refresh() {
+        let value = "x".sanitized()
+        users.append(value)
+        let count = users.count
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Repo.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // Method-call suffixes do not emit a navigation reference.
+    assert!(
+        !parsed
+            .references
+            .iter()
+            .any(|r| r.text == "sanitized" && r.kind == ReferenceKind::Field),
+        "call-function navigation_expression must not emit a `sanitized` reference; got refs={:?}",
+        parsed
+            .references
+            .iter()
+            .map(|r| (r.kind, r.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !parsed
+            .references
+            .iter()
+            .any(|r| r.text == "append" && r.kind == ReferenceKind::Field),
+        "call-function navigation_expression must not emit an `append` reference"
+    );
+    // Property access (`users.count`) is not a call: the suffix
+    // reference is still emitted for member-lookup queries.
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|r| r.text == "count" && r.kind == ReferenceKind::Field),
+        "plain `users.count` member access must still emit the suffix reference"
+    );
+    // The call itself still surfaces in the parsed-call stream.
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|c| c.name == "sanitized" && c.receiver.as_deref() == Some("\"x\"")),
+        "extension-method call must still appear in parsed calls"
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);

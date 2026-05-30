@@ -149,19 +149,33 @@ fn visit_swift_node(
     }
 
     if node.kind() == "property_declaration" || node.kind() == "protocol_property_declaration" {
-        let symbols =
-            swift_property_symbols_from_node(node, ctx, parent_symbol.as_ref(), extension_owner);
-        if !symbols.is_empty() {
-            let new_owners: Vec<SymbolId> = symbols.iter().map(|s| s.id.clone()).collect();
-            for symbol in symbols {
-                ctx.symbols.push(symbol);
+        // SourceKit-LSP's `documentSymbol` only surfaces stored / computed
+        // properties whose owner is a type (class/struct/enum/protocol/
+        // actor) or an extension thereof. File-scope `let foo = ...`
+        // (kind 13 Variable, no parent) and function-body locals
+        // (kind 13 Variable, parent = Method) are intentionally absent.
+        // Mirror that filter so the Squeezy/SourceKit symbol scans agree
+        // (covers `Package.swift`'s `let package = Package(...)` SwiftPM
+        // manifest binding and function-body `let trimmed = ...`).
+        if swift_property_owner_is_type(parent_symbol.as_ref(), extension_owner, node.kind()) {
+            let symbols = swift_property_symbols_from_node(
+                node,
+                ctx,
+                parent_symbol.as_ref(),
+                extension_owner,
+            );
+            if !symbols.is_empty() {
+                let new_owners: Vec<SymbolId> = symbols.iter().map(|s| s.id.clone()).collect();
+                for symbol in symbols {
+                    ctx.symbols.push(symbol);
+                }
+                // Treat the property's computed body as the owning context for
+                // body-hit / reference extraction. If multiple symbols (pattern
+                // `let a, b = ...`), attribute hits to the first.
+                let next_owner = new_owners.into_iter().next().or(owner_symbol.clone());
+                visit_swift_children(node, ctx, parent_symbol, next_owner, extension_owner);
+                return;
             }
-            // Treat the property's computed body as the owning context for
-            // body-hit / reference extraction. If multiple symbols (pattern
-            // `let a, b = ...`), attribute hits to the first.
-            let next_owner = new_owners.into_iter().next().or(owner_symbol.clone());
-            visit_swift_children(node, ctx, parent_symbol, next_owner, extension_owner);
-            return;
         }
     }
 
@@ -195,7 +209,22 @@ fn visit_swift_node(
             visit_swift_children(node, ctx, parent_symbol, owner_symbol, extension_owner);
         }
         "navigation_expression" => {
-            extract_swift_navigation_reference(node, ctx, owner_symbol.clone());
+            // `foo.bar()` parses as a `call_expression` whose `function`
+            // child is a `navigation_expression`. The enclosing
+            // `call_expression` branch already records the invocation
+            // as a `ParsedCall` (the canonical fact for an extension-
+            // method dispatch like `"  Ada  ".sanitized()` resolving to
+            // `extension String { func sanitized() }`); emitting an
+            // extra `Field`-kind reference at the suffix would
+            // double-count against SourceKit-LSP's
+            // `textDocument/references`, which ties the call to the
+            // method declaration via its semantic index and does not
+            // surface the raw suffix as a separate hit. We still keep
+            // the path-flavored body hit so body-search queries (like
+            // "find `trimmingCharacters` invocations") continue to
+            // attribute the hit to its owning method.
+            let emit_reference = !swift_navigation_is_call_function(node);
+            extract_swift_navigation_facts(node, ctx, owner_symbol.clone(), emit_reference);
             visit_swift_children(node, ctx, parent_symbol, owner_symbol, extension_owner);
         }
         "attribute" => {
@@ -286,6 +315,12 @@ fn swift_symbol_from_node(
             };
             (kind, "func".to_string())
         }
+        // Protocol method requirements parse under a distinct grammar
+        // node (`protocol_function_declaration`) — handle it alongside
+        // `function_declaration` so SourceKit-LSP's `documentSymbol`
+        // entry for the protocol's abstract method (kind 6 Method
+        // under the protocol parent) has a matching Squeezy symbol.
+        "protocol_function_declaration" => (SymbolKind::Method, "func".to_string()),
         "init_declaration" => (SymbolKind::Method, "init".to_string()),
         "deinit_declaration" => (SymbolKind::Method, "deinit".to_string()),
         "subscript_declaration" => (SymbolKind::Method, "subscript".to_string()),
@@ -873,6 +908,33 @@ fn swift_kind_owns_methods(kind: SymbolKind) -> bool {
     )
 }
 
+/// Mirrors SourceKit-LSP's `documentSymbol` filter for stored / computed
+/// properties: only emit a `Field` symbol when the declaration is owned
+/// by a type (class/struct/enum/protocol/actor/union) or by an
+/// `extension Foo { ... }` block. File-scope `let`/`var` (the SwiftPM
+/// `let package = Package(...)` manifest binding among them) and
+/// function-body `let`/`var` are locals SourceKit-LSP classifies as
+/// kind 13 (Variable) and excludes from per-file symbol scans.
+fn swift_property_owner_is_type(
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    extension_owner: ExtensionOwner<'_>,
+    node_kind: &str,
+) -> bool {
+    if extension_owner.is_some() {
+        return true;
+    }
+    // `protocol_property_declaration` only parses inside a `protocol` body,
+    // so by the time we see it the parent is guaranteed to be a `Trait`
+    // symbol. Keep the explicit allow so the rule survives any future
+    // grammar shuffle that re-routes the node kind.
+    if node_kind == "protocol_property_declaration" {
+        return true;
+    }
+    parent_symbol
+        .map(|(_, kind)| swift_kind_owns_methods(*kind))
+        .unwrap_or(false)
+}
+
 fn swift_node_is_declaration_name(node: Node<'_>) -> bool {
     // Suppress the type reference we would otherwise emit on a declaration's
     // own `name` field — e.g. the `Foo` in `class Foo {}` is the symbol's
@@ -888,6 +950,7 @@ fn swift_node_is_declaration_name(node: Node<'_>) -> bool {
                 "class_declaration"
                     | "protocol_declaration"
                     | "function_declaration"
+                    | "protocol_function_declaration"
                     | "init_declaration"
                     | "subscript_declaration"
                     | "typealias_declaration"
@@ -1035,10 +1098,30 @@ fn c_family_call_is_macro_like_swift(name: &str) -> bool {
     !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_uppercase() || c == '_')
 }
 
-fn extract_swift_navigation_reference(
+/// Returns true when `node` is the function position of an enclosing
+/// `call_expression`. In tree-sitter-swift the call shape is
+/// `call_expression{ function: navigation_expression, call_suffix }`,
+/// so a navigation_expression is the function position iff its parent is
+/// a call_expression and it is the first named child of that parent
+/// (the suffix that follows is a `call_suffix` node, not a
+/// `navigation_expression`).
+fn swift_navigation_is_call_function(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "call_expression" {
+        return false;
+    }
+    parent
+        .named_child(0)
+        .is_some_and(|first| first.id() == node.id())
+}
+
+fn extract_swift_navigation_facts(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     owner_id: Option<SymbolId>,
+    emit_reference: bool,
 ) {
     // `navigation_expression target: ... suffix: navigation_suffix suffix: simple_identifier`
     let Some(suffix) = node.child_by_field_name("suffix") else {
@@ -1052,14 +1135,16 @@ fn extract_swift_navigation_reference(
     else {
         return;
     };
-    ctx.references.push(ParsedReference {
-        file_id: ctx.file.id.clone(),
-        owner_id: owner_id.clone(),
-        text: name.clone(),
-        kind: ReferenceKind::Field,
-        span: span_from_node(suffix),
-        provenance: Provenance::new("tree-sitter-swift", "navigation_expression reference"),
-    });
+    if emit_reference {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: name.clone(),
+            kind: ReferenceKind::Field,
+            span: span_from_node(suffix),
+            provenance: Provenance::new("tree-sitter-swift", "navigation_expression reference"),
+        });
+    }
     ctx.body_hits.push(BodyHit {
         file_id: ctx.file.id.clone(),
         owner_id,
