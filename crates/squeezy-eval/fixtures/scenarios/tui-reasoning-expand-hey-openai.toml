@@ -1,0 +1,75 @@
+id = "tui-reasoning-expand-hey-openai"
+title = "Reproduce: Ctrl+O after `hey` (OpenAI gpt-5.4-mini, user's exact prompt)"
+description = """
+Same as `tui-reasoning-expand-openai.toml` but uses the user's
+exact reported prompt ("hey") so the produced reasoning is the
+minimal-content shape — a small summary line plus a short body —
+matching the screenshot. Verifies the hint label is "Ctrl-O" not
+"Ctrl-E" in the rendered frame too.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 800
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+[[steps]]
+kind = "prompt"
+text = "hey"
+wait_for = "turn_completed"
+
+# The relabel diagnostic: the new chip hint must read "Ctrl-O to
+# expand". If a build still has "Ctrl-E to expand" in the chip,
+# that's the old binary.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Ctrl-O to expand"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,74 @@
+id = "tui-reasoning-expand-openai"
+title = "Reproduce: Ctrl+O on reasoning entries (OpenAI gpt-5.4-mini)"
+description = """
+Mirror of `tui-reasoning-expand-anthropic.toml` but against OpenAI
+`gpt-5.4-mini` — the model in the user's bug report. Same harness,
+same assertions: before Ctrl+O the rendered frame must contain
+`▸ reasoning:`; after, it must contain `▾ reasoning` plus a body
+marker `▏`.
+
+Requires `OPENAI_API_KEY`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 2000
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+[[steps]]
+kind = "prompt"
+text = "Think about the trade-offs between a hash map and a B-tree for a small (~100 entry) keyed cache. Answer in one short sentence."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▏"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+
+[triage]
+enabled = false

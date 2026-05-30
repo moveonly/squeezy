@@ -1,0 +1,70 @@
+id = "tui-reasoning-multiseg-openai"
+title = "Reproduce: Ctrl+O on a hard prompt that produces multi-segment reasoning"
+description = """
+Mimics the user's prompt shape — a hard, open-ended question that
+OpenAI tends to answer with several reasoning segments. Adjacent
+reasoning entries coalesce into one rendered chip; without the
+`resolve_toggle_target` fix, Ctrl+O picks the most-recent
+(Suppressed) member and flips a flag that drives nothing visible.
+The two diagnostics together pin the visible behaviour:
+
+  1. Frame contains `▾ reasoning` after Ctrl+O.
+  2. Frame does NOT contain `▸ reasoning` after Ctrl+O — i.e. no
+     collapsed chip remains anywhere on screen.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 1500
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 60
+
+[[steps]]
+kind = "prompt"
+text = "Can you think deeply about the hardest problem in life?"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_does_not_contain"
+text = "▸ reasoning"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1046,6 +1046,39 @@ impl Driver {
                     .await
             }
             Assertion::TuiFrameContains { text } => self.assert_tui_frame_contains(text).await,
+            Assertion::TuiFrameDoesNotContain { text } => {
+                self.assert_tui_frame_does_not_contain(text).await
+            }
+        }
+    }
+
+    async fn assert_tui_frame_does_not_contain(&self, text: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: tui_frame_does_not_contain requires [tui_capture] drive_tui = true".into();
+        };
+        let mut h = harness.lock().await;
+        match h.render_frame() {
+            Ok(frame) => {
+                if !frame.plain_text.contains(text) {
+                    "asserted_pass".into()
+                } else {
+                    let preview: String = frame
+                        .plain_text
+                        .lines()
+                        .map(|l| l.trim_end())
+                        .filter(|l| {
+                            !l.is_empty()
+                                && !l
+                                    .chars()
+                                    .all(|c| matches!(c, '╭' | '╰' | '│' | '─' | '╮' | '╯' | ' '))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    let preview = preview.chars().take(900).collect::<String>();
+                    format!("asserted_fail: frame still contains {text:?} · preview: {preview}")
+                }
+            }
+            Err(err) => format!("asserted_fail: render: {err}"),
         }
     }
 

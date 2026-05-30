@@ -1,0 +1,73 @@
+id = "tui-reasoning-debug-openai"
+title = "Diagnostic: count ▸/▾ chips before and after Ctrl+O"
+description = """
+Force the failure mode so the diagnostic emits the full frame.
+Asserts the rendered frame contains NO `▸ reasoning` after
+Ctrl+O — i.e. every reasoning chip flipped, not just one. This
+catches the case where a standalone Reasoning entry and an
+embedded chip on the assistant message render side-by-side and
+the toggle only flips one of them.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 800
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+[[steps]]
+kind = "prompt"
+text = "hey"
+wait_for = "turn_completed"
+
+# Diagnostic 1: count chips BEFORE Ctrl+O. We need to know whether
+# the assistant message renders its own embedded reasoning chip in
+# addition to the standalone Reasoning entry's chip.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_does_not_contain"
+text = "REASONING_BUG_DIAG_BEFORE"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+# Diagnostic 2: after the toggle, no collapsed chip should remain.
+# If one does, that's the "user sees no expansion" failure mode —
+# either an embedded reasoning chip wasn't reached, or there are
+# two chips and only one flipped.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_does_not_contain"
+text = "▸ reasoning"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false
