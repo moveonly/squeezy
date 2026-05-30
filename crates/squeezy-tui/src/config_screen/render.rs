@@ -12,7 +12,9 @@ use super::{
     ConfigScope, ConfigScreenState, FieldEditor, ModelPickerState, SearchOverlayState,
     SecretEntryState, inheritance_label, picker_matches, provider_api_key_env, tier_path,
 };
-use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN};
+use crate::render::palette::{
+    AMBER, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN, footer_fg, muted_fg,
+};
 
 /// Pretty-print an absolute config path: replace `$HOME` with `~` so the
 /// tab subtitle stays compact, while still surfacing the per-machine
@@ -66,7 +68,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         let label_style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(muted_fg())
         };
         let dot = if exists { "●" } else { "○" };
         // Active dot is amber, inactive dots are quiet (grey). File
@@ -284,7 +286,7 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
                 Span::raw("    "),
                 Span::styled(
                     format!("{}.{}", entry.section_label, entry.field_label),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(muted_fg()),
                 ),
             ]));
             lines.push(Line::from(vec![
@@ -393,12 +395,12 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
         ]),
         Line::from(vec![
             Span::styled("env  ", Style::default().fg(QUIET)),
-            Span::styled(entry.env_var.as_str(), Style::default().fg(Color::White)),
+            Span::styled(entry.env_var.as_str(), Style::default().fg(muted_fg())),
         ]),
         Line::raw(""),
         Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(display, Style::default().fg(Color::White)),
+            Span::styled(display, Style::default().fg(muted_fg())),
             Span::styled("_", Style::default().fg(AMBER)),
         ]),
         Line::raw(""),
@@ -481,7 +483,7 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
             let style = if active {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -564,7 +566,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
             let style = if active {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             let mut row = vec![
                 Span::styled(
@@ -618,7 +620,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
         let style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -710,7 +712,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 let label_style = if active {
                     Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(muted_fg())
                 };
                 let mut spans = vec![
                     Span::styled(prefix, prefix_style),
@@ -720,7 +722,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     ),
                     Span::styled(
                         value_str,
-                        Style::default().fg(if active { GOLD } else { Color::White }),
+                        Style::default().fg(if active { GOLD } else { muted_fg() }),
                     ),
                 ];
                 if !source_label.is_empty() {
@@ -880,7 +882,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 } else {
                     spans.push(Span::styled(
                         format!(" {opt} "),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(muted_fg()),
                     ));
                 }
             }
@@ -900,7 +902,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                     if sel {
                         Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(muted_fg())
                     },
                 )
             };
@@ -937,12 +939,12 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
             let on_style = if *v {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             let off_style = if !*v {
                 Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(muted_fg())
             };
             spans.push(Span::styled(
                 if !*v {
@@ -1029,7 +1031,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
         .border_style(Style::default().fg(QUIET));
     frame.render_widget(
         Paragraph::new(vec![primary, secondary])
-            .style(Style::default().fg(Color::White))
+            .style(Style::default().fg(footer_fg()))
             .block(block),
         area,
     );
