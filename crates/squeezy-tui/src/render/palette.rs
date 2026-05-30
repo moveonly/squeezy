@@ -18,6 +18,10 @@ use ratatui::style::Color;
 pub(crate) const AMBER: Color = Color::Rgb(252, 211, 77);
 pub(crate) const GOLD: Color = Color::Rgb(254, 240, 138);
 pub(crate) const MODE_PURPLE: Color = Color::Rgb(149, 117, 205);
+/// Muted indigo used for path-like text (cross-project hints, env-derived
+/// file locations). Sits below `MODE_PURPLE` so a long path doesn't shout
+/// when it appears next to a brighter focus row.
+pub(crate) const PATH_HINT: Color = Color::Rgb(89, 86, 140);
 pub(crate) const SUCCESS_GREEN: Color = Color::Rgb(22, 101, 52);
 pub(crate) const MODE_BUILD_GREEN: Color = Color::Rgb(34, 117, 64);
 pub(crate) const ERROR_RED: Color = Color::Rgb(248, 113, 113);

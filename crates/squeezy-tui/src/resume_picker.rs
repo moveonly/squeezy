@@ -28,7 +28,7 @@ use squeezy_store::{
     detect_branches,
 };
 
-use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET};
+use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, PATH_HINT, QUIET};
 
 /// Maximum number of sessions shown in the overlay. Keep small — the user
 /// is choosing one of "most recent" and a longer list is just noise.
@@ -679,7 +679,7 @@ fn render_candidate_row(
         spans.push(Span::styled("  · ", Style::default().fg(QUIET)));
         spans.push(Span::styled(
             summary.project_hint(),
-            Style::default().fg(MODE_PURPLE),
+            Style::default().fg(PATH_HINT),
         ));
     }
     Line::from(spans)

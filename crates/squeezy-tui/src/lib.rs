@@ -5510,7 +5510,7 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
     vec![
-        startup_phase_strip(card_width, &app.version),
+        startup_phase_strip(card_width, app.version),
         Line::from(""),
         startup_meta_row(
             "model",
