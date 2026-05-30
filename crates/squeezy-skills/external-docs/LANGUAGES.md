@@ -16,6 +16,7 @@ uses the same family names so coverage claims stay checkable.
 | `go` | Go | `go` | `tree-sitter-go` | `go_types` | yes | `benchmarks/fixtures/go/semantic-cases` | `benchmarks/specs/go-smoke-queries.json` | gin, cobra, prometheus, etcd, zap |
 | `c-family` | C, C++ | `c`, `h`, `cc`, `cpp`, `cxx`, `hh`, `hpp`, `hxx` | `tree-sitter-c`, `tree-sitter-cpp` | `clang` | yes | `benchmarks/fixtures/c/semantic-cases`, `benchmarks/fixtures/cpp/semantic-cases` | `benchmarks/specs/c-smoke-queries.json`, `benchmarks/specs/cpp-smoke-queries.json` | redis, curl, sqlite, protobuf, nlohmann_json |
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
+| `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
 
 ## Rust
 
@@ -131,6 +132,27 @@ framework conventions can improve precision and recall.
 
 Oracle: TypeScript compiler API. CI installs the pinned `typescript` package and
 sets `SQUEEZY_TYPESCRIPT_PATH`.
+
+## Ruby
+
+Indexed: classes, modules, methods, singleton methods (`def self.foo`),
+`class << self` singleton class bodies, top-level functions, synthesized
+`attr_accessor`/`attr_reader`/`attr_writer` accessors, `require`/
+`require_relative`/`load`/`autoload` imports, `include`/`extend`/`prepend`
+mixins (recorded as both Type references and `mixin:include:<Mod>` style
+attributes for ancestor walks), constants, class variables, instance
+variables, calls, and references.
+
+Known limitations: dynamic dispatch through `method_missing`,
+`define_method`, `eval`/`instance_eval`/`class_eval`/`module_eval`-built
+methods, anonymous classes via `Class.new`, runtime monkey-patching, and
+gem-style `require` path resolution are documented recall gaps and are
+excluded from the oracle as well. Receiver-typed call resolution is best
+effort because Ruby lacks parameter types.
+
+Oracle: Ruby Prism subprocess. CI installs Ruby 3.3 via `ruby/setup-ruby`
+with `continue-on-error: true`; when the toolchain is missing the oracle
+degrades to a `mode = "scan-only"` self-compare.
 
 ## Benchmark Corpus Reporting
 

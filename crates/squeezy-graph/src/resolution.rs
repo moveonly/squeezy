@@ -275,6 +275,15 @@ impl SemanticGraph {
             );
         }
 
+        if let Some(callee) = self.inherited_ruby_method(caller_id, call) {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "ruby ancestor",
+                Vec::new(),
+            );
+        }
+
         let candidates = self
             .symbols_by_name_or_scan(&call.name)
             .into_iter()

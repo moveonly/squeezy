@@ -82,6 +82,7 @@ pub(crate) struct BenchmarkReport {
     pub(crate) java_oracle: Option<JavaOracleReport>,
     pub(crate) csharp_oracle: Option<CsharpOracleReport>,
     pub(crate) go_oracle: Option<GoOracleReport>,
+    pub(crate) ruby_oracle: Option<RubyOracleReport>,
     pub(crate) refresh_probe: Option<RefreshProbeReport>,
     pub(crate) heuristic_iterations: Vec<HeuristicIterationReport>,
     pub(crate) queries: Vec<QueryReport>,
@@ -324,6 +325,20 @@ pub(crate) struct GoOracleReport {
     pub(crate) limitations: Vec<String>,
 }
 
+/// Ruby Prism oracle (see `docs/internal/lang-specs/ruby.md` §9). When the
+/// Ruby toolchain is missing the oracle degrades to a self-compare scan and
+/// `mode` records `"scan-only"`.
+#[derive(Debug, Serialize)]
+pub(crate) struct RubyOracleReport {
+    pub(crate) oracle_ms: u128,
+    pub(crate) status: String,
+    pub(crate) mode: String,
+    pub(crate) oracle_unparseable_files: usize,
+    pub(crate) oracle_unparseable_examples: Vec<String>,
+    pub(crate) symbols: AccuracySetReport,
+    pub(crate) limitations: Vec<String>,
+}
+
 /// Per-iteration heuristic notes for the Go benchmark.
 ///
 /// Each entry documents a heuristic decision (accepted, rejected, or targeted
@@ -332,11 +347,24 @@ pub(crate) struct GoOracleReport {
 /// run only knows the current state. The current state is already reported in
 /// `go_oracle.symbols`; consumers that need before/after numbers should diff
 /// JSON reports across runs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct HeuristicIterationReport {
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) notes: Vec<String>,
+    /// Optional before/after precision/recall snapshots taken at the moment
+    /// the iteration entry is recorded. Spec §10 (Ruby) calls for these so
+    /// reports can show the delta a heuristic produced without diffing two
+    /// separate runs. All four are `None` for entries that pre-date the
+    /// delta-tracking work, including the existing Go iterations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) baseline_precision: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) baseline_recall: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) new_precision: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) new_recall: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]

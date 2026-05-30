@@ -47,6 +47,7 @@ pub(crate) fn run_mixed_workload(
         ),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
         BenchmarkLanguage::Python => (None, "mixed workload unsupported for Python".to_string()),
+        BenchmarkLanguage::Ruby => (None, "mixed workload unsupported for Ruby".to_string()),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             match time_js_ts_oracle(repo) {
                 Ok(ms) => (Some(ms), "TypeScript compiler API oracle".to_string()),
@@ -86,6 +87,7 @@ pub(crate) fn run_mixed_workload(
             empty_accuracy("mixed workload accuracy oracle not used for Java")
         }
         BenchmarkLanguage::Python => empty_accuracy("mixed workload unsupported for Python"),
+        BenchmarkLanguage::Ruby => empty_accuracy("mixed workload unsupported for Ruby"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(repo, &graph, ra_lsp_probes)
         }

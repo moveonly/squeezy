@@ -2010,6 +2010,175 @@ export function noisy(items) {
     }
 }
 
+#[test]
+fn parser_extracts_ruby_symbols_imports_calls_and_references() {
+    let source = r#"
+require "json"
+require_relative "user"
+
+class Admin < User
+  include Auditable
+
+  attr_accessor :name, :email
+  attr_reader :role
+
+  def promote(target)
+    target.full_name
+  end
+
+  def self.find_by_email(email)
+    nil
+  end
+end
+
+def standalone_runner(arg)
+  arg.do_thing
+end
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/models/admin.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    let admin = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Admin" && s.kind == SymbolKind::Class)
+        .expect("Admin class");
+    assert!(admin.attributes.contains(&"base:User".to_string()));
+    assert!(
+        admin
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:include:Auditable")
+    );
+    assert!(parsed.symbols.iter().any(|s| s.name == "promote"
+        && s.kind == SymbolKind::Method
+        && s.parent_id == Some(admin.id.clone())));
+    let find_by_email = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "find_by_email")
+        .expect("find_by_email symbol");
+    assert_eq!(find_by_email.kind, SymbolKind::Method);
+    assert!(
+        find_by_email
+            .attributes
+            .iter()
+            .any(|a| a == "ruby:singleton")
+    );
+    assert!(parsed.symbols.iter().any(|s| s.name == "name"
+        && s.kind == SymbolKind::Method
+        && s.attributes.iter().any(|a| a == "ruby:synthesized")
+        && s.attributes.iter().any(|a| a == "ruby:attr-reader")));
+    assert!(parsed.symbols.iter().any(|s| s.name == "name="
+        && s.kind == SymbolKind::Method
+        && s.attributes.iter().any(|a| a == "ruby:attr-writer")));
+    assert!(parsed.symbols.iter().any(|s| s.name == "role"
+        && s.kind == SymbolKind::Method
+        && s.attributes.iter().any(|a| a == "ruby:attr-reader")));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "standalone_runner" && s.kind == SymbolKind::Function)
+    );
+    assert!(parsed.imports.iter().any(|i| i.path == "json"));
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "app/models/user.rb")
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|c| c.name == "full_name" && c.receiver.as_deref() == Some("target"))
+    );
+}
+
+#[test]
+fn parser_handles_ruby_module_and_class_variables() {
+    let source = r#"
+module Auditable
+  CONST_VAL = 42
+  @@cvar = "x"
+
+  def audit!(event)
+    @event = event
+    log(event)
+    sql = <<~SQL
+      SELECT bogus FROM tbl WHERE id = 1
+    SQL
+    Foo::Bar.new(sql)
+  end
+end
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/concerns/auditable.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    let module = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Auditable" && s.kind == SymbolKind::Module)
+        .expect("Auditable module");
+    assert!(parsed.symbols.iter().any(|s| s.name == "audit!"
+        && s.kind == SymbolKind::Method
+        && s.parent_id == Some(module.id.clone())));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "CONST_VAL" && s.kind == SymbolKind::Const)
+    );
+    assert!(parsed.symbols.iter().any(|s| s.name == "@@cvar"
+        && s.kind == SymbolKind::Field
+        && s.attributes.iter().any(|a| a == "ruby:cvar")));
+    assert!(parsed.symbols.iter().any(|s| s.name == "@event"
+        && s.kind == SymbolKind::Field
+        && s.attributes.iter().any(|a| a == "ruby:ivar")));
+    // The heredoc body should not surface as an identifier reference.
+    for reference in &parsed.references {
+        assert_ne!(reference.text, "bogus");
+    }
+    // The `Foo::Bar.new(sql)` call should still register inside the method.
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|c| c.name == "new" && c.receiver.as_deref() == Some("Foo::Bar"))
+    );
+}
+
+#[test]
+fn parser_records_singleton_class_methods() {
+    let source = r#"
+class Greeter
+  class << self
+    def make
+      Greeter.new
+    end
+  end
+end
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/services/greeter.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let greeter = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Greeter" && s.kind == SymbolKind::Class)
+        .expect("Greeter class");
+    // The `make` method must be hosted by the Greeter class via the
+    // singleton_class descend path.
+    assert!(parsed.symbols.iter().any(|s| s.name == "make"
+        && s.kind == SymbolKind::Method
+        && s.parent_id == Some(greeter.id.clone())));
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);
@@ -2030,6 +2199,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn ruby_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Ruby;
     record
 }
 

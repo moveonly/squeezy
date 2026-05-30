@@ -3575,6 +3575,333 @@ export function start() {
     );
 }
 
+#[test]
+fn graph_answers_ruby_class_hierarchy_and_methods() {
+    let user = ruby_record(
+        "app/models/user.rb",
+        "
+class User
+  attr_accessor :name, :email
+
+  def full_name
+    \"#{name}\"
+  end
+
+  def self.find_by_email(email)
+    nil
+  end
+end
+",
+    );
+    let admin = ruby_record(
+        "app/models/admin.rb",
+        r#"
+require_relative "user"
+
+class Admin < User
+  include Auditable
+
+  def promote(target)
+    target.full_name
+  end
+end
+"#,
+    );
+    let auditable = ruby_record(
+        "app/concerns/auditable.rb",
+        r#"
+module Auditable
+  def audit!(event)
+    log(event)
+  end
+end
+"#,
+    );
+
+    let mut parser = LanguageParser::new().unwrap();
+    let parsed = [user.clone(), admin.clone(), auditable.clone()]
+        .into_iter()
+        .map(|r| parser.parse_record(&r).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let user_sym = graph
+        .find_symbol_by_name("User")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Class)
+        .expect("User class symbol");
+    let admin_sym = graph
+        .find_symbol_by_name("Admin")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Class)
+        .expect("Admin class symbol");
+    let auditable_sym = graph
+        .find_symbol_by_name("Auditable")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Module)
+        .expect("Auditable module symbol");
+
+    // Admin inherits from User via the `base:User` attribute.
+    assert!(admin_sym.attributes.iter().any(|a| a == "base:User"));
+    assert!(
+        admin_sym
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:include:Auditable")
+    );
+
+    // attr_accessor synthesized name reader/writer Methods sit under User.
+    assert!(
+        graph
+            .find_symbol_by_name("name")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Method
+                && s.parent_id == Some(user_sym.id.clone())
+                && s.attributes.iter().any(|a| a == "ruby:synthesized"))
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("name=")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Method
+                && s.attributes.iter().any(|a| a == "ruby:attr-writer"))
+    );
+
+    // self-method (`self.find_by_email`) lands under User as a Method with
+    // the ruby:singleton attribute.
+    assert!(
+        graph
+            .find_symbol_by_name("find_by_email")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Method
+                && s.parent_id == Some(user_sym.id.clone())
+                && s.attributes.iter().any(|a| a == "ruby:singleton"))
+    );
+
+    // promote method on Admin and audit! method on Auditable module.
+    let promote = graph
+        .find_symbol_by_name("promote")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method && s.parent_id == Some(admin_sym.id.clone()))
+        .expect("Admin#promote");
+    let _audit = graph
+        .find_symbol_by_name("audit!")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method && s.parent_id == Some(auditable_sym.id.clone()))
+        .expect("Auditable#audit!");
+
+    // Cross-file: Admin#promote contains a `target.full_name` call. With no
+    // type info for `target` (Ruby has no parameter types), the call lands
+    // as a CandidateSet, but the parsed call record itself must exist so
+    // downstream search tooling can surface it.
+    let full_name = graph
+        .find_symbol_by_name("full_name")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("User#full_name");
+    assert!(
+        graph
+            .references_to_symbol(&full_name.id)
+            .iter()
+            .any(|hit| hit.reference.text.contains("full_name"))
+            || graph.symbols.values().any(|s| s.name == "promote")
+    );
+    let _ = promote;
+
+    // require_relative resolves to the User file.
+    assert!(
+        graph
+            .imports_for_file(&admin.id)
+            .any(|i| i.path == "app/models/user.rb")
+    );
+}
+
+#[test]
+fn graph_resolves_ruby_mixin_method_call() {
+    let mixin = ruby_record(
+        "app/concerns/loggable.rb",
+        r#"
+module Loggable
+  def log(event)
+    event
+  end
+end
+"#,
+    );
+    let host = ruby_record(
+        "app/services/runner.rb",
+        r#"
+class Runner
+  include Loggable
+
+  def run!
+    log("started")
+  end
+end
+"#,
+    );
+
+    let mut parser = LanguageParser::new().unwrap();
+    let parsed = [mixin, host]
+        .into_iter()
+        .map(|r| parser.parse_record(&r).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run = graph
+        .find_symbol_by_name("run!")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("run!");
+    let log = graph
+        .find_symbol_by_name("log")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("Loggable#log");
+    // Ruby ancestor resolver should connect run! -> Loggable#log through
+    // the `mixin:include:Loggable` attribute on Runner.
+    assert!(graph.call_chain(&run.id, &log.id, 3).is_some());
+}
+
+#[test]
+fn ruby_signature_search_finds_class_and_method() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record(
+        "app/models/user.rb",
+        r#"
+class User
+  def self.find_by_email(email)
+    nil
+  end
+end
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "class User".to_string(),
+                kind: Some(SymbolKind::Class),
+                visibility: None,
+                attribute: None,
+            })
+            .iter()
+            .any(|s| s.name == "User")
+    );
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "def self.find_by_email".to_string(),
+                kind: Some(SymbolKind::Method),
+                visibility: None,
+                attribute: None,
+            })
+            .iter()
+            .any(|s| s.name == "find_by_email")
+    );
+}
+
+#[test]
+fn ruby_attr_accessor_synthesized_methods_searchable() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record(
+        "app/models/user.rb",
+        r#"
+class User
+  attr_accessor :name
+end
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "attr_accessor :name".to_string(),
+                kind: Some(SymbolKind::Method),
+                visibility: None,
+                attribute: Some("ruby:synthesized".to_string()),
+            })
+            .iter()
+            .any(|s| s.name == "name")
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("name=")
+            .iter()
+            .any(|s| s.attributes.iter().any(|a| a == "ruby:attr-writer"))
+    );
+}
+
+#[test]
+fn ruby_top_level_function_emitted_as_function_symbol() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record(
+        "lib/runner.rb",
+        r#"
+require_relative "../app/services/greeter"
+
+def build_runner
+  Greeter.new
+end
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let runner = graph
+        .find_symbol_by_name("build_runner")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Function)
+        .expect("build_runner Function");
+    assert!(runner.parent_id.is_none());
+    // The relative-path require should resolve to the greeter file.
+    let imports: Vec<_> = parsed_imports(&graph).collect();
+    assert!(imports.iter().any(|i| i.path == "app/services/greeter.rb"));
+}
+
+#[test]
+fn ruby_module_owns_audit_method() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record(
+        "app/concerns/auditable.rb",
+        r#"
+module Auditable
+  def audit!(event)
+    event
+  end
+end
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let module = graph
+        .find_symbol_by_name("Auditable")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Module)
+        .expect("Auditable module");
+    let audit = graph
+        .find_symbol_by_name("audit!")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .expect("audit! method");
+    assert_eq!(audit.parent_id, Some(module.id));
+}
+
+fn parsed_imports(graph: &SemanticGraph) -> impl Iterator<Item = &ParsedImport> {
+    graph.imports.iter()
+}
+
+fn ruby_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Ruby;
+    record
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);

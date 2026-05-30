@@ -697,6 +697,32 @@
         "rev": "6ae5fecd46f1a787c9cac9531420c510ec8d2c0d",
         "checkout": "target/benchmark-repos/prettier"
       }
+    },
+    {
+      "name": "ruby-smoke",
+      "family": "ruby",
+      "language": "ruby",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/ruby/semantic-cases",
+      "spec": "benchmarks/specs/ruby-smoke-queries.json",
+      "report": "ruby/ruby-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "sinatra",
+      "family": "ruby",
+      "language": "ruby",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/sinatra/lib",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "ruby/sinatra.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/sinatra/sinatra",
+        "rev": "v4.1.1",
+        "checkout": "target/benchmark-repos/sinatra"
+      }
     }
   ]
 }

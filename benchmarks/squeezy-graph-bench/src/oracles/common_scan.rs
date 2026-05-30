@@ -207,6 +207,61 @@ pub(crate) fn collect_csharp_squeezy_symbol_scan_excluding_files(
     scan
 }
 
+/// Symmetric exclusion list for the Ruby Prism oracle (spec §9):
+/// - synthesized `attr_*` methods (squeezy emits them, Prism does not)
+/// - block-local / method-local identifiers (extractor doesn't emit these
+///   as symbols today; documented for parity with the C++ filter)
+/// - `define_method`-built methods (extractor doesn't emit them either)
+pub(crate) fn collect_squeezy_ruby_symbol_scan_excluding_files(
+    graph: &SemanticGraph,
+    excluded_files: &BTreeSet<String>,
+) -> SymbolScan {
+    let mut scan = SymbolScan::default();
+    for symbol in graph.symbols.values() {
+        let Some(file) = graph.files.get(&symbol.file_id) else {
+            increment(&mut scan.excluded_by_kind, "MissingFile");
+            continue;
+        };
+        if file.language != LanguageKind::Ruby {
+            continue;
+        }
+        scan.raw_total += 1;
+        if excluded_files.contains(&file.relative_path) {
+            increment(&mut scan.excluded_by_kind, "OracleUnparseableFile");
+            continue;
+        }
+        if symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "ruby:synthesized")
+        {
+            increment(&mut scan.excluded_by_kind, "RubyAttrSynthesized");
+            continue;
+        }
+        let kind = match symbol.kind {
+            SymbolKind::Class => "Class".to_string(),
+            SymbolKind::Module => "Module".to_string(),
+            SymbolKind::Method => "Method".to_string(),
+            SymbolKind::Function | SymbolKind::Test => "Function".to_string(),
+            // Const/Field/etc are not emitted by the Prism oracle for the
+            // first PR; exclude them symmetrically to avoid skewed FP.
+            _ => {
+                increment(&mut scan.excluded_by_kind, &format!("{:?}", symbol.kind));
+                continue;
+            }
+        };
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file: file.relative_path.clone(),
+                kind,
+                name: normalize_symbol_name(&symbol.name),
+            },
+        );
+    }
+    scan
+}
+
 pub(crate) fn collect_csharp_squeezy_edge_scan_excluding_files(
     graph: &SemanticGraph,
     excluded_files: &BTreeSet<String>,

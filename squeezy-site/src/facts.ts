@@ -152,6 +152,11 @@ export const languageRows: MatrixRow[] = [
     name: "TypeScript",
     detail: "Imports, exports, classes, interfaces, type aliases, enums, decorators, type references, calls, and TSX declarations.",
     status: "first-class graph"
+  },
+  {
+    name: "Ruby",
+    detail: "Classes, modules, methods, singleton methods, attr_* synthesis, require_relative imports, include/extend/prepend mixins, calls, and references.",
+    status: "first-class graph"
   }
 ];
 

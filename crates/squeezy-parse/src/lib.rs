@@ -235,6 +235,7 @@ pub struct LanguageParser {
     rust_parser: Parser,
     java_parser: Parser,
     python_parser: Parser,
+    ruby_parser: Parser,
     typescript_parser: Parser,
     tsx_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
@@ -268,6 +269,7 @@ impl LanguageParser {
         let rust_parser = parser_with_rust_language()?;
         let java_parser = parser_with_java_language()?;
         let python_parser = parser_with_python_language()?;
+        let ruby_parser = parser_with_ruby_language()?;
         let typescript_parser = parser_with_typescript_language()?;
         let tsx_parser = parser_with_tsx_language()?;
         Ok(Self {
@@ -280,6 +282,7 @@ impl LanguageParser {
             rust_parser,
             java_parser,
             python_parser,
+            ruby_parser,
             typescript_parser,
             tsx_parser,
             cache: HashMap::new(),
@@ -467,6 +470,7 @@ impl LanguageParser {
             LanguageKind::Jsx => Ok(&mut self.jsx_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
+            LanguageKind::Ruby => Ok(&mut self.ruby_parser),
             LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
             LanguageKind::Tsx => Ok(&mut self.tsx_parser),
             _ => Err(SqueezyError::Parse(format!(
@@ -486,6 +490,7 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
         LanguageKind::JavaScript => parser_with_javascript_language(),
         LanguageKind::Jsx => parser_with_jsx_language(),
         LanguageKind::Python => parser_with_python_language(),
+        LanguageKind::Ruby => parser_with_ruby_language(),
         LanguageKind::Rust => parser_with_rust_language(),
         LanguageKind::TypeScript => parser_with_typescript_language(),
         LanguageKind::Tsx => parser_with_tsx_language(),
@@ -506,6 +511,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
         rust: parser_with_rust_language()?,
         java: parser_with_java_language()?,
         python: parser_with_python_language()?,
+        ruby: parser_with_ruby_language()?,
         typescript: parser_with_typescript_language()?,
         tsx: parser_with_tsx_language()?,
     };
@@ -526,6 +532,7 @@ struct WorkerParsers {
     rust: Parser,
     java: Parser,
     python: Parser,
+    ruby: Parser,
     typescript: Parser,
     tsx: Parser,
 }
@@ -542,6 +549,7 @@ impl WorkerParsers {
             LanguageKind::Jsx => Ok(&mut self.jsx),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
+            LanguageKind::Ruby => Ok(&mut self.ruby),
             LanguageKind::TypeScript => Ok(&mut self.typescript),
             LanguageKind::Tsx => Ok(&mut self.tsx),
             _ => Err(SqueezyError::Parse(format!(
@@ -688,6 +696,15 @@ fn parser_with_python_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_ruby_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = ruby_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Ruby grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_javascript_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = javascript_language();
@@ -771,6 +788,10 @@ fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
+fn ruby_language() -> tree_sitter::Language {
+    tree_sitter_ruby::LANGUAGE.into()
+}
+
 fn javascript_language() -> tree_sitter::Language {
     tree_sitter_javascript::LANGUAGE.into()
 }
@@ -806,10 +827,10 @@ fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
         LanguageKind::Jsx => Some(jsx_language()),
         LanguageKind::Python => Some(python_language()),
         LanguageKind::Rust => Some(rust_language()),
+        LanguageKind::Ruby => Some(ruby_language()),
         LanguageKind::TypeScript => Some(typescript_language()),
         LanguageKind::Tsx => Some(tsx_language()),
-        LanguageKind::Ruby
-        | LanguageKind::Php
+        LanguageKind::Php
         | LanguageKind::Kotlin
         | LanguageKind::Swift
         | LanguageKind::Scala

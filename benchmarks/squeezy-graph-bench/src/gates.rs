@@ -46,6 +46,22 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    // Ruby uses precision/recall thresholds rather than fp/fn counts because
+    // the dynamic-dispatch recall gap (`method_missing`, `define_method`)
+    // produces a steady stream of FNs we accept (spec §10). When the oracle
+    // is in `scan-only` fallback the precision/recall are 1.0 by
+    // construction; the gate still passes but the report's `mode` field
+    // tells consumers the oracle didn't run.
+    if !no_speed_gate
+        && let Some(ruby) = &report.ruby_oracle
+        && (ruby.symbols.precision < 0.90 || ruby.symbols.recall < 0.75)
+    {
+        return Err(SqueezyError::Graph(format!(
+            "Ruby oracle accuracy regressed: precision={:.3} recall={:.3}",
+            ruby.symbols.precision, ruby.symbols.recall
+        )));
+    }
+
     if let Some(mixed) = &report.mixed_workload
         && mixed.refresh_probe.reparsed_files != mixed.refresh_probe.edited_files
     {

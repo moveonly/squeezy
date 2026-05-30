@@ -15,8 +15,9 @@ use crate::{
     oracles::{
         collect_c_family_accuracy, collect_csharp_oracle_accuracy, collect_go_oracle_accuracy,
         collect_java_oracle_accuracy, collect_js_ts_accuracy, collect_js_ts_oracle_accuracy,
-        collect_python_oracle_accuracy, heuristic_iteration_reports, time_go_ast_oracle,
-        time_java_oracle_optional, time_js_ts_oracle, time_python_ast_oracle,
+        collect_python_oracle_accuracy, collect_ruby_oracle_accuracy,
+        heuristic_iteration_reports, time_go_ast_oracle, time_java_oracle_optional,
+        time_js_ts_oracle, time_python_ast_oracle,
     },
     report::*,
     summary::{print_summary, write_report},
@@ -190,6 +191,10 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
             time_go_ast_oracle(&args.fixture)?,
             "Go parser/type oracle".to_string(),
         ),
+        BenchmarkLanguage::Ruby => match crate::oracles::time_ruby_prism_oracle(&args.fixture) {
+            Ok(ms) => (ms, "Ruby Prism oracle".to_string()),
+            Err(err) => (0, format!("Ruby Prism oracle unavailable: {err}")),
+        },
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             match time_js_ts_oracle(&args.fixture) {
                 Ok(ms) => (ms, "TypeScript compiler API oracle".to_string()),
@@ -230,6 +235,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         }
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
         BenchmarkLanguage::Go => empty_accuracy("rust-analyzer oracle not used for Go"),
+        BenchmarkLanguage::Ruby => empty_accuracy("Ruby LSP navigation oracle not used"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(&args.fixture, &graph, args.ra_lsp_probes)
         }
@@ -240,6 +246,10 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
     };
     let go_oracle = match args.language {
         BenchmarkLanguage::Go => Some(collect_go_oracle_accuracy(&args.fixture, &graph)?),
+        _ => None,
+    };
+    let ruby_oracle = match args.language {
+        BenchmarkLanguage::Ruby => Some(collect_ruby_oracle_accuracy(&args.fixture, &graph)?),
         _ => None,
     };
     let js_ts_oracle = match args.language {
@@ -294,6 +304,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         &java_oracle,
         &csharp_oracle,
         &go_oracle,
+        &ruby_oracle,
     );
 
     Ok(BenchmarkReport {
@@ -328,6 +339,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         java_oracle,
         csharp_oracle,
         go_oracle,
+        ruby_oracle,
         refresh_probe,
         heuristic_iterations,
         queries: query_reports,
@@ -358,6 +370,7 @@ fn tool_metrics_report(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn answer_quality_report(
     query_reports: &[QueryReport],
     language: BenchmarkLanguage,
@@ -367,6 +380,7 @@ fn answer_quality_report(
     java_oracle: &Option<JavaOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
+    ruby_oracle: &Option<RubyOracleReport>,
 ) -> AnswerQualityReport {
     let expected_checks = query_reports
         .iter()
@@ -392,6 +406,7 @@ fn answer_quality_report(
         java_oracle,
         csharp_oracle,
         go_oracle,
+        ruby_oracle,
     );
 
     AnswerQualityReport {
@@ -408,6 +423,7 @@ fn answer_quality_report(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn oracle_summary(
     language: BenchmarkLanguage,
     accuracy: &AccuracyReport,
@@ -416,6 +432,7 @@ fn oracle_summary(
     java_oracle: &Option<JavaOracleReport>,
     csharp_oracle: &Option<CsharpOracleReport>,
     go_oracle: &Option<GoOracleReport>,
+    ruby_oracle: &Option<RubyOracleReport>,
 ) -> (String, Option<f64>, Option<f64>) {
     match language {
         BenchmarkLanguage::Python => python_oracle
@@ -443,6 +460,12 @@ fn oracle_summary(
                 symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
             }),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => js_ts_oracle
+            .as_ref()
+            .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
+            .unwrap_or_else(|| {
+                symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
+            }),
+        BenchmarkLanguage::Ruby => ruby_oracle
             .as_ref()
             .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
             .unwrap_or_else(|| {

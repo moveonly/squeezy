@@ -39,6 +39,7 @@ on:
           - c-family
           - csharp
           - js-ts
+          - ruby
       tier:
         description: Benchmark tier.
         required: true
@@ -61,7 +62,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || inputs.language == 'ruby' && 45 || 120 }}
 
     steps:
       - name: Checkout
@@ -72,6 +73,18 @@ jobs:
         with:
           language: ${{ inputs.language }}
           typescript-version: ${{ env.SQUEEZY_TYPESCRIPT_VERSION }}
+
+      - name: Setup Ruby 3.3 (Prism oracle)
+        if: inputs.language == 'ruby'
+        continue-on-error: true
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Verify Prism availability
+        if: inputs.language == 'ruby'
+        continue-on-error: true
+        run: ruby -rprism -e 'puts Prism::VERSION'
 
       - name: Pre-build Roslyn C# oracle
         if: inputs.language == 'csharp'
