@@ -792,13 +792,15 @@ fn api_key_row_reports_env_var_presence() {
     let custom_env = "SQUEEZY_OPTIONS_EVAL_OPENAI_KEY";
     // SAFETY: tests in this module run single-threaded.
     unsafe { std::env::set_var(custom_env, "sk-test-from-env-XYZ") };
-    let mut cfg = AppConfig::default();
-    cfg.provider = squeezy_core::ProviderConfig::OpenAi(squeezy_core::OpenAiConfig {
-        api_key_env: custom_env.to_string(),
-        api_key: None,
-        base_url: squeezy_core::DEFAULT_OPENAI_BASE_URL.to_string(),
-        transport: Default::default(),
-    });
+    let cfg = AppConfig {
+        provider: squeezy_core::ProviderConfig::OpenAi(squeezy_core::OpenAiConfig {
+            api_key_env: custom_env.to_string(),
+            api_key: None,
+            base_url: squeezy_core::DEFAULT_OPENAI_BASE_URL.to_string(),
+            transport: Default::default(),
+        }),
+        ..AppConfig::default()
+    };
     let mut state = ConfigScreenState::new(cfg, Some(SectionId::Models));
     state.field_index = 2; // synthetic API-key row
     let rendered = render_screen_to_text(&state, 120, 30);
