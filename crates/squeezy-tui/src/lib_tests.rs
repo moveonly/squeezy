@@ -2938,10 +2938,16 @@ async fn slash_context_reports_known_model_budget_percentages() {
 
     let output = last_message_content(&app).expect("context output");
     assert_eq!(app.status, "context snapshot");
-    assert!(output.contains("Context accounting"), "{output}");
-    assert!(output.contains("context_window=400000"), "{output}");
-    assert!(output.contains("remaining_input_budget="), "{output}");
-    assert!(output.contains("used="), "{output}");
+    // Post-squeezy-rw0i the /context output leads with consumed +
+    // remaining against the model's context window, followed by a
+    // per-source breakdown. Window for this model is 400_000.
+    assert!(output.contains("Context window"), "{output}");
+    assert!(output.contains("Consumption by source"), "{output}");
+    assert!(
+        output.contains("consumed:") && output.contains("remaining:"),
+        "{output}"
+    );
+    assert!(output.contains("400000"), "{output}");
     assert!(output.contains('%'), "{output}");
     assert!(app.jobs.is_empty());
 }
@@ -2957,10 +2963,15 @@ async fn slash_context_uses_registry_fallback_for_unknown_models() {
     assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
 
     let output = last_message_content(&app).expect("context output");
-    assert!(output.contains("context_window=272000"), "{output}");
-    assert!(output.contains("max_output_reserve=64000"), "{output}");
-    assert!(output.contains("input_budget="), "{output}");
-    assert!(output.contains("used="), "{output}");
+    // Fallback window is 272_000; max_output reserve 64_000. The new
+    // /context layout exposes both via the consumed/remaining header
+    // and the max_output_reserve line.
+    assert!(output.contains("272000"), "{output}");
+    assert!(
+        output.contains("max_output_reserve: 64000 tokens"),
+        "{output}"
+    );
+    assert!(output.contains("Consumption by source"), "{output}");
 }
 
 #[tokio::test]

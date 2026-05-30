@@ -6297,7 +6297,7 @@ fn format_message_entry_with_width(
 fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Line<'static>>> {
     let mut iter = content.lines();
     let header = iter.next()?;
-    if header != "Cost accounting" && header != "Context accounting" {
+    if header != "Cost accounting" && header != "Context window" {
         return None;
     }
     let header_span = Span::styled(

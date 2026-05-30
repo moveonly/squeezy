@@ -133,6 +133,94 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
 }
 
 pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str("Context window\n");
+    let consumed = snapshot.transmitted_request.input_tokens;
+    let window = snapshot.transmitted_request.context_window_tokens;
+    match window {
+        Some(window) if window > 0 => {
+            let remaining = window.saturating_sub(consumed);
+            let used_pct = (consumed as f64 / window as f64) * 100.0;
+            let remaining_pct = 100.0 - used_pct;
+            out.push_str(&format!(
+                "  consumed:  {} tokens ({:.1}% of {} window)\n",
+                consumed, used_pct, window,
+            ));
+            out.push_str(&format!(
+                "  remaining: {} tokens ({:.1}% headroom)\n",
+                remaining, remaining_pct,
+            ));
+        }
+        _ => {
+            out.push_str(&format!(
+                "  consumed:  {} tokens (context window unknown for this model)\n",
+                consumed,
+            ));
+        }
+    }
+    if let Some(max_output) = snapshot.transmitted_request.max_output_tokens {
+        out.push_str(&format!("  max_output_reserve: {max_output} tokens\n"));
+    }
+
+    // Per-source breakdown derived from existing accounting. Token
+    // estimates use the rough 4-bytes/token heuristic for text/tool
+    // bytes — same accuracy class as the consumed total above (both
+    // are deterministic local estimates of assembled request content).
+    // Per-source token attribution at the provider level (e.g. MCP
+    // vs internal tool vs skill within tool_output_bytes) would
+    // require instrumenting tool frames with a kind tag — out of
+    // scope for this pass.
+    out.push_str("\nConsumption by source\n");
+    let approx = |bytes: usize| (bytes + 3) / 4;
+    let user_tokens = approx(snapshot.conversation.text_bytes);
+    let tool_tokens = approx(snapshot.conversation.tool_output_bytes);
+    let reasoning_tokens = approx(snapshot.conversation.reasoning_bytes);
+    let image_tokens = approx(snapshot.conversation.image_bytes);
+    let attachment_tokens = approx(snapshot.attachments.stored_bytes);
+    out.push_str(&format!(
+        "  user + assistant text:    ~{user_tokens} tokens  ({} bytes; {} user / {} assistant items)\n",
+        snapshot.conversation.text_bytes,
+        snapshot.conversation.user_text,
+        snapshot.conversation.assistant_text,
+    ));
+    out.push_str(&format!(
+        "  tool call outputs:        ~{tool_tokens} tokens  ({} bytes from {} call(s); MCP / skill / internal split needs deeper accounting)\n",
+        snapshot.conversation.tool_output_bytes, snapshot.conversation.function_outputs,
+    ));
+    if snapshot.conversation.reasoning_bytes > 0 {
+        out.push_str(&format!(
+            "  reasoning content:        ~{reasoning_tokens} tokens  ({} bytes across {} item(s))\n",
+            snapshot.conversation.reasoning_bytes, snapshot.conversation.reasoning_items,
+        ));
+    }
+    if snapshot.conversation.image_bytes > 0 {
+        out.push_str(&format!(
+            "  image content:            ~{image_tokens} tokens  ({} bytes across {} item(s))\n",
+            snapshot.conversation.image_bytes, snapshot.conversation.image_items,
+        ));
+    }
+    if snapshot.attachments.stored_bytes > 0 {
+        out.push_str(&format!(
+            "  attached context:         ~{attachment_tokens} tokens  ({} bytes; {} active of {} total)\n",
+            snapshot.attachments.stored_bytes,
+            snapshot.attachments.active,
+            snapshot.attachments.total,
+        ));
+    }
+    let accounted = user_tokens + tool_tokens + reasoning_tokens + image_tokens + attachment_tokens;
+    let system_estimate = consumed.saturating_sub(accounted as u64);
+    out.push_str(&format!(
+        "  system prompt + framing:  ~{system_estimate} tokens  (consumed minus the above; covers system prompt, tool schemas, and per-request framing)\n",
+    ));
+
+    out.push_str("\nSession\n");
+    out.push_str(&format!(
+        "  session={}\n  provider={} model={} mode={}\n",
+        snapshot.session_id.as_deref().unwrap_or("-"),
+        snapshot.provider,
+        snapshot.model,
+        snapshot.mode.as_str(),
+    ));
     let response_state = if snapshot.store_responses {
         if snapshot.previous_response_id.is_some() {
             "store_responses=true previous_response_id=present"
@@ -142,56 +230,25 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     } else {
         "store_responses=false"
     };
-    let provider_gap = if snapshot.provider_stored_context_active() {
-        "provider_stored_context=active; exact provider-side current-window use is unknown, so compare transmitted request with the local full-history estimate"
-    } else {
-        "provider_stored_context=inactive"
-    };
-    format!(
-        "Context accounting\n\
-session={}\n\
-provider={} model={} mode={}\n\
-response_state={}\n\
-{}\n\
-completed_turns={} provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
-transcript items={} user={} assistant={} system={} bytes={}\n\
-local_history items={} user_text={} assistant_text={} function_calls={} function_outputs={} text_bytes={} tool_output_bytes={}\n\
-attached_context total={} active={} removed={} unsupported={} stored_bytes={} redactions={}\n\
-tool_volume calls={} results={} receipt_hits={} spill_writes={} spill_reads={} budget_denials={}\n\
-subagent_volume calls={} failures={} tool_calls={} bytes_read={} files_scanned={} model_output_bytes={} budget_denials={}\n\
-{}\n\
-{}\n\
-accuracy=context tokens are deterministic local estimates of assembled request content; percentages and remaining input budget are shown only when a model context limit is known.",
-        snapshot.session_id.as_deref().unwrap_or("-"),
-        snapshot.provider,
-        snapshot.model,
-        snapshot.mode.as_str(),
-        response_state,
-        provider_gap,
+    out.push_str(&format!("  {response_state}\n"));
+    if snapshot.provider_stored_context_active() {
+        out.push_str(
+            "  provider_stored_context=active; exact provider-side current-window use is unknown — compare transmitted request with the local full-history estimate\n",
+        );
+    }
+    out.push_str(&format!(
+        "  turns={} provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n",
         snapshot.metrics.turns,
         format_optional_u64(snapshot.cost.input_tokens),
         format_optional_u64(snapshot.cost.output_tokens),
         format_optional_u64(snapshot.cost.reasoning_output_tokens),
         format_optional_u64(snapshot.cost.cached_input_tokens),
         format_optional_u64(snapshot.cost.cache_write_input_tokens),
-        snapshot.transcript.items,
-        snapshot.transcript.user,
-        snapshot.transcript.assistant,
-        snapshot.transcript.system,
-        snapshot.transcript.bytes,
-        snapshot.conversation.items,
-        snapshot.conversation.user_text,
-        snapshot.conversation.assistant_text,
-        snapshot.conversation.function_calls,
-        snapshot.conversation.function_outputs,
-        snapshot.conversation.text_bytes,
-        snapshot.conversation.tool_output_bytes,
-        snapshot.attachments.total,
-        snapshot.attachments.active,
-        snapshot.attachments.removed,
-        snapshot.attachments.unsupported,
-        snapshot.attachments.stored_bytes,
-        snapshot.attachments.redactions,
+    ));
+
+    out.push_str("\nVolume\n");
+    out.push_str(&format!(
+        "  tools calls={} results={} receipt_hits={} spill_writes={} spill_reads={} budget_denials={}\n",
         snapshot.metrics.tool_calls,
         snapshot.metrics.tool_successes
             + snapshot.metrics.tool_errors
@@ -201,6 +258,9 @@ accuracy=context tokens are deterministic local estimates of assembled request c
         snapshot.metrics.spill_writes,
         snapshot.metrics.spill_reads,
         snapshot.metrics.budget_denials,
+    ));
+    out.push_str(&format!(
+        "  subagents calls={} failures={} tool_calls={} bytes_read={} files_scanned={} model_output_bytes={} budget_denials={}\n",
         snapshot.metrics.subagent_calls,
         snapshot.metrics.subagent_failures,
         snapshot.metrics.subagent_tool_calls,
@@ -208,9 +268,22 @@ accuracy=context tokens are deterministic local estimates of assembled request c
         snapshot.metrics.subagent_files_scanned,
         snapshot.metrics.subagent_model_output_bytes,
         snapshot.metrics.subagent_budget_denials,
-        format_request_estimate("transmitted_request", &snapshot.transmitted_request),
-        format_request_estimate("local_full_history", &snapshot.full_history_request),
-    )
+    ));
+
+    out.push_str("\nRequest estimates\n  ");
+    out.push_str(&format_request_estimate(
+        "transmitted_request",
+        &snapshot.transmitted_request,
+    ));
+    out.push_str("\n  ");
+    out.push_str(&format_request_estimate(
+        "local_full_history",
+        &snapshot.full_history_request,
+    ));
+    out.push_str(
+        "\n\naccuracy: token counts above are deterministic local estimates of assembled request content; per-source token attribution at the MCP / internal-tool / skill level requires deeper instrumentation (see squeezy-rw0i).",
+    );
+    out
 }
 
 fn format_request_estimate(label: &str, estimate: &RequestTokenEstimate) -> String {
