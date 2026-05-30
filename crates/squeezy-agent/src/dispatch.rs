@@ -477,15 +477,34 @@ impl fmt::Display for DispatchCommandKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatchOutcome {
-    /// `/compact` (manual compaction) succeeded.
-    Compacted,
+    /// `/compact` (manual compaction) ran. `skipped` is `true` when
+    /// the conversation had nothing eligible to compact (empty
+    /// session, only the synthetic head, or already maximally
+    /// compacted) — `false` when items were actually dropped.
+    /// Distinguishing the two lets callers surface a graceful
+    /// "nothing to compact yet" status line instead of an error.
+    /// Fixes squeezy-kkdb (audit B4).
+    Compacted {
+        #[serde(default)]
+        skipped: bool,
+    },
     /// `/compact undo` succeeded — `restored` is `true` when a
     /// checkpoint was found, `false` when there was nothing to undo.
     CompactedUndo { restored: bool },
     /// `/plan` / `/build` mode switch on the agent. `changed` is the
     /// same boolean `Agent::set_session_mode` returns so callers can
-    /// distinguish a real switch from a no-op.
-    ModeChanged { mode: String, changed: bool },
+    /// distinguish a real switch from a no-op. `prompt` carries the
+    /// optional trailing prompt arg (e.g. `/plan analyze this`) back
+    /// to the caller so non-TUI dispatchers (RPC, squeezy-eval) can
+    /// start a user turn with it; the TUI handler reads the same arg
+    /// off `DispatchCommand::Plan { prompt }` directly. Fixes
+    /// squeezy-9n9w (audit B3).
+    ModeChanged {
+        mode: String,
+        changed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
     /// `/cost` snapshot. `debug` is the pretty-printed
     /// `SessionAccountingSnapshot` so eval traces stay greppable.
     CostSnapshot { debug: String },

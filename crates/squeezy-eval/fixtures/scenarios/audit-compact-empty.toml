@@ -1,14 +1,13 @@
 id = "audit-compact-empty"
 title = "Audit · /compact on an empty conversation"
 description = """
-`/compact` with no prior turns. The agent's `compact_context_manual`
-runs against an empty conversation; the dispatch path returns
-`DispatchOutcome::Compacted` on success and
-`DispatchOutcome::Error { command: "/compact", … }` if the
-"not enough context" guard fires. This scenario pins which branch
-fires when the conversation is empty — surfacing whether the UX
-swallows the "nothing to compact" case gracefully or returns an
-error string.
+`/compact` with no prior turns. After squeezy-kkdb (audit B4), the
+agent's `compact_context_manual` returns `Ok(None)` when there's
+nothing to compact, and the dispatcher emits
+`DispatchOutcome::Compacted { skipped: true }` — no raw error string
+hits the status line. Prior to the fix this scenario produced an
+`asserted_fail` / `error:agent error: not enough context to compact`
+status; now it lands cleanly with `compacted:skipped=true`.
 """
 
 [workspace]

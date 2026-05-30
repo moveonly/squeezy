@@ -1,12 +1,13 @@
 id = "audit-plan-with-prompt"
-title = "Audit · /plan <prompt> switches mode (prompt is TUI-side, ignored agent-side)"
+title = "Audit · /plan <prompt> switches mode and preserves the prompt"
 description = """
-`/plan` accepts an optional trailing prompt that, in the TUI, is fed
-into a turn. The agent-side `DispatchCommand::Plan { prompt }` handler
-only switches mode — the prompt is discarded. This scenario exists to
-flag that documented divergence: `mode_plan_changed=true` fires, but
-the trailing text never reaches the model. Run via `drive_tui = false`
-to pin the agent-side behavior.
+`/plan <prompt>` switches mode and surfaces the prompt back through
+`DispatchOutcome::ModeChanged.prompt`. Pre-fix (squeezy-9n9w / audit
+B3), the agent dispatcher discarded the prompt while the TUI fed it
+into a turn — silent data loss for non-TUI callers. Now both paths
+see the prompt; non-TUI callers can decide what to do with it.
+Asserts via the action-status string: `prompt_len=N` appears when
+prompt was non-empty.
 """
 
 [workspace]

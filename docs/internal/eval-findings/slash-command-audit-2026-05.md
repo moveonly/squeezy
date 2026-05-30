@@ -85,8 +85,8 @@ CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`,
 
 - **B1 — driver `workspace_root_clone` fixed** (`squeezy-nyg8.1`). Now reads `agent.config().workspace_root` instead of `std::env::current_dir()`. `edit_file` actions land in the agent's actual workspace (snapshot worktree when `snapshot = true`); previously they wrote to the host repo (corrupted README.md mid-audit).
 - **B2 — `pump_until_idle` now waits for `pending_diff`** (`squeezy-nyg8.2`). The idle return predicate gained an `&& !app.pending_diff.is_some()` guard so `/diff`'s spawn_blocking task can land its result before the next assertion. `audit-misc-diff-with-changes.toml` simplified — no more `wait_seconds = 3` + extra slash workaround.
-- **B3 — `/plan <prompt>` divergence**: `DispatchCommand::Plan { prompt }` agent-side discards the prompt; the TUI handler additionally starts a turn with it. Silent data loss for RPC/eval consumers that send `/plan` with a prompt over the headless dispatch path.
-- **B4 — `/compact` on empty conversation surfaces raw error** (`error:agent error: not enough context to compact`) into the status line. Should be a graceful "nothing to compact yet" message, mirroring `/compact undo`'s `restored=false` path.
+- **B3 — `/plan <prompt>` divergence fixed** (`squeezy-9n9w`). `DispatchOutcome::ModeChanged` gained `prompt: Option<String>`; the agent dispatcher surfaces the prompt arg through it. Non-TUI callers (RPC, squeezy-eval) can now see the prompt and act on it; the TUI handler keeps reading the prompt off `DispatchCommand::Plan { prompt }` directly. Regression test in `lib_tests.rs::dispatch_command_plan_with_prompt_surfaces_prompt_in_outcome`.
+- **B4 — `/compact` empty-conversation graceful no-op** (`squeezy-kkdb`). `compact_context_manual` returns `Result<Option<ContextCompactionReport>>` (`Ok(None)` when nothing is compaction-eligible). `DispatchOutcome::Compacted { skipped }` carries the no-op marker. TUI status line shows "nothing to compact yet" instead of `compact failed: agent error: not enough context to compact`.
 
 ### Redundancy
 

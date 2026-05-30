@@ -2744,7 +2744,11 @@ async fn manual_context_compaction_preserves_pins_in_resume_state() {
         )
         .await
         .expect("pin");
-    let report = agent.compact_context_manual().await.expect("compact");
+    let report = agent
+        .compact_context_manual()
+        .await
+        .expect("compact")
+        .expect("conversation had compaction-eligible items");
 
     assert_eq!(report.record.trigger.as_str(), "manual");
     assert!(report.summary.contains("Use deterministic compaction"));
@@ -2816,7 +2820,11 @@ async fn manual_context_compaction_broadcasts_context_compacted_event() {
         )
         .await
         .expect("pin");
-    let report = agent.compact_context_manual().await.expect("compact");
+    let report = agent
+        .compact_context_manual()
+        .await
+        .expect("compact")
+        .expect("conversation had compaction-eligible items");
     assert_eq!(report.record.trigger.as_str(), "manual");
 
     let broadcast = events.recv().await.expect("broadcast event");

@@ -846,7 +846,7 @@ async fn apply_plan_choice(
             // in via the handoff prefix queued by the mode switch, so the
             // model retains the full plan even with an emptied transcript.
             match agent.compact_context_manual().await {
-                Ok(report) => {
+                Ok(Some(report)) => {
                     app.context_compaction.last = Some(report.record.clone());
                     app.context_compaction.generation = report.record.generation;
                     app.context_compaction.summary = Some(report.summary.clone());
@@ -858,11 +858,16 @@ async fn apply_plan_choice(
                         pending.plan_id
                     ));
                 }
-                Err(err) => {
-                    // "not enough context to compact" is fine — common on a
-                    // fresh session and not a blocker for execution.
+                Ok(None) => {
+                    // Nothing to compact — common on a fresh session.
                     app.push_log(format!(
-                        "execute-clean: skipped compaction ({err}); running plan"
+                        "execute-clean: nothing to compact for plan {}; running",
+                        pending.plan_id
+                    ));
+                }
+                Err(err) => {
+                    app.push_log(format!(
+                        "execute-clean: compaction failed ({err}); running plan"
                     ));
                 }
             }
@@ -2266,7 +2271,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 }
             } else {
                 match agent.compact_context_manual().await {
-                    Ok(report) => {
+                    Ok(Some(report)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
                         app.context_estimate = report.record.after.clone();
                         app.status = compaction_status_line(&report.record);
@@ -2284,6 +2289,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                             before = report.record.before.estimated_tokens,
                             after = report.record.after.estimated_tokens,
                         )));
+                    }
+                    Ok(None) => {
+                        app.status = "nothing to compact yet".to_string();
                     }
                     Err(error) => app.status = format!("compact failed: {error}"),
                 }

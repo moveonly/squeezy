@@ -1009,12 +1009,22 @@ impl Driver {
         }
         let outcome = self.agent.dispatch_command_raw(command).await;
         let status = match &outcome {
-            squeezy_agent::DispatchOutcome::Compacted => "compacted".to_string(),
+            squeezy_agent::DispatchOutcome::Compacted { skipped } => {
+                format!("compacted:skipped={skipped}")
+            }
             squeezy_agent::DispatchOutcome::CompactedUndo { restored } => {
                 format!("compact_undo:restored={restored}")
             }
-            squeezy_agent::DispatchOutcome::ModeChanged { mode, changed } => {
-                format!("mode_{mode}_changed={changed}")
+            squeezy_agent::DispatchOutcome::ModeChanged {
+                mode,
+                changed,
+                prompt,
+            } => {
+                let prompt_marker = prompt
+                    .as_deref()
+                    .map(|p| format!(":prompt_len={}", p.len()))
+                    .unwrap_or_default();
+                format!("mode_{mode}_changed={changed}{prompt_marker}")
             }
             squeezy_agent::DispatchOutcome::CostSnapshot { .. } => "cost_snapshot".to_string(),
             squeezy_agent::DispatchOutcome::ContextSnapshot { .. } => {
