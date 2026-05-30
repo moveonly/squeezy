@@ -689,16 +689,14 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// JSON-serialized payload sent to the LLM as the body of a
+    /// `FunctionCallOutput`. Only `self.content` is projected — the call
+    /// id is already carried by the wrapping `FunctionCallOutput` and the
+    /// rest of `ToolResult` (status, cost_hint, receipt) is telemetry the
+    /// model neither needs nor benefits from.
     pub fn model_output(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
-            json!({
-                "call_id": self.call_id,
-                "tool_name": self.tool_name,
-                "status": "error",
-                "content": {"error": "tool result serialization failed"},
-            })
-            .to_string()
-        })
+        serde_json::to_string(&self.content)
+            .unwrap_or_else(|_| json!({"error": "tool result serialization failed"}).to_string())
     }
 
     pub fn with_spill_model_output(mut self, output: String) -> Self {

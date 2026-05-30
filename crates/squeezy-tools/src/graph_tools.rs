@@ -17,7 +17,7 @@ use squeezy_graph::{
 use squeezy_vcs::{
     DiffFileStatus, DiffHunk, DiffMode, DiffOptions, DiffSnapshot, canonicalize_workspace_root,
 };
-use squeezy_workspace::{ExclusionReason, IndexCoverage};
+use squeezy_workspace::ExclusionReason;
 
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
@@ -150,32 +150,7 @@ enum ReadSliceSpanKind {
     Signature,
     Body,
 }
-fn coverage_json(coverage: &IndexCoverage) -> Option<Value> {
-    if coverage.skipped_files == 0 && coverage.skipped_dirs == 0 && coverage.reasons.is_empty() {
-        return None;
-    }
-    let reasons = coverage
-        .reasons
-        .iter()
-        .map(|(reason, coverage)| {
-            (
-                reason.clone(),
-                json!({
-                    "files": coverage.files,
-                    "dirs": coverage.dirs,
-                    "bytes": coverage.bytes,
-                    "samples": coverage.samples,
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    Some(json!({
-        "skipped_files": coverage.skipped_files,
-        "skipped_dirs": coverage.skipped_dirs,
-        "skipped_bytes": coverage.skipped_bytes,
-        "reasons": reasons,
-    }))
-}
+
 fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
     match baseline {
         DiffReadBaseline::Worktree => "worktree",
@@ -603,6 +578,8 @@ fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
 }
 
 pub(crate) fn graph_unavailable_result(call: &ToolCall) -> ToolResult {
+    // `fallback.suggested_tools` is intentionally absent — the reason code is
+    // enough for the model to pick a non-graph retry path on its own.
     make_result(
         call,
         ToolStatus::Success,
@@ -613,10 +590,6 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall) -> ToolResult {
             "packets": [],
             "fallback": {
                 "status": "graph_unavailable",
-                "suggested_tools": [
-                    {"tool": "glob", "arguments": {"pattern": "**/*"}},
-                    {"tool": "grep", "arguments": {"pattern": "<query>", "output_mode": "files_with_matches"}}
-                ]
             }
         }),
         ToolCostHint::default(),
@@ -626,35 +599,17 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall) -> ToolResult {
 
 pub(crate) fn graph_payload(
     tool: &str,
-    manager: &GraphManager,
-    refresh: &squeezy_graph::RefreshReport,
+    _manager: &GraphManager,
+    _refresh: &squeezy_graph::RefreshReport,
 ) -> serde_json::Map<String, Value> {
+    // Trim policy: `refresh` and `coverage` are dropped from the wire payload.
+    // The model never branched on either; the byte cost ran ~150-400B per
+    // graph tool result. Both signals still flow to telemetry via the typed
+    // graph events emitted around `refresh_before_query()`.
     let mut payload = serde_json::Map::new();
     payload.insert("tool".to_string(), json!(tool));
     payload.insert("graph_available".to_string(), json!(true));
-    payload.insert("refresh".to_string(), refresh_report_json(refresh));
-    if let Some(coverage) = coverage_json(&manager.build_report().coverage) {
-        payload.insert("coverage".to_string(), coverage);
-    }
     payload
-}
-
-fn refresh_report_json(report: &squeezy_graph::RefreshReport) -> Value {
-    // Intentionally omits `duration_ms`: that field changes between otherwise
-    // identical calls and breaks the receipt-stub layer for graph tools.
-    // Telemetry still records wall-clock timing via the typed graph event.
-    json!({
-        "refreshed": report.refreshed,
-        "changed_files": report.changed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-        "removed_files": report.removed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-        "reparsed_files": report.reparsed_files,
-        "excluded_files": report.excluded_files,
-        "excluded_dirs": report.excluded_dirs,
-        "excluded_bytes": report.excluded_bytes,
-        "bytes_reparsed": report.bytes_reparsed,
-        "skipped_due_to_interval": report.skipped_due_to_interval,
-        "budget_exhausted": report.budget_exhausted,
-    })
 }
 
 fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
@@ -1101,12 +1056,14 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
 /// - `reason`: one of `supported_language_no_match`, `path_unsupported`,
 ///   `path_unknown`, `no_path_scope`
 /// - `path` / `language` (nullable)
-/// - `suggested_tools`: a regex-escaped `grep` invocation plus a
-///   `decl_search` retry shape
+///
+/// `suggested_tools` is intentionally omitted from the wire payload —
+/// recommending grep/decl_search retries was decoration the model already
+/// knows how to do unprompted; the reason code is the load-bearing signal.
 fn graph_zero_hit_fallback(
     graph: &squeezy_graph::SemanticGraph,
     path: Option<&str>,
-    query: Option<&str>,
+    _query: Option<&str>,
     packet_count: usize,
 ) -> Value {
     if packet_count > 0 {
@@ -1135,24 +1092,11 @@ fn graph_zero_hit_fallback(
         }
         None => (Value::Null, Value::Null, "no_path_scope"),
     };
-    let grep_path = match &path_value {
-        Value::String(p) => p.clone(),
-        _ => ".".to_string(),
-    };
-    let grep_pattern = match query {
-        Some(q) if !q.is_empty() => regex::escape(q),
-        _ => "<query>".to_string(),
-    };
-    let decl_query = query.unwrap_or("<query>").to_string();
     json!({
         "status": "no_graph_evidence",
         "reason": reason,
         "path": path_value,
         "language": language_value,
-        "suggested_tools": [
-            {"tool": "grep", "arguments": {"pattern": grep_pattern, "path": grep_path}},
-            {"tool": "decl_search", "arguments": {"query": decl_query, "kind": null}}
-        ]
     })
 }
 
@@ -1164,23 +1108,24 @@ fn graph_status_for_language(language: LanguageKind) -> &'static str {
     }
 }
 
+// Trim policy: graph evidence packets drop `claim`, `freshness`, `provenance`,
+// `cost_hint`, and `next_action` from the wire payload. The structured spans,
+// symbol/edge bodies, and confidence id are the load-bearing data the model
+// actually uses; the dropped fields were decorations that ate tokens without
+// changing decisions. Telemetry that needs provenance/freshness reads from
+// the typed graph events rather than the tool result JSON.
 fn evidence_packet(
-    claim: impl Into<String>,
+    _claim: impl Into<String>,
     spans: Vec<Value>,
     confidence: Confidence,
-    freshness: Freshness,
-    provenance: Vec<Provenance>,
-    cost_hint: ToolCostHint,
-    next_action: Value,
+    _freshness: Freshness,
+    _provenance: Vec<Provenance>,
+    _cost_hint: ToolCostHint,
+    _next_action: Value,
 ) -> Value {
     json!({
-        "claim": claim.into(),
         "spans": spans,
         "confidence": confidence.id(),
-        "freshness": format!("{:?}", freshness),
-        "provenance": provenance.into_iter().map(provenance_json).collect::<Vec<_>>(),
-        "cost_hint": cost_hint,
-        "next_action": next_action,
     })
 }
 
@@ -2106,11 +2051,15 @@ pub(crate) fn reference_json(hit: ReferenceHit) -> Value {
 }
 
 fn span_json(span: squeezy_core::SourceSpan) -> Value {
+    // `end.column` is dropped from the wire payload — the start column plus the
+    // line range is enough for the model to locate the span, and the byte
+    // window already pins the exact end. Saves ~24B per span across every
+    // packet, repo_map node, symbol, edge, and reference hit.
     json!({
         "start_byte": span.start_byte,
         "end_byte": span.end_byte,
         "start": {"line": span.start.line, "column": span.start.column},
-        "end": {"line": span.end.line, "column": span.end.column},
+        "end": {"line": span.end.line},
     })
 }
 
@@ -3405,47 +3354,13 @@ impl ToolRegistry {
                 })
             })
             .collect::<Vec<_>>();
+        // Trim policy: `refresh` and `coverage` are dropped from the wire
+        // payload for the same reason as `graph_payload` — the model never
+        // branched on either. The refresh side-effect still runs and still
+        // emits its typed graph event.
+        let _ = refresh;
         let mut payload = serde_json::Map::new();
         payload.insert("available".to_string(), json!(true));
-        if let Some(report) = refresh {
-            let mut refresh_obj = serde_json::Map::new();
-            refresh_obj.insert("refreshed".to_string(), json!(report.refreshed));
-            refresh_obj.insert(
-                "changed_files".to_string(),
-                json!(
-                    report
-                        .changed_files
-                        .iter()
-                        .map(|id| id.0.clone())
-                        .collect::<Vec<_>>()
-                ),
-            );
-            refresh_obj.insert(
-                "removed_files".to_string(),
-                json!(
-                    report
-                        .removed_files
-                        .iter()
-                        .map(|id| id.0.clone())
-                        .collect::<Vec<_>>()
-                ),
-            );
-            refresh_obj.insert("reparsed_files".to_string(), json!(report.reparsed_files));
-            refresh_obj.insert("excluded_files".to_string(), json!(report.excluded_files));
-            refresh_obj.insert("excluded_dirs".to_string(), json!(report.excluded_dirs));
-            refresh_obj.insert("excluded_bytes".to_string(), json!(report.excluded_bytes));
-            if let Some(coverage) = coverage_json(&report.coverage) {
-                refresh_obj.insert("coverage".to_string(), coverage);
-            }
-            refresh_obj.insert(
-                "budget_exhausted".to_string(),
-                json!(report.budget_exhausted),
-            );
-            payload.insert("refresh".to_string(), Value::Object(refresh_obj));
-        }
-        if let Some(coverage) = coverage_json(&manager.build_report().coverage) {
-            payload.insert("coverage".to_string(), coverage);
-        }
         payload.insert("files".to_string(), json!(files));
         Value::Object(payload)
     }

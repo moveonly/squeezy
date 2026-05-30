@@ -425,10 +425,7 @@ impl LlmProvider for ToolUsingProvider {
             _ => None,
         });
         let events = if let Some(output) = tool_output {
-            let answer = if output.contains(&self.path)
-                && output.contains(&self.marker)
-                && output.contains("\"status\":\"Success\"")
-            {
+            let answer = if output.contains(&self.path) && output.contains(&self.marker) {
                 format!("found {}", self.path)
             } else {
                 format!("missing fixture output: {output}")

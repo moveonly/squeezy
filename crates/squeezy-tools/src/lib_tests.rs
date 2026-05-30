@@ -3977,7 +3977,7 @@ async fn large_tool_output_spills_to_handle_and_can_be_read_back() {
         fetched.content["content"]
             .as_str()
             .expect("content")
-            .contains("\"tool_name\":\"read_file\"")
+            .contains("\"bytes_returned\":30000")
     );
 
     let _ = fs::remove_dir_all(root);
@@ -7859,12 +7859,15 @@ pub mod service {
         )
         .await;
     assert_eq!(upstream.status, ToolStatus::Success);
+    // The per-packet `claim` string was trimmed from the wire payload; the
+    // structured `caller` + `callee` summaries carry the same information.
     assert!(
         upstream.content["packets"]
             .as_array()
             .expect("upstream packets")
             .iter()
-            .any(|packet| packet["claim"].as_str().unwrap_or("").contains("run"))
+            .any(|packet| packet["caller"]["name"].as_str() == Some("run")
+                || packet["callee"]["name"].as_str() == Some("run"))
     );
 
     let hierarchy = registry
@@ -8064,9 +8067,9 @@ async fn graph_navigation_tools_return_unsupported_language_fallback() {
         result.content["fallback"]["reason"].as_str(),
         Some("path_unsupported")
     );
-    assert_eq!(
-        result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
-        Some("grep")
+    assert!(
+        result.content["fallback"].get("suggested_tools").is_none(),
+        "fallback.suggested_tools must be trimmed from the wire payload"
     );
     assert!(result.content["packets"].as_array().unwrap().is_empty());
 
@@ -8117,11 +8120,9 @@ pub mod pipeline {
         .as_str()
         .expect("definition packet carries a symbol id")
         .to_string();
-    assert_eq!(
-        first_definition["next_action"]["tool"].as_str(),
-        Some("read_slice"),
-        "definition_search must point at read_slice for the exact declaration"
-    );
+    // The per-packet `next_action` recommendation was trimmed from the wire
+    // payload; the model can derive a `read_slice` call from the embedded
+    // symbol id + span without an explicit recommendation.
 
     let reference_by_text = registry
         .execute(
@@ -8222,11 +8223,13 @@ pub mod pipeline {
     let chain_packets = downstream_chain.content["packets"]
         .as_array()
         .expect("downstream_flow chain packets");
+    // The trim drops the per-packet `claim` field; the call-chain packet is
+    // still uniquely identifiable by its `chain` array — call_edge / edge
+    // packets do not carry that shape.
     assert!(
-        chain_packets.iter().any(|packet| packet["claim"]
-            .as_str()
-            .unwrap_or("")
-            .contains("call chain found")),
+        chain_packets
+            .iter()
+            .any(|packet| packet.get("chain").and_then(|v| v.as_array()).is_some()),
         "downstream_flow with target_query must emit a call_chain packet, got {chain_packets:?}"
     );
 
@@ -8538,17 +8541,12 @@ pub fn beta() {}
         Some("supported_language_no_match")
     );
     assert_eq!(fallback["path"].as_str(), Some("src/lib.rs"));
-    let tools = fallback["suggested_tools"]
-        .as_array()
-        .expect("suggested_tools array");
-    let grep = tools
-        .iter()
-        .find(|tool| tool["tool"].as_str() == Some("grep"))
-        .expect("grep entry");
-    assert_eq!(grep["arguments"]["path"].as_str(), Some("src/lib.rs"));
-    assert_eq!(
-        grep["arguments"]["pattern"].as_str(),
-        Some("no_such_symbol")
+    // `suggested_tools` is intentionally dropped from the wire payload — the
+    // reason code carries the load-bearing signal and the model can choose a
+    // retry tool without a verbose recommendation list.
+    assert!(
+        fallback.get("suggested_tools").is_none(),
+        "fallback.suggested_tools must be trimmed from the wire payload, got {fallback}"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -8574,49 +8572,18 @@ async fn decl_search_zero_hit_no_path_scope() {
     let fallback = &result.content["fallback"];
     assert_eq!(fallback["reason"].as_str(), Some("no_path_scope"));
     assert!(fallback["path"].is_null());
-    let tools = fallback["suggested_tools"]
-        .as_array()
-        .expect("suggested_tools array");
-    let grep = tools
-        .iter()
-        .find(|tool| tool["tool"].as_str() == Some("grep"))
-        .expect("grep entry");
-    assert_eq!(grep["arguments"]["path"].as_str(), Some("."));
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn decl_search_zero_hit_regex_escapes_query() {
-    let root = temp_workspace("graph_zero_hit_regex");
-    write_rust_crate(&root, "pub fn alpha() {}\n");
-    let registry = ToolRegistry::new(&root).expect("registry");
-
-    let result = registry
-        .execute(
-            ToolCall {
-                call_id: "zero_regex".to_string(),
-                name: "decl_search".to_string(),
-                arguments: json!({"query": "foo.bar()"}),
-            },
-            CancellationToken::new(),
-        )
-        .await;
-    assert_eq!(result.status, ToolStatus::Success);
-    let pattern = result.content["fallback"]["suggested_tools"][0]["arguments"]["pattern"]
-        .as_str()
-        .expect("pattern string");
     assert!(
-        pattern.contains(r"\."),
-        "regex metacharacters must be escaped; got {pattern:?}"
-    );
-    assert!(
-        pattern.contains(r"\(") && pattern.contains(r"\)"),
-        "parentheses must be escaped; got {pattern:?}"
+        fallback.get("suggested_tools").is_none(),
+        "fallback.suggested_tools must be trimmed from the wire payload, got {fallback}"
     );
 
     let _ = fs::remove_dir_all(root);
 }
+
+// `decl_search_zero_hit_regex_escapes_query` was removed when
+// `fallback.suggested_tools` was trimmed from the wire payload. The dropped
+// field was the only consumer of the regex-escape path; the reason code stays
+// and the model picks its own retry tool.
 
 #[tokio::test]
 async fn decl_search_non_empty_packets_keeps_null_fallback() {
@@ -8718,17 +8685,14 @@ def caller(obj):
     for entry in candidates {
         assert_eq!(entry["name"].as_str(), Some("do_thing"));
     }
-    let fanout = candidate_packet["next_action"]["fanout"]
-        .as_array()
-        .expect("candidate set packet must carry a read_slice fanout");
+    // The per-packet `next_action.fanout` recommendation was trimmed from the
+    // wire payload. The model still gets every candidate's symbol id + span
+    // through the `candidates` array above; the read_slice retry shape was
+    // duplicated decoration.
     assert!(
-        !fanout.is_empty(),
-        "fanout must contain at least one read_slice candidate"
+        candidate_packet.get("next_action").is_none(),
+        "candidate-set packet must not carry trimmed next_action: {candidate_packet}"
     );
-    for entry in fanout {
-        assert_eq!(entry["tool"].as_str(), Some("read_slice"));
-        assert!(entry["arguments"]["path"].as_str().is_some());
-    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -9131,18 +9095,26 @@ fn match_paths(result: &ToolResult) -> Vec<String> {
 }
 
 fn assert_uniform_evidence_packet(packet: &Value) {
-    for key in [
+    // After the wire-payload trim, graph packets keep only the spans + the
+    // confidence id. `claim`, `freshness`, `provenance`, `cost_hint`, and
+    // `next_action` are dropped from every packet to cut tokens per result;
+    // the same signals still flow to telemetry via the typed graph events.
+    for key in ["spans", "confidence"] {
+        assert!(
+            packet.get(key).is_some(),
+            "missing evidence key {key}: {packet}"
+        );
+    }
+    for trimmed in [
         "claim",
-        "spans",
-        "confidence",
         "freshness",
         "provenance",
         "cost_hint",
         "next_action",
     ] {
         assert!(
-            packet.get(key).is_some(),
-            "missing evidence key {key}: {packet}"
+            packet.get(trimmed).is_none(),
+            "evidence packet must not carry trimmed key {trimmed}: {packet}"
         );
     }
 }
