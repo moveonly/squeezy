@@ -1181,3 +1181,28 @@ async fn next_prompt_swap_applies_on_drain() {
         "drain should consume the queued swap"
     );
 }
+
+#[test]
+fn local_tab_stays_visible_when_repo_subtitle_is_long() {
+    // Regression for squeezy-5wu: a worktree-style repo path plus
+    // `(committed)` used to push the Local tab off the right edge at
+    // width=140 (the default eval terminal). The tab strip now budgets
+    // subtitle width so the rightmost label is always present.
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    state.sources.user_path_default = std::path::PathBuf::from("/home/eval/.squeezy/settings.toml");
+    state.sources.project_path_default = std::path::PathBuf::from(
+        "/home/eval/esqueezy/squeezy/.claude/worktrees/agent-a8f9491133db8e8fa/squeezy.toml",
+    );
+    state.sources.repo_path_default = std::path::PathBuf::from(
+        "/home/eval/.squeezy/projects/aaaabbbbccccddddeeeeffff00001111/settings.toml",
+    );
+    let rendered = render_screen_to_text(&state, 140, 30);
+    // Header row 0 contains the tab strip; "User", "Repo", and "Local"
+    // must all survive truncation. The previous bug rendered only the
+    // first two labels at width=140.
+    let header = rendered.lines().next().expect("header row");
+    assert!(
+        header.contains("User") && header.contains("Repo") && header.contains("Local"),
+        "all three tab labels should fit on a 140-col row; got:\n{header}"
+    );
+}
