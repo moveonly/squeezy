@@ -1095,9 +1095,51 @@ impl Driver {
         };
         let mut h = harness.lock().await;
         h.start_user_turn(prompt.clone());
-        h.pump_until_idle()
-            .await
-            .map_err(|err| EvalError::Internal(format!("harness pump: {err}")))?;
+
+        // Cap the number of approval modals we'll route through one
+        // prompt. Without a cap a buggy provider that re-emits the
+        // same ApprovalRequested forever would re-trigger our loop
+        // forever. 64 is well above any wave-2 probe's tool-call
+        // count and keeps the failure mode an `Err(_)` rather than a
+        // silent hang.
+        const MAX_APPROVAL_HOPS: usize = 64;
+        let mut approval_hops = 0usize;
+        loop {
+            h.pump_until_idle()
+                .await
+                .map_err(|err| EvalError::Internal(format!("harness pump: {err}")))?;
+            let Some(tool_name) = h.pending_approval_tool().map(str::to_string) else {
+                break;
+            };
+            // Mirror Driver::decide_approval's queue protocol: pop the
+            // matching Approve/Deny action and route it back into the
+            // harness via the new respond_* helpers. Falling through to
+            // Deny when nothing matches keeps drive_tui parity with the
+            // non-drive_tui path (where decide_approval returns Denied
+            // on an empty queue).
+            let (decision, recorded) = self.decide_approval(&tool_name).await;
+            let routed = match decision {
+                ToolApprovalDecision::Approved
+                | ToolApprovalDecision::AllowOnce
+                | ToolApprovalDecision::AllowSession
+                | ToolApprovalDecision::AllowRuleUser
+                | ToolApprovalDecision::AllowRuleProject => h.respond_approval(),
+                _ => h.respond_deny(),
+            };
+            self.capture.record(
+                None,
+                EvalEventKind::Approval {
+                    request: json!({ "tool": tool_name.clone() }),
+                    decision: format!("{recorded}{}", if routed { "" } else { ":unrouted" }),
+                },
+            )?;
+            approval_hops += 1;
+            if approval_hops >= MAX_APPROVAL_HOPS {
+                return Err(EvalError::Internal(format!(
+                    "harness pump: exceeded {MAX_APPROVAL_HOPS} approval modals on one prompt",
+                )));
+            }
+        }
         self.capture.record(
             None,
             EvalEventKind::ActionStep {
