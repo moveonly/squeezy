@@ -1217,6 +1217,63 @@ fn expect_finish_reason_not_quiet_when_stop_had_tool_call() {
     );
 }
 
+fn action_step(seq: u64, kind: &str, status: &str) -> EvalEvent {
+    EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: seq,
+        turn_id: Some("T(1)".into()),
+        kind: EvalEventKind::ActionStep {
+            action: serde_json::json!({"kind": kind}),
+            status: status.into(),
+        },
+    }
+}
+
+#[test]
+fn assertion_failed_flags_asserted_fail_action_step() {
+    let events = vec![action_step(
+        5,
+        "tui_frame_contains",
+        "asserted_fail: frame does not contain \"openai:gpt-5.4-mini\"",
+    )];
+    let ctx = ctx_from_events(events);
+    let out = AssertionFailed.check(&ctx, &empty_scenario());
+    assert_eq!(
+        out.len(),
+        1,
+        "asserted_fail action_step must produce a finding"
+    );
+    assert_eq!(out[0].rule_id, "assertion_failed");
+    assert_eq!(out[0].severity, Severity::Minor);
+    assert!(out[0].summary.contains("tui_frame_contains"));
+    assert!(out[0].summary.contains("frame does not contain"));
+    assert_eq!(out[0].evidence.len(), 1);
+    assert_eq!(out[0].evidence[0].trace_event, Some(5));
+}
+
+#[test]
+fn assertion_failed_quiet_when_step_passed() {
+    let events = vec![action_step(7, "tui_frame_contains", "asserted_ok")];
+    let ctx = ctx_from_events(events);
+    assert!(AssertionFailed.check(&ctx, &empty_scenario()).is_empty());
+}
+
+#[test]
+fn assertion_failed_fires_per_failure() {
+    let events = vec![
+        action_step(
+            5,
+            "tui_frame_contains",
+            "asserted_fail: frame missing thing",
+        ),
+        action_step(6, "tui_status_contains", "asserted_fail: status mismatch"),
+    ];
+    let ctx = ctx_from_events(events);
+    let out = AssertionFailed.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 2, "each asserted_fail step gets its own finding");
+}
+
 #[test]
 fn expect_finish_reason_not_quiet_when_stop_has_assistant_text() {
     // Plan-mode-style turn: no tool call but a real assistant message

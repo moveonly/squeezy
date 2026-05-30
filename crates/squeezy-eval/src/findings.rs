@@ -396,6 +396,47 @@ impl Rule for UnsupportedSlashCommand {
     }
 }
 
+/// A scripted `assert` action step finished with a status starting with
+/// `asserted_fail`. Without this rule, scenarios whose assertions fail
+/// still report `totals.findings = 0`, so `squeezy-eval check
+/// --fail-on findings` silently passes them. Each failing action_step
+/// becomes one finding so the CI gate can fire.
+pub struct AssertionFailed;
+impl Rule for AssertionFailed {
+    fn rule_id(&self) -> &'static str {
+        "assertion_failed"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (seq, kind, status) in &ctx.action_steps {
+            if !status.starts_with("asserted_fail") {
+                continue;
+            }
+            let kind_label = if kind.is_empty() {
+                "assert".to_string()
+            } else {
+                kind.clone()
+            };
+            let detail = status
+                .strip_prefix("asserted_fail")
+                .map(|rest| rest.trim_start_matches([':', ' ']))
+                .unwrap_or(status.as_str());
+            let detail_excerpt: String = detail.chars().take(240).collect();
+            out.push(Finding {
+                rule_id: "assertion_failed".into(),
+                severity: Severity::Minor,
+                category: "correctness".into(),
+                summary: format!("Scripted `{kind_label}` assertion failed: {detail_excerpt}"),
+                evidence: vec![EvidencePointer {
+                    trace_event: Some(*seq),
+                    frame: None,
+                }],
+            });
+        }
+        out
+    }
+}
+
 pub struct ApprovalUnanswered;
 impl Rule for ApprovalUnanswered {
     fn rule_id(&self) -> &'static str {
@@ -1494,6 +1535,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(StaleFunctionCallOutput),
         Box::new(HighToolBurst),
         Box::new(UnsupportedSlashCommand),
+        Box::new(AssertionFailed),
         Box::new(ApprovalUnanswered),
         Box::new(RedundantGraphLookup),
         Box::new(DeepChainExpansion),
