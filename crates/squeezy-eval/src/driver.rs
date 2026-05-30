@@ -1100,6 +1100,14 @@ impl Driver {
             Assertion::TuiFrameDoesNotContain { text } => {
                 self.assert_tui_frame_does_not_contain(text).await
             }
+            Assertion::TuiCellLuminanceLe {
+                max,
+                channel,
+                region,
+            } => {
+                self.assert_tui_cell_luminance_le(*max, channel.as_deref(), region.as_ref())
+                    .await
+            }
         }
     }
 
