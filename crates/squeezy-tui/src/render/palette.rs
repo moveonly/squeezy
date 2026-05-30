@@ -48,6 +48,19 @@ pub(crate) const ACCENT_CYAN: Color = Color::Rgb(64, 158, 158);
 pub(crate) const ACCENT_GREEN: Color = Color::Rgb(64, 158, 64);
 pub(crate) const ACCENT_MAGENTA: Color = Color::Rgb(158, 64, 158);
 
+/// Inline-code foreground for the default branch in
+/// `inline_code_style_for` and for link text. Same cyan hue family as
+/// `ACCENT_CYAN` but a touch lighter so it reads as an inline accent
+/// rather than a status-line chip; luminance ~130 stays inside the
+/// dark-only ≤160 guardrail.
+pub(crate) const INLINE_CODE_FG: Color = Color::Rgb(96, 158, 158);
+
+/// Inline-code foreground for the `model` / `@` branch. Dark rosy
+/// magenta — distinct from `Color::Magenta` (branch/path) below it and
+/// well clear of the bright `Color::LightMagenta` it replaces;
+/// luminance ~137 keeps the dark-only guardrail.
+pub(crate) const INLINE_MODEL_FG: Color = Color::Rgb(176, 110, 176);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteTone {
     Dark,

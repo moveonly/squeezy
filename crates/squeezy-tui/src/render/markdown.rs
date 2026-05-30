@@ -350,13 +350,13 @@ impl Writer {
             }
             Tag::Link { dest_url, .. } => {
                 self.link_stack.push(dest_url.into_string());
-                // Link text reads in the same `Cyan` as inline code,
+                // Link text reads in the same accent as inline code,
                 // with `underlined` to disambiguate from identifiers.
                 // The trailing `(url)` follows the same style because
                 // it's pushed via `current_style`.
                 self.push_style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(palette::INLINE_CODE_FG)
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
@@ -601,7 +601,7 @@ fn inline_code_style_for(text: &str) -> Style {
     let color = if looks_like_session_id(text) || lower.starts_with("session") {
         palette::QUIET
     } else if lower.contains("model") || text.starts_with('@') {
-        Color::LightMagenta
+        palette::INLINE_MODEL_FG
     } else if lower.contains("branch") || lower.contains("refs/") || lower.contains('/') {
         Color::Magenta
     } else if lower.contains("cost")
@@ -611,7 +611,7 @@ fn inline_code_style_for(text: &str) -> Style {
     {
         palette::AMBER
     } else {
-        Color::Cyan
+        palette::INLINE_CODE_FG
     };
     Style::default().fg(color)
 }
