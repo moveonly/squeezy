@@ -2823,7 +2823,7 @@ impl Agent {
                 "record": report.record,
                 "summary": report.summary,
                 "replacement_id": report.record.replacement_id,
-                "conversation": report.dropped,
+                "conversation": report.post_compact,
             }),
         );
     }
@@ -4680,7 +4680,7 @@ impl TurnRuntime {
                     "record": report.record,
                     "summary": report.summary,
                     "replacement_id": report.record.replacement_id,
-                    "conversation": report.dropped,
+                    "conversation": report.post_compact,
                 }),
             );
             let _ = self
@@ -5781,7 +5781,7 @@ impl TurnRuntime {
                         "record": report.record,
                         "summary": report.summary,
                         "replacement_id": report.record.replacement_id,
-                        "conversation": report.dropped,
+                        "conversation": report.post_compact,
                         "phase": "mid_turn",
                     }),
                 );

@@ -1487,6 +1487,184 @@ fn replay_snaps_to_compaction_checkpoint() {
 }
 
 #[test]
+fn replay_keeps_post_compact_base_and_skips_dropped_turns() {
+    // Producer/consumer contract: the `context_compacted` event's
+    // `conversation` field carries the *post-compact* base (summary head
+    // + kept recent items), not the dropped slice. `replay_resume_state`
+    // must snap to that base, dropping older pre-compact turns and
+    // forward-replaying only strictly-newer events. This pins the fix
+    // for `squeezy-bgc` (wave-1 critical): a buggy producer that wrote
+    // the dropped slice into `conversation` resurrected older turns and
+    // silently lost the kept ones on resume.
+    let root = temp_root("replay-post-compact-base");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    // Pre-compact turns 1+2 (these are the items the compaction will
+    // drop). They live in `events.jsonl` before the compaction event;
+    // the snap-to-checkpoint replay must skip them entirely.
+    for (user, assistant) in [
+        ("turn1 user prompt", "turn1 assistant reply"),
+        ("turn2 user prompt", "turn2 assistant reply"),
+    ] {
+        handle
+            .append_event(SessionEvent::new(
+                "user_message",
+                None,
+                Some(user.to_string()),
+                json!({}),
+            ))
+            .expect("append pre-compact user");
+        handle
+            .append_event(SessionEvent::new(
+                "assistant_completed",
+                None,
+                Some(assistant.to_string()),
+                json!({}),
+            ))
+            .expect("append pre-compact assistant");
+    }
+    // Pre-compact turns 3+4 (these are the items the compaction keeps).
+    // They live in `events.jsonl` before the compaction event too, but
+    // are subsumed by the checkpoint snapshot — the checkpoint already
+    // carries them, so the snap-to-checkpoint replay must not double-
+    // insert them via linear forward replay.
+    for (user, assistant) in [
+        ("turn3 user prompt", "turn3 assistant reply"),
+        ("turn4 user prompt", "turn4 assistant reply"),
+    ] {
+        handle
+            .append_event(SessionEvent::new(
+                "user_message",
+                None,
+                Some(user.to_string()),
+                json!({}),
+            ))
+            .expect("append kept user");
+        handle
+            .append_event(SessionEvent::new(
+                "assistant_completed",
+                None,
+                Some(assistant.to_string()),
+                json!({}),
+            ))
+            .expect("append kept assistant");
+    }
+
+    // Post-compact base = summary head + kept turns 3+4. This is what
+    // the producer now stamps into the `conversation` field after the
+    // fix; pre-fix code wrote the dropped (turn1+2) slice here.
+    let post_compact_base: Vec<ResumeItem> = vec![
+        ResumeItem::UserText {
+            text: "<compaction summary head>".to_string(),
+        },
+        ResumeItem::UserText {
+            text: "turn3 user prompt".to_string(),
+        },
+        ResumeItem::AssistantText {
+            text: "turn3 assistant reply".to_string(),
+        },
+        ResumeItem::UserText {
+            text: "turn4 user prompt".to_string(),
+        },
+        ResumeItem::AssistantText {
+            text: "turn4 assistant reply".to_string(),
+        },
+    ];
+    handle
+        .append_event(SessionEvent::new(
+            "context_compacted",
+            None,
+            Some("compacted".to_string()),
+            json!({
+                "record": null,
+                "summary": "<compaction summary head>",
+                "replacement_id": "ckpt-1",
+                "conversation": post_compact_base.clone(),
+            }),
+        ))
+        .expect("append context_compacted");
+    // Turn 5: a post-compact user prompt + assistant reply that must be
+    // forward-replayed on top of the checkpoint.
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("turn5 user prompt".to_string()),
+            json!({}),
+        ))
+        .expect("append post-compact user");
+    handle
+        .append_event(SessionEvent::new(
+            "assistant_completed",
+            None,
+            Some("turn5 assistant reply".to_string()),
+            json!({}),
+        ))
+        .expect("append post-compact assistant");
+    handle.flush_events().expect("flush events");
+
+    let replayed = handle.replay_resume_state().expect("replay");
+    assert!(replayed.resume_available);
+
+    // The dropped slice (turn1+2) must not resurface.
+    for ghost in [
+        "turn1 user prompt",
+        "turn1 assistant reply",
+        "turn2 user prompt",
+        "turn2 assistant reply",
+    ] {
+        assert!(
+            !replayed.conversation.iter().any(|item| match item {
+                ResumeItem::UserText { text } | ResumeItem::AssistantText { text } => text == ghost,
+                _ => false,
+            }),
+            "dropped turn {ghost:?} must not appear in replay; got {:?}",
+            replayed.conversation,
+        );
+    }
+
+    // Summary head + kept turns 3+4 must be present, in order, with no
+    // duplicates (the linear-replay pass must skip events at or before
+    // the checkpoint index).
+    let expected_prefix: Vec<&str> = vec![
+        "<compaction summary head>",
+        "turn3 user prompt",
+        "turn3 assistant reply",
+        "turn4 user prompt",
+        "turn4 assistant reply",
+        "turn5 user prompt",
+        "turn5 assistant reply",
+    ];
+    let actual_texts: Vec<String> = replayed
+        .conversation
+        .iter()
+        .map(|item| match item {
+            ResumeItem::UserText { text } | ResumeItem::AssistantText { text } => text.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        actual_texts,
+        expected_prefix
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        "replay must equal post-compact base + strictly-newer events",
+    );
+}
+
+#[test]
 fn session_event_kind_parses_unknown_as_unknown() {
     let event = SessionEvent::new("bogus_kind", None, None, json!({"foo": "bar"}));
     let typed = SessionEventKind::try_from_event(&event).expect("typed");
