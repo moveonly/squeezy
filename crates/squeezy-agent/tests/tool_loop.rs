@@ -368,15 +368,27 @@ async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "Windows default thread stack is 1MB; F10's buffer_unordered subagent dispatch \
-              exceeds it on win-x86_64 only. Real fix is to spawn the subagent fan-out on a \
-              dedicated tokio task with explicit Builder::new_multi_thread + thread_stack_size, \
-              tracked as a follow-up to F10-pi-parallel-and-chain-modes."
-)]
-async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
+#[test]
+fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
+    // F10's buffer_unordered subagent dispatch produces a deep async
+    // state-machine that exhausts the default 1 MB Windows thread stack
+    // and (post-#200's `Agent::background_tasks` plumbing) the default
+    // ~8 MB tokio worker stack on macOS too. Until the subagent fan-out
+    // is moved to a dedicated runtime with an explicit
+    // `thread_stack_size`, build the per-test runtime here so the test
+    // doesn't depend on whatever default the host OS picked. Linux CI
+    // already has enough headroom; this keeps Linux green AND fixes
+    // macOS/Windows.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs_impl());
+}
+
+async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs_impl() {
     let root = temp_workspace("explore_subagent_isolated");
     fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
     let provider = Arc::new(ScriptedProvider::new(vec![
