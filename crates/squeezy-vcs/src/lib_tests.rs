@@ -275,6 +275,69 @@ fn checkpoint_tracking_skips_ignored_large_files_without_failing() {
 }
 
 #[test]
+fn track_tree_succeeds_when_workspace_gitignore_matches_squeezy_dir() {
+    // bd-squeezy-42pp: when the workspace `.gitignore` matches `.squeezy/`,
+    // `git add --all -- . :(exclude).squeezy` exits 1 with an
+    // `addIgnoredFile` advisory even though every non-excluded file was
+    // staged. `track_tree` must tolerate that exit and still produce a
+    // tree-id; otherwise every edit-tool that drives checkpointing fails.
+    let root = temp_repo("checkpoint_ignored_squeezy_dir");
+    fs::write(root.join(".gitignore"), "**/.squeezy/\n").expect("write gitignore");
+    fs::create_dir_all(root.join(".squeezy").join("sub")).expect("create shadow dir");
+    fs::write(root.join(".squeezy").join("sub").join("file"), "shadow\n").expect("write shadow");
+    fs::write(root.join("foo.txt"), "new\n").expect("write foo");
+
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store
+        .track_tree()
+        .expect("track before with gitignored .squeezy");
+    assert!(!before.tree.is_empty(), "track_tree must yield a tree id");
+
+    fs::write(root.join("foo.txt"), "edit\n").expect("modify foo");
+    let record = store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint must exist for modified foo.txt");
+    assert_eq!(record.summary.files_changed, 1);
+    assert_eq!(record.files[0].path, "foo.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn track_tree_propagates_non_advisory_git_add_errors() {
+    // bd-squeezy-42pp: the gitignore tolerance must only swallow the
+    // addIgnoredFile advisory. Any other stderr body (e.g. a real
+    // pathspec / index failure) must still bubble up.
+    assert!(super::is_add_ignored_advisory_only(
+        "The following paths are ignored by one of your .gitignore files:\n\
+         .squeezy\n\
+         hint: Use -f if you really want to add them.\n\
+         hint: Turn this message off by running\n\
+         hint: \"git config advice.addIgnoredFile false\"\n"
+    ));
+    assert!(super::is_add_ignored_advisory_only(
+        "The following paths are ignored by one of your .gitignore files:\n.squeezy\n"
+    ));
+    assert!(!super::is_add_ignored_advisory_only(
+        "fatal: pathspec 'missing' did not match any files\n"
+    ));
+    assert!(!super::is_add_ignored_advisory_only(""));
+    assert!(!super::is_add_ignored_advisory_only(
+        "The following paths are ignored by one of your .gitignore files:\n\
+         .squeezy\n\
+         fatal: unrelated index corruption\n"
+    ));
+}
+
+#[test]
 fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
     let root = temp_repo("checkpoint_conflict");
     fs::write(root.join("a.txt"), "A\n").expect("write a");

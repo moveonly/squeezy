@@ -894,7 +894,19 @@ impl CheckpointStore {
         for file in &large_files {
             add_args.push(format!(":(exclude){}", file.path));
         }
-        self.git_vec(add_args)?;
+        // Git exits 1 with an "addIgnoredFile" advisory when a workspace
+        // `.gitignore` matches `.squeezy/` (squeezy ships exactly that rule
+        // in its own repo). The exclude pathspec is matched literally before
+        // the gitignore check, so the advisory fires even though every
+        // non-excluded file was staged successfully. Allow status 1 here and
+        // treat the run as a success when stderr only carries the advisory.
+        let add_output = self.git_vec_allow_status(add_args, &[0, 1])?;
+        if add_output.status.code() == Some(1) {
+            let stderr = String::from_utf8_lossy(&add_output.stderr);
+            if !is_add_ignored_advisory_only(&stderr) {
+                return Err(SqueezyError::Tool(stderr.trim().to_string()));
+            }
+        }
         if !large_files.is_empty() {
             let mut rm_args = vec![
                 "rm".to_string(),
@@ -2240,6 +2252,49 @@ fn parse_hunk_range(value: &str) -> (u32, u32) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
     (start, lines)
+}
+
+/// `true` when every non-empty line of `git add` stderr is part of the
+/// "paths are ignored by one of your .gitignore files" advisory.
+///
+/// The advisory body is: a header line, the listed paths (one per line,
+/// flush-left, no leading whitespace), and zero or more `hint: …` lines
+/// suggesting `-f` or `git config advice.addIgnoredFile false`. When that
+/// is the entire stderr, the add already succeeded for every non-excluded
+/// path and the non-zero exit is purely informational.
+///
+/// Any `fatal:` / `error:` / unknown diagnostic line — even mixed in after
+/// the header — causes this to return `false` so the real error still
+/// propagates through [`SqueezyError::Tool`].
+fn is_add_ignored_advisory_only(stderr: &str) -> bool {
+    let mut saw_header = false;
+    for raw_line in stderr.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("hint:") {
+            continue;
+        }
+        if line == "The following paths are ignored by one of your .gitignore files:" {
+            saw_header = true;
+            continue;
+        }
+        if !saw_header {
+            return false;
+        }
+        // After the header, accept only listed pathspecs: literal path
+        // tokens with no whitespace. Anything else (e.g. `fatal: …`,
+        // `error: …`, a stray `warning: …`) is a real diagnostic and must
+        // propagate.
+        if line.contains(char::is_whitespace) {
+            return false;
+        }
+        if line.starts_with("fatal:") || line.starts_with("error:") {
+            return false;
+        }
+    }
+    saw_header
 }
 
 #[cfg(test)]
