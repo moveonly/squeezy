@@ -1,0 +1,92 @@
+id = "wave2-16-status-line-cost-openai"
+title = "Wave-2 / 16 status-line-and-cost — OpenAI gpt-5.4-mini"
+description = """
+Domain 16 of the wave-2 bug-hunt: probe the bottom status line's render
+order, the `cost ...` segment formatting, and the cost-cap warning
+surface. Per the wave-2 plan we pin a tight session cost cap
+(`max_session_cost_usd_micros = 10_000` ≈ $0.01) so a single live
+`gpt-5.4-mini` turn (~14k input tokens against this repo) trips the
+cap before completion.
+
+Per the rubric, this probe asks:
+
+  1. Visual clarity — the status-line cost segment is rendered through
+     `render_status_detail_line`
+     (`crates/squeezy-tui/src/status.rs:303`). Each accent family uses
+     `StatusLineAccent::fallback_color`
+     (`crates/squeezy-tui/src/status.rs:290-296`) which delegates to
+     `ACCENT_CYAN` / `ACCENT_GREEN` / `ACCENT_MAGENTA` in
+     `crates/squeezy-tui/src/render/palette.rs:47-49`. Those constants
+     each sit at luminance ~96-114, comfortably under the wave-2
+     guardrail (luma > 160 = finding). The dark-only palette rule
+     applies: a regression that swaps any of these to `Color::White`
+     (lum 255) or a bright RGB would fire a finding.
+  2. Functionality — the default status-line items
+     (`DEFAULT_STATUS_LINE_ITEMS`,
+     `crates/squeezy-tui/src/status.rs:29-36`) must render in the
+     declared order: provider-and-model, current-dir, git-branch,
+     pull-request-number (only when present), branch-changes, cost.
+     A regression that reorders or silently drops the cost segment
+     would invalidate the user's ability to monitor spend.
+  3. Messaging — when `cost_cap_usd_micros` is `Some(cap > 0)` the
+     cost segment renders as `cost ${spent} / ${cap:.2} (N%)` per
+     `format_cost_segment` (`crates/squeezy-tui/src/status.rs:520-542`)
+     and the CostBroker emits a transcript notice ("session cost
+     crossed warning threshold: spent $X of $Y cap (N%)" via
+     `crates/squeezy-tui/src/events.rs:363-371`). The cap-reached
+     transcript copy comes from `format_cap_reached_reason`
+     (`crates/squeezy-agent/src/cost_broker.rs:259-266`) — "session
+     cost cap reached: spent $X of $Y (N%)". Both strings must cite a
+     next step (e.g. "raise cap with /config" or similar) — the
+     wave-2 rubric flags messages that don't.
+  4. Diff readability — n/a for this domain (no diff renders).
+  5. Progressive disclosure — when the cap fires, the user should see
+     both the per-frame status-line cost segment (always visible) AND
+     a transcript notice (one keystroke or scrollback away). A
+     regression that drops one without the other is a finding.
+  6. Cross-model consistency — compared head-to-head with the
+     anthropic and portkey siblings.
+
+Probe shape:
+
+  - Snapshot workspace so any model-attempted edits never reach the
+    live checkout.
+  - One real turn against `gpt-5.4-mini` with a prompt that nudges
+    the model to grep the codebase (assuring some input-token weight
+    + at least one tool call so cost actually accumulates) BEFORE
+    the model can finish.
+  - `permission_mode = "allow"` so the shell call doesn't block on an
+    approval popup.
+  - `max_session_cost_usd_micros = 10_000` (≈$0.01) per the wave-2
+    brief; the squeezy repo's system-prompt + first shell call lands
+    well above this so the cap trip is deterministic.
+
+Requires `OPENAI_API_KEY` in env. Provider config errors are a
+medium finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+max_session_cost_usd_micros = 10000
+
+[[steps]]
+kind = "prompt"
+text = "Use the shell tool to grep the repo for `pub fn render_status_detail_line` then summarise where the status-line renderer lives. Use the shell tool exactly once."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

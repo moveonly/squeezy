@@ -1,0 +1,75 @@
+id = "wave2-14-tool-card-coalescing-anthropic"
+title = "Wave-2 / domain 14 — tool card coalescing on Anthropic claude-haiku-4-5"
+description = """
+Wave-2 row 14 (tool-card-coalescing) cross-provider companion to
+the OpenAI scenario. Drives five adjacent grep tool calls against
+Anthropic Haiku 4.5 and asserts the grouped card landing.
+
+Note: Anthropic Haiku 4.5 declares `capabilities.reasoning_effort:
+true` in `crates/squeezy-llm/src/models.json`. The Anthropic API
+rejects `thinking.enabled.budget_tokens < 1024` (HTTP 400) so this
+scenario pins `max_output_tokens >= 1024` to avoid colliding with the
+unrelated wave2-01 finding (filed as `squeezy-71u`).
+
+Requires `ANTHROPIC_API_KEY` exported in the shell. Run with:
+
+    cargo run -p squeezy-eval --quiet -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-14-tool-card-coalescing-anthropic.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+# Haiku 4.5 requires thinking budget >= 1024; bump max_output_tokens
+# to keep the budget clamp under
+# `crates/squeezy-llm/src/anthropic.rs:140` above Anthropic's hard
+# minimum (tracked as squeezy-71u).
+max_output_tokens = 4096
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 60
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Run grep for these five patterns one at a time and list which files matched each: `Agent`, `Turn`, `Skill`, `Plan`, `Tool`."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Searched"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "searches"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "(Ctrl-E to expand all)"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+no_tool_errors = false
+
+[triage]
+enabled = false

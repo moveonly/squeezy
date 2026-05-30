@@ -59,7 +59,7 @@ instructions = "When asked to list N items, output one per line as `1. ...`, `2.
 [[steps]]
 kind = "prompt"
 text = "List 30 ideas for improving a small open-source CLI's onboarding experience. One per line, numbered `1.`, `2.`, ..., `30.`. No preamble."
-wait_for = { kind = "text_contains", text = "5." }
+wait_for = { text_contains = { text = "5." } }
 
 # Recovery probe: this is the harshest case in the matrix because of
 # the known Qwen "thinks but emits nothing" stop pattern. A botched

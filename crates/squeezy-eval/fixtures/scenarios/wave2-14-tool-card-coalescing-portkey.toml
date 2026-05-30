@@ -1,0 +1,71 @@
+id = "wave2-14-tool-card-coalescing-portkey"
+title = "Wave-2 / domain 14 — tool card coalescing on Portkey/OpenRouter Qwen3"
+description = """
+Wave-2 row 14 (tool-card-coalescing) cross-provider companion via
+Portkey's OpenRouter route to Qwen3-35b-a3b. Drives five adjacent
+grep tool calls and asserts the grouped card landing. Qwen3 routes
+often need `tool_choice = "required"` to commit to a tool call after
+the chatty preamble.
+
+Requires `[providers.portkey].api_key` to already be configured in
+`~/.squeezy/settings.toml`. NEVER embed the key in this file.
+
+Run with:
+
+    cargo run -p squeezy-eval --quiet -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-14-tool-card-coalescing-portkey.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 60
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Run grep for these five patterns one at a time and list which files matched each: `Agent`, `Turn`, `Skill`, `Plan`, `Tool`."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Searched"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "searches"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "(Ctrl-E to expand all)"
+
+[expect]
+max_wall_clock_seconds = 300
+max_input_tokens = 250000
+no_tool_errors = false
+
+[triage]
+enabled = false

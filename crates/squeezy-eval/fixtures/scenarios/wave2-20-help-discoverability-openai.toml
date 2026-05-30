@@ -1,0 +1,82 @@
+id = "wave2-20-help-discoverability-openai"
+title = "Wave2 #20 — help & discoverability (OpenAI gpt-5.4-mini)"
+description = """
+Wave-2 bug-hunt slice #20: help-and-discoverability. The probe asks
+the model two discoverability questions a new user would naturally
+ask after launching squeezy without reading docs:
+
+  1. "How do I cancel an in-flight model response in squeezy?" —
+     this is the surface a panicked user reaches for first when a turn
+     misbehaves. The canonical answer in this repo is **Esc** (or
+     Ctrl+C): the footer hint reads
+     `Ctrl-C/Esc interrupt · Enter queue · ...`
+     (`crates/squeezy-tui/src/lib.rs:9910`) and the dispatch is
+     `request_turn_interrupt`
+     (`crates/squeezy-tui/src/lib.rs:1799`,
+     called from the global keymap at
+     `crates/squeezy-tui/src/lib.rs:1396`).
+  2. "Where in the codebase is that handled? Cite the file." — the
+     follow-up forces a grounded answer. A grounded reply names
+     `request_turn_interrupt` or the file `squeezy-tui/src/lib.rs`.
+
+The rubric we score against (see `EVAL_COVERAGE_PLAN_WAVE2.md`
+"Evaluation rubric"):
+
+  - **Functionality**: does the agent name a real key (Esc / Ctrl+C)?
+  - **Messaging**: is the answer terse, actionable, no jargon, free of
+    invented commands like `/stop`, `/abort`, `/cancel-turn`?
+  - **Cross-model consistency**: do all three providers point at the
+    same primitive? If openai says "Esc" and another provider says
+    "Ctrl+C" only, that gap is the finding.
+
+`final_text_contains` pins the expected keyword set. A run that
+misses these surfaces an `expect_final_text_contains` finding rather
+than aborting, per wave-2 plan triage rules.
+
+Requires `OPENAI_API_KEY` exported. Run with:
+
+    source ~/.env.sh
+    cargo run -p squeezy-eval --quiet -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-20-help-discoverability-openai.toml \\
+      --no-triage
+
+Source touchpoints:
+  - footer hint string @ crates/squeezy-tui/src/lib.rs:9910
+  - request_turn_interrupt @ crates/squeezy-tui/src/lib.rs:1799
+  - Esc → interrupt dispatch @ crates/squeezy-tui/src/lib.rs:1396
+  - SLASH_COMMANDS table (no /cancel or /stop entry) @ crates/squeezy-tui/src/input.rs:108
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 512
+
+[[steps]]
+kind = "prompt"
+text = "How do I cancel an in-flight model response in squeezy? Answer in one short sentence — name the key or command a user would press."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Where in the codebase is that cancel handled? Name the file path under `crates/`."
+wait_for = "turn_completed"
+
+[expect]
+# Final answer must mention either Esc or Ctrl+C (the keys the footer
+# documents) AND it must cite a file path under crates/squeezy-tui —
+# `request_turn_interrupt` lives at lib.rs:1799. A miss surfaces an
+# `expect_final_text_contains` finding for triage.
+final_text_contains = ["squeezy-tui"]
+max_wall_clock_seconds = 180
+max_input_tokens = 200000
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,93 @@
+id = "wave2-15-working-card-portkey"
+title = "Wave-2 / 15 working-card-and-spinner — Portkey @openrouter/qwen3.6-35b-a3b"
+description = """
+Domain 15 of the wave-2 bug-hunt, Portkey/Qwen sibling. Mirrors the
+OpenAI and Anthropic probes but pins `tool_choice = "required"` so the
+Qwen3 chatty-preamble pattern (`stop_with_intent_text_no_tool_call`)
+cannot mask whether the model actually fires the tool sequence that
+makes the working card visible. Portkey key lives in
+`~/.squeezy/settings.toml`.
+
+Same domain-15 questions as the sibling fixtures:
+
+  - Working-line activity bullet must resolve to the AMBER brand
+    colour (`render::palette::accent_primary()` →
+    `Color::Rgb(215, 147, 52)`) at
+    `crates/squeezy-tui/src/lib.rs:4937`.
+  - Tool-args span at `crates/squeezy-tui/src/lib.rs:7865` is hard
+    `Color::White` — luminance 255 — palette finding regardless of
+    provider.
+  - Elapsed clock segment `(<N>s · esc to interrupt)` advances via
+    `prompt_elapsed_ms` (lib.rs:9178). Tick is gated on
+    `app.focused = true` (lib.rs:587) — the harness runs focused so
+    this advances during the run.
+  - Detail row from `working_detail_line` (lib.rs:4877) surfaces
+    `+N more tool call(s) queued` when the active set has more than
+    one non-control entry.
+
+Requires `[providers.portkey] api_key = "..."` in
+`~/.squeezy/settings.toml`. Provider config errors are a medium
+finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+instructions = "Reply with exactly the word ok. Use the read_file tool exactly once on Cargo.toml as the way to deliver your answer."
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+# Single short prompt with a one-shot read_file. `tool_choice = required`
+# forces a tool emission so we can still observe the Qwen wire behaviour;
+# the read is bounded so the turn finishes within the harness 180s
+# `pump_until_idle` deadline. Finding-doc analysis covers the
+# working_line / active_tool_spans render paths.
+[[steps]]
+kind = "prompt"
+text = "Use read_file on Cargo.toml then reply with the single word ok."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 1
+
+# Post-turn frame should still carry the AMBER brand-coloured prompt
+# coin (●), the canonical idle-state brand cue
+# (`crates/squeezy-tui/src/lib.rs:9152`).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "●"
+
+# Worked-for divider replaces the working line once the turn ends
+# (`crates/squeezy-tui/src/lib.rs:5023`).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Worked for"
+
+[expect]
+max_wall_clock_seconds = 300
+max_input_tokens = 200000
+max_tools_per_turn = 12
+no_tool_errors = false
+
+[triage]
+enabled = false

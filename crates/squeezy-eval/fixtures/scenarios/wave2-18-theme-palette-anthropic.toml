@@ -1,0 +1,104 @@
+id = "wave2-18-theme-palette-anthropic"
+title = "Wave-2 / domain 18 — theme + palette swap on Anthropic Haiku 4.5"
+description = """
+Wave-2 row 18 (theme-and-color-palette) cross-provider companion via
+Anthropic claude-haiku-4-5-20251001. Same probe shape as the OpenAI
+variant — boot the TUI, walk `/theme dark` → `/theme catppuccin` →
+`/theme dark`, capture frames around each swap so a future palette
+regression (or AMBER drift) trips a `tui_frame_contains` finding.
+
+Requires `ANTHROPIC_API_KEY` exported. Anthropic Haiku 4.5 has a
+1024-token thinking budget minimum (squeezy-irg / squeezy-71u): keep
+`max_output_tokens` at 2048 so the budget broker doesn't clamp below
+the minimum.
+
+Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-18-theme-palette-anthropic.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Say 'ok' and stop."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ">_ Squeezy v"
+
+# NOTE: `TuiHarness::new` hardcodes provider label as `"eval-harness"`
+# (`crates/squeezy-tui/src/testing.rs:53`), so this scenario asserts on
+# the model-id suffix only. See finding doc for the harness-coverage
+# gap ticket.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ":claude-haiku-4-5-20251001"
+
+# Phase 1: drive `/theme dark` through the composer.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "t", "h", "e", "m", "e", "space", "d", "a", "r", "k", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "theme"
+
+# Phase 2: drive `/theme catppuccin` through the composer.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = [
+  "/", "t", "h", "e", "m", "e", "space",
+  "c", "a", "t", "p", "p", "u", "c", "c", "i", "n", "Enter",
+]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "catppuccin"
+
+# Phase 3: drive `/theme dark` again — verify the second swap also
+# bumps `palette_generation()`.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "t", "h", "e", "m", "e", "space", "d", "a", "r", "k", "Enter"]
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = true
+
+[triage]
+enabled = false

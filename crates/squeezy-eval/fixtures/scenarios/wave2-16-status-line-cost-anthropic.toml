@@ -1,0 +1,82 @@
+id = "wave2-16-status-line-cost-anthropic"
+title = "Wave-2 / 16 status-line-and-cost — Anthropic claude-haiku-4-5"
+description = """
+Domain 16 of the wave-2 bug-hunt, Anthropic sibling. Same probe shape
+as `wave2-16-status-line-cost-openai.toml` against
+`claude-haiku-4-5-20251001` so cross-model consistency of the
+status-line cost segment and the cap-reached transcript notice can be
+checked.
+
+Why this probe matters:
+
+  - The status-line cost segment is rendered through
+    `format_cost_segment` (`crates/squeezy-tui/src/status.rs:520-542`)
+    which threads `cost_cap_usd_micros`
+    (`crates/squeezy-tui/src/lib.rs:10481, 10812`) — a Some(cap>0)
+    causes the segment to switch from `cost ${spent}` to
+    `cost ${spent} / ${cap:.2} (N%)`. Anthropic streams reasoning +
+    tool-call sequences slightly differently from OpenAI, and the
+    CostBroker (`crates/squeezy-agent/src/cost_broker.rs:67`) tracks
+    pricing through `squeezy_llm::estimate_cost`. If the Anthropic
+    pricing entry is wrong or the cap-trip timing is different, the
+    user-visible cost segment + transcript notice diverge across
+    providers and that is the finding.
+  - The cap-reached transcript copy comes from
+    `format_cap_reached_reason`
+    (`crates/squeezy-agent/src/cost_broker.rs:259-266`) — "session
+    cost cap reached: spent $X of $Y (N%)". The string does not name
+    a next step (e.g. how to raise the cap), which per the wave-2
+    messaging rubric is a finding.
+  - The default status-line items
+    (`DEFAULT_STATUS_LINE_ITEMS`,
+    `crates/squeezy-tui/src/status.rs:29-36`) must render in the
+    declared order across providers. A regression that drops the
+    cost segment on Anthropic only would be a cross-model
+    consistency finding.
+  - Wave-2 palette rule: all accent constants
+    (`ACCENT_CYAN` / `ACCENT_GREEN` / `ACCENT_MAGENTA` in
+    `crates/squeezy-tui/src/render/palette.rs:47-49`) sit at
+    luminance ~96-114, comfortably under the wave-2 guardrail
+    (luma > 160). Any cell rendering at luma > 160 in the status
+    detail line is a finding regardless of provider.
+
+Probe shape:
+
+  - Snapshot workspace so any model-attempted edits never reach the
+    live checkout.
+  - One real turn against `claude-haiku-4-5-20251001`
+    (`max_output_tokens = 2048` per the wave-2 brief).
+  - Prompt nudges the model into a single shell call to grep the repo
+    so cost accumulates beyond the $0.01 cap.
+  - `max_session_cost_usd_micros = 10_000` (≈$0.01) per the wave-2
+    brief.
+
+Requires `ANTHROPIC_API_KEY` in env. Provider config errors are a
+medium finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+max_session_cost_usd_micros = 10000
+
+[[steps]]
+kind = "prompt"
+text = "Use the shell tool to grep the repo for `pub fn render_status_detail_line` then summarise where the status-line renderer lives. Use the shell tool exactly once."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

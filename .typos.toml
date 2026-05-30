@@ -11,3 +11,7 @@ rustfmt = "rustfmt"
 serde = "serde"
 squeezy = "squeezy"
 unparseable = "unparseable"
+# Beads ticket slug fragment + short git-SHA fragment that look like
+# typos when typos-cli tokenises identifiers on digits.
+tje = "tje"
+ba = "ba"

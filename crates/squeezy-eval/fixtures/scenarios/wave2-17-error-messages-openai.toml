@@ -57,6 +57,20 @@ mode = "build"
 permission_mode = "allow"
 max_output_tokens = 1024
 
+# `permission_mode = "allow"` only covers edit/shell/web/mcp in the eval
+# driver; `read_file` lives under the Read capability and falls through
+# the default `Ask`. Pre-arm approval so the tool actually executes and
+# the model sees the underlying not-found / validation error.
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "read_file" }
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "read_file" }
+
 [[steps]]
 kind = "prompt"
 text = "Use the read_file tool to read the file at path `nonexistent.txt` at the repo root. After the tool errors, summarise the error in one line including the path and what a user should do next."

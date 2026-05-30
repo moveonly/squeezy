@@ -1,0 +1,104 @@
+id = "wave2-15-working-card-anthropic"
+title = "Wave-2 / 15 working-card-and-spinner — Anthropic claude-haiku-4-5"
+description = """
+Domain 15 of the wave-2 bug-hunt, Anthropic sibling. Same probe shape
+as `wave2-15-working-card-openai.toml` against
+`claude-haiku-4-5-20251001` so cross-model consistency of the working
+card can be checked.
+
+`max_output_tokens = 2048` avoids the Haiku thinking-budget clamp
+documented as squeezy-71u in the harness troubleshooting notes — Haiku
+4.5 silently caps reasoning when `max_output_tokens` is small enough
+that the visible-content budget collapses; staying ≥ 2k keeps the
+working-card render path exercised by a real, non-trivial tool
+sequence.
+
+Domain 15 questions per the rubric:
+
+  1. Visual clarity — confirm the working-line activity bullet pulls
+     `accent_primary()` (AMBER `Rgb(215, 147, 52)`) at
+     `crates/squeezy-tui/src/lib.rs:4937`. The tool-args span at
+     `crates/squeezy-tui/src/lib.rs:7865` is hard-coded
+     `Color::White` (luminance 255 — palette violation) for non-shell
+     tools, which is the headline visual finding for this domain. The
+     anthropic sibling captures a rendered frame so the cross-model
+     occurrence is documented.
+  2. Functionality — `working_line` must show
+     `• Working (<N>s · esc to interrupt)` while turn is in progress
+     and an active tool name when one fires. Elapsed tick must
+     advance — `prompt_elapsed_ms` reads
+     `animation_tick * animation_tick_rate` at
+     `crates/squeezy-tui/src/lib.rs:9178`. The main loop only ticks
+     when `app.focused = true` (lib.rs:587) so the test runs with
+     `focused = true` by default.
+  3. Messaging — the `working_detail_line` strings
+     (`+N more tool call(s) queued`, `mcp: starting X/Y servers`,
+     `computing diff…`) at lib.rs:4877 are concrete next-step
+     indicators. We capture whether Haiku's tool sequence triggers
+     the detail row in practice.
+  4. Diff readability — n/a (no diff renders this turn).
+  5. Progressive disclosure — single row unless detail required;
+     captured by `task_panel_height` test.
+  6. Cross-model consistency — sibling to openai + portkey runs.
+
+Requires `ANTHROPIC_API_KEY` in env. Provider config errors are a
+medium finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+# Single short prompt — no tool use. The turn completes quickly so the
+# harness `pump_until_idle` (180s deadline) drains cleanly. Finding-doc
+# analysis covers the working_line / active_tool_spans render paths.
+[[steps]]
+kind = "prompt"
+text = "Reply with the single word ok."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 1
+
+# Post-turn frame should still carry the AMBER brand-coloured prompt
+# coin (●), the canonical idle-state brand cue
+# (`crates/squeezy-tui/src/lib.rs:9152`).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "●"
+
+# Worked-for divider replaces the working line once the turn ends
+# (`crates/squeezy-tui/src/lib.rs:5023`).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Worked for"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 12
+no_tool_errors = false
+
+[triage]
+enabled = false

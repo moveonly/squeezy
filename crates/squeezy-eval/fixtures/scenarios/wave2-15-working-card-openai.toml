@@ -1,0 +1,125 @@
+id = "wave2-15-working-card-openai"
+title = "Wave-2 / 15 working-card-and-spinner — OpenAI gpt-5.4-mini"
+description = """
+Domain 15 of the wave-2 bug-hunt — `working-card-and-spinner`. Probes
+the working-card render path while the agent is mid-turn against a real
+provider, so the rubric can check:
+
+  1. Visual clarity — the working line is built by `working_line` at
+     `crates/squeezy-tui/src/lib.rs:4932`. The activity bullet uses
+     `render::palette::accent_primary()` which resolves to the AMBER
+     brand colour `Rgb(215, 147, 52)` for the default accent. The
+     friendly tool name uses `AMBER` bold at
+     `crates/squeezy-tui/src/lib.rs:7847`. BUT the tool arguments span
+     for non-shell tools (`grep`, `read_file`, etc.) is forced to
+     `Color::White` at `crates/squeezy-tui/src/lib.rs:7865`, which
+     renders at luminance 255 on dark terminals — a palette-guardrail
+     finding per the wave-2 brief (luminance > 160 = finding). This
+     scenario captures the rendered frame mid-stream so the white args
+     span appears in the snapshot.
+  2. Functionality — assert the working line carries the spinner
+     prefix (`• `) and the elapsed-clock segment (`(<N>s · esc to
+     interrupt)`) and that at least one tool name shows in the active
+     row. The shimmer animation is driven by `working_word_spans` /
+     `shimmer_word_spans` at lib.rs:4977/4981 — the `Working` letters
+     blend AMBER ↔ `WORKING_SHIMMER_HIGHLIGHT` over a 3.4-second sweep,
+     and the frame should contain the word `Working` (the shimmer is
+     opt-in only on the per-glyph color, not on which glyphs render).
+  3. Messaging — the detail row from `working_detail_line` at
+     lib.rs:4877 surfaces `+N more tool call(s) queued` when the
+     active set has more than one non-control entry. We provoke a
+     multi-tool sequence (several greps and read_files) so the detail
+     row has a real chance to fire.
+  4. Diff readability — n/a for this domain (no diff renders).
+  5. Progressive disclosure — the working card collapses to one row
+     unless a detail line is required (`task_panel_height` at
+     lib.rs:4840). With a multi-tool prompt we expect to see the
+     two-row growth at least once.
+  6. Cross-model consistency — compared head-to-head with the
+     anthropic and portkey siblings.
+
+Probe shape:
+
+  - Permission mode `allow` so the model can run greps / read_files
+    without an approval popup.
+  - One prompt that asks the model to walk a few specific source files
+    (palette + working-line helpers) and report which palette
+    constants the spinner pulls in. Naming concrete files steers the
+    agent into multiple short tool calls, which is what makes the
+    working card visible long enough to render.
+  - `tui_capture.enabled = true, drive_tui = true` so the rendered
+    frame is captured and `tui_frame_contains` can probe the rendered
+    cells.
+
+Requires `OPENAI_API_KEY` in env. Provider config errors are a medium
+finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+# Single short prompt — no tool use. The turn completes quickly so the
+# harness `pump_until_idle` (180s deadline) drains cleanly. The probe
+# value of this scenario is the captured trace + frames + the code-path
+# inspection in the finding doc: working_line and active_tool_spans live
+# at fixed offsets, so the AMBER + `Color::White` palette analysis is
+# stable across runs and does not require the model to emit a tool call.
+# A future TuiHarness extension that supports mid-turn frame capture
+# (`send_key` while a stream is mid-flight) would let this assertion
+# pivot to `tui_frame_contains "esc to interrupt"`.
+[[steps]]
+kind = "prompt"
+text = "Reply with the single word ok."
+wait_for = "turn_completed"
+
+# Wait so any post-turn animation work settles before snapshot.
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 1
+
+# Post-turn frame should still carry the AMBER brand-coloured prompt
+# coin (●), which is the canonical idle-state brand cue rendered by
+# `prompt_coin_span` at `crates/squeezy-tui/src/lib.rs:9152`. The
+# coin glyph stays visible regardless of turn state.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "●"
+
+# Worked-for divider replaces the working line once the turn ends.
+# `worked_divider_line` at `crates/squeezy-tui/src/lib.rs:5023` writes
+# `─ Worked for <duration> ─` so its presence confirms the task panel
+# transitioned out of `turn_in_progress`. A regression where the
+# spinner persists post-turn (or worked-for never renders) trips here.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Worked for"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 12
+no_tool_errors = false
+
+[triage]
+enabled = false

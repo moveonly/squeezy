@@ -1,0 +1,66 @@
+id = "wave2-20-help-discoverability-anthropic"
+title = "Wave2 #20 — help & discoverability (Anthropic Haiku 4.5)"
+description = """
+Wave-2 bug-hunt slice #20: help-and-discoverability — Anthropic
+mirror of the openai probe. Asks the same two discoverability
+questions a new user would naturally ask:
+
+  1. "How do I cancel an in-flight model response in squeezy?" —
+     canonical answer: **Esc** or **Ctrl+C**, see footer hint at
+     `crates/squeezy-tui/src/lib.rs:9910` and the dispatch at
+     `request_turn_interrupt`
+     (`crates/squeezy-tui/src/lib.rs:1799`).
+  2. "Where in the codebase is that cancel handled?" — grounded
+     follow-up that should land on `squeezy-tui/src/lib.rs`.
+
+Same rubric as the openai twin (Functionality / Messaging /
+Cross-model consistency). The cross-model comparison is the whole
+point: if Haiku invents `/stop` or `:q!` and openai gets it right,
+the gap is the finding.
+
+Requires `ANTHROPIC_API_KEY`. Run with:
+
+    source ~/.env.sh
+    cargo run -p squeezy-eval --quiet -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-20-help-discoverability-anthropic.toml \\
+      --no-triage
+
+Source touchpoints:
+  - footer hint string @ crates/squeezy-tui/src/lib.rs:9910
+  - request_turn_interrupt @ crates/squeezy-tui/src/lib.rs:1799
+  - Esc → interrupt dispatch @ crates/squeezy-tui/src/lib.rs:1396
+  - SLASH_COMMANDS table @ crates/squeezy-tui/src/input.rs:108
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[[steps]]
+kind = "prompt"
+text = "How do I cancel an in-flight model response in squeezy? Answer in one short sentence — name the key or command a user would press."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Where in the codebase is that cancel handled? Name the file path under `crates/`."
+wait_for = "turn_completed"
+
+[expect]
+# Final answer must reference a `squeezy-tui` source file — the
+# cancel primitive lives in `crates/squeezy-tui/src/lib.rs`. A miss
+# surfaces an `expect_final_text_contains` finding for triage.
+final_text_contains = ["squeezy-tui"]
+max_wall_clock_seconds = 180
+max_input_tokens = 200000
+no_tool_errors = false
+
+[triage]
+enabled = false

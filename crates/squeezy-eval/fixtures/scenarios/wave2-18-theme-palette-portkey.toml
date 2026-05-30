@@ -1,0 +1,103 @@
+id = "wave2-18-theme-palette-portkey"
+title = "Wave-2 / domain 18 — theme + palette swap on Portkey/OpenRouter Qwen3"
+description = """
+Wave-2 row 18 (theme-and-color-palette) cross-provider companion via
+Portkey's OpenRouter route to Qwen3-35b-a3b. Same probe shape as the
+OpenAI and Anthropic variants — exercises `/theme dark`, `/theme
+catppuccin`, then back to `/theme dark`, capturing TUI frames at each
+swap so the palette identity strings (AMBER on Default/Dark, catppuccin
+mauve on Catppuccin) can be diffed for cross-model parity.
+
+Requires `[providers.portkey].api_key` to already be configured in
+`~/.squeezy/settings.toml`. NEVER embed the key in this file.
+
+Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-18-theme-palette-portkey.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Say 'ok' and stop."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ">_ Squeezy v"
+
+# NOTE: `TuiHarness::new` hardcodes provider label as `"eval-harness"`
+# (`crates/squeezy-tui/src/testing.rs:53`), so this scenario asserts on
+# the model-id suffix only. See finding doc for the harness-coverage
+# gap ticket.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ":@openrouter/qwen/qwen3.6-35b-a3b"
+
+# Phase 1: drive `/theme dark`.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "t", "h", "e", "m", "e", "space", "d", "a", "r", "k", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "theme"
+
+# Phase 2: drive `/theme catppuccin`.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = [
+  "/", "t", "h", "e", "m", "e", "space",
+  "c", "a", "t", "p", "p", "u", "c", "c", "i", "n", "Enter",
+]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "catppuccin"
+
+# Phase 3: drive `/theme dark` again.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "t", "h", "e", "m", "e", "space", "d", "a", "r", "k", "Enter"]
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = true
+
+[triage]
+enabled = false

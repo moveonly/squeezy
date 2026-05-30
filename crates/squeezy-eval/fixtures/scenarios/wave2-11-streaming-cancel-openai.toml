@@ -62,7 +62,7 @@ instructions = "When asked to list N items, output one per line as `1. ...`, `2.
 [[steps]]
 kind = "prompt"
 text = "List 30 ideas for improving a small open-source CLI's onboarding experience. One per line, numbered `1.`, `2.`, ..., `30.`. No preamble."
-wait_for = { kind = "text_contains", text = "5." }
+wait_for = { text_contains = { text = "5." } }
 
 # After the cancel propagates, send a short follow-up to verify the
 # next turn drives cleanly. A botched cancel commonly surfaces as a

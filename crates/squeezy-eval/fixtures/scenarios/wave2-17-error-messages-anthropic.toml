@@ -28,7 +28,27 @@ provider = "anthropic"
 model = "claude-haiku-4-5-20251001"
 mode = "build"
 permission_mode = "allow"
-max_output_tokens = 1024
+# Anthropic Haiku ships `reasoning_effort = true` in the registry, so the
+# Anthropic backend always sends `thinking.enabled.budget_tokens` (capped
+# at `max_output_tokens.saturating_sub(1)`). Anthropic rejects budgets
+# below 1024 with a 400, so anything < 1025 here yields an unrecoverable
+# provider error before a single tool call lands. Set 8192 to leave
+# 4096 for the configured Low budget and 4096 for completion content.
+max_output_tokens = 8192
+
+# `permission_mode = "allow"` only covers edit/shell/web/mcp in the eval
+# driver; `read_file` lives under the Read capability and falls through
+# the default `Ask`. Pre-arm approval so the tool actually executes and
+# the model sees the underlying not-found / validation error.
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "read_file" }
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "read_file" }
 
 [[steps]]
 kind = "prompt"

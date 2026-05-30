@@ -1,0 +1,93 @@
+id = "wave2-14-tool-card-coalescing-openai"
+title = "Wave-2 / domain 14 — tool card coalescing on OpenAI gpt-5.4-mini"
+description = """
+Wave-2 row 14 (tool-card-coalescing). Drives the live TUI through five
+adjacent `grep` calls inside a single turn and asserts that the
+transcript renders a single grouped card — not five stacked cards. The
+render-time grouping path in
+`crates/squeezy-tui/src/lib.rs:6694` (`tool_run_info`) folds ≥ 2
+adjacent same-tool same-status entries into one card with a `"N
+searches"` header summary built by
+`crates/squeezy-tui/src/lib.rs:6847` (`format_grouped_tool_result_entry`).
+The conceptual `(5x)` indicator surfaces as the grouped count
+("Searched 5 searches") plus the canonical `(Ctrl-E to expand all)`
+affordance row at `crates/squeezy-tui/src/lib.rs:6873`.
+
+Palette guardrail (dark): the grouped header summary, the per-member
+summary rows, and the expand affordance row must all be quiet —
+`QUIET` (`DarkGray`) — not a bright fg. The amber `lead.color()` only
+covers the action verb / marker. Any cell rendering with luminance >
+160 is a `Visual clarity` finding per the wave-2 palette rule.
+
+The prompt instructs the model to issue five separate `grep` calls
+one-at-a-time for the patterns `Agent`, `Turn`, `Skill`, `Plan`,
+`Tool`. Adjacent same-tool same-status entries get the render-time
+group; if the model interleaves text / other tool calls, the
+adjacency breaks and the card collapses to a non-finding rendering
+(noted separately if observed).
+
+Requires `OPENAI_API_KEY` exported in the shell. Run with:
+
+    cargo run -p squeezy-eval --quiet -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-14-tool-card-coalescing-openai.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 60
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Run grep for these five patterns one at a time and list which files matched each: `Agent`, `Turn`, `Skill`, `Plan`, `Tool`."
+wait_for = "turn_completed"
+
+# After the turn completes, the rendered transcript must contain the
+# grouped card header verb ("Searched") for the grep run.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Searched"
+
+# The grouped header summary uses the plural noun "searches" — proof
+# that the render-time grouping (`format_grouped_tool_result_entry`)
+# fired vs. the singleton path (which would render the bare
+# `tool_result_summary_spans` without a count).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "searches"
+
+# The canonical affordance row from the grouped renderer.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "(Ctrl-E to expand all)"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+no_tool_errors = false
+
+[triage]
+enabled = false

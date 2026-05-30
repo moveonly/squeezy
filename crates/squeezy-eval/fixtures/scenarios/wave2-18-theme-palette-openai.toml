@@ -1,0 +1,141 @@
+id = "wave2-18-theme-palette-openai"
+title = "Wave-2 / domain 18 — theme + palette swap on OpenAI gpt-5.4-mini"
+description = """
+Wave-2 row 18 (theme-and-color-palette). Exercises the live `/theme`
+slash command across `dark`, `catppuccin`, and back to `dark` against
+the OpenAI live provider. Captures the TUI before and after each
+switch so a future palette regression (or AMBER drift) trips a
+`tui_frame_contains` finding.
+
+The dark-amber rule from
+`docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md` requires palette
+constants to live in `crates/squeezy-tui/src/render/palette.rs` and
+every rendered cell foreground to keep luminance
+`0.299*R + 0.587*G + 0.114*B ≤ 160`. AMBER `Rgb(215, 147, 52)` should
+reach banner, transcript chevrons, working-card balls / spinner, and
+the prompt activity ring on the default + Dark themes.
+
+Cache invalidation: `palette_generation()`
+(`crates/squeezy-tui/src/render/palette.rs:108-119`) must bump every
+time the runtime override flips. The `/theme catppuccin` step exercises
+the `accent_variant()` path; the assertions on a later frame confirm
+the prior amber identity strings are no longer the only brand cue.
+
+`slash_command = \"/theme dark\"` runs through
+`Agent::dispatch_command_raw`, which maps to `DispatchOutcome::TuiOnly`
+for `/theme` — the palette flip itself only takes effect when the
+command flows through the TuiHarness composer. The companion `send_keys`
+sequence types the slash command into the prompt and presses Enter so
+`handle_slash_command → apply_theme_change → apply_theme_overrides`
+actually fires.
+
+Requires `OPENAI_API_KEY` exported in the shell. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-18-theme-palette-openai.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+# A near-zero-cost prompt so the agent boots, paints its banner card
+# and the prompt ring + working-card animations resolve against AMBER
+# under the default (Dark) palette baseline.
+[[steps]]
+kind = "prompt"
+text = "Say 'ok' and stop."
+wait_for = "turn_completed"
+
+# Banner identity on the default Dark theme: the "Squeezy v<version>"
+# header. Should be the AMBER `>_` prefix.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ">_ Squeezy v"
+
+# Tactically capture the model row so a regression in the AMBER label
+# colour or in the model-id routing string trips. NOTE: the
+# `TuiHarness::new` constructor hardcodes the provider-side label as
+# `"eval-harness"` (`crates/squeezy-tui/src/testing.rs:53`), so this
+# scenario asserts on the model-id suffix only — a separate harness
+# bug ticket covers the provider-label gap.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ":gpt-5.4-mini"
+
+# Phase 1: drive `/theme dark` through the composer. Even though the
+# resolved theme is already Dark by default, this exercises the
+# round-trip through `handle_slash_command` and the cache
+# invalidation (`palette_generation` bump).
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "t", "h", "e", "m", "e", "space", "d", "a", "r", "k", "Enter"]
+
+# Status line after `/theme dark` should mention the theme change.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "theme"
+
+# Phase 2: drive `/theme catppuccin` through the composer. This swaps
+# `accent_primary()` from AMBER to catppuccin mauve `Rgb(203, 166,
+# 247)`. Luminance is `0.299*203 + 0.587*166 + 0.114*247 = 60.7 +
+# 97.4 + 28.2 = 186.3` — over the 160 ceiling, so the variant itself
+# is a finding candidate worth surfacing in run output.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = [
+  "/", "t", "h", "e", "m", "e", "space",
+  "c", "a", "t", "p", "p", "u", "c", "c", "i", "n", "Enter",
+]
+
+# After catppuccin, a notification or status update should hint that
+# the theme was applied. The `apply_theme_change` path pushes
+# `theme → catppuccin` into `app_notifications` so the substring
+# "catppuccin" should still appear somewhere in the rendered frame.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "catppuccin"
+
+# Phase 3: drive `/theme dark` again to confirm the second swap also
+# routes through `apply_theme_overrides` (no stale cache from the
+# catppuccin pass).
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "t", "h", "e", "m", "e", "space", "d", "a", "r", "k", "Enter"]
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = true
+
+[triage]
+enabled = false

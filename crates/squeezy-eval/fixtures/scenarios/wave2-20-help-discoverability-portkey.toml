@@ -1,0 +1,79 @@
+id = "wave2-20-help-discoverability-portkey"
+title = "Wave2 #20 — help & discoverability (Portkey Qwen3.6 required tools)"
+description = """
+Wave-2 bug-hunt slice #20: help-and-discoverability — Portkey
+mirror of the openai/anthropic probes, routed through
+`@openrouter/qwen/qwen3.6-35b-a3b` with `tool_choice = "required"`
+so the model is pushed to ground its answer in the repo by issuing
+at least one tool call rather than guessing.
+
+Probe shape:
+  1. "How do I cancel an in-flight model response in squeezy?" —
+     canonical answer: **Esc** or **Ctrl+C**, footer hint at
+     `crates/squeezy-tui/src/lib.rs:9910`, dispatch at
+     `request_turn_interrupt`
+     (`crates/squeezy-tui/src/lib.rs:1799`).
+  2. "Where in the codebase is that cancel handled?" — grounded
+     follow-up that should land on `squeezy-tui/src/lib.rs`.
+
+`tool_choice = "required"` exercises Qwen3's chatty-preamble-then-stop
+failure mode (see `reasoning_only_stop` + `stop_with_intent_text_no_tool_call`
+rules in `crates/squeezy-eval/src/findings.rs`); a discoverability
+answer that intends to grep but never emits the call is the
+canonical Qwen tool-frame drop pattern.
+
+Portkey API key must already be configured in
+`~/.squeezy/settings.toml` under `[providers.portkey] api_key = "..."`
+(or as `PORTKEY_API_KEY` in the env). NEVER inline a key into this
+file — provider-not-configured errors land as a `medium`-severity
+finding in the run (per wave-2 plan triage rules), not as an abort.
+
+Run with:
+
+    source ~/.env.sh
+    cargo run -p squeezy-eval --quiet -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-20-help-discoverability-portkey.toml \\
+      --no-triage
+
+Source touchpoints:
+  - footer hint string @ crates/squeezy-tui/src/lib.rs:9910
+  - request_turn_interrupt @ crates/squeezy-tui/src/lib.rs:1799
+  - Esc → interrupt dispatch @ crates/squeezy-tui/src/lib.rs:1396
+  - reasoning_only_stop / stop_with_intent_text_no_tool_call rules
+    @ crates/squeezy-eval/src/findings.rs
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "required"
+max_output_tokens = 4096
+
+[[steps]]
+kind = "prompt"
+text = "How do I cancel an in-flight model response in squeezy? Use a tool to confirm, then answer in one short sentence naming the key or command a user would press."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Where in the codebase is that cancel handled? Name the file path under `crates/`."
+wait_for = "turn_completed"
+
+[expect]
+# Final answer must reference a `squeezy-tui` source file — the
+# cancel primitive lives in `crates/squeezy-tui/src/lib.rs`. A miss
+# surfaces an `expect_final_text_contains` finding for triage.
+final_text_contains = ["squeezy-tui"]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 8
+no_tool_errors = false
+
+[triage]
+enabled = false
