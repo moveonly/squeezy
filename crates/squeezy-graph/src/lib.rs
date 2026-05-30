@@ -1826,6 +1826,24 @@ impl GraphManager {
         &self.build_report
     }
 
+    /// Per-language file counts derived from the current graph state.
+    /// Cheap (linear in `graph.files`), no parsing — safe to poll from
+    /// the TUI tick loop to drive a live status-line item.
+    pub fn current_language_report(&self) -> LanguageReport {
+        language_report(self.graph.files.values())
+    }
+
+    /// `true` when the file watcher has queued changes the next
+    /// `refresh_before_query` will pick up. Lets callers (e.g. the TUI
+    /// language-summary poller) decide whether a refresh is worth the
+    /// lock contention.
+    pub fn has_pending_changes(&self) -> bool {
+        self.pending_changed_paths
+            .lock()
+            .map(|paths| !paths.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {
         if let Ok(mut paths) = self.pending_changed_paths.lock() {
             paths.insert(path.into());

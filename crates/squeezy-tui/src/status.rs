@@ -28,6 +28,7 @@ const STATUS_LINE_SEPARATOR: &str = " · ";
 pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::ProviderAndModel,
     StatusLineItem::CurrentDir,
+    StatusLineItem::Languages,
     StatusLineItem::GitBranch,
     StatusLineItem::PullRequestNumber,
     StatusLineItem::BranchChanges,

@@ -600,6 +600,21 @@ async fn run_inner(
             apply_external_settings_reload(&mut app, &mut agent);
             app.needs_redraw = true;
         }
+        // Refresh the language-summary status item from the graph at
+        // the same cadence as the settings poll. The agent call is
+        // cheap when the file watcher hasn't queued changes (graph
+        // refresh is throttled by `idle_refresh_interval` = 15s) and
+        // only triggers a redraw when the rendered string actually
+        // changes, so idle workspaces pay no draw cost.
+        if app.animation_tick.is_multiple_of(settings_poll_every)
+            && let Some(report) = agent.current_language_report()
+        {
+            let next = format_language_report(&report);
+            if next != app.language_summary {
+                app.language_summary = next;
+                app.needs_redraw = true;
+            }
+        }
         // Only repaint when state actually changed (`needs_redraw`), a
         // resize is pending, or something visible is currently animating.
         // Skipping the draw on idle iterations stops the continuous
@@ -10291,6 +10306,37 @@ fn configured_language_summary(config: &AppConfig) -> String {
         "none".to_string()
     } else {
         config.graph.languages.join(", ")
+    }
+}
+
+/// Render a `LanguageReport` (live workspace file counts from the graph)
+/// into the same shape `startup_language_summary` in `squeezy-cli` uses
+/// at first paint, so the status-line value stays visually identical
+/// across the initial render and subsequent watcher-driven refreshes.
+/// Families are merged (jsx/tsx → JS/TS, c/cpp → C/C++) and sorted by
+/// display name; zero-count families are omitted.
+fn format_language_report(report: &squeezy_tools::LanguageReport) -> String {
+    let entries: [(&str, usize); 7] = [
+        ("C/C++", report.c_files + report.cpp_files),
+        ("C#", report.csharp_files),
+        ("Go", report.go_files),
+        ("Java", report.java_files),
+        (
+            "JS/TS",
+            report.javascript_files + report.jsx_files + report.typescript_files + report.tsx_files,
+        ),
+        ("Python", report.python_files),
+        ("Rust", report.rust_files),
+    ];
+    let pieces: Vec<String> = entries
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect();
+    if pieces.is_empty() {
+        "none".to_string()
+    } else {
+        pieces.join(", ")
     }
 }
 
