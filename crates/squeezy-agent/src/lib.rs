@@ -1236,12 +1236,7 @@ impl Agent {
         //     survives both a crash that ate the snapshot AND a
         //     pre-hydrated binary that wrote a thin one.
         let resume_state = match handle.read_resume_state() {
-            Ok(state)
-                if state.resume_available
-                    && (state.transcript.is_empty() == state.hydrated_transcript.is_empty()) =>
-            {
-                state
-            }
+            Ok(state) if state.resume_available => state,
             _ => match handle.replay_resume_state() {
                 Ok(state) => state,
                 Err(_) => {
@@ -1257,20 +1252,30 @@ impl Agent {
             )));
         }
         let metadata = handle.metadata()?;
-        let hydrated_transcript = if resume_state.hydrated_transcript.is_empty() {
-            // Wrap every message in `HydratedTranscriptItem::Message`
-            // so the TUI's resume loop has a single variant kind to
-            // dispatch on. This branch only runs when the events.jsonl
-            // replay also produced an empty list — i.e. a fresh
-            // session with nothing in it yet.
-            resume_state
-                .transcript
-                .iter()
-                .cloned()
-                .map(|item| HydratedTranscriptItem::Message { item })
-                .collect()
-        } else {
+        // The snapshot is authoritative for the LLM-facing conversation,
+        // but the live `ConversationState` does not track the hydrated
+        // (tool-result-bearing) transcript shape — that's a UI concern.
+        // When the snapshot omits it, run an events.jsonl replay just to
+        // recover the rich shape so the resumed TUI still shows prior
+        // tool-result cards, then discard the rest of the replay state.
+        let hydrated_transcript = if !resume_state.hydrated_transcript.is_empty() {
             resume_state.hydrated_transcript.clone()
+        } else if !resume_state.transcript.is_empty() {
+            handle
+                .replay_resume_state()
+                .ok()
+                .map(|replay| replay.hydrated_transcript)
+                .filter(|items| !items.is_empty())
+                .unwrap_or_else(|| {
+                    resume_state
+                        .transcript
+                        .iter()
+                        .cloned()
+                        .map(|item| HydratedTranscriptItem::Message { item })
+                        .collect()
+                })
+        } else {
+            Vec::new()
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
         let agent = Self::build(
