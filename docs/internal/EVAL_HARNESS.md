@@ -449,6 +449,14 @@ One record per assistant turn:
 - `styled_lines` flattens ratatui `Line`/`Span` into plain JSON; ratatui
   types do not leak into the schema.
 - `ansi` is a re-rendering you can `cat` into a terminal.
+- `input_tokens` is the **total** prompt the model saw — uncached
+  delta + cache reads + cache writes — across every provider. Provider
+  bindings normalise to this convention at the snapshot boundary
+  (see `AnthropicStreamState::cost` and `BedrockStreamState::cost`),
+  so an OpenAI cache-hit turn and an Anthropic cache-hit turn on the
+  same prompt shape report comparable totals. The cached share is
+  preserved separately on the `cost` payload in `trace.jsonl` as
+  `cached_input_tokens` / `cache_write_input_tokens`.
 - `cost_micro_usd` is the result of `squeezy_llm::estimate_cost`;
   `0` means no pricing entry for the model.
 - `finish_reason` is the provider-reported terminal reason

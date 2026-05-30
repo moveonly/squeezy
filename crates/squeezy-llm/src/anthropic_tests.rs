@@ -729,7 +729,10 @@ fn parser_extracts_completed_response_id_and_usage() {
         vec![LlmEvent::Completed {
             response_id: Some("msg_123".to_string()),
             cost: CostSnapshot {
-                input_tokens: Some(10),
+                // Normalised across providers: total prompt the model saw
+                // = 10 uncached + 3 cache read = 13. The breakdown lives
+                // in `cached_input_tokens`.
+                input_tokens: Some(13),
                 output_tokens: Some(4),
                 reasoning_output_tokens: None,
                 cached_input_tokens: Some(3),
@@ -778,7 +781,11 @@ fn parser_populates_both_cache_counters_from_usage() {
         vec![LlmEvent::Completed {
             response_id: Some("msg_cache".to_string()),
             cost: CostSnapshot {
-                input_tokens: Some(42),
+                // Normalised total = 42 uncached + 17 cache read + 29
+                // cache creation = 88. Standard rate is paid only on
+                // the uncached 42; cache_read + cache_write are billed
+                // at their own pricing tiers in `estimate_cost`.
+                input_tokens: Some(88),
                 output_tokens: Some(8),
                 reasoning_output_tokens: None,
                 cached_input_tokens: Some(17),

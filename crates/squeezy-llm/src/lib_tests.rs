@@ -49,12 +49,19 @@ fn registry_estimates_known_model_costs() {
 }
 
 #[test]
-fn registry_does_not_double_subtract_anthropic_cached_input() {
-    // Anthropic's Messages API reports `input_tokens` as already-uncached,
-    // so the OpenAI-style `input - cached - cache_write` math under-counts
-    // the standard share when prompt caching is active.
+fn registry_estimate_costs_anthropic_with_normalised_input_tokens() {
+    // `CostSnapshot.input_tokens` is the **total** prompt the model
+    // saw (uncached + cache_read + cache_write) under the normalised
+    // cross-provider convention. The Anthropic and Bedrock stream
+    // states fold the cache counters back in at the snapshot
+    // boundary so `estimate_cost` can run a single subtraction without
+    // a per-provider branch.
+    //
+    // Equivalent snapshots: 200 standard tokens, with vs. without a
+    // 5_000-token cache hit. Cache pricing is additive, so the cached
+    // estimate must be >= the uncached one.
     let cached = CostSnapshot {
-        input_tokens: Some(200),
+        input_tokens: Some(5_200),
         output_tokens: Some(50),
         reasoning_output_tokens: None,
         cached_input_tokens: Some(5_000),

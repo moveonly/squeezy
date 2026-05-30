@@ -280,8 +280,19 @@ struct BedrockStreamState {
 
 impl BedrockStreamState {
     fn cost(&self) -> CostSnapshot {
+        // Bedrock routes Claude models and inherits Anthropic's
+        // Messages-API convention where `usage.inputTokens` is the
+        // **uncached delta only**. Normalise to the cross-provider
+        // convention shared by OpenAI / Google / Ollama / compatible:
+        // `input_tokens` is the total prompt the model saw, and the
+        // cached share lives in `cached_input_tokens`. See the matching
+        // comment on `AnthropicStreamState::cost()`.
+        let base = self.input_tokens;
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        let cache_write = self.cache_write_input_tokens.unwrap_or(0);
+        let total_input = base.map(|b| b.saturating_add(cache_read).saturating_add(cache_write));
         CostSnapshot {
-            input_tokens: self.input_tokens,
+            input_tokens: total_input,
             output_tokens: self.output_tokens,
             reasoning_output_tokens: None,
             cached_input_tokens: self.cache_read_input_tokens,

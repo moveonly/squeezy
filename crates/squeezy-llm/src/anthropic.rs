@@ -615,19 +615,27 @@ fn anthropic_stream_attempt(
 /// [`LlmEvent::ContextOverflow`] when any path fires; the caller
 /// yields it immediately before the canonical [`LlmEvent::Completed`].
 ///
-/// `used` totals reported `input_tokens + output_tokens` so a turn
-/// that fills the prompt budget *or* spends the budget on output
-/// can both surface as `SilentUsage` when the result equals or
-/// exceeds the model's context window.
+/// `used` totals the normalised `input_tokens + output_tokens` from
+/// the snapshot's `cost()` view (i.e. the full prompt the model saw,
+/// cached + uncached + cache-write, plus output) so a turn that fills
+/// the prompt budget *or* spends the budget on output can both
+/// surface as `SilentUsage` when the result equals or exceeds the
+/// model's context window.
 fn overflow_event_for_completed(
     state: &AnthropicStreamState,
     max_window: Option<u64>,
     saw_visible_output: bool,
 ) -> Option<LlmEvent> {
-    let used = state
+    // Use the normalised cost view so the "used" total reflects the
+    // full prompt the model saw (including cached and cache-write
+    // tokens) rather than the small uncached delta. Reading
+    // `state.input_tokens` directly here would silently under-fire the
+    // SilentUsage classifier on cache-hit turns.
+    let cost = state.cost();
+    let used = cost
         .input_tokens
         .unwrap_or(0)
-        .saturating_add(state.output_tokens.unwrap_or(0));
+        .saturating_add(cost.output_tokens.unwrap_or(0));
     let usage = max_window.map(|max| OverflowUsage { used, max });
     let signal: OverflowSignal = classify_terminal(
         ANTHROPIC_PROVIDER_NAME,
@@ -666,8 +674,21 @@ struct AnthropicStreamState {
 
 impl AnthropicStreamState {
     fn cost(&self) -> CostSnapshot {
+        // Normalise to the cross-provider convention used in
+        // `CostSnapshot`: `input_tokens` is the **total** prompt the
+        // model saw (uncached + cache read + cache write), and the
+        // breakdown lives in `cached_input_tokens` /
+        // `cache_write_input_tokens`. Anthropic's Messages API ships
+        // `usage.input_tokens` as the uncached delta only, so we fold
+        // the cache counters back in here. Without this, a reader of
+        // `frames.jsonl` sees a tiny `input_tokens` value on a cache-hit
+        // turn and is misled into thinking the prompt was short.
+        let base = self.input_tokens;
+        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
+        let cache_write = self.cache_creation_input_tokens.unwrap_or(0);
+        let total_input = base.map(|b| b.saturating_add(cache_read).saturating_add(cache_write));
         CostSnapshot {
-            input_tokens: self.input_tokens,
+            input_tokens: total_input,
             output_tokens: self.output_tokens,
             reasoning_output_tokens: None,
             cached_input_tokens: self.cache_read_input_tokens,
