@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::proposed_plan::{self, PlanMeta};
+use crate::render::palette;
 
 const TEST_SESSION: &str = "card-tests";
 
@@ -43,12 +44,49 @@ fn render_plan_card_shows_id_path_and_step_count() {
         "header must include id: {header}"
     );
     assert!(
-        header.contains("(2 steps)"),
+        header.contains("· 2 steps"),
         "header must include step count: {header}"
     );
     // Path line is second.
     let path_line = line_text(&lines[1]);
     assert!(path_line.contains(TEST_SESSION));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn render_plan_card_uses_amber_box_not_full_amber_body() {
+    let root = fresh_workspace("amber_box");
+    let body = "Context\n\n1. Edit README\n";
+    let (plan_id, path) =
+        proposed_plan::persist_plan(&root, TEST_SESSION, body, &PlanMeta::default())
+            .expect("persist plan");
+    let data = PlanCardData {
+        plan_id,
+        path,
+        parent_plan_id: None,
+    };
+
+    let lines = render_plan_card(&data);
+    let top = line_text(&lines[0]);
+    let path = line_text(&lines[1]);
+    let body = lines
+        .iter()
+        .find(|line| line_text(line).contains("Context"))
+        .expect("body line");
+
+    assert!(top.starts_with("╭─ Plan "), "{top}");
+    assert_eq!(lines[0].spans[0].style.fg, Some(palette::AMBER));
+    assert!(path.starts_with("│ "), "{path}");
+    assert!(
+        body.spans
+            .iter()
+            .any(|span| span.content.contains("Context") && span.style.fg != Some(palette::AMBER)),
+        "body text should not be painted amber: {body:?}"
+    );
+    assert!(
+        line_text(lines.last().expect("bottom border")).starts_with('╰'),
+        "bottom border missing"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
