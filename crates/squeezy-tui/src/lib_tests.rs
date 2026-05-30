@@ -636,6 +636,75 @@ async fn wheel_scroll_works_in_inline_mode() {
 }
 
 #[tokio::test]
+async fn wheel_scroll_targets_transcript_overlay_when_open() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        3,
+        "wheel down must scroll the full transcript overlay"
+    );
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 0,
+        "overlay wheel events must not scroll the underlying transcript"
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(app.transcript_overlay.expect("overlay").scroll, 0);
+}
+
+#[tokio::test]
+async fn transcript_overlay_mouse_is_modal() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 4,
+            width: 80,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "overlay mouse events must not click through to the underlying UI"
+    );
+}
+
+#[tokio::test]
 async fn left_click_outside_indicator_does_not_open_overlay() {
     let mut app = test_app(SessionMode::Build);
     app.register_click(

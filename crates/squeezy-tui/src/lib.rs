@@ -1161,6 +1161,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 }
 
 fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
+    if handle_transcript_overlay_mouse(app, mouse) {
+        return;
+    }
+
     // Left-click is dispatched via the per-frame click registry so any
     // render path can add new buttons by pushing a `Clickable` — no
     // edits to this fn are needed when new buttons land.
@@ -1180,6 +1184,18 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
         _ => {}
     }
+}
+
+fn handle_transcript_overlay_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    let Some(state) = app.transcript_overlay.as_mut() else {
+        return false;
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp => state.scroll = state.scroll.saturating_sub(3),
+        MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_add(3),
+        _ => {}
+    }
+    true
 }
 
 /// Canonicalise a `KeyEvent` so every downstream dispatcher sees a
@@ -5164,7 +5180,7 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Some(state) => state,
         None => return,
     };
-    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn scroll ";
+    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn or wheel scroll ";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
