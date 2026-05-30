@@ -3917,6 +3917,109 @@ async fn output_spill_uses_registry_config() {
 }
 
 #[tokio::test]
+async fn spill_envelope_includes_recovery_hint_and_on_disk_path() {
+    // squeezy-uq1g: when a tool result overflows the spill threshold, the
+    // envelope handed back to the model must name the recovery tool, the
+    // recovery arguments, the on-disk path, and carry a short human-
+    // readable hint. Without these the model has to infer recovery from
+    // its tool registry and the TUI has no way to surface a tail command.
+    let root = temp_workspace("spill_recovery_envelope");
+    fs::write(root.join("payload.txt"), "y".repeat(2_048)).expect("write payload");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 128,
+            preview_bytes: 32,
+            retention_days: 1,
+            output_dir: None,
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_envelope".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "payload.txt", "limit": 10_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = &result.content;
+    assert_eq!(content["spilled"], true);
+    let handle = content["handle"].as_str().expect("handle");
+
+    // Recovery shape: tool name + args mirroring the handle.
+    assert_eq!(content["recovery_tool"], "read_tool_output");
+    assert_eq!(content["recovery_args"]["handle"], handle);
+
+    // on_disk_path must point at the spilled file under the workspace.
+    let on_disk_path = content["on_disk_path"]
+        .as_str()
+        .expect("on_disk_path string");
+    let expected_path = root
+        .canonicalize()
+        .expect("canonical root")
+        .join(".squeezy")
+        .join("tool_outputs")
+        .join(format!("{handle}.json"));
+    assert_eq!(
+        PathBuf::from(on_disk_path),
+        expected_path,
+        "on_disk_path must match the file on disk"
+    );
+    assert!(
+        PathBuf::from(on_disk_path).is_file(),
+        "on_disk_path must exist: {on_disk_path}"
+    );
+
+    // recovery_hint must mention the tool, the handle, and the path so a
+    // human reading the raw envelope (or a TUI mirror) can act on it.
+    let hint = content["recovery_hint"].as_str().expect("recovery_hint");
+    assert!(
+        hint.contains("read_tool_output"),
+        "hint must name the tool: {hint}"
+    );
+    assert!(
+        hint.contains(handle),
+        "hint must reference the handle: {hint}"
+    );
+
+    // Snapshot the envelope keys so accidental drops or renames trip the
+    // test instead of silently regressing wave-2 finding squeezy-uq1g.
+    let mut keys = content
+        .as_object()
+        .expect("envelope is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "handle".to_string(),
+            "on_disk_path".to_string(),
+            "original_output_sha256".to_string(),
+            "preview".to_string(),
+            "preview_bytes".to_string(),
+            "recovery_args".to_string(),
+            "recovery_hint".to_string(),
+            "recovery_tool".to_string(),
+            "sha256".to_string(),
+            "spilled".to_string(),
+            "total_bytes".to_string(),
+            "truncated".to_string(),
+        ],
+        "spill envelope keys drifted; update squeezy-uq1g snapshot deliberately"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn relative_output_dir_resolves_against_workspace_root() {
     let root = temp_workspace("output_dir_rel");
     fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");

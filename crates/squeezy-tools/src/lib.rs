@@ -4182,6 +4182,12 @@ impl ToolOutputStore {
         cost_hint.truncated = true;
         cost_hint.output_bytes = 0;
 
+        let on_disk_path = path.to_string_lossy().into_owned();
+        let recovery_hint = format!(
+            "Full output spilled to disk. Use read_tool_output with handle {sha256} \
+             (optional offset/limit) to recover, or paste the on_disk_path."
+        );
+
         make_result(
             &call,
             status,
@@ -4194,6 +4200,12 @@ impl ToolOutputStore {
                 "preview_bytes": preview.len(),
                 "preview": preview,
                 "truncated": true,
+                "recovery_tool": "read_tool_output",
+                "recovery_args": {
+                    "handle": sha256,
+                },
+                "on_disk_path": on_disk_path,
+                "recovery_hint": recovery_hint,
             }),
             cost_hint,
             content_sha256,
