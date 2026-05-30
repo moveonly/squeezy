@@ -5511,9 +5511,7 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
             inner,
             "",
             format!(">_ Squeezy v{}", app.version),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         ),
         startup_card_row(
             inner,
@@ -5525,13 +5523,13 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
             inner,
             "directory",
             app.directory.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         ),
         startup_card_row(
             inner,
             "languages",
             app.language_summary.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette::muted_fg()),
         ),
         Line::from(Span::styled(
             format!("╰{border}╯"),
