@@ -476,10 +476,16 @@ fn apply_overlay(
     if let Some(pm) = &overlay.permission_mode {
         let mode = PermissionMode::parse(pm)
             .ok_or_else(|| EvalError::Config(format!("unknown permission_mode: {pm}")))?;
-        // Apply uniformly to the gates the scenario most often wants to
-        // pin. Power users can shape these individually via settings.
+        // Apply uniformly to every capability gate so the scenario's
+        // declared permission_mode is comprehensive. Read and
+        // ignored_search must be included so internal recovery
+        // affordances like `read_tool_output` (used to recover a spilled
+        // tool stdout buffer) do not get auto-denied when the operator's
+        // settings.toml carries `[permissions] read = "ask"`.
+        config.permissions.read = mode;
         config.permissions.edit = mode;
         config.permissions.shell = mode;
+        config.permissions.ignored_search = mode;
         config.permissions.web = mode;
         config.permissions.mcp = mode;
     }
@@ -2237,3 +2243,7 @@ impl AgentExt for Agent {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 }
+
+#[cfg(test)]
+#[path = "driver_tests.rs"]
+mod tests;
