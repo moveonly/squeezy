@@ -217,6 +217,34 @@ pub(crate) fn render_apply_patch_diff(args: &ApplyPatchArgs) -> Option<String> {
     Some(out)
 }
 
+/// Collect every workspace path referenced by an `apply_patch` call, walking
+/// both the legacy `patches[]` field and the modern `operations[]` shape so
+/// the approval modal can show the reviewer which files are about to change.
+///
+/// `MoveFile` ops contribute both endpoints (the source disappears, the
+/// destination appears). Paths are de-duplicated and sorted via `BTreeSet`
+/// so the rendered summary is stable across permutations of the input.
+pub(crate) fn apply_patch_paths(args: &ApplyPatchArgs) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for patch in &args.patches {
+        paths.insert(patch.path.clone());
+    }
+    for op in &args.operations {
+        match op {
+            ApplyPatchOperation::SearchReplace { path, .. }
+            | ApplyPatchOperation::CreateFile { path, .. }
+            | ApplyPatchOperation::DeleteFile { path, .. } => {
+                paths.insert(path.clone());
+            }
+            ApplyPatchOperation::MoveFile { from, to, .. } => {
+                paths.insert(from.clone());
+                paths.insert(to.clone());
+            }
+        }
+    }
+    paths
+}
+
 fn append_search_replace_hunk(
     out: &mut String,
     path: &str,

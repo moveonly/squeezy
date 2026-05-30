@@ -635,6 +635,111 @@ fn webfetch_and_websearch_requests_carry_expected_targets() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn apply_patch_summary_and_metadata_walk_operations_shape() {
+    // `apply_patch` accepts both `patches[]` and `operations[]`; the
+    // approval summary line and the `paths` metadata entry must walk
+    // both shapes so the reviewer always sees which files are about to
+    // change — covering create_file, delete_file, search_replace, and
+    // both endpoints of move_file. Paths must be deduped and sorted so
+    // the rendered summary is stable across permutations of the input.
+    let root = temp_workspace("apply_patch_operations_summary");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let call = ToolCall {
+        call_id: "ops".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "operations": [
+                {
+                    "kind": "create_file",
+                    "path": "crates/squeezy-eval/README-PROBE.md",
+                    "contents": "# Probe one\n",
+                },
+                {
+                    "kind": "create_file",
+                    "path": "crates/squeezy-eval/README-PROBE2.md",
+                    "contents": "# Probe two\n",
+                },
+                {
+                    "kind": "delete_file",
+                    "path": "crates/squeezy-eval/OLD.md",
+                },
+                {
+                    "kind": "search_replace",
+                    "path": "crates/squeezy-eval/lib.rs",
+                    "search": "fn old()",
+                    "replace": "fn new()",
+                },
+                {
+                    "kind": "move_file",
+                    "from": "src/old_name.rs",
+                    "to": "src/new_name.rs",
+                },
+            ],
+        }),
+    };
+
+    let description = registry.describe_call(&call);
+    assert_eq!(
+        description,
+        "apply_patch paths=\"crates/squeezy-eval/OLD.md, \
+         crates/squeezy-eval/README-PROBE.md, \
+         crates/squeezy-eval/README-PROBE2.md, \
+         crates/squeezy-eval/lib.rs, \
+         src/new_name.rs, \
+         src/old_name.rs\"",
+        "summary must list every path touched by operations[] (including \
+         both endpoints of move_file), deduped and sorted",
+    );
+
+    let request = registry.permission_request(&call);
+    assert_eq!(
+        request.metadata["paths"],
+        "crates/squeezy-eval/OLD.md, \
+         crates/squeezy-eval/README-PROBE.md, \
+         crates/squeezy-eval/README-PROBE2.md, \
+         crates/squeezy-eval/lib.rs, \
+         src/new_name.rs, \
+         src/old_name.rs",
+        "approval metadata `paths` must mirror the summary so the audit \
+         line and the metadata stay in sync",
+    );
+    // Multi-path operations land on the generic workspace target rather
+    // than collapsing to a single file path.
+    assert_eq!(request.target, "workspace:patches");
+    // The first five paths should each register a session rule so the
+    // reviewer's "allow this path" choice survives across the call.
+    let rule_targets: Vec<&str> = request
+        .suggested_rules
+        .iter()
+        .map(|rule| rule.target.as_str())
+        .collect();
+    assert!(
+        rule_targets.contains(&"path:crates/squeezy-eval/README-PROBE.md"),
+        "suggested rules must seed at least the create_file paths; got {rule_targets:?}",
+    );
+
+    // Single-op operations[] payload collapses to `path:<that>` so the
+    // session rule from this approval covers the same path for future
+    // edit-family calls (matching the legacy single-patch behaviour).
+    let single = registry.permission_request(&ToolCall {
+        call_id: "single".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "operations": [{
+                "kind": "create_file",
+                "path": "src/only.rs",
+                "contents": "fn main() {}\n",
+            }],
+        }),
+    });
+    assert_eq!(single.target, "path:src/only.rs");
+    assert_eq!(single.metadata["paths"], "src/only.rs");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
     let root = temp_workspace("grep_ignore");

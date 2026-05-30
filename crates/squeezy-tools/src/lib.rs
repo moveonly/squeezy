@@ -79,8 +79,8 @@ use graph_tools::{
 pub use ipc::{IpcEndpoint, IpcStream};
 use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
-    PlanPatchArgs, SearchReplaceFallback, is_notebook_path, render_apply_patch_diff,
-    render_write_file_diff,
+    PlanPatchArgs, SearchReplaceFallback, apply_patch_paths, is_notebook_path,
+    render_apply_patch_diff, render_write_file_diff,
 };
 pub use safety::{ShellPreClassification, pre_classify_shell};
 use schema::compact_typed_tool_parameters;
@@ -1619,14 +1619,9 @@ impl ToolRegistry {
         let (capability, target, risk) = match call.name.as_str() {
             "apply_patch" => {
                 let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
-                let paths = args
+                let paths: Vec<String> = args
                     .as_ref()
-                    .map(|args| {
-                        args.patches
-                            .iter()
-                            .map(|patch| patch.path.as_str())
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|args| apply_patch_paths(args).into_iter().collect())
                     .unwrap_or_default();
                 let target = if paths.len() == 1 {
                     format!("path:{}", paths[0])
@@ -2042,9 +2037,8 @@ impl ToolRegistry {
                 let paths = args
                     .as_ref()
                     .map(|args| {
-                        args.patches
-                            .iter()
-                            .map(|patch| patch.path.as_str())
+                        apply_patch_paths(args)
+                            .into_iter()
                             .collect::<Vec<_>>()
                             .join(", ")
                     })
