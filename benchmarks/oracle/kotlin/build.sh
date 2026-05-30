@@ -31,11 +31,19 @@ if ! command -v java >/dev/null 2>&1; then
     exit 2
 fi
 
-# `-include-runtime` bundles the Kotlin stdlib. PSI / compiler-embeddable
-# classes used by KotlinOracle.kt ship with the kotlinc install via the
-# kotlin-compiler-embeddable jar — kotlinc adds it to the classpath when
-# invoked directly, no further wiring needed.
+# `-include-runtime` bundles the Kotlin stdlib. KotlinOracle.kt also depends on
+# `org.jetbrains.kotlin.cli.*` / `org.jetbrains.kotlin.psi.*`, which live in
+# `kotlin-compiler-embeddable.jar`. kotlinc does NOT add it to the classpath
+# automatically when invoked directly, so we resolve it from the kotlinc
+# install (one level up from the kotlinc launcher) and pass it explicitly.
+KOTLINC_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v kotlinc)")")")"
+EMBEDDABLE_JAR="$KOTLINC_HOME/lib/kotlin-compiler-embeddable.jar"
+if [ ! -f "$EMBEDDABLE_JAR" ]; then
+    echo "kotlin-compiler-embeddable.jar not found at $EMBEDDABLE_JAR" >&2
+    exit 2
+fi
+
 echo "Building Kotlin oracle jar with $(kotlinc -version 2>&1)..."
-kotlinc -include-runtime -d kotlin-oracle.jar KotlinOracle.kt
+kotlinc -include-runtime -cp "$EMBEDDABLE_JAR" -d kotlin-oracle.jar KotlinOracle.kt
 
 echo "Wrote $(pwd)/kotlin-oracle.jar"
