@@ -45,6 +45,10 @@ pub(crate) fn run_mixed_workload(
             None,
             "mixed workload compiler check not used for Java".to_string(),
         ),
+        BenchmarkLanguage::Kotlin => (
+            None,
+            "mixed workload unsupported for Kotlin".to_string(),
+        ),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
         BenchmarkLanguage::Php => {
             let (ms, status) = time_php_oracle_optional(repo);
@@ -90,6 +94,7 @@ pub(crate) fn run_mixed_workload(
         BenchmarkLanguage::Java => {
             empty_accuracy("mixed workload accuracy oracle not used for Java")
         }
+        BenchmarkLanguage::Kotlin => empty_accuracy("mixed workload unsupported for Kotlin"),
         BenchmarkLanguage::Php => {
             empty_accuracy("mixed workload accuracy oracle not used for PHP")
         }

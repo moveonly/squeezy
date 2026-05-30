@@ -161,7 +161,7 @@ impl SemanticGraph {
     ) -> bool {
         self.imports_for_file(&reference.file_id)
             .filter(|import| self.import_visible_from_reference(import, reference))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !is_package_marker(import))
             .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
             .any(|import| self.import_matches_symbol(import, symbol))
     }
@@ -342,6 +342,9 @@ impl SemanticGraph {
         let symbol_language = self.files.get(&symbol.file_id).map(|file| file.language);
         if symbol_language == Some(squeezy_core::LanguageKind::Java) {
             return self.java_import_matches_symbol(import, symbol);
+        }
+        if symbol_language == Some(squeezy_core::LanguageKind::Kotlin) {
+            return self.kotlin_import_matches_symbol(import, symbol);
         }
         if symbol_language.map(is_js_ts_language).unwrap_or(false) {
             return self.js_ts_import_matches_symbol(import, symbol);

@@ -7,6 +7,7 @@ pub(crate) mod common_scan;
 pub(crate) mod cpython_ast;
 pub(crate) mod go_types;
 pub(crate) mod javac;
+pub(crate) mod kotlin_oracle;
 pub(crate) mod php_oracle;
 pub(crate) mod roslyn;
 pub(crate) mod ruby_oracle;
@@ -18,6 +19,7 @@ pub(crate) use common_scan::*;
 pub(crate) use cpython_ast::*;
 pub(crate) use go_types::*;
 pub(crate) use javac::*;
+pub(crate) use kotlin_oracle::*;
 pub(crate) use php_oracle::*;
 pub(crate) use roslyn::*;
 pub(crate) use ruby_oracle::*;
@@ -68,6 +70,11 @@ static JAVAC: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::Java,
     language: BenchmarkLanguage::Java,
 };
+static KOTLIN_ORACLE: OracleDescriptor = OracleDescriptor {
+    id: "kotlin_compiler_embeddable",
+    family: LanguageFamily::Kotlin,
+    language: BenchmarkLanguage::Kotlin,
+};
 static ROSLYN: OracleDescriptor = OracleDescriptor {
     id: "roslyn",
     family: LanguageFamily::CSharp,
@@ -99,10 +106,11 @@ static RUBY_PRISM: OracleDescriptor = OracleDescriptor {
     language: BenchmarkLanguage::Ruby,
 };
 
-static ORACLES: [&'static dyn LanguageOracle; 9] = [
+static ORACLES: [&'static dyn LanguageOracle; 10] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
+    &KOTLIN_ORACLE,
     &ROSLYN,
     &GO_TYPES,
     &CLANG,

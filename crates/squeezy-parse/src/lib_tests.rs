@@ -1016,6 +1016,240 @@ record Helper(String name) {
 }
 
 #[test]
+fn parser_extracts_kotlin_package_imports_classes_and_calls() {
+    let source = r#"package com.example.app
+
+import com.example.services.Greeter
+import com.example.services.FriendlyGreeter as Friendly
+import kotlin.text.*
+
+class Runner(private val greeter: Greeter) {
+    suspend fun run() {
+        val name = greeter.greet()
+        Friendly.create()
+    }
+}
+
+fun String.prepare(): String = this.trim()
+
+object StringOps {
+    fun normalize(s: String): String = s.lowercase()
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/app/Runner.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none(), "expected supported parse");
+    assert_eq!(parsed.package.as_deref(), Some("com.example.app"));
+    // Package marker import.
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "com.example.app" && import.alias.as_deref() == Some("__kotlin_package__")
+    }));
+    // Aliased import.
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "com.example.services.FriendlyGreeter"
+            && import.alias.as_deref() == Some("Friendly")
+    }));
+    // Wildcard import.
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.is_glob && import.path == "kotlin.text"),
+    );
+
+    // Class with primary-constructor field promotion.
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "Runner" && symbol.kind == SymbolKind::Class })
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "greeter"
+            && symbol.kind == SymbolKind::Field
+            && symbol
+                .attributes
+                .contains(&"kotlin:ctor_property".to_string())
+    }));
+    // Suspend function.
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "run"
+            && symbol.kind == SymbolKind::Method
+            && symbol.attributes.contains(&"kotlin:suspend".to_string())
+    }));
+    // Extension function with receiver captured into language_identity.
+    let prepare = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "prepare")
+        .expect("prepare extension function");
+    assert_eq!(prepare.kind, SymbolKind::Function);
+    assert_eq!(prepare.language_identity.as_deref(), Some("String"));
+    assert!(prepare.attributes.contains(&"kotlin:extension".to_string()));
+
+    // Object declaration tagged.
+    let string_ops = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "StringOps")
+        .expect("StringOps object");
+    assert_eq!(string_ops.kind, SymbolKind::Class);
+    assert!(string_ops.attributes.contains(&"kotlin:object".to_string()));
+
+    // Calls: navigation-form should be Method; bare-name should be Direct.
+    assert!(parsed.calls.iter().any(|call| call.name == "greet"
+        && call.kind == ParsedCallKind::Method
+        && call.receiver.as_deref() == Some("greeter")));
+}
+
+#[test]
+fn parser_handles_kotlin_data_class_and_sealed_interface() {
+    let source = r#"package com.example.services
+
+sealed interface Greeter {
+    fun greet(): String
+}
+
+class FriendlyGreeter : Greeter {
+    companion object {
+        fun create(): FriendlyGreeter = FriendlyGreeter()
+    }
+    override fun greet(): String = "hi"
+}
+
+data class Person(val name: String, val age: Int)
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/services/Greeter.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+
+    // sealed interface -> Trait + kotlin:sealed attribute
+    let greeter = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Greeter")
+        .expect("Greeter trait");
+    assert_eq!(greeter.kind, SymbolKind::Trait);
+    assert!(greeter.attributes.contains(&"kotlin:sealed".to_string()));
+
+    // delegation base recorded on FriendlyGreeter
+    let friendly = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "FriendlyGreeter")
+        .expect("FriendlyGreeter class");
+    assert_eq!(friendly.kind, SymbolKind::Class);
+    assert!(friendly.attributes.contains(&"base:Greeter".to_string()));
+
+    // companion-object child re-parented to host class
+    let create = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "create")
+        .expect("create method");
+    assert_eq!(create.kind, SymbolKind::Method);
+    assert_eq!(create.parent_id.as_ref(), Some(&friendly.id));
+
+    // data class flag
+    let person = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Person")
+        .expect("Person class");
+    assert!(person.attributes.contains(&"kotlin:data".to_string()));
+    // primary-constructor fields promoted
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "name"
+            && symbol.kind == SymbolKind::Field
+            && symbol.parent_id.as_ref() == Some(&person.id)
+    }));
+}
+
+#[test]
+fn parser_handles_kotlin_top_level_decls_typealias_and_enums() {
+    let source = r#"package com.example.util
+
+typealias UserId = String
+
+val GREETING: String = "Hello"
+
+var counter: Int = 0
+
+suspend fun fetchDefault(): String = "default"
+
+enum class Color {
+    RED, GREEN, BLUE
+}
+
+val lazyVal: Int by lazy { 42 }
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/util/Util.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+
+    let alias = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "UserId")
+        .expect("UserId typealias");
+    assert_eq!(alias.kind, SymbolKind::TypeAlias);
+    assert_eq!(alias.language_identity.as_deref(), Some("String"));
+
+    let greeting = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "GREETING")
+        .expect("GREETING top-level val");
+    assert_eq!(greeting.kind, SymbolKind::Const);
+    assert!(greeting.parent_id.is_none(), "top-level val has no parent");
+
+    let counter = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "counter")
+        .expect("counter top-level var");
+    assert_eq!(counter.kind, SymbolKind::Static);
+
+    let fetch = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "fetchDefault")
+        .expect("fetchDefault function");
+    assert_eq!(fetch.kind, SymbolKind::Function);
+    assert!(fetch.attributes.contains(&"kotlin:suspend".to_string()));
+
+    let color = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Color")
+        .expect("Color enum");
+    assert_eq!(color.kind, SymbolKind::Enum);
+    let red = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "RED")
+        .expect("RED variant");
+    assert_eq!(red.kind, SymbolKind::Variant);
+    assert_eq!(red.parent_id.as_ref(), Some(&color.id));
+
+    let delegated = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "lazyVal")
+        .expect("delegated lazyVal");
+    assert!(
+        delegated
+            .attributes
+            .contains(&"kotlin:delegated".to_string())
+    );
+    assert_eq!(delegated.confidence, Confidence::Partial);
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
@@ -2367,6 +2601,12 @@ fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
+    record
+}
+
+fn kotlin_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Kotlin;
     record
 }
 

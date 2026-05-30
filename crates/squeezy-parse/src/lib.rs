@@ -235,6 +235,7 @@ pub struct LanguageParser {
     php_parser: Parser,
     rust_parser: Parser,
     java_parser: Parser,
+    kotlin_parser: Parser,
     python_parser: Parser,
     ruby_parser: Parser,
     typescript_parser: Parser,
@@ -270,6 +271,7 @@ impl LanguageParser {
         let php_parser = parser_with_php_language()?;
         let rust_parser = parser_with_rust_language()?;
         let java_parser = parser_with_java_language()?;
+        let kotlin_parser = parser_with_kotlin_language()?;
         let python_parser = parser_with_python_language()?;
         let ruby_parser = parser_with_ruby_language()?;
         let typescript_parser = parser_with_typescript_language()?;
@@ -284,6 +286,7 @@ impl LanguageParser {
             php_parser,
             rust_parser,
             java_parser,
+            kotlin_parser,
             python_parser,
             ruby_parser,
             typescript_parser,
@@ -471,6 +474,7 @@ impl LanguageParser {
             LanguageKind::Java => Ok(&mut self.java_parser),
             LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
             LanguageKind::Jsx => Ok(&mut self.jsx_parser),
+            LanguageKind::Kotlin => Ok(&mut self.kotlin_parser),
             LanguageKind::Php => Ok(&mut self.php_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
@@ -493,6 +497,7 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
         LanguageKind::Java => parser_with_java_language(),
         LanguageKind::JavaScript => parser_with_javascript_language(),
         LanguageKind::Jsx => parser_with_jsx_language(),
+        LanguageKind::Kotlin => parser_with_kotlin_language(),
         LanguageKind::Php => parser_with_php_language(),
         LanguageKind::Python => parser_with_python_language(),
         LanguageKind::Ruby => parser_with_ruby_language(),
@@ -516,6 +521,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
         php: parser_with_php_language()?,
         rust: parser_with_rust_language()?,
         java: parser_with_java_language()?,
+        kotlin: parser_with_kotlin_language()?,
         python: parser_with_python_language()?,
         ruby: parser_with_ruby_language()?,
         typescript: parser_with_typescript_language()?,
@@ -538,6 +544,7 @@ struct WorkerParsers {
     php: Parser,
     rust: Parser,
     java: Parser,
+    kotlin: Parser,
     python: Parser,
     ruby: Parser,
     typescript: Parser,
@@ -554,6 +561,7 @@ impl WorkerParsers {
             LanguageKind::Java => Ok(&mut self.java),
             LanguageKind::JavaScript => Ok(&mut self.javascript),
             LanguageKind::Jsx => Ok(&mut self.jsx),
+            LanguageKind::Kotlin => Ok(&mut self.kotlin),
             LanguageKind::Php => Ok(&mut self.php),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
@@ -767,6 +775,15 @@ fn parser_with_java_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_kotlin_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = kotlin_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Kotlin grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_c_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = c_language();
@@ -799,6 +816,10 @@ fn rust_language() -> tree_sitter::Language {
 
 fn java_language() -> tree_sitter::Language {
     tree_sitter_java::LANGUAGE.into()
+}
+
+fn kotlin_language() -> tree_sitter::Language {
+    tree_sitter_kotlin_ng::LANGUAGE.into()
 }
 
 fn python_language() -> tree_sitter::Language {
@@ -850,14 +871,14 @@ fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
         LanguageKind::Java => Some(java_language()),
         LanguageKind::JavaScript => Some(javascript_language()),
         LanguageKind::Jsx => Some(jsx_language()),
+        LanguageKind::Kotlin => Some(kotlin_language()),
         LanguageKind::Python => Some(python_language()),
         LanguageKind::Rust => Some(rust_language()),
         LanguageKind::Ruby => Some(ruby_language()),
         LanguageKind::Php => Some(php_language()),
         LanguageKind::TypeScript => Some(typescript_language()),
         LanguageKind::Tsx => Some(tsx_language()),
-        LanguageKind::Kotlin
-        | LanguageKind::Swift
+        LanguageKind::Swift
         | LanguageKind::Scala
         | LanguageKind::Dart
         | LanguageKind::Unsupported

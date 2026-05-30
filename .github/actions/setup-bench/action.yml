@@ -34,6 +34,27 @@ runs:
           8.0.x
           10.0.x
 
+    - name: Set up JDK 17 for Kotlin oracle
+      if: inputs.language == 'kotlin'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Install Kotlin compiler
+      if: inputs.language == 'kotlin'
+      shell: bash
+      run: |
+        # Kotlin oracle (`benchmarks/oracle/kotlin/KotlinOracle.kt`) depends
+        # on PSI types shipped with kotlin-compiler-embeddable, bundled with
+        # the standalone kotlinc distribution. Pin in lockstep with the
+        # tree-sitter-kotlin-ng grammar release tracked in Cargo.toml.
+        KOTLIN_VERSION="1.9.24"
+        curl -sLo /tmp/kotlin.zip \
+          "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
+        sudo unzip -q /tmp/kotlin.zip -d /opt
+        echo "/opt/kotlinc/bin" >> "$GITHUB_PATH"
+
     - name: Install C/C++ validation tools
       if: inputs.language == 'c-family'
       shell: bash
@@ -67,6 +88,10 @@ runs:
             ;;
           java)
             java -version
+            ;;
+          kotlin)
+            java -version
+            kotlinc -version
             ;;
           js-ts)
             node --version

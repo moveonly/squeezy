@@ -80,6 +80,7 @@ pub(crate) struct BenchmarkReport {
     pub(crate) python_oracle: Option<PythonOracleReport>,
     pub(crate) js_ts_oracle: Option<JsTsOracleReport>,
     pub(crate) java_oracle: Option<JavaOracleReport>,
+    pub(crate) kotlin_oracle: Option<KotlinOracleReport>,
     pub(crate) csharp_oracle: Option<CsharpOracleReport>,
     pub(crate) go_oracle: Option<GoOracleReport>,
     pub(crate) php_oracle: Option<PhpOracleReport>,
@@ -286,6 +287,15 @@ pub(crate) struct JsTsOracleReport {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct JavaOracleReport {
+    pub(crate) oracle_ms: Option<u128>,
+    pub(crate) status: String,
+    pub(crate) symbols: AccuracySetReport,
+    pub(crate) navigation: QueryOracleReport,
+    pub(crate) limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct KotlinOracleReport {
     pub(crate) oracle_ms: Option<u128>,
     pub(crate) status: String,
     pub(crate) symbols: AccuracySetReport,

@@ -382,6 +382,7 @@ pub struct SemanticGraph {
     /// they are scanned alongside the by-target hit list.
     wildcard_aliased_imports: Vec<usize>,
     java_package_by_file: HashMap<FileId, Vec<String>>,
+    kotlin_package_by_file: HashMap<FileId, Vec<String>>,
     js_ts_resolver: JsTsResolver,
     /// Parallel index of `(file, name, arity) -> symbol` so the resolver
     /// can disambiguate overloaded callees by exact positional-parameter
@@ -453,6 +454,7 @@ impl SemanticGraph {
             imports_by_alias_target: HashMap::new(),
             wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
+            kotlin_package_by_file: HashMap::new(),
             js_ts_resolver: JsTsResolver::default(),
             arity_index: HashMap::new(),
             importers_by_file: HashMap::new(),
@@ -1383,7 +1385,7 @@ impl SemanticGraph {
             }
         }
         for import in &self.imports {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if is_package_marker(import) {
                 continue;
             }
             let Some(slot) = self.resolver_slots.get_mut(&import.file_id) else {
@@ -1410,7 +1412,7 @@ impl SemanticGraph {
         // the same loop.
         let mut updates: HashMap<FileId, Vec<FileId>> = HashMap::new();
         for import in &self.imports {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if is_package_marker(import) {
                 continue;
             }
             let target_name = import
@@ -1442,6 +1444,7 @@ impl SemanticGraph {
         self.imports_by_alias_target.clear();
         self.wildcard_aliased_imports.clear();
         self.java_package_by_file.clear();
+        self.kotlin_package_by_file.clear();
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
                 .entry(import.file_id.clone())
@@ -1455,6 +1458,14 @@ impl SemanticGraph {
                 }
                 // Java package markers never name a target symbol; they live
                 // only in the by-file index. Skip both alias-target buckets.
+                continue;
+            }
+            if import.alias.as_deref() == Some("__kotlin_package__") {
+                let segments = path_segments(&import.path);
+                if !segments.is_empty() {
+                    self.kotlin_package_by_file
+                        .insert(import.file_id.clone(), segments);
+                }
                 continue;
             }
             if import.alias.is_none() {
@@ -3145,6 +3156,18 @@ fn single_unique<I: IntoIterator<Item = SymbolId>>(iter: I) -> Option<SymbolId> 
         }
     }
     seen
+}
+
+/// Pseudo-imports synthesised by language extractors to communicate the
+/// file-level package binding (e.g. `__java_package__`, `__kotlin_package__`).
+/// These never name a target symbol and must be skipped by the cross-file
+/// resolver, the importers index, and any code that maps imports to
+/// candidate symbols by name.
+pub(crate) fn is_package_marker(import: &ParsedImport) -> bool {
+    matches!(
+        import.alias.as_deref(),
+        Some("__java_package__") | Some("__kotlin_package__"),
+    )
 }
 
 fn package_key(path: &str) -> String {

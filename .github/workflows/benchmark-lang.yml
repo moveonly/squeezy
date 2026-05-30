@@ -39,6 +39,7 @@ on:
           - c-family
           - csharp
           - js-ts
+          - kotlin
           - php
           - ruby
       tier:
@@ -63,7 +64,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || (inputs.language == 'go' || inputs.language == 'php') && 60 || inputs.language == 'ruby' && 45 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp' || inputs.language == 'kotlin') && 90 || (inputs.language == 'go' || inputs.language == 'php') && 60 || inputs.language == 'ruby' && 45 || 120 }}
 
     steps:
       - name: Checkout
@@ -92,6 +93,16 @@ jobs:
         run: |
           dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
             -c Release --nologo -v minimal
+
+      - name: Build Kotlin oracle jar
+        if: inputs.language == 'kotlin'
+        shell: bash
+        run: |
+          # Requires kotlinc + JDK 17, installed by the setup-bench action's
+          # Kotlin steps. The build script writes
+          # benchmarks/oracle/kotlin/kotlin-oracle.jar (~20MB), which the
+          # Rust harness looks up by exact path. Not checked into the repo.
+          bash benchmarks/oracle/kotlin/build.sh
 
       - name: Install PHP oracle toolchain
         if: inputs.language == 'php'

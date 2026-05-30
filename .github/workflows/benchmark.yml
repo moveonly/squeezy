@@ -44,6 +44,7 @@ on:
           - c-family
           - csharp
           - js-ts
+          - kotlin
       tier:
         description: "Benchmark tier"
         required: true
@@ -146,3 +147,18 @@ jobs:
       tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
       artifact-suffix: js-ts
       summary-file: __js_ts_summary.md
+
+  # New language: Kotlin oracle/gates have not yet held two weeks of CI.
+  # The job uses the same reusable workflow as the other languages and
+  # follows the rest of the smoke-tier pattern; remove this comment once
+  # the Kotlin gate has been steady for two weeks of CI per the
+  # repo's convention for newly-added languages.
+  kotlin-semantic-graph-smoke:
+    name: Kotlin semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'kotlin' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: kotlin
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: kotlin
+      summary-file: __kotlin_summary.md

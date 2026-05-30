@@ -46,6 +46,28 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    // Kotlin smoke-tier symbol parity gate. Thresholds from
+    // `target/lang-specs/kotlin.md` §10: precision >= 0.94, recall >= 0.85.
+    // Skipped when the oracle was unavailable so missing kotlinc/JDK doesn't
+    // mask the fixture-query gates above.
+    if !no_speed_gate
+        && let Some(kotlin) = &report.kotlin_oracle
+        && kotlin.oracle_ms.is_some()
+    {
+        if kotlin.symbols.precision < 0.94 {
+            return Err(SqueezyError::Graph(format!(
+                "Kotlin oracle precision below 0.94 floor: {:.3} (fp={})",
+                kotlin.symbols.precision, kotlin.symbols.false_positive,
+            )));
+        }
+        if kotlin.symbols.recall < 0.85 {
+            return Err(SqueezyError::Graph(format!(
+                "Kotlin oracle recall below 0.85 floor: {:.3} (fn={})",
+                kotlin.symbols.recall, kotlin.symbols.false_negative,
+            )));
+        }
+    }
+
     if !no_speed_gate
         && let Some(php) = &report.php_oracle
         && php.oracle_ms.is_some()

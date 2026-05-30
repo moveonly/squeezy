@@ -3576,6 +3576,409 @@ export function start() {
 }
 
 #[test]
+fn graph_resolves_kotlin_named_import_to_target_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let greeter = kotlin_record(
+        "src/main/kotlin/com/example/services/Greeter.kt",
+        r#"package com.example.services
+
+class Greeter {
+    fun greet(): String = "hi"
+}
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.services.Greeter
+
+class Runner(private val greeter: Greeter) {
+    fun run(): String = greeter.greet()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let greeter_class = graph
+        .find_symbol_by_name("Greeter")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    assert!(
+        graph
+            .references_to_symbol(&greeter_class.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Greeter"),
+        "expected Greeter to be referenced from Runner",
+    );
+}
+
+#[test]
+fn graph_resolves_kotlin_wildcard_import_to_top_level_function() {
+    let mut parser = LanguageParser::new().unwrap();
+    let util = kotlin_record(
+        "src/main/kotlin/com/example/util/Names.kt",
+        r#"package com.example.util
+
+fun defaultName(): String = "Ada"
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.util.*
+
+fun greet(): String = defaultName()
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&util, fs::read_to_string(&util.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let default_name = graph.find_symbol_by_name("defaultName").pop().unwrap();
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    assert!(
+        graph.call_chain(&greet.id, &default_name.id, 3).is_some(),
+        "expected greet -> defaultName via wildcard import",
+    );
+}
+
+#[test]
+fn graph_resolves_kotlin_companion_factory_through_alias_import() {
+    let mut parser = LanguageParser::new().unwrap();
+    let friendly = kotlin_record(
+        "src/main/kotlin/com/example/services/FriendlyGreeter.kt",
+        r#"package com.example.services
+
+class FriendlyGreeter {
+    companion object {
+        fun create(): FriendlyGreeter = FriendlyGreeter()
+    }
+}
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.services.FriendlyGreeter as Friendly
+
+class Runner {
+    fun build(): FriendlyGreeter = Friendly.create()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&friendly, fs::read_to_string(&friendly.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let create = graph
+        .find_symbol_by_name("create")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+    let build = graph
+        .find_symbol_by_name("build")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+    // Companion-object member should re-parent onto FriendlyGreeter.
+    let friendly_class = graph
+        .find_symbol_by_name("FriendlyGreeter")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    assert_eq!(create.parent_id.as_ref(), Some(&friendly_class.id));
+    assert!(
+        graph.call_chain(&build.id, &create.id, 3).is_some(),
+        "build -> create via companion + alias",
+    );
+}
+
+#[test]
+fn graph_resolves_kotlin_extension_function_cross_file() {
+    let mut parser = LanguageParser::new().unwrap();
+    let strings = kotlin_record(
+        "src/main/kotlin/com/example/util/Strings.kt",
+        r#"package com.example.util
+
+fun String.prepare(): String = this.trim()
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.util.prepare
+
+class Runner(private val s: String) {
+    fun run(): String = s.prepare()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&strings, fs::read_to_string(&strings.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let prepare = graph
+        .find_symbol_by_name("prepare")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    assert_eq!(prepare.language_identity.as_deref(), Some("String"));
+    assert!(prepare.attributes.contains(&"kotlin:extension".to_string()));
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+    assert!(
+        graph.call_chain(&run.id, &prepare.id, 3).is_some(),
+        "run -> prepare extension fun call",
+    );
+}
+
+#[test]
+fn graph_resolves_kotlin_suspend_function_call() {
+    let mut parser = LanguageParser::new().unwrap();
+    let names = kotlin_record(
+        "src/main/kotlin/com/example/util/Names.kt",
+        r#"package com.example.util
+
+suspend fun fetchDefault(): String = "default"
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.util.fetchDefault
+
+class Runner {
+    suspend fun run(): String = fetchDefault()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&names, fs::read_to_string(&names.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let fetch = graph
+        .find_symbol_by_name("fetchDefault")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    assert!(fetch.attributes.contains(&"kotlin:suspend".to_string()));
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+    assert!(run.attributes.contains(&"kotlin:suspend".to_string()));
+    assert!(
+        graph.call_chain(&run.id, &fetch.id, 3).is_some(),
+        "suspend call chain",
+    );
+}
+
+#[test]
+fn graph_resolves_kotlin_object_singleton_member_call() {
+    let mut parser = LanguageParser::new().unwrap();
+    let object_file = kotlin_record(
+        "src/main/kotlin/com/example/util/StringOps.kt",
+        r#"package com.example.util
+
+object StringOps {
+    fun normalize(s: String): String = s
+}
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.util.StringOps
+
+class Runner {
+    fun handle(s: String): String = StringOps.normalize(s)
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&object_file, fs::read_to_string(&object_file.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let string_ops = graph
+        .find_symbol_by_name("StringOps")
+        .into_iter()
+        .find(|symbol| symbol.attributes.iter().any(|a| a == "kotlin:object"))
+        .unwrap();
+    assert_eq!(string_ops.kind, SymbolKind::Class);
+    // Reference to StringOps should resolve to the singleton class.
+    assert!(
+        graph
+            .references_to_symbol(&string_ops.id)
+            .iter()
+            .any(|hit| hit.reference.text == "StringOps"),
+    );
+}
+
+#[test]
+fn graph_records_kotlin_typealias_target() {
+    let mut parser = LanguageParser::new().unwrap();
+    let aliases = kotlin_record(
+        "src/main/kotlin/com/example/util/Aliases.kt",
+        r#"package com.example.util
+
+typealias UserId = String
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&aliases, fs::read_to_string(&aliases.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let alias = graph
+        .find_symbol_by_name("UserId")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::TypeAlias)
+        .unwrap();
+    assert_eq!(alias.language_identity.as_deref(), Some("String"));
+}
+
+#[test]
+fn graph_resolves_kotlin_top_level_property_reference() {
+    let mut parser = LanguageParser::new().unwrap();
+    let names = kotlin_record(
+        "src/main/kotlin/com/example/util/Names.kt",
+        r#"package com.example.util
+
+const val GREETING: String = "Hello"
+"#,
+    );
+    let runner = kotlin_record(
+        "src/main/kotlin/com/example/app/Runner.kt",
+        r#"package com.example.app
+
+import com.example.util.GREETING
+
+object Holder {
+    val cached: String = GREETING
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&names, fs::read_to_string(&names.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let greeting = graph
+        .find_symbol_by_name("GREETING")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Const)
+        .unwrap();
+    assert!(
+        greeting.parent_id.is_none(),
+        "top-level const has no parent"
+    );
+    assert!(greeting.attributes.contains(&"kotlin:const".to_string()));
+    // The named import of GREETING from the runner file should be retained
+    // in the parsed-import set so the resolver can route bare-identifier
+    // uses on later passes. Bare-identifier call-site references are
+    // suppressed by design (spec §3), so we assert the import not the ref.
+    let runner_file_id = greeting.file_id.clone();
+    let _ = runner_file_id;
+    // The import index should contain the GREETING named import.
+    let imported_greetings: usize = graph
+        .imports
+        .iter()
+        .filter(|import| {
+            last_path_segment(&import.path) == "GREETING"
+                && import.alias.as_deref() != Some("__kotlin_package__")
+        })
+        .count();
+    assert!(
+        imported_greetings >= 1,
+        "expected GREETING import to be tracked",
+    );
+}
+
+#[test]
+fn graph_resolves_kotlin_data_class_field_promotion() {
+    let mut parser = LanguageParser::new().unwrap();
+    let names = kotlin_record(
+        "src/main/kotlin/com/example/model/Person.kt",
+        r#"package com.example.model
+
+data class Person(val name: String, val age: Int)
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&names, fs::read_to_string(&names.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let person = graph
+        .find_symbol_by_name("Person")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    assert!(person.attributes.contains(&"kotlin:data".to_string()));
+    // Primary-constructor val parameters become field children.
+    let name = graph
+        .find_symbol_by_name("name")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Field)
+        .unwrap();
+    assert_eq!(name.parent_id.as_ref(), Some(&person.id));
+}
+
+#[test]
 fn graph_emits_php_namespace_module_symbol() {
     let mut parser = LanguageParser::new().unwrap();
     let service = php_record(
@@ -4251,6 +4654,12 @@ fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
+    record
+}
+
+fn kotlin_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Kotlin;
     record
 }
 

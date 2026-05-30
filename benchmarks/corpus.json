@@ -727,6 +727,32 @@
       }
     },
     {
+      "name": "kotlin-smoke",
+      "family": "kotlin",
+      "language": "kotlin",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/kotlin/semantic-cases",
+      "spec": "benchmarks/specs/kotlin-smoke-queries.json",
+      "report": "kotlin/kotlin-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "kotlinx-coroutines",
+      "family": "kotlin",
+      "language": "kotlin",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/kotlinx-coroutines/kotlinx-coroutines-core/common/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "kotlin/kotlinx-coroutines.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/Kotlin/kotlinx.coroutines",
+        "rev": "1.10.1",
+        "checkout": "target/benchmark-repos/kotlinx-coroutines"
+      }
+    },
+    {
       "name": "ruby-smoke",
       "family": "ruby",
       "language": "ruby",

@@ -12,6 +12,7 @@ uses the same family names so coverage claims stay checkable.
 | `rust` | Rust | `rs` | `tree-sitter-rust` | `rust_analyzer` | yes | `benchmarks/fixtures/rust/semantic-cases` | `benchmarks/specs/smoke-queries.json` | ripgrep, fd, bat, tokio, serde |
 | `python` | Python | `py` | `tree-sitter-python` | `cpython_ast` | no | `benchmarks/fixtures/python/semantic-cases` | `benchmarks/specs/python-smoke-queries.json` | requests, flask, click, black, fastapi |
 | `java` | Java | `java` | `tree-sitter-java` | `javac` | no | `benchmarks/fixtures/java/semantic-cases` | `benchmarks/specs/java-smoke-queries.json` | junit5, mockito, guava, retrofit, picocli |
+| `kotlin` | Kotlin | `kt`, `kts` | `tree-sitter-kotlin-ng` | `kotlin_compiler_embeddable` | no | `benchmarks/fixtures/kotlin/semantic-cases` | `benchmarks/specs/kotlin-smoke-queries.json` | kotlinx-coroutines |
 | `csharp` | C# | `cs`, `csx` | `tree-sitter-c-sharp` | `roslyn` | yes | `benchmarks/fixtures/csharp/semantic-cases` | `benchmarks/specs/csharp-smoke-queries.json` | newtonsoft_json, dapper, automapper, polly, serilog |
 | `go` | Go | `go` | `tree-sitter-go` | `go_types` | yes | `benchmarks/fixtures/go/semantic-cases` | `benchmarks/specs/go-smoke-queries.json` | gin, cobra, prometheus, etcd, zap |
 | `c-family` | C, C++ | `c`, `h`, `cc`, `cpp`, `cxx`, `hh`, `hpp`, `hxx` | `tree-sitter-c`, `tree-sitter-cpp` | `clang` | yes | `benchmarks/fixtures/c/semantic-cases`, `benchmarks/fixtures/cpp/semantic-cases` | `benchmarks/specs/c-smoke-queries.json`, `benchmarks/specs/cpp-smoke-queries.json` | redis, curl, sqlite, protobuf, nlohmann_json |
@@ -62,6 +63,32 @@ Known follow-ups: overload resolution, classpath completeness, annotation
 processing, and generated-source behavior are not compiler-equivalent.
 
 Oracle: `javac` compiler-tree scans for symbols and navigation query checks.
+
+## Kotlin
+
+Indexed: packages, imports (named/aliased/wildcard), classes, objects,
+companion objects, interfaces, sealed types, enums and enum entries, methods,
+secondary constructors, properties (top-level and class-level, `val`/`var`),
+typealiases, primary-constructor properties (promoted to fields), extension
+functions (receiver captured via `language_identity`), suspend / inline /
+operator / infix / tailrec attributes, override / abstract / open flags, and
+inheritance through `delegation_specifiers` (`base:<parent>` attributes).
+
+Known limitations: delegated-property accessor bodies (`val x by lazy {...}`),
+inline `reified` type-parameter modeling, generated data-class members
+(`copy`, `componentN`, `equals`, `hashCode`, `toString`), anonymous-object
+expressions, and overload resolution stay heuristic for v0; the oracle
+suppresses the same set so the symbol-set gates remain symmetric. Multiplatform
+`expect`/`actual` matching is not attempted.
+
+Known follow-ups: companion-object owner-path collapsing for member
+resolution, sealed-class child enumeration, and a Kotlin LSP-based navigation
+oracle (fwcd/kotlin-language-server) are scoped for a phase-2 follow-up
+once the symbol-set gates hold.
+
+Oracle: JetBrains `kotlin-compiler-embeddable` PSI walker
+(`benchmarks/oracle/kotlin/KotlinOracle.kt`). Build with
+`benchmarks/oracle/kotlin/build.sh` (requires `kotlinc` + JDK 17).
 
 ## C#
 

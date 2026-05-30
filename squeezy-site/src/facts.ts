@@ -124,6 +124,11 @@ export const languageRows: MatrixRow[] = [
     status: "first-class graph"
   },
   {
+    name: "Kotlin",
+    detail: "Packages, imports (aliased/wildcard), classes, objects, companion objects, data/sealed types, extension functions, suspend, typealiases, and Gradle facts.",
+    status: "first-class graph"
+  },
+  {
     name: "C#",
     detail: "Namespaces, types, members, partial links, inheritance, references, and .csproj/.sln project facts.",
     status: "first-class graph"
