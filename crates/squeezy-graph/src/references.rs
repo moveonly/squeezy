@@ -119,6 +119,9 @@ impl SemanticGraph {
         if self.workspace_cross_crate_qualified_match(symbol, reference) {
             return Some(Confidence::Heuristic);
         }
+        if self.go_cross_package_method_match(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if !self.reference_is_in_symbol_package(symbol, reference) {
             return None;
         }
@@ -148,7 +151,19 @@ impl SemanticGraph {
             return Some(Confidence::Heuristic);
         }
         if let Some(edge) = self.call_edge_for_reference(reference) {
-            return self.edge_binding_confidence(symbol, edge);
+            if let Some(confidence) = self.edge_binding_confidence(symbol, edge) {
+                return Some(confidence);
+            }
+            // A call edge with `to = None` is unresolved (e.g. a C#
+            // namespace-qualified static call that `resolve_call`
+            // couldn't disambiguate). Fall through so the later
+            // `semantic_edge_for_reference` branch — which DOES bind
+            // via the `References` edge whose `to` is `Some(symbol.id)` —
+            // gets a chance. Only short-circuit when the call edge is
+            // authoritatively resolved to a different symbol.
+            if edge.to.is_some() {
+                return None;
+            }
         }
         if self.imported_reference_matches_symbol(symbol, reference) {
             return Some(Confidence::ImportResolved);
@@ -399,6 +414,101 @@ impl SemanticGraph {
             }
         }
         symbol_seen && candidates_in_symbol_crate == 1
+    }
+
+    /// Bind Go cross-package method references like `cmd.VisitParents(...)`
+    /// from a sibling Go package that imports the symbol's package.
+    /// Tree-sitter emits a `Field`-kind reference with text equal to
+    /// the method name; the receiver `cmd` is a variable typed by
+    /// another package, which Squeezy doesn't track type-by-type.
+    /// This helper accepts the binding when:
+    ///   1. both files are Go,
+    ///   2. the reference text matches the symbol name,
+    ///   3. the reference's file imports a path whose leaf (or
+    ///      alias) equals the symbol's package name, and
+    ///   4. the symbol is the unique callable of its name in that
+    ///      package.
+    ///
+    /// Mirrors the Rust [`Self::workspace_cross_crate_qualified_match`]
+    /// but for Go's package + import shape.
+    pub(crate) fn go_cross_package_method_match(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+        ) {
+            return false;
+        }
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        if symbol_file.language != LanguageKind::Go || reference_file.language != LanguageKind::Go {
+            return false;
+        }
+        // Same-package references already pass `reference_is_in_symbol_package`;
+        // this helper only owns the cross-package case.
+        if self.packages.get(&symbol.file_id) == self.packages.get(&reference.file_id) {
+            return false;
+        }
+        if reference.text != symbol.name && last_path_segment(&reference.text) != symbol.name {
+            return false;
+        }
+        let Some(symbol_package) = self.packages.get(&symbol.file_id).cloned() else {
+            return false;
+        };
+        // Reference's file must import the symbol's package by name or
+        // alias.
+        let import_visible = self.imports_for_file(&reference.file_id).any(|import| {
+            let import_leaf = import
+                .alias
+                .as_deref()
+                .filter(|alias| *alias != "_")
+                .map(str::to_string)
+                .unwrap_or_else(|| last_path_segment(&import.path));
+            import_leaf == symbol_package || last_path_segment(&import.path) == symbol_package
+        });
+        if !import_visible {
+            return false;
+        }
+        // Symbol must be the unique callable by name within its package.
+        let mut count = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if candidate_file.language != LanguageKind::Go {
+                continue;
+            }
+            if self.packages.get(&candidate.file_id).cloned().as_deref()
+                != Some(symbol_package.as_str())
+            {
+                continue;
+            }
+            count += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if count > 1 {
+                return false;
+            }
+        }
+        symbol_seen && count == 1
     }
 
     /// For a bare-identifier reference whose enclosing file contains

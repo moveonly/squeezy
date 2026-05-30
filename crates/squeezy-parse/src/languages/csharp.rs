@@ -167,7 +167,23 @@ fn visit_csharp_node(
             extract_csharp_object_creation(node, ctx, owner_symbol.clone());
         }
         "identifier" if !is_csharp_declaration_name(node) => {
-            extract_csharp_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
+            // The right-hand name of `Foo.Bar` (a `member_access_expression`)
+            // is a method-or-field access, not a bare identifier; the
+            // graph's binding chain treats `Method` symbols as
+            // bindable from `Field`-kind references only (mirrors the
+            // Java / JS / TS extractors). Without this distinction
+            // every namespace-qualified call like
+            // `MiscellaneousUtils.CreateArgumentOutOfRangeException(...)`
+            // emitted only an `Identifier`-kind reference, which the
+            // semantic-edge step rejected via
+            // `reference_kind_can_bind_symbol`, so `reference_search`
+            // silently missed the call site.
+            let kind = if csharp_identifier_is_member_access_name(node) {
+                ReferenceKind::Field
+            } else {
+                ReferenceKind::Identifier
+            };
+            extract_csharp_reference(node, kind, ctx, owner_symbol.clone());
         }
         "type_identifier" => {
             extract_csharp_reference(node, ReferenceKind::Type, ctx, owner_symbol.clone());
@@ -1181,11 +1197,17 @@ pub(crate) fn is_csharp_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if let Some(name_node) = parent.child_by_field_name("name")
-        && name_node.id() == node.id()
-    {
-        return true;
-    }
+    // The early-return only fires when the parent is genuinely a
+    // declaration (class/method/struct/etc) and the current node is
+    // that declaration's `name` field. Without the kind gate, every
+    // inner identifier whose parent has a `name` field — most
+    // notably the rhs of a `member_access_expression`
+    // (`Foo.Bar(...)` → `Bar`) — was being incorrectly treated as a
+    // declaration name, so qualified call sites never got a
+    // `ParsedReference` and `reference_search` silently missed them
+    // (verified by the
+    // `references_to_symbol_finds_csharp_namespace_qualified_internal_static_call`
+    // test from the Newtonsoft.Json A/B).
     matches!(
         parent.kind(),
         "variable_declarator"
@@ -1209,6 +1231,23 @@ pub(crate) fn is_csharp_declaration_name(node: Node<'_>) -> bool {
             | "destructor_declaration"
             | "local_function_statement"
     ) && parent
+        .child_by_field_name("name")
+        .map(|name_node| name_node.id() == node.id())
+        .unwrap_or(false)
+}
+
+/// Returns true when `node` is an `identifier` sitting on the
+/// right-hand side of a `member_access_expression` (`Foo.Bar` → `Bar`).
+/// Mirrors the Java / JS / TS heuristic that treats these as
+/// field/method accesses rather than bare identifiers.
+pub(crate) fn csharp_identifier_is_member_access_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "member_access_expression" {
+        return false;
+    }
+    parent
         .child_by_field_name("name")
         .map(|name_node| name_node.id() == node.id())
         .unwrap_or(false)

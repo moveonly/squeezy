@@ -3640,6 +3640,89 @@ fn main() {
 }
 
 #[test]
+fn references_to_symbol_finds_csharp_namespace_qualified_internal_static_call() {
+    // C# A/B Task finding: the with-graph runs on Newtonsoft.Json
+    // missed call sites of
+    // `MiscellaneousUtils.CreateArgumentOutOfRangeException(...)` even
+    // though every caller lives in the same project (single package
+    // key `Src`). The class is `internal static` and the calls are of
+    // the shape `ClassName.Method(...)` from another file in the same
+    // namespace tree under `Src/Newtonsoft.Json/...`.
+    //
+    // Mirrors `references_to_symbol_finds_workspace_cross_crate_qualified_trait_impl`
+    // but uses `csharp_record` + the `Class.Method` qualifier shape
+    // rather than Rust's `crate::Trait` syntax.
+    let mut parser = LanguageParser::new().unwrap();
+    let utils = csharp_record(
+        "Src/Newtonsoft.Json/Utilities/MiscellaneousUtils.cs",
+        r#"
+using System;
+
+namespace Newtonsoft.Json.Utilities
+{
+    internal static class MiscellaneousUtils
+    {
+        public static ArgumentOutOfRangeException CreateArgumentOutOfRangeException(
+            string paramName, object actualValue, string message)
+        {
+            return new ArgumentOutOfRangeException(paramName, actualValue, message);
+        }
+    }
+}
+"#,
+    );
+    let caller = csharp_record(
+        "Src/Newtonsoft.Json/Utilities/DateTimeUtils.cs",
+        r#"
+using System;
+
+namespace Newtonsoft.Json.Utilities
+{
+    internal static class DateTimeUtils
+    {
+        internal static string ToSerializationMode(DateTimeKind kind)
+        {
+            switch (kind)
+            {
+                default:
+                    throw MiscellaneousUtils.CreateArgumentOutOfRangeException(
+                        nameof(kind), kind, "Unexpected DateTimeKind value.");
+            }
+        }
+    }
+}
+"#,
+    );
+    let parsed = [utils, caller]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let method = graph
+        .find_symbol_by_name("CreateArgumentOutOfRangeException")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("CreateArgumentOutOfRangeException method indexed");
+    let hits = graph.references_to_symbol(&method.id);
+    assert!(
+        hits.iter().any(|hit| hit.reference.file_id.0
+            == "Src/Newtonsoft.Json/Utilities/DateTimeUtils.cs"
+            && hit
+                .reference
+                .text
+                .contains("CreateArgumentOutOfRangeException")),
+        "expected `MiscellaneousUtils.CreateArgumentOutOfRangeException(...)` call \
+         in DateTimeUtils.cs to surface on reference_search, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
 fn references_to_symbol_finds_workspace_cross_crate_qualified_trait_impl() {
     // A/B Task 2 finding: the graph missed every `impl
     // squeezy_llm::LlmProvider for ...` block that lived outside the
@@ -3820,6 +3903,129 @@ fn main() {
              self-crate fallback; got {} main.rs hits for {}",
             main_hits.len(),
             shared.id.0,
+        );
+    }
+}
+
+#[test]
+fn references_to_symbol_finds_go_cross_package_qualified_call() {
+    // Go A/B finding: cobra's `doc/*.go` files import
+    // `"github.com/spf13/cobra"` and call `cmd.VisitParents(...)` on
+    // a `*cobra.Command` parameter. The graph emits a Field reference
+    // whose package (`doc`) differs from the symbol's package (the
+    // module root), so `reference_is_in_symbol_package` gates it out.
+    // The Rust-only `workspace_cross_crate_qualified_match` fallback
+    // does not fire because `crate_underscore_alias_for_relative_path`
+    // requires `crates/<name>/` paths, and `imported_reference_matches_symbol`
+    // does not fire because the Go import path leaf is the package
+    // (`cobra`), not the symbol name.
+    let mut parser = LanguageParser::new().unwrap();
+    let cobra = go_record(
+        "command.go",
+        r#"
+package cobra
+
+type Command struct {
+    parent *Command
+}
+
+func (c *Command) VisitParents(fn func(*Command)) {
+    if c.HasParent() {
+        fn(c.Parent())
+        c.Parent().VisitParents(fn)
+    }
+}
+
+func (c *Command) HasParent() bool { return c.parent != nil }
+func (c *Command) Parent() *Command { return c.parent }
+"#,
+    );
+    let doc = go_record(
+        "doc/md_docs.go",
+        r#"
+package doc
+
+import "github.com/spf13/cobra"
+
+func GenMarkdownCustom(cmd *cobra.Command) string {
+    name := ""
+    cmd.VisitParents(func(p *cobra.Command) {
+        name = "x"
+    })
+    return name
+}
+"#,
+    );
+    let parsed = [cobra, doc]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let visit_parents = graph
+        .find_symbol_by_name("VisitParents")
+        .pop()
+        .expect("VisitParents method indexed");
+    let hits = graph.references_to_symbol(&visit_parents.id);
+    assert!(
+        hits.iter()
+            .any(|hit| hit.reference.file_id.0 == "doc/md_docs.go"
+                && hit.reference.text.contains("VisitParents")),
+        "expected `cmd.VisitParents(...)` in doc/md_docs.go to surface via \
+         cross-package qualified call binding, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn go_cross_package_method_match_skips_ambiguous_same_package_name() {
+    // Conservatism guard: when the symbol's own Go package has TWO
+    // methods of the same name on different types, the cross-package
+    // fallback refuses to bind either — otherwise a `cmd.Run()` call
+    // from outside the package would arbitrarily pick one. Squeezy
+    // does not track Go variable types yet, so the safest behaviour
+    // is to leave the reference unresolved.
+    let mut parser = LanguageParser::new().unwrap();
+    let cobra = go_record(
+        "cobra/command.go",
+        r#"
+package cobra
+
+type Command struct{}
+func (c *Command) Run() {}
+
+type Runner struct{}
+func (r *Runner) Run() {}
+"#,
+    );
+    let doc = go_record(
+        "doc/md.go",
+        r#"
+package doc
+
+import "github.com/spf13/cobra"
+
+func Render(cmd *cobra.Command) { cmd.Run() }
+"#,
+    );
+    let parsed = [cobra, doc]
+        .into_iter()
+        .map(|r| {
+            let s = fs::read_to_string(&r.path).unwrap();
+            parser.parse_source(&r, s).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    for run in graph.find_symbol_by_name("Run") {
+        let hits = graph.references_to_symbol(&run.id);
+        assert!(
+            hits.iter().all(|h| h.reference.file_id.0 != "doc/md.go"),
+            "ambiguous `Run` across two types in same Go package must not bind via the cross-package fallback; symbol id={}",
+            run.id.0,
         );
     }
 }

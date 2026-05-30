@@ -1,0 +1,56 @@
+id = "graph-vs-nograph-go-callers-with-graph"
+title = "spf13/cobra (*Command).VisitParents callers — with graph (openai mini)"
+description = """
+Cross-language A/B (Go). Asks the model to enumerate the non-test
+call sites of the method `(*Command).VisitParents` in `spf13/cobra`.
+Includes one recursive self-call inside the definition and three
+cross-package qualified calls under `doc/`.
+"""
+
+[workspace.github]
+repo = "spf13/cobra"
+sha = "ad460ea8f249db69c943a365fb84f3a59042d54e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every non-test call site of the method `VisitParents` defined on
+`*Command` in `command.go`.
+
+Exclude:
+- Files ending in `_test.go`.
+- Any `import` lines.
+
+Include the recursive self-call inside the definition itself if you
+find one.
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing function or method (e.g. `(*Command).foo` for
+  receiver methods)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false
