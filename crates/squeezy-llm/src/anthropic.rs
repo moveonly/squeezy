@@ -40,6 +40,42 @@ const ANTHROPIC_MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
 /// the budget.
 const ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS: u64 = 1024;
 
+/// Beta header required for `output_config.effort`, used alongside
+/// `thinking.type=adaptive` on Claude 4.6+ models. The API rejects
+/// `thinking.type=enabled` for those models and directs callers here.
+const EFFORT_BETA_HEADER: &str = "effort-2025-11-24";
+
+/// Anthropic Opus and Sonnet from 4.6 onward are trained on adaptive
+/// thinking and reject `thinking.type=enabled`; budget is controlled via
+/// `output_config.effort` instead. Version is parsed from the model id
+/// (e.g. `claude-opus-4-7` → `(4, 7)`) so newer releases like opus-4-8
+/// or sonnet-5-0 pick up adaptive without a code change. Haiku and any
+/// pre-4.6 model fall back to the explicit-budget form.
+pub(crate) fn model_uses_adaptive_thinking(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    ["opus", "sonnet"]
+        .iter()
+        .any(|family| extract_claude_version(&lower, family).is_some_and(|v| v >= (4, 6)))
+}
+
+fn extract_claude_version(model: &str, family: &str) -> Option<(u32, u32)> {
+    let needle = format!("{family}-");
+    let start = model.find(&needle)? + needle.len();
+    let mut parts = model[start..].split('-');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn anthropic_effort_label(effort: squeezy_core::ReasoningEffort) -> &'static str {
+    match effort {
+        squeezy_core::ReasoningEffort::Low => "low",
+        squeezy_core::ReasoningEffort::Medium => "medium",
+        squeezy_core::ReasoningEffort::High => "high",
+        squeezy_core::ReasoningEffort::XHigh => "max",
+    }
+}
+
 /// Identity preamble Anthropic requires on OAuth-driven requests so
 /// the call counts against the Claude Pro/Max subscription quota
 /// rather than failing the OAuth quota check. Anthropic pins the
@@ -147,32 +183,42 @@ impl AnthropicProvider {
             && crate::capabilities_for("anthropic", &request.model)
                 .is_some_and(|caps| caps.reasoning_effort)
         {
-            // Anthropic requires `budget_tokens >= 1024` AND
-            // `max_tokens > budget_tokens`. When `max_output_tokens` is
-            // too small to satisfy both at once, emitting `thinking`
-            // earns a hard 400 on every turn. Skip the block in that
-            // case and warn so the operator can either raise
-            // `max_output_tokens` or unset `reasoning_effort`.
-            let ceiling = max_tokens.saturating_sub(ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS);
-            if ceiling >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS {
-                let budget = u64::from(effort.thinking_budget_tokens())
-                    .min(ceiling)
-                    .max(ANTHROPIC_MIN_THINKING_BUDGET_TOKENS);
-                body["thinking"] = json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
+            if model_uses_adaptive_thinking(&request.model) {
+                // Claude 4.6+ opus/sonnet reject `thinking.type=enabled`
+                // and want the budget conveyed through
+                // `output_config.effort` instead.
+                body["thinking"] = json!({ "type": "adaptive" });
+                body["output_config"] = json!({
+                    "effort": anthropic_effort_label(effort),
                 });
             } else {
-                tracing::warn!(
-                    provider = "anthropic",
-                    model = %request.model,
-                    max_output_tokens = max_tokens,
-                    min_required = ANTHROPIC_MIN_THINKING_BUDGET_TOKENS
-                        + ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS,
-                    "anthropic thinking disabled: max_output_tokens too small to satisfy \
-                     thinking.budget_tokens >= 1024 with a reply headroom; raise \
-                     max_output_tokens or clear reasoning_effort to silence this warning"
-                );
+                // Anthropic requires `budget_tokens >= 1024` AND
+                // `max_tokens > budget_tokens`. When `max_output_tokens` is
+                // too small to satisfy both at once, emitting `thinking`
+                // earns a hard 400 on every turn. Skip the block in that
+                // case and warn so the operator can either raise
+                // `max_output_tokens` or unset `reasoning_effort`.
+                let ceiling = max_tokens.saturating_sub(ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS);
+                if ceiling >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS {
+                    let budget = u64::from(effort.thinking_budget_tokens())
+                        .min(ceiling)
+                        .max(ANTHROPIC_MIN_THINKING_BUDGET_TOKENS);
+                    body["thinking"] = json!({
+                        "type": "enabled",
+                        "budget_tokens": budget,
+                    });
+                } else {
+                    tracing::warn!(
+                        provider = "anthropic",
+                        model = %request.model,
+                        max_output_tokens = max_tokens,
+                        min_required = ANTHROPIC_MIN_THINKING_BUDGET_TOKENS
+                            + ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS,
+                        "anthropic thinking disabled: max_output_tokens too small to satisfy \
+                         thinking.budget_tokens >= 1024 with a reply headroom; raise \
+                         max_output_tokens or clear reasoning_effort to silence this warning"
+                    );
+                }
             }
         }
         if !request.tools.is_empty() {
@@ -412,7 +458,19 @@ impl LlmProvider for AnthropicProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
-        let caller_beta_header = anthropic_header_value(&request.beta_headers);
+        let needs_effort_beta = request.reasoning_effort.is_some()
+            && model_uses_adaptive_thinking(&request.model)
+            && crate::capabilities_for("anthropic", &request.model)
+                .is_some_and(|caps| caps.reasoning_effort);
+        let mut effective_betas: Vec<Arc<str>> = request.beta_headers.iter().cloned().collect();
+        if needs_effort_beta
+            && !effective_betas
+                .iter()
+                .any(|beta| beta.as_ref() == EFFORT_BETA_HEADER)
+        {
+            effective_betas.push(Arc::<str>::from(EFFORT_BETA_HEADER));
+        }
+        let caller_beta_header = anthropic_header_value(&effective_betas);
         let transport = self.transport;
         let request_for_attempts = request.clone();
 

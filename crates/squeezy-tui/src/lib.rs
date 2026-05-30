@@ -893,6 +893,8 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     apply_theme_overrides(new_cfg.tui.theme);
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
+    app.provider_name = new_provider;
+    app.apply_config_change(&new_cfg);
     if old_provider == new_provider {
         agent.replace_config(new_cfg);
         app.app_notifications
@@ -3261,6 +3263,7 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     let mut next = agent.config_snapshot();
     next.reasoning_effort = next_effort;
     agent.replace_config(next);
+    app.reasoning_effort = next_effort;
     let label = next_effort.map_or_else(
         || "auto (model default)".to_string(),
         |e| e.as_str().to_string(),
@@ -10345,6 +10348,11 @@ pub(crate) struct TuiApp {
     pub(crate) provider_name: &'static str,
     pub(crate) version: &'static str,
     pub(crate) model: String,
+    /// Mirror of `AppConfig::reasoning_effort`. `None` means "let the
+    /// model choose"; the status-line `reasoning-effort` item hides
+    /// itself in that case and shows the level (`low`, `medium`, …)
+    /// when the user has set one explicitly.
+    pub(crate) reasoning_effort: Option<squeezy_core::ReasoningEffort>,
     pub(crate) directory: String,
     pub(crate) language_summary: String,
     pub(crate) mode: SessionMode,
@@ -10759,6 +10767,7 @@ impl TuiApp {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort,
             directory: compact_path(&config.workspace_root),
             language_summary: if startup.languages.trim().is_empty() {
                 configured_language_summary(config)
@@ -10883,6 +10892,40 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             settings_path_override: None,
+        }
+    }
+
+    /// Mirror every config-derived field the status line and header
+    /// read so external `settings.toml` edits surface live in the
+    /// running TUI without a restart. Runtime-only fields (transcript,
+    /// turn state, repo polling) are deliberately left alone — they
+    /// are owned by the session, not the config tier.
+    pub(crate) fn apply_config_change(&mut self, config: &AppConfig) {
+        self.model = config.model.clone();
+        self.reasoning_effort = config.reasoning_effort;
+        self.directory = compact_path(&config.workspace_root);
+        self.workspace_root = config.workspace_root.clone();
+        self.config_sources = config.config_source_labels().join(",");
+        self.status_verbosity = config.tui.status_verbosity;
+        self.response_verbosity = config.tui.response_verbosity;
+        self.tool_output_verbosity = config.tui.tool_output_verbosity;
+        self.transcript_default = config.tui.transcript_default;
+        self.show_reasoning_usage = config.tui.show_reasoning_usage;
+        self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
+        self.permissions = PermissionStatus::from_policy(&config.permissions);
+        self.telemetry = TelemetryStatus::from_config(&config.telemetry);
+        self.context_compaction_threshold = config.context_compaction.estimated_tokens;
+        self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
+        self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
+        self.status_line_use_colors = config.tui.status_line_use_colors;
+        self.animation_tick_rate = config.tick_rate;
+        // Languages only refresh from config when no filesystem
+        // detection populated them (the fallback path). Filesystem
+        // counts are owned by the startup walk and shouldn't be
+        // clobbered by a settings reload.
+        let summary = self.language_summary.trim();
+        if summary.is_empty() || summary == "none" {
+            self.language_summary = configured_language_summary(config);
         }
     }
 

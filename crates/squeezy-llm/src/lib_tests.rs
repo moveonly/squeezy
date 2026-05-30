@@ -114,7 +114,7 @@ fn registry_lists_context_limits_for_hosted_defaults() {
 
     let anthropic =
         model_info_for("anthropic", squeezy_core::DEFAULT_ANTHROPIC_MODEL).expect("anthropic");
-    assert_eq!(squeezy_core::DEFAULT_ANTHROPIC_MODEL, "claude-opus-4-7");
+    assert_eq!(squeezy_core::DEFAULT_ANTHROPIC_MODEL, "claude-sonnet-4-6");
     assert_eq!(anthropic.limits.unwrap().context_window_tokens, 200_000);
     assert_eq!(anthropic.limits.unwrap().max_output_tokens, 64_000);
 
