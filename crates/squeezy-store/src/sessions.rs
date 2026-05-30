@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload, Result,
-    SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload,
+    ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1537,6 +1537,7 @@ impl SessionHandle {
         let (events, _warnings) = read_jsonl(&self.dir().join("events.jsonl"))?;
         let mut conversation: Vec<ResumeItem> = Vec::new();
         let mut transcript: Vec<TranscriptItem> = Vec::new();
+        let mut replay = ReplayState::default();
         for (idx, event) in events.iter().enumerate().rev() {
             if let Some(SessionEventKind::ContextCompacted {
                 conversation: snapshot,
@@ -1549,7 +1550,7 @@ impl SessionHandle {
                 // order — events at idx or earlier are subsumed by the
                 // checkpoint snapshot.
                 for forward in events.iter().skip(idx + 1) {
-                    apply_event_to_replay(forward, &mut conversation, &mut transcript);
+                    apply_event_to_replay(forward, &mut conversation, &mut transcript, &mut replay);
                 }
                 return Ok(SessionResumeState {
                     resume_available: true,
@@ -1562,7 +1563,7 @@ impl SessionHandle {
             }
         }
         for event in &events {
-            apply_event_to_replay(event, &mut conversation, &mut transcript);
+            apply_event_to_replay(event, &mut conversation, &mut transcript, &mut replay);
         }
         Ok(SessionResumeState {
             resume_available: true,
@@ -2791,10 +2792,56 @@ fn attachment_file_stem(id: &str) -> Result<&str> {
     )))
 }
 
+/// Per-replay state that has to survive across `apply_event_to_replay`
+/// calls. Currently just the reasoning buffer: provider streams emit
+/// `Reasoning` events independently of the assistant message that
+/// follows, but the rendered transcript only has a place to attach a
+/// reasoning snapshot via `TranscriptItem.reasoning` on the assistant
+/// message itself. Buffering pending reasoning here lets the next
+/// `AssistantCompleted` carry it forward; without this, a resumed
+/// session loses every reasoning chip (#157 follow-up).
+#[derive(Debug, Default)]
+struct ReplayState {
+    pending_reasoning: Vec<ReasoningSnapshot>,
+}
+
+impl ReplayState {
+    fn drain_combined_reasoning(&mut self) -> Option<ReasoningSnapshot> {
+        if self.pending_reasoning.is_empty() {
+            return None;
+        }
+        // Concatenate every buffered segment's display text so the
+        // resumed chip carries the full reasoning the user originally
+        // watched stream in, separated by blank lines so a reviewer
+        // can still see the segment boundaries. The payload comes
+        // from the last segment so per-provider metadata (item_id,
+        // encrypted_content, thought_signature) stays consistent
+        // with what the provider would return on a fresh turn.
+        let mut display = String::new();
+        for snap in &self.pending_reasoning {
+            if !display.is_empty() {
+                display.push_str("\n\n");
+            }
+            display.push_str(&snap.display_text);
+        }
+        let last_payload = self
+            .pending_reasoning
+            .last()
+            .map(|s| s.payload.clone())
+            .expect("non-empty");
+        self.pending_reasoning.clear();
+        Some(ReasoningSnapshot {
+            display_text: display,
+            payload: last_payload,
+        })
+    }
+}
+
 fn apply_event_to_replay(
     event: &SessionEvent,
     conversation: &mut Vec<ResumeItem>,
     transcript: &mut Vec<TranscriptItem>,
+    replay: &mut ReplayState,
 ) {
     let Some(typed) = SessionEventKind::try_from_event(event) else {
         return;
@@ -2809,7 +2856,12 @@ fn apply_event_to_replay(
                 return;
             }
             conversation.push(ResumeItem::AssistantText { text: text.clone() });
-            transcript.push(TranscriptItem::assistant(text));
+            // Drain any reasoning buffered since the last assistant
+            // message and attach it to this one so the resumed
+            // transcript shows the reasoning chip via the
+            // `format_assistant_message_entry` embedded-chip path.
+            let attached = replay.drain_combined_reasoning();
+            transcript.push(TranscriptItem::assistant_with_reasoning(text, attached));
         }
         SessionEventKind::ToolCall {
             call_id,
@@ -2845,7 +2897,12 @@ fn apply_event_to_replay(
         // linear replay continue.
         SessionEventKind::ContextCompacted { .. } => {}
         SessionEventKind::Reasoning { payload } => {
-            conversation.push(ResumeItem::Reasoning { payload });
+            conversation.push(ResumeItem::Reasoning {
+                payload: payload.clone(),
+            });
+            replay
+                .pending_reasoning
+                .push(ReasoningSnapshot::from_payload(payload));
         }
         // Approval and session-lifecycle events are bookkeeping rather
         // than conversation items; they do not modify the resume state's

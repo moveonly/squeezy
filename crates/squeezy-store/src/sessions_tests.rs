@@ -1765,6 +1765,37 @@ fn replay_resume_state_round_trips_reasoning_items() {
         ],
         "reasoning items must round-trip with id and content preserved",
     );
+    // The replayed transcript (the UI hydration path) must surface the
+    // reasoning attached to the assistant message that immediately
+    // follows it via `TranscriptItem.reasoning`. Without this the TUI
+    // resume flow rebuilds the screen as user → assistant with no
+    // reasoning chip, which is the user-visible "resumed session lost
+    // my reasoning" regression.
+    assert_eq!(replayed.transcript.len(), 2, "user + assistant");
+    let assistant = &replayed.transcript[1];
+    assert_eq!(assistant.role, squeezy_core::Role::Assistant);
+    let attached = assistant
+        .reasoning
+        .as_deref()
+        .expect("assistant message must carry buffered reasoning after resume hydration");
+    assert!(
+        attached
+            .display_text
+            .contains("Read the file before patching it."),
+        "first reasoning segment must be preserved in the chip body, got {:?}",
+        attached.display_text,
+    );
+    assert!(
+        attached
+            .display_text
+            .contains("First check the failing test."),
+        "second reasoning segment must also be preserved, got {:?}",
+        attached.display_text,
+    );
+    assert!(
+        matches!(attached.payload, ReasoningPayload::Anthropic { .. }),
+        "the last segment's payload metadata wins so per-provider fields stay consistent",
+    );
 }
 
 fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
