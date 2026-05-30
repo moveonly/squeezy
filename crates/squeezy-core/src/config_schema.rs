@@ -22,9 +22,9 @@ use crate::{
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
     DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_WEBSEARCH_PROVIDER,
-    OpenAiCompatiblePreset, PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
-    SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
-    TuiSynchronizedOutput,
+    OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort,
+    ResponseVerbosity, SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    TuiAlternateScreen, TuiSynchronizedOutput,
 };
 
 /// When a save takes effect.
@@ -380,6 +380,8 @@ pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbo
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
 pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
 pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
+pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
+    &["default", "auto_review", "full_access", "custom"];
 pub const PERMISSION_MODE_OPTIONS: &[&str] = &["allow", "ask", "deny"];
 pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light", "catppuccin", "high-contrast"];
 
@@ -497,8 +499,23 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
     ConfigSectionMeta {
         id: SectionId::Permissions,
         label: "Permissions",
-        description: "Default action for each capability",
+        description: "Mode first, with granular defaults in Custom",
         fields: &[
+            FieldMeta {
+                label: "mode",
+                toml_path: &["permissions", "mode"],
+                kind: FieldKind::Enum {
+                    options: PERMISSION_POLICY_MODE_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_perm_mode,
+                set: set_perm_mode,
+                default_display: "default",
+                default: || FieldValue::Enum("default"),
+                help: "Permission preset. Default allows workspace read/edit/local commands, Auto-review routes eligible approvals through the reviewer, Full Access removes workspace/network prompts, Custom exposes each capability.",
+                env_override: None,
+                secret: false,
+            },
             FieldMeta {
                 label: "read",
                 toml_path: &["permissions", "read"],
@@ -515,6 +532,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "search",
+                toml_path: &["permissions", "search"],
+                kind: FieldKind::Enum {
+                    options: PERMISSION_MODE_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_perm_search,
+                set: set_perm_search,
+                default_display: "allow",
+                default: || FieldValue::Enum("allow"),
+                help: "Default for ordinary workspace search/navigation tools.",
+                env_override: Some("SQUEEZY_SEARCH_PERMISSION"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "edit",
                 toml_path: &["permissions", "edit"],
                 kind: FieldKind::Enum {
@@ -523,7 +555,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::Immediate,
                 get: get_perm_edit,
                 set: set_perm_edit,
-                default_display: "ask",
+                default_display: "allow",
                 default: || FieldValue::Enum("allow"),
                 help: "Default for file edits and writes.",
                 env_override: Some("SQUEEZY_EDIT_PERMISSION"),
@@ -538,8 +570,8 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::Immediate,
                 get: get_perm_shell,
                 set: set_perm_shell,
-                default_display: "ask",
-                default: || FieldValue::Enum("ask"),
+                default_display: "allow",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for shell command execution.",
                 env_override: Some("SQUEEZY_SHELL_PERMISSION"),
                 secret: false,
@@ -553,7 +585,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::Immediate,
                 get: get_perm_ignored_search,
                 set: set_perm_ignored_search,
-                default_display: "ask",
+                default_display: "allow",
                 default: || FieldValue::Enum("allow"),
                 help: "Default for searches that escape .gitignore boundaries.",
                 env_override: Some("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
@@ -587,6 +619,51 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Enum("ask"),
                 help: "Default for MCP tool invocations.",
                 env_override: Some("SQUEEZY_MCP_PERMISSION"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "git",
+                toml_path: &["permissions", "git"],
+                kind: FieldKind::Enum {
+                    options: PERMISSION_MODE_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_perm_git,
+                set: set_perm_git,
+                default_display: "allow",
+                default: || FieldValue::Enum("allow"),
+                help: "Default for non-destructive git command families.",
+                env_override: Some("SQUEEZY_GIT_PERMISSION"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "compiler",
+                toml_path: &["permissions", "compiler"],
+                kind: FieldKind::Enum {
+                    options: PERMISSION_MODE_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_perm_compiler,
+                set: set_perm_compiler,
+                default_display: "allow",
+                default: || FieldValue::Enum("allow"),
+                help: "Default for compiler/build/test verification command families.",
+                env_override: Some("SQUEEZY_COMPILER_PERMISSION"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "destructive",
+                toml_path: &["permissions", "destructive"],
+                kind: FieldKind::Enum {
+                    options: PERMISSION_MODE_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_perm_destructive,
+                set: set_perm_destructive,
+                default_display: "ask",
+                default: || FieldValue::Enum("ask"),
+                help: "Default for destructive commands such as remove/reset-style operations.",
+                env_override: Some("SQUEEZY_DESTRUCTIVE_PERMISSION"),
                 secret: false,
             },
         ],
@@ -1698,41 +1775,97 @@ fn set_store_responses(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'s
 
 // Permissions
 
+fn get_perm_mode(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.permissions.mode.as_str())
+}
+fn set_perm_mode(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("permission mode expects enum"),
+    };
+    let mode = PermissionPolicyMode::parse(s).ok_or("invalid permission policy mode")?;
+    cfg.permissions.apply_mode(mode);
+    Ok(())
+}
 fn get_perm_read(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.read.as_str())
 }
 fn set_perm_read(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    set_perm(value, &mut cfg.permissions.read)
+    set_perm(value, &mut cfg.permissions.read)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
+}
+fn get_perm_search(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.permissions.search.as_str())
+}
+fn set_perm_search(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    set_perm(value, &mut cfg.permissions.search)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
 }
 fn get_perm_edit(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.edit.as_str())
 }
 fn set_perm_edit(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    set_perm(value, &mut cfg.permissions.edit)
+    set_perm(value, &mut cfg.permissions.edit)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
 }
 fn get_perm_shell(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.shell.as_str())
 }
 fn set_perm_shell(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    set_perm(value, &mut cfg.permissions.shell)
+    set_perm(value, &mut cfg.permissions.shell)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
 }
 fn get_perm_ignored_search(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.ignored_search.as_str())
 }
 fn set_perm_ignored_search(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    set_perm(value, &mut cfg.permissions.ignored_search)
+    set_perm(value, &mut cfg.permissions.ignored_search)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
 }
 fn get_perm_web(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.web.as_str())
 }
 fn set_perm_web(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    set_perm(value, &mut cfg.permissions.web)
+    set_perm(value, &mut cfg.permissions.web)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
 }
 fn get_perm_mcp(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.mcp.as_str())
 }
 fn set_perm_mcp(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    set_perm(value, &mut cfg.permissions.mcp)
+    set_perm(value, &mut cfg.permissions.mcp)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
+}
+fn get_perm_git(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.permissions.git.as_str())
+}
+fn set_perm_git(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    set_perm(value, &mut cfg.permissions.git)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
+}
+fn get_perm_compiler(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.permissions.compiler.as_str())
+}
+fn set_perm_compiler(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    set_perm(value, &mut cfg.permissions.compiler)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
+}
+fn get_perm_destructive(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.permissions.destructive.as_str())
+}
+fn set_perm_destructive(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    set_perm(value, &mut cfg.permissions.destructive)?;
+    cfg.permissions.mode = PermissionPolicyMode::Custom;
+    Ok(())
 }
 
 fn set_perm(value: FieldValue, slot: &mut PermissionMode) -> Result<(), &'static str> {

@@ -111,11 +111,17 @@ commented examples so that built-in defaults can evolve over time:
 # default_model = "gpt-5.5"
 
 [permissions]
+# mode = "default"               # default | auto_review | full_access | custom
 # read = "allow"
+# search = "allow"
 # edit = "allow"
-# shell = "ask"
+# shell = "allow"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
+# git = "allow"
+# compiler = "allow"
+# destructive = "ask"
 # shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
 #
 # [[permissions.rules]]
@@ -133,13 +139,13 @@ commented examples so that built-in defaults can evolve over time:
 # [permissions.ai_reviewer]
 # enabled = false
 # model = "gpt-5-nano"
-# allow_capabilities = ["read", "search"]
+# allow_capabilities = ["read", "search", "network", "mcp"]
 # policy_file = "docs/external/APPROVAL_POLICY.md"
 # timeout_secs = 15
 
 # [permissions.shell_sandbox]
 # mode = "best_effort"
-# network = "deny_by_default"
+# network = "allow_when_approved"
 # audit = true
 # kill_grace_ms = 250                          # bounded to 10..=60000
 # env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
@@ -270,11 +276,16 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   and model rounds are capped separately from the parent turn, and only the
   final structured summary is returned to the parent conversation.
 - `[budgets]`: per-turn and per-tool output limits.
-- `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
-  `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
-  Build mode defaults to allowing workspace edits, while shell, network, MCP,
-  and compiler actions still ask unless rules or environment overrides allow
-  them.
+- `[permissions]`: `mode` selects the main policy shape. `default` allows
+  workspace reads, searches, edits, local shell, git, and compiler commands;
+  web/network, MCP, destructive actions, and reads or edits outside the
+  workspace still ask. `auto_review` uses the same defaults but routes eligible
+  `read`, `search`, `network`, and `mcp` prompts through the AI reviewer.
+  `full_access` allows all capability defaults and disables the shell OS
+  sandbox; use it only for trusted work. `custom` exposes granular
+  `read`, `search`, `edit`, `shell`, `ignored_search`, `web`, `mcp`, `git`,
+  `compiler`, and `destructive` defaults, each set to `allow`, `ask`, or
+  `deny`.
   `shell_classifier` (default `false`) enables a narrow LLM fallback that
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
@@ -284,8 +295,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   transcript window, the pending permission request, and the approval policy
   document, then returns `allow`, `deny`, or `ask` JSON. It may deny any
   request, but it may only auto-allow capabilities listed in
-  `allow_capabilities` (default `read` and `search`); non-allowlisted allows
-  fall back to the normal user approval prompt. `timeout_secs` bounds the extra
+  `allow_capabilities`; non-allowlisted allows fall back to the normal user
+  approval prompt. `timeout_secs` bounds the extra
   model call. Repeated denials trip a per-turn circuit breaker and return to
   user approval. See [`APPROVAL_POLICY.md`](APPROVAL_POLICY.md).
 - `[permissions.shell_sandbox]`: OS sandbox settings for the local shell tool.
@@ -314,11 +325,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   filesystem allowlists for workspace/default roots plus configured roots; in
   `required` mode missing Landlock support denies pre-spawn, while
   `best_effort` records that filesystem enforcement was unavailable.
-  `network = "deny_by_default"` keeps
-  the network namespace closed for every shell command, including classified
-  network commands (the permission policy still decides whether to RUN them).
   `network = "allow_when_approved"` opens the network namespace only when the
-  permission policy allowed a classified network command. Shell attempts append
+  permission policy allowed a classified network command; this is the default
+  for `default`, `auto_review`, and `full_access` modes. Set
+  `network = "deny_by_default"` to keep the namespace closed even for approved
+  network commands. Shell attempts append
   redacted JSONL audit entries to `.squeezy/audit/shell.jsonl` when
   `audit = true`; entries are written under a process-wide mutex with rotation
   at 8 MiB and four retained rotations. `sensitive_path_patterns` defaults to

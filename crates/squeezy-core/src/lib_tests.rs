@@ -939,6 +939,251 @@ fn permission_mode_parses_expected_values() {
 }
 
 #[test]
+fn permission_policy_modes_apply_presets() {
+    let default = AppConfig::from_env_vars(None, |_| None);
+    assert_eq!(default.permissions.mode, PermissionPolicyMode::Default);
+    assert_eq!(default.permissions.read, PermissionMode::Allow);
+    assert_eq!(default.permissions.edit, PermissionMode::Allow);
+    assert_eq!(default.permissions.shell, PermissionMode::Allow);
+    assert_eq!(default.permissions.web, PermissionMode::Ask);
+    assert_eq!(
+        default.permissions.shell_sandbox.network,
+        ShellSandboxNetworkPolicy::AllowWhenApproved
+    );
+
+    let auto_review = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "auto_review"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let auto_review = AppConfig::from_settings_and_env_vars(auto_review, |_| None);
+    assert_eq!(
+        auto_review.permissions.mode,
+        PermissionPolicyMode::AutoReview
+    );
+    assert!(auto_review.permissions.ai_reviewer.enabled);
+    assert_eq!(
+        auto_review.permissions.ai_reviewer.allow_capabilities,
+        vec![
+            PermissionCapability::Read,
+            PermissionCapability::Search,
+            PermissionCapability::Network,
+            PermissionCapability::Mcp,
+        ]
+    );
+    assert_eq!(auto_review.permissions.shell, PermissionMode::Allow);
+
+    let full_access = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "full_access"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let full_access = AppConfig::from_settings_and_env_vars(full_access, |_| None);
+    assert_eq!(
+        full_access.permissions.mode,
+        PermissionPolicyMode::FullAccess
+    );
+    assert_eq!(full_access.permissions.web, PermissionMode::Allow);
+    assert_eq!(full_access.permissions.mcp, PermissionMode::Allow);
+    assert_eq!(full_access.permissions.destructive, PermissionMode::Allow);
+    assert_eq!(
+        full_access.permissions.shell_sandbox.mode,
+        ShellSandboxMode::Off
+    );
+
+    let mut outside = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "read_file".to_string(),
+        capability: PermissionCapability::Read,
+        target: "path:/tmp/outside.txt".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "read outside".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+    outside
+        .metadata
+        .insert("outside_workspace".to_string(), "true".to_string());
+    assert_eq!(
+        default.permissions.evaluate(&outside).action,
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        full_access.permissions.evaluate(&outside).action,
+        PermissionAction::Allow
+    );
+}
+
+#[test]
+fn custom_permissions_and_legacy_defaults_remain_granular() {
+    let custom = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "custom"
+
+[permissions.custom]
+shell = "deny"
+network = "allow"
+destructive = "deny"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let custom = AppConfig::from_settings_and_env_vars(custom, |_| None);
+    assert_eq!(custom.permissions.mode, PermissionPolicyMode::Custom);
+    assert_eq!(custom.permissions.shell, PermissionMode::Deny);
+    assert_eq!(custom.permissions.web, PermissionMode::Allow);
+    assert_eq!(custom.permissions.destructive, PermissionMode::Deny);
+
+    let custom_table_without_mode = SettingsFile::from_toml_str(
+        r#"
+[permissions.custom]
+shell = "deny"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let custom_table_without_mode =
+        AppConfig::from_settings_and_env_vars(custom_table_without_mode, |_| None);
+    assert_eq!(
+        custom_table_without_mode.permissions.mode,
+        PermissionPolicyMode::Custom
+    );
+    assert_eq!(
+        custom_table_without_mode.permissions.shell,
+        PermissionMode::Deny
+    );
+    assert_eq!(
+        custom_table_without_mode.permissions.git,
+        PermissionMode::Allow
+    );
+    assert_eq!(
+        custom_table_without_mode.permissions.compiler,
+        PermissionMode::Allow
+    );
+    assert_eq!(
+        custom_table_without_mode.permissions.destructive,
+        PermissionMode::Ask
+    );
+
+    let explicit_custom_top_level_shell = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "custom"
+shell = "deny"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let explicit_custom_top_level_shell =
+        AppConfig::from_settings_and_env_vars(explicit_custom_top_level_shell, |_| None);
+    assert_eq!(
+        explicit_custom_top_level_shell.permissions.mode,
+        PermissionPolicyMode::Custom
+    );
+    assert_eq!(
+        explicit_custom_top_level_shell.permissions.shell,
+        PermissionMode::Deny
+    );
+    assert_eq!(
+        explicit_custom_top_level_shell.permissions.git,
+        PermissionMode::Allow
+    );
+    assert_eq!(
+        explicit_custom_top_level_shell.permissions.compiler,
+        PermissionMode::Allow
+    );
+    assert_eq!(
+        explicit_custom_top_level_shell.permissions.destructive,
+        PermissionMode::Ask
+    );
+
+    let legacy = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+shell = "deny"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let legacy = AppConfig::from_settings_and_env_vars(legacy, |_| None);
+    assert_eq!(legacy.permissions.mode, PermissionPolicyMode::Custom);
+    assert_eq!(legacy.permissions.shell, PermissionMode::Deny);
+    assert_eq!(legacy.permissions.git, PermissionMode::Deny);
+    assert_eq!(legacy.permissions.compiler, PermissionMode::Deny);
+    assert_eq!(legacy.permissions.destructive, PermissionMode::Deny);
+}
+
+#[test]
+fn permission_env_overrides_apply_after_mode_presets() {
+    let auto_review = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "auto_review"
+
+[permissions.ai_reviewer]
+enabled = false
+allow_capabilities = ["read"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let auto_review = AppConfig::from_settings_and_env_vars(auto_review, |name| match name {
+        "SQUEEZY_WEB_PERMISSION" => Some("deny".to_string()),
+        "SQUEEZY_GIT_PERMISSION" => Some("ask".to_string()),
+        "SQUEEZY_SHELL_PERMISSION" => Some("deny".to_string()),
+        _ => None,
+    });
+    assert_eq!(
+        auto_review.permissions.mode,
+        PermissionPolicyMode::AutoReview
+    );
+    assert!(auto_review.permissions.ai_reviewer.enabled);
+    assert_eq!(
+        auto_review.permissions.ai_reviewer.allow_capabilities,
+        vec![
+            PermissionCapability::Read,
+            PermissionCapability::Search,
+            PermissionCapability::Network,
+            PermissionCapability::Mcp,
+        ]
+    );
+    assert_eq!(auto_review.permissions.web, PermissionMode::Deny);
+    assert_eq!(auto_review.permissions.git, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.shell, PermissionMode::Deny);
+
+    let full_access = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+mode = "full_access"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let full_access = AppConfig::from_settings_and_env_vars(full_access, |name| match name {
+        "SQUEEZY_WEB_PERMISSION" => Some("ask".to_string()),
+        "SQUEEZY_DESTRUCTIVE_PERMISSION" => Some("deny".to_string()),
+        _ => None,
+    });
+    assert_eq!(
+        full_access.permissions.mode,
+        PermissionPolicyMode::FullAccess
+    );
+    assert_eq!(full_access.permissions.web, PermissionMode::Ask);
+    assert_eq!(full_access.permissions.destructive, PermissionMode::Deny);
+    assert_eq!(
+        full_access.permissions.shell_sandbox.mode,
+        ShellSandboxMode::Off
+    );
+}
+
+#[test]
 fn permission_policy_matches_last_rule_and_reports_source() {
     let settings = SettingsFile::from_toml_str(
         r#"

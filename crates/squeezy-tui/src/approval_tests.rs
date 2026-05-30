@@ -174,8 +174,8 @@ fn approval_menu_labels_name_capability_scope() {
         "shell project label missing binary scope: {menu}"
     );
     assert!(
-        menu.contains("Allow command cargo (session)"),
-        "shell session label missing binary scope: {menu}"
+        !menu.contains("(session)"),
+        "session labels should not be shown in the simplified approval menu: {menu}"
     );
 
     // Network surfaces the host so users can codify "allow this host"
@@ -229,7 +229,7 @@ fn approval_menu_labels_name_capability_scope() {
 
     // Deny options remain capability-agnostic.
     assert!(
-        git_menu.contains("Deny") && git_menu.contains("Deny for this session"),
+        git_menu.contains("Deny") && !git_menu.contains("Deny for this session"),
         "deny options missing: {git_menu}"
     );
 }

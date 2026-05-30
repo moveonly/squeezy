@@ -41,7 +41,12 @@ fn permission_round_trip() {
     let mut cfg = AppConfig::from_env();
     let perms = section(SectionId::Permissions).unwrap();
     for f in perms.fields {
-        for option in PERMISSION_MODE_OPTIONS {
+        let options = if f.label == "mode" {
+            PERMISSION_POLICY_MODE_OPTIONS
+        } else {
+            PERMISSION_MODE_OPTIONS
+        };
+        for option in options {
             (f.set)(&mut cfg, FieldValue::Enum(option)).unwrap();
             match (f.get)(&cfg) {
                 FieldValue::Enum(v) => assert_eq!(v, *option, "{}", f.label),

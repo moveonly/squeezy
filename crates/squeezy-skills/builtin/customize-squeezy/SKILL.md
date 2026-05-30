@@ -94,16 +94,35 @@ squeezy mcp disable docs --project
 
 ### Permission rules
 
-The compatibility defaults are coarse; per-target rules go in
-`[[permissions.rules]]`. Later matching rules win.
+Use `[permissions].mode` for the broad policy shape, `[permissions.custom]`
+for granular custom-mode defaults, and per-target rules in
+`[[permissions.rules]]` for exceptions. Later matching rules win.
 
 ```toml
 [permissions]
+mode = "custom" # default | auto_review | full_access | custom
+
+[permissions.custom]
 read = "allow"
+search = "allow"
 edit = "allow"
-shell = "ask"
+shell = "allow"
 ignored_search = "allow"
-web = "ask"
+network = "ask"
+mcp = "ask"
+git = "allow"
+compiler = "allow"
+destructive = "ask"
+
+[permissions.ai_reviewer]
+# auto_review forces enabled=true and allow_capabilities to this set.
+enabled = false
+allow_capabilities = ["read", "search", "network", "mcp"]
+
+[permissions.shell_sandbox]
+# default/auto_review use allow_when_approved unless explicitly configured;
+# full_access turns the shell sandbox off.
+network = "allow_when_approved"
 
 [[permissions.rules]]
 capability = "shell"

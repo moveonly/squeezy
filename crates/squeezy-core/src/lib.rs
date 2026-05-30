@@ -1224,8 +1224,16 @@ impl AppConfig {
 
         output.push_str("[permissions]\n");
         output.push_str(&format!(
+            "mode = {}\n",
+            toml_string(self.permissions.mode.as_str())
+        ));
+        output.push_str(&format!(
             "read = {}\n",
             toml_string(self.permissions.read.as_str())
+        ));
+        output.push_str(&format!(
+            "search = {}\n",
+            toml_string(self.permissions.search.as_str())
         ));
         output.push_str(&format!(
             "edit = {}\n",
@@ -1246,6 +1254,18 @@ impl AppConfig {
         output.push_str(&format!(
             "mcp = {}\n",
             toml_string(self.permissions.mcp.as_str())
+        ));
+        output.push_str(&format!(
+            "git = {}\n",
+            toml_string(self.permissions.git.as_str())
+        ));
+        output.push_str(&format!(
+            "compiler = {}\n",
+            toml_string(self.permissions.compiler.as_str())
+        ));
+        output.push_str(&format!(
+            "destructive = {}\n",
+            toml_string(self.permissions.destructive.as_str())
         ));
         output.push_str(&format!(
             "shell_classifier = {}\n\n",
@@ -3267,6 +3287,37 @@ impl PermissionMode {
 
 pub type PermissionAction = PermissionMode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionPolicyMode {
+    Default,
+    AutoReview,
+    FullAccess,
+    Custom,
+}
+
+impl PermissionPolicyMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "workspace" | "workspace_write" | "workspace-write" => Some(Self::Default),
+            "auto_review" | "auto-review" | "autoreview" | "auto" => Some(Self::AutoReview),
+            "full_access" | "full-access" | "danger_full_access" | "danger-full-access" => {
+                Some(Self::FullAccess)
+            }
+            "custom" | "granular" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AutoReview => "auto_review",
+            Self::FullAccess => "full_access",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
@@ -4282,13 +4333,19 @@ pub struct PermissionVerdict {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PermissionSettings {
+    pub mode: Option<PermissionPolicyMode>,
     pub read: Option<PermissionMode>,
+    pub search: Option<PermissionMode>,
     pub edit: Option<PermissionMode>,
     pub shell: Option<PermissionMode>,
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
     pub mcp: Option<PermissionMode>,
+    pub git: Option<PermissionMode>,
+    pub compiler: Option<PermissionMode>,
+    pub destructive: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
+    pub custom: Option<PermissionCustomSettings>,
     pub ai_reviewer: Option<AiReviewerSettings>,
     pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
@@ -4299,13 +4356,19 @@ impl PermissionSettings {
         reject_unknown_keys(
             table,
             &[
+                "mode",
                 "read",
+                "search",
                 "edit",
                 "shell",
                 "ignored_search",
                 "web",
                 "mcp",
+                "git",
+                "compiler",
+                "destructive",
                 "shell_classifier",
+                "custom",
                 "ai_reviewer",
                 "shell_sandbox",
                 "rules",
@@ -4313,8 +4376,19 @@ impl PermissionSettings {
             source,
             path,
         )?;
+        let mode = string_value(table, "mode", source, &field(path, "mode"))?
+            .map(|mode| {
+                PermissionPolicyMode::parse(&mode).ok_or_else(|| {
+                    SqueezyError::Config(format!(
+                        "{source}: {path}.mode invalid value {mode:?}; expected default, auto_review, full_access, or custom"
+                    ))
+                })
+            })
+            .transpose()?;
         Ok(Self {
+            mode,
             read: permission_value(table, "read", source, &field(path, "read"))?,
+            search: permission_value(table, "search", source, &field(path, "search"))?,
             edit: permission_value(table, "edit", source, &field(path, "edit"))?,
             shell: permission_value(table, "shell", source, &field(path, "shell"))?,
             ignored_search: permission_value(
@@ -4325,12 +4399,25 @@ impl PermissionSettings {
             )?,
             web: permission_value(table, "web", source, &field(path, "web"))?,
             mcp: permission_value(table, "mcp", source, &field(path, "mcp"))?,
+            git: permission_value(table, "git", source, &field(path, "git"))?,
+            compiler: permission_value(table, "compiler", source, &field(path, "compiler"))?,
+            destructive: permission_value(
+                table,
+                "destructive",
+                source,
+                &field(path, "destructive"),
+            )?,
             shell_classifier: bool_value(
                 table,
                 "shell_classifier",
                 source,
                 &field(path, "shell_classifier"),
             )?,
+            custom: optional_table(table, "custom", source)?
+                .map(|table| {
+                    PermissionCustomSettings::from_table(table, source, &field(path, "custom"))
+                })
+                .transpose()?,
             ai_reviewer: optional_table(table, "ai_reviewer", source)?
                 .map(|table| {
                     AiReviewerSettings::from_table(table, source, &field(path, "ai_reviewer"))
@@ -4346,13 +4433,23 @@ impl PermissionSettings {
     }
 
     fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.mode, next.mode);
         replace_if_some(&mut self.read, next.read);
+        replace_if_some(&mut self.search, next.search);
         replace_if_some(&mut self.edit, next.edit);
         replace_if_some(&mut self.shell, next.shell);
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
         replace_if_some(&mut self.mcp, next.mcp);
+        replace_if_some(&mut self.git, next.git);
+        replace_if_some(&mut self.compiler, next.compiler);
+        replace_if_some(&mut self.destructive, next.destructive);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
+        merge_option(
+            &mut self.custom,
+            next.custom,
+            PermissionCustomSettings::merge,
+        );
         merge_option(
             &mut self.ai_reviewer,
             next.ai_reviewer,
@@ -4364,6 +4461,90 @@ impl PermissionSettings {
             ShellSandboxSettings::merge,
         );
         self.rules.extend(next.rules);
+    }
+
+    fn has_legacy_defaults(&self) -> bool {
+        self.read.is_some()
+            || self.search.is_some()
+            || self.edit.is_some()
+            || self.shell.is_some()
+            || self.ignored_search.is_some()
+            || self.web.is_some()
+            || self.mcp.is_some()
+            || self.git.is_some()
+            || self.compiler.is_some()
+            || self.destructive.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PermissionCustomSettings {
+    pub read: Option<PermissionMode>,
+    pub search: Option<PermissionMode>,
+    pub edit: Option<PermissionMode>,
+    pub shell: Option<PermissionMode>,
+    pub ignored_search: Option<PermissionMode>,
+    pub network: Option<PermissionMode>,
+    pub mcp: Option<PermissionMode>,
+    pub git: Option<PermissionMode>,
+    pub compiler: Option<PermissionMode>,
+    pub destructive: Option<PermissionMode>,
+}
+
+impl PermissionCustomSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "read",
+                "search",
+                "edit",
+                "shell",
+                "ignored_search",
+                "network",
+                "mcp",
+                "git",
+                "compiler",
+                "destructive",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            read: permission_value(table, "read", source, &field(path, "read"))?,
+            search: permission_value(table, "search", source, &field(path, "search"))?,
+            edit: permission_value(table, "edit", source, &field(path, "edit"))?,
+            shell: permission_value(table, "shell", source, &field(path, "shell"))?,
+            ignored_search: permission_value(
+                table,
+                "ignored_search",
+                source,
+                &field(path, "ignored_search"),
+            )?,
+            network: permission_value(table, "network", source, &field(path, "network"))?,
+            mcp: permission_value(table, "mcp", source, &field(path, "mcp"))?,
+            git: permission_value(table, "git", source, &field(path, "git"))?,
+            compiler: permission_value(table, "compiler", source, &field(path, "compiler"))?,
+            destructive: permission_value(
+                table,
+                "destructive",
+                source,
+                &field(path, "destructive"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.read, next.read);
+        replace_if_some(&mut self.search, next.search);
+        replace_if_some(&mut self.edit, next.edit);
+        replace_if_some(&mut self.shell, next.shell);
+        replace_if_some(&mut self.ignored_search, next.ignored_search);
+        replace_if_some(&mut self.network, next.network);
+        replace_if_some(&mut self.mcp, next.mcp);
+        replace_if_some(&mut self.git, next.git);
+        replace_if_some(&mut self.compiler, next.compiler);
+        replace_if_some(&mut self.destructive, next.destructive);
     }
 }
 
@@ -5067,12 +5248,17 @@ pub enum PermissionScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionPolicy {
+    pub mode: PermissionPolicyMode,
     pub read: PermissionMode,
+    pub search: PermissionMode,
     pub edit: PermissionMode,
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
     pub mcp: PermissionMode,
+    pub git: PermissionMode,
+    pub compiler: PermissionMode,
+    pub destructive: PermissionMode,
     pub shell_classifier: bool,
     pub ai_reviewer: AiReviewerConfig,
     pub shell_sandbox: ShellSandboxConfig,
@@ -5096,43 +5282,84 @@ impl PermissionPolicy {
         workspace_root: &Path,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
-            read: parse_permission(
-                var("SQUEEZY_READ_PERMISSION"),
-                settings.read.unwrap_or(PermissionMode::Allow),
-            ),
-            edit: parse_permission(
-                var("SQUEEZY_EDIT_PERMISSION"),
-                settings.edit.unwrap_or(PermissionMode::Allow),
-            ),
-            shell: parse_permission(
-                var("SQUEEZY_SHELL_PERMISSION"),
-                settings.shell.unwrap_or(PermissionMode::Ask),
-            ),
-            ignored_search: parse_permission(
-                var("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
-                settings.ignored_search.unwrap_or(PermissionMode::Allow),
-            ),
-            web: parse_permission(
-                var("SQUEEZY_WEB_PERMISSION"),
-                settings.web.unwrap_or(PermissionMode::Ask),
-            ),
-            mcp: parse_permission(
-                var("SQUEEZY_MCP_PERMISSION"),
-                settings.mcp.unwrap_or(PermissionMode::Ask),
-            ),
-            shell_classifier: parse_bool(
-                var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
-                settings.shell_classifier.unwrap_or(false),
-            ),
-            ai_reviewer: AiReviewerConfig::from_settings(settings.ai_reviewer, source)?,
-            shell_sandbox: ShellSandboxConfig::from_settings(
-                settings.shell_sandbox,
-                source,
-                workspace_root,
-            )?,
-            rules: settings.rules,
-        })
+        let legacy_defaults = settings.has_legacy_defaults();
+        let custom_defaults = settings.custom.is_some();
+        let legacy_compat = legacy_defaults && settings.mode.is_none();
+        let mode = settings
+            .mode
+            .unwrap_or(if legacy_defaults || custom_defaults {
+                PermissionPolicyMode::Custom
+            } else {
+                PermissionPolicyMode::Default
+            });
+        let ai_reviewer_settings = settings.ai_reviewer.clone();
+        let shell_sandbox_settings = settings.shell_sandbox.clone();
+        let shell_sandbox_network_configured = shell_sandbox_settings
+            .as_ref()
+            .is_some_and(|settings| settings.network.is_some());
+
+        let mut policy = if legacy_compat {
+            Self::legacy_compat_defaults()
+        } else {
+            Self::preset(mode)
+        };
+        policy.mode = mode;
+
+        if mode == PermissionPolicyMode::Custom {
+            policy.apply_legacy_defaults(&settings, legacy_compat);
+            if let Some(custom) = &settings.custom {
+                policy.apply_custom_defaults(custom);
+            }
+        }
+
+        policy.read = parse_permission(var("SQUEEZY_READ_PERMISSION"), policy.read);
+        policy.search = parse_permission(var("SQUEEZY_SEARCH_PERMISSION"), policy.search);
+        policy.edit = parse_permission(var("SQUEEZY_EDIT_PERMISSION"), policy.edit);
+        policy.shell = parse_permission(var("SQUEEZY_SHELL_PERMISSION"), policy.shell);
+        policy.ignored_search = parse_permission(
+            var("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
+            policy.ignored_search,
+        );
+        policy.web = parse_permission(var("SQUEEZY_WEB_PERMISSION"), policy.web);
+        policy.mcp = parse_permission(var("SQUEEZY_MCP_PERMISSION"), policy.mcp);
+        policy.git = parse_permission(var("SQUEEZY_GIT_PERMISSION"), policy.git);
+        policy.compiler = parse_permission(var("SQUEEZY_COMPILER_PERMISSION"), policy.compiler);
+        policy.destructive =
+            parse_permission(var("SQUEEZY_DESTRUCTIVE_PERMISSION"), policy.destructive);
+        policy.shell_classifier = parse_bool(
+            var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
+            settings.shell_classifier.unwrap_or(false),
+        );
+
+        policy.ai_reviewer = AiReviewerConfig::from_settings(ai_reviewer_settings, source)?;
+        match mode {
+            PermissionPolicyMode::AutoReview => {
+                policy.ai_reviewer.enabled = true;
+                policy.ai_reviewer.allow_capabilities = auto_review_allow_capabilities();
+            }
+            PermissionPolicyMode::FullAccess => {
+                policy.ai_reviewer.enabled = false;
+            }
+            PermissionPolicyMode::Default | PermissionPolicyMode::Custom => {}
+        }
+
+        policy.shell_sandbox =
+            ShellSandboxConfig::from_settings(shell_sandbox_settings, source, workspace_root)?;
+        match mode {
+            PermissionPolicyMode::Default | PermissionPolicyMode::AutoReview => {
+                if !shell_sandbox_network_configured {
+                    policy.shell_sandbox.network = ShellSandboxNetworkPolicy::AllowWhenApproved;
+                }
+            }
+            PermissionPolicyMode::FullAccess => {
+                policy.shell_sandbox.mode = ShellSandboxMode::Off;
+                policy.shell_sandbox.network = ShellSandboxNetworkPolicy::AllowWhenApproved;
+            }
+            PermissionPolicyMode::Custom => {}
+        }
+
+        policy.rules = settings.rules;
+        Ok(policy)
     }
 
     pub const fn mode_for(&self, scope: PermissionScope) -> PermissionMode {
@@ -5144,6 +5371,37 @@ impl PermissionPolicy {
             PermissionScope::Web => self.web,
             PermissionScope::Mcp => self.mcp,
         }
+    }
+
+    pub const fn mode_for_capability(&self, capability: PermissionCapability) -> PermissionMode {
+        match capability {
+            PermissionCapability::Read => self.read,
+            PermissionCapability::Search => self.search,
+            PermissionCapability::Edit => self.edit,
+            PermissionCapability::Shell => self.shell,
+            PermissionCapability::Network => self.web,
+            PermissionCapability::Mcp => self.mcp,
+            PermissionCapability::Git => self.git,
+            PermissionCapability::Compiler => self.compiler,
+            PermissionCapability::Destructive => self.destructive,
+        }
+    }
+
+    pub fn apply_mode(&mut self, mode: PermissionPolicyMode) {
+        let rules = std::mem::take(&mut self.rules);
+        let shell_classifier = self.shell_classifier;
+        let mut ai_reviewer = self.ai_reviewer.clone();
+        let mut shell_sandbox = self.shell_sandbox.clone();
+        let mut next = Self::preset(mode);
+        next.rules = rules;
+        next.shell_classifier = shell_classifier;
+        ai_reviewer.enabled = next.ai_reviewer.enabled;
+        ai_reviewer.allow_capabilities = next.ai_reviewer.allow_capabilities.clone();
+        next.ai_reviewer = ai_reviewer;
+        shell_sandbox.mode = next.shell_sandbox.mode;
+        shell_sandbox.network = next.shell_sandbox.network;
+        next.shell_sandbox = shell_sandbox;
+        *self = next;
     }
 
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionVerdict {
@@ -5190,7 +5448,13 @@ impl PermissionPolicy {
                 silent,
             };
         }
-        let action = self.mode_for(legacy_scope_for_capability(request.capability));
+        let action = if path_request_targets_outside_workspace(request)
+            && self.mode != PermissionPolicyMode::FullAccess
+        {
+            PermissionAction::Ask
+        } else {
+            self.mode_for_capability(request.capability)
+        };
         PermissionVerdict {
             action,
             matched_rule: None,
@@ -5202,6 +5466,16 @@ impl PermissionPolicy {
             silent: false,
         }
     }
+}
+
+fn path_request_targets_outside_workspace(request: &PermissionRequest) -> bool {
+    matches!(
+        request.capability,
+        PermissionCapability::Read | PermissionCapability::Edit
+    ) && request
+        .metadata
+        .get("outside_workspace")
+        .is_some_and(|value| value == "true")
 }
 
 /// Belt-and-suspenders safety: refuse to honor an Allow rule that targets the
@@ -5252,19 +5526,133 @@ pub fn target_is_effectively_wildcard(target: &str) -> bool {
 
 impl Default for PermissionPolicy {
     fn default() -> Self {
+        Self::preset(PermissionPolicyMode::Default)
+    }
+}
+
+impl PermissionPolicy {
+    fn preset(mode: PermissionPolicyMode) -> Self {
+        let mut shell_sandbox = ShellSandboxConfig {
+            network: ShellSandboxNetworkPolicy::AllowWhenApproved,
+            ..ShellSandboxConfig::default()
+        };
+        let mut ai_reviewer = AiReviewerConfig::default();
+        let (read, search, edit, shell, ignored_search, web, mcp, git, compiler, destructive) =
+            match mode {
+                PermissionPolicyMode::Default
+                | PermissionPolicyMode::AutoReview
+                | PermissionPolicyMode::Custom => (
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Ask,
+                ),
+                PermissionPolicyMode::FullAccess => {
+                    shell_sandbox.mode = ShellSandboxMode::Off;
+                    (
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                        PermissionMode::Allow,
+                    )
+                }
+            };
+        if mode == PermissionPolicyMode::AutoReview {
+            ai_reviewer.enabled = true;
+            ai_reviewer.allow_capabilities = auto_review_allow_capabilities();
+        }
         Self {
+            mode,
+            read,
+            search,
+            edit,
+            shell,
+            ignored_search,
+            web,
+            mcp,
+            git,
+            compiler,
+            destructive,
+            shell_classifier: false,
+            ai_reviewer,
+            shell_sandbox,
+            rules: Vec::new(),
+        }
+    }
+
+    fn legacy_compat_defaults() -> Self {
+        Self {
+            mode: PermissionPolicyMode::Custom,
             read: PermissionMode::Allow,
+            search: PermissionMode::Allow,
             edit: PermissionMode::Allow,
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
             mcp: PermissionMode::Ask,
+            git: PermissionMode::Ask,
+            compiler: PermissionMode::Ask,
+            destructive: PermissionMode::Ask,
             shell_classifier: false,
             ai_reviewer: AiReviewerConfig::default(),
             shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
         }
     }
+
+    fn apply_legacy_defaults(&mut self, settings: &PermissionSettings, fan_out_shell: bool) {
+        replace_if_some_value(&mut self.read, settings.read);
+        replace_if_some_value(&mut self.search, settings.search);
+        replace_if_some_value(&mut self.edit, settings.edit);
+        if let Some(shell) = settings.shell {
+            self.shell = shell;
+            if fan_out_shell {
+                self.git = shell;
+                self.compiler = shell;
+                self.destructive = shell;
+            }
+        }
+        replace_if_some_value(&mut self.ignored_search, settings.ignored_search);
+        replace_if_some_value(&mut self.web, settings.web);
+        replace_if_some_value(&mut self.mcp, settings.mcp);
+        replace_if_some_value(&mut self.git, settings.git);
+        replace_if_some_value(&mut self.compiler, settings.compiler);
+        replace_if_some_value(&mut self.destructive, settings.destructive);
+    }
+
+    fn apply_custom_defaults(&mut self, custom: &PermissionCustomSettings) {
+        replace_if_some_value(&mut self.read, custom.read);
+        replace_if_some_value(&mut self.search, custom.search);
+        replace_if_some_value(&mut self.edit, custom.edit);
+        replace_if_some_value(&mut self.shell, custom.shell);
+        replace_if_some_value(&mut self.ignored_search, custom.ignored_search);
+        replace_if_some_value(&mut self.web, custom.network);
+        replace_if_some_value(&mut self.mcp, custom.mcp);
+        replace_if_some_value(&mut self.git, custom.git);
+        replace_if_some_value(&mut self.compiler, custom.compiler);
+        replace_if_some_value(&mut self.destructive, custom.destructive);
+    }
+}
+
+fn auto_review_allow_capabilities() -> Vec<PermissionCapability> {
+    vec![
+        PermissionCapability::Read,
+        PermissionCapability::Search,
+        PermissionCapability::Network,
+        PermissionCapability::Mcp,
+    ]
 }
 
 fn parse_permission(value: Option<String>, default: PermissionMode) -> PermissionMode {
@@ -5291,20 +5679,6 @@ fn parse_session_mode_value(value: &str, source: &str, path: &str) -> Result<Ses
 
 fn parse_bool(value: Option<String>, default: bool) -> bool {
     value.as_deref().map_or(default, parse_enabled_bool)
-}
-
-fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionScope {
-    match capability {
-        PermissionCapability::Read => PermissionScope::Read,
-        PermissionCapability::Search => PermissionScope::Read,
-        PermissionCapability::Edit => PermissionScope::Edit,
-        PermissionCapability::Shell => PermissionScope::Shell,
-        PermissionCapability::Network => PermissionScope::Web,
-        PermissionCapability::Mcp => PermissionScope::Mcp,
-        PermissionCapability::Git => PermissionScope::Shell,
-        PermissionCapability::Compiler => PermissionScope::Shell,
-        PermissionCapability::Destructive => PermissionScope::Shell,
-    }
 }
 
 fn parse_enabled_bool(value: &str) -> bool {
@@ -7142,18 +7516,40 @@ pub fn user_settings_template() -> &'static str {
 # stream_idle_timeout_ms = 300000
 
 [permissions]
+# mode = "default"               # default | auto_review | full_access | custom
+# default mode allows workspace read/edit/search plus local shell/git/compiler;
+# web, MCP, destructive actions, and outside-workspace paths still ask.
+# Top-level capability keys below are legacy aliases. Prefer [permissions.custom]
+# when mode = "custom".
 # read = "allow"
+# search = "allow"
 # edit = "allow"
-# shell = "ask"
+# shell = "allow"
 # ignored_search = "allow"
 # web = "ask"
 # mcp = "ask"
+# git = "allow"
+# compiler = "allow"
+# destructive = "ask"
 # shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
+#
+# [permissions.custom]           # used when permissions.mode = "custom"
+# read = "allow"
+# search = "allow"
+# edit = "allow"
+# shell = "allow"
+# ignored_search = "allow"
+# network = "ask"
+# mcp = "ask"
+# git = "allow"
+# compiler = "allow"
+# destructive = "ask"
 
 # [permissions.ai_reviewer]
 # enabled = false
 # model = "gpt-5-mini"          # optional reviewer model override
-# allow_capabilities = ["read", "search"]
+# allow_capabilities = ["read", "search", "network", "mcp"]
+# auto_review mode forces enabled=true and this allow_capabilities set.
 # policy_file = ""              # optional local approval policy override
 # timeout_secs = 15
 # max_transcript_tokens = 4000  # sliding-window budget: keeps recent turns whole + summary of older
@@ -7190,7 +7586,8 @@ pub fn user_settings_template() -> &'static str {
 
 # [permissions.shell_sandbox]
 # mode = "best_effort"              # best_effort | required | off | external
-# network = "deny_by_default"       # deny_by_default | allow_when_approved
+# default/auto_review set network = "allow_when_approved" unless explicitly configured.
+# network = "allow_when_approved"   # deny_by_default | allow_when_approved
 # audit = true
 # kill_grace_ms = 250
 # env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
@@ -7328,16 +7725,27 @@ pub fn project_settings_template() -> &'static str {
 # custom_patterns = []
 
 [permissions]
+# mode = "default"               # default | auto_review | full_access | custom
+# default mode allows workspace read/edit/search plus local shell/git/compiler;
+# web, MCP, destructive actions, and outside-workspace paths still ask.
+# Use [permissions.custom] for granular custom-mode defaults.
+#
+# [permissions.custom]
 # read = "allow"
+# search = "allow"
 # edit = "allow"
-# shell = "ask"
+# shell = "allow"
 # ignored_search = "allow"
-# web = "ask"
+# network = "ask"
 # mcp = "ask"
+# git = "allow"
+# compiler = "allow"
+# destructive = "ask"
 #
 # [permissions.ai_reviewer]
 # enabled = false
-# allow_capabilities = ["read", "search"]
+# allow_capabilities = ["read", "search", "network", "mcp"]
+# auto_review mode forces enabled=true and this allow_capabilities set.
 #
 # [[permissions.rules]]
 # capability = "compiler"
@@ -7346,6 +7754,8 @@ pub fn project_settings_template() -> &'static str {
 # source = "project"
 #
 # [permissions.shell_sandbox]
+# default/auto_review set network = "allow_when_approved" unless explicitly configured.
+# network = "allow_when_approved"
 # read_roots = []                  # shared absolute read-only shell roots
 # write_roots = []                 # shared absolute read/write shell roots
 # protected_metadata_names = [".git", ".squeezy", ".agents"]
@@ -9140,6 +9550,12 @@ fn field(prefix: &str, key: &str) -> String {
 
 fn replace_if_some<T>(target: &mut Option<T>, next: Option<T>) {
     if next.is_some() {
+        *target = next;
+    }
+}
+
+fn replace_if_some_value<T: Copy>(target: &mut T, next: Option<T>) {
+    if let Some(next) = next {
         *target = next;
     }
 }

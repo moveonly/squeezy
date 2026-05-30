@@ -185,6 +185,12 @@ fn save_field_inner(
         .push((target_path.clone(), pre_write_bytes));
 
     let mut edits: Vec<SettingsEdit> = vec![field_edit(field, &value)];
+    if is_permission_detail_field(field) {
+        edits.push(SettingsEdit {
+            path: &["permissions", "mode"],
+            op: EditOp::SetString("custom".to_string()),
+        });
+    }
     // When the user flips `[model].provider`, the in-memory setter has
     // already replaced `cfg.model` with that provider's default — persist
     // the same swap to the tier file so we never leave a half-written
@@ -227,6 +233,10 @@ fn save_field_inner(
     }
 
     apply_by_tier(state, agent, notifications, field, &outcome, silent);
+}
+
+fn is_permission_detail_field(field: &'static FieldMeta) -> bool {
+    permission_detail_write_path(field).is_some()
 }
 
 fn apply_by_tier(
@@ -362,9 +372,43 @@ fn field_edit(field: &'static FieldMeta, value: &FieldValue) -> SettingsEdit {
         | (_, FieldValue::TableArrayOrdered(_)) => EditOp::Unset,
     };
     SettingsEdit {
-        path: field.toml_path,
+        path: field_write_path(field),
         op,
     }
+}
+
+fn field_write_path(field: &'static FieldMeta) -> &'static [&'static str] {
+    permission_detail_write_path(field).unwrap_or(field.toml_path)
+}
+
+fn permission_detail_write_path(field: &'static FieldMeta) -> Option<&'static [&'static str]> {
+    match field.toml_path {
+        ["permissions", "read"] => Some(&["permissions", "custom", "read"]),
+        ["permissions", "search"] => Some(&["permissions", "custom", "search"]),
+        ["permissions", "edit"] => Some(&["permissions", "custom", "edit"]),
+        ["permissions", "shell"] => Some(&["permissions", "custom", "shell"]),
+        ["permissions", "ignored_search"] => Some(&["permissions", "custom", "ignored_search"]),
+        ["permissions", "web"] => Some(&["permissions", "custom", "network"]),
+        ["permissions", "mcp"] => Some(&["permissions", "custom", "mcp"]),
+        ["permissions", "git"] => Some(&["permissions", "custom", "git"]),
+        ["permissions", "compiler"] => Some(&["permissions", "custom", "compiler"]),
+        ["permissions", "destructive"] => Some(&["permissions", "custom", "destructive"]),
+        _ => None,
+    }
+}
+
+fn clear_field_edits(field: &'static FieldMeta) -> Vec<SettingsEdit> {
+    let mut edits = vec![SettingsEdit {
+        path: field_write_path(field),
+        op: EditOp::Unset,
+    }];
+    if permission_detail_write_path(field).is_some() {
+        edits.push(SettingsEdit {
+            path: field.toml_path,
+            op: EditOp::Unset,
+        });
+    }
+    edits
 }
 
 /// Clear the focused field's value in whichever tier the active scope tab
@@ -548,14 +592,11 @@ pub(crate) fn clear_scope_override_silent(
         }
         ConfigScope::User => return,
     };
-    let edit = SettingsEdit {
-        path: field.toml_path,
-        op: EditOp::Unset,
-    };
+    let edits = clear_field_edits(field);
     // Snapshot for undo before the write.
     let pre = std::fs::read(&path).ok();
     state.undo_stack.push((path.clone(), pre));
-    match apply_edits(&scope_target, &[edit]) {
+    match apply_edits(&scope_target, &edits) {
         Ok(_) => {
             if let Ok(reloaded) = load_separated_settings_sources() {
                 state.sources = reloaded;
@@ -584,12 +625,9 @@ pub(crate) fn clear_scope_override(
         }
         ConfigScope::User => return, // caller filters this out
     };
-    let edit = SettingsEdit {
-        path: field.toml_path,
-        op: EditOp::Unset,
-    };
+    let edits = clear_field_edits(field);
     let scope_label = state.scope.label();
-    match apply_edits(&scope_target, &[edit]) {
+    match apply_edits(&scope_target, &edits) {
         Ok(outcome) if outcome.edits_applied > 0 => {
             if let Ok(reloaded) = load_separated_settings_sources() {
                 state.sources = reloaded;
@@ -673,3 +711,7 @@ pub(crate) fn perform_reset(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "save_tests.rs"]
+mod tests;

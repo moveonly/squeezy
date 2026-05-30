@@ -41,8 +41,33 @@ model = ""
 api_key_env = "OPENAI_API_KEY"
 
 [permissions]
-web = "ask"
-shell = "ask"</code></pre>
+mode = "default"</code></pre>
+  </section>
+
+  <section class="doc-block">
+    <h2>Permission modes</h2>
+    <div class="doc-card-grid">
+      <article class="card">
+        <span class="label">default</span>
+        <h3>Workspace write</h3>
+        <p>Allows workspace reads, searches, edits, local shell, git, and compiler commands. Web, MCP, destructive actions, and outside-workspace paths still ask.</p>
+      </article>
+      <article class="card">
+        <span class="label">auto_review</span>
+        <h3>Reviewer-assisted</h3>
+        <p>Uses the same workspace defaults, but eligible read, search, network, and MCP prompts can be handled by the AI reviewer.</p>
+      </article>
+      <article class="card">
+        <span class="label">full_access</span>
+        <h3>Trusted work</h3>
+        <p>Allows all capability defaults, permits outside-workspace file paths, and turns off the local shell OS sandbox.</p>
+      </article>
+      <article class="card">
+        <span class="label">custom</span>
+        <h3>Granular defaults</h3>
+        <p>Reads per-capability defaults from `[permissions.custom]`; top-level capability keys are legacy aliases.</p>
+      </article>
+    </div>
   </section>
 
   <section class="doc-block">

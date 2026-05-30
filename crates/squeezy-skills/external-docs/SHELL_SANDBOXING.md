@@ -67,9 +67,10 @@ needed for normal builds and tests: reads under `/usr`, `/bin`, `/sbin`,
 `$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, and `$HOME/.rustup`; reads and
 writes under the workspace root, `/tmp`, `/private/tmp`, `/private/var/folders`,
 `$TMPDIR`, `$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, and `$HOME/.rustup`.
-Sensitive paths are denied on top of the default deny, and network is denied
-unless the command is classified as network and the user sets
-`network = "allow_when_approved"`.
+Sensitive paths are denied on top of the default deny. In `default` and
+`auto_review` permission modes, shell sandbox network policy defaults to
+`allow_when_approved`: network opens only for commands classified as network
+after the permission policy has allowed the command.
 
 On **Windows**, Squeezy launches shell commands directly (PowerShell 7
 preferred, then Windows PowerShell, then `cmd.exe`, configurable via
@@ -228,7 +229,7 @@ Default settings:
 ```toml
 [permissions.shell_sandbox]
 mode = "best_effort"
-network = "deny_by_default"
+network = "allow_when_approved"
 audit = true
 kill_grace_ms = 250
 env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
@@ -239,17 +240,22 @@ sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gn
 # replace_sensitive_path_patterns = false  # default; user list EXTENDS the floor above.
 ```
 
-`network = "deny_by_default"` keeps the network namespace closed for every
-shell command, including those classified as `network`. The permission policy
-can still ask the user whether to RUN the command (e.g. `curl ...`); if
-approved, the command runs but cannot reach the network. The audit record
-shows `sandbox.network = "denied_classified"` for that case.
-
 `network = "allow_when_approved"` opens the network namespace **only** when
 the command is classified as `network` and the permission policy allowed it.
 All other commands still run with network denied. The audit record shows
 `sandbox.network = "allowed_approved"` when network is opened and
 `"denied"` for everything else.
+
+`permissions.mode = "default"` and `permissions.mode = "auto_review"` choose
+this network posture unless `[permissions.shell_sandbox].network` is explicitly
+configured. Set `network = "deny_by_default"` to keep the older fail-closed
+network namespace behavior for every shell command.
+
+`network = "deny_by_default"` keeps the network namespace closed for every
+shell command, including those classified as `network`. The permission policy
+can still ask the user whether to run the command (for example, `curl ...`);
+if approved, the command runs but cannot reach the network. The audit record
+shows `sandbox.network = "denied_classified"` for that case.
 
 `env_allowlist` patterns support exact names (e.g. `PATH`) and single
 trailing wildcards (e.g. `LC_*`). Other glob shapes are rejected at config

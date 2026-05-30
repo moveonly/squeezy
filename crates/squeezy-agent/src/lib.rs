@@ -19,12 +19,12 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
     ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
     ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL,
-    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionRequest,
-    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
-    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
-    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
-    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
-    default_settings_path, detect_context_attachment_kind,
+    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionPolicyMode,
+    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
+    ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
+    StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig,
+    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
@@ -1479,6 +1479,7 @@ impl Agent {
                 shell_sandbox: config.permissions.shell_sandbox.clone(),
                 mcp_servers: config.mcp_servers.clone(),
                 checkpoints_enabled: config.checkpoints_enabled,
+                full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
             },
             config.skills.clone(),
             &config.graph,
@@ -1497,6 +1498,7 @@ impl Agent {
                     shell_sandbox: config.permissions.shell_sandbox.clone(),
                     mcp_servers: config.mcp_servers.clone(),
                     checkpoints_enabled: config.checkpoints_enabled,
+                    full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
                 },
                 config.skills.clone(),
                 &config.graph,
@@ -10519,7 +10521,7 @@ async fn permission_decision_for_request(
     }
     log_permission_verdict(&request, &verdict);
     match verdict.action {
-        PermissionAction::Allow => ApprovalDecision::Approved,
+        PermissionAction::Allow => approved_decision(context, &request),
         PermissionAction::Deny => {
             if verdict.silent {
                 log_silent_deny(context, &request, &verdict);
@@ -10595,7 +10597,7 @@ async fn permission_decision_for_request(
             );
             let outcome = match decision {
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AllowSession) => {
                     install_persistent_rule(
@@ -10617,7 +10619,7 @@ async fn permission_decision_for_request(
                             "action": "allow",
                         }),
                     );
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AllowRuleUser) => {
                     install_persistent_rule(
@@ -10627,7 +10629,7 @@ async fn permission_decision_for_request(
                         PermissionAction::Allow,
                     )
                     .await;
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AllowRuleProject) => {
                     install_persistent_rule(
@@ -10637,7 +10639,7 @@ async fn permission_decision_for_request(
                         PermissionAction::Allow,
                     )
                     .await;
-                    ApprovalDecision::Approved
+                    approved_decision(context, &request)
                 }
                 Ok(ToolApprovalDecision::AskRuleUser) => {
                     install_persistent_rule(
@@ -10737,6 +10739,14 @@ async fn permission_decision_for_request(
             outcome
         }
     }
+}
+
+fn approved_decision(
+    context: &PermissionDecisionContext,
+    request: &PermissionRequest,
+) -> ApprovalDecision {
+    context.tools.record_permission_grant(request);
+    ApprovalDecision::Approved
 }
 
 fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAskApprover {

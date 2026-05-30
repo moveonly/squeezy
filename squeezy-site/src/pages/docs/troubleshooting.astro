@@ -35,6 +35,12 @@ import { SITE } from "../../config";
   </section>
 
   <section class="doc-block">
+    <h2>Unexpected permissions</h2>
+    <p>Inspect `[permissions]`, `[[permissions.rules]]`, and `[permissions.shell_sandbox]` in `squeezy config inspect`. With no overrides, default mode allows workspace read/search/edit plus local shell, git, and compiler commands; web, MCP, destructive actions, and outside-workspace file paths still ask.</p>
+    <p>Default and auto-review modes use `network = "allow_when_approved"` unless the shell sandbox network policy is explicitly configured. Set `network = "deny_by_default"` when approved network-classified shell commands should still run without network access.</p>
+  </section>
+
+  <section class="doc-block">
     <h2>Report an issue</h2>
     <pre><code>/feedback
 /report

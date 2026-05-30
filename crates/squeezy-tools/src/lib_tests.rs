@@ -495,6 +495,90 @@ fn write_file_permission_request_target_matches_suggested_rule_target() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn outside_workspace_paths_require_permission_grant_unless_full_access() {
+    let root = temp_workspace("outside_workspace_permission");
+    let outside = root
+        .parent()
+        .expect("temp workspace has parent")
+        .join(format!(
+            "{}-outside.txt",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+    let _ = fs::remove_file(&outside);
+
+    let registry = registry_with_shell_sandbox_off(&root);
+    let write_call = ToolCall {
+        call_id: "outside-write".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": outside.display().to_string(),
+            "content": "outside\n",
+        }),
+    };
+    let request = registry.permission_request(&write_call);
+    assert_eq!(request.capability, PermissionCapability::Edit);
+    assert_eq!(request.target, format!("path:{}", outside.display()));
+    assert_eq!(request.metadata["outside_workspace"], "true");
+
+    let denied = registry
+        .execute(write_call.clone(), CancellationToken::new())
+        .await;
+    assert_eq!(denied.status, ToolStatus::Denied);
+
+    registry.record_permission_grant(&request);
+    let allowed = registry.execute(write_call, CancellationToken::new()).await;
+    assert_eq!(allowed.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
+
+    let read_call = ToolCall {
+        call_id: "outside-write".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({
+            "path": outside.display().to_string(),
+        }),
+    };
+    let read_request = registry.permission_request(&read_call);
+    assert_eq!(read_request.capability, PermissionCapability::Read);
+    assert_eq!(read_request.target, format!("path:{}", outside.display()));
+    assert_eq!(read_request.metadata["outside_workspace"], "true");
+
+    let denied_read = registry
+        .execute(read_call.clone(), CancellationToken::new())
+        .await;
+    assert_eq!(denied_read.status, ToolStatus::Error);
+
+    registry.record_permission_grant(&read_request);
+    let allowed_read = registry
+        .execute(read_call.clone(), CancellationToken::new())
+        .await;
+    assert_eq!(allowed_read.status, ToolStatus::Success);
+
+    let full_access = registry_with_runtime_config(
+        &root,
+        ToolRuntimeConfig {
+            full_access: true,
+            ..ToolRuntimeConfig::default()
+        },
+    );
+    let read = full_access
+        .execute(
+            ToolCall {
+                call_id: "outside-read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({
+                    "path": outside.display().to_string(),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(read.status, ToolStatus::Success);
+
+    let _ = fs::remove_file(outside);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn session_approval_extends_to_edit_family_on_optin() {
     // F04-permission-scope-collapse-edit-family: once the

@@ -152,6 +152,7 @@ pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
 const MAX_INFLIGHT_SHELLS: usize = 4;
+const MAX_PERMISSION_GRANTS: usize = 256;
 const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
@@ -602,6 +603,7 @@ pub struct ToolRuntimeConfig {
     pub shell_sandbox: ShellSandboxConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub checkpoints_enabled: bool,
+    pub full_access: bool,
 }
 
 impl Default for ToolOutputConfig {
@@ -810,6 +812,11 @@ pub struct ToolRegistry {
     pub(crate) shell_audit: Arc<ShellAuditStore>,
     pub(crate) shell_workdir_locks: Arc<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     pub(crate) shell_inflight: Arc<Semaphore>,
+    pub(crate) full_access: bool,
+    /// One-shot outside-workspace file grants, keyed by tool call id and
+    /// capability. A read grant does not imply edit, and an edit grant does not
+    /// imply read.
+    permission_grants: Arc<StdMutex<HashMap<String, PermissionRequest>>>,
     mcp: Arc<McpClientRegistry>,
     /// F04: cache for the per-turn `specs()` advertisement. The agent calls
     /// this at least once per round for cost accounting plus once more when
@@ -994,6 +1001,7 @@ impl ToolRegistry {
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
                 checkpoints_enabled: false,
+                full_access: false,
             },
             skills,
             crawl_options_from_graph_config(graph_config),
@@ -1041,6 +1049,7 @@ impl ToolRegistry {
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
                 checkpoints_enabled: false,
+                full_access: false,
             },
             skills,
             crawl_options,
@@ -1059,6 +1068,7 @@ impl ToolRegistry {
             state_store,
             redactor,
         } = runtime;
+        let full_access = config.full_access;
         let output_store = ToolOutputStore::new(&root, config.output)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
         // Compile the policy once up front. Invalid user globs surface as a
@@ -1156,6 +1166,8 @@ impl ToolRegistry {
             shell_audit: Arc::new(shell_audit),
             shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
             shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
+            full_access,
+            permission_grants: Arc::new(StdMutex::new(HashMap::new())),
             mcp: Arc::new(McpClientRegistry::new_with_store(
                 config.mcp_servers,
                 state_store.clone(),
@@ -1205,6 +1217,8 @@ impl ToolRegistry {
             shell_audit: Arc::new(shell_audit),
             shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
             shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
+            full_access: false,
+            permission_grants: Arc::new(StdMutex::new(HashMap::new())),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
@@ -1709,6 +1723,9 @@ impl ToolRegistry {
                     .to_string();
                 let rule_target = format!("path:{path}");
                 metadata.insert("path".to_string(), path.to_string());
+                if self.raw_path_targets_outside_workspace(&path) {
+                    metadata.insert("outside_workspace".to_string(), "true".to_string());
+                }
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 if let Some(diff) = args
                     .as_ref()
@@ -1728,6 +1745,39 @@ impl ToolRegistry {
                     rule_target,
                     PermissionRisk::High,
                 )
+            }
+            "read_file" => {
+                let path = call
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string();
+                metadata.insert("path".to_string(), path.clone());
+                if self.raw_path_targets_outside_workspace(&path) {
+                    metadata.insert("outside_workspace".to_string(), "true".to_string());
+                    let target = format!("path:{path}");
+                    suggested_rules.push(PermissionRule::new(
+                        "read",
+                        target.clone(),
+                        PermissionMode::Allow,
+                        PermissionRuleSource::Session,
+                        Some("approved outside workspace read".to_string()),
+                    ));
+                    (PermissionCapability::Read, target, PermissionRisk::Medium)
+                } else if self.read_file_targets_ignored_policy(&call.arguments) {
+                    (
+                        PermissionCapability::Search,
+                        "ignored:*".to_string(),
+                        PermissionRisk::Medium,
+                    )
+                } else {
+                    (
+                        PermissionCapability::Read,
+                        "workspace:*".to_string(),
+                        PermissionRisk::Low,
+                    )
+                }
             }
             "shell" => {
                 let args = serde_json::from_value::<ShellArgs>(call.arguments.clone()).ok();
@@ -1936,7 +1986,6 @@ impl ToolRegistry {
             | "downstream_flow"
             | "hierarchy"
             | "plan_patch"
-            | "read_file"
             | "read_slice"
             | "read_tool_output"
             | "repo_map"
@@ -1966,6 +2015,50 @@ impl ToolRegistry {
             metadata,
             suggested_rules,
         }
+    }
+
+    pub fn record_permission_grant(&self, request: &PermissionRequest) {
+        let outside_workspace = request
+            .metadata
+            .get("outside_workspace")
+            .is_some_and(|value| value == "true");
+        if !matches!(
+            request.capability,
+            PermissionCapability::Read | PermissionCapability::Edit
+        ) || !outside_workspace
+        {
+            return;
+        }
+        if let Ok(mut grants) = self.permission_grants.lock() {
+            if grants.len() >= MAX_PERMISSION_GRANTS
+                && !grants.contains_key(&request.call_id)
+                && let Some(evict) = grants.keys().next().cloned()
+            {
+                grants.remove(&evict);
+            }
+            grants.insert(request.call_id.clone(), request.clone());
+        }
+    }
+
+    fn raw_path_targets_outside_workspace(&self, raw: &str) -> bool {
+        let path = Path::new(raw);
+        path.is_absolute() && !path.starts_with(self.root.as_ref())
+    }
+
+    fn call_has_outside_path_grant(&self, call_id: &str, capability: PermissionCapability) -> bool {
+        if self.full_access {
+            return true;
+        }
+        let Ok(grants) = self.permission_grants.lock() else {
+            return false;
+        };
+        grants.get(call_id).is_some_and(|request| {
+            request.capability == capability
+                && request
+                    .metadata
+                    .get("outside_workspace")
+                    .is_some_and(|value| value == "true")
+        })
     }
 
     /// Per-tool preview lines for the approval dialog. See
@@ -3639,7 +3732,11 @@ impl ToolRegistry {
                 None,
             );
         }
-        if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
+        let has_outside_grant =
+            self.call_has_outside_path_grant(&call.call_id, PermissionCapability::Edit);
+        if !has_outside_grant
+            && let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox)
+        {
             return make_result(
                 call,
                 ToolStatus::Denied,
@@ -3654,7 +3751,11 @@ impl ToolRegistry {
                 None,
             );
         }
-        let path = match self.resolve_for_write(&args.path) {
+        let path = match self.resolve_for_write_for_call(
+            &args.path,
+            &call.call_id,
+            PermissionCapability::Edit,
+        ) {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };
@@ -3776,7 +3877,11 @@ impl ToolRegistry {
         if !is_notebook_path(&args.path) {
             return tool_error(call, "notebook_edit only operates on .ipynb files");
         }
-        if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
+        let has_outside_grant =
+            self.call_has_outside_path_grant(&call.call_id, PermissionCapability::Edit);
+        if !has_outside_grant
+            && let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox)
+        {
             return make_result(
                 call,
                 ToolStatus::Denied,
@@ -3791,7 +3896,11 @@ impl ToolRegistry {
                 None,
             );
         }
-        let path = match self.resolve_existing(&args.path) {
+        let path = match self.resolve_existing_for_call(
+            &args.path,
+            &call.call_id,
+            PermissionCapability::Edit,
+        ) {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };
@@ -3930,10 +4039,19 @@ impl ToolRegistry {
     }
 
     pub(crate) fn resolve_existing(&self, raw: &str) -> std::result::Result<PathBuf, String> {
-        let candidate = self.join_workspace(raw)?;
+        self.resolve_existing_for_call(raw, "", PermissionCapability::Read)
+    }
+
+    pub(crate) fn resolve_existing_for_call(
+        &self,
+        raw: &str,
+        call_id: &str,
+        capability: PermissionCapability,
+    ) -> std::result::Result<PathBuf, String> {
+        let candidate = self.join_workspace_for_call(raw, call_id, capability)?;
         let canonical = canonicalize_workspace_root(&candidate)
             .map_err(|err| format!("path does not exist or is inaccessible: {err}"))?;
-        self.ensure_inside(canonical)
+        self.ensure_inside_for_call(canonical, call_id, capability)
     }
 
     pub(crate) fn resolve_shell_workdir(&self, raw: &str) -> std::result::Result<PathBuf, String> {
@@ -3958,22 +4076,42 @@ impl ToolRegistry {
     }
 
     fn resolve_for_write(&self, raw: &str) -> std::result::Result<PathBuf, String> {
-        let candidate = self.join_workspace(raw)?;
+        self.resolve_for_write_for_call(raw, "", PermissionCapability::Edit)
+    }
+
+    fn resolve_for_write_for_call(
+        &self,
+        raw: &str,
+        call_id: &str,
+        capability: PermissionCapability,
+    ) -> std::result::Result<PathBuf, String> {
+        let candidate = self.join_workspace_for_call(raw, call_id, capability)?;
         if candidate.exists() {
-            return self.resolve_existing(raw);
+            return self.resolve_existing_for_call(raw, call_id, capability);
         }
         let parent = candidate
             .parent()
             .ok_or_else(|| "path has no parent".to_string())?;
         let parent = canonicalize_workspace_root(parent)
             .map_err(|err| format!("parent directory does not exist or is inaccessible: {err}"))?;
-        self.ensure_inside(parent)?;
+        self.ensure_inside_for_call(parent, call_id, capability)?;
         Ok(candidate)
     }
 
     pub(crate) fn join_workspace(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        self.join_workspace_for_call(raw, "", PermissionCapability::Read)
+    }
+
+    fn join_workspace_for_call(
+        &self,
+        raw: &str,
+        call_id: &str,
+        capability: PermissionCapability,
+    ) -> std::result::Result<PathBuf, String> {
         let path = self.join_shell_path(raw)?;
-        if !path.starts_with(self.root.as_ref()) {
+        if !path.starts_with(self.root.as_ref())
+            && !self.call_has_outside_path_grant(call_id, capability)
+        {
             return Err("path must stay inside the workspace".to_string());
         }
         Ok(path)
@@ -3997,8 +4135,15 @@ impl ToolRegistry {
         })
     }
 
-    fn ensure_inside(&self, canonical: PathBuf) -> std::result::Result<PathBuf, String> {
-        if canonical.starts_with(self.root.as_ref()) {
+    fn ensure_inside_for_call(
+        &self,
+        canonical: PathBuf,
+        call_id: &str,
+        capability: PermissionCapability,
+    ) -> std::result::Result<PathBuf, String> {
+        if canonical.starts_with(self.root.as_ref())
+            || self.call_has_outside_path_grant(call_id, capability)
+        {
             Ok(canonical)
         } else {
             Err("path is outside the workspace".to_string())

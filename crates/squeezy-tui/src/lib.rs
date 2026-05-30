@@ -3937,10 +3937,8 @@ fn send_approval_decision(
     let _ = pending.decision_tx.send(option.decision);
     app.status = match option.choice {
         ApprovalChoice::Approve => format!("approved {tool_name}"),
-        ApprovalChoice::ApproveSession => format!("saved session approval for {tool_name}"),
         ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
-        ApprovalChoice::DenySession => format!("saved session deny for {tool_name}"),
     };
     true
 }
@@ -3948,10 +3946,8 @@ fn send_approval_decision(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalChoice {
     Approve,
-    ApproveSession,
     ApproveProject,
     Deny,
-    DenySession,
 }
 
 #[derive(Debug, Clone)]
@@ -3996,53 +3992,27 @@ fn approval_deny() -> ApprovalOption {
     )
 }
 
-fn approval_deny_session() -> ApprovalOption {
-    ApprovalOption::new_static(
-        ApprovalChoice::DenySession,
-        "Deny for this session",
-        "save an in-memory deny rule",
-        ToolApprovalDecision::DenySession,
-    )
-}
-
 /// Build the per-capability allow/deny menu for a pending approval. The
-/// option list is shaped to the request (network host vs exec amendment
-/// vs plain accept) so each "Approve" label names the binary, host,
-/// server, or path that the resulting rule will cover — the user can
-/// codify *why* in one keystroke.
+/// menu keeps the obvious one-shot decision first, then offers one
+/// project-scoped allow rule for users who want to persist the decision.
 fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
-    let (session_label, session_hint, project_label, project_hint) =
-        capability_scope_labels(request);
-    let session = ApprovalOption {
-        choice: ApprovalChoice::ApproveSession,
-        label: session_label,
-        hint: session_hint,
-        decision: ToolApprovalDecision::AllowSession,
-    };
+    let (project_label, project_hint) = capability_project_label(request);
     let project = ApprovalOption {
         choice: ApprovalChoice::ApproveProject,
         label: project_label,
         hint: project_hint,
         decision: ToolApprovalDecision::AllowRuleProject,
     };
-    vec![
-        approval_once(),
-        session,
-        project,
-        approval_deny(),
-        approval_deny_session(),
-    ]
+    vec![approval_once(), project, approval_deny()]
 }
 
-/// Returns `(session_label, session_hint, project_label, project_hint)` for
-/// the allow options. Each label names the capability-specific target (binary,
-/// host, MCP server/tool, write root) so the prompt makes the persisted rule
-/// shape visible without forcing the user to read the rule-preview line.
-fn capability_scope_labels(
+/// Returns `(project_label, project_hint)` for the persistent allow option.
+/// Each label names the capability-specific target (binary, host, MCP
+/// server/tool, write root) so the prompt makes the persisted rule shape
+/// visible without forcing the user to read the rule-preview line.
+fn capability_project_label(
     request: &ToolApprovalRequest,
 ) -> (
-    std::borrow::Cow<'static, str>,
-    std::borrow::Cow<'static, str>,
     std::borrow::Cow<'static, str>,
     std::borrow::Cow<'static, str>,
 ) {
@@ -4092,8 +4062,6 @@ fn capability_scope_labels(
         }
     }) else {
         return (
-            Cow::Borrowed("Approve for this session"),
-            Cow::Borrowed("save an in-memory rule"),
             Cow::Borrowed("Always approve this command in this repo"),
             Cow::Borrowed("save a project rule"),
         );
@@ -4110,8 +4078,6 @@ fn capability_scope_labels(
         | PermissionCapability::Destructive => unreachable!(),
     };
     (
-        Cow::Owned(format!("Allow {kind} {scope_display} (session)")),
-        Cow::Owned(format!("save an in-memory {hint_kind} rule")),
         Cow::Owned(format!("Always allow {kind} {scope_display}")),
         Cow::Owned(format!("save a project {hint_kind} rule")),
     )
@@ -10523,20 +10489,16 @@ fn format_language_report(report: &squeezy_tools::LanguageReport) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PermissionStatus {
-    read: String,
-    edit: String,
+    mode: String,
     shell: String,
-    web: String,
     sandbox: String,
 }
 
 impl PermissionStatus {
     fn from_policy(policy: &PermissionPolicy) -> Self {
         Self {
-            read: policy.read.as_str().to_string(),
-            edit: policy.edit.as_str().to_string(),
+            mode: policy.mode.as_str().replace('_', "-"),
             shell: policy.shell.as_str().to_string(),
-            web: policy.web.as_str().to_string(),
             sandbox: format!(
                 "{}/net={}",
                 policy.shell_sandbox.mode.as_str(),
@@ -10546,10 +10508,7 @@ impl PermissionStatus {
     }
 
     fn compact(&self) -> String {
-        format!(
-            "perm=r:{} e:{} sh:{} web:{}",
-            self.read, self.edit, self.shell, self.web
-        )
+        format!("perm={}", self.mode)
     }
 }
 

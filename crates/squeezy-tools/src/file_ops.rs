@@ -9,6 +9,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use squeezy_core::PermissionCapability;
 use squeezy_vcs::{DiffMode, DiffOptions};
 use squeezy_workspace::ExclusionReason;
 use tokio_util::sync::CancellationToken;
@@ -517,7 +518,11 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        let path = match self.resolve_existing(&args.path) {
+        let path = match self.resolve_existing_for_call(
+            &args.path,
+            &call.call_id,
+            PermissionCapability::Read,
+        ) {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };

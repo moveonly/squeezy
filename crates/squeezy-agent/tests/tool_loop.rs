@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_core::Stream;
@@ -63,6 +63,31 @@ impl LlmProvider for ScriptedProvider {
             Box::pin(stream::iter(events));
         stream
     }
+}
+
+fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build high-stack test runtime");
+    runtime.block_on(async move {
+        tokio::spawn(future)
+            .await
+            .expect("high-stack test task should not panic");
+    });
+}
+
+async fn wait_for_agent_graph(agent: &Agent) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if agent.current_language_report().is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("agent graph did not become ready");
 }
 
 #[tokio::test]
@@ -368,145 +393,140 @@ async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "Windows default thread stack is 1MB; F10's buffer_unordered subagent dispatch \
-              exceeds it on win-x86_64 only. Real fix is to spawn the subagent fan-out on a \
-              dedicated tokio task with explicit Builder::new_multi_thread + thread_stack_size, \
-              tracked as a follow-up to F10-pi-parallel-and-chain-modes."
-)]
-async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
-    let root = temp_workspace("explore_subagent_isolated");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "explore_call".to_string(),
-                name: "explore".to_string(),
-                arguments: serde_json::json!({
-                    "prompt": "Find the needle entrypoint",
-                    "scope": "src.rs",
-                    "thoroughness": "quick"
+#[test]
+fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
+    run_high_stack_test(async {
+        let root = temp_workspace("explore_subagent_isolated");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "explore_call".to_string(),
+                    name: "explore".to_string(),
+                    arguments: serde_json::json!({
+                        "prompt": "Find the needle entrypoint",
+                        "scope": "src.rs",
+                        "thoroughness": "quick"
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(100),
+                        output_tokens: Some(10),
+                        ..CostSnapshot::default()
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("parent_tools".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(100),
-                    output_tokens: Some(10),
-                    ..CostSnapshot::default()
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "sub_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "src.rs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("sub_tools".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(11),
-                    output_tokens: Some(3),
-                    ..CostSnapshot::default()
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(
-                "Brief: src.rs defines fn needle(). Read src.rs before editing.".to_string(),
-            )),
-            Ok(LlmEvent::Completed {
-                response_id: Some("sub_final".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(7),
-                    output_tokens: Some(5),
-                    ..CostSnapshot::default()
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("ready".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("parent_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.model = "expensive-main".to_string();
-    config.subagents.explore_model = Some("cheap-explore".to_string());
-    let agent = Agent::new(config, provider.clone());
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_tools".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(11),
+                        output_tokens: Some(3),
+                        ..CostSnapshot::default()
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "Brief: src.rs defines fn needle(). Read src.rs before editing.".to_string(),
+                )),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_final".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(7),
+                        output_tokens: Some(5),
+                        ..CostSnapshot::default()
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ready".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.model = "expensive-main".to_string();
+        config.subagents.explore_model = Some("cheap-explore".to_string());
+        let agent = Agent::new(config, provider.clone());
 
-    drain_turn(agent.start_turn("research first".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("research first".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 4);
-    assert_eq!(&*requests[0].model, "expensive-main");
-    assert_eq!(&*requests[1].model, "cheap-explore");
-    assert_eq!(&*requests[2].model, "cheap-explore");
-    assert_eq!(&*requests[3].model, "expensive-main");
-    let subagent_tools = tool_names(&requests[1]);
-    assert!(subagent_tools.contains(&"read_file"));
-    assert!(subagent_tools.contains(&"repo_map"));
-    for forbidden in [
-        "delegate",
-        "explore",
-        "apply_patch",
-        "write_file",
-        "shell",
-        "verify",
-    ] {
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(&*requests[0].model, "expensive-main");
+        assert_eq!(&*requests[1].model, "cheap-explore");
+        assert_eq!(&*requests[2].model, "cheap-explore");
+        assert_eq!(&*requests[3].model, "expensive-main");
+        let subagent_tools = tool_names(&requests[1]);
+        assert!(subagent_tools.contains(&"read_file"));
+        assert!(subagent_tools.contains(&"repo_map"));
+        for forbidden in [
+            "delegate",
+            "explore",
+            "apply_patch",
+            "write_file",
+            "shell",
+            "verify",
+        ] {
+            assert!(
+                !subagent_tools.contains(&forbidden),
+                "explore subagent should not advertise {forbidden}: {subagent_tools:?}"
+            );
+        }
+
+        let parent_outputs = function_outputs(&requests[3]);
+        assert_eq!(parent_outputs.len(), 1);
+        assert_eq!(parent_outputs[0].0, "explore_call");
+        let explore_content = &parent_outputs[0].1["content"];
+        assert_eq!(explore_content["ok"], true);
+        assert_eq!(explore_content["agent"], "explore");
         assert!(
-            !subagent_tools.contains(&forbidden),
-            "explore subagent should not advertise {forbidden}: {subagent_tools:?}"
+            explore_content["summary"]
+                .as_str()
+                .expect("summary")
+                .contains("needle")
         );
-    }
+        assert!(
+            !requests[3].input.iter().any(|item| matches!(
+                item,
+                LlmInputItem::FunctionCall { call_id, .. }
+                    | LlmInputItem::FunctionCallOutput { call_id, .. } if call_id == "sub_read"
+            )),
+            "subagent intermediate tool calls must not reach the parent request"
+        );
 
-    let parent_outputs = function_outputs(&requests[3]);
-    assert_eq!(parent_outputs.len(), 1);
-    assert_eq!(parent_outputs[0].0, "explore_call");
-    let explore_content = &parent_outputs[0].1["content"];
-    assert_eq!(explore_content["ok"], true);
-    assert_eq!(explore_content["agent"], "explore");
-    assert!(
-        explore_content["summary"]
-            .as_str()
-            .expect("summary")
-            .contains("needle")
-    );
-    assert!(
-        !requests[3].input.iter().any(|item| matches!(
-            item,
-            LlmInputItem::FunctionCall { call_id, .. }
-                | LlmInputItem::FunctionCallOutput { call_id, .. } if call_id == "sub_read"
-        )),
-        "subagent intermediate tool calls must not reach the parent request"
-    );
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(snapshot.metrics.subagent_calls, 1);
+        assert_eq!(snapshot.metrics.subagent_failures, 0);
+        assert_eq!(snapshot.metrics.subagent_tool_calls, 1);
+        assert!(snapshot.metrics.subagent_bytes_read > 0);
+        assert_eq!(snapshot.metrics.subagent_provider.input_tokens, Some(18));
+        assert_eq!(snapshot.metrics.subagent_provider.output_tokens, Some(8));
 
-    let snapshot = agent.session_accounting_snapshot().await;
-    assert_eq!(snapshot.metrics.subagent_calls, 1);
-    assert_eq!(snapshot.metrics.subagent_failures, 0);
-    assert_eq!(snapshot.metrics.subagent_tool_calls, 1);
-    assert!(snapshot.metrics.subagent_bytes_read > 0);
-    assert_eq!(snapshot.metrics.subagent_provider.input_tokens, Some(18));
-    assert_eq!(snapshot.metrics.subagent_provider.output_tokens, Some(8));
-
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -1668,10 +1688,12 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
     ]]));
     let agent = Agent::new(config_for(root.clone()), provider);
     drain_turn(agent.start_turn("warm graph".to_string(), CancellationToken::new())).await;
-    // Join the agent's background tasks (notably the MCP refresh from
-    // `start_turn`) before dropping it so their `Arc<SqueezyStore>`
-    // clones are released. Without this the redb lock can outlive
-    // `drop(agent)` and the re-open below races a fire-and-forget spawn.
+    // Wait for the deferred graph open before dropping the agent. On
+    // Windows, redb keeps an exclusive file lock while the graph task holds
+    // its store handle, so re-opening below would otherwise race startup.
+    wait_for_agent_graph(&agent).await;
+    // Join the agent's tracked background tasks before dropping it so their
+    // `Arc<SqueezyStore>` clones are released too.
     agent.shutdown().await;
     drop(agent);
 

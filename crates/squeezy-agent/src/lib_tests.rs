@@ -2702,8 +2702,8 @@ async fn shell_approval_event_surfaces_new_sandbox_metadata() {
             call_id: "call_meta".to_string(),
             name: "shell".to_string(),
             arguments: json!({
-                "command": "cargo test --workspace",
-                "description": "run tests",
+                "command": "node build.js --release",
+                "description": "run build script",
                 "timeout_ms": 45_000,
                 "output_byte_cap": 16_000,
             }),

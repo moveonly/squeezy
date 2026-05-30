@@ -1,6 +1,8 @@
 # Approval Policy
 
-Squeezy can optionally ask the configured model to review permission prompts before the user sees them. This AI reviewer is disabled by default.
+Squeezy can optionally ask the configured model to review permission prompts before the user sees them. The reviewer is disabled in `permissions.mode = "default"` and enabled by `permissions.mode = "auto_review"` or explicit `[permissions.ai_reviewer]` settings.
+
+`permissions.mode = "auto_review"` is a preset: it forces `permissions.ai_reviewer.enabled = true` and `permissions.ai_reviewer.allow_capabilities = ["read", "search", "network", "mcp"]`. Other reviewer fields such as `model`, `policy_file`, `timeout_secs`, and `max_transcript_tokens` still come from config.
 
 When enabled, the reviewer receives only a bounded recent transcript, the pending permission request, and this policy. The reviewer must return a JSON object with:
 
@@ -12,7 +14,7 @@ Valid actions are `allow`, `deny`, and `ask`.
 
 The reviewer may deny any request when the transcript, command, target, or risk suggests unsafe behavior. Denials are treated as final unless the circuit breaker trips.
 
-The reviewer may only approve capabilities listed in `permissions.ai_reviewer.allow_capabilities`. The default allowlist is `read` and `search`. Requests for edit, shell, network, git, compiler, destructive, or MCP capabilities must stay in `ask` unless the user explicitly adds those capabilities to the allowlist.
+The reviewer may only approve capabilities listed in `permissions.ai_reviewer.allow_capabilities`. Requests for edit, shell, git, compiler, or destructive capabilities must stay in `ask` unless the user explicitly adds those capabilities to the allowlist outside auto-review mode.
 
 Prefer `ask` when the request depends on unstated user intent, writes outside the active work, touches project metadata, broadens network access, persists credentials, changes approval rules, or has ambiguous command effects.
 

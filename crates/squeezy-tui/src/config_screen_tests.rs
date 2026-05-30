@@ -1079,12 +1079,13 @@ async fn immediate_tier_enum_save_propagates_to_agent() {
 
 #[tokio::test]
 async fn immediate_tier_permission_save_propagates_to_agent() {
-    use squeezy_core::PermissionMode;
+    use squeezy_core::{PermissionMode, PermissionPolicyMode};
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Permissions));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 0;
+    state.effective.permissions.mode = PermissionPolicyMode::Custom;
+    state.field_index = 1;
     state.effective.permissions.read = PermissionMode::Allow;
     agent.replace_config(state.effective.clone());
     handle_key(

@@ -800,7 +800,16 @@ fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome
         (KeyCode::Enter, _) => {
             if let Some((sidx, fidx, _)) = search.matches.get(search.cursor).copied() {
                 state.section_index = sidx;
-                state.field_index = fidx;
+                let section = &CONFIG_SECTIONS[sidx];
+                state.field_index = if section.id
+                    == squeezy_core::config_schema::SectionId::Permissions
+                    && state.effective.permissions.mode
+                        != squeezy_core::PermissionPolicyMode::Custom
+                {
+                    0
+                } else {
+                    fidx
+                };
             }
             state.search = None;
         }

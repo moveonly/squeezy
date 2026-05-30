@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[cfg(test)]
 use squeezy_agent::Agent;
 use squeezy_core::{
-    AppConfig, SeparatedSources,
+    AppConfig, PermissionPolicyMode, SeparatedSources,
     config_schema::{
         CONFIG_SECTIONS, ConfigSectionMeta, FieldKind, FieldMeta, FieldSource, FieldValue,
         SectionId,
@@ -362,6 +362,13 @@ impl ConfigScreenState {
         let section = self.current_section();
         match section.id {
             SectionId::Models => section.fields.len() + 1,
+            SectionId::Permissions => {
+                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
+                    section.fields.len()
+                } else {
+                    1
+                }
+            }
             // The Reset section only ever surfaces the action for the active
             // scope tab — resetting another tab's file from here would be
             // confusing and the tier-tab context already disambiguates which
@@ -386,6 +393,15 @@ impl ConfigScreenState {
                 r if r < SYNTHETIC_KEY_ROW => section.fields.get(r),
                 r => section.fields.get(r - 1),
             },
+            SectionId::Permissions => {
+                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
+                    section.fields.get(row)
+                } else if row == 0 {
+                    section.fields.first()
+                } else {
+                    None
+                }
+            }
             SectionId::Reset => None,
             _ => section.fields.get(row),
         }
