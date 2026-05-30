@@ -6440,13 +6440,7 @@ fn format_user_prompt_entry(
         % BULLETS.len();
     let bullet = BULLETS[bullet_idx];
 
-    let top = Line::from(vec![
-        Span::raw(INDENT.to_string()),
-        Span::styled(format!("╭{}╮", "─".repeat(max_text_width + 2)), amber),
-    ]);
-
-    let mut lines = Vec::with_capacity(content.len() + 3);
-    lines.push(top);
+    let mut lines = Vec::with_capacity(content.len() + 2);
 
     let mut line_start = 0usize;
     for (index, line_text) in content.iter().enumerate() {

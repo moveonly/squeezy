@@ -5174,24 +5174,18 @@ fn submitted_prompt_renders_bubble_around_text() {
         true,
     );
 
-    let top = lines[0]
+    let content = lines[0]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    let content = lines[1]
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let bottom = lines[2]
+    let bottom = lines[1]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(top.starts_with("  ╭"), "{top}");
-    assert!(top.ends_with('╮'), "{top}");
+    assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(content.starts_with("  "), "{content}");
     assert!(content.ends_with("find getFoo"), "{content}");
     assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
@@ -5221,15 +5215,14 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
-    // Open bubble: top corners + 4 content rows ("one", "", "three", "") + bottom corners + separator
-    assert_eq!(lines.len(), 7);
-    assert!(rendered[0].starts_with("  ╭"), "{rendered:?}");
-    assert!(rendered[1].contains("one"), "{rendered:?}");
-    assert_eq!(rendered[2].trim(), "");
-    assert!(rendered[3].contains("three"), "{rendered:?}");
-    assert_eq!(rendered[4].trim(), "");
-    assert!(rendered[5].starts_with("  ╰─◖"), "{rendered:?}");
-    assert_eq!(rendered[6], "");
+    // Open bubble: 4 content rows ("one", "", "three", "") + bottom edge + separator.
+    assert_eq!(lines.len(), 6);
+    assert!(rendered[0].contains("one"), "{rendered:?}");
+    assert_eq!(rendered[1].trim(), "");
+    assert!(rendered[2].contains("three"), "{rendered:?}");
+    assert_eq!(rendered[3].trim(), "");
+    assert!(rendered[4].starts_with("  ╰─◖"), "{rendered:?}");
+    assert_eq!(rendered[5], "");
 }
 
 #[test]
@@ -5415,15 +5408,15 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    // Open bubble: lines[0] = top corners, lines[1] = bullet + content text
-    assert_eq!(user_lines[1].spans[1].style.fg, Some(AMBER));
+    // Open bubble: lines[0] = bullet + content text.
+    assert_eq!(user_lines[0].spans[1].style.fg, Some(AMBER));
     assert!(
-        user_lines[1].spans[1].content.ends_with(' '),
+        user_lines[0].spans[1].content.ends_with(' '),
         "{:?}",
-        user_lines[1].spans[1].content
+        user_lines[0].spans[1].content
     );
-    assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
-    assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
+    assert_eq!(user_lines[0].spans[2].content.as_ref(), "hi");
+    assert_eq!(user_lines[0].spans[2].style.fg, Some(Color::White));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -5440,21 +5433,21 @@ fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let _text = lines[1]
+    let _text = lines[0]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    // Open bubble: lines[1].spans = [indent "  ", bullet (phase + space), text]
-    assert_eq!(lines[1].spans[1].style.fg, Some(AMBER));
+    // Open bubble: lines[0].spans = [indent "  ", bullet (phase + space), text]
+    assert_eq!(lines[0].spans[1].style.fg, Some(AMBER));
     assert!(
-        lines[1].spans[1].content.ends_with(' '),
+        lines[0].spans[1].content.ends_with(' '),
         "{:?}",
-        lines[1].spans[1].content
+        lines[0].spans[1].content
     );
-    assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
-    assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
+    assert_eq!(lines[0].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[0].spans[2].style.fg, Some(Color::White));
 }
 
 #[test]
@@ -5462,13 +5455,13 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
     let item = TranscriptItem::user("  !ls");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    // Content row is lines[1] (lines[0] is the bubble top border).
-    let bang = lines[1]
+    // Content row is lines[0].
+    let bang = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "!")
         .expect("bang marker span");
-    let rest = lines[1]
+    let rest = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "ls")
@@ -5507,12 +5500,12 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
     let item = TranscriptItem::user("  !!git status");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    let bang = lines[1]
+    let bang = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "!!")
         .expect("double-bang marker span");
-    let rest = lines[1]
+    let rest = lines[0]
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "git status")
