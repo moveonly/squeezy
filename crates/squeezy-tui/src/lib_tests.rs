@@ -3308,7 +3308,7 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "> hello");
+    assert_eq!(text, "  │ hello │");
 }
 
 #[test]
@@ -3589,7 +3589,7 @@ fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     });
     app.push_tool_result(result);
 
-    let output = render_to_string(&app, 140, 12);
+    let output = render_to_string(&app, 140, 16);
 
     assert!(
         output.contains("⚠ Not run cargo check -p sonar-arch-graph · no Cargo.toml found"),
@@ -4742,7 +4742,7 @@ fn render_uses_two_line_status_footer() {
     };
 
     let output = render_to_string(&app, 140, 18);
-    assert!(output.contains(">_ Squeezy v"), "{output}");
+    assert!(output.contains("Squeezy v"), "{output}");
     assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("dir "), "{output}");
     assert!(output.contains("feature"), "{output}");
@@ -4786,10 +4786,10 @@ fn render_keeps_header_when_transcript_has_content() {
     app.push_transcript_item(TranscriptItem::user("hello"));
     app.push_transcript_item(TranscriptItem::assistant("answer"));
 
-    let output = render_to_string(&app, 120, 18);
-    assert!(output.contains(">_ Squeezy v"), "{output}");
+    let output = render_to_string(&app, 120, 24);
+    assert!(output.contains("Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
-    assert!(output.contains("> hello"), "{output}");
+    assert!(output.contains("│ hello"), "{output}");
     assert!(output.contains("● answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
 }
@@ -4829,11 +4829,11 @@ fn startup_card_scrolls_with_transcript_history() {
     }
 
     let at_bottom = render_to_string(&app, 120, 20);
-    assert!(!at_bottom.contains(">_ Squeezy v"), "{at_bottom}");
+    assert!(!at_bottom.contains("Squeezy v"), "{at_bottom}");
 
     app.transcript_scroll_from_bottom = u16::MAX;
     let at_top = render_to_string(&app, 120, 20);
-    assert!(at_top.contains(">_ Squeezy v"), "{at_top}");
+    assert!(at_top.contains("Squeezy v"), "{at_top}");
 }
 
 #[test]
@@ -4903,8 +4903,8 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
     let first = inline_history_lines_for_flush(&app, 100, true, 0);
     let rendered = lines_to_plain_text(&first);
 
-    assert!(rendered.contains(">_ Squeezy v0.1.0"), "{rendered}");
-    assert!(rendered.contains("> find getFoo"), "{rendered}");
+    assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
+    assert!(rendered.contains("│ find getFoo"), "{rendered}");
     assert!(rendered.contains("● No definition found."), "{rendered}");
 
     let next = inline_history_lines_for_flush(&app, 100, false, app.transcript.len());
@@ -4920,7 +4920,7 @@ fn inline_live_viewport_excludes_flushed_history() {
 
     let output = render_inline_to_string(&app, 100, 12);
 
-    assert!(!output.contains(">_ Squeezy v"), "{output}");
+    assert!(!output.contains("Squeezy v"), "{output}");
     assert!(!output.contains("old prompt"), "{output}");
     assert!(!output.contains("old answer"), "{output}");
     assert!(output.contains("new prompt┃"), "{output}");
@@ -4974,7 +4974,7 @@ fn active_prompt_keeps_one_blank_line_after_header() {
     let lines = output.lines().collect::<Vec<_>>();
     let header_bottom = lines
         .iter()
-        .position(|line| line.contains('╯'))
+        .rposition(|line| line.contains("languages"))
         .expect("header bottom");
 
     assert!(
@@ -4987,7 +4987,7 @@ fn active_prompt_keeps_one_blank_line_after_header() {
         lines
             .iter()
             .skip(header_bottom + 2)
-            .take(2)
+            .take(6)
             .any(|line| line.contains('┃')),
         "{output}"
     );
@@ -5007,15 +5007,16 @@ fn footer_mentions_expand_and_transcript_shortcuts() {
 fn active_prompt_cursor_is_vertically_centered() {
     let app = test_app(SessionMode::Build);
 
-    let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT);
+    let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT, 80);
 
-    assert_eq!(lines.len(), 3);
-    assert!(!lines[0].spans.iter().any(|span| span.content.contains('┃')));
-    assert!(
-        lines[1].spans.iter().any(|span| span.content.contains('┃')),
-        "{lines:?}"
-    );
-    assert!(!lines[2].spans.iter().any(|span| span.content.contains('┃')));
+    // Composer at min height: top rule + top pad + content + bot pad + bottom rule = 5 rows
+    assert_eq!(lines.len(), 5);
+    let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains('●'));
+    assert!(!has_coin(&lines[0]), "{lines:?}");
+    assert!(!has_coin(&lines[1]), "{lines:?}");
+    assert!(has_coin(&lines[2]), "{lines:?}");
+    assert!(!has_coin(&lines[3]), "{lines:?}");
+    assert!(!has_coin(&lines[4]), "{lines:?}");
 }
 
 #[test]
@@ -5193,7 +5194,7 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("> why?"), "{output}");
+    assert!(output.contains("│ why?"), "{output}");
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
@@ -5330,7 +5331,7 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
 }
 
 #[test]
-fn submitted_prompt_surface_extends_to_render_width() {
+fn submitted_prompt_renders_bubble_around_text() {
     let item = TranscriptItem::user("find getFoo");
 
     let lines = format_message_entry_with_width(
@@ -5341,29 +5342,29 @@ fn submitted_prompt_surface_extends_to_render_width() {
         Some(40),
         true,
     );
-    let rendered = lines[1]
+
+    let top = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let content = lines[1]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let bottom = lines[2]
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines.len(), PROMPT_MIN_HEIGHT as usize + 1);
-    assert_eq!(
-        lines[0]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-            .chars()
-            .count(),
-        40
-    );
-    assert_eq!(rendered.chars().count(), 40);
-    assert!(rendered.starts_with("> find getFoo"), "{rendered}");
-    assert_eq!(lines[0].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[2].spans[1].style.bg, Some(PROMPT_BG));
+    assert!(top.starts_with("  ╭"), "{top}");
+    assert!(top.ends_with('╮'), "{top}");
+    assert!(content.starts_with("  │ find getFoo"), "{content}");
+    assert!(content.ends_with(" │"), "{content}");
+    assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
+    assert!(bottom.ends_with('╯'), "{bottom}");
     assert_eq!(lines.last().expect("separator").spans.len(), 0);
 }
 
@@ -5389,18 +5390,15 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
+    // Bubble structure: top border + 4 content rows ("one", "", "three", "") + bottom border + separator
     assert_eq!(lines.len(), 7);
+    assert!(rendered[0].starts_with("  ╭"), "{rendered:?}");
     assert!(rendered[1].contains("one"), "{rendered:?}");
-    assert_eq!(rendered[2].trim(), "");
+    assert!(rendered[2].contains('│'), "{rendered:?}");
     assert!(rendered[3].contains("three"), "{rendered:?}");
-    assert_eq!(rendered[4].trim(), "");
+    assert!(rendered[4].contains('│'), "{rendered:?}");
+    assert!(rendered[5].starts_with("  ╰─◖"), "{rendered:?}");
     assert_eq!(rendered[6], "");
-    assert!(lines[..6].iter().all(|line| {
-        line.spans
-            .iter()
-            .filter(|span| !span.content.is_empty())
-            .all(|span| span.style.bg == Some(PROMPT_BG))
-    }));
 }
 
 #[test]
@@ -5410,7 +5408,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
     app.push_log("turn failed: provider stream failed".to_string());
 
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("> hi"), "{output}");
+    assert!(output.contains("│ hi"), "{output}");
     assert!(
         output.contains("│ turn failed: provider stream failed"),
         "{output}"
@@ -5586,10 +5584,11 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
     );
-    assert_eq!(user_lines[1].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(user_lines[1].spans[1].content.as_ref(), "hi");
-    assert_eq!(user_lines[1].spans[1].style.fg, Some(Color::White));
-    assert_eq!(user_lines[1].spans[1].style.bg, Some(PROMPT_BG));
+    // Bubble: lines[0] = top border, lines[1] = content row with bubble sides + text
+    assert_eq!(user_lines[1].spans[1].content.as_ref(), "│ ");
+    assert_eq!(user_lines[1].spans[1].style.fg, Some(AMBER));
+    assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
+    assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -5612,10 +5611,11 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines[1].spans[1].content.as_ref(), "find getFoo");
-    assert_eq!(lines[1].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[1].style.fg, Some(Color::White));
+    // Bubble: lines[1].spans = [indent "  ", left "│ ", text, padding, right " │"]
+    assert_eq!(lines[1].spans[1].content.as_ref(), "│ ");
+    assert_eq!(lines[1].spans[1].style.fg, Some(AMBER));
+    assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
     assert!(!text.contains("◐"), "{text}");
 }
 
@@ -5624,6 +5624,7 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
     let item = TranscriptItem::user("  !ls");
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    // Content row is lines[1] (lines[0] is the bubble top border).
     let bang = lines[1]
         .spans
         .iter()
@@ -5636,9 +5637,7 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
     assert_eq!(rest.style.fg, Some(Color::White));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
 }
 
 #[test]
@@ -5659,9 +5658,7 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
     assert_eq!(rest.style.fg, Some(Color::White));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
 }
 
 #[test]
@@ -5684,9 +5681,7 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
     assert_eq!(rest.style.fg, Some(Color::White));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
     assert!(
         lines[1]
             .spans
@@ -5714,22 +5709,20 @@ fn live_double_bang_prompt_marks_both_bangs_dark_red() {
         .expect("command body span");
 
     assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(bang.style.bg, Some(PROMPT_BG));
     assert_eq!(rest.style.fg, Some(Color::White));
-    assert_eq!(rest.style.bg, Some(PROMPT_BG));
 }
 
 #[test]
 fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
-    assert_eq!(input_panel_height(&app, 100), 3);
+    assert_eq!(input_panel_height(&app, 100), PROMPT_MIN_HEIGHT);
 
     set_input(&mut app, "one\ntwo\nthree".to_string());
-    assert_eq!(input_panel_height(&app, 100), 5);
+    assert_eq!(input_panel_height(&app, 100), 7);
 
     set_input(
         &mut app,
-        (0..20)
+        (0..30)
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>()
             .join("\n"),

@@ -714,6 +714,47 @@ pub(crate) fn move_input_cursor_word_right(app: &mut TuiApp) {
     app.input_cursor = next_word_end(&app.input, cursor);
 }
 
+/// Move the cursor up one line in a multi-line input. Returns `true` when
+/// it moved, `false` when there is no previous line (caller can then fall
+/// through to history recall / transcript scroll).
+pub(crate) fn move_input_cursor_up(app: &mut TuiApp) -> bool {
+    let cursor = input_cursor(app);
+    let curr_start = line_start_before_cursor(&app.input, cursor);
+    if curr_start == 0 {
+        return false;
+    }
+    let col = cursor - curr_start;
+    let prev_end = curr_start - 1;
+    let prev_start = app.input[..prev_end]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let prev_len = prev_end - prev_start;
+    app.input_cursor = prev_start + col.min(prev_len);
+    true
+}
+
+/// Move the cursor down one line in a multi-line input. Returns `true`
+/// when it moved, `false` when already on the last line.
+pub(crate) fn move_input_cursor_down(app: &mut TuiApp) -> bool {
+    let cursor = input_cursor(app);
+    let curr_start = line_start_before_cursor(&app.input, cursor);
+    let col = cursor - curr_start;
+    let Some(next_start) = app.input[curr_start..]
+        .find('\n')
+        .map(|offset| curr_start + offset + 1)
+    else {
+        return false;
+    };
+    let next_end = app.input[next_start..]
+        .find('\n')
+        .map(|offset| next_start + offset)
+        .unwrap_or(app.input.len());
+    let next_len = next_end - next_start;
+    app.input_cursor = next_start + col.min(next_len);
+    true
+}
+
 fn line_start_before_cursor(text: &str, cursor: usize) -> usize {
     let cursor = text_cursor(text, cursor);
     text[..cursor]

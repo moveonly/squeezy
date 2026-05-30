@@ -100,10 +100,11 @@ use input::{
     clear_input, complete_selected_slash_command, delete_at_cursor, delete_before_cursor,
     delete_next_word, delete_previous_word, delete_to_line_end, delete_to_line_start,
     handle_mention_popup_key, handle_overlay_key, handle_request_user_input_key, input_cursor,
-    insert_input_char, insert_input_text, move_input_cursor_left, move_input_cursor_line_end,
-    move_input_cursor_line_start, move_input_cursor_right, move_input_cursor_word_left,
-    move_input_cursor_word_right, move_slash_menu_selection, push_input_history,
-    recall_prompt_history, reject_unknown_slash_command, slash_suggestions,
+    insert_input_char, insert_input_text, move_input_cursor_down, move_input_cursor_left,
+    move_input_cursor_line_end, move_input_cursor_line_start, move_input_cursor_right,
+    move_input_cursor_up, move_input_cursor_word_left, move_input_cursor_word_right,
+    move_slash_menu_selection, push_input_history, recall_prompt_history,
+    reject_unknown_slash_command, slash_suggestions,
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
@@ -131,8 +132,8 @@ const TOOL_CALL_MAX_LINES: usize = 5;
 /// `local_shell_command_call` in the agent). 50 lines fits a typical
 /// command's full output without truncation.
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
-const PROMPT_MIN_HEIGHT: u16 = 3;
-const PROMPT_MAX_HEIGHT: u16 = 8;
+const PROMPT_MIN_HEIGHT: u16 = 5;
+const PROMPT_MAX_HEIGHT: u16 = 30;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 // The slash-command roster grew well past 30 entries, so a 5-row
 // window forced users to scroll for almost any non-top-5 command.
@@ -1456,6 +1457,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 select_previous_transcript_entry(app);
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 recall_prompt_history(app, HistoryDirection::Previous);
+            } else if move_input_cursor_up(app) {
+                // Multi-line input: step the cursor up one line. Falls
+                // through to history/scroll when the cursor is already on
+                // the first line so the single-line behaviour is intact.
             } else if should_route_plain_arrow_to_scroll(app) {
                 scroll_transcript_up(app, 3);
             } else {
@@ -1471,6 +1476,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 select_next_transcript_entry(app);
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 recall_prompt_history(app, HistoryDirection::Next);
+            } else if move_input_cursor_down(app) {
+                // Same as Up — when there's a next line in the composer
+                // step into it; only when on the last line do we fall
+                // through to history/scroll.
             } else if should_route_plain_arrow_to_scroll(app) {
                 scroll_transcript_down(app, 3);
             } else {
@@ -5500,72 +5509,81 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
-    let inner = card_width.saturating_sub(2);
-    let border = "─".repeat(inner);
     vec![
-        Line::from(Span::styled(
-            format!("╭{border}╮"),
-            Style::default().fg(GOLD),
-        )),
-        startup_card_row(
-            inner,
-            "",
-            format!(">_ Squeezy v{}", app.version),
+        startup_phase_strip(card_width, app.version),
+        Line::from(""),
+        startup_meta_row(
+            "model",
+            format!("{}:{}", app.provider_name, app.model),
+            card_width,
+        ),
+        startup_meta_row("directory", app.directory.clone(), card_width),
+        startup_meta_row("languages", app.language_summary.clone(), card_width),
+    ]
+}
+
+fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
+    const FULL: &[&str] = &["◌", "◔", "◑", "◕", "●"];
+    const COMPACT: &[&str] = &["◔", "◑", "◕", "●"];
+    const TIGHT: &[&str] = &["◑", "◕", "●"];
+    const MINIMAL: &[&str] = &["●"];
+
+    let title = "Squeezy";
+    let version_text = format!(" v{version}");
+    let title_total = title.chars().count() + version_text.chars().count();
+
+    for glyphs in [FULL, COMPACT, TIGHT, MINIMAL] {
+        let strip_chars = glyphs.len() * 2 - 1;
+        let content_total = strip_chars + 2 + title_total + 2 + strip_chars;
+        if content_total <= card_width {
+            let left_strip = glyphs.join(" ");
+            let right_strip = glyphs.iter().rev().copied().collect::<Vec<_>>().join(" ");
+            let pad_total = card_width.saturating_sub(content_total);
+            let pad_left = pad_total / 2;
+            let pad_right = pad_total.saturating_sub(pad_left);
+            return Line::from(vec![
+                Span::raw(" ".repeat(pad_left)),
+                Span::styled(left_strip, Style::default().fg(AMBER)),
+                Span::raw("  "),
+                Span::styled(
+                    title.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(version_text.clone(), Style::default().fg(AMBER)),
+                Span::raw("  "),
+                Span::styled(right_strip, Style::default().fg(AMBER)),
+                Span::raw(" ".repeat(pad_right)),
+            ]);
+        }
+    }
+
+    let pad = card_width.saturating_sub(title_total) / 2;
+    Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            title.to_string(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        startup_card_row(
-            inner,
-            "model",
-            format!("{}:{}", app.provider_name, app.model),
-            Style::default().fg(GOLD),
-        ),
-        startup_card_row(
-            inner,
-            "directory",
-            app.directory.clone(),
-            Style::default().fg(Color::White),
-        ),
-        startup_card_row(
-            inner,
-            "languages",
-            app.language_summary.clone(),
-            Style::default().fg(Color::White),
-        ),
-        Line::from(Span::styled(
-            format!("╰{border}╯"),
-            Style::default().fg(GOLD),
-        )),
-    ]
+        Span::styled(version_text, Style::default().fg(AMBER)),
+    ])
 }
 
-fn startup_card_row(
-    inner_width: usize,
-    label: &'static str,
-    value: String,
-    value_style: Style,
-) -> Line<'static> {
-    let label_width = if label.is_empty() { 0 } else { 11 };
-    let value_width = inner_width.saturating_sub(label_width + 2);
-    let value = fit_chars(&value, value_width);
-    let used = 1 + label_width + value.chars().count();
-    let padding = " ".repeat(inner_width.saturating_sub(used));
-    if label.is_empty() {
-        return Line::from(vec![
-            Span::styled("│ ", Style::default().fg(GOLD)),
-            Span::styled(value, value_style),
-            Span::raw(padding),
-            Span::styled("│", Style::default().fg(GOLD)),
-        ]);
-    }
+fn startup_meta_row(label: &'static str, value: String, card_width: usize) -> Line<'static> {
+    const INDENT: usize = 4;
+    const LABEL_WIDTH: usize = 11;
+    let label_len = label.chars().count();
+    let trailing = LABEL_WIDTH.saturating_sub(label_len);
+    let max_value = card_width.saturating_sub(INDENT + LABEL_WIDTH);
+    let value = fit_chars(&value, max_value);
     Line::from(vec![
-        Span::styled("│ ", Style::default().fg(GOLD)),
-        Span::styled(format!("{label}:"), Style::default().fg(AMBER)),
-        Span::raw(" ".repeat(label_width.saturating_sub(label.len() + 1))),
-        Span::styled(value, value_style),
-        Span::raw(padding),
-        Span::styled("│", Style::default().fg(GOLD)),
+        Span::raw(" ".repeat(INDENT)),
+        Span::styled(label.to_string(), Style::default().fg(AMBER)),
+        Span::raw(" ".repeat(trailing)),
+        Span::styled(value, Style::default().fg(Color::White)),
     ])
 }
 
@@ -6431,73 +6449,72 @@ fn accounting_value_style(value: &str) -> Style {
 fn format_user_prompt_entry(
     item: &TranscriptItem,
     _selected: bool,
-    width: Option<u16>,
+    _width: Option<u16>,
 ) -> Vec<Line<'static>> {
     let bang_range = bang_command_marker_range(&item.content);
     let mut content = item.content.split('\n').collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
     }
+    let max_text_width = content
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let amber = Style::default().fg(AMBER);
+    const INDENT: &str = "  ";
+
+    let top = Line::from(vec![
+        Span::raw(INDENT.to_string()),
+        Span::styled(format!("╭{}╮", "─".repeat(max_text_width + 2)), amber),
+    ]);
+
     let mut lines = Vec::with_capacity(content.len() + 3);
-    lines.push(user_prompt_blank_line(width));
+    lines.push(top);
+
     let mut line_start = 0usize;
-    lines.extend(content.into_iter().enumerate().map(|(index, line)| {
-        let marker = if index == 0 { "> " } else { "  " };
-        let rendered =
-            user_prompt_content_line(marker, line, line_start, bang_range.as_ref(), width);
-        line_start = line_start.saturating_add(line.len()).saturating_add(1);
-        rendered
-    }));
-    lines.push(user_prompt_blank_line(width));
+    for (index, line_text) in content.iter().enumerate() {
+        let slash_len = if index == 0 {
+            input::match_slash_command_prefix(line_text)
+        } else {
+            None
+        };
+        let bang_ref = bang_range.as_ref();
+        let style_text_at = |abs_offset: usize| -> Style {
+            if bang_ref.is_some_and(|range| range.contains(&abs_offset)) {
+                Style::default().fg(BANG_RED)
+            } else if let Some(len) = slash_len {
+                if abs_offset < len {
+                    Style::default().fg(AMBER)
+                } else {
+                    Style::default().fg(Color::White)
+                }
+            } else {
+                Style::default().fg(Color::White)
+            }
+        };
+        let mut spans = vec![
+            Span::raw(INDENT.to_string()),
+            Span::styled("│ ".to_string(), amber),
+        ];
+        push_styled_segments(&mut spans, line_text, line_start, style_text_at);
+        let pad = max_text_width.saturating_sub(line_text.chars().count());
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+        spans.push(Span::styled(" │".to_string(), amber));
+        lines.push(Line::from(spans));
+        line_start = line_start.saturating_add(line_text.len()).saturating_add(1);
+    }
+
+    let bottom = Line::from(vec![
+        Span::raw(INDENT.to_string()),
+        Span::styled(format!("╰─◖{}╯", "─".repeat(max_text_width)), amber),
+    ]);
+    lines.push(bottom);
     lines.push(Line::from(""));
     lines
-}
-
-fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
-    let marker = "  ";
-    let surface_width = user_prompt_surface_width(marker, width).unwrap_or(1);
-    Line::from(vec![
-        user_prompt_marker_span(marker),
-        Span::styled(" ".repeat(surface_width), Style::default().bg(PROMPT_BG)),
-    ])
-}
-
-fn user_prompt_content_line(
-    marker: &'static str,
-    line: &str,
-    line_start: usize,
-    bang_range: Option<&std::ops::Range<usize>>,
-    width: Option<u16>,
-) -> Line<'static> {
-    let text_width = line.chars().count();
-    let padding = user_prompt_surface_width(marker, width)
-        .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
-        .unwrap_or_default();
-    let mut spans = vec![user_prompt_marker_span(marker)];
-    // First content line of a user message can carry a `/<command>` prefix.
-    // We keep the rest of the line in white so multi-word prompts like
-    // `/help changing the model` stay legible while the recognised command
-    // pops in amber.
-    let slash_len = (marker == "> ")
-        .then(|| input::match_slash_command_prefix(line))
-        .flatten();
-    let style_text_at = |abs_offset: usize| -> Style {
-        let base = Style::default().bg(PROMPT_BG);
-        if bang_range.is_some_and(|range| range.contains(&abs_offset)) {
-            base.fg(BANG_RED)
-        } else if let Some(len) = slash_len {
-            if marker == "> " && abs_offset < len {
-                base.fg(AMBER)
-            } else {
-                base.fg(Color::White)
-            }
-        } else {
-            base.fg(Color::White)
-        }
-    };
-    push_styled_segments(&mut spans, line, line_start, style_text_at);
-    spans.push(Span::styled(padding, Style::default().bg(PROMPT_BG)));
-    Line::from(spans)
 }
 
 /// Byte range covering the leading `!` (single-bang) or `!!`
@@ -6518,19 +6535,6 @@ fn bang_command_marker_range(text: &str) -> Option<std::ops::Range<usize>> {
         end += next.len_utf8();
     }
     Some(start..end)
-}
-
-fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
-    width.map(|width| (width as usize).saturating_sub(marker.chars().count()))
-}
-
-fn user_prompt_marker_span(marker: &'static str) -> Span<'static> {
-    let style = if marker.trim().is_empty() {
-        Style::default().bg(PROMPT_BG)
-    } else {
-        Style::default().fg(GOLD).bg(PROMPT_BG)
-    };
-    Span::styled(marker, style)
 }
 
 fn format_assistant_message_entry(
@@ -7041,11 +7045,14 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         ])];
     }
     if entry.kind == LogKind::Warn {
-        // Single-line `⚠ message` rendering for turn-end signals so the
-        // user can spot a cancel/fail at a glance instead of scanning a
-        // `│`-prefixed body that visually matches every other log row.
+        // `⚠ message` rendering for turn-end signals so the user can spot
+        // a cancel/fail at a glance. Newlines are flattened to spaces so
+        // the whole error reads as one bullet, and the transcript
+        // paragraph's `Wrap { trim: false }` line-wraps anything long —
+        // errors from providers can be hundreds of characters and need to
+        // stay fully visible rather than being cut off with `…`.
         let marker = if selected { "> " } else { "  " };
-        let preview = compact_text(message, 200);
+        let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
             Span::raw(marker),
             Span::styled("⚠ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
@@ -9145,14 +9152,17 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
     // activity indicators buzzing forever even though the agent was
     // doing nothing.
     if app.turn_visual == TurnVisualState::Idle {
-        return Span::styled("●", Style::default().fg(AMBER));
+        return Span::styled("●", Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
     }
     let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
         GOLD
     } else {
         AMBER
     };
-    Span::styled(prompt_coin_frame(app), Style::default().fg(color))
+    Span::styled(
+        prompt_coin_frame(app),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
@@ -9176,7 +9186,7 @@ fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
 }
 
 fn prompt_cursor_span() -> Span<'static> {
-    Span::styled("┃", Style::default().fg(GOLD).bg(PROMPT_BG))
+    Span::styled("┃", Style::default().fg(AMBER))
 }
 
 pub(crate) fn compact_text(text: &str, limit: usize) -> String {
@@ -9254,7 +9264,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         queue_overlay_lines + overlay_lines + mention_lines + suggestion_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
-        .saturating_add(2)
+        .saturating_add(4)
         .saturating_add(queue_overlay_lines)
         .saturating_add(overlay_lines)
         .saturating_add(mention_lines)
@@ -9280,9 +9290,8 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
 fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     if app.input.is_empty() {
         return vec![Line::from(vec![
-            Span::styled(" ", Style::default().bg(PROMPT_BG)),
             prompt_coin_span(app),
-            Span::styled("  ", Style::default().bg(PROMPT_BG)),
+            Span::raw("  "),
             prompt_cursor_span(),
         ])];
     }
@@ -9300,31 +9309,23 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(index, line)| {
             let prefix = if index == 0 {
-                vec![
-                    Span::styled(" ", Style::default().bg(PROMPT_BG)),
-                    prompt_coin_span(app),
-                    Span::styled("  ", Style::default().bg(PROMPT_BG)),
-                ]
+                vec![prompt_coin_span(app), Span::raw("  ")]
             } else {
-                vec![Span::styled(
-                    "    ",
-                    Style::default().fg(QUIET).bg(PROMPT_BG),
-                )]
+                vec![Span::raw("   ")]
             };
             let mut spans = prefix;
             let line_end = line_start + line.len();
             let slash_split = if index == 0 { slash_len } else { None };
             let style_text_at = |abs_offset: usize| -> Style {
-                let base = Style::default().bg(PROMPT_BG);
                 if bang_range
                     .as_ref()
                     .is_some_and(|range| range.contains(&abs_offset))
                 {
-                    base.fg(BANG_RED)
+                    Style::default().fg(BANG_RED)
                 } else {
                     match slash_split {
-                        Some(len) if abs_offset < len => base.fg(AMBER),
-                        _ => base.fg(Color::White),
+                        Some(len) if abs_offset < len => Style::default().fg(AMBER),
+                        _ => Style::default().fg(Color::White),
                     }
                 }
             };
@@ -9376,19 +9377,67 @@ fn push_styled_segments(
     }
 }
 
-fn prompt_blank_line() -> Line<'static> {
-    Line::from(Span::styled(" ", Style::default().bg(PROMPT_BG)))
+fn prompt_input_lines(app: &TuiApp, height: u16, width: u16) -> Vec<Line<'static>> {
+    let content = prompt_input_content_lines(app);
+    let cursor_line = app.input[..input_cursor(app)].matches('\n').count();
+    composer_bubble_lines(content, cursor_line, height, width)
 }
 
-fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
-    let content = prompt_input_content_lines(app);
-    let spare = (height as usize).saturating_sub(content.len());
-    let top_padding = spare / 2;
-    let bottom_padding = spare.saturating_sub(top_padding);
-    let mut lines = Vec::with_capacity(top_padding + content.len() + bottom_padding);
-    lines.extend((0..top_padding).map(|_| prompt_blank_line()));
-    lines.extend(content);
-    lines.extend((0..bottom_padding).map(|_| prompt_blank_line()));
+fn composer_bubble_lines(
+    content: Vec<Line<'static>>,
+    cursor_line: usize,
+    height: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let height = height as usize;
+    if width < 4 || height < 3 {
+        return content;
+    }
+    let amber = Style::default().fg(AMBER);
+
+    // Open layout: just a top and bottom horizontal rule with the typed
+    // content sandwiched between blank padding rows. No vertical sides —
+    // they read as visual noise when the composer is on the default
+    // terminal background.
+    let rule = Line::from(Span::styled("─".repeat(width), amber));
+
+    let interior_rows = height.saturating_sub(2);
+    let mut content = content;
+    if content.len() > interior_rows {
+        // Pick the visible window so the cursor's line stays on screen.
+        // Center the cursor in the window when there's room; clamp to
+        // the content's start/end so Up at the top doesn't show phantom
+        // rows above line 0 and Down at the bottom doesn't show rows
+        // past the last typed line.
+        let cursor_line = cursor_line.min(content.len() - 1);
+        let half = interior_rows / 2;
+        let max_start = content.len() - interior_rows;
+        let window_start = cursor_line.saturating_sub(half).min(max_start);
+        let window_end = window_start + interior_rows;
+        content = content[window_start..window_end].to_vec();
+    }
+
+    // Center the content vertically inside the interior so the coin
+    // hovers between the rules instead of hugging the top one.
+    let spare = interior_rows.saturating_sub(content.len());
+    let top_pad = spare / 2;
+    let bot_pad = spare - top_pad;
+
+    let mut lines = Vec::with_capacity(height);
+    lines.push(rule.clone());
+    for _ in 0..top_pad {
+        lines.push(Line::from(""));
+    }
+    for line in content {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+    for _ in 0..bot_pad {
+        lines.push(Line::from(""));
+    }
+    lines.push(rule);
     lines
 }
 
@@ -9526,7 +9575,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         + suggestion_lines.len()
         + indicator_line.iter().count();
     let prompt_height = area.height.saturating_sub(extra_height as u16);
-    let mut lines = prompt_input_lines(app, prompt_height);
+    let mut lines = prompt_input_lines(app, prompt_height, area.width);
     let indicator_row_offset = lines.len() as u16;
     let indicator_present = indicator_line.is_some();
     if let Some(line) = indicator_line {
@@ -9555,7 +9604,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White).bg(PROMPT_BG))
+        .style(Style::default().fg(Color::White))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);

@@ -8,37 +8,30 @@ use std::{
 
 use ratatui::style::Color;
 
-// Squeezy palette rule (default `AccentVariant`):
-//
-// - The agent's brand colour is **dark amber `Rgb(215, 147, 52)`**. It
-//   carries banner, working-card balls/spinner, transcript chevrons,
-//   and every other "this is squeezy talking to you" cue.
-// - Questions and other neutral surfaces (plan-mode chrome, config
-//   environment hints, request_user_input modals) use **warm taupe
-//   `Rgb(145, 132, 113)`** — distinct from the amber brand but still
-//   calm; carries no value judgement.
-// - Success and failure use **other dark identifying colours** (deep
-//   green, deep crimson). Never bright — rule of thumb: luminance
-//   `0.299*R + 0.587*G + 0.114*B` ≤ ~160 on TrueColor terminals so a
-//   dark-mode user reading the screen at a glance can pick the brand
-//   amber out from the cooler semantic markers without being shouted
-//   at.
-// - Catppuccin / HighContrast variants override these defaults via the
-//   `accent_*` accessors; the constants below are the baseline every
-//   un-themed install renders against.
-pub(crate) const AMBER: Color = Color::Rgb(215, 147, 52);
-pub(crate) const GOLD: Color = Color::Rgb(184, 124, 38);
-pub(crate) const MODE_PURPLE: Color = Color::Rgb(145, 132, 113);
+/// Default accent values for the amber/gold family. The active accent is
+/// resolved through [`accent_primary`] / [`accent_secondary`] and friends
+/// so themes (`catppuccin`, `high-contrast`) can replace them at runtime
+/// without touching the ~150 surfaces that already reference `AMBER`/
+/// `GOLD` as their accent token. The const remains the visual default
+/// (`TuiTheme::System|Dark|Light`); themed variants flip an atomic
+/// override that the accent accessors consult on every read.
+pub(crate) const AMBER: Color = Color::Rgb(252, 211, 77);
+pub(crate) const GOLD: Color = Color::Rgb(254, 240, 138);
+pub(crate) const MODE_PURPLE: Color = Color::Rgb(149, 117, 205);
+/// Muted indigo used for path-like text (cross-project hints, env-derived
+/// file locations). Sits below `MODE_PURPLE` so a long path doesn't shout
+/// when it appears next to a brighter focus row.
+pub(crate) const PATH_HINT: Color = Color::Rgb(89, 86, 140);
 pub(crate) const SUCCESS_GREEN: Color = Color::Rgb(22, 101, 52);
 pub(crate) const MODE_BUILD_GREEN: Color = Color::Rgb(34, 117, 64);
-pub(crate) const ERROR_RED: Color = Color::Rgb(180, 60, 60);
+pub(crate) const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 pub(crate) const BANG_RED: Color = Color::Rgb(153, 27, 27);
 pub(crate) const QUIET: Color = Color::DarkGray;
 pub(crate) const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
 pub(crate) const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
 pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
-pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(184, 124, 38);
+pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
 pub(crate) const SEPARATOR_BLUE: Color = Color::Rgb(96, 165, 250);
 
 /// Status-line accent fallbacks. Mid-tone so they stay readable on both
