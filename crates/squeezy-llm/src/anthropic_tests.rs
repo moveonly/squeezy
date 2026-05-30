@@ -556,6 +556,82 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
     }
 }
 
+/// Anthropic rejects `thinking.budget_tokens < 1024`. When the caller
+/// sets a small `max_output_tokens` (here 256), the adapter must
+/// suppress the `thinking` block entirely rather than emit a sub-floor
+/// budget that would 400 every turn.
+#[test]
+fn request_body_omits_thinking_when_max_output_tokens_below_1024_floor() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: Some(256),
+        response_verbosity: None,
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::Low),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    assert_eq!(body["max_tokens"], 256);
+    assert!(
+        body.get("thinking").is_none(),
+        "thinking block must be omitted when max_output_tokens cannot satisfy the 1024 \
+         budget floor + reply headroom, got {body}",
+    );
+}
+
+/// When `max_output_tokens` clears the 1024-budget + 1024-reply floor,
+/// the `thinking.budget_tokens` we emit must (1) be `>= 1024`,
+/// (2) leave room for the reply, and (3) honor the requested effort
+/// when the headroom allows it.
+#[test]
+fn request_body_emits_thinking_clamped_to_max_output_minus_reply_headroom() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        // Tight output cap: clears the 2048 gate but smaller than the
+        // Low effort budget (4096). The emitted budget should be
+        // clamped down to `max_output_tokens - 1024 = 1024`.
+        max_output_tokens: Some(2_048),
+        response_verbosity: None,
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::Low),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    assert_eq!(body["max_tokens"], 2_048);
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 1_024);
+
+    // Ample output cap: emitted budget should match the effort default.
+    let request = LlmRequest {
+        max_output_tokens: Some(32_000),
+        ..request
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["thinking"]["budget_tokens"], 4_096);
+}
+
 #[test]
 fn sse_decoder_collects_data_events_across_chunks() {
     let mut decoder = SseDecoder::default();
