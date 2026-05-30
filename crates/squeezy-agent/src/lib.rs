@@ -6446,6 +6446,10 @@ async fn handle_request_user_input_call(
             .collect(),
         allow_freeform: args.allow_freeform,
     };
+    // Capture the question contract for post-response validation; the request
+    // itself is moved into the event below.
+    let offered_values: Vec<String> = request.choices.iter().map(|c| c.value.clone()).collect();
+    let allow_freeform = request.allow_freeform;
 
     let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
     if context
@@ -6473,6 +6477,66 @@ async fn handle_request_user_input_call(
         _ = context.cancel.cancelled() => RequestUserInputResponse::cancelled(),
         result = response_rx => result.unwrap_or_else(|_| RequestUserInputResponse::cancelled()),
     };
+
+    // Validate the response shape against the offered question contract.
+    // A driver/UI that replies with a choice_value not in the offered set, or
+    // a freeform reply when the question disabled freeform, must surface a
+    // typed error so the model sees the violation instead of an opaque
+    // success.
+    match response.action {
+        RequestUserInputAction::Choice => {
+            let Some(choice_value) = response.choice_value.as_deref() else {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "request_user_input choice response missing choice_value"
+                    }),
+                );
+            };
+            if !offered_values.iter().any(|v| v.as_str() == choice_value) {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "choice_value not in offered choices",
+                        "choice_value": choice_value,
+                        "offered": offered_values,
+                    }),
+                );
+            }
+        }
+        RequestUserInputAction::Freeform => {
+            if !allow_freeform {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "freeform not allowed for this question",
+                    }),
+                );
+            }
+            if response
+                .freeform
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true)
+            {
+                return control_tool_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "ok": false,
+                        "error": "request_user_input freeform response missing freeform text"
+                    }),
+                );
+            }
+        }
+        RequestUserInputAction::Cancelled => {}
+    }
 
     let mut payload = json!({
         "ok": true,

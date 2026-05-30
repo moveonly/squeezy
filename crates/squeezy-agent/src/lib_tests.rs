@@ -6467,6 +6467,153 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
 }
 
 #[tokio::test]
+async fn plan_mode_request_user_input_rejects_choice_value_not_in_offered_set() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                arguments: json!({
+                    "question": "Which approach?",
+                    "choices": [
+                        {"label": "Simplify", "value": "simplify"},
+                        {"label": "Split",    "value": "split"},
+                        {"label": "Perf",     "value": "perf"}
+                    ]
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut saw_validation_error = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested { response_tx, .. } => {
+                // Driver/UI responds with a choice_value that is not in the
+                // offered choices — emulates the OpenAI wave2-06 trace.
+                let _ = response_tx.send(RequestUserInputResponse::choice("small"));
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "ask_1" => {
+                assert_eq!(result.status, squeezy_tools::ToolStatus::Error);
+                let content = serde_json::to_string(&result.content).unwrap();
+                assert!(
+                    content.contains("choice_value not in offered choices"),
+                    "expected typed validation error in payload: {content}",
+                );
+                saw_validation_error = true;
+            }
+            AgentEvent::Completed { .. } => break,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_validation_error,
+        "agent must surface a typed ToolStatus::Error when choice_value is out of bounds"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_request_user_input_rejects_freeform_when_disallowed() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                // allow_freeform omitted → defaults to false (matches the
+                // Anthropic wave2-06 bumped trace).
+                arguments: json!({
+                    "question": "What is the primary goal of this refactor?",
+                    "choices": [
+                        {"label": "Speed",    "value": "speed"},
+                        {"label": "Clarity",  "value": "clarity"}
+                    ]
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut saw_validation_error = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested { response_tx, .. } => {
+                // Driver/UI replies with a freeform string despite the
+                // request not allowing freeform answers.
+                let _ = response_tx.send(RequestUserInputResponse::freeform(
+                    "Yes - focus on the eval driver",
+                ));
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "ask_1" => {
+                assert_eq!(result.status, squeezy_tools::ToolStatus::Error);
+                let content = serde_json::to_string(&result.content).unwrap();
+                assert!(
+                    content.contains("freeform not allowed for this question"),
+                    "expected typed validation error in payload: {content}",
+                );
+                saw_validation_error = true;
+            }
+            AgentEvent::Completed { .. } => break,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_validation_error,
+        "agent must surface a typed ToolStatus::Error when freeform is disabled"
+    );
+}
+
+#[tokio::test]
 async fn build_mode_refuses_request_user_input_call() {
     use super::REQUEST_USER_INPUT_TOOL_NAME;
 
