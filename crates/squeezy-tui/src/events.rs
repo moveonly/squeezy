@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use squeezy_agent::{
     AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, RequestUserInputResponse,
+    MAX_JOBS_RETAINED, RequestUserInputResponse, format_warn_threshold_notice,
 };
 use squeezy_core::SessionMode;
 use squeezy_tools::{McpElicitationResponse, McpStatusSnapshot, ToolStatus};
@@ -361,12 +361,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     break;
                 }
                 AgentEvent::CostWarning { status, .. } => {
-                    let notice = format!(
-                        "session cost crossed warning threshold: spent ${:.4} of ${:.2} cap ({}%)",
-                        status.spent_usd_micros as f64 / 1_000_000.0,
-                        status.cap_usd_micros as f64 / 1_000_000.0,
-                        status.percent
-                    );
+                    let notice = format_warn_threshold_notice(status);
                     app.push_transcript_item(TranscriptItem::system(notice));
                 }
                 AgentEvent::ShellSandboxBestEffortFallback {

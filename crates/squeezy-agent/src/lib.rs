@@ -95,7 +95,7 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
-pub use cost_broker::CostCapStatus;
+pub use cost_broker::{CostCapStatus, format_warn_threshold_notice};
 pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 pub use subagent_catalog::{

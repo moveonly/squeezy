@@ -258,7 +258,24 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
 
 pub(crate) fn format_cap_reached_reason(status: CostCapStatus) -> String {
     format!(
-        "session cost cap reached: spent ${:.6} of ${:.6} ({}%)",
+        "session cost cap reached: spent ${:.6} of ${:.6} ({}%). \
+         Run /config to raise `max_session_cost_usd_micros` \
+         (or set SQUEEZY_MAX_SESSION_COST_USD_MICROS), then send the next prompt.",
+        status.spent_usd_micros as f64 / 1_000_000.0,
+        status.cap_usd_micros as f64 / 1_000_000.0,
+        status.percent,
+    )
+}
+
+/// Render the cost-cap *warning* threshold notice with the same next-step
+/// guidance as the cap-reached error. Surfaced by the TUI when the broker
+/// reports a warning-tier `CostCapStatus` so the user can react before the
+/// hard cap actually trips.
+pub fn format_warn_threshold_notice(status: CostCapStatus) -> String {
+    format!(
+        "session cost crossed warning threshold: spent ${:.4} of ${:.2} cap ({}%). \
+         Run /config to raise `max_session_cost_usd_micros` before the cap trips \
+         (or set SQUEEZY_MAX_SESSION_COST_USD_MICROS).",
         status.spent_usd_micros as f64 / 1_000_000.0,
         status.cap_usd_micros as f64 / 1_000_000.0,
         status.percent,
@@ -276,4 +293,81 @@ fn cap_percent(spent_usd_micros: u64, cap_usd_micros: u64) -> u8 {
     }
     let percent = (spent_usd_micros as u128 * 100) / cap_usd_micros as u128;
     percent.min(255) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_status() -> CostCapStatus {
+        CostCapStatus {
+            spent_usd_micros: 12_457,
+            cap_usd_micros: 10_000,
+            percent: 124,
+        }
+    }
+
+    #[test]
+    fn cap_reached_reason_states_spent_cap_and_percent() {
+        let msg = format_cap_reached_reason(sample_status());
+        assert!(
+            msg.contains("$0.012457"),
+            "spent amount must be cited; got: {msg}"
+        );
+        assert!(
+            msg.contains("$0.010000"),
+            "cap amount must be cited; got: {msg}"
+        );
+        assert!(msg.contains("(124%)"), "percent must be cited; got: {msg}");
+    }
+
+    #[test]
+    fn cap_reached_reason_includes_next_step_guidance() {
+        // squeezy-zp6e: the cap-reached error must steer the user to a
+        // concrete next step (raise the cap via /config or env var).
+        // Without this the user is left with a bare numeric message and
+        // no idea how to recover.
+        let msg = format_cap_reached_reason(sample_status());
+        assert!(
+            msg.contains("/config"),
+            "cap-reached message must reference /config; got: {msg}"
+        );
+        assert!(
+            msg.contains("max_session_cost_usd_micros"),
+            "cap-reached message must name the setting; got: {msg}"
+        );
+        assert!(
+            msg.contains("SQUEEZY_MAX_SESSION_COST_USD_MICROS"),
+            "cap-reached message must cite the env var override; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn warn_threshold_notice_includes_next_step_guidance() {
+        // squeezy-zp6e: the warning-tier notice also needs an actionable
+        // hint so the user can raise the cap *before* the hard cap trips
+        // and a turn fails outright.
+        let status = CostCapStatus {
+            spent_usd_micros: 9_600,
+            cap_usd_micros: 10_000,
+            percent: 96,
+        };
+        let notice = format_warn_threshold_notice(status);
+        assert!(
+            notice.contains("warning threshold"),
+            "notice must label itself as the warning tier; got: {notice}"
+        );
+        assert!(
+            notice.contains("/config"),
+            "warn notice must reference /config; got: {notice}"
+        );
+        assert!(
+            notice.contains("max_session_cost_usd_micros"),
+            "warn notice must name the setting; got: {notice}"
+        );
+        assert!(
+            notice.contains("(96%)"),
+            "warn notice must cite the percent; got: {notice}"
+        );
+    }
 }
