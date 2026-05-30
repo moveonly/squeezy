@@ -3349,7 +3349,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
 }
 
 #[test]
-fn toggle_selected_without_selection_toggles_latest_transcript_entry() {
+fn toggle_selected_without_selection_expands_latest_collapsed_entry() {
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
 
@@ -3363,12 +3363,61 @@ fn toggle_selected_without_selection_toggles_latest_transcript_entry() {
         "expanded transcript entry 1 · Ctrl+E expand all"
     );
 
+    // Ctrl+O is bound to `ExpandSelectedTranscriptEntry`; with nothing
+    // left collapsed and no explicit selection it must not fold the
+    // entry we just opened. Status reports the no-op so the user gets
+    // feedback instead of silent re-folding.
     toggle_selected_transcript_entry(&mut app);
-    assert!(app.transcript[0].collapsed);
-    assert_eq!(
-        app.status,
-        "collapsed transcript entry 1 · Ctrl+E expand all"
+    assert!(!app.transcript[0].collapsed);
+    assert_eq!(app.status, "nothing to expand");
+}
+
+#[test]
+fn ctrl_o_does_not_collapse_assistant_when_no_reasoning_entry_exists() {
+    // squeezy-a88 regression. OpenAI gpt-5.4-mini @ reasoning_effort=low
+    // ships no reasoning summary, so the transcript drains to
+    // [user, assistant] with both entries already expanded (assistant
+    // messages skip the compact-default collapse). Ctrl+O used to fall
+    // through to the assistant body and collapse it — the binding is
+    // named `ExpandSelectedTranscriptEntry`, so collapsing on press is
+    // wrong. The fix: with no collapsed entry to target, Ctrl+O is a
+    // no-op and the status hints "nothing to expand".
+    let mut app = test_app(SessionMode::Build);
+    app.show_reasoning_usage = true;
+    app.push_transcript_item(TranscriptItem::user("Think briefly…"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "For a tiny ~100-entry keyed cache, a hash map is usually the better fit.",
+    ));
+
+    assert!(app.selected_entry.is_none());
+    assert!(
+        app.transcript.iter().all(|entry| !entry.collapsed),
+        "fixture must start with no collapsed entries to reproduce the bug"
     );
+    assert!(
+        !app.transcript
+            .iter()
+            .any(|entry| matches!(entry.kind, TranscriptEntryKind::Reasoning(_))),
+        "fixture must have no Reasoning entry (the OpenAI no-summary case)"
+    );
+
+    toggle_selected_transcript_entry(&mut app);
+
+    let assistant_index = app
+        .transcript
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.kind,
+                TranscriptEntryKind::Message(item) if item.role == Role::Assistant
+            )
+        })
+        .expect("assistant message present");
+    assert!(
+        !app.transcript[assistant_index].collapsed,
+        "Ctrl+O must not collapse the assistant body when nothing is collapsed"
+    );
+    assert_eq!(app.status, "nothing to expand");
 }
 
 #[test]
