@@ -4400,7 +4400,9 @@ fn format_request_user_input_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            // Tone-aware muted grey sits below the luminance budget so
+            // the selected GOLD row wins the eye in the warm-taupe modal.
+            Style::default().fg(palette::muted_fg())
         };
         let mut spans = vec![
             Span::styled(
@@ -4420,9 +4422,15 @@ fn format_request_user_input_menu_lines(
     if request.allow_freeform {
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
-        let entry_style = Style::default().fg(Color::White);
-        let label_style = Style::default().fg(Color::Indexed(33));
-        let cursor_style = Style::default().fg(Color::Black).bg(Color::Indexed(33));
+        // Label + cursor share the `MODE_PURPLE` warm-taupe accent so the
+        // whole modal reads as one semantic surface; the typed body uses
+        // a dim+bold tone-aware foreground for legibility without
+        // overpowering the question line.
+        let entry_style = Style::default()
+            .fg(palette::footer_fg())
+            .add_modifier(Modifier::BOLD);
+        let label_style = Style::default().fg(MODE_PURPLE);
+        let cursor_style = Style::default().fg(Color::Black).bg(MODE_PURPLE);
         let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
         if input.is_empty() {
             spans.push(Span::styled(
