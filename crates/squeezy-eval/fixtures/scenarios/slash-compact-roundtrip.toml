@@ -1,0 +1,104 @@
+id = "slash-compact-roundtrip"
+title = "Round-trip /compact: seed transcript, compact, then post-compact turn"
+description = """
+Offline mock-provider scenario that exercises the /compact slash command
+mid-conversation. The flow seeds enough conversation items to clear
+`compaction_recent_items` (default 6 — needs > 6 items so `initial_split`
+in `compact_conversation` is non-zero), dispatches `/compact`, then runs
+one more prompt to verify the post-compact turn still drives cleanly
+(no orphaned tool calls, no provider rejections, assistant text reaches
+`frames.jsonl`).
+
+The assertion on the final turn's assistant text is the regression guard:
+if `/compact` corrupts the conversation (drops a FunctionCallOutput,
+loses the synthetic summary head, or trips
+`compact_conversation_with_strategy` into the "not enough context"
+branch), the post-compact prompt either fails or produces empty text,
+and the `expect_final_text_contains` / `expect_no_tool_errors` rules
+fire.
+
+Also probes the resume-state path described in
+`crates/squeezy-store/src/sessions.rs` (`replay_resume_state` — the
+walk that looks for the most recent `ContextCompacted` event). The
+post-compact prompt forces `Agent::compact_context_manual` to flush
+a new `resume_state.json` and emit a `ContextCompacted` event into
+`events.jsonl`; any divergence between the two surfaces immediately
+as a failed turn on the next mock cycle.
+"""
+
+[workspace]
+local = "."
+snapshot = false
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Turn 1: introduce the make_widget seed."
+
+[[steps]]
+kind = "prompt"
+text = "Turn 2: extend the make_widget context."
+
+[[steps]]
+kind = "prompt"
+text = "Turn 3: more make_widget chatter to grow the conversation past compaction_recent_items."
+
+[[steps]]
+kind = "prompt"
+text = "Turn 4: final pre-compact turn — conversation now holds 8 items (4 user + 4 assistant)."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/compact"
+
+[[steps]]
+kind = "prompt"
+text = "Turn 5 (post-compact): summarise the post-compact state."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "post-compact"
+
+[expect]
+final_text_contains = ["post-compact"]
+no_tool_errors = true
+max_wall_clock_seconds = 60
+
+[mock]
+default_text = "(mock fallback: no scripted turn for this prompt)"
+
+[[mock.turns]]
+text = "Acknowledged turn 1 — make_widget noted."
+input_tokens = 30
+output_tokens = 8
+
+[[mock.turns]]
+text = "Acknowledged turn 2 — make_widget context extended."
+input_tokens = 32
+output_tokens = 8
+
+[[mock.turns]]
+text = "Acknowledged turn 3 — make_widget chatter recorded."
+input_tokens = 34
+output_tokens = 8
+
+[[mock.turns]]
+text = "Acknowledged turn 4 — conversation now spans 8 items, ready for /compact."
+input_tokens = 36
+output_tokens = 12
+
+[[mock.turns]]
+text = "post-compact turn ran cleanly — summary head intact, no orphan tool calls."
+input_tokens = 40
+output_tokens = 14
+
+[triage]
+enabled = false

@@ -1,0 +1,100 @@
+id = "approval-deny-shell"
+title = "Approval flow: user denies a shell tool call"
+description = """
+Regression guard for the approve/deny path on `shell` tool calls.
+
+Permission mode is `ask`, so when the mock turn emits a `shell` tool
+call the agent must raise an `ApprovalRequested`. A pre-queued `deny`
+action with `match.tool = "shell"` answers that request with
+`ToolApprovalDecision::Denied`.
+
+Two invariants the harness checks:
+
+- The denied tool MUST NOT actually run. Concretely: there must be no
+  `tool_call_started` event for the shell call, and the per-frame
+  `tool_calls` entry must end up with status `cancelled`/`error` (a
+  denial is not a successful execution), never `success`.
+- There must be no second approval popup for the same call. The
+  `approval_unanswered` finding (rule id) must not fire — the scenario
+  consumed the matching deny action, so any extra approval would land
+  on `denied_no_action` and trigger that rule.
+
+Mock-only, no keys, no real shell execution.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+# Pre-arm the deny BEFORE the prompt that produces the shell tool call.
+# `match.tool = "shell"` ensures only shell approvals are answered by
+# this action; anything else falls through to the default
+# `denied_no_action` (which would fire `approval_unanswered`, our
+# negative-control signal).
+[[steps]]
+kind = "action"
+action = "deny"
+reason = "regression guard: deny shell so the tool must not execute"
+
+[steps.match]
+tool = "shell"
+
+# The mock turn emits a `shell` tool call. The agent will route it
+# through the ask-flow approval gate; the queued deny answers it.
+[[steps]]
+kind = "prompt"
+text = "Please run `echo hi` via shell."
+
+# After the deny propagates the agent reports the denial back to the
+# model. The next mock turn closes the conversation with a plain
+# acknowledgement so the run terminates cleanly (no extra tool calls).
+[[steps]]
+kind = "prompt"
+text = "Acknowledge that the shell call was denied."
+
+# Negative-control assertion: a denied shell call must not surface as a
+# successful `shell` invocation in the assembled assistant transcript.
+# Combined with `max_tools_per_turn = 1` (the queued shell call itself)
+# this catches both a duplicate approval popup and any silent re-run.
+[[steps]]
+kind = "action"
+action = "assert"
+check = { kind = "max_tool_calls", max = 1 }
+
+[expect]
+max_wall_clock_seconds = 30
+# A denied tool call legitimately surfaces as Cancelled/Error on the
+# completion event; that is not a regression so do not flag it.
+no_tool_errors = false
+# One queued shell call. Anything more means either the model retried
+# or a duplicate approval fired.
+max_tools_per_turn = 1
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(mock fallback)"
+
+# Turn 1: emit the shell tool call. The agent will pause for approval;
+# the queued deny answers Denied; the agent injects a
+# PermissionDenied tool result back into the conversation and the turn
+# completes without a `tool_call_started` for shell.
+[[mock.turns]]
+text = "Running the requested shell command."
+tool_calls = [
+  { name = "shell", arguments = { command = "echo hi" } },
+]
+input_tokens = 40
+output_tokens = 8
+
+# Turn 2: plain acknowledgement, no tool calls. Closes the conversation
+# so the run terminates without dangling state.
+[[mock.turns]]
+text = "Understood — the shell call was denied and was not executed."
+input_tokens = 40
+output_tokens = 12
