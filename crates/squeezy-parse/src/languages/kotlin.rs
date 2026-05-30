@@ -16,8 +16,18 @@
 //
 // Deferred (TODO comments inline, see spec sections):
 //   - data-class generated members (§4e): excluded for symmetry with oracle
-//   - `inline reified` modeling beyond an attribute flag (§4d)
-//   - delegated-property accessor bodies (§4g): emit single property, partial confidence
+//
+// Filled in by langs/kotlin-deferred follow-up:
+//   - delegated-property accessor binding (§4g): emit the delegate target
+//     (`lazy`, `Delegates.observable`) as a `ParsedCall` whose `caller_id` is
+//     the property symbol so cross-call resolvers can find it.
+//   - sealed-class child enumeration (§4f): emit a `ParsedReference`
+//     (`kind: Type`) from each nested class/object in a `sealed` parent
+//     pointing back to the parent name, so `references_to_symbol(Parent)`
+//     includes the siblings declared inside the parent body.
+//   - `inline reified` modeling (§4d): record each `reified` type-parameter
+//     name in `language_identity` (template the extension-function pattern)
+//     so the resolver can use it for cross-call type matching.
 
 use std::collections::HashSet;
 
@@ -143,6 +153,22 @@ pub(crate) fn visit_kotlin_node(
         } else {
             owner_symbol.clone()
         };
+        // kotlin spec §4f: emit a Type reference from each class/object
+        // declared inside a `sealed` parent body pointing back to the
+        // parent's name. The `delegation_specifier` walk only fires when
+        // the child explicitly says `: Parent()`; this catches sealed
+        // siblings declared inside the same body and (more importantly)
+        // attaches a reference whose `owner_id` is the *child* symbol so
+        // an ancestor-walk for `Parent.children` finds the sibling set.
+        let sealed_child_ref = if matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum
+        ) {
+            kotlin_sealed_parent_name(node, ctx.source)
+                .map(|parent_name| (parent_name, symbol.id.clone(), symbol.span))
+        } else {
+            None
+        };
 
         // Companion-object child promotion: children of `companion_object`
         // re-parent onto the *grandparent* class so signatures like
@@ -158,6 +184,17 @@ pub(crate) fn visit_kotlin_node(
             ctx.symbols.push(symbol);
             next_parent
         };
+
+        if let Some((parent_name, child_id, span)) = sealed_child_ref {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(child_id),
+                text: parent_name,
+                kind: ReferenceKind::Type,
+                span,
+                provenance: Provenance::new("tree-sitter-kotlin", "sealed child enumeration"),
+            });
+        }
 
         let _ = next_kind;
         visit_kotlin_children(node, ctx, child_parent, next_owner);
@@ -183,6 +220,18 @@ pub(crate) fn visit_kotlin_node(
         }
         "annotation" => {
             extract_kotlin_annotation_reference(node, ctx, owner_symbol);
+        }
+        "property_delegate" => {
+            // kotlin spec §4g: bind the delegate target to the enclosing
+            // property symbol so cross-call resolution can find it. The
+            // delegate's immediate child is the call expression
+            // (`lazy { ... }` / `Delegates.observable(...)`); emit a single
+            // ParsedCall whose `caller_id` is the property and then recurse
+            // *under* the immediate call expression so calls inside any
+            // trailing lambda body are still attached to the property scope
+            // without double-emitting the delegate target itself.
+            extract_kotlin_property_delegate_call(node, ctx, owner_symbol.clone());
+            visit_kotlin_property_delegate_children(node, ctx, parent_symbol, owner_symbol);
         }
         "identifier" => {
             // Suppressed; bare identifiers are too noisy to emit as
@@ -411,11 +460,24 @@ fn kotlin_function_declaration_symbol(
     if kotlin_function_modifier_present(node, "suspend") {
         attributes.push("kotlin:suspend".to_string());
     }
-    if kotlin_function_modifier_present(node, "inline") {
+    let inline_function = kotlin_function_modifier_present(node, "inline");
+    if inline_function {
         attributes.push("kotlin:inline".to_string());
-        // TODO(spec §4d): emit per-type-parameter `kotlin:reified` flags
-        // once reified handling is added; for now the inline marker is
-        // sufficient for downstream filtering.
+    }
+    // kotlin spec §4d: capture each `reified` type parameter as a per-name
+    // attribute (`kotlin:reified:T`) plus a sorted list folded into
+    // `language_identity` (`reified:T,U`) so the resolver can match
+    // call-site type arguments against the function. We only check the
+    // modifier when the function is `inline`, because `reified` is only
+    // valid on inline type parameters; honouring that constraint keeps
+    // syntactically-invalid sources from leaking junk identities.
+    let reified_type_params = if inline_function {
+        kotlin_reified_type_parameters(node, ctx.source)
+    } else {
+        Vec::new()
+    };
+    for name in &reified_type_params {
+        attributes.push(format!("kotlin:reified:{name}"));
     }
     if kotlin_function_modifier_present(node, "operator") {
         attributes.push("kotlin:operator".to_string());
@@ -465,6 +527,19 @@ fn kotlin_function_declaration_symbol(
     } else {
         Confidence::ExactSyntax
     };
+    // kotlin spec §4d: fold `reified` type-parameter names into
+    // `language_identity`, templating the existing extension-receiver
+    // pattern. Format is `<receiver>;reified:<T,U>` so both halves remain
+    // round-trippable. A pure reified inline (no extension receiver) lands
+    // as `reified:<T>`; an extension fun on a resolvable type with reified
+    // params lands as `String;reified:T`.
+    if !reified_type_params.is_empty() {
+        let reified_tag = format!("reified:{}", reified_type_params.join(","));
+        language_identity = Some(match language_identity {
+            Some(existing) if !existing.is_empty() => format!("{existing};{reified_tag}"),
+            _ => reified_tag,
+        });
+    }
 
     if is_kotlin_test_symbol(&ctx.file.relative_path, kind, &name, &attributes) {
         attributes.push("kotlin:test".to_string());
@@ -1030,6 +1105,180 @@ pub(crate) fn extract_kotlin_constructor_invocation(
     });
 }
 
+/// kotlin spec §4g: emit the delegate target call (e.g. `lazy` /
+/// `Delegates.observable`) as a `ParsedCall` whose `caller_id` is the
+/// enclosing property. The variable symbol itself is still emitted by
+/// `kotlin_property_symbols`; this helper only adds the delegate-binding
+/// call so a graph query like "what does `x` delegate to?" resolves.
+pub(crate) fn extract_kotlin_property_delegate_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(inner) = kotlin_property_delegate_inner(node) else {
+        return;
+    };
+    let (name, receiver, kind) = match inner.kind() {
+        "call_expression" => kotlin_call_expression_callee_summary(inner, ctx.source),
+        "navigation_expression" => kotlin_navigation_call_summary(inner, ctx.source),
+        "identifier" => {
+            let raw = node_text(inner, ctx.source)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if raw.is_empty() {
+                return;
+            }
+            (raw, None, ParsedCallKind::Direct)
+        }
+        _ => return,
+    };
+    if name.is_empty() {
+        return;
+    }
+    let raw = node_text(inner, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let arity = kotlin_first_child_of_kind(inner, "value_arguments")
+        .map(kotlin_argument_count)
+        .unwrap_or_default();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id,
+        name,
+        target_text: raw,
+        receiver,
+        arity,
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-kotlin", "property_delegate"),
+        confidence: Confidence::CandidateSet,
+    });
+}
+
+/// Walk children of a `property_delegate` *below* its immediate call
+/// expression so calls inside any trailing lambda body are still captured
+/// without re-emitting the delegate-target call itself (which
+/// `extract_kotlin_property_delegate_call` already handled). For non-call
+/// inner expressions (`property by someValue`) we delegate to the normal
+/// child walker.
+pub(crate) fn visit_kotlin_property_delegate_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let Some(inner) = kotlin_property_delegate_inner(node) else {
+        visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
+        return;
+    };
+    if !matches!(inner.kind(), "call_expression" | "navigation_expression") {
+        visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
+        return;
+    }
+    visit_kotlin_delegate_call_body(inner, ctx, parent_symbol, owner_symbol);
+}
+
+/// Walk the children of a delegate's call/navigation expression, suppressing
+/// the immediate call/callee emission so the delegate target call is not
+/// duplicated. Trailing-lambda forms (`foo() { ... }`) parse as nested
+/// `call_expression`s, so we recurse one level deeper while still skipping
+/// the inner call's callee.
+fn visit_kotlin_delegate_call_body(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            // Skip the immediate callee — its name is already captured by
+            // the delegate-call summary, so re-emitting via the normal
+            // call_expression / navigation_expression path would duplicate.
+            "expression" | "identifier" | "navigation_expression" => continue,
+            // Trailing-lambda parse: the outer call_expression's first child
+            // is the inner call_expression. Recurse one level deeper.
+            "call_expression" => {
+                visit_kotlin_delegate_call_body(
+                    child,
+                    ctx,
+                    parent_symbol.clone(),
+                    owner_symbol.clone(),
+                );
+            }
+            _ => visit_kotlin_node(child, ctx, parent_symbol.clone(), owner_symbol.clone()),
+        }
+    }
+}
+
+fn kotlin_property_delegate_inner(node: Node<'_>) -> Option<Node<'_>> {
+    // `property_delegate`'s only child is the delegate expression (concrete
+    // type, e.g. `call_expression`, `navigation_expression`, `identifier`).
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn kotlin_call_expression_callee_summary(
+    node: Node<'_>,
+    source: &str,
+) -> (String, Option<String>, ParsedCallKind) {
+    let raw = node_text(node, source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let Some(callee) = node.named_child(0) else {
+        return (method_name_from_text(&raw), None, ParsedCallKind::Direct);
+    };
+    match callee.kind() {
+        "navigation_expression" => kotlin_navigation_call_summary(callee, source),
+        "identifier" => {
+            let name = node_text(callee, source)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            (name, None, ParsedCallKind::Direct)
+        }
+        // Trailing-lambda form: `foo()(bar) { ... }` parses as an outer
+        // `call_expression` whose callee is itself a `call_expression`. Use
+        // the inner callee's name as the delegate target.
+        "call_expression" => kotlin_call_expression_callee_summary(callee, source),
+        _ => {
+            let name = method_name_from_text(&raw);
+            let receiver = receiver_from_method_text(&raw, &name);
+            let kind = if receiver.is_some() {
+                ParsedCallKind::Method
+            } else {
+                ParsedCallKind::Direct
+            };
+            (name, receiver, kind)
+        }
+    }
+}
+
+fn kotlin_navigation_call_summary(
+    node: Node<'_>,
+    source: &str,
+) -> (String, Option<String>, ParsedCallKind) {
+    let mut cursor = node.walk();
+    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    let method = children
+        .iter()
+        .rev()
+        .find(|child| child.kind() == "identifier")
+        .and_then(|child| node_text(*child, source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default();
+    let receiver = children
+        .first()
+        .and_then(|child| node_text(*child, source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    (method, receiver, ParsedCallKind::Method)
+}
+
 pub(crate) fn extract_kotlin_navigation_expression(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -1585,6 +1834,45 @@ fn kotlin_extension_receiver(node: Node<'_>, source: &str) -> (Option<String>, b
     (Some(text), is_simple)
 }
 
+/// Collect identifier names of every `reified` type parameter on a
+/// `function_declaration`. The grammar shape is
+/// `type_parameters -> type_parameter -> [type_parameter_modifiers ->
+/// reification_modifier 'reified'] identifier`. Caller is responsible for
+/// gating on the `inline` modifier (only inline functions accept `reified`).
+fn kotlin_reified_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(params) = kotlin_first_child_of_kind(node, "type_parameters") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        if param.kind() != "type_parameter" {
+            continue;
+        }
+        // Must carry a `reification_modifier` inside its
+        // `type_parameter_modifiers` block.
+        let has_reified = kotlin_first_child_of_kind(param, "type_parameter_modifiers")
+            .map(|modifiers| {
+                let mut mod_cursor = modifiers.walk();
+                modifiers
+                    .named_children(&mut mod_cursor)
+                    .any(|child| child.kind() == "reification_modifier")
+            })
+            .unwrap_or(false);
+        if !has_reified {
+            continue;
+        }
+        if let Some(name) = kotlin_first_child_of_kind(param, "identifier")
+            .and_then(|child| node_text(child, source).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn kotlin_user_type_is_extension_receiver(parent: Node<'_>, idx: usize) -> bool {
     // Used by `extract_kotlin_user_type_reference` to skip emitting a type
     // reference for the extension-function receiver type (we already track
@@ -1629,6 +1917,42 @@ fn kotlin_first_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<No
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
+}
+
+/// kotlin spec §4f: if `node` (a class/object declaration) is the immediate
+/// child of a `sealed` parent class's body, return the parent's identifier.
+/// Used to emit a Type reference from each sealed sibling back to the
+/// parent so `references_to_symbol(Parent)` lists the enumerated cases.
+fn kotlin_sealed_parent_name(node: Node<'_>, source: &str) -> Option<String> {
+    let body = node.parent()?;
+    // Sealed children live in `class_body -> class_member_declaration ->
+    // declaration -> class_declaration|object_declaration`. The grammar may
+    // inline `class_member_declaration` and `declaration` as subtypes, so
+    // the parent could be `class_body` directly or one of those wrappers.
+    let mut current = Some(body);
+    while let Some(walker) = current {
+        if walker.kind() == "class_body" {
+            break;
+        }
+        if matches!(walker.kind(), "class_declaration" | "object_declaration") {
+            // Already past the body; we're in our own declaration's chain.
+            return None;
+        }
+        current = walker.parent();
+    }
+    let class_body = current?;
+    let parent_decl = class_body.parent()?;
+    if parent_decl.kind() != "class_declaration" {
+        return None;
+    }
+    if !kotlin_class_modifier_present(parent_decl, "sealed") {
+        return None;
+    }
+    kotlin_first_child_of_kind(parent_decl, "identifier")
+        .or_else(|| parent_decl.child_by_field_name("name"))
+        .and_then(|child| node_text(child, source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 /// True when `node` is nested inside a `companion_object` ancestor. Used

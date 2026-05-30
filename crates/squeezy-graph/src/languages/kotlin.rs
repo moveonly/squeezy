@@ -8,9 +8,18 @@
 // Out of scope for this PR (TODOs reference the spec):
 //   - companion-object owner-path collapsing for member resolution beyond
 //     "child reparented to host class" (extractor side)
-//   - delegated-property accessor binding (spec §4g)
-//   - `inline reified` type-parameter modeling (spec §4d)
-//   - sealed-class child enumeration helper (spec §4f, phase 2)
+//
+// Filled in by langs/kotlin-deferred (extractor-side, see
+// `crates/squeezy-parse/src/languages/kotlin.rs`):
+//   - delegated-property accessor binding (spec §4g): delegate target is
+//     emitted as a `ParsedCall` whose `caller_id` is the property symbol.
+//   - sealed-class child enumeration (spec §4f): nested children of a
+//     `sealed` parent emit a Type `ParsedReference` to the parent, so
+//     `references_to_symbol(Parent)` already returns the sibling set
+//     without a dedicated resolver helper.
+//   - `inline reified` type-parameter modeling (spec §4d): each reified
+//     type-parameter name lands in `language_identity` so a future
+//     resolver can match call-site type arguments against the function.
 
 use crate::*;
 
@@ -131,8 +140,17 @@ impl SemanticGraph {
                         .language_identity
                         .as_deref()
                         .map(|identity| {
-                            identity == receiver_type
-                                || last_path_segment(identity) == receiver_type
+                            // §4d: extension+reified language_identity is
+                            // shaped `<receiver>;reified:<params>`. Match
+                            // only on the receiver half so the existing
+                            // extension-function routing keeps working
+                            // alongside reified-type-arg matching.
+                            let receiver_half = identity
+                                .split_once(';')
+                                .map(|(head, _)| head)
+                                .unwrap_or(identity);
+                            receiver_half == receiver_type
+                                || last_path_segment(receiver_half) == receiver_type
                         })
                         .unwrap_or(false)
             })

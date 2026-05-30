@@ -3979,6 +3979,180 @@ data class Person(val name: String, val age: Int)
 }
 
 #[test]
+fn graph_binds_kotlin_property_delegate_call_to_owning_variable() {
+    // kotlin spec §4g: `val x by lazy { ... }` keeps `x` as a single Field
+    // symbol and emits the delegate target (`lazy`) as a ParsedCall whose
+    // `caller_id` is `x`. A second property delegating via `Delegates.observable`
+    // exercises the navigation-expression callee shape.
+    let mut parser = LanguageParser::new().unwrap();
+    let cache = kotlin_record(
+        "src/main/kotlin/com/example/Cache.kt",
+        r#"package com.example
+
+import kotlin.properties.Delegates
+
+class Cache {
+    val store by lazy { 42 }
+    var counter: Int by Delegates.observable(0) { _, _, _ -> }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&cache, fs::read_to_string(&cache.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let store = graph
+        .find_symbol_by_name("store")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Field)
+        .unwrap();
+    assert!(store.attributes.contains(&"kotlin:delegated".to_string()));
+    let counter = graph
+        .find_symbol_by_name("counter")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Field)
+        .unwrap();
+    assert!(counter.attributes.contains(&"kotlin:delegated".to_string()));
+
+    // The delegate target call must be present with `caller_id = property`.
+    // Exactly one `lazy` call for `store` and one `observable` call for `counter`.
+    let calls = &graph.calls;
+    let lazy_calls = calls
+        .iter()
+        .filter(|call| call.name == "lazy" && call.caller_id.as_ref() == Some(&store.id))
+        .count();
+    assert_eq!(
+        lazy_calls, 1,
+        "expected exactly one `lazy` call bound to store"
+    );
+    let observable_calls = calls
+        .iter()
+        .filter(|call| call.name == "observable" && call.caller_id.as_ref() == Some(&counter.id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observable_calls.len(),
+        1,
+        "expected exactly one `Delegates.observable` call bound to counter",
+    );
+    assert_eq!(observable_calls[0].receiver.as_deref(), Some("Delegates"));
+}
+
+#[test]
+fn graph_enumerates_sealed_class_children_with_type_references() {
+    // kotlin spec §4f: each nested class/object in a `sealed` parent body
+    // emits a ParsedReference (kind: Type) pointing back to the parent name
+    // owned by the child symbol. `references_to_symbol(parent)` must list
+    // the sibling set so an ancestor-walk for `Result.children` works even
+    // when the sibling lacks an explicit delegation specifier.
+    let mut parser = LanguageParser::new().unwrap();
+    let sealed = kotlin_record(
+        "src/main/kotlin/com/example/Result.kt",
+        r#"package com.example
+
+sealed class Result<T> {
+    class Success<T>(val value: T) : Result<T>()
+    class Failure<T>(val err: Throwable) : Result<T>()
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&sealed, fs::read_to_string(&sealed.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let result_class = graph
+        .find_symbol_by_name("Result")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    assert!(
+        result_class
+            .attributes
+            .contains(&"kotlin:sealed".to_string())
+    );
+    let success = graph
+        .find_symbol_by_name("Success")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    let failure = graph
+        .find_symbol_by_name("Failure")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+
+    let references = graph.references_to_symbol(&result_class.id);
+    let owner_ids = references
+        .iter()
+        .filter_map(|hit| hit.reference.owner_id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        owner_ids.contains(&success.id),
+        "Success should reference its sealed parent Result; owners={owner_ids:?}",
+    );
+    assert!(
+        owner_ids.contains(&failure.id),
+        "Failure should reference its sealed parent Result; owners={owner_ids:?}",
+    );
+}
+
+#[test]
+fn graph_records_kotlin_reified_type_parameters_in_language_identity() {
+    // kotlin spec §4d: `inline fun <reified T>` records `T` in
+    // `language_identity` (templating the existing extension-function
+    // pattern) and tags a per-parameter `kotlin:reified:T` attribute.
+    // Multi-parameter and mixed extension+reified forms both round-trip.
+    let mut parser = LanguageParser::new().unwrap();
+    let reified = kotlin_record(
+        "src/main/kotlin/com/example/Reified.kt",
+        r#"package com.example
+
+inline fun <reified T> bar(): T = TODO()
+inline fun <reified A, reified B> foo(): Pair<A, B> = TODO()
+inline fun <reified T> String.tag(): T = TODO()
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&reified, fs::read_to_string(&reified.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let bar = graph
+        .find_symbol_by_name("bar")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    assert!(bar.attributes.contains(&"kotlin:inline".to_string()));
+    assert!(bar.attributes.contains(&"kotlin:reified:T".to_string()));
+    assert_eq!(bar.language_identity.as_deref(), Some("reified:T"));
+
+    let foo = graph
+        .find_symbol_by_name("foo")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    assert!(foo.attributes.contains(&"kotlin:reified:A".to_string()));
+    assert!(foo.attributes.contains(&"kotlin:reified:B".to_string()));
+    assert_eq!(foo.language_identity.as_deref(), Some("reified:A,B"));
+
+    // Mixed extension fun + reified: language_identity carries both halves
+    // (`<receiver>;reified:<params>`) so the resolver still matches the
+    // extension receiver while exposing the reified info for typed routing.
+    let tag = graph
+        .find_symbol_by_name("tag")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Function)
+        .unwrap();
+    assert!(tag.attributes.contains(&"kotlin:extension".to_string()));
+    assert!(tag.attributes.contains(&"kotlin:reified:T".to_string()));
+    assert_eq!(tag.language_identity.as_deref(), Some("String;reified:T"));
+}
+
+#[test]
 fn graph_emits_php_namespace_module_symbol() {
     let mut parser = LanguageParser::new().unwrap();
     let service = php_record(
