@@ -3394,12 +3394,25 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
             .filter(|entry| entry_targets_toggle(entry, app.show_reasoning_usage))
             .map(|_| resolve_toggle_target(&app.transcript, index))
     });
+    let latest_reasoning = latest_reasoning_toggle_target(app);
     let picked_by = if selected_from_entry.is_some() {
         "selected"
+    } else if latest_reasoning.is_some() {
+        "latest_reasoning"
     } else {
         "latest"
     };
+    // Picker order matters for "Ctrl+O on a visible chip toggles
+    // *that* chip" muscle memory. Without the reasoning-first
+    // shortcut, the first press flips the (collapsed) reasoning,
+    // then `latest_collapsed_transcript_entry` falls through to the
+    // assistant message and every subsequent press bounces the
+    // assistant body back and forth — the user perceives "Ctrl+O
+    // stopped working on the reasoning". Preferring the latest
+    // reasoning entry keeps repeated presses sticky on the chip the
+    // user is actually looking at.
     let Some(index) = selected_from_entry
+        .or(latest_reasoning)
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
@@ -3582,6 +3595,26 @@ fn resolve_toggle_target(transcript: &[TranscriptEntry], index: usize) -> usize 
         cursor -= 1;
     }
     cursor
+}
+
+/// The latest reasoning entry the user can see, mapped to its Lead.
+/// `toggle_selected_transcript_entry` prefers this over the more
+/// generic pickers so repeated Ctrl+O presses stay sticky on the
+/// reasoning chip the user is looking at, rather than flipping the
+/// chip once and then bouncing other toggleable entries.
+fn latest_reasoning_toggle_target(app: &TuiApp) -> Option<usize> {
+    if !app.show_reasoning_usage {
+        return None;
+    }
+    app.transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| {
+            matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) && entry.is_toggleable()
+        })
+        .map(|(index, _)| index)
+        .map(|index| resolve_toggle_target(&app.transcript, index))
 }
 
 fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
