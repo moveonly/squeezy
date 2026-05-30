@@ -5263,7 +5263,44 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
     }
 }
 
+/// One-shot dump of the reasoning entries' collapsed state at render
+/// time. Append-only, gated on the `SQUEEZY_DEBUG_RENDER` env var so a
+/// user reporting "the chip flag flipped but the screen didn't" can
+/// see exactly what the renderer thought the chip should look like at
+/// the moment the cell grid was written. Triggers per draw; cheap (a
+/// single fmt + writeln when enabled, zero work otherwise).
+fn debug_log_render_chips(app: &TuiApp) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("SQUEEZY_DEBUG_RENDER") else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(
+        f,
+        "--- draw at {:?} show_reasoning={} needs_redraw={} entries={}",
+        std::time::SystemTime::now(),
+        app.show_reasoning_usage,
+        app.needs_redraw,
+        app.transcript.len()
+    );
+    for (i, entry) in app.transcript.iter().enumerate() {
+        let kind = transcript_entry_kind_label(entry);
+        let _ = writeln!(
+            f,
+            "  pos={i} id={} kind={kind} collapsed={} revision={}",
+            entry.id, entry.collapsed, entry.revision
+        );
+    }
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
+    debug_log_render_chips(app);
     let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
     let scroll =
         transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
