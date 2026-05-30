@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 pub use crossterm::event::KeyEvent;
 use crossterm::event::{KeyEventKind, KeyEventState};
+use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, backend::TestBackend};
 use squeezy_agent::{Agent, ToolApprovalDecision};
 use squeezy_core::{AppConfig, Result, SessionMode, SqueezyError};
@@ -273,7 +274,14 @@ impl TuiHarness {
                 let cell = &buffer[(x, y)];
                 let symbol = cell.symbol().to_string();
                 plain.push_str(&symbol);
-                cells.push(FrameCell { x, y, symbol });
+                cells.push(FrameCell {
+                    x,
+                    y,
+                    symbol,
+                    fg: color_name(cell.fg),
+                    bg: color_name(cell.bg),
+                    modifiers: modifier_names(cell.modifier),
+                });
             }
             plain.push('\n');
         }
@@ -344,14 +352,129 @@ pub struct FrameSnapshot {
     pub cells: Vec<FrameCell>,
 }
 
-/// Single rendered cell. Style is intentionally omitted from this v1
-/// surface — consumers can pull the full styled buffer in a follow-up
-/// when they actually need fg/bg/modifier deltas.
+/// Single rendered cell. `fg` / `bg` are stringified ratatui colors
+/// (`"red"`, `"dark_gray"`, `"rgb(215,147,52)"`, `"indexed(7)"`) and
+/// are `None` when the cell carries `Color::Reset` (i.e. inherits the
+/// terminal default). `modifiers` lists active text modifiers (`"bold"`,
+/// `"dim"`, ...). Consumers needing the raw ratatui `Color` enum can
+/// parse `rgb(R,G,B)` via [`parse_rgb`].
 #[derive(Debug, Clone)]
 pub struct FrameCell {
     pub x: u16,
     pub y: u16,
     pub symbol: String,
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub modifiers: Vec<String>,
+}
+
+/// Stringify a ratatui `Color` for [`FrameCell`]. `Color::Reset` returns
+/// `None` so consumers can distinguish "use terminal default" from any
+/// explicit color choice. Mirrors the encoding used by
+/// `squeezy_eval::tui_capture::TuiCell` so both surfaces share scenario
+/// assertions.
+fn color_name(c: Color) -> Option<String> {
+    if c == Color::Reset {
+        return None;
+    }
+    Some(match c {
+        Color::Reset => "reset".into(),
+        Color::Black => "black".into(),
+        Color::Red => "red".into(),
+        Color::Green => "green".into(),
+        Color::Yellow => "yellow".into(),
+        Color::Blue => "blue".into(),
+        Color::Magenta => "magenta".into(),
+        Color::Cyan => "cyan".into(),
+        Color::Gray => "gray".into(),
+        Color::DarkGray => "dark_gray".into(),
+        Color::LightRed => "light_red".into(),
+        Color::LightGreen => "light_green".into(),
+        Color::LightYellow => "light_yellow".into(),
+        Color::LightBlue => "light_blue".into(),
+        Color::LightMagenta => "light_magenta".into(),
+        Color::LightCyan => "light_cyan".into(),
+        Color::White => "white".into(),
+        Color::Rgb(r, g, b) => format!("rgb({r},{g},{b})"),
+        Color::Indexed(i) => format!("indexed({i})"),
+    })
+}
+
+fn modifier_names(modifier: Modifier) -> Vec<String> {
+    let mut out = Vec::new();
+    for (flag, name) in [
+        (Modifier::BOLD, "bold"),
+        (Modifier::DIM, "dim"),
+        (Modifier::ITALIC, "italic"),
+        (Modifier::UNDERLINED, "underlined"),
+        (Modifier::SLOW_BLINK, "slow_blink"),
+        (Modifier::RAPID_BLINK, "rapid_blink"),
+        (Modifier::REVERSED, "reversed"),
+        (Modifier::HIDDEN, "hidden"),
+        (Modifier::CROSSED_OUT, "crossed_out"),
+    ] {
+        if modifier.contains(flag) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Resolve a stringified color (from [`FrameCell::fg`] / `bg`) to its
+/// approximate sRGB triple. Named ratatui colors map to their common
+/// 8-bit palette equivalents; `rgb(R,G,B)` parses directly; `indexed`
+/// colors and unknown names return `None` (caller can decide whether
+/// to skip or warn). Used by eval-side luminance assertions so the
+/// rubric in `EVAL_COVERAGE_PLAN_WAVE2.md` (`0.299R + 0.587G + 0.114B
+/// > 160` is a finding) can run against any [`FrameCell`].
+pub fn cell_rgb(name: &str) -> Option<(u8, u8, u8)> {
+    if let Some(rgb) = parse_rgb(name) {
+        return Some(rgb);
+    }
+    Some(match name {
+        "black" => (0, 0, 0),
+        "red" => (170, 0, 0),
+        "green" => (0, 170, 0),
+        "yellow" => (170, 85, 0),
+        "blue" => (0, 0, 170),
+        "magenta" => (170, 0, 170),
+        "cyan" => (0, 170, 170),
+        "gray" => (170, 170, 170),
+        "dark_gray" => (85, 85, 85),
+        "light_red" => (255, 85, 85),
+        "light_green" => (85, 255, 85),
+        "light_yellow" => (255, 255, 85),
+        "light_blue" => (85, 85, 255),
+        "light_magenta" => (255, 85, 255),
+        "light_cyan" => (85, 255, 255),
+        "white" => (255, 255, 255),
+        _ => return None,
+    })
+}
+
+/// Parse the `rgb(R,G,B)` form emitted by [`color_name`]. Returns
+/// `None` for any other shape (named color, `indexed(...)`, malformed
+/// input) so callers can chain through [`cell_rgb`].
+pub fn parse_rgb(name: &str) -> Option<(u8, u8, u8)> {
+    let inner = name.strip_prefix("rgb(")?.strip_suffix(')')?;
+    let mut parts = inner.split(',');
+    let r: u8 = parts.next()?.trim().parse().ok()?;
+    let g: u8 = parts.next()?.trim().parse().ok()?;
+    let b: u8 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((r, g, b))
+}
+
+/// Rec. 601 luminance of an sRGB triple, rounded to the nearest u8.
+/// `0.299R + 0.587G + 0.114B`. Wave-2 palette guardrails treat any
+/// rendered cell whose luminance exceeds ~160 as a finding.
+pub fn rgb_luminance(rgb: (u8, u8, u8)) -> u8 {
+    let (r, g, b) = (f64::from(rgb.0), f64::from(rgb.1), f64::from(rgb.2));
+    (0.299 * r + 0.587 * g + 0.114 * b)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Public projection of `TranscriptEntry`. `kind` is a string tag

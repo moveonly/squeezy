@@ -1087,6 +1087,14 @@ impl Driver {
                     .await
             }
             Assertion::TuiFrameContains { text } => self.assert_tui_frame_contains(text).await,
+            Assertion::TuiCellLuminanceLe {
+                max,
+                channel,
+                region,
+            } => {
+                self.assert_tui_cell_luminance_le(*max, channel.as_deref(), region.as_ref())
+                    .await
+            }
         }
     }
 
@@ -1299,6 +1307,84 @@ impl Driver {
                 }
             }
             Err(err) => format!("asserted_fail: render: {err}"),
+        }
+    }
+
+    async fn assert_tui_cell_luminance_le(
+        &self,
+        max: u8,
+        channel: Option<&str>,
+        region: Option<&crate::scenario::CellRegion>,
+    ) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: tui_cell_luminance_le requires [tui_capture] drive_tui = true"
+                .into();
+        };
+        let channel = channel.unwrap_or("fg");
+        if channel != "fg" && channel != "bg" {
+            return format!(
+                "asserted_fail: tui_cell_luminance_le channel must be \"fg\" or \"bg\", got {channel:?}"
+            );
+        }
+        let mut h = harness.lock().await;
+        let frame = match h.render_frame() {
+            Ok(f) => f,
+            Err(err) => return format!("asserted_fail: render: {err}"),
+        };
+        // Clip the requested region to the actual frame dimensions so a
+        // scenario authored against width=160 doesn't fail when the
+        // harness rebuilds at a different size.
+        let (x0, y0, x1, y1) = match region {
+            Some(r) => (
+                r.x0,
+                r.y0,
+                r.x1.min(frame.width.saturating_sub(1)),
+                r.y1.min(frame.height.saturating_sub(1)),
+            ),
+            None => (
+                0,
+                0,
+                frame.width.saturating_sub(1),
+                frame.height.saturating_sub(1),
+            ),
+        };
+        let mut worst: Option<(u16, u16, String, u8, (u8, u8, u8))> = None;
+        for cell in frame.cells.iter() {
+            if cell.x < x0 || cell.x > x1 || cell.y < y0 || cell.y > y1 {
+                continue;
+            }
+            // Skip whitespace-only cells: blanks carry whatever style
+            // the renderer left behind but no visible ink, so they
+            // can't actually be "too bright".
+            if cell.symbol.chars().all(|c| c.is_whitespace()) {
+                continue;
+            }
+            let color = match channel {
+                "fg" => cell.fg.as_deref(),
+                "bg" => cell.bg.as_deref(),
+                _ => unreachable!(),
+            };
+            let Some(color) = color else {
+                continue;
+            };
+            let Some(rgb) = squeezy_tui::testing::cell_rgb(color) else {
+                // Unknown name or indexed(...): we can't compute
+                // luminance for it, so skip rather than falsely fail.
+                continue;
+            };
+            let lum = squeezy_tui::testing::rgb_luminance(rgb);
+            if lum > max {
+                let worst_lum = worst.as_ref().map(|w| w.3).unwrap_or(0);
+                if lum > worst_lum {
+                    worst = Some((cell.x, cell.y, color.to_string(), lum, rgb));
+                }
+            }
+        }
+        match worst {
+            None => "asserted_pass".into(),
+            Some((x, y, color, lum, (r, g, b))) => format!(
+                "asserted_fail: cell ({x},{y}) {channel}={color} (rgb {r},{g},{b}) luminance {lum} > {max}"
+            ),
         }
     }
 

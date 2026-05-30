@@ -474,6 +474,39 @@ pub enum Assertion {
     /// Substring match — reads the same projection the eval
     /// `frames_tui.jsonl` records.
     TuiFrameContains { text: String },
+    /// Every rendered cell in the optional `region` (defaulting to the
+    /// full frame) has Rec. 601 luminance `0.299R + 0.587G + 0.114B`
+    /// less than or equal to `max`. Enforces the wave-2 dark-only
+    /// palette guardrail (`max = 160`). Cells whose stringified color
+    /// can't be resolved to an sRGB triple (`indexed(...)`, unknown
+    /// names) are skipped, not failed. Requires `[tui_capture]
+    /// drive_tui = true`.
+    TuiCellLuminanceLe {
+        /// Maximum allowed luminance, inclusive. Wave-2 plan pins this
+        /// at `160`.
+        max: u8,
+        /// Which channel to inspect. `"fg"` (the default) is the right
+        /// answer for palette discipline; `"bg"` is useful for
+        /// inverted-button surfaces.
+        #[serde(default)]
+        channel: Option<String>,
+        /// Optional inclusive cell-grid region. Unset means the full
+        /// frame; coordinates are 0-based with `(0, 0)` at the
+        /// top-left. Clipped against the rendered frame's dimensions.
+        #[serde(default)]
+        region: Option<CellRegion>,
+    },
+}
+
+/// Inclusive rectangular region in the rendered cell grid. All four
+/// fields are required so a scenario can't silently pick a half-open
+/// shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellRegion {
+    pub x0: u16,
+    pub y0: u16,
+    pub x1: u16,
+    pub y1: u16,
 }
 
 /// Selector for `Assertion::TuiTranscriptEntry`. Mirrors the way TUI
