@@ -1,9 +1,12 @@
 id = "audit-config-verbosity-bare"
-title = "Audit · /verbosity (no arg) opens config_screen on Verbosity section"
+title = "Audit · /verbosity (no arg) prints current value + usage hint"
 description = """
-Bare `/verbosity` falls through to toggle_config_screen with the
-Verbosity SectionId. modal_active = "config" (NOT the legacy
-verbosity-only overlay), and the Verbosity label appears in the frame.
+After squeezy-3ys0 / squeezy-a19z (audit U1+U2), bare `/verbosity` no
+longer opens the config_screen — it prints the current value into
+the transcript and reports the value in the status line, matching
+the shape `/effort` has always used. No mode-switch surprise on
+argument presence. To open the Verbosity section of the config
+screen, use `/options verbosity`.
 """
 
 [workspace]
@@ -31,14 +34,14 @@ kind = "action"
 action = "assert"
 [steps.check]
 kind = "modal_active"
-name = "config"
+name = "none"
 
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_frame_contains"
-text = "Verbosity"
+kind = "tui_status_contains"
+text = "response verbosity:"
 
 [expect]
 max_wall_clock_seconds = 30

@@ -96,9 +96,9 @@ CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`,
 
 ### UX inconsistencies
 
-- **U1 — `/effort` vs `/verbosity` vs `/tool-verbosity` use different feedback surfaces**: `/effort` updates `app.status` (visible in status line); `/verbosity` and `/tool-verbosity` push `app_notifications` (toast-style). Three commands with near-identical shapes should share a surface.
-- **U2 — bare `/effort`/`/verbosity`/`/tool-verbosity` divert to `config_screen`** while the arg-form is session-scoped. Mode-switch on argument presence is surprising.
-- **U3 — `/collapse <category>` reports "collapsed 0 transcript entries"** when empty — awkward; should be "no <category> entries to collapse".
+- **U1 — settings commands unified on status line** (`squeezy-a19z`). `/effort`, `/verbosity`, `/tool-verbosity` all now report changes via `app.status` (the immediate-feedback surface). The `app_notifications` (toast) push that `/effort` used to add was removed for consistency — notifications stay reserved for asynchronous / "you might've missed this" messages.
+- **U2 — bare settings commands no longer divert to `config_screen`** (`squeezy-3ys0`). `/verbosity` and `/tool-verbosity` now print current value + usage hint into the transcript and update the status line, matching the shape `/effort` had. Mode-switch on argument presence is gone. To open the config section for these settings, use `/options verbosity` / `/options tool-verbosity` explicitly.
+- **U3 — `/collapse <category>` empty state** (`squeezy-o3z0`). When no entries match the requested category, the status line now reads `no <category> entries to collapse` (or `no matching entries to collapse` for bare `/collapse`) instead of the awkward `collapsed 0 transcript entries`.
 
 ### Dead code
 
