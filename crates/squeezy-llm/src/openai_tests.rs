@@ -252,9 +252,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
 #[test]
 fn request_body_emits_prompt_cache_retention_24h_for_long_retention() {
     // F11: `CacheRetention::Long` must surface on the OpenAI Responses
-    // wire as the top-level `prompt_cache_retention: "24h"` field. Mirrors
-    // pi's `getPromptCacheRetention`
-    // (`others/pi/packages/ai/src/providers/openai-responses.ts:48-53`).
+    // wire as the top-level `prompt_cache_retention: "24h"` field.
     let request = LlmRequest {
         model: "gpt-test".to_string().into(),
         instructions: "hi".to_string().into(),

@@ -1,6 +1,6 @@
 //! Anthropic OAuth (Claude Pro/Max subscription) credential source.
 //!
-//! Mirrors pi's [`packages/ai/src/utils/oauth/anthropic.ts`] flow:
+//! The flow:
 //!
 //! 1. The CLI runs `squeezy auth anthropic login`, which generates a
 //!    PKCE pair and prints a `https://claude.ai/oauth/authorize?...`
@@ -20,9 +20,9 @@
 //!    value.
 //!
 //! The provider client side picks OAuth versus API-key auth by
-//! sniffing the token prefix (`sk-ant-oat`), matching pi's
-//! `isOAuthToken` heuristic — that keeps the trait surface narrow
-//! without forcing every existing static-key caller to opt in.
+//! sniffing the token prefix (`sk-ant-oat`) — that keeps the trait
+//! surface narrow without forcing every existing static-key caller to
+//! opt in.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,10 +37,9 @@ use crate::transport::shared_client;
 
 use super::pkce::PkceCodes;
 
-/// Anthropic Claude Code public OAuth client id. Mirrors pi's
-/// hardcoded value verbatim — Anthropic registers this client with
-/// the platform OAuth server and pins the exact redirect URI below,
-/// so any other id will be rejected.
+/// Anthropic Claude Code public OAuth client id — Anthropic registers
+/// this client with the platform OAuth server and pins the exact
+/// redirect URI below, so any other id will be rejected.
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Authorize endpoint. Hosted on `claude.ai` so the consent UI is
@@ -52,32 +51,29 @@ pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 
 /// Default callback the platform OAuth server is allowed to redirect
-/// to. Anthropic pins the exact value — see pi's reference. The
-/// `/callback` suffix is part of the URI Anthropic registered, not a
-/// separately routed path.
+/// to. Anthropic pins the exact value. The `/callback` suffix is part
+/// of the URI Anthropic registered, not a separately routed path.
 pub const REDIRECT_URI: &str = "http://localhost:54545/callback";
 
 /// OAuth scopes Claude Code requests. The Pro/Max quota is gated on
-/// `user:inference` + the `claude_code` session scope; the rest are
-/// requested verbatim from pi so the consent screen matches what
-/// users have already approved for Claude Code.
+/// `user:inference` + the `claude_code` session scope; the rest match
+/// the consent screen users have already approved for Claude Code.
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// `anthropic-beta` value that flags a request as Claude-Code-issued
 /// so it counts against the user's Pro/Max subscription quota rather
-/// than the API-key billing path. Mirrors pi's
-/// `claude-code-20250219,oauth-2025-04-20` joined value.
+/// than the API-key billing path. Anthropic pins both halves of the
+/// joined value.
 pub const OAUTH_BETA_HEADER: &str = "claude-code-20250219,oauth-2025-04-20";
 
 /// Prefix every Anthropic OAuth access token starts with. Used to
 /// detect OAuth-driven sources at the HTTP layer without changing the
-/// [`ApiKeySource`] trait — matching pi's `isOAuthToken` helper.
+/// [`ApiKeySource`] trait.
 pub const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 
-/// Cushion between the issuer-reported expiry and the moment we
-/// refresh proactively. pi uses five minutes; we mirror that so a
-/// long-running streaming response never starts on a key that's about
-/// to die mid-flight.
+/// Cushion between the issuer-reported expiry and the moment we refresh
+/// proactively. Five minutes ensures a long-running streaming response
+/// never starts on a key that's about to die mid-flight.
 const REFRESH_LEAD_TIME: Duration = Duration::from_secs(5 * 60);
 
 /// HTTP timeout for the token exchange and refresh round-trips. The
@@ -173,9 +169,8 @@ impl Default for AnthropicLoginConfig {
 
 impl AnthropicLoginConfig {
     /// Build the `https://claude.ai/oauth/authorize?...` URL the user
-    /// opens in their browser. Mirrors pi's parameter set verbatim —
-    /// `code=true` is the platform's idiosyncratic opt-in for the
-    /// auth-code flow.
+    /// opens in their browser. `code=true` is the platform's
+    /// idiosyncratic opt-in for the auth-code flow.
     pub fn authorize_url(&self, codes: &PkceCodes) -> String {
         let params = [
             ("code", "true"),
@@ -196,10 +191,9 @@ impl AnthropicLoginConfig {
     }
 }
 
-/// Parsed authorization input — what the user paste into the prompt
-/// (or what the local callback captured). Mirrors pi's
-/// `parseAuthorizationInput` so the CLI accepts a bare code, a
-/// `code#state` joined string, a query-string fragment, or the full
+/// Parsed authorization input — what the user pastes into the prompt
+/// (or what the local callback captured). The CLI accepts a bare code,
+/// a `code#state` joined string, a query-string fragment, or the full
 /// redirect URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAuthorization {
@@ -235,7 +229,7 @@ pub fn parse_authorization_input(input: &str) -> ParsedAuthorization {
         }
     }
 
-    // 2) `code#state` joined form (pi's compact callback display).
+    // 2) `code#state` joined form (the compact callback display).
     if trimmed.contains('#') && !trimmed.contains('=') {
         let mut parts = trimmed.splitn(2, '#');
         let code = parts.next().map(str::to_string).filter(|s| !s.is_empty());
@@ -287,9 +281,9 @@ pub fn anthropic_oauth_beta_header() -> &'static str {
 }
 
 /// Exchange an authorization code for a token pair at the platform
-/// OAuth endpoint. The `state` is passed through to match pi's
-/// payload — Anthropic's token endpoint accepts it as an extra field
-/// even though PKCE alone would suffice.
+/// OAuth endpoint. The `state` is passed through verbatim — Anthropic's
+/// token endpoint accepts it as an extra field even though PKCE alone
+/// would suffice.
 pub async fn exchange_authorization_code(
     client: &reqwest::Client,
     config: &AnthropicLoginConfig,

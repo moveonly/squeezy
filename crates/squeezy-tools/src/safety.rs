@@ -10,9 +10,8 @@ use crate::shell_parse::{
 
 /// Pre-AI structural classifier for shell commands. Runs unconditionally
 /// between the policy verdict and the AI reviewer to short-circuit obvious
-/// cases without paying an LLM round-trip. Mirrors clear-code's
-/// `isAutoModeAllowlistedTool` + dangerous-pattern stripper layered before
-/// the yolo classifier.
+/// cases without paying an LLM round-trip — a structural allowlist plus a
+/// dangerous-pattern check, layered before the LLM-driven classifier.
 ///
 /// Tokenisation reuses the tree-sitter-bash backed segmenter
 /// (`shell_segments` + `expand_wrapper_segments`) so wrapped commands like

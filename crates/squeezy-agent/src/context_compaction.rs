@@ -39,11 +39,9 @@ mod tests;
 // then bounded again by `config.context_compaction.max_summary_bytes` at the
 // end of `build_compaction_summary`.
 //
-// Reference: clear-code names its post-compact "survivor" budgets explicitly
-// (`POST_COMPACT_TOKEN_BUDGET`, `POST_COMPACT_MAX_TOKENS_PER_FILE`, …) at
-// `src/services/compact/compact.ts:122-130`. Squeezy's summary is a single
-// concatenated string rather than a set of post-compact attachments, so the
-// caps below sit inside one family rather than across many message slots.
+// Squeezy's summary is a single concatenated string rather than a set of
+// post-compact attachments, so the caps below sit inside one family rather
+// than across many message slots.
 
 // --- SUMMARY_BLOCK family: prose carrying over from the prior summary chain ---
 
@@ -107,11 +105,9 @@ const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
 /// dropped first — the older slice is walked in order so the most
 /// recent file touches survive.
 ///
-/// Reference: pi's emission shape lives at
-/// `others/pi/packages/coding-agent/src/core/compaction/utils.ts:62-82`
-/// (`computeFileLists` / `formatFileOperations`). Squeezy reproduces the
-/// XML-tag shape verbatim so a swap-in summarizer can re-extract the
-/// lists with the same regex.
+/// The XML-tag shape (`<read-files>` / `<modified-files>`) stays stable
+/// so a swap-in summarizer can re-extract the lists with the same
+/// regex.
 const COMPACTION_FILE_LINEAGE_LIMIT: usize = 50;
 
 // --- STATE retention (non-summary) ---
@@ -415,8 +411,8 @@ pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmI
 }
 
 /// Substring marker the summarizer should see in place of a stripped
-/// image data URI. Mirrors clear-code's `'[image]'` token from
-/// `stripImagesFromMessages`.
+/// image data URI. A short opaque token keeps the model from trying to
+/// reason about the stripped bytes while still preserving the slot.
 const IMAGE_DATA_URI_PLACEHOLDER: &str = "[image]";
 /// Same, for PDF or other document data URIs.
 const DOCUMENT_DATA_URI_PLACEHOLDER: &str = "[document]";
@@ -987,7 +983,7 @@ pub(crate) fn build_compaction_summary(
 ///   force a redb schema bump and a session-replay migration for one
 ///   isolated piece of derived metadata.
 ///
-/// Rules (mirroring pi's `computeFileLists`):
+/// Rules:
 /// - A file appearing in both read- and modify-class tool calls is
 ///   reported only under `<modified-files>` (modification dominates).
 /// - Paths are emitted alphabetically and de-duplicated.
@@ -1046,8 +1042,7 @@ fn file_lineage_blocks(older: &[LlmInputItem], previous_summary: Option<&str>) -
     }
 
     // Modification dominates: a file that was both read and modified is
-    // reported only in `<modified-files>`. Mirrors pi's
-    // `computeFileLists` rule.
+    // reported only in `<modified-files>` to avoid double-listing.
     read.retain(|path| !modified_set.contains(path));
 
     if read.len() > COMPACTION_FILE_LINEAGE_LIMIT {

@@ -2,7 +2,7 @@
 //!
 //! Generates a 32-byte random verifier, encodes it as base64url, and
 //! derives the SHA-256 challenge the authorize endpoint expects. The
-//! verifier doubles as the OAuth `state` parameter in pi's Anthropic
+//! verifier doubles as the OAuth `state` parameter in the Anthropic
 //! flow, so we keep both values together in [`PkceCodes`] to make that
 //! reuse explicit at the call site.
 
@@ -13,9 +13,8 @@ use squeezy_core::{Result, SqueezyError};
 
 /// PKCE verifier (kept private to the client) and its SHA-256
 /// challenge (sent to the authorize endpoint). The verifier is also
-/// reused as the OAuth `state` value by pi's Anthropic flow, so
-/// callers should treat both fields as bound to the same login
-/// attempt.
+/// reused as the OAuth `state` value by the Anthropic flow, so callers
+/// should treat both fields as bound to the same login attempt.
 #[derive(Debug, Clone)]
 pub struct PkceCodes {
     pub verifier: String,

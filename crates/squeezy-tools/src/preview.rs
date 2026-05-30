@@ -1,14 +1,12 @@
 //! Per-tool [`PermissionPreview`] catalog. Turns a `ToolCall` into a
 //! tool-specific `Vec<PreviewLine>` that the TUI renders with per-kind
-//! styling — preserving the per-tool fidelity that clear-code surfaces
-//! via ~15 React dialog components, while keeping a single TUI renderer.
+//! styling — one approval dialog per tool family, all routed through a
+//! single TUI renderer instead of one widget per tool.
 //!
 //! The trait exists so MCP transports / future tool families can plug in
 //! their own preview without touching this file; the in-tree catalog
 //! covers the first-party tools and is dispatched from
 //! [`crate::ToolRegistry::preview_for`].
-//!
-//! See `audits/clear-code-comparison-2026-05-25/04-sandboxing-and-permissions.md#f04-cc-permission-dialog-catalog`.
 use std::path::Path;
 
 use serde_json::Value;

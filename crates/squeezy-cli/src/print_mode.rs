@@ -1,11 +1,11 @@
 //! Helpers that desugar `--prompt` arguments into the ordered sequence of
 //! user prompts run by print mode.
 //!
-//! Pi's print mode accepts three layered input shapes — repeated message
-//! arguments, piped stdin, and `@path` file mentions that may carry image
-//! envelopes — and this module mirrors the textual subset of that surface
-//! for Squeezy's `--prompt` flag. The resolver is split out so it can be
-//! tested without spawning an LLM provider or a sub-process.
+//! Print mode accepts three layered input shapes — repeated `--prompt`
+//! arguments, piped stdin, and `@path` file mentions — and this module
+//! resolves them into a stable list of prompt strings. The resolver is
+//! split out so it can be tested without spawning an LLM provider or a
+//! sub-process.
 
 use std::{
     fs,
@@ -18,14 +18,10 @@ use squeezy_core::SqueezyError;
 /// Resolved print-mode prompt body plus the per-prompt exclude-from-context
 /// flag derived from the `!!` prefix.
 ///
-/// The double-bang escape mirrors pi's interactive-mode UX — see
-/// `packages/coding-agent/src/modes/interactive/interactive-mode.ts:5435-5500`
-/// (`handleBashCommand(command, excludeFromContext = true)`) — and the RPC
-/// `bash` command's `excludeFromContext` field
-/// (`packages/coding-agent/src/modes/rpc/rpc-types.ts:52`). Print mode is the
-/// CLI sibling: the user can run `squeezy --prompt "!!cmd"` to get the same
-/// "execute but do not feed the output back into the LLM transcript"
-/// semantic that the TUI bang-bang shortcut will eventually offer.
+/// The double-bang escape gives print mode an "execute but do not feed
+/// the output back into the LLM transcript" semantic, matching the TUI
+/// bang-bang shortcut. The user can run `squeezy --prompt "!!cmd"` to
+/// run a side check without polluting the conversation.
 ///
 /// Today the runtime that actually executes `cmd` lives behind the
 /// F01-exclude-from-context-bang-bang sibling work; until that lands, the
@@ -46,8 +42,8 @@ pub(crate) struct PromptInput {
 ///
 /// Detection is intentionally narrow: only a literal `"!!"` at the very
 /// start of the resolved prompt counts. A single leading `!` is **not**
-/// recognised — that's pi's "include-in-context" bash escape, which
-/// Squeezy does not yet expose as a top-level shortcut and which would
+/// recognised — Squeezy does not yet expose an "include-in-context"
+/// bash escape as a top-level shortcut, and recognising it here would
 /// otherwise collide with prompts that legitimately begin with an
 /// exclamation mark (e.g. "!important: …"). Whitespace before the
 /// double-bang is preserved as content so callers can't accidentally
@@ -69,7 +65,7 @@ pub(crate) fn classify_prompt(content: String) -> PromptInput {
 /// Resolve repeated `--prompt` values plus any piped stdin into the
 /// ordered list of prompts that print mode should dispatch.
 ///
-/// Rules (chosen to mirror pi's print-mode CLI):
+/// Rules:
 /// - Plain `--prompt <text>` is appended verbatim.
 /// - `--prompt @path` reads `path` as utf-8 text via `read_file`; binary
 ///   or image-typed files are rejected by the caller-provided reader.

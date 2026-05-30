@@ -24,9 +24,9 @@ branch, last build status, recent test failures, on-call rotation) into the
 base prompt without the user editing `memory.md` or invoking `/context` by
 hand.
 
-Codex covers the equivalent need with `SessionStart` and `UserPromptSubmit`
-hooks (`codex-rs/hooks/src/events/session_start.rs:1`). Each hook returns
-`additional_context` strings that the agent folds into developer instructions.
+A typical alternative shape is a pair of `SessionStart` and
+`UserPromptSubmit` hook events that return `additional_context` strings
+the agent folds into developer instructions.
 
 ### Deferred design
 
@@ -50,5 +50,6 @@ session-start enrichment covers the highest-leverage facts (branch, current
 date, last test status) without the latency cost of running shells on every
 user turn.
 
-The decision to defer is recorded against audit finding `E-UX-09`
-(`audits/codex-comparison-2026-05-25/ux.md`).
+The decision to defer is intentional: session-start enrichment is the
+load-bearing knob, and a per-prompt variant can land later once we have
+profiling on how much the deferred hook costs.

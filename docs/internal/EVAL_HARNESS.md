@@ -82,8 +82,8 @@ This is the canonical "probe a real repo with triage on" workflow.
 
 ## How an agent should use this
 
-If you are an agent (Claude Code, etc.) given a task like "find bugs in
-squeezy", "verify this fix", or "regress this behavior", this is the playbook:
+If you are an agent given a task like "find bugs in squeezy", "verify
+this fix", or "regress this behavior", this is the playbook:
 
 1. **Pick or author a scenario.**
    - For broad bug-hunting: copy `bug-probe-v2.toml` and tighten it

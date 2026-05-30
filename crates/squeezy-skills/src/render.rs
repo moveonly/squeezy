@@ -65,8 +65,8 @@ pub fn render_active_skills(
     // Aggregate overflow: switch every skill to its minimum-stub form (zero
     // description chars) and verify the floor fits. If even the floor blows
     // the budget we drop the lowest-priority skills until it fits or no skill
-    // remains. This mirrors codex's `render_lines_with_description_budget`:
-    // the roster is preserved before per-skill description detail.
+    // remains. The roster of survivors is preserved before any per-skill
+    // description detail.
     let mut survivors: Vec<&LoadedSkill> = skills.iter().collect();
     let mut min_blocks: Vec<String> = survivors
         .iter()

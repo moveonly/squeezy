@@ -24,7 +24,8 @@ use ratatui::style::Color;
 use crate::render::palette::{AMBER, ERROR_RED, GOLD, SUCCESS_GREEN};
 
 /// How long a freshly pushed toast stays on screen before auto-dismiss.
-/// Mirrors OpenCode's `ui/toast.tsx` default.
+/// 5s is long enough to read a one-line notice without forcing the user
+/// to dismiss it manually, short enough that stale toasts don't pile up.
 pub(crate) const DEFAULT_TOAST_TTL: Duration = Duration::from_secs(5);
 
 /// Cap on simultaneously visible toasts. Three is enough to absorb a small
@@ -38,8 +39,7 @@ pub(crate) const MAX_VISIBLE_TOASTS: usize = 3;
 //
 // `allow(dead_code)`: variants are constructed by the test suite and by
 // future consumers (telemetry flush, MCP connect, index ready) wired in
-// follow-up tickets — see audits/opencode-comparison-2026-05-25/06-ui.md
-// recommendations for the call sites the audit identified.
+// follow-up tickets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum ToastVariant {

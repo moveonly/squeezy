@@ -20,7 +20,7 @@
 //!
 //! Cap rationale:
 //! - markdown: 256 distinct assistant messages — covers extended sessions
-//!   (clear-code uses 500, sized for a busier Node host).
+//!   without blowing the heap on a long conversation.
 //! - highlight: 256 distinct `(content, language)` pairs — fenced blocks
 //!   are usually small (10–500 lines), single-digit KB per entry.
 //! - diff: 64 distinct `(path, patch)` pairs — diffs are the heaviest

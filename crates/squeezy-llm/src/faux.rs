@@ -8,11 +8,10 @@
 //! a scripted sequence of responses and replays them as
 //! [`LlmEvent`] streams.
 //!
-//! Pi's `packages/ai/src/providers/faux.ts` is the architectural
-//! reference. Squeezy keeps the conceptual surface — pre-scripted
-//! responses, optional error injection, multi-turn replay — but ports
-//! the API to Rust idioms: programmatic builders for in-test wiring and
-//! a TOML script format for eval fixtures.
+//! The conceptual surface — pre-scripted responses, optional error
+//! injection, multi-turn replay — is exposed through Rust idioms:
+//! programmatic builders for in-test wiring and a TOML script format
+//! for eval fixtures.
 //!
 //! # Configuration wiring
 //!
@@ -79,9 +78,8 @@ use crate::{LlmEvent, LlmProvider, LlmRequest, LlmStream, LlmToolCall, StopReaso
 /// [`FauxProvider::with_name`].
 pub const DEFAULT_FAUX_NAME: &str = "faux";
 
-/// Default error message surfaced when a scripted response is exhausted.
-/// Mirrors pi's "No more faux responses queued" wording so cross-stack
-/// debuggers see a familiar signal.
+/// Default error message surfaced when a scripted response is
+/// exhausted.
 const NO_MORE_RESPONSES_MESSAGE: &str = "faux: no scripted response remaining for this request";
 
 /// One scripted response from the faux provider. Each entry in

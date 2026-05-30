@@ -2046,11 +2046,10 @@ fn unarchive_round_trip_restores_session() {
     );
 }
 
-/// Acceptance test for the lifecycle field extension from
-/// `audits/opencode-comparison-2026-05-25/12-sessions-state-and-compaction.md#f12-session-archived-state`:
-/// once a session is archived, it must disappear from the default list
-/// surface so `bd ready`-style discovery does not pull stale history into
-/// the user's working view.
+/// Acceptance test for the session-archived lifecycle field: once a
+/// session is archived, it must disappear from the default list surface
+/// so the next list query does not pull stale history into the user's
+/// working view.
 #[test]
 fn archived_session_excluded_from_list_default() {
     let (_root, store, config) = open_test_store("archived-excluded-default");

@@ -8,9 +8,8 @@
 //! reasoning replay, hosted tools) only through Responses; earlier Grok
 //! models (grok-2, grok-beta) predate the Responses launch and answer only
 //! the Chat route. Selecting per request keeps both generations working
-//! through one provider entry. Mirrors opencode's `providers/xai.ts`
-//! split that exposes both `OpenAIResponses.route` and
-//! `OpenAICompatibleChat.route` and picks by model id.
+//! through one provider entry by picking the route based on the
+//! requested model id.
 //!
 //! The provider holds one client per route and dispatches per-request based
 //! on [`is_responses_capable`]; per-startup dispatch would lock a session

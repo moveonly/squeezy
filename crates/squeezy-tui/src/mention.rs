@@ -17,8 +17,8 @@ const MAX_WORKSPACE_FILES: usize = 5000;
 
 /// Floor between background rebuilds of the workspace file list when the
 /// `.git/index` mtime has not changed. The floor still picks up untracked
-/// files, which don't bump the index. Matches the clear-code peer in
-/// `src/hooks/fileSuggestions.ts` (`REFRESH_THROTTLE_MS = 5_000`).
+/// files, which don't bump the index. 5s keeps suggestion updates
+/// responsive without re-walking the workspace on every keystroke.
 pub(crate) const WORKSPACE_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 
 /// The state of an in-flight `@`-mention.
@@ -121,8 +121,7 @@ pub(crate) fn load_workspace_files(root: &Path) -> Vec<PathBuf> {
 /// with a permanent cache it never picked up files created after TUI
 /// startup. The poll keeps the cache fresh after git operations
 /// (checkout/commit/rm bump `.git/index`) and the floor catches new
-/// untracked files, mirroring the clear-code peer in
-/// `src/hooks/fileSuggestions.ts:635-686`.
+/// untracked files.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceFileCache {
     files: Arc<Vec<PathBuf>>,

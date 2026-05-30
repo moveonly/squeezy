@@ -254,9 +254,9 @@ impl OpenAiProvider {
     /// that carries a cache key. OpenAI's load balancer uses these to
     /// route the session to the same backend that warmed the cached
     /// prefix; without them, repeat turns can land on a cold node and
-    /// silently miss cache even when `prompt_cache_key` matches. Mirrors
-    /// the official Codex CLI's behavior and pi's
-    /// `openai-responses.ts` (`session_id` + `x-client-request-id`).
+    /// silently miss cache even when `prompt_cache_key` matches. The
+    /// header values are `session_id` and `x-client-request-id`, both
+    /// taken from the request's cache key.
     ///
     /// The header values carry the full (unclamped) cache key — the
     /// 64-codepoint limit is specific to the body field; routing headers

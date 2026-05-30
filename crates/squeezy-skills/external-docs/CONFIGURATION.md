@@ -461,8 +461,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   tool bytes, receipt hits, budget denials, and redaction counts.
   `response_verbosity` controls answer-length guidance, `tool_output_verbosity`
   controls expanded tool-result preview size, `transcript_default` chooses
-  compact or expanded transcript entries, `alternate_screen = "auto"` uses a
-  Codex-style inline viewport with real terminal scrollback,
+  compact or expanded transcript entries, `alternate_screen = "auto"` uses an
+  inline viewport with real terminal scrollback,
   `alternate_screen = "always"` forces the dedicated full-screen transcript
   buffer, `alternate_screen = "never"` also uses the inline viewport, and
   `show_reasoning_usage` controls both the provider-reported reasoning-token

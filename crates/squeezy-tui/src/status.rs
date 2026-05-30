@@ -2,8 +2,7 @@
 //!
 //! Each item is an opt-in segment a user can enable through `/statusline`.
 //! Items are grouped into [`StatusLineAccent`] families so the configured
-//! list paints with the same color vocabulary as the codex sibling
-//! (see `codex-rs/tui/src/bottom_pane/status_line_style.rs`).
+//! list paints with a consistent color vocabulary across enabled items.
 //!
 //! The legacy `render_status_details` plain-text path is kept for tests and
 //! for the historical verbose detail line that fires when no
@@ -171,8 +170,7 @@ impl StatusLineItem {
         }
     }
 
-    /// All items, in the order shown in the picker (matches codex's
-    /// fixed order for codex-compatible items, then squeezy-only extras).
+    /// All items, in the order shown in the picker.
     pub(crate) const ALL: &'static [StatusLineItem] = &[
         Self::ProviderAndModel,
         Self::ModelWithReasoning,
@@ -235,7 +233,8 @@ impl FromStr for StatusLineItem {
     }
 }
 
-/// Color family for an item, mirroring codex's 10-accent palette.
+/// Color family for an item — drives the 10-accent palette the status
+/// bar paints each item with.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum StatusLineAccent {
     Model,

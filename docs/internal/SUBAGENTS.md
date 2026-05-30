@@ -88,8 +88,8 @@ the next subagent can start.
 
 ## What This Document Is Not
 
-This document does not describe Codex-style recursive or persistent
-agent trees, cloud-style agent fleets, or interactive agents. Squeezy's
-subagents are deliberately flat, one-shot, and in-process. If a future
+This document does not describe recursive or persistent agent trees,
+cloud-style agent fleets, or interactive agents. Squeezy's subagents
+are deliberately flat, one-shot, and in-process. If a future
 feature needs a different shape, propose it explicitly and update this
 document — do not extend the role catalog into something it is not.

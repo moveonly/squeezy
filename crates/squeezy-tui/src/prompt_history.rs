@@ -20,9 +20,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-/// Maximum number of prompts retained. Matches clear-code's recall
-/// buffer; large enough to span an afternoon of work, small enough to
-/// keep the file readable and the scrollback cheap.
+/// Maximum number of prompts retained. Large enough to span an
+/// afternoon of work, small enough to keep the file readable and the
+/// scrollback cheap.
 pub(crate) const DEFAULT_PROMPT_HISTORY_CAPACITY: usize = 100;
 
 /// In-memory ring of recent prompts with optional disk mirror. Reads

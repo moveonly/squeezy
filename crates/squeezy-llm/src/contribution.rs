@@ -43,10 +43,8 @@ use crate::{AnthropicProvider, GoogleProvider, LlmProvider, OllamaProvider, Open
 /// that the rest of the agent uses through the existing
 /// [`LlmProvider`](crate::LlmProvider) trait.
 ///
-/// Lifted from pi's `registerProvider` API (`packages/ai/src/api-registry.ts`)
-/// — the Rust port keeps the runtime surface trait-shaped instead of a
-/// closure pair so a third-party crate can implement the contribution
-/// with a normal `struct + impl` block.
+/// Trait-shaped instead of a closure pair so a third-party crate can
+/// implement the contribution with a normal `struct + impl` block.
 ///
 /// [`build`]: ProviderContribution::build
 pub trait ProviderContribution: Send + Sync + 'static {

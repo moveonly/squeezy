@@ -6247,9 +6247,7 @@ fn delegate_chain_threads_previous_step_summary_into_next_step_prompt() {
     // F10: the chain helper must replace every literal `{previous}` token
     // in step N+1's prompt with step N's summary verbatim. Step 0 sees an
     // empty `previous`, so the leading step's template stays
-    // byte-identical apart from the placeholder being erased — that
-    // matches how peer agents (opencode's `chain` mode) seed the lead-in
-    // step.
+    // byte-identical apart from the placeholder being erased.
     //
     // Substitution is exercised through `chain_substitute_previous`
     // directly so the test does not need a live LLM or subagent registry

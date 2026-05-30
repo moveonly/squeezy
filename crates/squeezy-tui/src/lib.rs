@@ -121,15 +121,15 @@ const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
-/// Default tool-card cap for model-initiated tool calls. Matches codex's
-/// `TOOL_CALL_MAX_LINES`. Aggressive on purpose — the structured detail
-/// is one keystroke (Ctrl-E / Ctrl-T) away, and a 5-line preview keeps
-/// the transcript readable even when the model fires off long commands.
+/// Default tool-card cap for model-initiated tool calls. Aggressive on
+/// purpose — the structured detail is one keystroke (Ctrl-E / Ctrl-T)
+/// away, and a 5-line preview keeps the transcript readable even when
+/// the model fires off long commands.
 const TOOL_CALL_MAX_LINES: usize = 5;
 /// Larger cap for `!`-shell calls the user typed directly (those carry
 /// `direct_user_shell: true` in their arguments, set by
-/// `local_shell_command_call` in the agent). Mirrors codex's
-/// `USER_SHELL_TOOL_CALL_MAX_LINES`.
+/// `local_shell_command_call` in the agent). 50 lines fits a typical
+/// command's full output without truncation.
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
@@ -146,8 +146,7 @@ const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 /// indicator strip to receive `MouseEventKind::Down(Left)` events.
 /// Note: while this is enabled, native text selection in the terminal
 /// requires holding `Shift` on most emulators — the standard tradeoff
-/// when a TUI takes over mouse input (htop / codex / vim-with-mouse
-/// all do the same).
+/// when a TUI takes over mouse input.
 const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
 // The matching disable sequence (1000l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
@@ -4085,13 +4084,11 @@ fn approval_deny_session() -> ApprovalOption {
     )
 }
 
-/// Build the per-capability allow/deny menu for a pending approval. Codex's
-/// `ExecApprovalRequestEvent::default_available_decisions` shapes the option
-/// list to the request (network host vs exec amendment vs plain accept); the
-/// audit (`ux.md#E-UX-06`) calls out that squeezy's fixed five-option set hides
-/// what scope each "Approve" actually saves. Labels here name the binary, host,
-/// server, or path that the resulting rule will cover so the user can codify
-/// *why* in one keystroke.
+/// Build the per-capability allow/deny menu for a pending approval. The
+/// option list is shaped to the request (network host vs exec amendment
+/// vs plain accept) so each "Approve" label names the binary, host,
+/// server, or path that the resulting rule will cover — the user can
+/// codify *why* in one keystroke.
 fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
     let (session_label, session_hint, project_label, project_hint) =
         capability_scope_labels(request);
@@ -5772,9 +5769,9 @@ fn format_plan_card_entry(
 /// Run the `/diff` slash command: capture a worktree diff (tracked +
 /// untracked) via `GitVcs::snapshot` and push a styled card into the
 /// transcript. On a clean tree or a non-git workspace we surface a log
-/// advisory instead of an empty card. Mirrors codex's `get_git_diff` +
-/// `disable_output_cap` UX — never truncated, always renderable via the
-/// existing `render::diff` helpers.
+/// advisory instead of an empty card. Never truncated by default, so
+/// the user always sees the full diff via the existing `render::diff`
+/// helpers.
 fn handle_slash_diff(app: &mut TuiApp) {
     if app.pending_diff.is_some() {
         app.push_log("/diff: already computing — please wait".to_string());
@@ -6947,8 +6944,7 @@ fn tool_oneline_summary(tool: &ToolTranscript) -> Vec<Span<'static>> {
 
 /// Whether this tool result was triggered by the user typing `!<command>`
 /// (a "direct user shell" call), as opposed to being initiated by the
-/// model. Mirrors codex's `ExecCall::is_user_shell_command`. The agent
-/// stamps `direct_user_shell: true` on these calls in
+/// model. The agent stamps `direct_user_shell: true` on these calls in
 /// `local_shell_command_call` (crates/squeezy-agent/src/lib.rs).
 fn is_user_shell_call(tool: &ToolTranscript) -> bool {
     let from_call = tool
@@ -6977,8 +6973,8 @@ fn tool_preview_line_cap(tool: &ToolTranscript) -> usize {
 
 /// Tools whose expanded body is *the* point of the card (a small,
 /// structured artifact like a diff or a per-file summary) and which we
-/// therefore do not truncate by default. Matches codex's behaviour of
-/// never capping patch output.
+/// therefore do not truncate by default. Patch output stays uncapped
+/// so the user always sees the full edit set.
 fn tool_bypasses_preview_cap(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -6999,12 +6995,11 @@ fn collapsed_tool_preview_lines(
     head_tail_truncate_lines(detail, cap)
 }
 
-/// Head-tail truncate a list of rendered detail lines, inserting a single
-/// "… +N lines (Ctrl-O to expand)" ellipsis between the head and tail
-/// when the total exceeds `2 * cap`. Cap is the maximum number of lines
-/// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
-/// wording stays consistent with the existing diff renderer
-/// (see `render::diff::head_tail`).
+/// Head-tail truncate a list of rendered detail lines, inserting a
+/// single "… +N lines (Ctrl-O to expand)" ellipsis between the head and
+/// tail when the total exceeds `2 * cap`. Cap is the maximum number of
+/// lines to keep on EACH end. Wording stays consistent with the existing
+/// diff renderer (see `render::diff::head_tail`).
 fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'static>> {
     if cap == 0 || lines.len() <= cap.saturating_mul(2) {
         return lines;
@@ -7928,10 +7923,10 @@ fn active_tool_args(call: &ToolCall) -> String {
     }
 }
 
-/// Title-cased display name for the working-row label (codex-style
-/// "Shell: …", "Read: …"). Known tools get explicit casing; unknown tools
-/// fall back to ASCII-uppercase first letter so a server-defined tool
-/// like `slack_search` reads as `Slack_search` rather than the raw slug.
+/// Title-cased display name for the working-row label (e.g. "Shell: …",
+/// "Read: …"). Known tools get explicit casing; unknown tools fall back
+/// to ASCII-uppercase first letter so a server-defined tool like
+/// `slack_search` reads as `Slack_search` rather than the raw slug.
 fn friendly_tool_name(tool_name: &str) -> String {
     match tool_name {
         "shell" => "Shell".to_string(),
@@ -9806,8 +9801,8 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Right-align the mode label on a status row whose left side is the
-/// codex-style detail line. Mirrors [`format_status_overview_line`]'s
-/// alignment math but preserves the detail line's styled spans.
+/// detail line. Mirrors [`format_status_overview_line`]'s alignment
+/// math but preserves the detail line's styled spans.
 fn compose_status_overview_with_detail(
     mut detail: Line<'static>,
     app: &TuiApp,
@@ -10352,8 +10347,8 @@ pub(crate) struct TuiApp {
     pub(crate) overlay_active_id: Option<u64>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
-    /// a scroll offset. Mirrors codex's `open_transcript_overlay` as the
-    /// escape hatch from the new aggressive default truncation.
+    /// a scroll offset. Acts as the escape hatch from the aggressive
+    /// default truncation.
     pub(crate) transcript_overlay: Option<TranscriptOverlayState>,
     pub(crate) alternate_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
@@ -11180,8 +11175,8 @@ impl TranscriptEntry {
         _transcript_default: TranscriptDefault,
     ) -> Self {
         // Tool results are uniformly collapsed-by-default for the happy
-        // path: the codex-style head-tail preview caps each card at ~5
-        // lines (50 for direct `!`-shell).
+        // path: the head-tail preview caps each card at ~5 lines (50 for
+        // direct `!`-shell).
         //
         // Failed tool calls are the exception. The preview hides the
         // actual error message under "Ctrl-O to expand", which is
@@ -11245,8 +11240,8 @@ impl TranscriptEntry {
         Self {
             id,
             kind: TranscriptEntryKind::Diff(Box::new(data)),
-            // Mirror codex's `/diff`: never truncated by default. The
-            // user can still Ctrl-E to fold the body if it's huge.
+            // `/diff` is never truncated by default. The user can still
+            // Ctrl-E to fold the body if it's huge.
             collapsed: false,
             revision: 0,
         }

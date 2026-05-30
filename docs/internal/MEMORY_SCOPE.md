@@ -37,7 +37,7 @@ If a future user request justifies adoption, the staged path is:
 3. Only after real usage data justifies the cost, consider a phase-2
    consolidation pass that rewrites or deduplicates entries.
 
-Keep durable cross-session knowledge in the static memory file or in
-`bd remember` (Beads) until step 1 lands. Skills, hooks, and remote
-runtimes are not part of the memory path; see `SKILLS_SCOPE.md` for the
-adjacent decision on instruction bundles.
+Keep durable cross-session knowledge in the static memory file until
+step 1 lands. Skills, hooks, and remote runtimes are not part of the
+memory path; see `SKILLS_SCOPE.md` for the adjacent decision on
+instruction bundles.

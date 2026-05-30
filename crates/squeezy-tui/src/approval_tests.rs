@@ -178,8 +178,8 @@ fn approval_menu_labels_name_capability_scope() {
         "shell session label missing binary scope: {menu}"
     );
 
-    // Network surfaces the host so users can codify "allow this host" in one
-    // keystroke (audit E-UX-06 cites Codex's `ApplyNetworkPolicyAmendment`).
+    // Network surfaces the host so users can codify "allow this host"
+    // in one keystroke.
     let net = request_with(
         "webfetch",
         PermissionCapability::Network,

@@ -32,11 +32,10 @@ pub(crate) enum Overlay {
 ///
 /// The TUI does not have a generic focus manager today: the resting
 /// input owner is always the composer, and modal overlays / popups
-/// borrow keys while they are open. This enum is the contract the
-/// audit note for the OpenCode parity follow-up — callers tell
-/// [`DialogHandle::open`] what was focused, and [`DialogHandle::restore_focus`]
-/// hands that hint back at close time so future focusables can be
-/// added without changing call sites.
+/// borrow keys while they are open. This enum is the contract callers
+/// hand [`DialogHandle::open`] to declare what was focused, and
+/// [`DialogHandle::restore_focus`] returns that hint at close time so
+/// future focusables can be added without changing call sites.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum PriorFocus {
     /// The composer (prompt input). The default for slash-command

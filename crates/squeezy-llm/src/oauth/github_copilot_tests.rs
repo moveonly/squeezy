@@ -97,7 +97,7 @@ fn github_copilot_urls_for_domain_match_pi_layout() {
     // Enterprise hosts route through `https://{tenant}` not
     // `https://api.{tenant}` for the device-code + access-token
     // endpoints, but the copilot token endpoint sits under
-    // `https://api.{tenant}` (matching pi's layout).
+    // `https://api.{tenant}`.
     let ent = GitHubCopilotUrls::for_domain("acme.ghe.com");
     assert_eq!(
         ent.device_code_url,

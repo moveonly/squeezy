@@ -82,7 +82,7 @@ pub enum HookEvent {
     /// Fired at session start; companion to [`HookEvent::Setup`].
     SessionStart,
     /// Fired when the agent yields the turn back to the user without
-    /// an outstanding tool call (clear-code's `Stop` semantics).
+    /// an outstanding tool call.
     Stop,
     /// Fired the first time the agent boots in a workspace, or when a
     /// maintenance task (config migration, index rebuild) completes.
@@ -285,9 +285,8 @@ pub trait HookHandler {
 /// The registry is intentionally simple: handlers are stored in
 /// insertion order and every handler sees every event. Filtering by
 /// [`HookEvent`] is the handler's responsibility — the trait method
-/// receives the event in `ctx.event`. This mirrors the codex
-/// reference contract and keeps the registry oblivious to per-handler
-/// subscription policy.
+/// receives the event in `ctx.event`. This keeps the registry oblivious
+/// to per-handler subscription policy.
 #[derive(Default)]
 pub struct HookRegistry {
     handlers: Vec<Box<dyn HookHandler + Send + Sync>>,

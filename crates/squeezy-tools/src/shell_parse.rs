@@ -70,8 +70,8 @@ pub(crate) struct Redirect {
 
 /// Walks the bash parse tree and returns one `CommandUnit` per `command`
 /// node. Returns an empty vector when tree-sitter cannot parse the input.
-/// Mirrors the single-pass extraction surface clear-code exposes via
-/// `extractCommandArguments` + `extractEnvVars` + `parseForSecurityFromAst`.
+/// A single-pass extraction covers command arguments, env vars, and
+/// security-relevant AST features in one walk.
 #[allow(dead_code)]
 pub(crate) fn extract_command_units(command: &str) -> Vec<CommandUnit> {
     let mut parser = Parser::new();

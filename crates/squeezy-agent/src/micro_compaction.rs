@@ -11,12 +11,11 @@
 //! conversation well-formed. The model still sees which tools ran in what
 //! order; only the bulky payload is replaced.
 //!
-//! Compactable tools are a closed set drawn from the audit recommendation
-//! (`audits/clear-code-comparison-2026-05-25/12-sessions-state-and-compaction.md`,
-//! finding `F12-cc-microcompaction`). Tools that already return
-//! receipt-stubbed or otherwise small payloads (`notes_recall`,
-//! `checkpoint_*`, MCP control calls) are intentionally excluded — there
-//! is nothing worth clearing.
+//! Compactable tools are a closed set: only the tools that plausibly emit
+//! large outputs (file reads, shell, search, web) are in scope. Tools that
+//! already return receipt-stubbed or otherwise small payloads
+//! (`notes_recall`, `checkpoint_*`, MCP control calls) are intentionally
+//! excluded — there is nothing worth clearing.
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -27,9 +26,7 @@ use crate::context_compaction::estimate_context;
 
 /// Tools whose `FunctionCallOutput.output` payload may be rewritten to a
 /// placeholder once the conversation crosses the micro-compaction
-/// threshold. Mirrors clear-code's `COMPACTABLE_TOOLS` set
-/// (`src/services/compact/microCompact.ts:41-50`) mapped to Squeezy tool
-/// names. Limited to tools that can plausibly emit large outputs
+/// threshold. Limited to tools that can plausibly emit large outputs
 /// (file/shell/search/web). Tools whose outputs are already capped by
 /// receipts or by aggregate budgets stay out of the set so the model
 /// keeps their full content.

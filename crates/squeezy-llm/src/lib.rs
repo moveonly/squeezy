@@ -154,9 +154,7 @@ pub struct LlmRequest {
     /// historical behavior and lets the provider apply its default
     /// (typically `auto`). Set to `"required"` for tool-shy models like
     /// Qwen via OpenRouter that otherwise emit a chatty preamble and
-    /// finish with `stop` without calling any tool. Mirrors opencode's
-    /// `lowerToolChoice` pass-through (`openai-chat.ts:172, 267`) and
-    /// clear-code's `options.toolChoice` (`claude.ts:1712`).
+    /// finish with `stop` without calling any tool.
     pub tool_choice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<LlmOutputSchema>,
@@ -170,9 +168,8 @@ pub struct LlmRequest {
     /// Anthropic provider joins these into an `anthropic-beta` HTTP
     /// header; the Bedrock provider partitions them and forwards only
     /// the body-param-eligible subset via
-    /// `additional_model_request_fields.anthropic_beta`. Mirrors
-    /// clear-code's per-provider routing (`constants/betas.ts` +
-    /// `claude.ts:272-331`). Other providers ignore the field.
+    /// `additional_model_request_fields.anthropic_beta`. Other
+    /// providers ignore the field.
     #[serde(default = "empty_beta_headers")]
     pub beta_headers: Arc<[Arc<str>]>,
 }
@@ -392,11 +389,9 @@ impl LlmRequest {
 ///    output so the wire format stays well-formed.
 ///
 /// Non-tool items (`UserText`, `AssistantText`, `Reasoning`) pass
-/// through unchanged. Mirrors pi's `transformMessages` (see
-/// `others/pi/packages/ai/src/providers/transform-messages.ts`) —
-/// each provider's `request_body` calls this once at the front of
-/// its existing transform so the per-provider wire shapes are
-/// preserved.
+/// through unchanged. Each provider's `request_body` calls this once
+/// at the front of its existing transform so the per-provider wire
+/// shapes are preserved.
 pub(crate) fn normalize_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmInputItem> {
     let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut next_index: usize = 0;

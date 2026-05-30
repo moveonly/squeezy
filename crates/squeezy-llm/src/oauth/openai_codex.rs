@@ -1,13 +1,11 @@
 //! ChatGPT Plus/Pro subscription auth via the OpenAI Codex OAuth flow.
 //!
-//! This module mirrors pi's `loginOpenAICodex` /
-//! `refreshOpenAICodexToken` pair (see
-//! `others/pi/packages/ai/src/utils/oauth/openai-codex.ts`) using the
-//! same public constants — `client_id`, the `auth.openai.com`
-//! authorize and token endpoints, the `http://localhost:1455`
-//! redirect, and the `openid profile email offline_access` scope set —
-//! so the resulting access token is interchangeable with Codex CLI
-//! credentials.
+//! Uses OpenAI's published OAuth constants — `client_id`, the
+//! `auth.openai.com` authorize and token endpoints, the
+//! `http://localhost:1455` redirect, and the
+//! `openid profile email offline_access` scope set — so the resulting
+//! access token is interchangeable with credentials minted by the
+//! Codex CLI.
 //!
 //! Layout:
 //! 1. PKCE + state generation (`getrandom` + SHA-256), authorize URL
@@ -54,9 +52,8 @@ use crate::{LlmEvent, LlmProvider, LlmRequest, LlmStream, OpenAiProvider};
 // ─── Public OAuth constants ────────────────────────────────────────────────
 
 /// OAuth client id registered by OpenAI for the Codex CLI flow.
-/// Public information (see pi's `openai-codex.ts`); intentionally
-/// hard-coded so squeezy's flow is wire-identical to pi's and to the
-/// reference Codex CLI.
+/// Public information; intentionally hard-coded so squeezy's flow is
+/// wire-identical to the reference Codex CLI.
 pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -69,9 +66,8 @@ pub const OPENAI_CODEX_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 pub const OPENAI_CODEX_CALLBACK_HOST: &str = "127.0.0.1";
 pub const OPENAI_CODEX_CALLBACK_PORT: u16 = 1455;
 /// Filename under `~/.squeezy/auth/` where the persisted Codex token
-/// set lives. Hyphenated to match the public reference (Codex CLI,
-/// pi's docs); the rest of the codebase stays on snake_case provider
-/// section names.
+/// set lives. Hyphenated to match the Codex CLI's filename; the rest
+/// of the codebase stays on snake_case provider section names.
 pub const OPENAI_CODEX_AUTH_FILE_NAME: &str = "openai-codex.json";
 
 /// Force a refresh when the cached access token has less than this
@@ -83,22 +79,20 @@ const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 /// Number of random bytes the PKCE verifier and OAuth state nonce
 /// consume. RFC 7636 §4.1 recommends 32 bytes for the verifier so the
 /// base64url-encoded form lands at 43 chars; the state nonce uses 16
-/// bytes for a 22-char value, matching pi's hex-encoded form modulo
-/// the encoding choice.
+/// bytes for a 22-char value.
 const PKCE_VERIFIER_BYTES: usize = 32;
 const PKCE_STATE_BYTES: usize = 16;
 
 // ─── Token set + persistence ───────────────────────────────────────────────
 
-/// Persisted Codex credential set. Field names match pi's
-/// `OAuthCredentials` shape so a future tool can read both stores in
-/// the same struct.
+/// Persisted Codex credential set. Field names follow the OAuth
+/// `credentials` shape so a future tool can read both stores in the
+/// same struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiCodexTokenSet {
     pub access_token: String,
     pub refresh_token: String,
-    /// Absolute expiry as Unix milliseconds. Matches pi's
-    /// `OAuthCredentials.expires` so the file format is portable.
+    /// Absolute expiry as Unix milliseconds.
     pub expires_at_unix_ms: u64,
     pub account_id: String,
 }

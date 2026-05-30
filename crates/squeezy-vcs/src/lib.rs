@@ -501,11 +501,11 @@ impl GitVcs {
     // what it planned against — including drift produced by the user
     // between turns or by a concurrent tool.
     //
-    // Codex-style progressive line-pattern fuzz (exact → rstrip → trimmed
-    // → Unicode-normalised) is intentionally NOT the default. It trades a
-    // pre-mutation hash check for opportunistic typographic recovery, and
-    // the resulting "the model intended this so we wrote it" semantics
-    // weaken the cross-turn safety property above.
+    // Progressive line-pattern fuzz (exact → rstrip → trimmed →
+    // Unicode-normalised) is intentionally NOT the default. It trades a
+    // pre-mutation hash check for opportunistic typographic recovery,
+    // and the resulting "the model intended this so we wrote it"
+    // semantics weaken the cross-turn safety property above.
     //
     // The unified-diff path below is the deliberate escape hatch: callers
     // opt in per-block via `fallback:"unified_diff"` when their literal

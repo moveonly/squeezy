@@ -610,9 +610,8 @@ async fn main() -> squeezy_core::Result<()> {
             ));
         }
         // Recognise the `!!` exclude-from-context prefix on each resolved
-        // prompt before we hand them to the agent loop. Detection is the
-        // CLI sibling of pi's TUI bang-bang shortcut (audit-07 finding
-        // F07-print-mode-exclude-from-context); the runtime side is
+        // prompt before we hand them to the agent loop. Print mode is the
+        // CLI sibling of the TUI bang-bang shortcut; the runtime side is
         // pending the F01-exclude-from-context-bang-bang sibling work
         // that adds an Agent-level `local_shell_command(input,
         // exclude_from_context=true)` entry point, so for now `!!cmd`
@@ -704,8 +703,7 @@ fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
 
 fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_core::Result<()> {
     match command {
-        // `squeezy config` with no subcommand mirrors pi's `pi config browse`
-        // and lands on the resource picker.
+        // `squeezy config` with no subcommand lands on the resource picker.
         None => {
             let config = config_from_cli(cli)?;
             handle_browse_command(&config, &ConfigBrowseArgs::default())
@@ -2285,8 +2283,7 @@ where
 /// The runtime side of this flag — actually executing the command via a
 /// shell-tool entry point that marks the result as
 /// `exclude_from_context = true` — depends on the sibling
-/// F01-exclude-from-context-bang-bang work (audit-07,
-/// `audits/pi-comparison-2026-05-27/07-ux-and-workflows.md`). Until that
+/// F01-exclude-from-context-bang-bang work. Until that
 /// lands, the print-mode bang-bang flow:
 ///
 /// * recognises the prefix at argument-parse time so the rest of the
@@ -2510,12 +2507,9 @@ where
 ///
 /// The `excluded_from_context` variant marks a `!!`-prefixed print-mode
 /// prompt that was recognised at parse time but not dispatched to the
-/// agent. It pre-stakes the JSON-mode contract for the future RPC
-/// `bash` command's `excludeFromContext` field
-/// (`packages/coding-agent/src/modes/rpc/rpc-types.ts:52` in pi's
-/// reference implementation) so callers can already observe the
-/// distinction between "this prompt populates the transcript" and "this
-/// prompt is intentionally invisible to subsequent turns".
+/// agent. Callers can already observe the distinction between "this
+/// prompt populates the transcript" and "this prompt is intentionally
+/// invisible to subsequent turns".
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum PromptWireEvent {

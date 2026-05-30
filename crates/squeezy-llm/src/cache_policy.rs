@@ -105,10 +105,8 @@ pub(crate) enum MessageStrategy {
 
 /// Auto-placement policy: mark tools, system, and the latest user message.
 ///
-/// Mirrors OpenCode's `AUTO = { tools: true, system: true, messages: "latest-user-message" }`
-/// (`packages/llm/src/cache-policy.ts:18-22`). Squeezy currently exposes only
-/// this default; per-skill or per-session overrides plug into the same struct
-/// when needed.
+/// Squeezy currently exposes only this default; per-skill or per-session
+/// overrides plug into the same struct when needed.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CachePolicy {
     pub tools: bool,

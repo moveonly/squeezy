@@ -1,11 +1,11 @@
-//! `squeezy config browse` — pi-style resource picker.
+//! `squeezy config browse` — unified resource picker.
 //!
 //! Surfaces every discoverable Squeezy resource as a single structured
 //! listing so users can answer "what does this checkout know about?"
 //! without remembering the four sibling commands (`squeezy providers
 //! list`, `squeezy sessions list`, the `/skill` and `/<prompt>` slash
-//! menus). Mirrors pi's `pi config browse` UX: text by default, JSON
-//! with `--json`, one section per resource type.
+//! menus). Output is text by default, JSON with `--json`, one section
+//! per resource type.
 //!
 //! The aggregator stays a thin shim over the existing in-process
 //! catalogs (`SkillCatalog::discover`, `PromptTemplateCatalog::discover`,

@@ -278,8 +278,8 @@ pub(crate) fn migrate_legacy_plans(workspace_root: &Path) -> usize {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PlanMeta {
     /// Identifier of the plan this one refines, set by the TUI when the
-    /// active plan is being replaced. Mirrors clear-code's parent-of
-    /// pointer; used by the styled card (PR-F) to render diffs.
+    /// active plan is being replaced. Used by the styled card (PR-F) to
+    /// render diffs against the prior version.
     pub parent_plan_id: Option<String>,
     /// Free-form model id (e.g. `gpt-5-codex`). Captured at persist time
     /// for retrospective debugging — not used by any runtime gate.

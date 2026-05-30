@@ -479,12 +479,11 @@ impl From<String> for StaticApiKey {
 /// refresh endpoint, and an optional absolute expiry the refresh flow
 /// uses to decide whether the cached access token is still good.
 ///
-/// The shape mirrors pi's `OAuthCredentials` so the upcoming
-/// Anthropic Pro/Max and ChatGPT Plus/Pro implementations have a
-/// natural place to land the device-code outputs. Additional
-/// provider-specific fields (account id, scope set, etc.) can ride
-/// on the implementing OAuth source rather than expanding this
-/// struct.
+/// The shape is intentionally minimal so Anthropic Pro/Max and ChatGPT
+/// Plus/Pro implementations have a natural place to land the
+/// device-code outputs. Additional provider-specific fields (account
+/// id, scope set, etc.) can ride on the implementing OAuth source
+/// rather than expanding this struct.
 #[derive(Debug, Clone)]
 pub struct TokenState {
     pub access_token: String,

@@ -246,10 +246,9 @@ fn delete_fg_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Soft green tint behind added lines. Values mirror codex's diff
-/// backgrounds (`#213A2B` dark / `#dafbe1` light) so the look matches
-/// existing patch-review tools and reads on both themes via
-/// `palette::best_color` quantisation.
+/// Soft green tint behind added lines. The `#213A2B` dark / `#dafbe1`
+/// light pair matches conventional patch-review styling and reads on
+/// both themes via `palette::best_color` quantisation.
 pub(crate) fn diff_add_bg() -> Color {
     let rgb = match palette::palette_tone() {
         palette::PaletteTone::Dark => (33, 58, 43),
@@ -258,8 +257,8 @@ pub(crate) fn diff_add_bg() -> Color {
     palette::best_color(rgb)
 }
 
-/// Soft red tint behind removed lines. Values mirror codex's
-/// `#4A221D` dark / `#ffebe9` light diff backgrounds.
+/// Soft red tint behind removed lines. `#4A221D` dark / `#ffebe9` light
+/// matches conventional patch-review styling.
 pub(crate) fn diff_del_bg() -> Color {
     let rgb = match palette::palette_tone() {
         palette::PaletteTone::Dark => (74, 34, 29),

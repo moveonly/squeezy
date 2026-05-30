@@ -8,8 +8,7 @@
 //! realpath serialise, mutations against distinct realpaths run
 //! concurrently.
 //!
-//! The key derivation mirrors the Pi reference (`packages/coding-agent/src/
-//! core/tools/file-mutation-queue.ts`):
+//! The key derivation:
 //!
 //! 1. Canonicalise the absolute path. If the file already exists, the
 //!    symlink chain is resolved so a write to `link.txt` and a write to its

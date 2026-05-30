@@ -23,11 +23,10 @@ use tokio::sync::watch;
 /// the affected row when an upstream event lands (`JobNotification`
 /// stdout deltas, bash output stream, plan-approval state machine, …).
 ///
-/// Mirrors clear-code's `progressMessagesForMessage` subscription in
-/// `src/components/messages/AssistantToolUseMessage.tsx`, but uses a
-/// `watch::Receiver<()>` ticker rather than carrying payload through the
-/// channel — the cell already owns the source data and a tick just
-/// means "your cached layout is stale, recompute on next frame".
+/// Uses a `watch::Receiver<()>` ticker rather than carrying payload
+/// through the channel — the cell already owns the source data and a
+/// tick just means "your cached layout is stale, recompute on next
+/// frame".
 pub(crate) type HistoryCellUpdateStream = watch::Receiver<()>;
 
 /// Anything that renders a contiguous block of lines into the transcript.

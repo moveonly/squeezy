@@ -1,13 +1,10 @@
 //! Centralized [`reqwest::Client`] factory for the native Squeezy
 //! providers.
 //!
-//! Mirrors pi's `configureHttpDispatcher`
-//! (`packages/coding-agent/src/core/http-dispatcher.ts`) — pi installs a
-//! single global undici dispatcher with a configurable
-//! `bodyTimeout`/`headersTimeout` so every fetch in the process shares the
-//! same connection pool and inherits the idle-timeout knob the user
-//! picked. Each Squeezy provider previously called
-//! [`reqwest::Client::new`] in its constructor, which meant:
+//! A single process-wide HTTP client lets every fetch share one TCP/TLS
+//! pool and inherit the idle-timeout knob the user picked. Each Squeezy
+//! provider previously called [`reqwest::Client::new`] in its
+//! constructor, which meant:
 //!
 //! - Multi-provider routing (e.g. small-fast vs main, or model
 //!   switches mid-session) paid the DNS/TLS handshake cost on every
@@ -27,10 +24,9 @@
 //! ## Tuning knobs surfaced via `ProviderTransportConfig`
 //!
 //! - `pool_idle_timeout_ms`: how long an idle socket sits in the pool
-//!   before reqwest drops it. Mirrors pi's `HTTP_IDLE_TIMEOUT_MS`,
-//!   though semantically distinct (pi controls bodyTimeout; reqwest's
-//!   request-body timeout would clip live streaming bodies and is
-//!   intentionally left at "unbounded" here).
+//!   before reqwest drops it. Reqwest's request-body timeout would
+//!   clip live streaming bodies and is intentionally left at
+//!   "unbounded" here.
 //! - `pool_max_idle_per_host`: cap on idle connections kept per
 //!   origin. `u32::MAX` is treated as "unbounded" (reqwest default).
 //!
@@ -101,9 +97,9 @@ pub(crate) fn build_client(config: &ProviderTransportConfig) -> reqwest::Client 
     let mut builder =
         reqwest::Client::builder().pool_max_idle_per_host(config.pool_max_idle_per_host as usize);
     builder = if config.pool_idle_timeout_ms == 0 {
-        // `None` keeps idle sockets parked indefinitely (pi's
-        // "disabled" choice). Matches the user-visible semantic of
-        // `HTTP_IDLE_TIMEOUT_MS=0` in pi's selector UI.
+        // `None` keeps idle sockets parked indefinitely — a
+        // `pool_idle_timeout_ms = 0` config explicitly disables
+        // eviction.
         builder.pool_idle_timeout(None)
     } else {
         builder.pool_idle_timeout(Some(Duration::from_millis(config.pool_idle_timeout_ms)))

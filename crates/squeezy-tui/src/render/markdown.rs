@@ -309,9 +309,9 @@ impl Writer {
                 self.finish_line();
             }
             Event::TaskListMarker(checked) => {
-                // Mirror Codex: checkboxes render unstyled. The `[ ]` /
-                // `[x]` glyph itself is structural enough; painting it
-                // (GOLD or QUIET) competes with the item content.
+                // Checkboxes render unstyled. The `[ ]` / `[x]` glyph
+                // itself is structural enough; painting it (GOLD or
+                // QUIET) competes with the item content.
                 self.push_text(if checked { "[x] " } else { "[ ] " }, Style::default());
             }
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
@@ -326,9 +326,9 @@ impl Writer {
             Tag::Heading { level, .. } => self.push_style(heading_style(level)),
             Tag::BlockQuote(_) => {
                 self.quote_depth += 1;
-                // Mirror Codex: block-quote *content* paints the same
-                // green as the leading `> ` prefix so the whole quoted
-                // run reads as one visual region.
+                // Block-quote *content* paints the same green as the
+                // leading `> ` prefix so the whole quoted run reads as
+                // one visual region.
                 self.push_style(Style::default().fg(Color::Green));
             }
             Tag::CodeBlock(kind) => {
@@ -350,10 +350,10 @@ impl Writer {
             }
             Tag::Link { dest_url, .. } => {
                 self.link_stack.push(dest_url.into_string());
-                // Mirror Codex: link text reads in the same `Cyan` as
-                // inline code, with `underlined` to disambiguate from
-                // identifiers. The trailing `(url)` follows the same
-                // style because it's pushed via `current_style`.
+                // Link text reads in the same `Cyan` as inline code,
+                // with `underlined` to disambiguate from identifiers.
+                // The trailing `(url)` follows the same style because
+                // it's pushed via `current_style`.
                 self.push_style(
                     Style::default()
                         .fg(Color::Cyan)
@@ -580,10 +580,10 @@ impl Writer {
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
-    // Mirror Codex: hierarchy through modifiers, not color. A wall of
-    // GOLD-painted headings competed with everything else for the eye.
-    // Bold for every level; underline H1/H2; italic for H3-H6 so the
-    // deeper levels still differ from H2.
+    // Hierarchy through modifiers, not color. A wall of GOLD-painted
+    // headings competed with everything else for the eye. Bold for
+    // every level; underline H1/H2; italic for H3-H6 so the deeper
+    // levels still differ from H2.
     let mut style = Style::default().add_modifier(Modifier::BOLD);
     match level {
         HeadingLevel::H1 | HeadingLevel::H2 => {

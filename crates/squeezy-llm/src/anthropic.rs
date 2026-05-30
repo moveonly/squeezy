@@ -31,9 +31,9 @@ const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
 /// Identity preamble Anthropic requires on OAuth-driven requests so
 /// the call counts against the Claude Pro/Max subscription quota
-/// rather than failing the OAuth quota check. Mirrors pi's verbatim
-/// string. The user's real instructions ride after this in a second
-/// system block.
+/// rather than failing the OAuth quota check. Anthropic pins the
+/// exact string. The user's real instructions ride after this in a
+/// second system block.
 const OAUTH_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// `User-Agent` value that marks a Squeezy-issued OAuth request as

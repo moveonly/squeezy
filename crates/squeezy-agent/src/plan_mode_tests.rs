@@ -51,8 +51,10 @@ fn build_mode_returns_base_verbatim() {
 
 #[test]
 fn plan_mode_instructions_within_budget() {
-    // The 3-phase prompt is intentionally heavier than v2's one-liner, but
-    // still well under Codex's 4.5KB plan.md. 3500 chars is the cap.
+    // The 3-phase prompt is intentionally heavier than v2's one-liner.
+    // 3500 chars is the cap — large enough for three phases plus the
+    // proposed-plan contract, small enough to stay well inside the
+    // cached system-prompt prefix.
     assert!(
         PLAN_MODE_INSTRUCTIONS.len() <= 3500,
         "PLAN_MODE_INSTRUCTIONS length {} > 3500",
@@ -103,8 +105,9 @@ fn plan_mode_uses_three_phase_structure() {
 
 #[test]
 fn plan_mode_instructs_exploration_before_questions() {
-    // Codex's failure mode at v2: model asks before reading anything.
-    // The prompt must explicitly steer toward exploration first.
+    // Common Plan-mode failure mode at v2: model asks before reading
+    // anything. The prompt must explicitly steer toward exploration
+    // first.
     assert!(
         PLAN_MODE_INSTRUCTIONS.contains("Read/Search"),
         "PLAN_MODE_INSTRUCTIONS must mention the Read/Search exploration pass"

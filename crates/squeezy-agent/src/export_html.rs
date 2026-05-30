@@ -6,13 +6,11 @@
 //! so terminal color sequences come out as inline-styled spans, and all
 //! user / model / tool content is HTML-escaped before reaching the page.
 //!
-//! The architecture is ported from pi's `core/export-html/` module (see
-//! `others/pi/packages/coding-agent/src/core/export-html`): we keep the
-//! shape (escape → ANSI parser → per-event render → wrap in a static
-//! document) but reuse Squeezy's own [`SessionRecord`] event stream
-//! instead of a separate session-manager file format. The output is
-//! intentionally portable: a static `.html` a user can email, attach to
-//! a bug report, or open offline without depending on any SaaS service.
+//! The pipeline is escape → ANSI parser → per-event render → wrap in a
+//! static document, driven directly by Squeezy's [`SessionRecord`] event
+//! stream. The output is intentionally portable: a static `.html` a user
+//! can email, attach to a bug report, or open offline without depending
+//! on any SaaS service.
 
 use std::fmt::Write;
 
@@ -382,9 +380,9 @@ fn write_footer(out: &mut String, record: &SessionRecord) -> Result<(), ExportEr
     Ok(())
 }
 
-/// HTML-escape `s` against attribute and content contexts. Matches the
-/// five-entity set used by pi's exporter so a session containing
-/// `<script>` literally renders as text.
+/// HTML-escape `s` against attribute and content contexts. Covers the
+/// standard five-entity set so a session containing `<script>`
+/// literally renders as text.
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     push_escaped_html(&mut out, s);
@@ -413,9 +411,9 @@ fn pretty_json(value: &Value) -> String {
 
 // ---- ANSI -> HTML ----------------------------------------------------------
 //
-// Ported from pi's `ansi-to-html.ts`. We keep the same palette and SGR
-// dispatch so the visual output matches a terminal as closely as
-// possible. Pure Rust; no external dep.
+// Standard 16-color ANSI palette + SGR dispatch so the rendered HTML
+// matches a terminal as closely as possible. Pure Rust; no external
+// dep.
 
 /// Standard ANSI 16-color palette. Index 0-7 are the standard colors,
 /// 8-15 are their bright variants.
@@ -665,9 +663,8 @@ fn ansi_lines_to_html(text: &str) -> String {
 /// The full CSS bundle baked into the export. Kept under 200 lines per
 /// the implementation contract; both themes coexist as
 /// attribute-selected variants so the exported file does not depend on
-/// a theme picker. The numbers were ported from pi's `template.css`
-/// (light variant) plus Squeezy's existing dark accent palette so the
-/// document looks at home next to the rest of the TUI's output.
+/// a theme picker. The dark accent palette matches Squeezy's TUI so the
+/// document looks at home next to the rest of the agent's output.
 fn inline_css() -> &'static str {
     include_str!("export_html_styles.css")
 }

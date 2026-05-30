@@ -25,16 +25,16 @@
 //! malformed template must never prevent valid templates (or the rest
 //! of the agent) from loading.
 //!
-//! Argument substitution supports two interchangeable surfaces so users
-//! can carry templates between Squeezy, Pi, Claude Code, Codex, and
-//! OpenCode without rewriting them:
+//! Argument substitution supports two interchangeable surfaces so the
+//! same template body works whether the author thinks in named slots or
+//! in shell-style positional args:
 //!
 //! - Named: `{name}` resolves to the positional arg at the index where
 //!   `name` appears in the `args` schema. `{ARGUMENTS}` resolves to all
 //!   args joined with a single space. `{1}`, `{2}`, …  resolve to
 //!   positional args (1-indexed, matching shell convention).
 //! - Compat: `$1`, `$2`, …, `$@`, `$ARGUMENTS`, `${@:N}`, `${@:N:L}`
-//!   match the bash/pi syntax verbatim. `${@:N}` slices from the Nth
+//!   use the bash slice syntax. `${@:N}` slices from the Nth
 //!   argument onward (1-indexed); `${@:N:L}` slices `L` args starting at
 //!   `N`.
 //!
@@ -474,11 +474,10 @@ pub fn parse_command_args(input: &str) -> Vec<String> {
 /// Render a template body by substituting argument tokens.
 ///
 /// The substitution honours both the `{name}`/`{ARGUMENTS}`/`{N}` curly
-/// syntax (used by the task spec and by Claude Code via `{}` blocks)
-/// and the `$1`/`$@`/`$ARGUMENTS`/`${@:N[:L]}` syntax (used by Pi and
-/// shell-script style templates). Tokens that don't resolve to a value
-/// are passed through verbatim so authors can keep literal braces or
-/// dollar signs in the prompt body.
+/// syntax (used by the task spec) and the
+/// `$1`/`$@`/`$ARGUMENTS`/`${@:N[:L]}` shell-style syntax. Tokens that
+/// don't resolve to a value are passed through verbatim so authors can
+/// keep literal braces or dollar signs in the prompt body.
 pub fn substitute_args(content: &str, args: &[String], schema: &[String]) -> String {
     let bytes = content.as_bytes();
     let mut out = String::with_capacity(content.len());

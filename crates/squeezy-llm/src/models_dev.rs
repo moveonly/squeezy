@@ -29,8 +29,9 @@ use squeezy_core::{Result, SqueezyError};
 /// air-gapped mirrors.
 pub const DEFAULT_MODELS_URL: &str = "https://models.dev/api.json";
 
-/// 24 hours. OpenCode uses 5 minutes because they have org-config pushing
-/// from a SaaS layer; Squeezy has no such layer, so daily is sufficient.
+/// 24 hours. Pricing and capability rows churn slowly enough that a
+/// daily refresh keeps the local catalog current without re-fetching
+/// on every cold start.
 pub const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -92,9 +93,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Default cache location: `~/.squeezy/cache/models.json`. Matches OpenCode's
-/// `~/.opencode/cache/models.json` convention so users familiar with the
-/// pattern aren't surprised.
+/// Default cache location: `~/.squeezy/cache/models.json`.
 pub fn default_cache_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     Some(home.join(".squeezy").join("cache").join("models.json"))

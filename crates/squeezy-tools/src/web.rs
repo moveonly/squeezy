@@ -28,10 +28,9 @@ pub(crate) const DEFAULT_WEB_SEARCH_RESULTS: usize = 8;
 pub(crate) const MAX_WEB_SEARCH_RESULTS: usize = 20;
 pub(crate) const DEFAULT_WEB_SEARCH_CONTEXT_CHARS: usize = 10_000;
 pub(crate) const MAX_WEB_SEARCH_CONTEXT_CHARS: usize = 50_000;
-/// Parallel Search MCP endpoint. Mirrors OpenCode's `PARALLEL_URL` in
-/// `packages/opencode/src/tool/mcp-websearch.ts`; both Exa and Parallel
-/// speak the same JSON-RPC `tools/call` protocol so the dispatcher only
-/// varies URL, auth, tool name, and argument shape.
+/// Parallel Search MCP endpoint. Both Exa and Parallel speak the same
+/// JSON-RPC `tools/call` protocol, so the dispatcher only varies URL,
+/// auth, tool name, and argument shape.
 pub const DEFAULT_PARALLEL_MCP_URL: &str = "https://search.parallel.ai/mcp";
 
 /// Selects which remote MCP-style websearch backend handles a query. The

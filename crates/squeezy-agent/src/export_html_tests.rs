@@ -99,8 +99,8 @@ fn xss_user_message_is_escaped() {
         json!({"text": payload}),
     )]);
     let html = export_session_to_html(&session, &ExportOpts::default()).unwrap();
-    // The literal `<script>` substring must never appear as raw markup;
-    // pi's exporter has the same guard. The escaped form does.
+    // The literal `<script>` substring must never appear as raw markup
+    // (escape guard); the escaped form does.
     assert!(
         !html.contains("<script>alert"),
         "user input escaped into raw markup: {html}"

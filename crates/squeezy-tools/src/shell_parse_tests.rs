@@ -1,10 +1,8 @@
 //! Unit tests for the typed `CommandUnit` payload produced by
-//! `extract_command_units`. The acceptance criterion comes from
-//! `audits/clear-code-comparison-2026-05-25/05-shell-parsing-and-exec.md`
-//! finding `F05-cc-tree-sitter-richer-command-extraction`:
-//! a structured walk should surface `{ name, args, env, redirects,
-//! has_substitution }` per `command` node so downstream classifiers can stop
-//! re-splitting segment text via `split_whitespace`.
+//! `extract_command_units`. A structured walk should surface
+//! `{ name, args, env, redirects, has_substitution }` per `command` node
+//! so downstream classifiers can stop re-splitting segment text via
+//! `split_whitespace`.
 
 use super::{CommandUnit, Redirect, extract_command_units};
 

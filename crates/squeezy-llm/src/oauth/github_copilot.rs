@@ -1,8 +1,7 @@
 //! GitHub Copilot OAuth (Copilot Chat API subscription) credential
 //! source.
 //!
-//! Mirrors pi's [`packages/ai/src/utils/oauth/github-copilot.ts`]
-//! device-code flow verbatim:
+//! Uses GitHub's device-code flow:
 //!
 //! 1. The CLI runs `squeezy auth github-copilot login`, optionally
 //!    prompting for an enterprise domain.
@@ -89,15 +88,14 @@ pub const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
 pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 
 /// Fallback base URL when token parsing fails (or the user is on a
-/// brand-new account whose token has not yet been observed). Matches
-/// pi's individual default; enterprise installs derive their base
-/// from the `enterprise_domain`.
+/// brand-new account whose token has not yet been observed). Enterprise
+/// installs derive their base from the `enterprise_domain`.
 pub const DEFAULT_BASE_URL: &str = "https://api.individual.githubcopilot.com";
 
 /// Filename under `~/.squeezy/auth/` where persisted Copilot tokens
-/// live. Hyphenated to match the CLI subcommand (`github-copilot`)
-/// and the pi reference; the rest of the codebase stays on
-/// snake_case provider section names.
+/// live. Hyphenated to match the CLI subcommand (`github-copilot`);
+/// the rest of the codebase stays on snake_case provider section
+/// names.
 pub const AUTH_FILE_NAME: &str = "github-copilot.json";
 
 /// RFC 8628 §3.2 default polling interval when the device-code
@@ -309,9 +307,8 @@ pub fn write_tokens(path: &Path, tokens: &PersistedGitHubCopilotTokens) -> Resul
 
 /// Normalize a user-supplied enterprise domain or URL into a bare
 /// host. Returns `None` for an empty/whitespace input so the caller
-/// can fall back to [`DEFAULT_DOMAIN`]. Mirrors pi's
-/// `normalizeDomain` so an enterprise user can paste either
-/// `acme.ghe.com` or `https://acme.ghe.com/`.
+/// can fall back to [`DEFAULT_DOMAIN`]. Lets an enterprise user paste
+/// either `acme.ghe.com` or `https://acme.ghe.com/`.
 pub fn normalize_domain(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -355,7 +352,7 @@ impl GitHubCopilotUrls {
 /// The token payload is a `;`-delimited key/value string and
 /// `proxy-ep=<host>` carries the host of the inference proxy; the
 /// matching API host is the same value with the `proxy.` prefix
-/// rewritten to `api.`. Mirrors pi's `getBaseUrlFromToken`.
+/// rewritten to `api.`.
 pub fn base_url_from_token(token: &str) -> Option<String> {
     for part in token.split(';') {
         let (key, value) = part.split_once('=')?;
@@ -557,9 +554,8 @@ fn classify_device_error(err: &DeviceTokenErrorResponse) -> DevicePollOutcome {
     }
 }
 
-/// Drive the polling loop to completion. Mirrors pi's
-/// `pollOAuthDeviceCodeFlow`: bound by `expires_in`, sleeps for at
-/// least `interval` seconds between pollings, applies
+/// Drive the polling loop to completion. Bounded by `expires_in`,
+/// sleeps for at least `interval` seconds between pollings, applies
 /// [`SLOW_DOWN_INCREMENT`] whenever the server says `slow_down`, and
 /// surfaces a typed `Cancelled` error when the supplied
 /// [`CancellationToken`] fires.
@@ -693,8 +689,7 @@ pub struct PolicyEnablementOutcome {
 
 /// POST `/models/{id}/policy` for each model id, asking GitHub to
 /// flip the user's per-model "enabled" flag. Best-effort: a failed
-/// request does not abort the loop, matching pi's
-/// `enableAllGitHubCopilotModels`. Returns the per-model outcome so
+/// request does not abort the loop. Returns the per-model outcome so
 /// the CLI can report it without surfacing each underlying error.
 pub async fn enable_models(
     client: &reqwest::Client,

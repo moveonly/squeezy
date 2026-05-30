@@ -9,9 +9,8 @@
 //! of zero with no error in sight.
 //!
 //! This module centralizes the client-side clamp so the OpenAI Responses
-//! adapter and the OpenAI-compatible chat-completions adapter agree on the
-//! single source of truth. Mirrors pi's `clampOpenAIPromptCacheKey`
-//! (`others/pi/packages/ai/src/providers/openai-prompt-cache.ts`).
+//! adapter and the OpenAI-compatible chat-completions adapter agree on
+//! the single source of truth.
 //!
 //! The clamp counts Unicode scalar values (codepoints), not bytes — a key
 //! of 64 multibyte characters (up to 4 bytes each) is well within the

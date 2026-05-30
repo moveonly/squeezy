@@ -425,9 +425,7 @@ fn request_body_emits_one_hour_ttl_marker_for_long_retention() {
     // F11: `CacheRetention::Long` must surface on the Anthropic Messages
     // wire as `cache_control: { type: "ephemeral", ttl: "1h" }` on every
     // breakpoint (system, last user, last stable tool) so the cached
-    // prefix survives Anthropic's default ~5m short window. Mirrors pi's
-    // `cacheRetention = "long"` behavior
-    // (`others/pi/packages/ai/src/providers/anthropic.ts:62-66`).
+    // prefix survives Anthropic's default ~5m short window.
     let request = LlmRequest {
         model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
         instructions: "system prompt".to_string().into(),

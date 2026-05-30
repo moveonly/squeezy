@@ -765,8 +765,7 @@ fn request_body_emits_prompt_cache_retention_24h_for_long_retention_openai_route
     // F11: OpenAI-via-OpenRouter (Chat Completions route) must surface
     // `CacheRetention::Long` as the top-level `prompt_cache_retention: "24h"`
     // body field so the cached prefix lifetime matches the native OpenAI
-    // provider. Mirrors pi's `streamOpenAICompletions`
-    // (`others/pi/packages/ai/src/providers/openai-completions.ts:517-522`).
+    // provider.
     let mut request = sample_request();
     request.model = "openai/gpt-5.5".to_string().into();
     request.cache = crate::CacheSpec {
@@ -866,8 +865,7 @@ fn classify_is_case_insensitive() {
 fn classify_falls_back_to_generic_for_unknown_namespace() {
     // Unknown namespaces (custom self-hosted ids, brand-new aggregators)
     // must fall through to Generic instead of crashing or accidentally
-    // picking up Anthropic-style cache markers. Mirrors pi's behavior in
-    // `others/pi/packages/ai/src/types.ts` where compat overrides default
+    // picking up Anthropic-style cache markers. Compat overrides default
     // to "ignore" rather than "panic" for unknown providers.
     assert_eq!(classify("groq/llama-3.3-70b"), CompatFlavor::Generic);
     assert_eq!(classify("custom-self-hosted-model"), CompatFlavor::Generic);

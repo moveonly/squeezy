@@ -46,12 +46,12 @@ operation. The sha256 gate still fires per file, so any file the user
 edited between the agent turn and the rollback is reported as a
 conflict rather than clobbered.
 
-## Reference Comparison
+## Design Rationale
 
-Codex's `apply_patch` records `AppliedPatchDelta` per call but exposes
-no group identifier and no group-level rollback verb. Reverting an
-agent turn there means hand-composing reverse hunks. That is the
-specific gap `group_id` closes; keep it.
+Per-call edit deltas without a group identifier force a turn-level
+revert to be hand-composed from reverse hunks. The `group_id` shape
+closes that gap by giving every checkpoint a single addressable unit
+that can be rolled back atomically.
 
 The shadow-repo isolation (`refs/squeezy/checkpoints/<id>/{before,after}`,
 hooks/gpg/commit-graph disabled) is what makes group rollback durable

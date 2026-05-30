@@ -102,10 +102,8 @@ pub use subagent_catalog::{
     PROJECT_SUBAGENTS_DIR, SubagentCatalog, SubagentDefinition, SubagentSource, USER_SUBAGENTS_DIR,
 };
 
-// Emergency belt on tool rounds per turn — codex and opencode loop
-// unbounded; CC only caps explicit-purpose subagents (its
-// `forkSubagent` uses 200). 200 keeps a true safety ceiling without
-// truncating legitimate long-running exploration.
+// Emergency belt on tool rounds per turn. 200 keeps a true safety
+// ceiling without truncating legitimate long-running exploration.
 const MAX_TOOL_ROUNDS: usize = 200;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
 const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
@@ -3860,7 +3858,7 @@ async fn complete_local_tool_turn(
         // `!!cmd` (exclude_from_context) keeps the exchange visible in the
         // TUI transcript and the durable session log, but skips the
         // LLM-facing `conversation` so the next model round will not
-        // replay the ad-hoc check (mirrors pi's `!!` head-commit feature).
+        // replay the ad-hoc check the user ran as a sanity prompt.
         if !exclude_from_context {
             state.conversation.push(user_item);
             state
@@ -5092,8 +5090,8 @@ impl TurnRuntime {
                         // Push the opaque blob into the conversation now so the
                         // model gets it back on every subsequent provider call
                         // in this turn (tool result → next model call → ...),
-                        // not just at the end. Mirrors codex: each reasoning
-                        // segment is committed when it closes.
+                        // not just at the end. Each reasoning segment is
+                        // committed the moment it closes.
                         conversation.push(redact_input_item(
                             LlmInputItem::Reasoning(payload),
                             &self.redactor,
@@ -6614,14 +6612,14 @@ struct SubagentExecution {
     /// `summary` carries the raw text and callers can fall back to it.
     structured_output: Option<Value>,
     /// Workspace-relative or absolute paths the subagent read or wrote,
-    /// extracted from tool-call arguments and deduped in iteration order.
-    /// Mirrors clear-code's `agentToolResultSchema` shape so the parent
-    /// can attribute work without reading the supporting-receipt SHAs.
+    /// extracted from tool-call arguments and deduped in iteration
+    /// order. Lets the parent attribute work without reading the
+    /// supporting-receipt SHAs.
     files_touched: Vec<String>,
     /// Full assistant + tool trace when the operator opts in via
     /// `subagents.include_transcript = true`. Empty by default so the
     /// parent-visible block stays the synthesized result, not the raw
-    /// child loop history (see `agentToolUtils.ts:276–357`).
+    /// child loop history.
     transcript: Vec<Value>,
 }
 
@@ -7060,11 +7058,10 @@ async fn run_subagent(
     config.session_mode = SessionMode::Plan;
     config.store_responses = false;
     // Plan/Delegate/Review subagents do real agent work and should be sized
-    // like the main agent — peer agents (codex, opencode) apply no output cap
-    // at all, CC only caps its narrow fork. Inherit the parent's cap; only
-    // fall back to `max_summary_tokens` when the parent didn't set one, so
-    // users with a strict global ceiling still get that ceiling honored.
-    // DocHelp keeps its own floor because its "summary" IS the user-facing
+    // like the main agent. Inherit the parent's cap; only fall back to
+    // `max_summary_tokens` when the parent didn't set one, so users with
+    // a strict global ceiling still get that ceiling honored. DocHelp
+    // keeps its own floor because its "summary" IS the user-facing
     // answer (not a synopsis) — see DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS.
     config.max_output_tokens = match kind {
         SubagentKind::DocHelp => parent
@@ -7081,8 +7078,7 @@ async fn run_subagent(
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
     // Subagent inherits the parent's per-round result-bytes cap directly.
     // The previous `.min(24_000)` halved the budget for a subagent that
-    // already had fewer tool calls to spend; no peer agent applies a
-    // smaller per-result cap to subagents than to the parent.
+    // already had fewer tool calls to spend.
     let model = subagent_model_for_kind(parent.provider.name(), &config, kind);
     config.model = model.clone();
 
@@ -7223,9 +7219,8 @@ fn collect_files_touched(supporting_receipts: &[Value]) -> Vec<String> {
 /// Serializes the subagent's tool-using conversation into a compact
 /// array of `{role, ...}` records so an operator who opts in via
 /// `subagents.include_transcript = true` can replay the child's loop.
-/// Mirrors clear-code's sidechain transcript (`runAgent.ts:792–805`)
-/// but stays in the parent-visible JSON instead of a separate file so
-/// it can be diffed against the synthesized summary in one place.
+/// Stays in the parent-visible JSON instead of a separate file so it
+/// can be diffed against the synthesized summary in one place.
 fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
     conversation
         .iter()
@@ -7659,10 +7654,9 @@ fn subagent_control_result(
         "supporting_receipts": execution.supporting_receipts,
         "files_touched": execution.files_touched,
         "cost": provider,
-        // Cache breakdown promoted to a top-level block mirroring
-        // clear-code's `agentToolResultSchema.usage` shape so the
-        // parent can answer "how much of this subagent's input was
-        // a cache hit?" without reaching into the nested `cost` map.
+        // Cache breakdown promoted to a top-level block so the parent
+        // can answer "how much of this subagent's input was a cache
+        // hit?" without reaching into the nested `cost` map.
         "cache": {
             "input_tokens": provider.input_tokens,
             "output_tokens": provider.output_tokens,
@@ -7788,9 +7782,8 @@ fn parse_delegate_chain_steps(call: &ToolCall) -> Result<Vec<DelegateChainStep>,
 /// Done verbatim — no regex, no formatting — so a step that does not
 /// mention `{previous}` stays byte-identical and a step that mentions it
 /// multiple times sees every instance replaced. The first step's
-/// `previous` is the empty string, which mirrors how chained models in
-/// peer agents (e.g. opencode's `chain` mode) seed the placeholder for
-/// the leading step.
+/// `previous` is the empty string for the leading step, so the
+/// placeholder collapses to nothing instead of leaving a stray literal.
 fn chain_substitute_previous(template: &str, previous: &str) -> String {
     template.replace(DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER, previous)
 }

@@ -3,8 +3,8 @@
 `squeezy-core` resolves every TOML string value in `settings.toml` whose first
 character is `!` by running the remainder through the user's shell
 (`/bin/sh -c <cmd>` on Unix, `cmd.exe /C <cmd>` on Windows) at config-load
-time and substituting the trimmed stdout as the value. This mirrors pi's
-`resolve-config-value` flow and lets users wire in credential helpers like
+time and substituting the trimmed stdout as the value. The escape lets
+users wire in credential helpers like
 `api_key = "!op read op://Personal/OpenAI/credential"` without persisting
 secrets to disk. The escape only fires on strings that *start* with `!`;
 values such as `prompt = "hello!"` are left intact. **The settings file is

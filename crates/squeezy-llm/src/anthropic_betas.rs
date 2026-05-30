@@ -5,10 +5,8 @@
 //! Messages API accepts them via the `anthropic-beta` HTTP header; on
 //! Bedrock the AWS gateway strips non-standard headers, so a subset has
 //! to go in `additional_model_request_fields.anthropic_beta` (an
-//! application-layer body field) instead. Mirrors clear-code's
-//! `constants/betas.ts` `BEDROCK_EXTRA_PARAMS_HEADERS` set: only those
-//! body-param-eligible betas reach Bedrock; the rest are dropped on
-//! that transport.
+//! application-layer body field) instead. Only the body-param-eligible
+//! betas reach Bedrock; the rest are dropped on that transport.
 //!
 //! This module is the routing surface only. Specific beta constants and
 //! per-model gating policy belong in a follow-up.

@@ -1,8 +1,7 @@
 //! Case-insensitive subsequence matcher with a prefix bonus.
 //!
-//! Mirrors the *shape* of Codex's `utils/fuzzy-match` (case-insensitive
-//! subsequence, Unicode-correct, `-100` prefix bonus). Implemented from
-//! scratch; no upstream code is copied.
+//! Scoring is case-insensitive, Unicode-correct, with a `-100` prefix
+//! bonus that pulls exact-prefix matches above subsequence hits.
 
 /// Score a haystack against a needle using a case-insensitive subsequence
 /// match. Returns `None` if the needle's lowercase characters do not all

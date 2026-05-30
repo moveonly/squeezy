@@ -1,15 +1,15 @@
 //! Git worktree create/cleanup primitives for isolated agent sessions.
 //!
-//! Mirrors the lifecycle pieces of clear-code's `EnterWorktreeTool` /
-//! `ExitWorktreeTool` (see `src/utils/worktree.ts`) at the VCS layer: slug
-//! validation, `git worktree add`, and a fail-closed cleanup path that
-//! refuses to remove worktrees with uncommitted changes or ahead-of-base
-//! commits unless the caller explicitly opts in via `discard_changes`.
+//! Covers slug validation, `git worktree add`, and a fail-closed cleanup
+//! path that refuses to remove worktrees with uncommitted changes or
+//! ahead-of-base commits unless the caller explicitly opts in via
+//! `discard_changes`.
 //!
 //! The TUI/CLI binding (`/worktree enter` / `/worktree exit`) lives in
-//! `squeezy-tui`; this crate intentionally exposes no model-callable tool
-//! surface — per the F07-cc-worktree-isolation audit, worktree creation
-//! stays a user gesture in the first batch.
+//! `squeezy-tui`; this crate intentionally exposes no model-callable
+//! tool surface — worktree creation stays a user gesture in the first
+//! batch so a runaway agent can't pivot the user out of their current
+//! checkout.
 //!
 //! `AGENTS.md` discovery in `squeezy-agent` walks from `workspace_root`
 //! downward, so pointing the agent at a fresh worktree path already gives
@@ -43,11 +43,10 @@ pub struct Worktree {
     pub head_commit: String,
 }
 
-/// Validate a worktree slug using clear-code's allowlist (see
-/// `src/utils/worktree.ts:48`): each `/`-separated segment must be
-/// non-empty and contain only letters, digits, `.`, `_`, `-`. Total length
-/// capped at 64. Rejects `.` / `..` segments so a slug can never escape
-/// the `worktrees/` parent via `path::join`.
+/// Validate a worktree slug: each `/`-separated segment must be
+/// non-empty and contain only letters, digits, `.`, `_`, `-`. Total
+/// length is capped at 64. Rejects `.` / `..` segments so a slug can
+/// never escape the `worktrees/` parent via `path::join`.
 pub fn validate_worktree_slug(slug: &str) -> Result<()> {
     if slug.len() > MAX_WORKTREE_SLUG_LENGTH {
         return Err(SqueezyError::Tool(format!(
@@ -112,8 +111,7 @@ pub fn create(repo_root: &Path, slug: &str) -> Result<Worktree> {
 impl Worktree {
     /// Count uncommitted entries (porcelain status lines) and commits
     /// ahead of `base_commit`. Returns `None` (fail-closed) when git
-    /// status fails — callers should treat that as "refuse to remove",
-    /// mirroring clear-code's `countWorktreeChanges` (`ExitWorktreeTool.ts:79`).
+    /// status fails — callers should treat that as "refuse to remove".
     pub fn count_changes(&self) -> Option<(usize, usize)> {
         let status = git_text(&self.path, &["status", "--porcelain"]).ok()?;
         let dirty = status.lines().filter(|line| !line.is_empty()).count();

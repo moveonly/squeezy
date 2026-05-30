@@ -287,8 +287,8 @@ impl OpenAiCompatibleProvider {
             // via OpenRouter, smaller MoEs) ignore `auto` and emit a
             // chatty preamble with zero tool calls; setting
             // `tool_choice = "required"` in `[model]` flips them into
-            // calling at least one tool per turn — see opencode's
-            // pass-through pattern in `openai-chat.ts:267`.
+            // calling at least one tool per turn by passing the field
+            // through verbatim.
             if let Some(choice) = request.tool_choice.as_deref() {
                 body["tool_choice"] = json!(choice);
             }
@@ -332,10 +332,9 @@ pub(crate) enum CompatFlavor {
     Generic,
 }
 
-/// Per-namespace compatibility row. The struct mirrors pi's
-/// `OpenAICompletionsCompat` interface (`others/pi/packages/ai/src/types.ts`)
-/// in spirit: a typed set of capability flags that drive wire-shape choices
-/// without scattering substring tests across the request builder.
+/// Per-namespace compatibility row. A typed set of capability flags
+/// drives wire-shape choices without scattering substring tests across
+/// the request builder.
 ///
 /// `flavor`, `supports_tool_calls`, and `supports_reasoning` are read by
 /// the unit tests in `compatible_tests.rs` and exposed for the next
@@ -861,10 +860,9 @@ impl StreamState {
             // Qwen sometimes ship a tool-call delta whose name chunk goes
             // missing or whose stream cuts mid-call. Erroring here would
             // discard any assistant text the model already produced and
-            // halt the turn. Match opencode's `finishAll`
-            // (utils/tool-stream.ts:200): drop the partial entry, complete
-            // the turn with whatever did surface, let the model retry next
-            // turn. A short stderr warning makes the drop traceable.
+            // halt the turn. Drop the partial entry, complete the turn
+            // with whatever did surface, let the model retry next turn.
+            // A short stderr warning makes the drop traceable.
             let Some(name) = partial.name else {
                 // Surface the drop both to stderr (for `tail -f
                 // ~/.cache/squeezy-tui-debug.log`) AND via the

@@ -9,8 +9,6 @@
 //! * Project: `<workspace>/.squeezy/agents/*.md`
 //! * User: `~/.squeezy/agents/*.md`
 //!
-//! The discovery flow mirrors pi's `discoverAgents` reference design
-//! (`others/pi/packages/coding-agent/examples/extensions/subagent/agents.ts`).
 //! Each `.md` file carries a YAML frontmatter block with `name`,
 //! `description`, optional `model`, and an optional CSV/inline-list
 //! `tools` field; the body becomes the subagent's system prompt.
@@ -305,9 +303,9 @@ pub(crate) struct SubagentFrontmatter {
 /// The format is YAML between `---` fences at the top, then markdown
 /// body. The parser is intentionally line-based (no `yaml` crate
 /// dependency) to match the existing skills frontmatter parser and keep
-/// the dependency footprint flat. Unknown frontmatter keys are ignored,
-/// matching pi's lenient `parseFrontmatter` contract so adding a new
-/// optional field in a `.md` file never breaks an older Squeezy build.
+/// the dependency footprint flat. Unknown frontmatter keys are ignored
+/// so adding a new optional field in a `.md` file never breaks an older
+/// Squeezy build.
 pub(crate) fn parse_subagent_file(
     content: &str,
 ) -> std::result::Result<(SubagentFrontmatter, String), String> {

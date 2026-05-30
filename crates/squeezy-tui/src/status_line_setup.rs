@@ -1,11 +1,11 @@
 //! Interactive `/statusline` picker overlay.
 //!
-//! Mirrors codex's `bottom_pane/status_line_setup.rs`: a checkbox list of
-//! every [`StatusLineItem`], a "Use theme colors" toggle, an order-preserving
-//! reorder via Shift+↑/↓, a free-form search filter, and a live preview built
-//! with the same renderer the real status bar uses. Save persists the picker
-//! state to `[tui].status_line` + `[tui].status_line_use_colors` and applies
-//! the change in-memory immediately.
+//! A checkbox list of every [`StatusLineItem`], a "Use theme colors"
+//! toggle, an order-preserving reorder via Shift+↑/↓, a free-form
+//! search filter, and a live preview built with the same renderer the
+//! real status bar uses. Save persists the picker state to
+//! `[tui].status_line` + `[tui].status_line_use_colors` and applies the
+//! change in-memory immediately.
 //!
 //! The view owns no app state of its own beyond what's needed to draw and
 //! handle keys; on save it asks the caller to update `TuiApp` so the next
@@ -43,8 +43,7 @@ pub(crate) enum KeyOutcome {
 pub(crate) struct StatusLineSetupState {
     /// Items in the order they will render in the status bar.
     items: Vec<(StatusLineItem, bool)>,
-    /// Whether the accent palette is applied. Mirrors codex's
-    /// `status_line_use_colors`.
+    /// Whether the accent palette is applied to enabled items.
     use_colors: bool,
     /// Cursor row in the *visible* (filter-matched) list. Row 0 is the
     /// "Use theme colors" toggle; rows 1.. are item rows after the
@@ -57,8 +56,8 @@ pub(crate) struct StatusLineSetupState {
 impl StatusLineSetupState {
     pub(crate) fn new(configured: Option<&[StatusLineItem]>, use_colors: bool) -> Self {
         // Start from the user's configured order; append any items they
-        // haven't enabled in the codex-style "all available" order so they
-        // remain reachable in the picker.
+        // haven't enabled in the canonical "all available" order so
+        // they remain reachable in the picker.
         let mut items: Vec<(StatusLineItem, bool)> = Vec::new();
         if let Some(configured) = configured {
             for item in configured {

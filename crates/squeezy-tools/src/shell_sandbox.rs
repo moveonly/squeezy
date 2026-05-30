@@ -1307,9 +1307,9 @@ pub(crate) fn linux_unshare_supported() -> bool {
 /// sibling processes in the same user namespace, `process_vm_readv` /
 /// `process_vm_writev` for cross-process memory, or `socket(AF_UNIX)` for
 /// connecting to abstract or filesystem-backed local sockets the agent runs.
-/// We mirror codex's Linux sandbox by returning `EPERM` for those calls;
-/// the kernel returns the same errno a normal access check would, so a
-/// well-behaved tool degrades to a clean error instead of crashing.
+/// The sandbox returns `EPERM` for those calls; the kernel returns the
+/// same errno a normal access check would, so a well-behaved tool
+/// degrades to a clean error instead of crashing.
 #[cfg(target_os = "linux")]
 mod linux_seccomp {
     use std::collections::BTreeMap;

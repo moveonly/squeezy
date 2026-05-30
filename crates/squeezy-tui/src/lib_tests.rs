@@ -3313,7 +3313,7 @@ fn transcript_item_formats_role_label() {
 
 #[test]
 fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
-    // Long-output regression: under the codex-style 5-line cap, a short
+    // Long-output regression: under the 5-line collapsed cap, a short
     // grep result fits inside the preview window so the body shows even
     // in the collapsed state — but a long body must be head-tail truncated
     // with the Ctrl-E ellipsis, then fully expand when toggled.
@@ -3765,8 +3765,8 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
         }),
     );
 
-    // Each card now shows a short body preview by default (codex-style
-    // 5-line cap), so the rendered height is taller than the old empty-
+    // Each card now shows a short body preview by default (5-line head-
+    // tail cap), so the rendered height is taller than the old empty-
     // body collapsed view — render at a height that fits all three cards.
     let output = render_to_string(&app, 180, 40);
 
@@ -3878,7 +3878,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
 
 #[test]
 fn collapsed_edit_row_shows_diff_preview() {
-    // apply_patch cards bypass the codex-style 5-line cap (the diff *is*
+    // apply_patch cards bypass the 5-line collapsed cap (the diff *is*
     // the point of the card) so the body renders inline by default. We
     // verify the per-file summary header + the +/- patch lines survive.
     let mut app = test_app(SessionMode::Build);

@@ -1492,10 +1492,10 @@ impl ToolRegistry {
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
         // Partition first-party before MCP, alphabetic within each group. The
         // contiguous first-party prefix lets the Anthropic adapter place its
-        // tools-array `cache_control` breakpoint on the last first-party tool
-        // (clear-code's `assembleToolPool` invariant in `src/tools.ts:345-367`),
-        // so a mid-session MCP `tools/list` refresh churns only bytes after the
-        // breakpoint instead of invalidating the cached prefix for every turn.
+        // tools-array `cache_control` breakpoint on the last first-party tool,
+        // so a mid-session MCP `tools/list` refresh churns only bytes after
+        // the breakpoint instead of invalidating the cached prefix for every
+        // turn.
         specs.sort_by(|left, right| {
             let left_mcp = left.name.starts_with("mcp__");
             let right_mcp = right.name.starts_with("mcp__");
@@ -5450,7 +5450,6 @@ pub(crate) fn truncate_text(value: &str, max_chars: usize) -> String {
 }
 
 /// Curly-quote → straight-quote map used by the apply_patch search fallback.
-/// Mirrors clear-code's `normalizeQuotes` (`src/tools/FileEditTool/utils.ts:31`).
 /// Each curly quote in UTF-8 is 3 bytes; the straight counterpart is 1 byte —
 /// so a normalized copy of any string is at most the same byte length as the
 /// original, never longer. That lets us safely index normalized offsets back
@@ -5513,10 +5512,9 @@ fn find_with_quote_normalization(content: &str, search: &str) -> Option<(usize, 
     Some((orig_start, orig_end, matches.len()))
 }
 /// Re-emit curly quotes in `replace` whenever the matched original slice used
-/// them, so a quote-normalized edit preserves the file's typography. Mirrors
-/// clear-code's `preserveQuoteStyle` (`src/tools/FileEditTool/utils.ts:104`)
-/// with the same open/close heuristic plus the apostrophe-in-contraction
-/// special case so `"don't" → "don't"` round-trips correctly.
+/// them, so a quote-normalized edit preserves the file's typography. The
+/// open/close heuristic plus the apostrophe-in-contraction special case
+/// keeps `"don't" → "don't"` round-tripping correctly.
 fn preserve_quote_style(replace: &str, original_slice: &str) -> String {
     let has_curly_double =
         original_slice.contains('\u{201C}') || original_slice.contains('\u{201D}');

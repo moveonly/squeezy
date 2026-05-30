@@ -18,9 +18,7 @@
 //! `lookup_patch_plan` for the cleanup-on-read semantics.
 //!
 //! This binding is intentional and is the reason Squeezy can refuse to drift
-//! outside the plan even when the model emits a wider edit set; see
-//! `audits/codex-comparison-2026-05-25/vcs.md` finding `G-vcs-F4` for the
-//! rationale and the comparison with Codex's no-planning model. The binding
+//! outside the plan even when the model emits a wider edit set. The binding
 //! is graph-anchored rather than path-prefix based on purpose: a refactor's
 //! neighborhood follows call/reference edges, not directory structure.
 

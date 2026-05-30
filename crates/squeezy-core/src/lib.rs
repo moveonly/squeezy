@@ -19,15 +19,13 @@ pub use hardening::pre_main_hardening;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
-/// ChatGPT Plus/Pro Codex backend. Mirrors pi's `openai-codex-responses`
-/// route — the protocol is OpenAI's Responses API, but the requests go
-/// through the ChatGPT backend with the subscription's account id stamped
-/// in `chatgpt-account-id`.
+/// ChatGPT Plus/Pro Codex backend. The protocol is OpenAI's Responses
+/// API, but the requests go through the ChatGPT backend with the
+/// subscription's account id stamped in `chatgpt-account-id`.
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const DEFAULT_OPENAI_CODEX_MODEL: &str = DEFAULT_OPENAI_MODEL;
 /// Originator tag stamped on every Codex request so OpenAI can attribute
-/// traffic to squeezy in their dashboards. Matches the `originator`
-/// header pi uses (`"pi"`) but identifies squeezy specifically.
+/// traffic to squeezy in their dashboards.
 pub const DEFAULT_OPENAI_CODEX_ORIGINATOR: &str = "squeezy";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-7";
@@ -139,13 +137,12 @@ pub fn vertex_base_url(project: &str, location: &str) -> String {
 }
 
 /// Resolve a bare-name model alias (e.g. `opus`, `sonnet`, `haiku`) to the
-/// provider-preferred full model ID. Mirrors clear-code's
-/// `getDefaultOpusModel` / `getDefaultSonnetModel` / `getDefaultHaikuModel`
-/// (`src/utils/model/model.ts:105-138`) so `squeezy --model opus` resolves to
-/// `claude-opus-4-7` on Anthropic instead of being sent verbatim and 404-ing
-/// downstream. Lookup is case-insensitive on the alias. Returns `None` for
-/// inputs that don't match any alias, in which case callers should pass the
-/// string through unchanged (it's presumed to be a full model ID).
+/// provider-preferred full model ID, so `squeezy --model opus` resolves to
+/// `claude-opus-4-7` on Anthropic instead of being sent verbatim and
+/// 404-ing downstream. Lookup is case-insensitive on the alias. Returns
+/// `None` for inputs that don't match any alias, in which case callers
+/// should pass the string through unchanged (it's presumed to be a full
+/// model ID).
 pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> {
     let normalized = alias.trim().to_ascii_lowercase();
     match (provider, normalized.as_str()) {
@@ -199,13 +196,11 @@ pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
-// Per-turn aggregate budgets. None of the three peer agents (codex,
-// CC, opencode) bound aggregate tool calls, bytes read, or
-// files enumerated across a turn — every cap they have is per single
-// tool invocation. These defaults are sized so they never bind in
-// realistic use; users who want strict cost caps can set tighter
-// values in `squeezy.toml`. Kept finite (rather than `u64::MAX`) so
-// the inspect output remains TOML-roundtrippable.
+// Per-turn aggregate budgets across every tool the agent runs in a
+// single turn. These defaults are sized so they never bind in realistic
+// use; users who want strict cost caps can set tighter values in
+// `squeezy.toml`. Kept finite (rather than `u64::MAX`) so the inspect
+// output remains TOML-roundtrippable.
 pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 10_000;
 pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 1_000_000_000;
 pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 1_000_000;
@@ -231,20 +226,17 @@ pub const DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST: u32 = u32::MAX;
 /// for hours by claiming a multi-day cooldown.
 pub const DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS: u64 = 60_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
-// Per-subagent-invocation budgets. No peer agent has any equivalent —
-// codex, CC, and opencode bound work per single tool call,
-// not per subagent run. Sized so they never bind in realistic use;
-// the subagent's natural exit is the model emitting a final answer
-// with no tool calls.
+// Per-subagent-invocation budgets, sized so they never bind in
+// realistic use; the subagent's natural exit is the model emitting a
+// final answer with no tool calls.
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
-// Emergency belt on subagent model rounds. CC caps its narrow
-// `forkSubagent` at 200, but Plan/Delegate/Review subagents here
-// run full agent work — sized to match what real long-running
+// Emergency belt on subagent model rounds. Plan/Delegate/Review
+// subagents run full agent work, sized to match what real long-running
 // agent sessions reach in practice. The cost broker, cancellation
-// token, and per-tool-call truncations are the load-bearing
-// safeguards; this is the last-resort belt.
+// token, and per-tool-call truncations are the load-bearing safeguards;
+// this is the last-resort belt.
 pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 1_000;
 // Wall-clock ceiling for a single subagent run. None of the per-call
 // budgets (tool calls, bytes, model rounds, summary tokens) measure elapsed
@@ -290,10 +282,10 @@ pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 // Absolute fallback for the per-turn compaction trigger when
 // `model_context_window` is not set in `squeezy.toml`. Modern models
-// run with 128k+ context windows; the percent-of-context path (which
-// peer agents use, ~90%) is the right shape and should take over once
-// the window is auto-derived from `model_info_for`. This fallback is
-// only the safety net for the unknown-model case.
+// run with 128k+ context windows; the percent-of-context path (~90%)
+// is the right shape and takes over once the window is auto-derived
+// from `model_info_for`. This fallback is only the safety net for the
+// unknown-model case.
 pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 60_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
 pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
@@ -321,10 +313,8 @@ pub const DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKEN
 pub const DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT: u8 = 60;
 /// Keep this many newest compactable tool results verbatim during
 /// micro-compaction; older results are rewritten to a placeholder. 5
-/// matches clear-code's `TIME_BASED_MC_CONFIG_DEFAULTS.keepRecent`
-/// (`src/services/compact/timeBasedMCConfig.ts:33`), which is enough to
-/// resolve typical "what did the last read of foo.rs show?" follow-ups
-/// without forcing a re-read.
+/// is enough to resolve typical "what did the last read of foo.rs
+/// show?" follow-ups without forcing a re-read.
 pub const DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT: usize = 5;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 /// Tools whose full JSON schema is always sent up-front in every request,
@@ -2228,9 +2218,8 @@ pub struct ProviderTransportConfig {
     pub stream_idle_timeout_ms: u64,
     /// Idle timeout (ms) for TCP connections sitting in the shared
     /// HTTP pool. `0` disables eviction entirely (connections live
-    /// until the remote closes them). Mirrors pi's
-    /// `HTTP_IDLE_TIMEOUT_MS` knob — but note this controls pool
-    /// eviction; per-event SSE idle gating stays governed by
+    /// until the remote closes them). Controls pool eviction;
+    /// per-event SSE idle gating stays governed by
     /// [`Self::stream_idle_timeout_ms`].
     pub pool_idle_timeout_ms: u64,
     /// Maximum idle TCP connections kept per origin in the shared
@@ -3809,9 +3798,9 @@ pub struct SubagentConfig {
     pub max_runtime_secs: Option<u64>,
     /// When `true`, the structured subagent result returned to the parent
     /// carries a `transcript` field with the child's assistant + tool
-    /// trace. Default `false` — the parent sees only the final `summary`
-    /// + `supporting_receipts` + `files_touched`, mirroring clear-code's
-    ///   sidechained-by-default shape (`agentToolUtils.ts:276–357`).
+    /// trace. Default `false` — the parent sees only the final fields
+    /// (`summary`, `supporting_receipts`, `files_touched`), keeping the
+    /// parent loop's context tight.
     pub include_transcript: bool,
 }
 
@@ -5909,8 +5898,8 @@ pub struct WebSettings {
     pub exa_api_key_env: Option<String>,
     pub parallel_mcp_url: Option<String>,
     pub parallel_api_key_env: Option<String>,
-    /// Pluggable websearch backend selector. Mirrors OpenCode's
-    /// `OPENCODE_WEBSEARCH_PROVIDER`; valid values: `exa`, `parallel`.
+    /// Pluggable websearch backend selector. Valid values: `exa`,
+    /// `parallel`.
     pub websearch_provider: Option<String>,
 }
 
@@ -8345,8 +8334,8 @@ fn resolve_shell_escape(value: String, source: &str, path: &str) -> Result<Strin
     })?;
 
     // Trim a single trailing newline (the common shell-echo case) plus any
-    // additional trailing whitespace. Mirrors pi's `.trim()` behavior while
-    // staying lenient about credential helpers that emit `secret\n`.
+    // additional trailing whitespace, so credential helpers that emit
+    // `secret\n` still round-trip cleanly.
     Ok(stdout.trim_end().to_string())
 }
 

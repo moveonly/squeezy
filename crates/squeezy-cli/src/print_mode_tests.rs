@@ -250,10 +250,10 @@ fn classify_prompt_leaves_plain_text_untouched() {
 
 #[test]
 fn classify_prompt_treats_single_bang_as_normal_content() {
-    // Pi's single-bang `!cmd` escape (LLM sees output) is not yet a
-    // print-mode shortcut. Leaving a single leading `!` in place keeps
-    // legitimate prompt bodies like `"!important: rerun the migration"`
-    // intact while reserving `!!` for the exclude semantic.
+    // A single-bang `!cmd` escape is not yet a print-mode shortcut.
+    // Leaving a single leading `!` in place keeps legitimate prompt
+    // bodies like `"!important: rerun the migration"` intact while
+    // reserving `!!` for the exclude-from-context semantic.
     let classified = classify_prompt("!important note".to_string());
     assert_eq!(
         classified,

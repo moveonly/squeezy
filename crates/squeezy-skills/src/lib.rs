@@ -46,10 +46,6 @@ struct BundledSkillSource {
 
 const BUNDLED_SKILL_SOURCES: &[BundledSkillSource] = &[
     BundledSkillSource {
-        dir_name: "beads-workflow",
-        content: include_str!("../builtin/beads-workflow/SKILL.md"),
-    },
-    BundledSkillSource {
         dir_name: "customize-squeezy",
         content: include_str!("../builtin/customize-squeezy/SKILL.md"),
     },
