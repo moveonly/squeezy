@@ -4431,6 +4431,149 @@ end
 }
 
 #[test]
+fn graph_emits_uses_trait_edge_for_php_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_file = php_record(
+        "src/Foo/Bar/Loggable.php",
+        "<?php\nnamespace Foo\\Bar;\n\ntrait Loggable { public function log(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service {
+    use Loggable;
+}
+"#,
+    );
+    let parsed = [trait_file, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let service_id = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .map(|symbol| symbol.id.clone())
+        .unwrap();
+    let loggable_id = graph
+        .find_symbol_by_name("Loggable")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Trait)
+        .map(|symbol| symbol.id.clone())
+        .unwrap();
+
+    let uses_trait_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == service_id && edge.kind == EdgeKind::UsesTrait)
+        .expect("expected UsesTrait edge from Service");
+    assert_eq!(uses_trait_edge.target_text, "Loggable");
+    assert_eq!(uses_trait_edge.to.as_ref(), Some(&loggable_id));
+    assert_eq!(uses_trait_edge.confidence, Confidence::Heuristic);
+}
+
+#[test]
+fn graph_emits_multiple_uses_trait_edges_for_php_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let trait_a = php_record(
+        "src/Foo/TraitA.php",
+        "<?php\nnamespace Foo;\n\ntrait TraitA { public function a(): void {} }\n",
+    );
+    let trait_b = php_record(
+        "src/Foo/TraitB.php",
+        "<?php\nnamespace Foo;\n\ntrait TraitB { public function b(): void {} }\n",
+    );
+    let class_file = php_record(
+        "src/Foo/Multi.php",
+        r#"<?php
+namespace Foo;
+
+class Multi {
+    use TraitA, TraitB;
+}
+"#,
+    );
+    let parsed = [trait_a, trait_b, class_file.clone()]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let multi_id = graph
+        .find_symbol_by_name("Multi")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .map(|symbol| symbol.id.clone())
+        .unwrap();
+
+    let trait_edges = graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.from == multi_id && edge.kind == EdgeKind::UsesTrait)
+        .map(|edge| edge.target_text.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        trait_edges.iter().any(|target| target == "TraitA"),
+        "expected UsesTrait edge to TraitA, got {trait_edges:?}",
+    );
+    assert!(
+        trait_edges.iter().any(|target| target == "TraitB"),
+        "expected UsesTrait edge to TraitB, got {trait_edges:?}",
+    );
+}
+
+#[test]
+fn graph_emits_external_uses_trait_edge_when_trait_missing() {
+    let mut parser = LanguageParser::new().unwrap();
+    let class_file = php_record(
+        "src/Foo/Bar/Service.php",
+        r#"<?php
+namespace Foo\Bar;
+
+class Service {
+    use UnknownTrait;
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&class_file, fs::read_to_string(&class_file.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let service_id = graph
+        .find_symbol_by_name("Service")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .map(|symbol| symbol.id.clone())
+        .unwrap();
+    let edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == service_id && edge.kind == EdgeKind::UsesTrait)
+        .expect("expected UsesTrait edge even when target is external");
+    assert_eq!(edge.target_text, "UnknownTrait");
+    assert!(
+        edge.to.is_none(),
+        "unresolved edge should have no target id"
+    );
+    assert_eq!(edge.confidence, Confidence::External);
+}
+
+#[test]
 fn graph_marks_php_magic_method_calls_as_partial() {
     let mut parser = LanguageParser::new().unwrap();
     let magic = php_record(

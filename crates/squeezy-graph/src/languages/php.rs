@@ -2,13 +2,13 @@ use crate::*;
 
 impl SemanticGraph {
     /// Walk every PHP class/interface/trait/enum and synthesize Extends /
-    /// Implements edges from the `base:<leaf>` attributes the extractor
-    /// stamped onto the symbol. The shape mirrors C# and Java: a single base
-    /// candidate becomes an `Extends`/`Implements` edge; zero matches stay
-    /// `External`; multiple matches become a `CandidateSet`. `UsesTrait` is
-    /// intentionally not synthesized in v1 — `EdgeKind::UsesTrait` does not
-    /// exist yet, and the spec downgrades that probe to a `references_to_symbol`
-    /// query so the first PR avoids touching shared graph types.
+    /// Implements / UsesTrait edges from the `base:<leaf>` and
+    /// `uses_trait:<leaf>` attributes the extractor stamped onto the symbol.
+    /// The shape mirrors C# and Java for base types: a single base candidate
+    /// becomes an `Extends`/`Implements` edge; zero matches stay `External`;
+    /// multiple matches become a `CandidateSet`. Trait inclusion
+    /// (`use TraitA;` inside a class body) follows the same candidate-set
+    /// machinery but always lands as `EdgeKind::UsesTrait`.
     pub(crate) fn add_php_type_edges(&mut self) {
         let symbols = self
             .symbols
@@ -58,6 +58,41 @@ impl SemanticGraph {
                     confidence,
                     freshness: Freshness::Fresh,
                     provenance: Provenance::new("tree-sitter-php", "base type edge"),
+                    candidates: edge_candidates,
+                });
+            }
+
+            let traits = symbol
+                .attributes
+                .iter()
+                .filter_map(|attribute| attribute.strip_prefix("uses_trait:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            for trait_name in traits {
+                let candidates =
+                    self.php_type_candidates_for_name_in_file(&symbol.file_id, &trait_name);
+                let (to, confidence, edge_candidates) = match candidates.as_slice() {
+                    [only] => (Some(only.clone()), Confidence::Heuristic, Vec::new()),
+                    [] => (None, Confidence::External, Vec::new()),
+                    _ => (
+                        None,
+                        Confidence::CandidateSet,
+                        candidates
+                            .iter()
+                            .take(MAX_EDGE_CANDIDATES)
+                            .cloned()
+                            .collect(),
+                    ),
+                };
+                self.edges.push(GraphEdge {
+                    from: symbol.id.clone(),
+                    to,
+                    target_text: trait_name,
+                    kind: EdgeKind::UsesTrait,
+                    span: Some(symbol.span),
+                    confidence,
+                    freshness: Freshness::Fresh,
+                    provenance: Provenance::new("tree-sitter-php", "trait include edge"),
                     candidates: edge_candidates,
                 });
             }

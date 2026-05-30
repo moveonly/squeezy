@@ -56,10 +56,10 @@
     },
     {
       "id": "php-trait-inclusion",
-      "kind": "references_to_symbol",
-      "to": "Loggable",
+      "kind": "edges",
       "expected_contains": [
-        "Loggable"
+        "Implements:Service->IRunner:IRunner:Heuristic",
+        "UsesTrait:Service->Loggable:Loggable:Heuristic"
       ]
     },
     {

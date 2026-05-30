@@ -10315,6 +10315,11 @@ pub enum SymbolKind {
     Unknown,
 }
 
+/// Stable kind tag attached to every `GraphEdge`. New variants append at the
+/// end so serialized graphs stay forward-compatible: callers that ignore
+/// unknown kinds keep working when a deployment lands a kind they haven't
+/// seen yet. Inheritance-style kinds (`Extends`, `Implements`, `UsesTrait`)
+/// participate in ancestor walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind {
     Contains,
@@ -10331,6 +10336,11 @@ pub enum EdgeKind {
     DefinesMacro,
     InvokesMacro,
     Conditional,
+    /// PHP trait inclusion (`use TraitA;` inside a class/trait body). Modelled
+    /// alongside `Extends`/`Implements` so ancestor-style queries can walk a
+    /// class up through its included traits the same way they walk parents
+    /// and implemented interfaces.
+    UsesTrait,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -378,11 +378,9 @@ Write to `benchmarks/specs/php-smoke-queries.json`:
 }
 ```
 
-The `UsesTrait` edge kind does not exist yet in
-`crates/squeezy-core/src/lib.rs` — either add it alongside the PHP work
-or, for the first PR, downgrade that probe to a `references_to_symbol`
-query on `Loggable` to avoid expanding `EdgeKind`. Spec author note: the
-former is cleaner long-term; do it in this PR if the diff is small.
+The `UsesTrait` edge kind lives in `crates/squeezy-core/src/lib.rs` and is
+synthesized by `add_php_type_edges` from the `uses_trait:<leaf>` attributes
+the extractor stamps on the enclosing class.
 
 ## 9. Oracle plan
 
