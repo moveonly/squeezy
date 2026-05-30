@@ -11696,11 +11696,11 @@ impl TranscriptEntry {
 
 fn system_message_can_collapse(item: &TranscriptItem) -> bool {
     item.role != Role::System
-        || !item
+        || item
             .content
             .lines()
             .next()
-            .is_some_and(|header| header == "Context window")
+            .is_none_or(|header| header != "Context window")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

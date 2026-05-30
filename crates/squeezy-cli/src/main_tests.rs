@@ -124,6 +124,20 @@ fn cli_prompt_format_rejects_unknown_value() {
 }
 
 #[test]
+fn repo_profile_error_does_not_block_startup() {
+    let mut config = AppConfig::default();
+    let prepared = prepare_repo_profile_from_load(
+        &mut config,
+        Err(SqueezyError::Permission("blocked by sandbox".to_string())),
+    );
+
+    let summary = prepared.visible_summary.expect("warning summary");
+    assert!(summary.contains("Repo profile unavailable"), "{summary}");
+    assert!(summary.contains("blocked by sandbox"), "{summary}");
+    assert!(prepared.language_summary.is_empty());
+}
+
+#[test]
 fn ask_format_json_emits_one_object_per_line() {
     // Exercises the JSONL schema used by `squeezy --prompt ... --format json`.
     // Each emitted line must parse as a single `LlmEvent`; the tag/content

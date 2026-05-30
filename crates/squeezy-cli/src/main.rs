@@ -536,7 +536,7 @@ async fn main() -> squeezy_core::Result<()> {
         config = config_from_cli(&cli)?;
     }
 
-    let onboarding = prepare_repo_profile(&mut config)?;
+    let onboarding = prepare_repo_profile(&mut config);
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
@@ -1565,18 +1565,34 @@ struct PreparedRepoProfile {
     language_summary: String,
 }
 
-fn prepare_repo_profile(config: &mut AppConfig) -> squeezy_core::Result<PreparedRepoProfile> {
-    let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
+fn prepare_repo_profile(config: &mut AppConfig) -> PreparedRepoProfile {
+    let loaded = ensure_repo_profile(&config.workspace_root, &config.graph);
+    prepare_repo_profile_from_load(config, loaded)
+}
+
+fn prepare_repo_profile_from_load(
+    config: &mut AppConfig,
+    loaded: squeezy_core::Result<RepoProfileLoad>,
+) -> PreparedRepoProfile {
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return PreparedRepoProfile {
+                visible_summary: Some(format!("Repo profile unavailable: {error}")),
+                language_summary: String::new(),
+            };
+        }
+    };
     append_repo_profile_instructions(config, &loaded);
     let language_summary = startup_language_summary(&loaded);
     let visible_summary = loaded
         .status
         .should_show_onboarding()
         .then(|| loaded.profile.compact_summary(loaded.status));
-    Ok(PreparedRepoProfile {
+    PreparedRepoProfile {
         visible_summary,
         language_summary,
-    })
+    }
 }
 
 fn startup_language_summary(loaded: &RepoProfileLoad) -> String {
