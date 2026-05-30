@@ -1,0 +1,62 @@
+id = "wave2-17-error-messages-portkey"
+title = "Wave-2 / 17 error-and-failure-messages — Qwen3 via PortKey"
+description = """
+Domain 17 sibling: Qwen3 via PortKey replay of the same three failure
+modes (missing file, non-zero shell exit, tool-args validation), so the
+wave-2 cross-provider question — does a third model render concrete
+next-step hints on tool failures the same way the OpenAI / Anthropic
+siblings do — is answerable from the trace + frames + rendered styled
+lines.
+
+`tool_choice = "required"` matches the established Qwen3-via-PortKey
+scenarios in the repo (see `modernize-one-file-qwen-portkey.toml`,
+`plan-mode-qwen-portkey.toml`) and pushes the model toward producing a
+tool call rather than a chatty stop. The wave-2 brief pins the model
+id `@openrouter/qwen/qwen3.6-35b-a3b`.
+
+Requires `[providers.portkey].api_key` in `~/.squeezy/settings.toml`
+(or `PORTKEY_API_KEY` env var). Provider config errors are a medium
+finding per the wave-2 brief, not an abort. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-17-error-messages-portkey.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 1024
+
+[[steps]]
+kind = "prompt"
+text = "Use the read_file tool to read the file at path `nonexistent.txt` at the repo root. After the tool errors, summarise the error in one line including the path and what a user should do next."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Use the shell tool to run exactly `exit 7`. After it fails, summarise the failure in one line including the numeric exit code and what the user should do next."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Use the read_file tool but deliberately omit the `path` argument so the dispatcher rejects it. After it errors, summarise the validation message in one line including what argument was missing."
+wait_for = "turn_completed"
+
+[expect]
+final_text_contains = ["path"]
+finish_reason_not = ["stop_no_action"]
+max_wall_clock_seconds = 300
+max_input_tokens = 200000
+max_tools_per_turn = 4
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,87 @@
+id = "wave2-11-streaming-cancel-portkey"
+title = "Wave 2 / 11 streaming-cancel-and-restore (Portkey Qwen)"
+description = """
+Same probe as `wave2-11-streaming-cancel-{openai,anthropic}.toml` but
+against the Portkey OpenRouter Qwen route. Qwen3 has the most
+distinctive cancellation regression in the wave-1 transcripts: the
+"thinks-but-emits-nothing" stop pattern and dropped tool-call frames.
+A mid-stream cancel against this provider is the hardest case in the
+matrix.
+
+Portkey credentials live in `~/.squeezy/settings.toml` under
+`[providers.portkey].api_key`; the scenario references the provider
+by name only — the key is never echoed by the scenario or by this
+description.
+
+`tool_choice = "required"` matches the wave-1 portkey fixtures and
+keeps the Qwen route's behaviour comparable to its other appearances
+in this repo (it tends to wedge on `tool_choice = "auto"` for
+list-style prompts).
+
+Probe shape:
+
+1. Long-stream prompt ("List 30 ideas, one per line.") with
+   `wait_for = { kind = "text_contains", text = "5." }`. Cancel
+   mid-stream when the fifth numbered line lands.
+2. Follow-up prompt that asks Qwen to acknowledge the cancel cleanly.
+
+Eval-trace expectations:
+
+- `trace.jsonl` must contain a `turn_cancelled` envelope.
+- The second turn's frame must complete normally with non-empty
+  `assistant_text`.
+- The `stop_with_intent_text_no_tool_call` and `dropped_tool_calls`
+  rules should not fire on the recovery turn.
+
+Requires Portkey credentials in `~/.squeezy/settings.toml`. Run with:
+
+    source ~/.env.sh && cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-11-streaming-cancel-portkey.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+instructions = "When asked to list N items, output one per line as `1. ...`, `2. ...`, etc. Keep each line under 80 characters. Do not call tools for these list prompts."
+
+# Mid-stream cancel target. Qwen via Portkey/OpenRouter routinely
+# burst-flushes whole list bodies; the `5.` marker still lands
+# strictly before completion.
+[[steps]]
+kind = "prompt"
+text = "List 30 ideas for improving a small open-source CLI's onboarding experience. One per line, numbered `1.`, `2.`, ..., `30.`. No preamble."
+wait_for = { kind = "text_contains", text = "5." }
+
+# Recovery probe: this is the harshest case in the matrix because of
+# the known Qwen "thinks but emits nothing" stop pattern. A botched
+# cancel that leaves the conversation with a dangling tool-call hash
+# usually surfaces as either the `stop_with_intent_text_no_tool_call`
+# or `stale_function_call_output` auto-finding.
+[[steps]]
+kind = "prompt"
+text = "Acknowledge the cancel and reply with exactly: `restored: ready for next prompt`."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "restored: ready"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+final_text_contains = ["restored: ready"]
+
+[triage]
+enabled = false

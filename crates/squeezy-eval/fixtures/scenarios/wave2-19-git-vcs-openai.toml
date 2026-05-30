@@ -1,0 +1,100 @@
+id = "wave2-19-git-vcs-openai"
+title = "wave2-19 git-and-vcs-surfaces — OpenAI gpt-5.4-mini"
+description = """
+Domain 19 (`git-and-vcs-surfaces`) wave-2 probe against OpenAI's
+`gpt-5.4-mini`. The flow is the same across the three provider
+scenarios so cross-model regressions surface as side-by-side trace +
+frame deltas in the resulting run dirs.
+
+Flow:
+  1. ask the agent to make a small, well-scoped edit in the snapshot
+     workspace — `crates/squeezy-eval/PROBE-19.md` gains three lines
+     (`# wave2-19 probe` / blank / `hello git`). The edit must use a
+     checkpoint-producing tool (`write_file` or `apply_patch`) so the
+     subsequent `/undo` has a target.
+  2. dispatch the `/diff` slash command. This drives
+     `crates/squeezy-tui/src/lib.rs:5778` `handle_slash_diff` →
+     `compute_diff_snapshot` → `GitVcs::snapshot(DiffMode::Worktree, ...)`
+     on the background pool, and pushes a `DiffCardData` into the
+     transcript whose lines flow through the `DIFF_ADD_FG`/`DIFF_DEL_FG`
+     palette tokens at `crates/squeezy-tui/src/render/palette.rs:28-29`.
+  3. dispatch `/undo` to fire `start_local_checkpoint_job(..., "checkpoint_undo", ...)`
+     (`crates/squeezy-tui/src/lib.rs:2538`) which routes through
+     `execute_checkpoint_undo` (`crates/squeezy-tools/src/checkpoints.rs:105`)
+     and `CheckpointStore::rollback(Latest, ...)`
+     (`crates/squeezy-vcs/src/lib.rs:1029`). The expected result is the
+     workspace returning to clean.
+  4. dispatch `/undo` a second time. The first /undo already restored
+     the latest checkpoint, so the journal lists nothing newer than
+     the rollback record. `rollback(Latest, ...)` should report
+     `skipped: true, applied: false` — the rubric question is whether
+     the user-visible status reads as a concrete, actionable
+     "nothing to undo" rather than a generic "internal error" or empty
+     spinner.
+
+Soft expectations capture the auto-finding signals worth watching:
+the run must complete inside the 240s budget, no
+`duplicate_tool_call` / `high_tool_burst` regressions, and the
+post-undo prompt's final text mentions the file we restored.
+
+Requires `OPENAI_API_KEY` exported and `SQUEEZY_CHECKPOINTS_ENABLED=1`
+so the agent's edit produces a checkpoint that `/undo` can target.
+The duplicated `checkpoints_enabled = true` overlay below documents
+intent for future schema work but is currently a silent no-op (the
+`SqueezyOverlay` struct in `crates/squeezy-eval/src/scenario.rs:110`
+has no `checkpoints_enabled` field), which is itself flagged in the
+finding doc.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[[steps]]
+kind = "prompt"
+text = "Create the file `crates/squeezy-eval/PROBE-19.md` with exactly three lines: `# wave2-19 probe`, an empty line, and `hello git`. Use the `write_file` tool. Do not edit any other file. After the write succeeds, reply with just `done`."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/diff"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[[steps]]
+kind = "prompt"
+text = "In one short sentence, confirm whether `crates/squeezy-eval/PROBE-19.md` exists right now (one tool call max)."
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,77 @@
+id = "wave2-09-mcp-elicitation-anthropic"
+title = "Wave-2 09 — MCP elicitation + status snapshot (anthropic)"
+description = """
+Wave-2 domain `09 mcp-elicitation-and-status` against the Anthropic
+`claude-haiku-4-5-20251001` provider.
+
+Mirrors `wave2-09-mcp-elicitation-openai.toml` so the trio can be
+diffed via `squeezy-eval diff`. Probes:
+  - MCP elicitation lifecycle. A `respond_elicitation` Accept action
+    is queued ahead of time. With no `mock_mcp` driver in the
+    scenario schema (wave-1 known harness gap, see
+    `docs/internal/eval-findings/mcp-elicitation-form.md`), no
+    `McpElicitationRequested` will fire end-to-end. The queued reply
+    ends as `action_step.status = "unfired_no_trigger"` in
+    `trace.jsonl`.
+  - MCP status snapshot rendering. The TUI is captured; the status
+    line should show the `format_mcp_status_snapshot` output
+    (`"none"` when no servers; `ratio + tools` otherwise — see
+    `crates/squeezy-tui/src/lib.rs` ~9955).
+  - The "mcp tools" system-prompt preamble. The prompt asks the
+    model to enumerate MCP tools so the assistant text echoes the
+    preamble; misformatted entries surface in
+    `frames.jsonl[].assistant_text`.
+
+Requires `ANTHROPIC_API_KEY` in env. Run with:
+
+    source ~/.env.sh
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-09-mcp-elicitation-anthropic.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "List every MCP tool you have available right now. If there are none, say so explicitly. Do not call any tool — answer in two sentences."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "respond_elicitation"
+[steps.match]
+kind = "form"
+[steps.decision]
+action = "accept"
+content = { answer = "scripted-by-eval-anthropic" }
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = ""
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,73 @@
+id = "wave2-19-git-vcs-anthropic"
+title = "wave2-19 git-and-vcs-surfaces — Anthropic claude-haiku-4-5"
+description = """
+Cross-model peer of `wave2-19-git-vcs-openai.toml`. Same probe shape
+(edit → `/diff` → `/undo` → `/undo`) against Anthropic's
+`claude-haiku-4-5-20251001`. The point is the cross-model consistency
+question from rubric dimension 6 — Haiku's tool-call cadence and final
+text differ from GPT-5.4-mini, but the surface under test (`/diff`
+card, `/undo` job result, second `/undo` messaging) must behave the
+same on every provider.
+
+See the openai sibling scenario for the full source-walk and rubric
+mapping; this file only swaps the provider/model overlay.
+
+Requires `ANTHROPIC_API_KEY` exported and
+`SQUEEZY_CHECKPOINTS_ENABLED=1`. The `checkpoints_enabled = true`
+overlay below is a documented no-op (no `SqueezyOverlay` field in
+`crates/squeezy-eval/src/scenario.rs:110`); see the finding doc for
+the schema gap.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[[steps]]
+kind = "prompt"
+text = "Create the file `crates/squeezy-eval/PROBE-19.md` with exactly three lines: `# wave2-19 probe`, an empty line, and `hello git`. Use the `write_file` tool. Do not edit any other file. After the write succeeds, reply with just `done`."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/diff"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[[steps]]
+kind = "prompt"
+text = "In one short sentence, confirm whether `crates/squeezy-eval/PROBE-19.md` exists right now (one tool call max)."
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

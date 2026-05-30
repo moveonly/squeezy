@@ -1,0 +1,95 @@
+id = "wave2-09-mcp-elicitation-openai"
+title = "Wave-2 09 — MCP elicitation + status snapshot (openai)"
+description = """
+Wave-2 domain `09 mcp-elicitation-and-status` against the OpenAI
+`gpt-5.4-mini` provider.
+
+What this scenario probes:
+  - The MCP elicitation lifecycle. A `respond_elicitation` Accept is
+    queued ahead of time. With no `mock_mcp` driver in the scenario
+    schema (wave-1 known harness gap, documented in
+    `docs/internal/eval-findings/mcp-elicitation-form.md`), no
+    `McpElicitationRequested` will fire end-to-end and the queued
+    reply ends as an `action_step.status = "unfired_no_trigger"`
+    record in `trace.jsonl`. The day a `mock_mcp` driver lands the
+    same scenario should flip to `accepted` without further edits.
+  - The MCP **status snapshot** rendering. The TUI is captured at
+    the rendered-frame level. `format_mcp_status_snapshot`
+    (`crates/squeezy-tui/src/lib.rs` ~9955) returns `"none"` when no
+    server is configured, which the status line must display in the
+    dark-only palette (`QUIET = DarkGray`).
+  - The "MCP tools" preamble the agent injects into the system
+    prompt. We prompt the model to recite which MCP tools it can see
+    so the assistant text reflects the preamble verbatim — any
+    misformatted entry surfaces in `frames.jsonl[].assistant_text`.
+
+Requires `OPENAI_API_KEY` in env. Run with:
+
+    source ~/.env.sh
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-09-mcp-elicitation-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+# Keep `permission_mode = "ask"` so the elicitation policy gate
+# (`McpClientRegistry::set_elicitation_policy`, default `Ask`) is the
+# code path a real run would hit. The harness `permission_mode` field
+# applies to edit/shell/web/mcp uniformly per the eval docs.
+permission_mode = "ask"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+# Single navigation prompt: deliberately asks the model to recite the
+# MCP tool preamble so the assistant text echoes whatever was injected.
+# Steers free of any actual file writes by phrasing it as "list, do
+# not call". Keeps cost minimal.
+[[steps]]
+kind = "prompt"
+text = "List every MCP tool you have available right now. If there are none, say so explicitly. Do not call any tool — answer in two sentences."
+wait_for = "turn_completed"
+
+# Queue a scripted Accept reply that a future `mock_mcp` driver would
+# consume. With no live MCP elicitation today, this slot sits idle and
+# the eval `RespondElicitation`-unmatched path is the only thing
+# exercised. The terminal status of this step's `action_step` in
+# `trace.jsonl` is the wave-1 witness pattern.
+[[steps]]
+kind = "action"
+action = "respond_elicitation"
+[steps.match]
+kind = "form"
+[steps.decision]
+action = "accept"
+content = { answer = "scripted-by-eval-openai" }
+
+# Soft assertion: the TUI status line should at minimum render with
+# the "mcp none" fragment (when StatusLineItem::Mcp is configured) or
+# at least not crash. Empty `text` checks that *some* status was
+# rendered.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = ""
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false

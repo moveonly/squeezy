@@ -1,0 +1,79 @@
+id = "wave2-11-streaming-cancel-anthropic"
+title = "Wave 2 / 11 streaming-cancel-and-restore (Anthropic)"
+description = """
+Same probe as `wave2-11-streaming-cancel-openai.toml` but against
+Anthropic's `claude-haiku-4-5-20251001`. Cross-provider parity is
+explicitly in scope for the rubric (dimension #6); a regression
+visible only on one provider becomes a finding.
+
+Probe shape:
+
+1. Long-stream prompt ("List 30 ideas, one per line.") with
+   `wait_for = { kind = "text_contains", text = "5." }`. The driver
+   cancels mid-stream the instant the fifth numbered line lands.
+2. Follow-up prompt that asks Haiku to acknowledge the cancel cleanly.
+
+Eval-trace expectations:
+
+- `trace.jsonl` must contain one `turn_cancelled` envelope keyed to
+  the first turn.
+- The second turn's frame must complete normally (`finish: completed`)
+  with non-empty `assistant_text`.
+
+Anthropic's streaming protocol does not honour an in-flight cancel
+the same way as OpenAI: the SSE connection stays open until the
+provider emits `message_stop`. The eval driver short-circuits its
+loop on `should_break_on_text`, so on the eval side the cancel is
+clean, but the provider transport may still be billing tokens for the
+remainder of the stream. Capture both the eval-side and any token
+disparity in the finding doc.
+
+Requires `ANTHROPIC_API_KEY`. Run with:
+
+    source ~/.env.sh && cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-11-streaming-cancel-anthropic.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+instructions = "When asked to list N items, output one per line as `1. ...`, `2. ...`, etc. Keep each line under 80 characters. Do not call tools for these list prompts."
+
+# Mid-stream cancel target. Haiku tends to emit a brief preamble on
+# list prompts even when told not to; the `5.` marker is robust to a
+# short lead-in.
+[[steps]]
+kind = "prompt"
+text = "List 30 ideas for improving a small open-source CLI's onboarding experience. One per line, numbered `1.`, `2.`, ..., `30.`. No preamble."
+wait_for = { kind = "text_contains", text = "5." }
+
+# Recovery probe: the second turn must run cleanly. A stuck stream or
+# half-consumed Anthropic message would surface here as a 4xx or a
+# zero-token completion.
+[[steps]]
+kind = "prompt"
+text = "Acknowledge the cancel and reply with exactly: `restored: ready for next prompt`."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "restored: ready"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+final_text_contains = ["restored: ready"]
+
+[triage]
+enabled = false

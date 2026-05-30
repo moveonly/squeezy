@@ -1,0 +1,74 @@
+id = "wave2-08-apply-patch-diff-portkey"
+title = "Wave 2 / 08 apply-patch diff rendering — Portkey Qwen3"
+description = """
+Wave-2 bug-hunt slice 08: apply-patch approval-preview diff rendering.
+
+Sibling of the OpenAI / Anthropic scenarios for cross-provider
+comparison. Uses PortKey routing to OpenRouter's Qwen3 build, which is
+the per-domain Portkey peer (see `docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md`).
+
+`tool_choice = "required"` is set so Qwen routes through tool emission
+on the first round rather than stopping after a chatty preamble (the
+documented Wave-1 Qwen pattern, see
+`modernize-one-file-qwen-portkey.toml`).
+
+The harness pre-arms `approve` for `apply_patch` and `write_file` so
+the approval preview renders + the patch lands.
+
+Rubric focus: dimension 4 (diff readability), dimension 1 (palette
+guardrails / luminance ≤ 160), dimension 6 (cross-model consistency).
+
+Requires `[providers.portkey].api_key` in `~/.squeezy/settings.toml`
+or `PORTKEY_API_KEY` env. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-08-apply-patch-diff-portkey.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "ask"
+tool_choice = "required"
+max_output_tokens = 4096
+
+[tui_capture]
+enabled = true
+width = 120
+height = 40
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "apply_patch" }
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "write_file" }
+
+[[steps]]
+kind = "prompt"
+text = """
+Use apply_patch in a single call to create two new files:
+- crates/squeezy-eval/README-PROBE.md with the single line `# Probe one`
+- crates/squeezy-eval/README-PROBE2.md with the single line `# Probe two`
+
+Do not edit any other file. Make the change in one apply_patch call.
+"""
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 240
+no_tool_errors = false
+max_tools_per_turn = 8
+
+[triage]
+enabled = false

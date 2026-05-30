@@ -1,0 +1,70 @@
+id = "wave2-08-apply-patch-diff-anthropic"
+title = "Wave 2 / 08 apply-patch diff rendering — Anthropic claude-haiku-4-5"
+description = """
+Wave-2 bug-hunt slice 08: apply-patch approval-preview diff rendering.
+
+Sibling of `wave2-08-apply-patch-diff-openai.toml` for cross-provider
+comparison. Anthropic Haiku is the per-domain Anthropic peer (see
+`docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md`).
+
+The probe asks the live agent to perform a small multi-file create via
+apply_patch so the approval preview pipeline runs end-to-end. With
+`permission_mode = "ask"`, the harness pre-arms an `approve` action so
+the diff lands and the approval-frame text is captured.
+
+Rubric focus: dimension 4 (diff readability), dimension 1 (palette
+guardrails / luminance ≤ 160), and dimension 6 (cross-model
+consistency).
+
+Requires ANTHROPIC_API_KEY. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-08-apply-patch-diff-anthropic.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+width = 120
+height = 40
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "apply_patch" }
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "write_file" }
+
+[[steps]]
+kind = "prompt"
+text = """
+Use apply_patch in a single call to create two new files:
+- crates/squeezy-eval/README-PROBE.md with the single line `# Probe one`
+- crates/squeezy-eval/README-PROBE2.md with the single line `# Probe two`
+
+Do not edit any other file. Make the change in one apply_patch call.
+"""
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+max_tools_per_turn = 6
+
+[triage]
+enabled = false

@@ -1,0 +1,124 @@
+id = "wave2-05-slash-config-screen-anthropic"
+title = "Wave 2 · 05 slash-config-screen · Anthropic Haiku 4.5"
+description = """
+Anthropic-side mirror of `wave2-05-slash-config-screen-openai`. Same
+probe shape so the wave-2 cross-model-consistency rubric dimension can
+compare the rendered overlay across providers. The overlay itself is
+provider-independent — its rendering depends only on the runtime
+palette and the resolved AppConfig — so any cross-provider divergence
+here would itself be a finding.
+
+Suspect surfaces:
+  * config_screen render             @ crates/squeezy-tui/src/config_screen/render.rs
+  * apply_external_settings_reload   @ crates/squeezy-tui/src/lib.rs:882
+  * toggle_config_screen             @ crates/squeezy-tui/src/lib.rs:1824
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/config"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "F11"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Config"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "User"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Repo"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Local"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Right"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Permissions"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Down", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Esc to cancel"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Esc", "Tab"]
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "p", "r", "o", "v", "Esc"]
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "prompt"
+text = "Reply with the single word ok."
+
+[expect]
+max_wall_clock_seconds = 180
+event_timeout_seconds = 60
+max_input_tokens = 60000
+max_tools_per_turn = 4
+no_tool_errors = true
+
+[triage]
+enabled = false

@@ -1,0 +1,108 @@
+id = "wave2-10-reasoning-toggle-portkey"
+title = "Wave2 #10 — reasoning toggle + stream (Portkey Qwen3.6, required tools)"
+description = """
+Wave-2 bug-hunt slice #10: reasoning-toggle-and-stream. Portkey
+route through `@openrouter/qwen/qwen3.6-35b-a3b` with
+`tool_choice = "required"` so the model is steered to emit at
+least one tool call. Qwen3-style reasoning streams should still
+land in the transcript and surface a `▸ reasoning:` chip after
+the turn completes.
+
+Probe shape:
+  1. One prompt that elicits a brief reasoning trace (and a tool call,
+     since `tool_choice = "required"`).
+  2. Sanity assert: rendered TUI frame contains `▸ reasoning`.
+  3. `send_key = "Ctrl+O"` expands the most-recent reasoning entry.
+  4. Assert frame contains `▾ reasoning` (expanded header) and
+     `▏` (body marker).
+  5. `tui_status_contains "expanded"` pins status-bar feedback.
+
+Portkey API key must be configured in `~/.squeezy/settings.toml` as
+`[providers.portkey] api_key = "..."`. When the key is missing the
+provider-not-configured path lands as a `medium`-severity finding in
+the run, not an abort (see wave-2 plan, Triage rules).
+
+Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-portkey.toml \\
+      --no-triage
+
+Source touchpoints:
+  - streaming_reasoning_lines @ crates/squeezy-tui/src/lib.rs:5478
+  - collapsed/expanded reasoning chip @ crates/squeezy-tui/src/lib.rs:6595
+  - Ctrl+O dispatch @ crates/squeezy-tui/src/lib.rs:1715
+  - reasoning_only_stop bookkeeping (Qwen3 stop pattern)
+    @ crates/squeezy-eval/src/findings.rs
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "low"
+tool_choice = "required"
+max_output_tokens = 4096
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Briefly think about which file defines the squeezy `Agent` struct. Use one tool to confirm, then answer in one short sentence."
+wait_for = "turn_completed"
+
+# Sanity: the rendered frame shows the collapsed reasoning chip.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+# After the toggle, the chip must flip from ▸ to ▾ AND a body
+# line marker (▏) must appear in the rendered frame.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▏"
+
+# Status-bar feedback so the user knows the toggle landed.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+max_tools_per_turn = 8
+
+[triage]
+enabled = false

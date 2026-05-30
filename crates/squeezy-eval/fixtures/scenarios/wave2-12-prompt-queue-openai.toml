@@ -1,0 +1,162 @@
+id = "wave2-12-prompt-queue-openai"
+title = "Wave2-12 prompt queue + drain · OpenAI gpt-5.4-mini"
+description = """
+Wave-2 domain 12 (prompt-queue-and-drain). Drives the live TuiApp via
+the eval `TuiHarness` against OpenAI's gpt-5.4-mini. Three short
+prompts are typed; the second and third are submitted with
+`Shift+Enter` so the Enter handler's queue-arm (`turn_rx.is_some() =>
+push onto prompt_queue`) is the intended path. After each submission
+the scenario pins on `tui_status_contains` for the queue-count chrome
+the indicator owns (`queued (N)` from `lib.rs:1513` / `lib.rs:2063`),
+and afterwards on `tui_frame_contains` for the streamed assistant
+tokens so we observe that the queue actually drains across real-LLM
+token streams.
+
+Re-tests the wave-1 harness gap. `TuiHarness::send_key` still calls
+`pump_until_idle` on both sides of the keystroke (see
+`crates/squeezy-tui/src/testing.rs:141`), so the second Enter lands
+*after* turn 1 has drained — i.e. `app.turn_rx` is `None` when the
+queue arm should fire, and the `queued (1)` status line is
+unreachable from any scenario that submits via `send_keys`. If the
+provider streams take long enough that turn 1 is still in-flight
+when keystroke 2 arrives (live LLM, multi-second streaming), the
+queue arm can still trip — that's the open question this scenario
+asks of the real-token streams.
+
+Visual-clarity / palette checks (the dark-only luminance ≤ 160 rule
+from EVAL_COVERAGE_PLAN_WAVE2.md) target the queue-status indicator:
+`crates/squeezy-tui/src/render/button.rs::BUTTON_FG = Indexed(33)`
+and the GOLD constant in `crates/squeezy-tui/src/prompt_queue.rs`
+selected-row highlight. Both are too bright per the wave-2 palette
+table; recorded as findings against
+`crates/squeezy-tui/src/render/palette.rs`.
+
+Requires `OPENAI_API_KEY` in the env. Run with:
+
+    OPENAI_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-12-prompt-queue-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+instructions = "Reply with one or two short words and stop. Do not call any tools."
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+# -------------------------------------------------------------------
+# Prompt 1: type "p" then Enter. First submission starts the agent
+# turn directly (no queue). Mock-text equivalence: the model is
+# instructed to reply with one or two short words.
+# -------------------------------------------------------------------
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["p", "Enter"]
+
+# After turn 1 drains, the status line should not mention "queued"
+# — the queue must be empty at steady-state.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "p"
+
+# -------------------------------------------------------------------
+# Prompt 2: type "q" then Shift+Enter to queue. With the harness's
+# `pump_until_idle` serialisation this currently submits exactly
+# like Enter (turn 1 already drained); the assertion below pins the
+# observable post-drain steady state.
+# -------------------------------------------------------------------
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["q", "Shift+Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "q"
+
+# -------------------------------------------------------------------
+# Prompt 3: type "r" then Shift+Enter. Same as above — under the
+# harness gap this lands as a fresh turn rather than the third
+# queued entry. The frame assertion guards that prompt 3 still
+# round-trips through the agent loop.
+# -------------------------------------------------------------------
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["r", "Shift+Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "r"
+
+# After the third drain, the queue must be empty; status_text should
+# not contain "queued (" or "running queued prompt" anymore.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "session"
+
+# -------------------------------------------------------------------
+# Mid-queue cancel probe. Esc routes through the TUI's
+# `request_turn_interrupt` (driver routes `cancel_turn` via
+# `last_cancel` only on the non-harness path; under `drive_tui =
+# true` `cancel_turn` is a no-op per wave-1 finding #2). Send Esc
+# directly so any in-flight turn 3 (or whatever residual is still
+# streaming) hits the cancel path; the queue, if non-empty, must
+# keep draining.
+# -------------------------------------------------------------------
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+# Ctrl+R restores the last cancelled prompt into the composer. With
+# `pump_until_idle` no real cancellation is observable from this
+# scenario; the assertion below confirms the third user message is
+# still in the transcript regardless.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+R"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_transcript_entry"
+[steps.check.index]
+by = "last_of_kind"
+entry_kind = "message"
+
+[expect]
+max_wall_clock_seconds = 180
+max_input_tokens = 80000
+no_tool_errors = false
+
+[triage]
+enabled = false

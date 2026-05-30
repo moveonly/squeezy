@@ -1,0 +1,83 @@
+id = "wave2-17-error-messages-openai"
+title = "Wave-2 / 17 error-and-failure-messages — OpenAI gpt-5.4-mini"
+description = """
+Domain 17 of the wave-2 bug-hunt: drive a sequence of tool-side and
+shell-side failures and evaluate the surface squeezy shows for each.
+The goal is to confirm that:
+
+  1. Visual clarity — every failure-decorated line uses the dark-only
+     palette. `crates/squeezy-tui/src/render/palette.rs:23` declares
+     `ERROR_RED = Rgb(248, 113, 113)`; the wave-2 guardrails require
+     `Rgb(180, 60, 60)`. `BANG_RED = Rgb(153, 27, 27)` already matches.
+     Any rendered cell whose luminance `0.299*R + 0.587*G + 0.114*B`
+     exceeds ~160 is a finding.
+  2. Functionality — failures surface without crashing the agent. The
+     turn must complete (or terminate cleanly) and the next prompt must
+     be accepted.
+  3. Messaging — each error string must be concrete (cite the path,
+     the exit code, or the provider response) and end with a next-step
+     hint. "internal error" / "unexpected error" / "request failed"
+     without a target or remediation is a finding.
+  4. Diff readability — n/a for this domain (no diff renders).
+  5. Progressive disclosure — the transcript card surfaces a one-line
+     summary; the full stderr / response body is reachable but not
+     dumped on the default frame.
+  6. Cross-model consistency — compared head-to-head with the
+     anthropic and portkey siblings. A failure formatted concretely on
+     one provider but as `internal error` on another is the canonical
+     wave-2 cross-provider finding.
+
+Probe shape (one prompt per failure mode, all in build mode so no
+approval popups break the flow):
+
+  - `read_file path = "nonexistent.txt"` — the agent must surface a
+    file-not-found error that names the path.
+  - `shell command = "exit 7"` — the agent must report the non-zero
+    exit code, not just "command failed".
+  - tool-args validation — call `read_file` with no `path` argument.
+    The squeezy-tools dispatcher rejects with a per-tool validation
+    message. The agent must not retry with the same shape.
+
+Requires `OPENAI_API_KEY` in env. Provider config errors are a medium
+finding per the wave-2 brief, not an abort. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-17-error-messages-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 1024
+
+[[steps]]
+kind = "prompt"
+text = "Use the read_file tool to read the file at path `nonexistent.txt` at the repo root. After the tool errors, summarise the error in one line including the path and what a user should do next."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Use the shell tool to run exactly `exit 7`. After it fails, summarise the failure in one line including the numeric exit code and what the user should do next."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Use the read_file tool but deliberately omit the `path` argument so the dispatcher rejects it. After it errors, summarise the validation message in one line including what argument was missing."
+wait_for = "turn_completed"
+
+[expect]
+final_text_contains = ["path"]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 4
+no_tool_errors = false
+
+[triage]
+enabled = false

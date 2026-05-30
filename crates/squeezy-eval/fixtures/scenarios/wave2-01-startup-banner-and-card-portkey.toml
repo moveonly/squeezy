@@ -1,0 +1,76 @@
+id = "wave2-01-startup-banner-and-card-portkey"
+title = "Wave-2 / domain 01 — startup banner + card on Portkey/OpenRouter Qwen3"
+description = """
+Wave-2 row 01 (startup-banner-and-card) cross-provider companion via
+Portkey's OpenRouter route to Qwen3-35b-a3b. The provider name in the
+banner row should read `portkey:@openrouter/qwen/qwen3.6-35b-a3b` so
+the model + base-URL routing is observable on the first paint.
+
+Requires `[providers.portkey].api_key` to already be configured in
+`~/.squeezy/settings.toml`. NEVER embed the key in this file.
+
+Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-01-startup-banner-and-card-portkey.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Say 'ok' and stop."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ">_ Squeezy v"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "portkey:@openrouter/qwen/qwen3.6-35b-a3b"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "languages"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "directory"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = true
+
+[triage]
+enabled = false

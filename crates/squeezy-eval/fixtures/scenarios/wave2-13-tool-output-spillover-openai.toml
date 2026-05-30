@@ -1,0 +1,80 @@
+id = "wave2-13-tool-output-spillover-openai"
+title = "Wave-2 / 13 tool-output-spillover — OpenAI gpt-5.4-mini"
+description = """
+Domain 13 of the wave-2 bug-hunt: drive a tool call whose stdout exceeds
+`DEFAULT_TOOL_SPILL_THRESHOLD_BYTES` (25 KiB) so the agent's
+`ToolOutputStore::maybe_spill` path fires, then evaluate the surface the
+model and the TUI see for the spill outcome.
+
+Per the rubric, this probe asks:
+
+  1. Visual clarity — the in-card preview must use the dark-only palette
+     (no cell luminance > 160). `Color::White` constants in the tool
+     summary span (`crates/squeezy-tui/src/lib.rs:7422`) need to be
+     dark-mode-safe even when the result is a spill envelope.
+  2. Functionality — `maybe_spill` writes to
+     `<workspace>/.squeezy/tool_outputs/<sha>.json` and the on-disk file
+     must survive the per-tool retention prune that ran inside
+     `ToolOutputStore::new` (the prune fires before the spill write —
+     spec'd by `cleanup_old_outputs` at
+     `crates/squeezy-tools/src/lib.rs:4227`). A regression where
+     `maybe_spill` is followed by another prune would delete the
+     just-written file before `read_tool_output` could fetch it.
+  3. Messaging — the spill envelope returned to the model
+     (`crates/squeezy-tools/src/lib.rs:4185-4200`) only includes
+     `spilled`, `handle`, `sha256`, `original_output_sha256`,
+     `total_bytes`, `preview_bytes`, `preview`, `truncated`. It does NOT
+     name the tool (`read_tool_output`) the model should call to recover
+     the full output, and does NOT cite the on-disk path. The fixture
+     captures both whether the live model recovers without that hint
+     and whether the spill envelope text the user sees in the card
+     describes a concrete next step.
+  4. Diff readability — n/a for this domain (no diff renders).
+  5. Progressive disclosure — the spilled card collapses to one row
+     summarising `bytes` and offers `(Ctrl-O to expand)`; the test
+     captures whether that hint is reachable from the spilled-envelope
+     payload (which carries `preview` but no `content` key, so
+     `expanded_read_tool_output_detail_lines` at
+     `crates/squeezy-tui/src/lib.rs:8461` may render an empty body).
+  6. Cross-model consistency — compared head-to-head with the
+     anthropic and portkey siblings.
+
+Probe shape:
+
+  - Prompt the agent to run `grep -rE 'fn ' crates/ --include='*.rs'`
+    via the `shell` tool, then summarise the busiest module. The grep
+    output is ~7 MB across the squeezy crates, which trivially exceeds
+    the 25 KiB spill threshold.
+  - Permission mode is `allow` so the shell call does not stall on an
+    approval popup.
+  - One turn, deterministic prompt, so trace + frames are small and the
+    spill envelope is easy to find.
+
+Requires `OPENAI_API_KEY` in env. Provider config errors are a
+medium finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[[steps]]
+kind = "prompt"
+text = "Run `grep -rE 'fn ' crates/ --include='*.rs'` via the shell tool and summarise the busiest module (which crate has the most function definitions). Use the shell tool exactly once."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

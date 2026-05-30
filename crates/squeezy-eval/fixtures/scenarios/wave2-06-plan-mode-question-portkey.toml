@@ -1,0 +1,79 @@
+id = "wave2-06-plan-mode-question-portkey"
+title = "Wave-2/06 plan-mode question — Portkey Qwen3"
+description = """
+Wave-2 domain 06: same probe shape as the OpenAI/Anthropic siblings,
+run against Portkey's `@openrouter/qwen/qwen3.6-35b-a3b` route. Qwen3 is
+the most likely of the three to exhibit the "thinks out loud, never
+emits the tool call" pattern, so `tool_choice = "required"` is pinned
+to give it the strongest possible signal that a tool call is the
+expected shape of the turn.
+
+Cross-provider divergence to watch for vs the OpenAI/Anthropic runs:
+
+  - Qwen3 on Portkey is the canonical source of
+    `stop_with_intent_text_no_tool_call` and `reasoning_only_stop`
+    findings; either shows up here as a `findings.jsonl` entry.
+  - Qwen3 sometimes calls `request_user_input` with malformed
+    `choices` (e.g. an array of strings instead of `{label, value}`
+    objects). The agent's `handle_request_user_input_call`
+    (`crates/squeezy-agent/src/lib.rs:6411`) returns
+    `ToolStatus::Error` with `"invalid request_user_input arguments"`
+    — that error string in `tool_call_completed.error` is the bug.
+  - The freeform decision exercises the same response branch as the
+    Anthropic sibling; comparing `action_step.status` text between
+    the two runs flags any provider-specific transformation.
+
+Portkey API key is read from `~/.squeezy/settings.toml` under
+`[providers.portkey] api_key = "..."`. If that entry is missing the
+run aborts before the first prompt — the wave-2 plan says provider
+config errors are findings, not aborts, so the finding doc records
+the gap rather than treating it as a hard failure.
+
+Drive-tui = false: same harness-gap rationale as the siblings.
+
+Requires the Portkey provider configured. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-06-plan-mode-question-portkey.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "plan"
+permission_mode = "allow"
+tool_choice = "required"
+max_output_tokens = 2048
+instructions = "When in Plan mode, prefer the request_user_input tool over prose for any clarifying question."
+
+[tui_capture]
+enabled = true
+drive_tui = false
+width = 120
+height = 36
+palette_tone = "dark"
+
+# Freeform answer matching the Anthropic sibling so cross-model
+# divergence on the same decision shape is easy to read.
+[[steps]]
+kind = "action"
+action = "respond_user_input"
+decision = { action = "freeform", text = "Yes — focus on the eval driver's request_user_input path first." }
+
+[[steps]]
+kind = "prompt"
+text = "I want to plan a refactor of the squeezy-eval driver. Ask me 2 multiple-choice clarifying questions first using the request_user_input tool. Each question must have at least 2 short labelled options."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+max_tools_per_turn = 6
+
+[triage]
+enabled = false

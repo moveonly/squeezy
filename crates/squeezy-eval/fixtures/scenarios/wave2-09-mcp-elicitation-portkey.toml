@@ -1,0 +1,86 @@
+id = "wave2-09-mcp-elicitation-portkey"
+title = "Wave-2 09 — MCP elicitation + status snapshot (portkey/qwen)"
+description = """
+Wave-2 domain `09 mcp-elicitation-and-status` against Portkey's
+OpenRouter Qwen route (`@openrouter/qwen/qwen3.6-35b-a3b`) with
+`tool_choice = "required"` per the wave-2 dispatch board.
+
+Mirrors the openai/anthropic siblings so cross-provider diffs are
+clean. Probes:
+  - MCP elicitation lifecycle (wave-1 harness gap — no `mock_mcp`
+    driver means the queued `respond_elicitation` Accept sits idle
+    as `action_step.status = "unfired_no_trigger"` in `trace.jsonl`).
+  - MCP status snapshot rendering (status line "mcp none" / "mcp
+    R/T ready N tools" — `format_mcp_status_snapshot`,
+    `crates/squeezy-tui/src/lib.rs` ~9955).
+  - "mcp tools" system-prompt preamble — Qwen has a documented
+    chatty-preamble-then-stop pattern; this probe also catches
+    `stop_with_intent_text_no_tool_call` / `reasoning_only_stop` if
+    the model claims it will look up MCP tools but never emits a
+    function call. With `tool_choice = "required"` the model has
+    no fallback to a pure-text answer, which is the harshest test
+    of the preamble's clarity.
+
+Requires `[providers.portkey].api_key` in `~/.squeezy/settings.toml`.
+The model id `@openrouter/qwen/qwen3.6-35b-a3b` is passed through
+PortKey verbatim per the wave-2 plan. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-09-mcp-elicitation-portkey.toml \\
+      --no-triage
+
+If the provider config errors out (PORTKEY_API_KEY / settings.toml
+unresolved) the run is treated as a `medium` finding per the wave-2
+constraints, not aborted.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 1024
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "List every MCP tool you have available right now. If there are none, say so explicitly. Do not call any tool — answer in two sentences."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "respond_elicitation"
+[steps.match]
+kind = "form"
+[steps.decision]
+action = "accept"
+content = { answer = "scripted-by-eval-portkey" }
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = ""
+
+[expect]
+max_wall_clock_seconds = 180
+# tool_choice = "required" + a "no tool" prompt is the canonical
+# Qwen-on-Portkey misalignment trap; surfacing it as a finding is
+# the point.
+finish_reason_not = ["stop_no_action"]
+no_tool_errors = false
+
+[triage]
+enabled = false

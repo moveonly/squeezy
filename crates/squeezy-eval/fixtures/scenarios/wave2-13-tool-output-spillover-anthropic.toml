@@ -1,0 +1,57 @@
+id = "wave2-13-tool-output-spillover-anthropic"
+title = "Wave-2 / 13 tool-output-spillover — Anthropic claude-haiku-4-5"
+description = """
+Domain 13 of the wave-2 bug-hunt, Anthropic sibling. Same probe shape
+as `wave2-13-tool-output-spillover-openai.toml` against
+`claude-haiku-4-5-20251001` so cross-model consistency of the spill
+envelope can be checked.
+
+Why this probe matters:
+
+  - The spill envelope at
+    `crates/squeezy-tools/src/lib.rs:4185-4200` is what the LLM sees
+    after a >25 KiB tool result. It includes `spilled=true`,
+    `handle=<sha>`, and a middle-truncated `preview`, but does NOT name
+    the recovery tool (`read_tool_output`) and does NOT cite the
+    on-disk path. Anthropic models tend to be more conservative about
+    inferring tool affordances; this probe checks whether Haiku
+    recovers without the hint or stalls.
+  - The TUI tool card uses `Color::White` for the headline span
+    (`crates/squeezy-tui/src/lib.rs:7422` etc.) which renders at
+    luminance 255 on a dark palette. Per wave-2 palette guardrails
+    (luminance > 160 = finding) that is a finding regardless of
+    provider.
+  - The retention prune in `ToolOutputStore::new` runs at construction
+    time, not at every spill, so the just-written file is safe. The
+    fixture asserts on-disk presence via a subsequent
+    `read_tool_output` call so we have positive evidence the file
+    survived.
+
+Requires `ANTHROPIC_API_KEY` in env. Provider config errors are a
+medium finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+
+[[steps]]
+kind = "prompt"
+text = "Run `grep -rE 'fn ' crates/ --include='*.rs'` via the shell tool and summarise the busiest module (which crate has the most function definitions). Use the shell tool exactly once."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

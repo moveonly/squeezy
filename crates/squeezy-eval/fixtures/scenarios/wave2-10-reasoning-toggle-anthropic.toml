@@ -1,0 +1,104 @@
+id = "wave2-10-reasoning-toggle-anthropic"
+title = "Wave2 #10 — reasoning toggle + stream (Anthropic Haiku, high)"
+description = """
+Wave-2 bug-hunt slice #10: reasoning-toggle-and-stream. Anthropic
+`claude-haiku-4-5-20251001` at `reasoning_effort = "high"` so Haiku
+emits a substantive reasoning trace, exercising the streaming
+reasoning path (`pending_reasoning` → `streaming_reasoning_lines`)
+in addition to the post-turn coalesced reasoning chip.
+
+Probe shape:
+  1. One prompt that elicits a brief reasoning trace.
+  2. Sanity assert: rendered TUI frame contains `▸ reasoning`
+     (collapsed chip after the turn completes).
+  3. `send_key = "Ctrl+O"` expands the most-recent reasoning entry.
+  4. Assert frame contains `▾ reasoning` (expanded header) and
+     `▏` (body marker emitted by reasoning_lines/streaming_reasoning_lines).
+  5. `tui_status_contains "expanded"` pins the status-bar feedback.
+
+Requires `ANTHROPIC_API_KEY` exported. Run with:
+
+    ANTHROPIC_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-anthropic.toml \\
+      --no-triage
+
+This scenario differs from the existing `tui-reasoning-expand-anthropic.toml`
+fixture only in id/name so it slots into the wave-2 dispatch board
+(`docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md` row 10) and runs in the
+snapshot workspace alongside the other wave-2 fixtures.
+
+Source touchpoints:
+  - streaming_reasoning_lines @ crates/squeezy-tui/src/lib.rs:5478
+  - collapsed/expanded reasoning chip @ crates/squeezy-tui/src/lib.rs:6595
+  - Ctrl+O dispatch @ crates/squeezy-tui/src/lib.rs:1715
+  - toggle_selected_transcript_entry @ crates/squeezy-tui/src/lib.rs:3391
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 2000
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Think briefly about the trade-offs between a hash map and a B-tree for a small (~100 entry) keyed cache. Answer in one short sentence."
+wait_for = "turn_completed"
+
+# Sanity: rendered frame shows the collapsed reasoning chip.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+# After the toggle, the chip must flip from ▸ to ▾ AND a body
+# line marker (▏) must appear in the rendered frame.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▏"
+
+# Status-bar feedback for users whose terminal hides chevron differences.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,88 @@
+id = "wave2-06-plan-mode-question-openai"
+title = "Wave-2/06 plan-mode question — OpenAI gpt-5.4-mini"
+description = """
+Wave-2 domain 06: probe the plan-mode `request_user_input` modal against
+a live OpenAI provider. The model is asked to ask two multiple-choice
+clarifying questions before drafting a plan; the driver answers the
+first incoming question via a queued `respond_user_input → choice`
+action so the turn can complete and the modal life-cycle is observable
+end-to-end through `trace.jsonl`.
+
+What this scenario pins:
+
+  - Across providers, the model must reach for the
+    `request_user_input` tool (not embed the question in prose) when
+    Plan mode is active and the system prompt advertises the tool.
+  - The question text, both choice labels, and freeform-enabled flag
+    round-trip into the `tool_call_queued` event verbatim.
+  - The driver's queued `respond_user_input` action lands in
+    `action_step.status` as `choice:<value>` and the agent's
+    `tool_call_completed` echoes the same value back.
+  - The follow-up turn completes successfully (the modal closed, the
+    response channel resolved).
+
+Cross-provider divergence to watch for:
+
+  - OpenAI gpt-5.4-mini may interleave the second clarifying question
+    into the *same* turn (one `request_user_input` call) or split it
+    into two turns. Both shapes are legal but worth recording.
+  - Models sometimes embed `choices` as JSON arrays vs nested objects;
+    the agent rejects bad payloads with a tool error.
+
+Drive-tui = false is intentional: the wave-1 finding
+`plan-mode-question-styling` documented that the live TuiHarness
+`pump_until_idle` deadlocks while a `request_user_input` modal is open
+(see `crates/squeezy-tui/src/testing.rs:124` and
+`crates/squeezy-tui/src/events.rs:302-320`). Until that harness gap is
+closed, plan-mode modal probes must stay on the driver-intercept path.
+
+Requires `OPENAI_API_KEY`. Run with:
+
+    OPENAI_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-06-plan-mode-question-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "plan"
+permission_mode = "allow"
+max_output_tokens = 1024
+
+# Capture a per-turn snapshot so reviewers can re-render the assistant
+# stream. The modal lives outside the markdown pipeline so `styled_lines`
+# only covers the assistant text; the `request_user_input` payload still
+# shows up in `overlays` and in the structured trace events.
+[tui_capture]
+enabled = true
+drive_tui = false
+width = 120
+height = 36
+palette_tone = "dark"
+
+# Queue the answer before the prompt so the driver replies as soon as
+# the agent emits `RequestUserInputRequested`. `value = "small"` is the
+# first listed value the model is most likely to surface; the matcher
+# is unset so any incoming request matches.
+[[steps]]
+kind = "action"
+action = "respond_user_input"
+decision = { action = "choice", value = "small" }
+
+[[steps]]
+kind = "prompt"
+text = "I want to plan a refactor of the squeezy-eval driver. Ask me 2 multiple-choice clarifying questions first using the request_user_input tool. Each question must have at least 2 short labelled options."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+max_tools_per_turn = 6
+
+[triage]
+enabled = false

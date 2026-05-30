@@ -1,0 +1,107 @@
+id = "wave2-12-prompt-queue-anthropic"
+title = "Wave2-12 prompt queue + drain · Anthropic claude-haiku-4-5"
+description = """
+Wave-2 domain 12 (prompt-queue-and-drain) on Anthropic Haiku 4.5.
+Three short prompts typed via `send_keys`; prompts 2 and 3 submit
+with Shift+Enter so the Enter handler's queue-arm
+(`turn_rx.is_some() => push onto prompt_queue`, status
+`queued (N)`) is the intended path. Cross-model regression
+companion of the OpenAI scenario — Anthropic's streaming cadence
+differs from OpenAI's so the wave-1 harness `pump_until_idle` gap
+may manifest differently.
+
+Requires `ANTHROPIC_API_KEY`. Run with:
+
+    ANTHROPIC_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-12-prompt-queue-anthropic.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+instructions = "Reply with one or two short words and stop. Do not call any tools."
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["p", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "p"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["q", "Shift+Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "q"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["r", "Shift+Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "r"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "session"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+R"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_transcript_entry"
+[steps.check.index]
+by = "last_of_kind"
+entry_kind = "message"
+
+[expect]
+max_wall_clock_seconds = 180
+max_input_tokens = 80000
+no_tool_errors = false
+
+[triage]
+enabled = false

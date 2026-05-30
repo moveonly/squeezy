@@ -1,0 +1,56 @@
+id = "wave2-17-error-messages-anthropic"
+title = "Wave-2 / 17 error-and-failure-messages — Anthropic claude-haiku-4-5"
+description = """
+Domain 17 sibling: Anthropic Haiku replay of the same three failure
+modes the OpenAI scenario probes (missing file, non-zero shell exit,
+tool-args validation). Drives a real provider so the wave-2 palette
+guardrail (`ERROR_RED` luminance, `BANG_RED` correctness) is checked
+against the actual rendered styled lines for tool-error frames.
+
+Same rubric (Visual clarity, Functionality, Messaging, Diff readability,
+Progressive disclosure, Cross-model consistency) — see the OpenAI
+sibling for the long-form rubric notes.
+
+Requires `ANTHROPIC_API_KEY` in env. Provider config errors are a
+medium finding per the wave-2 brief, not an abort. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-17-error-messages-anthropic.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 1024
+
+[[steps]]
+kind = "prompt"
+text = "Use the read_file tool to read the file at path `nonexistent.txt` at the repo root. After the tool errors, summarise the error in one line including the path and what a user should do next."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Use the shell tool to run exactly `exit 7`. After it fails, summarise the failure in one line including the numeric exit code and what the user should do next."
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "prompt"
+text = "Use the read_file tool but deliberately omit the `path` argument so the dispatcher rejects it. After it errors, summarise the validation message in one line including what argument was missing."
+wait_for = "turn_completed"
+
+[expect]
+final_text_contains = ["path"]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 4
+no_tool_errors = false
+
+[triage]
+enabled = false

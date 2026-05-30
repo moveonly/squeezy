@@ -1,0 +1,127 @@
+id = "wave2-05-slash-config-screen-portkey"
+title = "Wave 2 · 05 slash-config-screen · Portkey Qwen3.6-35B"
+description = """
+Third leg of the wave-2 `/config` overlay probe. Uses the Portkey
+OpenRouter Qwen3.6-35B route with `tool_choice = required` per the
+wave-2 plan. Same overlay probe shape as the openai / anthropic
+scenarios so cross-model behaviour is comparable; if Portkey trips a
+regression the other two don't, that itself is the finding under the
+"Cross-model consistency" rubric dimension.
+
+Surface notes:
+  * The overlay is provider-independent, but `tool_choice = required`
+    on a chatty Qwen model can produce stop-with-intent-text-no-tool
+    turns; the post-overlay prompt is intentionally trivial so the
+    probe survives the Qwen "preamble then stop" pattern catalogued in
+    `crates/squeezy-eval/src/findings.rs` (`stop_with_intent_text_no_tool_call`).
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "ask"
+tool_choice = "required"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/config"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "F11"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Config"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "User"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Repo"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Local"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Right"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Permissions"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Down", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Esc to cancel"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Esc", "Tab"]
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "p", "r", "o", "v", "Esc"]
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "prompt"
+text = "Reply with the single word ok."
+
+[expect]
+max_wall_clock_seconds = 240
+event_timeout_seconds = 60
+max_input_tokens = 60000
+max_tools_per_turn = 4
+no_tool_errors = false
+
+[triage]
+enabled = false

@@ -1,0 +1,53 @@
+id = "wave2-13-tool-output-spillover-portkey"
+title = "Wave-2 / 13 tool-output-spillover — Portkey @openrouter/qwen3.6-35b-a3b"
+description = """
+Domain 13 of the wave-2 bug-hunt, Portkey/Qwen sibling. Mirrors the
+OpenAI and Anthropic probes but pins `tool_choice = "required"` so the
+Qwen3 chatty-preamble pattern (`stop_with_intent_text_no_tool_call`)
+cannot mask whether the model emits the spill-recovery follow-up tool
+call. Portkey key lives in `~/.squeezy/settings.toml`.
+
+Same domain-13 questions as the sibling fixtures:
+
+  - Spill envelope shape (`crates/squeezy-tools/src/lib.rs:4185-4200`)
+    does not name `read_tool_output` or the on-disk path; check whether
+    Qwen recovers without that hint.
+  - TUI tool-card palette: `Color::White` headline span
+    (`crates/squeezy-tui/src/lib.rs:7422`) on a dark palette is a
+    finding regardless of provider.
+  - Per-tool retention prune
+    (`crates/squeezy-tools/src/lib.rs:4227`) runs at construction;
+    the just-spilled file must survive until a later
+    `read_tool_output` call.
+
+Requires `[providers.portkey] api_key = "..."` in
+`~/.squeezy/settings.toml`. Provider config errors are a medium
+finding, not an abort, per the wave-2 brief.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 4096
+instructions = "Use the shell tool exactly once to run the requested grep. Then summarise the result in at most 6 lines."
+
+[[steps]]
+kind = "prompt"
+text = "Run `grep -rE 'fn ' crates/ --include='*.rs'` via the shell tool and summarise the busiest module (which crate has the most function definitions). Use the shell tool exactly once."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 300
+max_input_tokens = 200000
+max_tools_per_turn = 8
+no_tool_errors = false
+
+[triage]
+enabled = false

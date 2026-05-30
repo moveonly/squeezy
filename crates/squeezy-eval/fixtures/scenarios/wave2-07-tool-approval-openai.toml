@@ -1,0 +1,103 @@
+id = "wave2-07-tool-approval-openai"
+title = "wave-2 07 tool-approval allow/deny — OpenAI gpt-5.4-mini"
+description = """
+Probe the full approval-menu lifecycle on the OpenAI provider. The agent
+must route an edit-tool attempt through the `ask` approval gate; the
+pre-armed `approve` action consumes the slot so the write proceeds. A
+later shell attempt is denied via a pre-armed `deny`, exercising the
+deny short-circuit (no `tool_call_started` for the shell call).
+
+Per the wave-2 coverage rubric this scenario captures:
+
+- Functionality — approve-once + deny-once both deliver via the harness'
+  `decide_approval`, no `approval_unanswered` fallback.
+- Visual clarity — `format_approval_menu_lines`
+  (`crates/squeezy-tui/src/lib.rs:4450`) is the surface under review;
+  the palette finding lives in the docs/internal eval-findings doc since
+  the eval harness is headless and cannot capture the rendered colours
+  directly (the palette constants are checked statically against the
+  > 160 luminance rule).
+- Diff readability — the apply_patch preview's `unified_diff` branch
+  (`crates/squeezy-tui/src/approval.rs:118`) is exercised when the agent
+  attempts the markdown comment edit; the assertion is that the edit
+  fires through the approval path at all.
+- Cross-model consistency — paired with the Anthropic and Portkey
+  scenarios so reviewers can diff per-provider behaviour.
+
+Requires `OPENAI_API_KEY` exported. Run with `--no-triage`.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 2048
+
+# Pre-arm approval for the apply_patch / write-file edit. The match
+# filter only fires for the named edit tools; anything else falls
+# through to the harness' default `denied_no_action`, which would
+# surface as `approval_unanswered` and is a regression signal for this
+# probe.
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "apply_patch"
+
+# Second approve covers providers/models that prefer the legacy
+# `write_file` tool name. Either match is fine — the regression we are
+# probing is "approve consumed the slot at all".
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "write_file"
+
+# Pre-arm a deny for shell so the deny short-circuit is exercised in the
+# same run. The model is asked for a sandboxed read-only check; if it
+# tries shell anyway, the deny stops the call before `tool_call_started`.
+[[steps]]
+kind = "action"
+action = "deny"
+reason = "wave-2-07: deny shell to verify the deny short-circuit"
+
+[steps.match]
+tool = "shell"
+
+# Probe 1: edit. Trigger the apply_patch / write_file approval path. The
+# file is intentionally fresh so the diff is one hunk and the preview
+# stays short. The prompt is explicit so a tool-choice=required model
+# does not over-explore.
+[[steps]]
+kind = "prompt"
+text = "Add a single-line comment `// wave-2-07 probe` to a new file at `crates/squeezy-eval/README-PROBE.md`. Create the file if missing. Do not edit any other file. Do not run shell."
+
+# Probe 2: shell. Forces the deny path. Anything > one shell attempt
+# would mean the model retried after the denial, which is itself a
+# minor finding (caught by `max_tools_per_turn`).
+[[steps]]
+kind = "prompt"
+text = "Run `echo wave-2-07` via shell to record this probe."
+
+# Probe 3: acknowledge. Closes the conversation so the run terminates.
+[[steps]]
+kind = "prompt"
+text = "In one sentence, acknowledge that the shell call was denied and the edit landed (if it landed). Do not call any tools."
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+# An apply_patch approval + a denied shell + maybe one extra read; if
+# the model bursts > 6 tools per turn we want to know.
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

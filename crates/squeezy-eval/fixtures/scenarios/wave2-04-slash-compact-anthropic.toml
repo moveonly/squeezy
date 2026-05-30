@@ -1,0 +1,125 @@
+id = "wave2-04-slash-compact-anthropic"
+title = "Wave-2 / 04 slash-compact-and-resume: live Anthropic Haiku 4.5"
+description = """
+Wave-2 cross-provider repro for the wave-1 `slash-compact-roundtrip`
+findings (`docs/internal/eval-findings/slash-compact-roundtrip.md`):
+
+  - Critical: `replay_resume_state` mis-interprets the
+    `ContextCompacted.conversation` payload (the producer writes the
+    dropped older slice; the consumer treats it as the post-compact
+    checkpoint), so any resume that falls back to event-replay drops
+    the recent kept turns and resurrects the summarised ones. Suspect:
+    `crates/squeezy-store/src/sessions.rs:1547`.
+  - Major: `Agent::compact_context_manual` only logs to
+    `events.jsonl`; it does not emit `AgentEvent::ContextCompacted`
+    through `self.tx` the way the auto-compaction path does. Any TUI
+    overlay / eval consumer / external subscriber listening for the
+    typed `AgentEvent` misses a manual `/compact` entirely. Suspect:
+    `crates/squeezy-agent/src/lib.rs:2406`.
+
+This scenario reproduces those defects against live Anthropic
+(`claude-haiku-4-5-20251001`) so we can compare the post-compact
+frame, the resulting `events.jsonl`, and the broadcast pattern
+across providers. It seeds four short prompts (to push past
+`compaction_recent_items = 6` and force a non-zero `initial_split`
+in `compact_conversation`), dispatches `/compact`, then runs one
+post-compact prompt so any state divergence shows up in the next
+turn's input.
+
+Requires `ANTHROPIC_API_KEY`. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-04-slash-compact-anthropic.toml \\
+      --no-triage
+
+After the run, inspect:
+  - `target/eval/<run-dir>/trace.jsonl` for a `context_compacted`
+    envelope (absent today — finding 2).
+  - the session's `.squeezy/sessions/<id>/events.jsonl` for the
+    `context_compacted` record's `conversation` payload — confirm it
+    matches `report.dropped`, not the post-compact state. Compare
+    against `resume_state.json` in the same dir — that file carries
+    the post-compact state correctly. The divergence is finding 1.
+  - `frames.jsonl` for the post-compact assistant_text to confirm
+    the model actually saw the compacted history.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+# Four short, scripted-shape prompts so the conversation grows past
+# `compaction_recent_items = 6` (4 user + 4 assistant items = 8). The
+# prompts intentionally ask for one-line answers about a stable
+# squeezy fact so token spend stays small.
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name the crate that hosts `Agent::start_turn`."
+
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name one slash command this CLI exposes."
+
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name a recent commit message subject from this branch."
+
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name the workspace overlay file under `~/.squeezy/`."
+
+# Manual /compact dispatch. The wave-1 finding documents that this
+# typed path returns `DispatchOutcome::Compacted` (which the eval
+# driver still observes via the `slash_command` action's
+# `action_step.status`) but never broadcasts
+# `AgentEvent::ContextCompacted` — so `trace.jsonl` will not contain
+# a `context_compacted` envelope on a clean run. This is the
+# negative-signal evidence for finding 2.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/compact"
+
+# One post-compact prompt. With the wave-1 finding-1 bug, the
+# `compact_conversation` call drops items 1..=initial_split into the
+# `report.dropped` slice and prepends a synthetic summary head; the
+# in-memory `state.conversation` is correct. The session-log payload
+# writes `report.dropped` into the event's `conversation` field, so
+# a subsequent `replay_resume_state` falls into the buggy branch
+# (see `crates/squeezy-store/src/sessions.rs:1547`). We do NOT try
+# to resume in this scenario — the wave-1 finding doc already proves
+# the divergence by reading `resume_state.json` and walking the
+# event log; the cross-provider question is only whether the same
+# event-payload shape lands here.
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence containing the phrase `post-compact` so we can pin the frame."
+
+# Pin the post-compact frame: the assistant must reach the user with
+# a coherent reply. If finding 1's payload bug also tripped the
+# in-memory state on the live path the next turn would surface a
+# tool error or empty assistant text; the pinning catches that.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "post-compact"
+
+[expect]
+# `final_text_contains` is a soft check, not an abort. A failure
+# becomes an `expect_final_text_contains` finding.
+final_text_contains = ["post-compact"]
+no_tool_errors = false
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

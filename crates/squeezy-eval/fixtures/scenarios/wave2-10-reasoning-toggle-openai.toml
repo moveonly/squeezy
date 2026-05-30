@@ -1,0 +1,105 @@
+id = "wave2-10-reasoning-toggle-openai"
+title = "Wave2 #10 — reasoning toggle + stream (OpenAI gpt-5.4-mini, low)"
+description = """
+Wave-2 bug-hunt slice #10: reasoning-toggle-and-stream. OpenAI
+provider with reasoning_effort = "low" so the request still asks
+for a reasoning trace, even though `gpt-5.4-mini` typically emits
+short reasoning summaries.
+
+Probe shape:
+  1. One prompt that elicits a brief reasoning trace.
+  2. Sanity assert: the rendered TUI frame contains `▸ reasoning`
+     (collapsed chip) when the turn completes.
+  3. `send_key = "Ctrl+O"` flips the selected reasoning entry.
+  4. Assert frame contains `▾ reasoning` (expanded header) and
+     `▏` (body-line marker emitted by
+     `streaming_reasoning_lines` / `reasoning_lines`).
+  5. Belt-and-braces: `tui_status_contains "expanded"` pins the
+     status-bar feedback the toggle writes back.
+
+Requires `OPENAI_API_KEY` exported. Run with:
+
+    OPENAI_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-openai.toml \\
+      --no-triage
+
+Source touchpoints:
+  - streaming_reasoning_lines @ crates/squeezy-tui/src/lib.rs:5478
+  - collapsed/expanded reasoning chip @ crates/squeezy-tui/src/lib.rs:6595
+  - Ctrl+O dispatch @ crates/squeezy-tui/src/lib.rs:1715
+  - toggle_selected_transcript_entry @ crates/squeezy-tui/src/lib.rs:3391
+  - show_reasoning_usage gating @ crates/squeezy-tui/src/lib.rs:3475
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "low"
+max_output_tokens = 1024
+# Pin the user-visible config (reasoning chip ON) regardless of the
+# host's `show_reasoning_usage` setting so the assertions are stable.
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Think briefly about whether a hash map or a B-tree fits a tiny ~100-entry keyed cache better, then answer in one short sentence."
+wait_for = "turn_completed"
+
+# Sanity: the rendered frame shows the collapsed reasoning chip.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+O"
+
+# After the toggle, the chip must flip from ▸ to ▾ AND a body
+# line marker (▏) must appear — proves the toggle reaches the
+# render path, not just the collapsed flag.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▏"
+
+# Status-bar feedback so users on terminals with weak unicode
+# rendering still know the toggle landed.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false

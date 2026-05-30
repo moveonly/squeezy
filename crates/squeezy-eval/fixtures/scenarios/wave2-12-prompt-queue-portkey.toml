@@ -1,0 +1,108 @@
+id = "wave2-12-prompt-queue-portkey"
+title = "Wave2-12 prompt queue + drain · Portkey Qwen3.6-35b-a3b"
+description = """
+Wave-2 domain 12 (prompt-queue-and-drain) on Portkey's OpenRouter
+Qwen route. Three short prompts typed via `send_keys`; prompts 2
+and 3 submit with Shift+Enter. `tool_choice = "required"` per the
+wave-2 plan so the Qwen route exercises a tool-forcing turn (Qwen
+without a tool target tends to chat-preamble-then-stop). The
+status-text assertions probe the same `queued (N)` chrome the
+OpenAI / Anthropic scenarios target so cross-provider behaviour is
+diff-able.
+
+Requires `[providers.portkey].api_key` in `~/.squeezy/settings.toml`.
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-12-prompt-queue-portkey.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+instructions = "Reply with one or two short words and stop."
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["p", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "p"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["q", "Shift+Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "q"
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["r", "Shift+Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "r"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "session"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+R"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_transcript_entry"
+[steps.check.index]
+by = "last_of_kind"
+entry_kind = "message"
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 80000
+no_tool_errors = false
+
+[triage]
+enabled = false

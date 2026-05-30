@@ -1,0 +1,76 @@
+id = "wave2-07-tool-approval-anthropic"
+title = "wave-2 07 tool-approval allow/deny — Anthropic claude-haiku-4-5"
+description = """
+Anthropic-side counterpart to wave2-07-tool-approval-openai. Same shape:
+queued `approve` for the edit tool, queued `deny` for shell, three
+prompts that walk the model through edit → shell → ack.
+
+The cross-provider diff between this run and the openai/portkey runs is
+the primary cross-model-consistency signal for the wave-2 rubric.
+
+Requires `ANTHROPIC_API_KEY` exported. Run with `--no-triage`.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 2048
+
+# Queued approve for the edit. The match filter narrows to the named
+# edit tools so other approvals (unexpected reads, etc) surface as
+# `approval_unanswered` and become findings.
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "apply_patch"
+
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "write_file"
+
+# Queued deny for shell — exercises the deny short-circuit. No
+# `tool_call_started` should fire for the shell call.
+[[steps]]
+kind = "action"
+action = "deny"
+reason = "wave-2-07: deny shell to verify the deny short-circuit"
+
+[steps.match]
+tool = "shell"
+
+# Probe 1: edit. The Anthropic native tool format is the same shape; the
+# agent maps it back to `apply_patch` / `write_file` regardless of which
+# the model picks.
+[[steps]]
+kind = "prompt"
+text = "Add a single-line comment `// wave-2-07 probe` to a new file at `crates/squeezy-eval/README-PROBE.md`. Create the file if missing. Do not edit any other file. Do not run shell."
+
+# Probe 2: shell, forces the deny path.
+[[steps]]
+kind = "prompt"
+text = "Run `echo wave-2-07` via shell to record this probe."
+
+# Probe 3: acknowledge, closes the conversation.
+[[steps]]
+kind = "prompt"
+text = "In one sentence, acknowledge that the shell call was denied and the edit landed (if it landed). Do not call any tools."
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+
+[triage]
+enabled = false

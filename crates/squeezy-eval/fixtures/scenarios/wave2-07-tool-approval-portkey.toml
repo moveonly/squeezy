@@ -1,0 +1,74 @@
+id = "wave2-07-tool-approval-portkey"
+title = "wave-2 07 tool-approval allow/deny — Portkey Qwen via OpenRouter"
+description = """
+Portkey/OpenRouter Qwen counterpart to wave2-07-tool-approval-openai
+and -anthropic. Same probe shape; `tool_choice = "required"` is set so
+the Qwen3-style chatty-preamble-then-stop pattern does not silently
+swallow the edit + shell attempts (would surface as
+`stop_with_intent_text_no_tool_call`).
+
+Requires `[providers.portkey].api_key` in `~/.squeezy/settings.toml`.
+Run with `--no-triage`.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "ask"
+tool_choice = "required"
+max_output_tokens = 4096
+
+# Queued approve for the edit. Same match-filter strategy as the
+# openai/anthropic runs.
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "apply_patch"
+
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "write_file"
+
+# Queued deny for shell — exercises the deny short-circuit.
+[[steps]]
+kind = "action"
+action = "deny"
+reason = "wave-2-07: deny shell to verify the deny short-circuit"
+
+[steps.match]
+tool = "shell"
+
+[[steps]]
+kind = "prompt"
+text = "Add a single-line comment `// wave-2-07 probe` to a new file at `crates/squeezy-eval/README-PROBE.md`. Create the file if missing. Do not edit any other file. Do not run shell."
+
+[[steps]]
+kind = "prompt"
+text = "Run `echo wave-2-07` via shell to record this probe."
+
+[[steps]]
+kind = "prompt"
+text = "In one sentence, acknowledge that the shell call was denied and the edit landed (if it landed). Do not call any tools."
+
+[expect]
+max_wall_clock_seconds = 300
+max_input_tokens = 200000
+# Qwen is chattier on plan-mode-style preambles; raise the per-turn cap
+# a notch and rely on `stop_with_intent_text_no_tool_call` for the
+# "thought-but-no-call" signal.
+max_tools_per_turn = 8
+no_tool_errors = false
+finish_reason_not = ["stop_no_action"]
+
+[triage]
+enabled = false

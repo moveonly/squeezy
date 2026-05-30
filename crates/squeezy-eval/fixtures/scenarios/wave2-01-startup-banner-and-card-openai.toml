@@ -1,0 +1,87 @@
+id = "wave2-01-startup-banner-and-card-openai"
+title = "Wave-2 / domain 01 — startup banner + card on OpenAI gpt-5.4-mini"
+description = """
+Wave-2 row 01 (startup-banner-and-card). Probes the first-frame
+banner card legibility, language summary accuracy, and the post-#154
+brand palette against the OpenAI live provider. The dark-amber rule
+from `docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md` requires
+`palette::AMBER = Rgb(215, 147, 52)`; the banner border / labels in
+`startup_card_lines`/`startup_card_row`
+(`crates/squeezy-tui/src/lib.rs:5504-5572`) read AMBER / GOLD /
+Color::White. The scenario captures the booted TUI frame after a
+trivially short prompt and asserts on the banner shape so a future
+darkening pass (or any palette regression) trips a `tui_frame_contains`
+finding.
+
+Requires `OPENAI_API_KEY` exported in the shell. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/wave2-01-startup-banner-and-card-openai.toml \\
+        --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 36
+palette_tone = "dark"
+
+# A near-zero-cost prompt so the TUI boots, paints its first frame
+# (the startup card) and the language summary / model row are
+# resolved against the live AppConfig before assertions fire.
+[[steps]]
+kind = "prompt"
+text = "Say 'ok' and stop."
+wait_for = "turn_completed"
+
+# Banner identity: the "Squeezy v<version>" header row.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = ">_ Squeezy v"
+
+# Model row: must echo the configured provider + model exactly.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "openai:gpt-5.4-mini"
+
+# Languages row label — the column is always present, even when the
+# repo has zero detected languages ("none").
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "languages"
+
+# Directory row label.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "directory"
+
+[expect]
+max_wall_clock_seconds = 90
+no_tool_errors = true
+
+[triage]
+enabled = false

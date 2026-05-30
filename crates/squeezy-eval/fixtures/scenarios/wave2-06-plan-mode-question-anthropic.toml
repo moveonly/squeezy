@@ -1,0 +1,73 @@
+id = "wave2-06-plan-mode-question-anthropic"
+title = "Wave-2/06 plan-mode question — Anthropic Haiku 4.5"
+description = """
+Wave-2 domain 06: same probe shape as the OpenAI sibling, run against
+Anthropic `claude-haiku-4-5-20251001`. The driver answers the first
+incoming `request_user_input` request with a freeform reply so we
+exercise the `RequestUserInputResponse::freeform` branch
+(`crates/squeezy-agent/src/lib.rs:12131`) in addition to the choice
+branch the OpenAI sibling covers.
+
+Cross-provider divergence to watch for vs the OpenAI run:
+
+  - Anthropic Haiku tends to emit reasoning before the tool call when
+    `reasoning_effort` is set. With reasoning unset it should reach
+    `request_user_input` directly.
+  - Some Anthropic models prefer to *describe* their question in prose
+    and only call the tool after the user nudges; a finding if the
+    first turn has zero tool calls but assistant text contains an
+    intent phrase (the `stop_with_intent_text_no_tool_call` rule
+    catches this).
+  - The freeform path means the agent's
+    `tool_call_completed.action_step.status` is
+    `freeform:<text>` — verify the captured response text matches the
+    queued action exactly (no trimming, no leading-rune loss).
+
+Drive-tui = false: same harness-gap rationale as the OpenAI scenario.
+
+Requires `ANTHROPIC_API_KEY`. Run with:
+
+    ANTHROPIC_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-06-plan-mode-question-anthropic.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+mode = "plan"
+permission_mode = "allow"
+max_output_tokens = 1024
+
+[tui_capture]
+enabled = true
+drive_tui = false
+width = 120
+height = 36
+palette_tone = "dark"
+
+# Use a freeform answer so the `Freeform` branch of
+# `RequestUserInputResponse` is exercised. The text starts with a non-
+# ASCII rune (the warm-taupe `taupe` cue) so a leading-rune-drop
+# regression is visible in `action_step.status`.
+[[steps]]
+kind = "action"
+action = "respond_user_input"
+decision = { action = "freeform", text = "Yes — focus on the eval driver's request_user_input path first." }
+
+[[steps]]
+kind = "prompt"
+text = "I want to plan a refactor of the squeezy-eval driver. Ask me 2 multiple-choice clarifying questions first using the request_user_input tool. Each question must have at least 2 short labelled options."
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+max_tools_per_turn = 6
+
+[triage]
+enabled = false

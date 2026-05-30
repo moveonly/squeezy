@@ -1,0 +1,77 @@
+id = "wave2-19-git-vcs-portkey"
+title = "wave2-19 git-and-vcs-surfaces — PortKey @openrouter/qwen/qwen3.6-35b-a3b"
+description = """
+Cross-model peer of `wave2-19-git-vcs-openai.toml`. Same probe shape
+against Qwen3-35B routed via PortKey + OpenRouter. The PortKey
+provider exercises the chat-completions adapter, which historically
+trips `stop_with_intent_text_no_tool_call` on Qwen variants, so this
+scenario keeps `tool_choice = "required"` to force a tool call on
+every turn.
+
+See the openai sibling scenario for the full source-walk and rubric
+mapping; this file only swaps the provider/model overlay and pins
+`tool_choice = "required"`.
+
+Requires `[providers.portkey].api_key` configured in
+`~/.squeezy/settings.toml` and `SQUEEZY_CHECKPOINTS_ENABLED=1`. The
+`checkpoints_enabled = true` overlay below is a documented no-op
+(no `SqueezyOverlay` field in
+`crates/squeezy-eval/src/scenario.rs:110`); see the finding doc for
+the schema gap.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "required"
+checkpoints_enabled = true
+max_output_tokens = 16000
+
+[[steps]]
+kind = "prompt"
+text = "Create the file `crates/squeezy-eval/PROBE-19.md` with exactly three lines: `# wave2-19 probe`, an empty line, and `hello git`. Use the `write_file` tool. Do not edit any other file. After the write succeeds, reply with just `done`."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/diff"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[[steps]]
+kind = "prompt"
+text = "In one short sentence, confirm whether `crates/squeezy-eval/PROBE-19.md` exists right now (one tool call max)."
+
+[expect]
+max_wall_clock_seconds = 300
+max_input_tokens = 200000
+max_tools_per_turn = 6
+no_tool_errors = false
+finish_reason_not = ["stop_no_action"]
+
+[triage]
+enabled = false

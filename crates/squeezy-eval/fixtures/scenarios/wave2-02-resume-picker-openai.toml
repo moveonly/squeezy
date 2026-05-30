@@ -1,0 +1,111 @@
+id = "wave2-02-resume-picker-openai"
+title = "Wave 2 / 02 resume-picker-and-restore (OpenAI gpt-5.4-mini)"
+description = """
+Wave-2 row `02 resume-picker-and-restore` — OpenAI provider leg.
+
+Probe focus (see docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md):
+
+  * Picker row legibility (recency labels, branch tip indicators,
+    cross-project entries — `crates/squeezy-tui/src/resume_picker.rs`).
+  * The post-#151/#153 `Resuming session…` placeholder
+    (`draw_startup_placeholder` @ `crates/squeezy-tui/src/lib.rs:11817`,
+    dispatched at `crates/squeezy-tui/src/lib.rs:471`).
+  * The first interactive frame after `Agent::resume`
+    (`crates/squeezy-agent/src/lib.rs:1213`).
+
+Apply the dark-only palette rule from `EVAL_COVERAGE_PLAN_WAVE2.md`:
+any rendered cell whose foreground RGB has luminance
+`0.299*R + 0.587*G + 0.114*B > 160` is a finding regardless of
+location.
+
+Harness limitation (carried forward from wave-1
+`docs/internal/eval-findings/session-resume-picker.md`):
+`TuiHarness::new` @ `crates/squeezy-tui/src/testing.rs:51` only calls
+`Agent::new`; there is no `TuiHarness::new_resume` /
+`with_existing_session` constructor. As a consequence neither the
+picker overlay nor the `Agent::resume` placeholder is observable to
+any scenario today. This scenario therefore drives the closest
+reachable shape — a single live turn that establishes a per-cwd
+session inside the snapshot — and asserts on the first interactive
+frame the harness *can* paint (the composer + branding chrome). A
+post-fix follow-up would extend this row with explicit picker drive
+once the harness ships a resume entry point.
+
+Requires `OPENAI_API_KEY` in the env. Run with:
+
+    OPENAI_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-02-resume-picker-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"
+
+# Seed step: drive one cheap live turn through the harness so the
+# snapshot's `.squeezy/sessions/...` carries a single-prompt entry —
+# the same "1 prompt" recency label a real resume picker would surface.
+# Keep the prompt trivial and the output budget tight; this is a seed,
+# not a probe of model quality.
+[[steps]]
+kind = "prompt"
+text = "Reply with the single word ok."
+wait_for = "turn_completed"
+
+# Give the session-store flush a beat to land on disk before the next
+# assertion. Mirrors the seeding shape called out by the wave-2 brief.
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 1
+
+# First-frame branding cue: the prompt activity ring chevron `◆` is
+# painted in AMBER (`palette::AMBER` Rgb(215,147,52)) and is the
+# canonical "this is squeezy" marker. If a regression hides it the
+# first interactive frame no longer carries the brand identity the
+# resume-picker title bar also uses (`resume_picker.rs:540`).
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "◆"
+
+# Composer chevron / activity ring identity. `▸` is the resume-picker
+# cursor row marker (`resume_picker.rs:641`) and also appears on
+# transcript chevrons. Presence on the first interactive frame guards
+# against a regression where the picker exits into an empty frame.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸"
+
+# Sanity: the seed turn finished cleanly. `expect_final_text_contains`
+# is intentionally a *single* substring so a slightly verbose model
+# reply still satisfies the guard.
+[expect]
+final_text_contains = ["ok"]
+no_tool_errors = true
+max_wall_clock_seconds = 90
+# Single seed turn against the squeezy repo; the system prompt + repo
+# profile bring input tokens to roughly 14-50k.
+max_input_tokens = 80000
+
+[triage]
+enabled = false

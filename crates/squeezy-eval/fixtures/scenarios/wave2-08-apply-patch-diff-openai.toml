@@ -1,0 +1,71 @@
+id = "wave2-08-apply-patch-diff-openai"
+title = "Wave 2 / 08 apply-patch diff rendering — OpenAI gpt-5.4-mini"
+description = """
+Wave-2 bug-hunt slice 08: apply-patch approval-preview diff rendering.
+
+The probe asks the live agent to perform a small multi-file create via
+apply_patch so the approval preview pipeline runs end-to-end. With
+`permission_mode = "ask"`, the harness pre-arms an `approve` action so
+the diff lands and the approval-frame text is captured via
+`squeezy-eval`'s trace + frames + tui_capture artifacts. The point of
+the scenario is the approval frame, not the resulting code change.
+
+Rubric focus: dimension 4 (diff readability) and dimension 1 (visual
+clarity / palette guardrails). The constants
+`DIFF_ADD_FG`, `DIFF_DEL_FG`, and `DIFF_HUNK_FG` are inspected against
+the wave-2 luminance rule (≤ 160 against the prompt background).
+
+See `docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md` row 08.
+
+Requires OPENAI_API_KEY. Run with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-08-apply-patch-diff-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 2048
+
+[tui_capture]
+enabled = true
+width = 120
+height = 40
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "apply_patch" }
+
+[[steps]]
+kind = "action"
+action = "approve"
+match = { tool = "write_file" }
+
+[[steps]]
+kind = "prompt"
+text = """
+Use apply_patch in a single call to create two new files:
+- crates/squeezy-eval/README-PROBE.md with the single line `# Probe one`
+- crates/squeezy-eval/README-PROBE2.md with the single line `# Probe two`
+
+Do not edit any other file. Make the change in one apply_patch call.
+"""
+wait_for = "turn_completed"
+
+[expect]
+max_wall_clock_seconds = 180
+no_tool_errors = false
+max_tools_per_turn = 6
+
+[triage]
+enabled = false

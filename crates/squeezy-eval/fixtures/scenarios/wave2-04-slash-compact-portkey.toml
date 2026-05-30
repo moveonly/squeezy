@@ -1,0 +1,134 @@
+id = "wave2-04-slash-compact-portkey"
+title = "Wave-2 / 04 slash-compact-and-resume: live Qwen3 via PortKey"
+description = """
+Wave-2 cross-provider repro for the wave-1 `slash-compact-roundtrip`
+findings (`docs/internal/eval-findings/slash-compact-roundtrip.md`):
+
+  - Critical: `replay_resume_state` mis-interprets the
+    `ContextCompacted.conversation` payload (the producer writes the
+    dropped older slice; the consumer treats it as the post-compact
+    checkpoint), so any resume that falls back to event-replay drops
+    the recent kept turns and resurrects the summarised ones. Suspect:
+    `crates/squeezy-store/src/sessions.rs:1547`.
+  - Major: `Agent::compact_context_manual` only logs to
+    `events.jsonl`; it does not emit `AgentEvent::ContextCompacted`
+    through `self.tx` the way the auto-compaction path does. Any TUI
+    overlay / eval consumer / external subscriber listening for the
+    typed `AgentEvent` misses a manual `/compact` entirely. Suspect:
+    `crates/squeezy-agent/src/lib.rs:2406`.
+
+This scenario reproduces those defects against live PortKey routing
+to Qwen3 (`@openrouter/qwen/qwen3.6-35b-a3b`). Qwen3 is the model the
+recent `stop_no_action` work hardened against, so it's a useful
+third lens — if `/compact` corrupts conversation shape for a model
+that already has a propensity to "think then stop", we'd expect to
+see the chatty-preamble pattern emerge post-compact. `tool_choice =
+"required"` matches the established Qwen3-via-PortKey scenarios in
+the repo and pushes the model toward producing a tool call rather
+than a chatty stop.
+
+Requires `[providers.portkey].api_key` in `~/.squeezy/settings.toml`
+(or `PORTKEY_API_KEY` env var). The provider-config resolution path
+is `AppConfig::from_env_and_settings_with_provider("portkey")`. Run
+with:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-04-slash-compact-portkey.toml \\
+      --no-triage
+
+After the run, inspect:
+  - `target/eval/<run-dir>/trace.jsonl` for a `context_compacted`
+    envelope (absent today — finding 2).
+  - the session's `.squeezy/sessions/<id>/events.jsonl` for the
+    `context_compacted` record's `conversation` payload — confirm it
+    matches `report.dropped`, not the post-compact state. Compare
+    against `resume_state.json` in the same dir — that file carries
+    the post-compact state correctly. The divergence is finding 1.
+  - `frames.jsonl` for the post-compact assistant_text to confirm
+    Qwen3 did not collapse into `stop_with_intent_text_no_tool_call`
+    after compaction. A cross-provider regression where Qwen3 alone
+    misbehaves post-compact is itself a wave-2 finding.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "@openrouter/qwen/qwen3.6-35b-a3b"
+tool_choice = "required"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 1024
+
+# Four short, scripted-shape prompts so the conversation grows past
+# `compaction_recent_items = 6` (4 user + 4 assistant items = 8). The
+# prompts intentionally ask for one-line answers about a stable
+# squeezy fact so token spend stays small.
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name the crate that hosts `Agent::start_turn`."
+
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name one slash command this CLI exposes."
+
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name a recent commit message subject from this branch."
+
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence: name the workspace overlay file under `~/.squeezy/`."
+
+# Manual /compact dispatch. The wave-1 finding documents that this
+# typed path returns `DispatchOutcome::Compacted` (which the eval
+# driver still observes via the `slash_command` action's
+# `action_step.status`) but never broadcasts
+# `AgentEvent::ContextCompacted` — so `trace.jsonl` will not contain
+# a `context_compacted` envelope on a clean run. This is the
+# negative-signal evidence for finding 2.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/compact"
+
+# One post-compact prompt. With the wave-1 finding-1 bug, the
+# `compact_conversation` call drops items 1..=initial_split into the
+# `report.dropped` slice and prepends a synthetic summary head; the
+# in-memory `state.conversation` is correct. The session-log payload
+# writes `report.dropped` into the event's `conversation` field, so
+# a subsequent `replay_resume_state` falls into the buggy branch
+# (see `crates/squeezy-store/src/sessions.rs:1547`). We do NOT try
+# to resume in this scenario — the wave-1 finding doc already proves
+# the divergence by reading `resume_state.json` and walking the
+# event log; the cross-provider question is only whether the same
+# event-payload shape lands here.
+[[steps]]
+kind = "prompt"
+text = "Reply with one short sentence containing the phrase `post-compact` so we can pin the frame."
+
+# Pin the post-compact frame: the assistant must reach the user with
+# a coherent reply. If finding 1's payload bug also tripped the
+# in-memory state on the live path the next turn would surface a
+# tool error or empty assistant text; the pinning catches that. The
+# `finish_reason_not = ["stop_no_action"]` guard below catches the
+# Qwen3 chatty-preamble-then-stop pattern surfacing as a
+# cross-provider regression specifically on PortKey/Qwen3.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "post-compact"
+
+[expect]
+final_text_contains = ["post-compact"]
+finish_reason_not = ["stop_no_action"]
+no_tool_errors = false
+max_wall_clock_seconds = 300
+max_input_tokens = 200000
+
+[triage]
+enabled = false

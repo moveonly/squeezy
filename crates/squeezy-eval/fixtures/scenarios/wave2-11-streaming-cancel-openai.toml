@@ -1,0 +1,92 @@
+id = "wave2-11-streaming-cancel-openai"
+title = "Wave 2 / 11 streaming-cancel-and-restore (OpenAI)"
+description = """
+Cancel an in-flight assistant stream mid-way and verify the agent
+surfaces a clean `turn_cancelled` event without leaking partial state
+into the next turn. Driven against `gpt-5.4-mini` because it is the
+cheapest model in the registry and it streams a long-ish list reliably
+when asked for 30 enumerated lines.
+
+The probe shape:
+
+1. One long-stream prompt ("List 30 ideas, one per line.") with
+   `wait_for = { kind = "text_contains", text = "5." }`. The driver
+   cancels the turn the instant the assistant output crosses the fifth
+   numbered line, which lands well before the model would naturally
+   finish.
+2. A follow-up prompt that asks the model to acknowledge the cancel and
+   continue cleanly. This is the regression guard: a botched cancel
+   typically surfaces here as a stale tool-call output, a stuck
+   `previous_response_id`, or an empty completion.
+
+Eval-trace expectations:
+
+- `trace.jsonl` must contain one `turn_cancelled` envelope keyed to
+  the first turn.
+- The second turn's frame must complete normally (`finish: completed`)
+  with non-empty `assistant_text`.
+
+Caveats:
+
+- `cancelled_prompt` is TUI-only state (`TuiApp::cancelled_prompt` in
+  `crates/squeezy-tui/src/lib.rs`). The eval driver bypasses the TUI,
+  so any regression in the Ctrl+R restore path is **not** observable
+  from this scenario — see the wave2-11 finding doc for the structural
+  gap.
+- `--no-triage` keeps cost bounded; the rubric finding is authored by
+  hand against `trace.jsonl` and `frames.jsonl`.
+
+Requires `OPENAI_API_KEY`. Run with:
+
+    source ~/.env.sh && cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/wave2-11-streaming-cancel-openai.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 2048
+instructions = "When asked to list N items, output one per line as `1. ...`, `2. ...`, etc. Keep each line under 80 characters. Do not call tools for these list prompts."
+
+# Long-stream prompt; the driver cancels the moment "5." appears in
+# the assistant text. The list has to be long enough that the cancel
+# fires strictly mid-stream; 30 entries is comfortably past that
+# threshold for any of the three providers in the wave-2 matrix.
+[[steps]]
+kind = "prompt"
+text = "List 30 ideas for improving a small open-source CLI's onboarding experience. One per line, numbered `1.`, `2.`, ..., `30.`. No preamble."
+wait_for = { kind = "text_contains", text = "5." }
+
+# After the cancel propagates, send a short follow-up to verify the
+# next turn drives cleanly. A botched cancel commonly surfaces as a
+# stale `previous_response_id`, a dangling tool-call output, or an
+# empty assistant message — all of which would show up here as a
+# failed second frame.
+[[steps]]
+kind = "prompt"
+text = "Acknowledge the cancel and reply with exactly: `restored: ready for next prompt`."
+wait_for = "turn_completed"
+
+# Belt-and-braces soft check on the final turn. Any "I'll continue
+# the list" drift or empty completion fails this.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "restored: ready"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+final_text_contains = ["restored: ready"]
+
+[triage]
+enabled = false

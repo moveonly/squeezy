@@ -1,0 +1,166 @@
+id = "wave2-05-slash-config-screen-openai"
+title = "Wave 2 · 05 slash-config-screen · OpenAI gpt-5.4-mini"
+description = """
+Wave-2 bug-hunt for the `/config` (alias `/options`) overlay on OpenAI
+gpt-5.4-mini. Probes the dispatch path, the rendered surface, navigation,
+and the mtime-reload roundtrip per the EVAL_COVERAGE_PLAN_WAVE2.md
+palette guardrails + six-dimension rubric.
+
+Surface checks:
+  * dispatch: `/config` lands as `tui_only:options` on the typed agent
+    path (`crates/squeezy-agent/src/dispatch.rs:251`); does not open the
+    overlay by itself.
+  * actual overlay open: F11 (`ToggleConfigScreen` default binding in
+    `crates/squeezy-tui/src/keymap.rs:109`) flips
+    `app.config_screen = Some(...)`
+    (`crates/squeezy-tui/src/lib.rs:1824` `toggle_config_screen`).
+  * rendering: `crates/squeezy-tui/src/config_screen/render.rs`.
+  * mtime-reload: `crates/squeezy-tui/src/lib.rs:882`
+    `apply_external_settings_reload` is the path the watcher triggers on
+    on-disk edits.
+
+Palette guardrails this probe is most sensitive to (see
+EVAL_COVERAGE_PLAN_WAVE2.md "Palette guardrails"):
+  * AMBER, GOLD, MODE_PURPLE are used as the dominant tier / scope /
+    api-key labels — any cell whose luminance
+    `0.299*R + 0.587*G + 0.114*B` exceeds ~160 is a finding regardless of
+    where in the overlay it appears.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 512
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+# 1. Record the typed dispatch entry-point. `/config` lands as
+# `DispatchOutcome::TuiOnly { command: "options" }` because the agent
+# loop owns no overlay state; the action_step's status string is the
+# canary for a future regression where the head is dropped from the
+# dispatch table.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/config"
+
+# 2. Actually open the overlay through the keymap binding. We do this
+# *after* the typed dispatch above so the trace still records both
+# entry-points (operators commonly try `/config` first, then F11).
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "F11"
+
+# 3. Frame check: the overlay must render the brand-amber "Config" banner
+# at the top of the tabs strip, plus the three scope labels (User / Repo
+# / Local). These come from `render_tabs` in
+# `crates/squeezy-tui/src/config_screen/render.rs`.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Config"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "User"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Repo"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Local"
+
+# 4. Navigate to the next sidebar section (Permissions) using the
+# arrow-right binding documented in `render_footer`.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Right"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Permissions"
+
+# 5. Move focus down a row and open the editor with Enter. The bottom
+# help line ("Enter to commit · Esc to cancel") is the marker that the
+# field editor took focus — this is also where the wave-2 rubric flags
+# inconsistent question/answer styling, because the editor lines render
+# in QUIET while the active label is GOLD+BOLD.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Down", "Enter"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Esc to cancel"
+
+# 6. Cancel out and tab to the next scope (Tab cycles User → Repo →
+# Local per `render_footer`).
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Esc", "Tab"]
+
+# 7. Open the search overlay (`/` per `render_footer`), type a query,
+# then Esc out. This pins the dim help-text styling on the search
+# overlay's "Type to filter" footer line.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["/", "p", "r", "o", "v", "Esc"]
+
+# 8. Close the overlay back to the composer.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+# 9. Ask the model a tiny low-token question so the run has at least one
+# real provider exchange — the wave-2 plan asks for three *live*
+# provider scenarios so we can cross-compare. Keep this trivial; the
+# probe surface is the overlay rendering above, not the agent's answer.
+[[steps]]
+kind = "prompt"
+text = "Reply with the single word ok."
+
+[expect]
+max_wall_clock_seconds = 180
+event_timeout_seconds = 60
+max_input_tokens = 60000
+max_tools_per_turn = 4
+no_tool_errors = true
+
+[triage]
+enabled = false
