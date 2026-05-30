@@ -12,10 +12,11 @@
 use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::render::button::{ButtonState, button_spans};
+use crate::render::palette;
 use crate::{GOLD, QUIET};
 
 #[derive(Debug, Clone, Default)]
@@ -164,7 +165,7 @@ pub(crate) fn render_lines(
         let style = if is_selected {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         let body = format!("{:>2}. {}", index + 1, preview(item));
         lines.push(Line::from(vec![

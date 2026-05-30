@@ -26,6 +26,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::render::diff;
+use crate::render::palette::AMBER;
 
 /// Best-effort snapshot of the fields parsed from an in-flight patch
 /// object inside `apply_patch`'s `patches` array.
@@ -291,9 +292,7 @@ pub fn render_streaming_preview(partial: &PatchPartial) -> Vec<Line<'static>> {
             Span::raw("  "),
             Span::styled(
                 format!("✎ {path}"),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "  (streaming preview)",
