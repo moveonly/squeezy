@@ -1,0 +1,54 @@
+id = "audit-session-fork-tui"
+title = "/fork via drive_tui=true → forked status banner"
+description = """
+Drive the TUI handler so `DispatchCommand::Fork` reaches
+`agent.fork_current()`. After dispatch, `app.status` should contain
+`forked session ->` (per lib.rs:2508), and the transcript should hold
+a system message containing `/fork started session`.
+"""
+
+[workspace]
+local = "/tmp/audit-session-fork-tui-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "warm up"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/fork"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "forked session"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "ack"
+[[mock.turns]]
+text = "ack"
+input_tokens = 4
+output_tokens = 1
+
+[triage]
+enabled = false

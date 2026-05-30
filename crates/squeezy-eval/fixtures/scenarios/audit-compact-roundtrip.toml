@@ -1,0 +1,77 @@
+id = "audit-compact-roundtrip"
+title = "Audit · /compact then /compact undo round-trip"
+description = """
+Seeds enough conversation items to clear `compaction_recent_items`
+(>6 items needed), dispatches `/compact` (expects `compacted`), then
+`/compact undo` (expects `compact_undo:restored=true`). Companion to
+`slash-compact-roundtrip` that exercises only the post-compact turn;
+this one stops after the undo so the undo path is the asserted shape.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "prompt"
+text = "Turn 1 (seed)."
+
+[[steps]]
+kind = "prompt"
+text = "Turn 2 (seed)."
+
+[[steps]]
+kind = "prompt"
+text = "Turn 3 (seed)."
+
+[[steps]]
+kind = "prompt"
+text = "Turn 4 (seed past compaction_recent_items)."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/compact"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/compact undo"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — should not be hit)"
+
+[[mock.turns]]
+text = "Acknowledged turn 1."
+input_tokens = 30
+output_tokens = 8
+
+[[mock.turns]]
+text = "Acknowledged turn 2."
+input_tokens = 32
+output_tokens = 8
+
+[[mock.turns]]
+text = "Acknowledged turn 3."
+input_tokens = 34
+output_tokens = 8
+
+[[mock.turns]]
+text = "Acknowledged turn 4."
+input_tokens = 36
+output_tokens = 10
+
+[triage]
+enabled = false

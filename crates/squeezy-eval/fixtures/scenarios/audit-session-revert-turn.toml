@@ -1,0 +1,32 @@
+id = "audit-session-revert-turn"
+title = "/revert-turn <id> → tui_only:revert-turn"
+description = """
+`/revert-turn <group_id>` is `TuiOnly`. Pins the baseline so the
+agent-side dispatch path stays quiet — destructive operations should
+require the TUI's interactive confirmation layer rather than firing
+silently on a typo'd group id.
+"""
+
+[workspace]
+local = "/tmp/audit-session-revert-turn-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/revert-turn group-does-not-exist"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

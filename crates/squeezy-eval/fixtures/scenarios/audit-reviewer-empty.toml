@@ -1,0 +1,35 @@
+id = "audit-reviewer-empty"
+title = "Audit · /reviewer with no AI reviewer decisions yet"
+description = """
+Fresh session — the reviewer audit log is empty. Dispatch returns
+`DispatchOutcome::ReviewerSnapshot { count: 0 }`, rendered by the
+eval driver as `reviewer_snapshot:0`. Quick gate so any future
+"reviewer always returns 1+" regression flags here first.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/reviewer"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

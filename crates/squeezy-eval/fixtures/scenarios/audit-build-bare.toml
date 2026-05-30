@@ -1,0 +1,34 @@
+id = "audit-build-bare"
+title = "Audit · /build switches session mode to build"
+description = """
+Starts in `mode = "plan"` so that `/build` is an actual state change.
+Asserts `DispatchOutcome::ModeChanged { mode: "build", changed: true }`
+maps to `mode_build_changed=true` in the action_step status.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "plan"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/build"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

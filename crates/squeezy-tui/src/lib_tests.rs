@@ -2938,10 +2938,16 @@ async fn slash_context_reports_known_model_budget_percentages() {
 
     let output = last_message_content(&app).expect("context output");
     assert_eq!(app.status, "context snapshot");
-    assert!(output.contains("Context accounting"), "{output}");
-    assert!(output.contains("context_window=400000"), "{output}");
-    assert!(output.contains("remaining_input_budget="), "{output}");
-    assert!(output.contains("used="), "{output}");
+    // Post-squeezy-rw0i the /context output leads with consumed +
+    // remaining against the model's context window, followed by a
+    // per-source breakdown. Window for this model is 400_000.
+    assert!(output.contains("Context window"), "{output}");
+    assert!(output.contains("Consumption by source"), "{output}");
+    assert!(
+        output.contains("consumed:") && output.contains("remaining:"),
+        "{output}"
+    );
+    assert!(output.contains("400000"), "{output}");
     assert!(output.contains('%'), "{output}");
     assert!(app.jobs.is_empty());
 }
@@ -2957,10 +2963,15 @@ async fn slash_context_uses_registry_fallback_for_unknown_models() {
     assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
 
     let output = last_message_content(&app).expect("context output");
-    assert!(output.contains("context_window=272000"), "{output}");
-    assert!(output.contains("max_output_reserve=64000"), "{output}");
-    assert!(output.contains("input_budget="), "{output}");
-    assert!(output.contains("used="), "{output}");
+    // Fallback window is 272_000; max_output reserve 64_000. The new
+    // /context layout exposes both via the consumed/remaining header
+    // and the max_output_reserve line.
+    assert!(output.contains("272000"), "{output}");
+    assert!(
+        output.contains("max_output_reserve: 64000 tokens"),
+        "{output}"
+    );
+    assert!(output.contains("Consumption by source"), "{output}");
 }
 
 #[tokio::test]
@@ -6003,18 +6014,6 @@ mod slash_commands {
                 "expected /tasks output to include a reviewer line: {body}"
             );
         }
-
-        #[tokio::test]
-        async fn jobs_alias_renders_same_surface() {
-            let mut agent = test_agent(SessionMode::Build);
-            let mut app = test_app(SessionMode::Build);
-            assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
-            let body = last_message_content(&app).unwrap_or_default().to_string();
-            assert!(
-                body.contains("reviewer"),
-                "expected /jobs alias to render the /tasks surface: {body}"
-            );
-        }
     }
 }
 
@@ -7617,18 +7616,32 @@ async fn slash_effort_rejects_unknown_value() {
 }
 
 #[tokio::test]
-async fn slash_verbosity_opens_config_when_called_without_arg() {
+async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
+    // squeezy-3ys0 (audit U2): bare /verbosity no longer diverts into
+    // the config_screen modal. It prints the current value + usage
+    // hint into the transcript (matching /effort's surface) so users
+    // get consistent shape between bare and arg-form invocations.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
     assert!(ran);
-    let state = app
-        .config_screen
-        .as_ref()
-        .expect("config screen should be open");
-    assert_eq!(
-        state.current_section().id,
-        squeezy_core::config_schema::SectionId::Verbosity
+    assert!(
+        app.config_screen.is_none(),
+        "bare /verbosity should not open config_screen"
+    );
+    assert!(
+        app.status.starts_with("response verbosity:"),
+        "status should report the current verbosity; got {:?}",
+        app.status
+    );
+    let body = last_message_content(&app).expect("transcript usage hint");
+    assert!(
+        body.contains("response verbosity"),
+        "transcript should include the usage hint; got {body:?}"
+    );
+    assert!(
+        body.contains("/verbosity [concise|normal|verbose]"),
+        "transcript should include the usage line; got {body:?}"
     );
 }
 

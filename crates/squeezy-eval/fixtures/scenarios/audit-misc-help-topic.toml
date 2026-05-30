@@ -1,0 +1,45 @@
+id = "audit-misc-help-topic"
+title = "Audit · /help providers returns curated answer with PROVIDERS.md citation"
+description = """
+`/help providers` matches the curated topic `providers` and returns
+the bundled answer, which cites `docs/external/PROVIDERS.md`. Local
+short-circuit — no provider request needed.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help providers"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "PROVIDERS.md"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — curated /help providers should short-circuit)"
+
+[triage]
+enabled = false

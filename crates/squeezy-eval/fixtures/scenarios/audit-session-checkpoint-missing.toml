@@ -1,0 +1,31 @@
+id = "audit-session-checkpoint-missing"
+title = "/checkpoint <unknown-id> → tui_only:checkpoint"
+description = """
+`/checkpoint <id>` is `TuiOnly`. Verifies the agent dispatch routes
+unrecognised checkpoint references through TuiOnly rather than
+short-circuiting them to an Error variant.
+"""
+
+[workspace]
+local = "/tmp/audit-session-checkpoint-missing-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/checkpoint cp-does-not-exist"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

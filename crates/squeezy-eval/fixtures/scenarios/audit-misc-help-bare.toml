@@ -1,0 +1,47 @@
+id = "audit-misc-help-bare"
+title = "Audit · bare /help renders the local topic index (no provider hit)"
+description = """
+`/help` (no args) routes through `handle_help_command` which starts a
+user turn with `/help`. The agent's `resolve_help_turn` matches the
+curated input set, returns `SqueezyHelp::topic_index()` locally and
+short-circuits before any provider request. The reply contains
+`Supported topics`. Asserts via `tui_frame_contains`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/help"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Supported topics"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — curated /help should short-circuit before provider)"
+
+[triage]
+enabled = false

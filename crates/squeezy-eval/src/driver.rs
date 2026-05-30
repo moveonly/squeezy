@@ -229,6 +229,7 @@ pub async fn run_scenario(
         tui_capture: tui_capture.clone(),
         pending_overlays: TokioMutex::new(Vec::new()),
         harness,
+        scenario_vars: TokioMutex::new(std::collections::BTreeMap::new()),
     };
 
     driver.dispatch_steps().await?;
@@ -726,6 +727,47 @@ struct Driver {
     /// through it instead of through `agent` directly. None for the
     /// default markdown-only render path.
     harness: Option<Arc<TokioMutex<squeezy_tui::testing::TuiHarness>>>,
+    /// Scenario-local variable bag populated by
+    /// `Action::CaptureSessionId` and consumed by `${var}`
+    /// substitution in slash-command strings. squeezy-wtxu (audit H4).
+    scenario_vars: TokioMutex<std::collections::BTreeMap<String, String>>,
+}
+
+/// Replace `${var}` occurrences in `text` with the matching entry
+/// from `vars`. Unknown vars are left in place — the caller decides
+/// whether to error or pass through.
+fn substitute_scenario_vars(
+    text: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(next);
+            }
+            if closed && let Some(value) = vars.get(&name) {
+                out.push_str(value);
+                continue;
+            }
+            out.push_str("${");
+            out.push_str(&name);
+            if closed {
+                out.push('}');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Driver {
@@ -792,13 +834,26 @@ impl Driver {
         let payload = action_to_value(action);
         match action {
             Action::SlashCommand { command, .. } => {
-                let status = self.dispatch_slash_command(command).await?;
+                // ${var} substitution from prior `capture_session_id`
+                // (and any future capture_*) so chained scenarios can
+                // build the slash text from runtime-only values.
+                let resolved = {
+                    let vars = self.scenario_vars.lock().await;
+                    substitute_scenario_vars(command, &vars)
+                };
+                let status = self.dispatch_slash_command(&resolved).await?;
                 self.capture.record(
                     None,
                     EvalEventKind::SlashCommand {
-                        command: command.clone(),
+                        command: resolved.clone(),
                     },
                 )?;
+                let mut payload = payload;
+                if resolved != *command
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert("command".into(), Value::from(resolved));
+                }
                 self.capture.record(
                     None,
                     EvalEventKind::ActionStep {
@@ -978,19 +1033,74 @@ impl Driver {
                     },
                 )?;
             }
+            Action::CaptureSessionId { var, .. } => {
+                let status = match self.agent.session_id() {
+                    Some(id) => {
+                        self.scenario_vars
+                            .lock()
+                            .await
+                            .insert(var.clone(), id.clone());
+                        format!("captured_session_id:var={var}:id={id}")
+                    }
+                    None => {
+                        "asserted_fail: capture_session_id: agent has no session id yet".to_string()
+                    }
+                };
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
         }
         Ok(())
     }
 
     async fn dispatch_slash_command(&self, command: &str) -> Result<String, EvalError> {
+        // When the harness is live (drive_tui = true), route the slash
+        // through the TUI's `handle_slash_command` so the visual side
+        // (config_screen toggles, overlay::Overlay openings, status
+        // updates, transcript pushes via `toggle_*`/`handle_slash_*`)
+        // actually runs. The agent-side `dispatch_command_raw` path
+        // only fires for commands that are pure agent-state changes
+        // (e.g. `/attach`, `/pin`, `/undo`) — and for those the TUI's
+        // `apply_dispatch_command` calls into the agent helpers
+        // directly, so we don't double-dispatch.
+        if let Some(harness) = self.harness.as_ref() {
+            let routed = {
+                let mut h = harness.lock().await;
+                h.dispatch_slash_command(command)
+                    .await
+                    .map_err(|err| EvalError::Internal(format!("harness slash: {err}")))?
+            };
+            let status_text = {
+                let h = harness.lock().await;
+                h.status_text().to_string()
+            };
+            return Ok(format!(
+                "tui_dispatched:routed={routed}:status={status_text:?}"
+            ));
+        }
         let outcome = self.agent.dispatch_command_raw(command).await;
         let status = match &outcome {
-            squeezy_agent::DispatchOutcome::Compacted => "compacted".to_string(),
+            squeezy_agent::DispatchOutcome::Compacted { skipped } => {
+                format!("compacted:skipped={skipped}")
+            }
             squeezy_agent::DispatchOutcome::CompactedUndo { restored } => {
                 format!("compact_undo:restored={restored}")
             }
-            squeezy_agent::DispatchOutcome::ModeChanged { mode, changed } => {
-                format!("mode_{mode}_changed={changed}")
+            squeezy_agent::DispatchOutcome::ModeChanged {
+                mode,
+                changed,
+                prompt,
+            } => {
+                let prompt_marker = prompt
+                    .as_deref()
+                    .map(|p| format!(":prompt_len={}", p.len()))
+                    .unwrap_or_default();
+                format!("mode_{mode}_changed={changed}{prompt_marker}")
             }
             squeezy_agent::DispatchOutcome::CostSnapshot { .. } => "cost_snapshot".to_string(),
             squeezy_agent::DispatchOutcome::ContextSnapshot { .. } => {
@@ -1063,6 +1173,9 @@ impl Driver {
                 ),
             },
             squeezy_agent::DispatchOutcome::TuiOnly { command } => {
+                // Reached only when `drive_tui = false`: nothing more
+                // to do — the command requires a live TUI to take
+                // visual effect, and the scenario opted out.
                 format!("tui_only:{command}")
             }
             squeezy_agent::DispatchOutcome::Unsupported { command } => {
@@ -1249,6 +1362,70 @@ impl Driver {
                 self.assert_tui_cell_luminance_le(*max, channel.as_deref(), region.as_ref())
                     .await
             }
+            Assertion::ModalActive { name } => self.assert_modal_active(name).await,
+            Assertion::ConfigScreenSection { name } => self.assert_config_section(name).await,
+            Assertion::ActionStepStatusContains { command, contains } => {
+                self.assert_action_step_status_contains(command.as_deref(), contains)
+            }
+        }
+    }
+
+    async fn assert_config_section(&self, name: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: config_screen_section requires [tui_capture] drive_tui = true"
+                .into();
+        };
+        let h = harness.lock().await;
+        let actual = h.config_section();
+        let trimmed = name.trim();
+        match actual {
+            Some(slug) if slug.eq_ignore_ascii_case(trimmed) => "asserted_pass".into(),
+            Some(slug) => {
+                format!("asserted_fail: expected config_screen section {trimmed:?}, got {slug:?}")
+            }
+            None => format!(
+                "asserted_fail: expected config_screen section {trimmed:?}, but no config_screen is open"
+            ),
+        }
+    }
+
+    fn assert_action_step_status_contains(
+        &self,
+        command_filter: Option<&str>,
+        needle: &str,
+    ) -> String {
+        match self.capture.last_slash_status(command_filter) {
+            Some((_, status)) if status.contains(needle) => "asserted_pass".into(),
+            Some((cmd, status)) => format!(
+                "asserted_fail: latest slash {cmd:?} status {status:?} does not contain {needle:?}"
+            ),
+            None => match command_filter {
+                Some(cmd) => {
+                    format!("asserted_fail: no slash_command action step recorded for {cmd:?}")
+                }
+                None => "asserted_fail: no slash_command action step recorded".into(),
+            },
+        }
+    }
+
+    async fn assert_modal_active(&self, name: &str) -> String {
+        let Some(harness) = self.harness.as_ref() else {
+            return "asserted_fail: modal_active requires [tui_capture] drive_tui = true".into();
+        };
+        let h = harness.lock().await;
+        let current = h.current_modal();
+        let trimmed = name.trim();
+        let expect_none = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none");
+        match (expect_none, current) {
+            (true, None) => "asserted_pass".into(),
+            (true, Some(actual)) => {
+                format!("asserted_fail: expected no modal, got {actual:?}")
+            }
+            (false, Some(actual)) if actual.eq_ignore_ascii_case(trimmed) => "asserted_pass".into(),
+            (false, actual) => format!(
+                "asserted_fail: expected modal {trimmed:?}, got {:?}",
+                actual.unwrap_or("<none>")
+            ),
         }
     }
 
@@ -2730,6 +2907,7 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::DetachAttachment { .. } => "detach_attachment",
         Action::SendKey { .. } => "send_key",
         Action::SendKeys { .. } => "send_keys",
+        Action::CaptureSessionId { .. } => "capture_session_id",
     }
 }
 
@@ -2745,22 +2923,18 @@ fn transcript_text(item: &squeezy_core::TranscriptItem) -> String {
     item.content.clone()
 }
 
-/// Internal extension: the agent's workspace_root is stored in its config
-/// but not exposed as a getter. Eval needs it to resolve relative
-/// edit_file paths. We approximate via env::current_dir if the agent
-/// doesn't expose it — but the agent does carry an `AppConfig` so we
-/// expose a tiny accessor via a trait below.
+/// Internal extension: lift the agent's workspace_root off its
+/// AppConfig. Scenarios with `[workspace] snapshot = true` build the
+/// agent against a snapshot worktree; resolving relative edit_file
+/// paths via `env::current_dir()` (the previous fallback) wrote into
+/// the host repo instead. squeezy-nyg8.1.
 trait AgentExt {
     fn workspace_root_clone(&self) -> PathBuf;
 }
 
 impl AgentExt for Agent {
     fn workspace_root_clone(&self) -> PathBuf {
-        // Squeezy's Agent does not currently expose its config. As a
-        // first-cut fallback, use the process cwd which `Agent::new`
-        // inherits via `AppConfig::workspace_root`. Improving this is a
-        // one-line change in squeezy-agent once we want it.
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        self.config().workspace_root.clone()
     }
 }
 

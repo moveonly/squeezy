@@ -1,0 +1,54 @@
+id = "audit-attach-detach-roundtrip"
+title = "Audit · /attach then /detach <id> round-trip"
+description = """
+Full attach lifecycle:
+  1. `/attach Cargo.toml` — expects `attached:att-0001`.
+  2. `/attachments` — expects `attachments_list:1`.
+  3. `/detach att-0001` — expects `detached:att-0001`.
+  4. `/attachments` — expects `attachments_list:0`.
+
+Relies on the agent's deterministic `att-NNNN` allocator (see
+`Agent::attach_file_context`).
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/attach Cargo.toml"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/attachments"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/detach att-0001"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/attachments"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[triage]
+enabled = false

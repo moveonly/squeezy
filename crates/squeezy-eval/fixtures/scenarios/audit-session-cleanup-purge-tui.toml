@@ -1,0 +1,47 @@
+id = "audit-session-cleanup-purge-tui"
+title = "/session-cleanup --purge via TUI — destructive variant respects flag"
+description = """
+Drive `/session-cleanup --purge` through the TUI. With no sessions
+present, `archived 0 removed 0` should still be reported — the flag
+only matters when there's data to remove. This pins the parser branch
+in lib.rs:2557-2563 so `--purge` is still consumed correctly.
+
+Per-scenario SQUEEZY_HOME isolates the destructive case.
+"""
+
+[workspace]
+local = "/tmp/audit-session-cleanup-purge-tui-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session-cleanup --purge"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "archived 0 removed 0"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

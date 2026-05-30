@@ -1,0 +1,85 @@
+id = "audit-smoke-modal-active"
+title = "Audit smoke · modal_active assertion across /options open + Esc close"
+description = """
+Smoke scenario for the new `modal_active` assertion. Asserts that the
+TUI starts with no modal, `/options` opens the `config` modal, Esc
+closes it, and `/permissions` opens the `permissions` overlay. Gates
+Phase 3 of the slash-command audit: if this fails, none of the
+~70 modal-asserting scenarios will be trustworthy.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+# Resting state: no modal.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "none"
+
+# /options opens the config screen.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "config"
+
+# Esc closes it.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "none"
+
+# /permissions also routes into the config_screen (focused on
+# Permissions section) — the standalone Overlay::Permissions variant
+# is only reached via a different entry point. Recording the actual
+# modal shape here is itself an audit finding.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/permissions"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "config"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

@@ -1,0 +1,39 @@
+id = "audit-session-checkpoints-tui"
+title = "/checkpoints via TUI → start_local_checkpoint_job kicks a job"
+description = """
+Drive `/checkpoints` through the TUI. `start_local_checkpoint_job`
+spawns a job that prints to the transcript. Without an actual
+checkpoint store this is mainly a smoke probe — we assert the slash
+doesn't error.
+"""
+
+[workspace]
+local = "/tmp/audit-session-checkpoints-tui-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/checkpoints"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

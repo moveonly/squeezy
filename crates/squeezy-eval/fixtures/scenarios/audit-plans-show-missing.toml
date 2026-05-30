@@ -1,0 +1,62 @@
+id = "audit-plans-show-missing"
+title = "Audit · /plans show <missing-id> and other subcommands without args"
+description = """
+Exercises the `/plans show|delete|set-active|open` subcommands with
+an id that does not exist (or no id at all). All variants route through
+`DispatchCommand::Plans { args }` → `DispatchOutcome::TuiOnly`, and the
+TUI handler is responsible for the user-facing "no plan matches" /
+"usage" message. This scenario pins the agent-side dispatch shape
+(`tui_only:plans`); the TUI path is a separate concern.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/plans show"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/plans show nonexistent-id"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/plans delete missing"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/plans set-active missing"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/plans open missing"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/plans bogus-sub"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

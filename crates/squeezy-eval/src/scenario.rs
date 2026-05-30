@@ -404,6 +404,18 @@ pub enum Action {
         #[serde(default)]
         when: Option<When>,
     },
+    /// Capture the agent's current session id (queried at action
+    /// time, after any prior `/fork`) into a scenario-local variable.
+    /// Subsequent `slash_command` actions can reference the value as
+    /// `${var}` and the driver substitutes before dispatch. Unlocks
+    /// chained scenarios for `/session-export <id>`, `/resume <id>`,
+    /// `/checkpoint <id>` whose success path needs a real id.
+    /// squeezy-wtxu (audit H4).
+    CaptureSessionId {
+        var: String,
+        #[serde(default)]
+        when: Option<When>,
+    },
 }
 
 impl Action {
@@ -425,7 +437,8 @@ impl Action {
             | Action::AttachFile { when, .. }
             | Action::DetachAttachment { when, .. }
             | Action::SendKey { when, .. }
-            | Action::SendKeys { when, .. } => when.as_ref(),
+            | Action::SendKeys { when, .. }
+            | Action::CaptureSessionId { when, .. } => when.as_ref(),
         }
     }
 }
@@ -614,6 +627,33 @@ pub enum Assertion {
         /// top-left. Clipped against the rendered frame's dimensions.
         #[serde(default)]
         region: Option<CellRegion>,
+    },
+    /// The TUI's current foreground modal matches `name`, or no modal
+    /// is active when `name` is `"none"`/empty. Names mirror
+    /// `TuiHarness::current_modal`: `"approval"`, `"mcp_elicitation"`,
+    /// `"user_input"`, `"transcript_overlay"`, `"config"`, `"model"`,
+    /// `"verbosity"`, `"tool_verbosity"`, `"permissions"`,
+    /// `"prompt_queue"`, `"plan_choice"`, `"feedback"`, `"report"`.
+    /// Requires `[tui_capture] drive_tui = true`.
+    ModalActive { name: String },
+    /// The config_screen modal's focused section slug equals `name`
+    /// (mirrors `SectionId::slug` — `"models"`, `"permissions"`,
+    /// `"verbosity"`, `"limits"`, ...). Disambiguates `/options`,
+    /// `/model`, `/permissions` which all report
+    /// `modal_active = "config"`. Requires `drive_tui = true`.
+    /// squeezy-qr9e (audit H2).
+    ConfigScreenSection { name: String },
+    /// The most-recent `slash_command` action step's recorded status
+    /// string contains `contains`. Optional `command` (e.g.
+    /// `"/tasks"`) narrows the search; unset means "any slash".
+    /// Lets non-`drive_tui` scenarios assert on the typed
+    /// `DispatchOutcome` payload (e.g. `"tasks_list:5"`,
+    /// `"mode_plan_changed=true:prompt_len=12"`) without driving the
+    /// full TUI. squeezy-7hgd (audit H3).
+    ActionStepStatusContains {
+        #[serde(default)]
+        command: Option<String>,
+        contains: String,
     },
 }
 

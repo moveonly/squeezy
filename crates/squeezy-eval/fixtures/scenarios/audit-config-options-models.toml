@@ -1,0 +1,51 @@
+id = "audit-config-options-models"
+title = "Audit · /options models opens config_screen focused on Models"
+description = """
+`/options models` explicit-section variant. Same modal_active = "config"
+as bare; substring "Models" must appear in rendered frame.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/options models"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "config"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Models"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

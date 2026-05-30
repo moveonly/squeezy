@@ -1,0 +1,49 @@
+id = "audit-smoke-capture-session-id"
+title = "Audit smoke · capture_session_id + ${var} substitution"
+description = """
+Captures the agent's session id into a scenario var, then dispatches
+/session ${id} and asserts the dispatch reports exists=true (the
+captured id is the live session, so it must resolve).
+
+Unlocks the success path of /session-export <id>, /resume <id>,
+/checkpoint <id> for chained scenarios. squeezy-wtxu (audit H4).
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "capture_session_id"
+var = "id"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session ${id}"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "action_step_status_contains"
+contains = "exists=true"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

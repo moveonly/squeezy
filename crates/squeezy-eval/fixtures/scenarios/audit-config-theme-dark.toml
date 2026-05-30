@@ -1,0 +1,53 @@
+id = "audit-config-theme-dark"
+title = "Audit · /theme dark applies and persists"
+description = """
+`/theme dark` should set theme without opening a modal. Persists via
+apply_edits to the (scenario-isolated) user settings path; success path
+sets app.status = "theme saved to <path>". Asserts modal_active = "none"
+and status mentions theme save.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/theme dark"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "none"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "theme"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

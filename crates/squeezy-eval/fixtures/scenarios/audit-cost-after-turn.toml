@@ -1,0 +1,44 @@
+id = "audit-cost-after-turn"
+title = "Audit · /cost after a mock turn (non-zero accounting)"
+description = """
+Seeds one mock turn so `session_accounting_snapshot` carries non-zero
+input/output token counts, then dispatches `/cost`. Confirms the
+typed snapshot fires regardless of whether the session has spent any
+real money.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "prompt"
+text = "Echo a short ack so accounting registers a turn."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/cost"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — should not be hit)"
+
+[[mock.turns]]
+text = "Acknowledged."
+input_tokens = 40
+output_tokens = 10
+
+[triage]
+enabled = false

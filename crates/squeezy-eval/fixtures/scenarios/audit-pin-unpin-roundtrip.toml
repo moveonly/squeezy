@@ -1,0 +1,69 @@
+id = "audit-pin-unpin-roundtrip"
+title = "Audit · /pin selected then /unpin <id> round-trip"
+description = """
+Chains the full pin lifecycle:
+  1. Seed a transcript entry via a mock turn.
+  2. `/pin selected` — TUI-side, allocates pin id `pin-0001`.
+  3. `/pins` — agent-side, expects `pins_list:1`.
+  4. `/unpin pin-0001` — agent-side, expects `unpinned:pin-0001`.
+  5. `/pins` again — expects `pins_list:0`.
+
+Relies on the agent's deterministic `pin-NNNN` id allocator; if pins
+ever shift to UUIDs or session-prefixed ids, this scenario will
+regress and the audit notes can be updated.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Seed a transcript entry so the pin handler has a target."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/pin selected"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/pins"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/unpin pin-0001"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/pins"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = "Assistant reply to pin and then unpin."
+input_tokens = 25
+output_tokens = 12
+
+[triage]
+enabled = false

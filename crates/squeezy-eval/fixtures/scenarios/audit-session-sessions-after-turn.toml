@@ -1,0 +1,40 @@
+id = "audit-session-sessions-after-turn"
+title = "/sessions after a mock turn — current session is persisted"
+description = """
+Run a single mock turn, then `/sessions`. Expectation per the agent's
+`list_sessions` implementation: the current session is persisted via
+the session store before /sessions queries it, so the count should be
+>= 1. Asserted via grep of trace.jsonl status `sessions_list:<n>`.
+"""
+
+[workspace]
+local = "/tmp/audit-session-sessions-after-turn-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "ping"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/sessions"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "pong"
+[[mock.turns]]
+text = "pong"
+input_tokens = 4
+output_tokens = 1
+
+[triage]
+enabled = false

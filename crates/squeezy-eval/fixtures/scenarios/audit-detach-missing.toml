@@ -1,0 +1,34 @@
+id = "audit-detach-missing"
+title = "Audit · /detach <nonexistent-id> returns Error"
+description = """
+`/detach` of an id that was never created. Confirms the error path
+(`DispatchOutcome::Error { command: "/detach", message }`) is what
+surfaces rather than a silent success or a panic.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/detach attach-id-that-does-not-exist"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[triage]
+enabled = false

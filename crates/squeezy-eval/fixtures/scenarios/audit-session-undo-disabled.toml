@@ -1,0 +1,36 @@
+id = "audit-session-undo-disabled"
+title = "/undo with checkpoints disabled → checkpoint_undo:disabled"
+description = """
+`/undo` is one of the few destructive commands wired into the agent
+dispatch path. When checkpoints_enabled is false (or unset), the
+`tools.checkpoint_undo_latest(None)` call returns `Ok(None)` and the
+agent emits `CheckpointUndo { result: None }`. Status mapping in
+driver.rs:1083 produces `checkpoint_undo:disabled`.
+
+This is the safe-default behaviour — destructive op against a feature
+the user hasn't opted into should be a clean no-op rather than an error.
+"""
+
+[workspace]
+local = "/tmp/audit-session-undo-disabled-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+# checkpoints_enabled deliberately unset
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

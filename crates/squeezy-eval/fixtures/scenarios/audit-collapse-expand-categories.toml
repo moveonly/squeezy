@@ -1,0 +1,138 @@
+id = "audit-collapse-expand-categories"
+title = "Audit · /collapse + /expand per-category aliases"
+description = """
+Parametric coverage for the `tools|logs|diffs|receipts|assistant|reasoning`
+sub-options of `/collapse` and `/expand`. Each pair fires under
+`drive_tui = true` so the TUI handler runs. The status text reflects
+the actual number of entries flipped (which may be 0 when the
+category has no live members); the assertion only requires the
+"collapsed"/"expanded" prefix.
+
+Also covers the `thinking` alias for `reasoning` and an explicitly
+unknown category (`/collapse bogus`) — the latter should set status
+to a `usage:` hint per `apply_collapse_expand`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Seed assistant + reasoning entries for the categories that need members."
+
+# tools
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse tools"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand tools"
+
+# logs
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse logs"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand logs"
+
+# diffs
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse diffs"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand diffs"
+
+# receipts
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse receipts"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand receipts"
+
+# assistant
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse assistant"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand assistant"
+
+# reasoning + thinking alias
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse reasoning"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand reasoning"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse thinking"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand thinking"
+
+# Unknown category — status should set "usage: …"
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse bogus"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "usage:"
+
+[expect]
+max_wall_clock_seconds = 90
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = "Seeded assistant entry for the category cases."
+input_tokens = 25
+output_tokens = 12
+
+[triage]
+enabled = false

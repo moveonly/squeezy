@@ -1,0 +1,31 @@
+id = "audit-session-resume-missing"
+title = "/resume <unknown-id> → tui_only:resume (no agent-side path)"
+description = """
+`/resume` is gated through `TuiOnly`. With drive_tui=false the agent
+dispatch should report `tui_only:resume` — this scenario pins that
+behaviour so the audit can flag regressions where someone tries to add
+an agent-side handler that silently fails on a missing session.
+"""
+
+[workspace]
+local = "/tmp/audit-session-resume-missing-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/resume does-not-exist"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

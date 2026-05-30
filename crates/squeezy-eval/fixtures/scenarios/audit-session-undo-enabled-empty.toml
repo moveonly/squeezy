@@ -1,0 +1,35 @@
+id = "audit-session-undo-enabled-empty"
+title = "/undo with checkpoints enabled but no prior turn → skipped path"
+description = """
+`/undo` with `checkpoints_enabled = true` but no checkpointed turn in
+the journal. Agent dispatch should land `CheckpointUndo { applied: false,
+skipped: true, checkpoint_ids: [] }` — the "clean tree, nothing to undo"
+case. Status: `checkpoint_undo:applied=false:skipped=true:checkpoints=`.
+
+Pinning skipped=true here means a future regression that flips
+"nothing to undo" into a hard error would surface as a status mismatch.
+"""
+
+[workspace]
+local = "/tmp/audit-session-undo-enabled-empty-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/undo"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

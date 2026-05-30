@@ -1,0 +1,43 @@
+id = "audit-session-fork-bare"
+title = "/fork — agent-side path lands `tui_only:fork` (drive_tui=false)"
+description = """
+Per `Agent::dispatch_command`, `/fork` requires the TUI to invoke
+`Agent::fork_current` directly and is gated through `TuiOnly` when
+drive_tui=false. This scenario records the baseline behaviour so we
+can detect a regression in either direction (someone wiring /fork into
+the agent dispatch path, or breaking the TuiOnly default).
+
+Expected status: `tui_only:fork`.
+"""
+
+[workspace]
+local = "/tmp/audit-session-fork-bare-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "set up state"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/fork"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "ack"
+[[mock.turns]]
+text = "ack"
+input_tokens = 4
+output_tokens = 1
+
+[triage]
+enabled = false

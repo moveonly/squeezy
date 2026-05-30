@@ -1,0 +1,30 @@
+id = "audit-session-checkpoints-bare"
+title = "/checkpoints bare → tui_only:checkpoints on the agent path"
+description = """
+`/checkpoints` is `TuiOnly`. Pins the agent-side baseline so a future
+attempt to wire checkpoints through dispatch_command_raw is caught.
+"""
+
+[workspace]
+local = "/tmp/audit-session-checkpoints-bare-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+checkpoints_enabled = true
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/checkpoints"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

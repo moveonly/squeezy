@@ -1,0 +1,32 @@
+id = "audit-session-cleanup-archive"
+title = "/session-cleanup --archive (empty home) → tui_only:session-cleanup"
+description = """
+`/session-cleanup` is `TuiOnly`. On the agent-side path (drive_tui=false)
+it should land as `tui_only:session-cleanup` regardless of the
+--archive flag. Pins the regression case where someone might wire it
+through dispatch_command_raw — the destructive nature of --purge means
+the agent path should stay quiet until the TUI re-confirms intent.
+"""
+
+[workspace]
+local = "/tmp/audit-session-cleanup-archive-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session-cleanup --archive"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

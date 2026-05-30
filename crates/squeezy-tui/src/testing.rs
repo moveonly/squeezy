@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use crate::{
     Clipboard, PendingMcpElicitation, TranscriptEntryKind, TuiApp, apply_theme_overrides,
     drain_agent_events, drain_job_events, drain_pending_diff, format_mcp_elicitation_status_line,
-    handle_key, keymap::parse_keyspec, render, start_user_turn,
+    handle_key, handle_slash_command, keymap::parse_keyspec, render, start_user_turn,
 };
 
 /// Opaque driver wrapping a TuiApp + Agent + headless terminal.
@@ -173,7 +173,16 @@ impl TuiHarness {
             if waiting_on_operator {
                 return Ok(());
             }
-            if !queued && self.app.turn_rx.is_none() && self.app.prompt_queue.is_empty() {
+            // Keep pumping while a spawn_blocking diff task is still
+            // outstanding — otherwise an immediate idle return drops
+            // the scenario back before `drain_pending_diff` had a
+            // chance to land the result. squeezy-nyg8.2.
+            let waiting_on_pending_diff = self.app.pending_diff.is_some();
+            if !queued
+                && self.app.turn_rx.is_none()
+                && self.app.prompt_queue.is_empty()
+                && !waiting_on_pending_diff
+            {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -247,6 +256,34 @@ impl TuiHarness {
         let want_exit = handle_key(&mut self.app, agent, key).await?;
         self.pump_until_idle().await?;
         Ok(want_exit)
+    }
+
+    /// Dispatch a slash command (e.g. `"/options"`, `"/permissions"`,
+    /// `"/effort high"`) through the TUI's `handle_slash_command`
+    /// path — the same code path a user typing the command into the
+    /// composer would take. This is the only way to exercise
+    /// `DispatchOutcome::TuiOnly` commands (`/options`, `/model`,
+    /// `/permissions`, `/effort`, `/verbosity`, `/tool-verbosity`,
+    /// `/theme`, `/statusline`, `/keymap`, `/collapse`, `/expand`,
+    /// `/copy`, `/help`, etc.) from an eval driver — those commands
+    /// short-circuit `Agent::dispatch_command_raw` and never reach the
+    /// TUI.
+    ///
+    /// Returns `true` when the input parsed as a slash command (a
+    /// known head OR a registered prompt template); `false` when the
+    /// input is empty or non-slash. Pumps the harness before and
+    /// after so any agent-side side effect of the command (mode
+    /// change, transcript push, status update) is reflected before
+    /// the caller asserts.
+    pub async fn dispatch_slash_command(&mut self, input: &str) -> Result<bool> {
+        self.pump_until_idle().await?;
+        let agent = self
+            .agent
+            .as_mut()
+            .expect("agent dropped before harness; this is a bug in TuiHarness");
+        let routed = handle_slash_command(&mut self.app, agent, input).await;
+        self.pump_until_idle().await?;
+        Ok(routed)
     }
 
     /// Inject a sequence of keys, pumping between each. Returns the
@@ -404,6 +441,65 @@ impl TuiHarness {
     /// Height the harness was built with.
     pub fn height(&self) -> u16 {
         self.height
+    }
+
+    /// Slug for the currently-focused section in the config_screen
+    /// modal, or `None` when no config_screen is open. Maps onto
+    /// `squeezy_core::config_schema::SectionId::slug` so scenarios
+    /// can disambiguate `/options` vs `/model` (`"models"`) vs
+    /// `/permissions` (`"permissions"`) when `current_modal()` only
+    /// reports `"config"` for all three. squeezy-qr9e (audit H2).
+    pub fn config_section(&self) -> Option<&'static str> {
+        self.app
+            .config_screen
+            .as_ref()
+            .map(|state| state.current_section().id.slug())
+    }
+
+    /// Stable identifier for the modal/overlay currently occupying the
+    /// foreground, or `None` when the composer holds focus. The
+    /// returned id is the audit-stable name an eval scenario asserts
+    /// against (`"approval"`, `"mcp_elicitation"`, `"config"`,
+    /// `"model"`, etc.). Priority follows the production
+    /// `app.has_modal_focus` chain — top-z modals (`approval`,
+    /// `mcp_elicitation`, `user_input`) shadow the lower-z pickers.
+    pub fn current_modal(&self) -> Option<&'static str> {
+        if self.app.pending_approval.is_some() {
+            return Some("approval");
+        }
+        if self.app.pending_mcp_elicitation.is_some() {
+            return Some("mcp_elicitation");
+        }
+        if self.app.pending_request_user_input.is_some() {
+            return Some("user_input");
+        }
+        if self.app.transcript_overlay.is_some() {
+            return Some("transcript_overlay");
+        }
+        if self.app.config_screen.is_some() {
+            return Some("config");
+        }
+        if self.app.status_line_setup.is_some() {
+            return Some("statusline");
+        }
+        if let Some(overlay) = self.app.overlay.as_ref() {
+            return Some(match overlay {
+                crate::overlay::Overlay::Model(_) => "model",
+            });
+        }
+        if self.app.prompt_queue_overlay.is_some() {
+            return Some("prompt_queue");
+        }
+        if self.app.pending_plan_choice.is_some() {
+            return Some("plan_choice");
+        }
+        if self.app.pending_feedback.is_some() {
+            return Some("feedback");
+        }
+        if self.app.pending_report.is_some() {
+            return Some("report");
+        }
+        None
     }
 }
 

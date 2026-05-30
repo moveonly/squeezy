@@ -1,0 +1,59 @@
+id = "audit-misc-diff-with-changes"
+title = "Audit · /diff renders the worktree diff card"
+description = """
+Stages a deterministic uncommitted change against a per-run snapshot
+worktree (B1 / squeezy-nyg8.1 fixed the workspace_root_clone driver
+bug so edit_file lands inside the snapshot, not the host repo), then
+runs /diff and asserts the diff card lands in the transcript.
+pump_until_idle waits for app.pending_diff (B2 / squeezy-nyg8.2) so
+the assert reads the landed entry without extra slashes.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+# Stage a deterministic diff inside the snapshot worktree.
+[[steps]]
+kind = "action"
+action = "edit_file"
+path = "audit-diff-probe.md"
+content = "# audit diff probe\nLine added for the /diff scenario.\n"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/diff"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_transcript_entry"
+entry_kind = "diff"
+[steps.check.index]
+by = "last_of_kind"
+entry_kind = "diff"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

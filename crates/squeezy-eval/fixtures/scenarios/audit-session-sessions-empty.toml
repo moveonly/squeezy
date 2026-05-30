@@ -1,0 +1,32 @@
+id = "audit-session-sessions-empty"
+title = "/sessions on an empty SQUEEZY_HOME → SessionsList { count = 0 }"
+description = """
+Bare `/sessions` against a freshly-isolated SQUEEZY_HOME. Asserts the
+agent-side dispatch outcome is `SessionsList { count }` with `count = 0`
+(no prior sessions present). Tests the drive_tui=false agent path so the
+status string is the literal `sessions_list:0` produced in
+`driver.rs:1039`.
+"""
+
+[workspace]
+local = "/tmp/audit-session-sessions-empty-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/sessions"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

@@ -196,20 +196,19 @@ fn parse_task_family_requires_id() {
 }
 
 #[test]
-fn parse_jobs_family_aliases() {
-    assert_eq!(parse("/jobs").unwrap(), DispatchCommand::Jobs);
-    assert_eq!(
-        parse("/job 12").unwrap(),
-        DispatchCommand::Job {
-            id: "12".to_string()
-        }
-    );
-    assert_eq!(
-        parse("/job-cancel 12").unwrap(),
-        DispatchCommand::JobCancel {
-            id: "12".to_string()
-        }
-    );
+fn parse_jobs_family_no_longer_recognized() {
+    assert!(matches!(
+        parse("/jobs").unwrap_err(),
+        DispatchCommandParseError::Unknown { .. }
+    ));
+    assert!(matches!(
+        parse("/job 12").unwrap_err(),
+        DispatchCommandParseError::Unknown { .. }
+    ));
+    assert!(matches!(
+        parse("/job-cancel 12").unwrap_err(),
+        DispatchCommandParseError::Unknown { .. }
+    ));
 }
 
 #[test]

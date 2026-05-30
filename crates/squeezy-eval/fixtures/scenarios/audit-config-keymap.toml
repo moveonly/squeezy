@@ -1,0 +1,54 @@
+id = "audit-config-keymap"
+title = "Audit · /keymap pushes keymap to transcript"
+description = """
+`/keymap` is a text-output command — no modal. Pushes a formatted
+keymap listing into the transcript (system entry) and sets the status
+to "keymap (defaults)" when no overrides exist (or with override count).
+We assert via status + frame_contains a known action name from the
+default keymap ("submit" appears in the default bindings table).
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/keymap"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "none"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "keymap"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

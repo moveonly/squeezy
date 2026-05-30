@@ -1,0 +1,42 @@
+id = "audit-session-session-export-after-turn"
+title = "/session-export <current> after a turn — non-zero bytes"
+description = """
+Seed a session with a turn, capture the active session id via /sessions
+(producing `sessions_list:1`), then run `/session-export` against a
+known-bad id. Expectation: SessionExport with a missing id returns
+`error:` (status format `error:<message>`). Combined with the
+session-export-current scenario below this pins both success and miss
+paths.
+"""
+
+[workspace]
+local = "/tmp/audit-session-session-export-after-turn-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "warm up"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session-export does-not-exist"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "ack"
+[[mock.turns]]
+text = "ack"
+input_tokens = 4
+output_tokens = 1
+
+[triage]
+enabled = false

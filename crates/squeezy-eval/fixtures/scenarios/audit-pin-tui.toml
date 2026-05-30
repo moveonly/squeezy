@@ -1,0 +1,52 @@
+id = "audit-pin-tui"
+title = "Audit · /pin selected under TUI after seeding a transcript entry"
+description = """
+`/pin` is TUI-side (agent dispatch returns `TuiOnly { command: "pin" }`)
+because it needs the transcript selection to find what to pin. With
+`drive_tui = true`, the TUI handler routes through `pin_source` →
+`agent.pin_context_entry`, which sets status to either "pinned <id>"
+or a "no transcript entry to pin" / "usage:" string.
+
+Seeds one mock turn so the transcript is non-empty, then dispatches
+`/pin selected`. Asserts status starts with "pinned" or "no transcript".
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Reply with a sentence that will become a transcript entry to pin."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/pin selected"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = "Assistant reply that the pin handler may attach as a pinned entry."
+input_tokens = 25
+output_tokens = 14
+
+[triage]
+enabled = false

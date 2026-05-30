@@ -1,0 +1,74 @@
+id = "audit-collapse-expand-tui"
+title = "Audit · /collapse all + /expand all under live TUI"
+description = """
+`/collapse` and `/expand` are TUI-side mutations: the agent-side
+dispatch returns `DispatchOutcome::TuiOnly { command: "collapse" }`
+(or "expand"), so `drive_tui = false` makes them no-ops. With
+`drive_tui = true`, the TUI handler routes through
+`apply_collapse_expand` which sets a status like
+"collapsed N transcript entries" / "expanded N transcript entries".
+
+Seeds one mock turn so the transcript actually has something to
+collapse, then asserts the status text for each command. The "all"
+sub-option is exercised by the bare form; per-category aliases live
+in companion scenarios.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "prompt"
+text = "Seed a transcript entry the collapse handler can target."
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/collapse all"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "collapsed"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/expand all"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
+
+[expect]
+max_wall_clock_seconds = 60
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = "Seeded assistant reply so /collapse has something to operate on."
+input_tokens = 25
+output_tokens = 14
+
+[triage]
+enabled = false

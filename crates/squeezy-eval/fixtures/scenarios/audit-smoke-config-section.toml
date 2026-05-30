@@ -1,0 +1,70 @@
+id = "audit-smoke-config-section"
+title = "Audit smoke · config_screen_section disambiguates /model vs /permissions"
+description = """
+/options, /model, /permissions all open the same config_screen modal,
+so modal_active alone reports "config" for all three. The
+config_screen_section assertion (squeezy-qr9e / audit H2) reads the
+focused SectionId and lets scenarios pin which section is up.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/model"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "config"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "config_screen_section"
+name = "models"
+
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/permissions"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "config_screen_section"
+name = "permissions"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

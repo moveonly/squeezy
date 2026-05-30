@@ -408,6 +408,7 @@ fn describe_action(action: &Action) -> String {
         Action::DetachAttachment { id, .. } => format!("detach_attachment: {id}"),
         Action::SendKey { key, .. } => format!("send_key: {key}"),
         Action::SendKeys { keys, .. } => format!("send_keys: [{}]", keys.join(", ")),
+        Action::CaptureSessionId { var, .. } => format!("capture_session_id → {var}"),
         Action::InjectMcpElicitation { request, .. } => {
             let kind = request.kind.as_deref().unwrap_or("form");
             format!(

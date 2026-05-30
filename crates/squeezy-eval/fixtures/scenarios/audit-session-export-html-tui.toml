@@ -1,0 +1,51 @@
+id = "audit-session-export-html-tui"
+title = "/session-export-html <id> path written via drive_tui=true"
+description = """
+`/session-export-html` is `TuiOnly`. Driving the TUI exercises
+`lib.rs:2526`: `show_session` + `export_session_to_html` + std::fs::write,
+with the default path `squeezy-session-<id>.html`. Status should
+contain `wrote ` on success or `session export html failed:` on miss.
+
+We pass a known-bad id to keep the workspace clean: success would
+write a real .html into the workspace which we don't want to leak.
+The failure path is the more important regression guard anyway —
+without it, the export step could silently no-op and the user would
+never know.
+"""
+
+[workspace]
+local = "/tmp/audit-session-export-html-tui-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session-export-html does-not-exist"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "session export html failed"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

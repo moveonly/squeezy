@@ -846,7 +846,7 @@ async fn apply_plan_choice(
             // in via the handoff prefix queued by the mode switch, so the
             // model retains the full plan even with an emptied transcript.
             match agent.compact_context_manual().await {
-                Ok(report) => {
+                Ok(Some(report)) => {
                     app.context_compaction.last = Some(report.record.clone());
                     app.context_compaction.generation = report.record.generation;
                     app.context_compaction.summary = Some(report.summary.clone());
@@ -858,11 +858,16 @@ async fn apply_plan_choice(
                         pending.plan_id
                     ));
                 }
-                Err(err) => {
-                    // "not enough context to compact" is fine — common on a
-                    // fresh session and not a blocker for execution.
+                Ok(None) => {
+                    // Nothing to compact — common on a fresh session.
                     app.push_log(format!(
-                        "execute-clean: skipped compaction ({err}); running plan"
+                        "execute-clean: nothing to compact for plan {}; running",
+                        pending.plan_id
+                    ));
+                }
+                Err(err) => {
+                    app.push_log(format!(
+                        "execute-clean: compaction failed ({err}); running plan"
                     ));
                 }
             }
@@ -2051,7 +2056,7 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
     }
 }
 
-async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let cmd = match DispatchCommand::parse(input) {
         Ok(cmd) => cmd,
         // Unknown heads fall through to the user-authored prompt
@@ -2266,7 +2271,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 }
             } else {
                 match agent.compact_context_manual().await {
-                    Ok(report) => {
+                    Ok(Some(report)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
                         app.context_estimate = report.record.after.clone();
                         app.status = compaction_status_line(&report.record);
@@ -2284,6 +2289,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                             before = report.record.before.estimated_tokens,
                             after = report.record.after.estimated_tokens,
                         )));
+                    }
+                    Ok(None) => {
+                        app.status = "nothing to compact yet".to_string();
                     }
                     Err(error) => app.status = format!("compact failed: {error}"),
                 }
@@ -2339,44 +2347,10 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
         DispatchCommand::Verbosity { value } => {
-            if let Some(value) = value
-                && let Some(verbosity) = parse_response_verbosity(&value)
-            {
-                app.response_verbosity = verbosity;
-                let mut next = agent.config_snapshot();
-                next.tui.response_verbosity = verbosity;
-                agent.replace_config(next);
-                app.app_notifications.push(
-                    format!("response verbosity → {}", verbosity.as_str()),
-                    NotifySeverity::Success,
-                );
-                return;
-            }
-            toggle_config_screen(
-                app,
-                agent,
-                Some(squeezy_core::config_schema::SectionId::Verbosity),
-            );
+            handle_slash_verbosity(app, agent, value.as_deref());
         }
         DispatchCommand::ToolVerbosity { value } => {
-            if let Some(value) = value
-                && let Some(verbosity) = parse_tool_output_verbosity(&value)
-            {
-                app.tool_output_verbosity = verbosity;
-                let mut next = agent.config_snapshot();
-                next.tui.tool_output_verbosity = verbosity;
-                agent.replace_config(next);
-                app.app_notifications.push(
-                    format!("tool output verbosity → {}", verbosity.as_str()),
-                    NotifySeverity::Success,
-                );
-                return;
-            }
-            toggle_config_screen(
-                app,
-                agent,
-                Some(squeezy_core::config_schema::SectionId::Verbosity),
-            );
+            handle_slash_tool_verbosity(app, agent, value.as_deref());
         }
         DispatchCommand::Theme { theme } => {
             let Some(parsed) = TuiTheme::parse(&theme) else {
@@ -2401,16 +2375,16 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             };
             app.push_transcript_item(TranscriptItem::system(body));
         }
-        DispatchCommand::Tasks | DispatchCommand::Jobs => {
+        DispatchCommand::Tasks => {
             sync_jobs_from_agent(app, agent);
             let body = format_tasks_list(app, agent);
             app.status = format!("{} tasks", app.jobs.len());
             app.push_transcript_item(TranscriptItem::system(body));
         }
-        DispatchCommand::Task { id } | DispatchCommand::Job { id } => {
+        DispatchCommand::Task { id } => {
             apply_task_detail(app, agent, &id);
         }
-        DispatchCommand::TaskCancel { id } | DispatchCommand::JobCancel { id } => {
+        DispatchCommand::TaskCancel { id } => {
             apply_task_cancel(app, agent, &id);
         }
         DispatchCommand::Sessions => match agent.list_sessions(&SessionQuery::default()) {
@@ -2602,7 +2576,8 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
 }
 
 fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>, collapsed: bool) {
-    let category = match category {
+    let category_arg = category;
+    let category = match category_arg {
         Some(value) => match parse_transcript_category(value) {
             Some(category) => category,
             None => {
@@ -2614,12 +2589,24 @@ fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>
         None => TranscriptCategory::All,
     };
     let changed = set_transcript_collapsed(app, category, collapsed);
-    app.status = format!(
-        "{} {} transcript entr{}",
-        if collapsed { "collapsed" } else { "expanded" },
-        changed,
-        if changed == 1 { "y" } else { "ies" }
-    );
+    let verb = if collapsed { "collapse" } else { "expand" };
+    let past = if collapsed { "collapsed" } else { "expanded" };
+    if changed == 0 {
+        // squeezy-o3z0 (audit U3): when nothing matches the requested
+        // category, say so directly instead of leaking a "collapsed 0
+        // transcript entries" line. `category_arg` is the user-typed
+        // slug; falling back to "matching" keeps the bare /collapse
+        // case (TranscriptCategory::All) readable too.
+        let label = category_arg.unwrap_or("matching");
+        app.status = format!("no {label} entries to {verb}");
+    } else {
+        app.status = format!(
+            "{} {} transcript entr{}",
+            past,
+            changed,
+            if changed == 1 { "y" } else { "ies" }
+        );
+    }
 }
 
 fn apply_task_detail(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
@@ -3314,10 +3301,11 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
         || "auto (model default)".to_string(),
         |e| e.as_str().to_string(),
     );
-    app.app_notifications.push(
-        format!("reasoning effort → {label}"),
-        NotifySeverity::Success,
-    );
+    // squeezy-a19z (audit U1): status line only; the previous
+    // app_notification push duplicated feedback and diverged from
+    // /verbosity / /tool-verbosity, which only used notifications.
+    // Unify on the status line — it's the immediate-feedback surface
+    // for these session-scoped switches.
     app.status = format!("reasoning effort → {label}");
     if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
         app.app_notifications.push(
@@ -3325,6 +3313,59 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
             NotifySeverity::Warn,
         );
     }
+}
+
+/// `/verbosity [concise|normal|verbose]`. Bare prints the current
+/// value and usage hint into the transcript (matches `/effort`'s
+/// surface); with an explicit value, sets `tui.response_verbosity`
+/// and reports via the status line. Previously the bare form
+/// short-circuited to the `/options` config_screen — surprising
+/// mode-switch on argument presence (squeezy-3ys0 / audit U2).
+fn handle_slash_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let Some(raw) = value else {
+        let current = agent.config_snapshot().tui.response_verbosity;
+        app.status = format!("response verbosity: {}", current.as_str());
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "response verbosity = {}\nusage: /verbosity [concise|normal|verbose]",
+            current.as_str()
+        )));
+        return;
+    };
+    let Some(verbosity) = parse_response_verbosity(raw) else {
+        app.status =
+            format!("unknown response verbosity {raw:?}; expected concise, normal, or verbose");
+        return;
+    };
+    app.response_verbosity = verbosity;
+    let mut next = agent.config_snapshot();
+    next.tui.response_verbosity = verbosity;
+    agent.replace_config(next);
+    app.status = format!("response verbosity → {}", verbosity.as_str());
+}
+
+/// `/tool-verbosity [compact|normal|verbose]`. Same shape as
+/// [`handle_slash_verbosity`] — bare prints + usage hint, with-arg
+/// sets and reports via the status line. squeezy-a19z + squeezy-3ys0.
+fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let Some(raw) = value else {
+        let current = agent.config_snapshot().tui.tool_output_verbosity;
+        app.status = format!("tool output verbosity: {}", current.as_str());
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "tool output verbosity = {}\nusage: /tool-verbosity [compact|normal|verbose]",
+            current.as_str()
+        )));
+        return;
+    };
+    let Some(verbosity) = parse_tool_output_verbosity(raw) else {
+        app.status =
+            format!("unknown tool output verbosity {raw:?}; expected compact, normal, or verbose");
+        return;
+    };
+    app.tool_output_verbosity = verbosity;
+    let mut next = agent.config_snapshot();
+    next.tui.tool_output_verbosity = verbosity;
+    agent.replace_config(next);
+    app.status = format!("tool output verbosity → {}", verbosity.as_str());
 }
 
 fn set_transcript_collapsed(
@@ -6256,7 +6297,7 @@ fn format_message_entry_with_width(
 fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Line<'static>>> {
     let mut iter = content.lines();
     let header = iter.next()?;
-    if header != "Cost accounting" && header != "Context accounting" {
+    if header != "Cost accounting" && header != "Context window" {
         return None;
     }
     let header_span = Span::styled(

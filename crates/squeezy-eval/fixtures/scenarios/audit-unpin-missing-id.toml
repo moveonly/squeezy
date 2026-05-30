@@ -1,0 +1,34 @@
+id = "audit-unpin-missing-id"
+title = "Audit · /unpin with no id surfaces Usage error"
+description = """
+Bare `/unpin` with no arg. `DispatchCommand::parse` returns
+`Usage { hint: "usage: /unpin <pin_id>" }`, surfaced by the eval
+driver as `error:usage: /unpin <pin_id>`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = false
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/unpin"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback)"
+
+[triage]
+enabled = false

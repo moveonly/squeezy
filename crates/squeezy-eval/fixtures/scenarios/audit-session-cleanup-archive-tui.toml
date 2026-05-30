@@ -1,0 +1,45 @@
+id = "audit-session-cleanup-archive-tui"
+title = "/session-cleanup --archive via TUI — status reports 0/0"
+description = """
+Drive `/session-cleanup --archive` through the TUI with an empty
+SQUEEZY_HOME. The handler invokes `agent.cleanup_sessions_with(&[], Archive)`
+and the status line ends up as `archived <n> removed <m>` per
+lib.rs:2566. With no sessions, both counts are 0.
+"""
+
+[workspace]
+local = "/tmp/audit-session-cleanup-archive-tui-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session-cleanup --archive"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "archived 0 removed 0"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "(no model turn expected)"
+
+[triage]
+enabled = false

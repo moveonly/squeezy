@@ -1,0 +1,40 @@
+id = "audit-session-session-rename"
+title = "/session rename <name> → SessionRenamed { display_name = Some(<name>) }"
+description = """
+Seed a turn so a session metadata file exists, then `/session rename`.
+Asserts that the dispatch produces a `SessionRenamed` outcome whose
+`display_name` matches the supplied argument. Status string format:
+`session_renamed:my-custom-name`.
+"""
+
+[workspace]
+local = "/tmp/audit-session-session-rename-workspace"
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "warm up the session record"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/session rename my-custom-name"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[mock]
+default_text = "ack"
+[[mock.turns]]
+text = "ack"
+input_tokens = 4
+output_tokens = 1
+
+[triage]
+enabled = false

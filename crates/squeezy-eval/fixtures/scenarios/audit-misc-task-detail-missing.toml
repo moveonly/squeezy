@@ -1,0 +1,46 @@
+id = "audit-misc-task-detail-missing"
+title = "Audit · /task <id> for missing job sets 'task 999 not found'"
+description = """
+Canonical /task form. With no jobs spawned, looking up id 999 misses
+both the local `app.jobs` map and `agent.job_snapshot`. The TUI
+handler in `apply_task_detail` sets the status to `task 999 not found`.
+Asserts via `tui_status_contains`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "ask"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 44
+palette_tone = "dark"
+
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/task 999"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "task 999 not found"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+
+[mock]
+default_text = "(mock fallback — no model turn expected)"
+
+[triage]
+enabled = false

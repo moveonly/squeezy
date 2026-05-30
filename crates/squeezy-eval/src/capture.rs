@@ -230,6 +230,11 @@ struct CaptureInner {
     path: PathBuf,
     file: std::fs::File,
     sequence: u64,
+    /// In-memory log of slash_command ActionStep events. Powers the
+    /// `Assertion::ActionStepStatusContains` evaluator without making
+    /// it re-parse the on-disk trace. Each entry is (command, status)
+    /// captured at record time. squeezy-7hgd (audit H3).
+    slash_action_steps: Vec<(String, String)>,
 }
 
 impl Capture {
@@ -251,6 +256,7 @@ impl Capture {
                 path,
                 file,
                 sequence: 0,
+                slash_action_steps: Vec::new(),
             }),
             live,
         })
@@ -263,6 +269,16 @@ impl Capture {
             .map_err(|err| EvalError::Internal(format!("capture mutex poisoned: {err}")))?;
         let sequence = guard.sequence;
         guard.sequence += 1;
+        // Snapshot slash_command status before moving `kind` into the
+        // event — the assertion evaluator queries this buffer later.
+        if let EvalEventKind::ActionStep { action, status } = &kind
+            && action.get("action").is_some_and(|v| v == "slash_command")
+            && let Some(command) = action.get("command").and_then(|v| v.as_str())
+        {
+            guard
+                .slash_action_steps
+                .push((command.to_string(), status.clone()));
+        }
         let event = EvalEvent {
             schema_version: EVAL_TRACE_SCHEMA_VERSION,
             ts_unix_ms: now_ms(),
@@ -284,6 +300,19 @@ impl Capture {
 
     pub fn path(&self) -> PathBuf {
         self.inner.lock().expect("capture lock").path.clone()
+    }
+
+    /// Most-recent `slash_command` action step matching `command` (or
+    /// any slash when `command` is `None`). Returns the recorded
+    /// status string. Backs `Assertion::ActionStepStatusContains`.
+    pub fn last_slash_status(&self, command: Option<&str>) -> Option<(String, String)> {
+        let guard = self.inner.lock().expect("capture lock");
+        guard
+            .slash_action_steps
+            .iter()
+            .rev()
+            .find(|(cmd, _)| command.is_none_or(|target| cmd == target))
+            .cloned()
     }
 }
 

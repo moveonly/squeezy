@@ -20,12 +20,6 @@ fn match_slash_command_prefix_prefers_longest_match() {
         match_slash_command_prefix("/task-cancel abc"),
         Some("/task-cancel".len())
     );
-    // The legacy `/job-cancel` alias must still resolve to itself for the
-    // grace-release window.
-    assert_eq!(
-        match_slash_command_prefix("/job-cancel abc"),
-        Some("/job-cancel".len())
-    );
 }
 
 #[test]
@@ -126,17 +120,13 @@ fn options_is_surfaced_without_config_duplicate() {
 fn purely_informational_slash_commands_declare_no_capabilities() {
     // `/cost`, `/context`, `/tasks`, `/pin`, etc. only read in-memory state.
     // Showing capability badges on them would dilute the signal for commands
-    // that actually touch the world. `/jobs`/`/job`/`/job-cancel` are kept as
-    // aliases for one release; they share the no-badges contract.
+    // that actually touch the world.
     for name in [
         "/cost",
         "/context",
         "/tasks",
         "/task",
         "/task-cancel",
-        "/jobs",
-        "/job",
-        "/job-cancel",
         "/pins",
         "/pin",
         "/unpin",
