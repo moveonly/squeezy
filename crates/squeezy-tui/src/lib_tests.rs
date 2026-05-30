@@ -8156,6 +8156,99 @@ async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
     assert_eq!(palette::accent_primary(), palette::AMBER);
 }
 
+/// Regression for `squeezy-ramu`: when the eval harness pins a settings
+/// path override, `/theme dark` must persist to the scratch file and
+/// must NOT touch the env-resolved (production-style "home") path. The
+/// harness's per-run scratch path beats `$SQUEEZY_SETTINGS_PATH` /
+/// `$HOME/.squeezy/settings.toml` so scenarios can't clobber the
+/// operator's real config mid-run.
+#[tokio::test]
+async fn tui_harness_settings_override_pins_theme_writes_to_scratch() {
+    use crate::render::palette;
+    use crate::testing::TuiHarness;
+
+    let dir = temp_workspace("ramu_harness_override");
+    let scratch_settings = dir.join("scratch-settings.toml");
+    // `fake_home_settings` stands in for `~/.squeezy/settings.toml`:
+    // we point `SQUEEZY_SETTINGS_PATH` at it so `default_settings_path`
+    // (the production fallback) resolves here, then assert the override
+    // wins and this file is never created.
+    let fake_home_settings = dir.join("fake-home-settings.toml");
+    let _guard = ScopedSettingsPath::new(fake_home_settings.clone());
+
+    let mut config = test_config(SessionMode::Build);
+    config.workspace_root = dir.clone();
+    let provider = Arc::new(UnavailableProvider::new(
+        "scripted",
+        "harness override test",
+    ));
+    let mut harness = TuiHarness::new(
+        config,
+        SessionMode::Build,
+        provider,
+        80,
+        24,
+        Some(scratch_settings.clone()),
+    )
+    .expect("harness builds with override");
+
+    // Sanity: the override is the resolved persistence target.
+    assert_eq!(
+        harness.app_mut().user_settings_path(),
+        scratch_settings,
+        "override should win over $SQUEEZY_SETTINGS_PATH",
+    );
+
+    // Drive `/theme dark` through the live slash dispatch — same code
+    // path the eval composer hits via `send_keys` typing `/theme dark`
+    // + Enter. We invoke the dispatcher directly to keep the test
+    // fast and decoupled from key-event parsing.
+    let ran = {
+        let (app, agent) = harness.app_and_agent_mut();
+        handle_slash_command(app, agent, "/theme dark").await
+    };
+    assert!(ran, "/theme dark should dispatch");
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+
+    // Scratch file got the override; the env-pointed "home" file did
+    // NOT — that's the whole point of the fix.
+    let saved = std::fs::read_to_string(&scratch_settings).expect("scratch settings file written");
+    assert!(
+        saved.contains("theme = \"dark\""),
+        "scratch should record the theme; got {saved}",
+    );
+    assert!(
+        !fake_home_settings.exists(),
+        "env-pointed fallback path must not be created when override is set; \
+         leaked write to {}",
+        fake_home_settings.display(),
+    );
+}
+
+/// Companion regression: with the override left `None` the harness
+/// still resolves the production path via `default_settings_path()` —
+/// i.e. we did not accidentally break the non-eval default branch.
+#[tokio::test]
+async fn tui_harness_without_override_falls_through_to_default_path() {
+    use crate::testing::TuiHarness;
+
+    let dir = temp_workspace("ramu_harness_default");
+    let env_settings = dir.join("env-settings.toml");
+    let _guard = ScopedSettingsPath::new(env_settings.clone());
+
+    let mut config = test_config(SessionMode::Build);
+    config.workspace_root = dir.clone();
+    let provider = Arc::new(UnavailableProvider::new("scripted", "harness default test"));
+    let mut harness = TuiHarness::new(config, SessionMode::Build, provider, 80, 24, None)
+        .expect("harness builds without override");
+
+    assert_eq!(
+        harness.app_mut().user_settings_path(),
+        env_settings,
+        "no override ⇒ default_settings_path (env-backed) should win",
+    );
+}
+
 /// `/keymap` lists the current bindings — even with no overrides it
 /// must surface every action plus the persisted-defaults hint so a
 /// fresh install can be inspected.

@@ -153,12 +153,19 @@ pub async fn run_scenario(
         let width = scenario.tui_capture.width.unwrap_or(160);
         let height = scenario.tui_capture.height.unwrap_or(48);
         let session_mode = config.session_mode;
+        // Pin slash-command settings writes (`/theme`, `/statusline`, …)
+        // to a scratch file under the per-run dir so the harness can't
+        // clobber the operator's real `~/.squeezy/settings.toml` mid-run
+        // (squeezy-ramu). The file is created lazily by `apply_edits`
+        // when a scenario actually flips a setting.
+        let scratch_settings = run_dir.join("scratch-settings.toml");
         let harness = squeezy_tui::testing::TuiHarness::new(
             config.clone(),
             session_mode,
             provider.clone(),
             width,
             height,
+            Some(scratch_settings),
         )
         .map_err(|err| EvalError::Internal(format!("init TuiHarness: {err}")))?;
         Some(Arc::new(TokioMutex::new(harness)))

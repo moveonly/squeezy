@@ -1893,7 +1893,7 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
     next.tui.theme = theme;
     agent.replace_config(next);
 
-    let target_path = squeezy_core::default_settings_path();
+    let target_path = app.user_settings_path();
     let scope_target = SettingsScope::user(&target_path);
     let edits = [SettingsEdit {
         path: &["tui", "theme"],
@@ -1929,7 +1929,7 @@ fn save_status_line(
 ) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    let target_path = squeezy_core::default_settings_path();
+    let target_path = app.user_settings_path();
     let scope_target = SettingsScope::user(&target_path);
     let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
     let edits = [
@@ -10641,6 +10641,14 @@ pub(crate) struct TuiApp {
     /// `DispatchCommand`; a match expands the template body and routes
     /// it through [`start_user_turn`] like any other typed prompt.
     pub(crate) prompt_templates: PromptTemplateCatalog,
+    /// Override for the user-scope settings file that slash commands
+    /// (`/theme`, `/statusline`, …) persist into. `None` ⇒ production
+    /// path: `squeezy_core::default_settings_path()` (which itself
+    /// honours `$SQUEEZY_SETTINGS_PATH` then `$HOME/.squeezy/settings.toml`).
+    /// `Some(path)` ⇒ writes are pinned to `path`, used by the eval
+    /// harness so scenario runs cannot clobber the operator's real
+    /// `~/.squeezy/settings.toml`.
+    pub(crate) settings_path_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10912,7 +10920,27 @@ impl TuiApp {
             pending_chord: None,
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
+            settings_path_override: None,
         }
+    }
+
+    /// Resolve the user-scope settings path slash commands should write
+    /// to. Returns the [`settings_path_override`](Self::settings_path_override)
+    /// when one has been pinned (eval harness path), else the production
+    /// [`squeezy_core::default_settings_path`] (which itself honours
+    /// `$SQUEEZY_SETTINGS_PATH` then `$HOME/.squeezy/settings.toml`).
+    pub(crate) fn user_settings_path(&self) -> PathBuf {
+        self.settings_path_override
+            .clone()
+            .unwrap_or_else(squeezy_core::default_settings_path)
+    }
+
+    /// Pin the user-scope settings path. Used by the eval harness so
+    /// `/theme` etc. cannot escape the per-run scratch directory. Has
+    /// no effect on production sessions, which never call this.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn set_settings_path_override(&mut self, path: Option<PathBuf>) {
+        self.settings_path_override = path;
     }
 
     /// Open `content` as a typed slash-command overlay and return a

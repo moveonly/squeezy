@@ -8,6 +8,7 @@
 //! frame, read transcript / status state. The internal struct keeps
 //! its 150-plus `pub(crate)` fields private to the crate.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use crossterm::event::KeyEvent;
@@ -40,12 +41,20 @@ impl TuiHarness {
     /// Build a harness around `config + provider`. Mirrors the
     /// preamble of `run_inner` (`apply_theme_overrides` then construct
     /// TuiApp + Agent) so palette and state line up with production.
+    ///
+    /// `settings_path_override` pins the user-scope settings file that
+    /// in-session slash commands (`/theme`, `/statusline`, …) persist
+    /// into. The eval driver passes a per-run scratch path so scenarios
+    /// can't clobber the operator's real `~/.squeezy/settings.toml`;
+    /// `None` keeps the production fallback
+    /// (`squeezy_core::default_settings_path`).
     pub fn new(
         config: AppConfig,
         mode: SessionMode,
         provider: Arc<dyn LlmProvider>,
         width: u16,
         height: u16,
+        settings_path_override: Option<PathBuf>,
     ) -> Result<Self> {
         apply_theme_overrides(config.tui.theme);
         // Mirror production (`crates/squeezy-tui/src/lib.rs:525`): the
@@ -55,8 +64,9 @@ impl TuiHarness {
         // the trait keeps eval and production in lock-step.
         let provider_name = provider.name();
         let agent = Agent::new(config.clone(), provider);
-        let app =
+        let mut app =
             TuiApp::new_with_clipboard(provider_name, &config, mode, None, Box::new(NoopClipboard));
+        app.set_settings_path_override(settings_path_override);
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)
             .map_err(|e| SqueezyError::Terminal(format!("test backend init: {e}")))?;
@@ -76,6 +86,29 @@ impl TuiHarness {
         self.agent
             .as_mut()
             .expect("agent dropped before harness; this is a bug in TuiHarness")
+    }
+
+    /// In-crate access to the wrapped [`TuiApp`] for internal unit
+    /// tests that need to inspect or drive private TUI state directly
+    /// (e.g. asserting `settings_path_override` plumbing). Not part of
+    /// the public eval-driver API — external callers go through
+    /// [`send_keys`](Self::send_keys) and [`render_frame`](Self::render_frame).
+    #[cfg(test)]
+    pub(crate) fn app_mut(&mut self) -> &mut TuiApp {
+        &mut self.app
+    }
+
+    /// In-crate access to both [`TuiApp`] and [`Agent`] in one borrow,
+    /// for unit tests that need to drive `handle_slash_command` (which
+    /// takes both mutably) against the harness's internal state without
+    /// going through the async key-pump.
+    #[cfg(test)]
+    pub(crate) fn app_and_agent_mut(&mut self) -> (&mut TuiApp, &mut Agent) {
+        let agent = self
+            .agent
+            .as_mut()
+            .expect("agent dropped before harness; this is a bug in TuiHarness");
+        (&mut self.app, agent)
     }
 
     /// Start a user turn through the same code path the TUI uses for
@@ -323,42 +356,5 @@ impl Clipboard for NoopClipboard {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use squeezy_llm::{LlmProvider, LlmRequest, LlmStream};
-    use tokio_util::sync::CancellationToken;
-
-    /// Minimal provider stub: returns its configured name and never
-    /// streams. Lets the harness build without a live LLM, so the test
-    /// can render a frame and read the banner-derived model row.
-    struct NamedProvider(&'static str);
-
-    impl LlmProvider for NamedProvider {
-        fn name(&self) -> &'static str {
-            self.0
-        }
-        fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
-            use futures_util::stream;
-            Box::pin(stream::iter(Vec::new()))
-        }
-    }
-
-    #[test]
-    fn harness_banner_uses_real_provider_name_not_eval_harness() {
-        let mut config = AppConfig::default();
-        config.model = "test-model".to_string();
-        let provider: Arc<dyn LlmProvider> = Arc::new(NamedProvider("anthropic"));
-        let mut harness = TuiHarness::new(config, SessionMode::default(), provider, 120, 36)
-            .expect("build TuiHarness");
-        let snapshot = harness.render_frame().expect("render frame");
-        let plain = snapshot.plain_text;
-        assert!(
-            plain.contains("anthropic:test-model"),
-            "expected banner to contain `anthropic:test-model`, frame was:\n{plain}"
-        );
-        assert!(
-            !plain.contains("eval-harness:"),
-            "banner still carries the harness literal `eval-harness:`; frame was:\n{plain}"
-        );
-    }
-}
+#[path = "testing_tests.rs"]
+mod tests;
