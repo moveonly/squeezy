@@ -1197,6 +1197,14 @@ pub struct Agent {
     /// `AgentEvent` contains non-`Clone` variants (oneshot senders);
     /// subscribers receive cheap `Arc<AgentEvent>` clones.
     event_broadcast: broadcast::Sender<Arc<AgentEvent>>,
+    /// Background tasks spawned from within the agent — currently just
+    /// the MCP tool-palette refresh fired during `start_turn`. Tracking
+    /// them lets [`Agent::shutdown`] join the spawns before returning so
+    /// callers that need the underlying `Arc<SqueezyStore>` released
+    /// (e.g. a test that reopens the redb file) don't race the
+    /// fire-and-forget lifetime of these tasks. New tasks may still be
+    /// registered after a shutdown completes; the JoinSet is reusable.
+    background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -1590,6 +1598,7 @@ impl Agent {
             agent_hook_bus: None,
             pending_swap: None,
             event_broadcast,
+            background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -1706,6 +1715,14 @@ impl Agent {
         self.provider.name()
     }
 
+    /// Current per-language file counts from the workspace graph, or
+    /// `None` when the graph has not finished its initial open yet.
+    /// Cheap to poll (graph state is in-memory; opportunistically
+    /// refreshes only when the file watcher has queued changes).
+    pub fn current_language_report(&self) -> Option<squeezy_tools::LanguageReport> {
+        self.tools.current_language_report()
+    }
+
     pub fn session_mode(&self) -> SessionMode {
         load_session_mode(&self.session_mode)
     }
@@ -1753,6 +1770,33 @@ impl Agent {
         self.tools
             .execute_for_group(call, CancellationToken::new(), "manual".to_string())
             .await
+    }
+
+    /// Refresh the MCP tool palette synchronously. Production turns kick a
+    /// background refresh on each `start_turn`; this helper lets tests
+    /// and the eval harness pre-warm the cache so the very first turn
+    /// can issue `mcp__*` tool calls without racing the background task.
+    pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
+        self.tools.refresh_mcp_tools(CancellationToken::new()).await
+    }
+
+    /// Drain every background task the agent spawned (currently just the
+    /// MCP tool-palette refresh from `start_turn`) and wait for it to
+    /// finish. Once this returns, the spawned tasks have dropped their
+    /// `Arc<SqueezyStore>` clones, so a caller that owns the agent can
+    /// safely drop it and re-open the redb store without racing the
+    /// background lifetime. Tests rely on this for deterministic shared-
+    /// state-store assertions on Windows, where the redb lock is
+    /// exclusive and a same-process re-open fails while any handle is
+    /// still alive. The agent remains usable after shutdown: a fresh
+    /// `start_turn` will simply register new tasks into the now-empty
+    /// JoinSet.
+    pub async fn shutdown(&self) {
+        let mut tasks = match self.background_tasks.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poison) => std::mem::take(&mut *poison.into_inner()),
+        };
+        while tasks.join_next().await.is_some() {}
     }
 
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
@@ -3255,6 +3299,7 @@ impl Agent {
         let replay = self.replay.clone();
         let subagents = self.subagents.clone();
         let hooks = self.hooks.clone();
+        let background_tasks = self.background_tasks.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -3374,6 +3419,7 @@ impl Agent {
                     redactor.clone(),
                     tx.clone(),
                     turn_id,
+                    background_tasks.clone(),
                 );
 
                 let outcome = TurnRuntime {
@@ -4113,8 +4159,9 @@ fn refresh_mcp_tools_in_background(
     redactor: Arc<Redactor>,
     tx: mpsc::Sender<AgentEvent>,
     turn_id: TurnId,
+    background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
 ) {
-    tokio::spawn(async move {
+    let task = async move {
         let outcome = tools.refresh_mcp_tools(cancel).await;
         log_session_event(
             session_log.as_ref(),
@@ -4140,7 +4187,22 @@ fn refresh_mcp_tools_in_background(
                 json!({ "error": error }),
             );
         }
-    });
+    };
+    // Hand the spawn to a tracked `JoinSet` so `Agent::shutdown` can
+    // wait for the spawn to drop its `Arc<SqueezyStore>` clone before
+    // the agent's owner re-opens the redb store. Mutex contention here
+    // can only come from a concurrent `start_turn` or a concurrent
+    // shutdown drain; both windows are bounded and short, so the
+    // blocking lock is safe — and falling back to an untracked spawn
+    // would silently regress the lifecycle guarantee.
+    match background_tasks.lock() {
+        Ok(mut tasks) => {
+            tasks.spawn(task);
+        }
+        Err(poison) => {
+            poison.into_inner().spawn(task);
+        }
+    }
 }
 
 /// Parsed `!cmd` or `!!cmd` prompt. The second form runs identically to the

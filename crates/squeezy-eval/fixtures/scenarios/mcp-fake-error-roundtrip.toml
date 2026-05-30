@@ -1,0 +1,70 @@
+id = "mcp-fake-error-roundtrip"
+title = "MCP: tool errors from a server surface as failed tool results, not transport errors"
+description = """
+Spawns `squeezy-fake-mcp` and asks the mock provider to call the
+`fail` tool, which always returns `isError: true`. The eval driver
+must:
+
+  1. observe the tool call,
+  2. surface the failure as a normal tool result with status
+     `error` (not a transport-level cancel or timeout),
+  3. count it against `tool_errors` so the `no_tool_errors`
+     expectation can flag a regression at the surfacing layer.
+
+A regression here would mean we either silently swallow the failure
+or escalate it to a transport error and abort the turn.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[mcp.servers.bench]
+transport = "stdio"
+command = "bundled:fake-mcp"
+args = []
+enabled = true
+timeout_ms = 10000
+
+[[steps]]
+kind = "prompt"
+text = "Trigger the bench/fail tool to confirm error surfacing."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "mcp__bench__fail"
+args_contains = ""
+
+[expect]
+max_wall_clock_seconds = 30
+# This scenario *expects* a tool error; the auto-finding rule should
+# not trip on a single, scripted is_error roundtrip.
+no_tool_errors = false
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Calling fail to verify error surfacing."
+input_tokens = 16
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "mcp__bench__fail"
+arguments = {}
+
+[[mock.turns]]
+text = "Bench/fail returned an error result as expected."
+input_tokens = 24
+output_tokens = 8

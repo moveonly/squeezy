@@ -1,0 +1,83 @@
+id = "skills-fixture-trigger"
+title = "Skills: a fixture skill's trigger phrase activates it in the prompt preamble"
+description = """
+Drops a fixture skill with a unique trigger word, then sends a prompt
+containing that trigger. The agent is expected to:
+
+  1. discover the fixture skill from the workspace snapshot,
+  2. word-boundary match the trigger against the user input,
+  3. embed the skill's metadata block in the instructions for the turn.
+
+We assert by scripting the mock to issue `list_skills`. The tool
+returns the catalog snapshot, which must include `fixture-trigger-pin`.
+This avoids depending on a real LLM noticing the preamble.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[[fixture_skills]]
+dir = "fixture-trigger-pin"
+content = """
+---
+name: fixture-trigger-pin
+description: Eval-only fixture skill triggered by the phrase \"pineapple compass\".
+when_to_use: When the eval driver wants to assert trigger-based activation.
+triggers:
+  - pineapple compass
+---
+
+# Trigger Pin
+
+Body for the trigger-pin fixture. The presence of this skill in the
+`list_skills` output is the assertion target.
+"""
+
+[[steps]]
+kind = "prompt"
+text = "We just spotted a pineapple compass in the workshop. Please list available skills."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "list_skills"
+args_contains = ""
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "fixture-trigger-pin"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Listing skills before continuing."
+input_tokens = 24
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "list_skills"
+arguments = {}
+
+[[mock.turns]]
+text = "fixture-trigger-pin is in the catalog."
+input_tokens = 32
+output_tokens = 12

@@ -43,6 +43,85 @@ pub struct Scenario {
     /// `"linux"`, `"macos"`, `"windows"`. Case-insensitive.
     #[serde(default)]
     pub platform: Option<String>,
+    /// Skills to materialize under `<workspace>/.squeezy/skills/<dir>/SKILL.md`
+    /// after the workspace is provisioned but before the agent is built.
+    /// Lets scenarios exercise the skill discovery + activation paths
+    /// without polluting the host workspace.
+    #[serde(default)]
+    pub fixture_skills: Vec<FixtureSkill>,
+    /// MCP servers merged into [`AppConfig::mcp_servers`] before the
+    /// agent is built. Scenarios can point at the bundled
+    /// `fake-mcp-server` binary (built by `build.rs`) to exercise the
+    /// MCP discovery + call paths offline.
+    #[serde(default)]
+    pub mcp: McpScenarioConfig,
+}
+
+/// Per-scenario MCP overrides. Servers declared here are merged into
+/// [`AppConfig::mcp_servers`] after the standard config load, so they
+/// participate in tool discovery exactly like a user-defined server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpScenarioConfig {
+    /// Map of server name → server config. The shape mirrors the
+    /// user-settings `[mcp.servers.<name>]` block but trims the fields
+    /// scenarios actually need; entries default to `enabled = true` and
+    /// `transport = "stdio"`. Stdio commands are resolved through the
+    /// driver helpers so `command = "cargo"` plus `args = ["run", "-p",
+    /// "fake-mcp-server"]` works without spelling out an absolute
+    /// path.
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, ScenarioMcpServer>,
+}
+
+/// Inline scenario MCP server definition. Keep this surface deliberately
+/// narrow — the goal is "spin up the fixture binary, talk to it" rather
+/// than a full re-implementation of `[mcp.servers.<name>]` from settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioMcpServer {
+    /// `"stdio" | "http" | "sse"`. Defaults to `"stdio"`.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Stdio command name (resolved via `PATH`).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Stdio command args.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// HTTP/SSE URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Per-server `enabled` flag. Defaults to `true` — scenarios that
+    /// declare a server almost always want it active.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Env vars exported into the spawned process.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Bound the bring-up call so a misbehaving fixture binary fails
+    /// fast rather than hanging the eval run. Defaults to 10s when
+    /// unset.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Optional `enabled_tools` allow-list. Unset means "all tools".
+    #[serde(default)]
+    pub enabled_tools: Option<Vec<String>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Inline SKILL.md fixture. Materialized to
+/// `<workspace>/.squeezy/skills/<dir>/SKILL.md` after the workspace
+/// snapshot is provisioned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixtureSkill {
+    /// Directory name under `.squeezy/skills/`. Must match the
+    /// `name:` in the frontmatter — the skill catalog rejects
+    /// mismatched names.
+    pub dir: String,
+    /// Full SKILL.md content (frontmatter + body).
+    pub content: String,
 }
 
 /// Per-scenario TUI render-capture knobs. Empty/default disables the

@@ -1,0 +1,64 @@
+id = "mcp-fake-echo-call"
+title = "MCP: agent calls fake-mcp `echo` and surfaces the result text"
+description = """
+Spawns the bundled `squeezy-fake-mcp` stdio server as the MCP server
+named `bench`. The mock provider scripts a `mcp__bench__echo` tool
+call carrying a known marker string. We assert that the tool call
+is observed with the expected arguments and that the tool result
+makes it into the assistant transcript.
+
+This is the offline equivalent of asking a live model to call
+`mcp__filesystem__read_file` — same execution path, no network.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[mcp.servers.bench]
+transport = "stdio"
+command = "bundled:fake-mcp"
+args = []
+enabled = true
+timeout_ms = 10000
+
+[[steps]]
+kind = "prompt"
+text = "Ask the bench MCP server to echo the phrase 'mcp-echo-pong'."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "mcp__bench__echo"
+args_contains = "mcp-echo-pong"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Calling the bench echo tool."
+input_tokens = 16
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "mcp__bench__echo"
+arguments = { message = "mcp-echo-pong" }
+
+[[mock.turns]]
+text = "Echo returned mcp-echo-pong from the bench server."
+input_tokens = 24
+output_tokens = 12

@@ -1668,6 +1668,11 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
     ]]));
     let agent = Agent::new(config_for(root.clone()), provider);
     drain_turn(agent.start_turn("warm graph".to_string(), CancellationToken::new())).await;
+    // Join the agent's background tasks (notably the MCP refresh from
+    // `start_turn`) before dropping it so their `Arc<SqueezyStore>`
+    // clones are released. Without this the redb lock can outlive
+    // `drop(agent)` and the re-open below races a fire-and-forget spawn.
+    agent.shutdown().await;
     drop(agent);
 
     let store = SqueezyStore::open(&root, None).expect("reopen state store");

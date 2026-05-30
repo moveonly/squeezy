@@ -1,0 +1,82 @@
+id = "skills-fixture-load"
+title = "Skills: a fixture SKILL.md is discovered and the load_skill tool returns its body"
+description = """
+Materializes a fixture skill into the scenario workspace's
+`.squeezy/skills/` directory, then scripts the mock provider to call
+`load_skill` against it. Verifies:
+
+  1. workspace skill discovery picks the fixture up,
+  2. the `load_skill` tool returns the body content (no panic / no
+     "skill not found"),
+  3. the skill body shows up in the assistant transcript via the tool
+     result.
+
+Runs offline against the mock provider — exercises the
+[skills.discovery → render_active_skills → load_skill] surface
+without needing a live model.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[[fixture_skills]]
+dir = "fixture-echo"
+content = """
+---
+name: fixture-echo
+description: Eval-only fixture skill used to exercise skill discovery and load_skill.
+when_to_use: Whenever the eval driver wants to assert that a workspace skill loaded.
+triggers:
+  - fixture echo trigger
+---
+
+# Fixture Echo
+
+This is a fixture body. The eval harness asserts that this exact phrase
+(`fixture-echo-body-marker`) appears in the load_skill tool result so a
+regression in skill discovery surfaces immediately.
+
+`fixture-echo-body-marker`
+"""
+
+[[steps]]
+kind = "prompt"
+text = "Load the fixture-echo skill so I can read its instructions."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "load_skill"
+args_contains = "fixture-echo"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Calling load_skill to read the fixture body."
+input_tokens = 32
+output_tokens = 16
+[[mock.turns.tool_calls]]
+name = "load_skill"
+arguments = { name = "fixture-echo" }
+
+[[mock.turns]]
+text = "Loaded the fixture-echo skill. fixture-echo-body-marker"
+input_tokens = 48
+output_tokens = 24

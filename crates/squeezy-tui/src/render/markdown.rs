@@ -603,7 +603,7 @@ fn inline_code_style_for(text: &str) -> Style {
     } else if lower.contains("model") || text.starts_with('@') {
         palette::INLINE_MODEL_FG
     } else if lower.contains("branch") || lower.contains("refs/") || lower.contains('/') {
-        Color::Magenta
+        palette::PATH_HINT
     } else if lower.contains("cost")
         || lower.contains("token")
         || lower.contains("ctx")

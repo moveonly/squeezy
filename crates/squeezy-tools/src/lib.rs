@@ -113,6 +113,7 @@ use specs::{
     refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
     upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
 };
+pub use squeezy_graph::LanguageReport;
 
 #[cfg(all(test, target_os = "macos"))]
 use shell_sandbox::macos_shell_sandbox_profile;
@@ -1447,6 +1448,24 @@ impl ToolRegistry {
 
     /// Return the advertised tool list. The result is cached behind an
     /// `Arc<Vec<ToolSpec>>` and re-used across turns; the cache is
+    /// Current per-language file counts from the graph, or `None` when
+    /// the background `GraphManager::open_with_store` hasn't finished
+    /// yet. When the watcher has accumulated pending changes since the
+    /// last refresh, opportunistically calls `refresh_before_query`
+    /// (which has its own debounce + idle interval, so the cost is
+    /// bounded) so the returned counts reflect newly-added/removed
+    /// files without waiting for the next tool call.
+    pub fn current_language_report(&self) -> Option<LanguageReport> {
+        let Ok(mut slot) = self.graph.lock() else {
+            return None;
+        };
+        let manager = slot.as_mut()?;
+        if manager.has_pending_changes() {
+            let _ = manager.refresh_before_query();
+        }
+        Some(manager.current_language_report())
+    }
+
     /// invalidated when [`refresh_mcp_tools`] changes the external tool set.
     pub fn specs(&self) -> Arc<Vec<ToolSpec>> {
         if let Ok(mut slot) = self.cached_specs.lock() {

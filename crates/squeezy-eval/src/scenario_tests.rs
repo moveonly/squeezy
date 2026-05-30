@@ -71,6 +71,50 @@ sha = "deadbeef"
 }
 
 #[test]
+fn parses_fixture_skills_block() {
+    let toml = r#"
+id = "skills"
+title = "Skills"
+
+[workspace]
+local = "/tmp/repo"
+
+[[fixture_skills]]
+dir = "fixture-one"
+content = "---\nname: fixture-one\ndescription: probe\n---\nbody"
+"#;
+    let scenario: Scenario = toml::from_str(toml).unwrap();
+    assert_eq!(scenario.fixture_skills.len(), 1);
+    assert_eq!(scenario.fixture_skills[0].dir, "fixture-one");
+    assert!(scenario.fixture_skills[0].content.contains("fixture-one"));
+}
+
+#[test]
+fn parses_inline_mcp_server_with_bundled_command() {
+    let toml = r#"
+id = "mcp"
+title = "MCP"
+
+[workspace]
+local = "/tmp/repo"
+
+[mcp.servers.bench]
+transport = "stdio"
+command = "bundled:fake-mcp"
+args = []
+"#;
+    let scenario: Scenario = toml::from_str(toml).unwrap();
+    let server = scenario
+        .mcp
+        .servers
+        .get("bench")
+        .expect("bench server must parse");
+    assert_eq!(server.command.as_deref(), Some("bundled:fake-mcp"));
+    assert_eq!(server.transport.as_deref(), Some("stdio"));
+    assert!(server.enabled, "default enabled must be true");
+}
+
+#[test]
 fn rejects_edit_file_without_payload() {
     let toml = r#"
 id = "bad"

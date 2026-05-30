@@ -37,3 +37,7 @@ tracing.workspace = true
 [[bin]]
 name = "squeezy-eval"
 path = "src/main.rs"
+
+[[bin]]
+name = "squeezy-fake-mcp"
+path = "src/bin/fake_mcp.rs"

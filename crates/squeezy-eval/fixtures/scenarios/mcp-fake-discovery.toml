@@ -1,0 +1,59 @@
+id = "mcp-fake-discovery"
+title = "MCP: discovery against the bundled fake-mcp stdio server lists the expected tools"
+description = """
+Spawns the bundled `squeezy-fake-mcp` binary (`cargo build -p
+squeezy-eval` produces it next to `squeezy-eval`) as a stdio MCP
+server, then scripts the mock provider to call `list_skills`. The
+real assertion is that the agent's tool registry exposes
+`mcp__bench__echo`, `mcp__bench__add`, and `mcp__bench__fail` after
+the eval driver pre-warms `refresh_mcp_tools` — that's checked via
+a follow-up `tools/list`-style call. We use `list_skills` as a
+placeholder no-op tool call so the trace records a tool turn for
+the auto-finding rules to attribute.
+
+Runs offline. The fake server speaks the 2025-03-26 MCP protocol.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[mcp.servers.bench]
+transport = "stdio"
+command = "bundled:fake-mcp"
+args = []
+enabled = true
+timeout_ms = 10000
+
+[[steps]]
+kind = "prompt"
+text = "List the available skills."
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Listing skills."
+input_tokens = 16
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "list_skills"
+arguments = {}
+
+[[mock.turns]]
+text = "Done."
+input_tokens = 12
+output_tokens = 4

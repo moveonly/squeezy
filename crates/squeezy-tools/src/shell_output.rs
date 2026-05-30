@@ -361,6 +361,26 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
     if text.trim().is_empty() {
         return String::new();
     }
+    // Unified-diff output ("git diff", "git show", "diff -u", …) is structured:
+    // every line carries signal, blank lines inside hunks are meaningful
+    // context, and `+`/`-` markers must survive byte-for-byte. The default
+    // shaper would drop blank-context lines as noise and head/tail-cap the
+    // body, silently corrupting the diff. Pass it through unchanged so the
+    // TUI and model both see the full hunk set.
+    if looks_like_unified_diff(text) {
+        let mut out = text.trim_end().to_string();
+        if truncated {
+            out.push_str(
+                "\n[raw stream was truncated; recover full bytes via read_tool_output {\"path\": \"<spillover-path>\"}]",
+            );
+        }
+        if let Some(exit_code) = exit_code
+            && exit_code != 0
+        {
+            out.push_str(&format!("\nexit_code={exit_code}"));
+        }
+        return out;
+    }
     const HEAD_BUDGET: usize = 20;
     const TAIL_BUDGET: usize = 20;
     let mut head: Vec<String> = Vec::new();
@@ -448,6 +468,15 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
         kept.push(format!("exit_code={exit_code}"));
     }
     join_shaped_lines(kept)
+}
+
+/// Cheap unified-diff detector. Looks for a hunk header (`@@ -... @@`), which
+/// is the universal marker of every unified-diff-format emitter and never
+/// appears as a coincidental substring in conventional command output. The
+/// check is line-anchored so a stray `@@` in JSON or prose won't false-positive.
+pub(crate) fn looks_like_unified_diff(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with("@@ -") && line.contains(" @@"))
 }
 
 fn line_is_noise(line: &str) -> bool {

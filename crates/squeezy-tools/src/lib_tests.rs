@@ -4062,12 +4062,14 @@ async fn spill_envelope_includes_recovery_hint_and_on_disk_path() {
     assert_eq!(content["recovery_args"]["handle"], handle);
 
     // on_disk_path must point at the spilled file under the workspace.
+    // The producer joins paths against the un-canonicalized workspace
+    // root, so strip the `\\?\` Windows extended-length prefix that
+    // `fs::canonicalize` adds before comparing — otherwise the test
+    // fails on Windows even though both sides reference the same file.
     let on_disk_path = content["on_disk_path"]
         .as_str()
         .expect("on_disk_path string");
-    let expected_path = root
-        .canonicalize()
-        .expect("canonical root")
+    let expected_path = strip_verbatim_prefix(root.canonicalize().expect("canonical root"))
         .join(".squeezy")
         .join("tool_outputs")
         .join(format!("{handle}.json"));

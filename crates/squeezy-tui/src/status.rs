@@ -28,6 +28,7 @@ const STATUS_LINE_SEPARATOR: &str = " · ";
 pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::ProviderAndModel,
     StatusLineItem::CurrentDir,
+    StatusLineItem::Languages,
     StatusLineItem::GitBranch,
     StatusLineItem::PullRequestNumber,
     StatusLineItem::BranchChanges,
@@ -41,9 +42,11 @@ pub(crate) enum StatusLineItem {
     Model,
     ModelWithReasoning,
     ProviderAndModel,
+    ReasoningEffort,
     // Path
     CurrentDir,
     ProjectName,
+    Languages,
     // Branch
     GitBranch,
     PullRequestNumber,
@@ -92,8 +95,10 @@ impl StatusLineItem {
             Self::Model => "model",
             Self::ModelWithReasoning => "model-with-reasoning",
             Self::ProviderAndModel => "provider-and-model",
+            Self::ReasoningEffort => "reasoning-effort",
             Self::CurrentDir => "current-dir",
             Self::ProjectName => "project-name",
+            Self::Languages => "languages",
             Self::GitBranch => "git-branch",
             Self::PullRequestNumber => "pull-request-number",
             Self::BranchChanges => "branch-changes",
@@ -134,8 +139,12 @@ impl StatusLineItem {
             Self::Model => "Current model name",
             Self::ModelWithReasoning => "Current model name with reasoning level",
             Self::ProviderAndModel => "Active provider and model (provider:model)",
+            Self::ReasoningEffort => {
+                "Configured reasoning effort (omitted when unset / model default)"
+            }
             Self::CurrentDir => "Current working directory",
             Self::ProjectName => "Project name (omitted when unavailable)",
+            Self::Languages => "Detected workspace languages (counts when available)",
             Self::GitBranch => "Current Git branch (omitted when unavailable)",
             Self::PullRequestNumber => "Open pull request number for the current branch",
             Self::BranchChanges => "Committed branch changes against the default branch",
@@ -175,8 +184,10 @@ impl StatusLineItem {
         Self::ProviderAndModel,
         Self::ModelWithReasoning,
         Self::Model,
+        Self::ReasoningEffort,
         Self::CurrentDir,
         Self::ProjectName,
+        Self::Languages,
         Self::GitBranch,
         Self::PullRequestNumber,
         Self::BranchChanges,
@@ -254,8 +265,11 @@ impl StatusLineAccent {
         match item {
             StatusLineItem::Model
             | StatusLineItem::ModelWithReasoning
-            | StatusLineItem::ProviderAndModel => Self::Model,
-            StatusLineItem::CurrentDir | StatusLineItem::ProjectName => Self::Path,
+            | StatusLineItem::ProviderAndModel
+            | StatusLineItem::ReasoningEffort => Self::Model,
+            StatusLineItem::CurrentDir
+            | StatusLineItem::ProjectName
+            | StatusLineItem::Languages => Self::Path,
             StatusLineItem::GitBranch
             | StatusLineItem::PullRequestNumber
             | StatusLineItem::BranchChanges => Self::Branch,
@@ -348,6 +362,9 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             &format!("{}:{}", app.provider_name, app.model),
             54,
         )),
+        StatusLineItem::ReasoningEffort => app
+            .reasoning_effort
+            .map(|effort| format!("effort {}", effort.as_str())),
         StatusLineItem::CurrentDir => Some(compact_text(&app.directory, 48)),
         StatusLineItem::ProjectName => {
             let name = app
@@ -356,6 +373,14 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
                 .and_then(|n| n.to_str())
                 .map(str::to_string);
             name.filter(|n| !n.is_empty())
+        }
+        StatusLineItem::Languages => {
+            let summary = app.language_summary.trim();
+            if summary.is_empty() || summary == "none" {
+                None
+            } else {
+                Some(compact_text(summary, 48))
+            }
         }
         StatusLineItem::GitBranch => app
             .repo

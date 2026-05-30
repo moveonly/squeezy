@@ -1,0 +1,138 @@
+id = "skill-anthropic-claude-md-improver"
+title = "Skill: real Anthropic-published claude-md-improver (Apache 2.0) discovers + loads"
+description = """
+End-to-end against an unmodified real-world Anthropic-published skill.
+The frontmatter and body are copied verbatim from
+`claude-plugins-official/plugins/claude-md-management/skills/claude-md-improver/SKILL.md`
+(Apache 2.0). Validates that squeezy's catalog:
+
+  - parses real-world frontmatter shape (including the `tools:` field
+    that squeezy doesn't natively support — must drop silently, not
+    fail the load),
+  - surfaces the skill in `list_skills`,
+  - returns the full body when `load_skill` is called by name,
+  - preserves Markdown structure (tables, fenced code, headings).
+
+The Anthropic publishers do not include a `triggers:` block, so this
+scenario activates the skill explicitly via a scripted `load_skill`
+tool call rather than relying on trigger matching.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 512
+
+[[fixture_skills]]
+dir = "claude-md-improver"
+content = """
+---
+name: claude-md-improver
+description: Audit and improve CLAUDE.md files in repositories. Use when user asks to check, audit, update, improve, or fix CLAUDE.md files. Scans for all CLAUDE.md files, evaluates quality against templates, outputs quality report, then makes targeted updates. Also use when the user mentions \"CLAUDE.md maintenance\" or \"project memory optimization\".
+tools: Read, Glob, Grep, Bash, Edit
+---
+
+# CLAUDE.md Improver
+
+Audit, evaluate, and improve CLAUDE.md files across a codebase to ensure Claude Code has optimal project context.
+
+**This skill can write to CLAUDE.md files.** After presenting a quality report and getting user approval, it updates CLAUDE.md files with targeted improvements.
+
+## Workflow
+
+### Phase 1: Discovery
+
+Find all CLAUDE.md files in the repository:
+
+```bash
+find . -name \"CLAUDE.md\" -o -name \".claude.md\" -o -name \".claude.local.md\" 2>/dev/null | head -50
+```
+
+### Phase 2: Quality Assessment
+
+For each CLAUDE.md file, evaluate against quality criteria.
+
+### Phase 3: Quality Report Output
+
+**ALWAYS output the quality report BEFORE making any updates.**
+
+```
+## CLAUDE.md Quality Report
+
+### Summary
+- Files found: X
+- Average score: X/100
+- Files needing update: X
+```
+
+### Phase 4: Targeted Updates
+
+After outputting the quality report, ask user for confirmation before updating.
+
+### Phase 5: Apply Updates
+
+After user approval, apply changes using the Edit tool. Preserve existing content structure.
+"""
+
+[[steps]]
+kind = "prompt"
+text = "List the available skills, then load the claude-md-improver skill and confirm its quality-report phase is documented."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "list_skills"
+args_contains = ""
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "load_skill"
+args_contains = "claude-md-improver"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "text_contains"
+text = "Quality Report"
+
+[expect]
+max_wall_clock_seconds = 30
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Listing skills."
+input_tokens = 12
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "list_skills"
+arguments = {}
+
+[[mock.turns]]
+text = "Loading claude-md-improver."
+input_tokens = 14
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "load_skill"
+arguments = { name = "claude-md-improver" }
+
+[[mock.turns]]
+text = "The claude-md-improver skill's Phase 3 is the CLAUDE.md Quality Report stage — exactly as documented in the loaded body."
+input_tokens = 24
+output_tokens = 24

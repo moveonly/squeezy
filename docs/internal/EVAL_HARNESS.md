@@ -357,6 +357,61 @@ rest of the agent loop (workspace tools, exploration planner,
 redaction, telemetry) runs for real, which is exactly what makes the
 mock useful for self-testing the harness.
 
+### Fixture skills
+
+Inline `SKILL.md` bundles are written into
+`<workspace>/.squeezy/skills/<dir>/SKILL.md` after the workspace
+snapshot is provisioned, so the catalog discovers them like any
+user-authored skill:
+
+```toml
+[[fixture_skills]]
+dir = "fixture-echo"
+content = """
+---
+name: fixture-echo
+description: Eval-only fixture skill.
+triggers: [fixture echo trigger]
+---
+# Body
+...
+"""
+```
+
+The `dir` value must be a simple directory name (no `/`, no `.`) and
+should match the frontmatter `name:` — the skill catalog rejects
+mismatched names. See `fixtures/scenarios/skills-fixture-*.toml`.
+
+### Inline MCP servers
+
+`[mcp.servers.<name>]` entries are merged into
+`AppConfig.mcp_servers` after the standard config load, so they
+participate in tool discovery exactly like a user-defined server. The
+eval driver pre-warms the MCP cache before the first prompt so the
+very first turn can issue `mcp__*` tool calls without racing the
+production background refresh.
+
+```toml
+[mcp.servers.bench]
+transport = "stdio"           # or "http" | "sse"
+command = "bundled:fake-mcp"  # sentinel resolved to the eval crate's bundled binary
+args = []
+enabled = true                # default true
+timeout_ms = 10000            # bound the bring-up so a wedged binary fails fast
+```
+
+`bundled:fake-mcp` is resolved to the sibling `squeezy-fake-mcp`
+binary that `cargo build -p squeezy-eval` produces. It speaks the
+2025-03-26 MCP protocol over stdio and exposes three tools:
+
+| tool | behavior |
+|---|---|
+| `echo` | echoes `message` back as text content |
+| `add` | returns `a + b` as text content |
+| `fail` | always returns `isError: true` |
+
+See `fixtures/scenarios/mcp-fake-*.toml` for offline MCP scenarios.
+
 ---
 
 ## Per-run output layout

@@ -1,0 +1,97 @@
+id = "mcp-everything-real"
+title = "MCP: real `@modelcontextprotocol/server-everything` reference server, echo + get-sum roundtrip"
+description = """
+End-to-end against the canonical Model Context Protocol reference
+implementation, `@modelcontextprotocol/server-everything`. Validates
+that squeezy's MCP client correctly:
+
+  - launches a real Node-based MCP stdio server,
+  - completes the 2025-03-26 initialize handshake,
+  - imports the published tool palette (sanitized into
+    `mcp__everything__echo`, `mcp__everything__get_sum`, etc.),
+  - dispatches the agent-side tool call into the server,
+  - surfaces the structured `content` array back into the trace.
+
+The mock provider scripts both calls. Verified locally against
+@modelcontextprotocol/server-everything 2026.1.26.
+
+Prereq (already cached in CI when the @modelcontextprotocol package is
+on disk):
+
+    npm --prefix /tmp/mcp-everything init -y
+    npm --prefix /tmp/mcp-everything install @modelcontextprotocol/server-everything
+
+Then:
+
+    cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/mcp-everything-real.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[mcp.servers.everything]
+transport = "stdio"
+command = "/tmp/mcp-everything/node_modules/.bin/mcp-server-everything"
+args = ["stdio"]
+enabled = true
+timeout_ms = 20000
+
+[[steps]]
+kind = "prompt"
+text = "Ask the everything server to echo 'mcp-everything-roundtrip', then sum 7 and 35."
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "mcp__everything__echo"
+args_contains = "mcp-everything-roundtrip"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tool_call_with_args"
+tool = "mcp__everything__get_sum"
+args_contains = "35"
+
+[expect]
+max_wall_clock_seconds = 60
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "Calling echo first."
+input_tokens = 16
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "mcp__everything__echo"
+arguments = { message = "mcp-everything-roundtrip" }
+
+[[mock.turns]]
+text = "Now calling get_sum."
+input_tokens = 16
+output_tokens = 8
+[[mock.turns.tool_calls]]
+name = "mcp__everything__get_sum"
+arguments = { a = 7, b = 35 }
+
+[[mock.turns]]
+text = "All done — echo and get_sum both returned via the real reference server."
+input_tokens = 16
+output_tokens = 16

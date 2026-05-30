@@ -113,6 +113,11 @@ pub async fn run_scenario(
     let scratch_root = options.out_root.join("_workspaces");
     let workspace = workspace::provision(&scenario.workspace, &scratch_root)?;
 
+    // 1b. Materialize any fixture skills under the snapshot's
+    // `.squeezy/skills/<dir>/SKILL.md`. Runs before AppConfig builds
+    // the SkillsConfig so workspace discovery picks them up.
+    materialize_fixture_skills(&workspace.path, &scenario.fixture_skills)?;
+
     // 2. Build the AppConfig with the scenario overlay applied, then the agent.
     //
     // When the scenario pins a provider (`[squeezy] provider = "..."`), thread it
@@ -133,6 +138,7 @@ pub async fn run_scenario(
             .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?,
     };
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
+    apply_mcp_overlay(&mut config, &scenario.mcp)?;
     let provider = if scenario.squeezy.provider.as_deref() == Some("mock") {
         crate::mock_provider::MockProvider::shared(scenario.mock.clone())
     } else {
@@ -143,6 +149,32 @@ pub async fn run_scenario(
     let provider_name = agent.provider_name();
     let model = config.model.clone();
     let session_id = agent.session_id().unwrap_or_default();
+
+    // Pre-warm the MCP tool palette so the very first prompt can issue
+    // `mcp__*` tool calls without racing the production background
+    // refresh. Cheap no-op when the scenario didn't declare any MCP
+    // servers (the registry exits immediately on `has_no_enabled_servers`).
+    if !config.mcp_servers.is_empty() {
+        let outcome = agent.refresh_mcp_tools().await;
+        for error in &outcome.errors {
+            eprintln!("squeezy-eval: mcp warmup error: {error}");
+        }
+        capture.record(
+            None,
+            EvalEventKind::ActionStep {
+                action: json!({
+                    "kind": "mcp_warmup",
+                    "errors": outcome.errors,
+                    "ready_servers": outcome.status.per_server.len(),
+                }),
+                status: if outcome.errors.is_empty() {
+                    "ok".into()
+                } else {
+                    format!("errors:{}", outcome.errors.len())
+                },
+            },
+        )?;
+    }
 
     // 3. Drive the steps. When `drive_tui = true`, build a
     //    `TuiHarness` so prompt steps and the TUI-only actions
@@ -540,6 +572,115 @@ fn apply_overlay(
             .retain(|name| !excluded.contains(name));
     }
     Ok(())
+}
+
+fn materialize_fixture_skills(
+    workspace_root: &Path,
+    skills: &[crate::scenario::FixtureSkill],
+) -> Result<(), EvalError> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+    let skills_root = workspace_root.join(".squeezy").join("skills");
+    std::fs::create_dir_all(&skills_root)
+        .map_err(|err| EvalError::Io(format!("create {skills_root:?}: {err}")))?;
+    for skill in skills {
+        if skill.dir.is_empty() || skill.dir.chars().any(|c| c == '/' || c == '\\' || c == '.') {
+            return Err(EvalError::ScenarioParse(format!(
+                "fixture_skill dir must be a simple directory name: {}",
+                skill.dir
+            )));
+        }
+        let dir = skills_root.join(&skill.dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| EvalError::Io(format!("create {dir:?}: {err}")))?;
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, &skill.content)
+            .map_err(|err| EvalError::Io(format!("write {path:?}: {err}")))?;
+    }
+    Ok(())
+}
+
+fn apply_mcp_overlay(
+    config: &mut AppConfig,
+    overlay: &crate::scenario::McpScenarioConfig,
+) -> Result<(), EvalError> {
+    if overlay.servers.is_empty() {
+        return Ok(());
+    }
+    let bundled_fake_mcp = bundled_fake_mcp_path();
+    for (name, spec) in &overlay.servers {
+        if name.is_empty() {
+            return Err(EvalError::ScenarioParse(
+                "mcp server name must be non-empty".into(),
+            ));
+        }
+        let transport = match spec.transport.as_deref().unwrap_or("stdio") {
+            "stdio" => squeezy_core::McpTransport::Stdio,
+            "http" => squeezy_core::McpTransport::Http,
+            "sse" => squeezy_core::McpTransport::Sse,
+            other => {
+                return Err(EvalError::ScenarioParse(format!(
+                    "unknown mcp transport: {other}"
+                )));
+            }
+        };
+        let command = match spec.command.as_deref() {
+            Some("bundled:fake-mcp") => Some(
+                bundled_fake_mcp
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EvalError::Config(
+                    "scenario requires `bundled:fake-mcp` but its binary was not found alongside \
+                     `squeezy-eval`; build with `cargo build -p squeezy-eval`"
+                        .into(),
+                )
+                    })?
+                    .display()
+                    .to_string(),
+            ),
+            other => other.map(str::to_string),
+        };
+        let server = squeezy_core::McpServerConfig {
+            enabled: spec.enabled,
+            transport,
+            command,
+            args: spec.args.clone(),
+            url: spec.url.clone(),
+            timeout_ms: spec.timeout_ms.or(Some(10_000)),
+            discovery_timeout_ms: None,
+            tool_call_timeout_ms: None,
+            enabled_tools: spec.enabled_tools.clone(),
+            disabled_tools: Vec::new(),
+            env: spec.env.clone(),
+            permissions: squeezy_core::McpPermissionConfig::default(),
+            bearer_token_env_var: None,
+            http_headers: std::collections::BTreeMap::new(),
+            env_http_headers: std::collections::BTreeMap::new(),
+        };
+        config.mcp_servers.insert(name.clone(), server);
+    }
+    Ok(())
+}
+
+/// Look up the sibling `squeezy-fake-mcp` binary that ships with the eval
+/// crate. Resolved relative to the running `squeezy-eval` executable so
+/// `cargo run -p squeezy-eval` and a release binary both find the
+/// fixture in their own `target/<profile>/` directory.
+fn bundled_fake_mcp_path() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) {
+        "squeezy-fake-mcp.exe"
+    } else {
+        "squeezy-fake-mcp"
+    };
+    let current = std::env::current_exe().ok()?;
+    let dir = current.parent()?;
+    let candidate = dir.join(exe_name);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn provider_hint(err: squeezy_core::SqueezyError) -> String {
