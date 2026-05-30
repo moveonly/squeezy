@@ -11542,21 +11542,29 @@ impl From<TuiAlternateScreen> for TerminalMode {
 
 struct TerminalGuard {
     /// `Option` so we can drop and rebuild the ratatui `Terminal`
-    /// at runtime when swapping between inline-mode and the
-    /// alt-screen buffer for a full-terminal overlay. The field is
-    /// `Some` everywhere except inside the brief swap window in
-    /// `sync_overlay_screen`; the `term`/`term_opt` helpers below
-    /// give the rest of the impl a clean accessor.
+    /// Primary terminal in the user-configured mode. For inline
+    /// mode this is a `Viewport::Inline(N)` terminal pinned to the
+    /// bottom N rows of the main buffer; for alt-screen mode it's
+    /// a fullscreen terminal. Always `Some` after `enter`.
     terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
+    /// Secondary fullscreen terminal used only when the configured
+    /// mode is inline and the transcript overlay is open. Built
+    /// lazily on the first overlay open so a session that never
+    /// opens the overlay never pays for it. Once constructed it
+    /// stays alive for the rest of the session — re-using it
+    /// avoids ratatui's `Terminal::with_options(Inline(N))`
+    /// `append_lines` scroll-up that fires on every fresh inline
+    /// Terminal construction (the bug that ghosted the pre-overlay
+    /// viewport above the new one on overlay close).
+    overlay_terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
     /// User-configured mode (`Inline` or `AlternateScreen`). Stays
     /// constant for the session — overlay-screen swaps only flip
     /// `overlay_screen_active`, not `mode`.
     mode: TerminalMode,
-    /// True while the inline guard has swapped into the alt-screen
-    /// buffer for a transcript overlay. The contained `terminal`
-    /// is a fullscreen ratatui `Terminal` during that window.
-    /// Always `false` when `mode == AlternateScreen` (that mode is
-    /// already fullscreen — no swap needed).
+    /// True while the inline guard is currently routing draws to
+    /// the alt-screen overlay terminal. Always `false` when
+    /// `mode == AlternateScreen` (that mode is already fullscreen —
+    /// no swap needed).
     overlay_screen_active: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
@@ -11569,10 +11577,19 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// The terminal that should receive the next draw. Routes to
+    /// `overlay_terminal` while the alt-screen overlay is up, back
+    /// to the primary `terminal` otherwise.
     fn term(&mut self) -> &mut Terminal<CrosstermBackend<TerminalWriter>> {
-        self.terminal
-            .as_mut()
-            .expect("terminal taken during overlay-screen swap")
+        if self.overlay_screen_active {
+            self.overlay_terminal
+                .as_mut()
+                .expect("overlay terminal must be built when overlay-screen is active")
+        } else {
+            self.terminal
+                .as_mut()
+                .expect("primary terminal lost — unreachable after `enter`")
+        }
     }
 }
 
@@ -11652,6 +11669,7 @@ impl TerminalGuard {
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
             terminal: Some(terminal),
+            overlay_terminal: None,
             mode,
             overlay_screen_active: false,
             exit_hint: None,
@@ -11789,75 +11807,78 @@ impl TerminalGuard {
     }
 
     fn enter_overlay_screen(&mut self) -> Result<()> {
-        // Drop the inline ratatui Terminal first so its
-        // CrosstermBackend's TerminalWriter releases stdout — we
-        // need exclusive write access to send the alt-screen-enter
-        // escape sequence before the fullscreen Terminal takes over.
-        drop(self.terminal.take());
-        let mut writer = TerminalWriter::from_env(io::stdout());
-        execute!(
-            writer,
-            EnterAlternateScreen,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        // Drop the temporary writer so stdout is free again before
-        // the new Terminal grabs it.
-        drop(writer);
-        let writer = TerminalWriter::from_env(io::stdout());
-        let backend = CrosstermBackend::new(writer);
-        let terminal =
-            Terminal::new(backend).map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        self.terminal = Some(terminal);
+        // Lazily build the alt-screen ratatui `Terminal` the first
+        // time the overlay opens. `Viewport::Fullscreen` is the
+        // important detail: ratatui's fullscreen construction does
+        // NOT call `append_lines`, so it never scrolls main-buffer
+        // content. The terminal stays alive for the rest of the
+        // session — subsequent opens just re-enter alt-screen via
+        // ANSI without rebuilding the ratatui state.
+        if self.overlay_terminal.is_none() {
+            let writer = TerminalWriter::from_env(io::stdout());
+            let backend = CrosstermBackend::new(writer);
+            self.overlay_terminal = Some(
+                Terminal::new(backend).map_err(|err| SqueezyError::Terminal(err.to_string()))?,
+            );
+        }
+        // Switch the terminal emulator into the alt-screen buffer.
+        // Write through the inline Terminal's backend so the bytes
+        // serialize with any pending inline output.
+        {
+            let inline = self
+                .terminal
+                .as_mut()
+                .expect("primary inline terminal lost — unreachable after `enter`");
+            execute!(
+                inline.backend_mut(),
+                EnterAlternateScreen,
+                Clear(ClearType::All),
+                MoveTo(0, 0)
+            )
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // Force the overlay terminal to paint from scratch — its
+        // internal "previously drawn" buffer is stale (from the
+        // last overlay open, or empty on first use) but the
+        // alt-screen buffer we're about to draw into is blank.
+        self.overlay_terminal
+            .as_mut()
+            .expect("just built / persistent")
+            .clear()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         self.overlay_screen_active = true;
         Ok(())
     }
 
     fn leave_overlay_screen(&mut self) -> Result<()> {
-        drop(self.terminal.take());
-        let mut writer = TerminalWriter::from_env(io::stdout());
-        // 1. Restore the main buffer. Cursor returns to where it
-        //    sat at `EnterAlternateScreen` time — typically inside
-        //    the pre-overlay inline viewport. The old viewport's
-        //    rendered content (input row + status + hint) is still
-        //    sitting in the bottom rows of the main buffer.
-        execute!(writer, LeaveAlternateScreen)
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        // 2. Wipe the bottom `INLINE_VIEWPORT_HEIGHT` rows where
-        //    the new inline `Terminal` will install its viewport.
-        //    Without this, ratatui's `compute_inline_size` ->
-        //    `append_lines(N - 1)` scrolls those old viewport rows
-        //    up into the visible area, leaving a duplicate stack
-        //    of [divider / cursor / status / hint] above the
-        //    freshly rendered one. Clearing first means
-        //    `append_lines` scrolls blank rows into scrollback
-        //    instead.
-        let (_, rows) =
-            crossterm::terminal::size().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let viewport_top = rows.saturating_sub(INLINE_VIEWPORT_HEIGHT);
-        execute!(
-            writer,
-            MoveTo(0, viewport_top),
-            Clear(ClearType::FromCursorDown),
-            // 3. Park the cursor at the bottom row so the new
-            //    inline `Terminal` computes its viewport against
-            //    the bottom of the screen — matches the original
-            //    pre-overlay layout.
-            MoveTo(0, rows.saturating_sub(1)),
-        )
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        drop(writer);
-        let writer = TerminalWriter::from_env(io::stdout());
-        let backend = CrosstermBackend::new(writer);
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
-            },
-        )
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        self.terminal = Some(terminal);
+        // Last write through the overlay Terminal's backend before
+        // we leave alt-screen — same reasoning as
+        // `enter_overlay_screen`: serialize the escape sequence
+        // with any final overlay-render bytes.
+        {
+            let overlay = self
+                .overlay_terminal
+                .as_mut()
+                .expect("overlay terminal must be built when overlay-screen is active");
+            execute!(overlay.backend_mut(), LeaveAlternateScreen)
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // The terminal emulator has restored the main buffer. The
+        // pre-overlay inline TUI viewport content (input row,
+        // status, hint) is still sitting in the bottom rows where
+        // it was when alt-screen entered, because we never touched
+        // the main buffer during the overlay. The inline Terminal's
+        // internal "last drawn" state still matches that visible
+        // content, so the next `draw` diffs against the correct
+        // baseline and only emits cells that genuinely changed.
+        //
+        // What CAN have changed during the overlay: new transcript
+        // entries (committed reasoning, assistant message) that
+        // arrived while we were suppressing `flush_history`. The
+        // next `draw_app` call will pick them up and push them
+        // into scrollback via `insert_before`, scrolling the
+        // pre-overlay viewport down into its new position
+        // naturally.
         self.overlay_screen_active = false;
         Ok(())
     }
@@ -11940,13 +11961,18 @@ impl Drop for TerminalGuard {
         // If we exited while the overlay-screen swap was active,
         // leave the alt-screen buffer first so the user's main-buffer
         // scrollback (the inline conversation history) is what stays
-        // visible after the process tears down.
+        // visible after the process tears down. The overlay terminal
+        // owns the writer that's currently routed to alt-screen.
         if self.overlay_screen_active
-            && let Some(terminal) = self.terminal.as_mut()
+            && let Some(overlay) = self.overlay_terminal.as_mut()
         {
-            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            let _ = execute!(overlay.backend_mut(), LeaveAlternateScreen);
             self.overlay_screen_active = false;
         }
+        // Drop the overlay terminal explicitly so its writer
+        // releases stdout before the primary terminal does its
+        // teardown writes below.
+        drop(self.overlay_terminal.take());
         let Some(terminal) = self.terminal.as_mut() else {
             return;
         };
