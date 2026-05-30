@@ -188,8 +188,16 @@ pub(crate) fn set_accent_variant(variant: AccentVariant) {
 pub(crate) fn accent_primary() -> Color {
     match accent_variant() {
         AccentVariant::Default => AMBER,
-        AccentVariant::Catppuccin => Color::Rgb(203, 166, 247), // catppuccin mauve
-        AccentVariant::HighContrast => Color::Rgb(255, 255, 0), // pure yellow
+        // Darker mauve in the catppuccin violet family. Luminance
+        // 0.299*140 + 0.587*100 + 0.114*200 = 41.86 + 58.70 + 22.80 =
+        // 123.36, comfortably under the 160 dark-only cap while still
+        // reading as the canonical catppuccin mauve hue.
+        AccentVariant::Catppuccin => Color::Rgb(140, 100, 200),
+        // Strong-yellow identity preserved for accessibility (R==G with
+        // zero blue keeps the WCAG-grade yellow signal) but darkened
+        // under the cap. Luminance 0.299*160 + 0.587*130 + 0.114*0 =
+        // 47.84 + 76.31 = 124.15.
+        AccentVariant::HighContrast => Color::Rgb(160, 130, 0),
     }
 }
 
@@ -198,8 +206,14 @@ pub(crate) fn accent_primary() -> Color {
 pub(crate) fn accent_working_highlight() -> Color {
     match accent_variant() {
         AccentVariant::Default => WORKING_SHIMMER_HIGHLIGHT,
-        AccentVariant::Catppuccin => Color::Rgb(245, 224, 220), // catppuccin rosewater
-        AccentVariant::HighContrast => Color::Rgb(255, 255, 255),
+        // Darker catppuccin rosewater. Luminance 0.299*150 + 0.587*130
+        // + 0.114*125 = 44.85 + 76.31 + 14.25 = 135.41, under the cap
+        // and still warm enough to pop against the mauve primary.
+        AccentVariant::Catppuccin => Color::Rgb(150, 130, 125),
+        // Neutral gray substituting the white peak. Luminance 155
+        // (0.299*155 + 0.587*155 + 0.114*155), just under the cap and
+        // still bright relative to the dark-gold HighContrast primary.
+        AccentVariant::HighContrast => Color::Rgb(155, 155, 155),
     }
 }
 
