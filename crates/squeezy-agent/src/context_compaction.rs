@@ -122,10 +122,18 @@ const COMPACTION_MAX_HISTORY: usize = 20;
 pub struct ContextCompactionReport {
     pub record: ContextCompactionRecord,
     pub summary: String,
-    /// Pre-compaction conversation slice. Stamped into the
-    /// `context_compacted` session event so replay can snap to this
-    /// checkpoint without re-reading the redb mirror.
+    /// Pre-compaction conversation slice (the items removed by the
+    /// compaction pass). Persisted via the undo-checkpoint write so a
+    /// future `compact_context_undo` can restore them verbatim. Not
+    /// stamped into the session-event `conversation` field — that field
+    /// carries `post_compact` so replay snaps to the post-compact base.
     pub dropped: Vec<ResumeItem>,
+    /// Post-compaction conversation (summary head + kept recent items).
+    /// Stamped into the `context_compacted` session event's
+    /// `conversation` field so `replay_resume_state` snaps to the
+    /// correct post-compact checkpoint and forward-replays only the
+    /// strictly-newer events.
+    pub post_compact: Vec<ResumeItem>,
 }
 
 /// Trigger compaction mid-turn when the configured context window is in
@@ -313,10 +321,16 @@ pub(crate) fn compact_conversation(
         let excess = state.history.len() - COMPACTION_MAX_HISTORY;
         state.history.drain(0..excess);
     }
+    let post_compact: Vec<squeezy_store::ResumeItem> = conversation
+        .iter()
+        .cloned()
+        .map(llm_input_to_resume_item)
+        .collect();
     Some(ContextCompactionReport {
         record,
         summary,
         dropped,
+        post_compact,
     })
 }
 
@@ -727,10 +741,18 @@ pub(crate) async fn compact_conversation_with_strategy(
             if let Some(last) = state.history.last_mut() {
                 last.summary_bytes = new_summary.len();
             }
+            // The post-compact head is the summary slot; reflect the
+            // model-assisted rewrite in the report so the persisted
+            // checkpoint matches the in-memory conversation.
+            let mut post_compact = report.post_compact;
+            if let Some(ResumeItem::UserText { text }) = post_compact.first_mut() {
+                *text = new_summary.clone();
+            }
             return Some(ContextCompactionReport {
                 summary: new_summary,
                 record: patched_record,
                 dropped: report.dropped,
+                post_compact,
             });
         }
     };

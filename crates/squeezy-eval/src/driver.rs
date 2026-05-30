@@ -1482,12 +1482,13 @@ impl Driver {
                 AgentEvent::ContextCompacted { turn_id, report } => {
                     let turn_str = format!("{turn_id:?}");
                     // `ContextCompactionReport` carries `record` (a
-                    // `ContextCompactionRecord`) + `summary` + a
-                    // `dropped` Vec. The record itself is Serialize via
-                    // `squeezy-core`, so capturing the structured form
-                    // gives findings rules a typed handle on
-                    // before/after token totals and trigger reason.
-                    // Fall back to debug if serialization ever fails.
+                    // `ContextCompactionRecord`) + `summary` + `dropped`
+                    // + `post_compact` Vecs. The record itself is
+                    // Serialize via `squeezy-core`, so capturing the
+                    // structured form gives findings rules a typed
+                    // handle on before/after token totals and trigger
+                    // reason. Fall back to debug if serialization ever
+                    // fails.
                     let report_value = serde_json::to_value(&report.record)
                         .unwrap_or_else(|_| json!({"debug": format!("{:?}", report.record)}));
                     let value = json!({
