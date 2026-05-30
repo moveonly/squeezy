@@ -102,11 +102,11 @@ CLI subcommands (`config`, `repo`, `sessions`, `feedback`, `mcp`, `ask`, `auth`,
 
 ### Dead code
 
-- **D1 — `overlay::Overlay::Permissions`, `Verbosity`, `ToolVerbosity` variants are unreachable** from these slash commands. All `/permissions`, `/verbosity`, `/tool-verbosity` invocations route through `toggle_config_screen` instead. Either delete the overlay variants or re-wire the slash commands to use them.
+- **D1 — Dead overlay variants dropped** (`squeezy-h2ab`). `Overlay::Permissions`, `Verbosity`, `ToolVerbosity`, their builder helpers, and `overlay_tests.rs` are removed; `Overlay::Model` is the only remaining variant. `/permissions`, `/verbosity`, `/tool-verbosity` all route through `toggle_config_screen` and continue to work unchanged.
 
 ## Harness gaps (surfaced by subagents)
 
-- **H1 — `current_modal()` doesn't cover `status_line_setup`** overlay. `/statusline` opens `app.status_line_setup` which is a separate field never folded into the modal-id chain. Scenarios fall back to substring matches on the frame.
+- **H1 — `current_modal()` now covers `status_line_setup`** (`squeezy-nq30`). Returns `Some("statusline")` when `/statusline` opens its modal; `audit-config-statusline.toml` was migrated from substring fallback to `modal_active = "statusline"`.
 - **H2 — No `config_screen_section { name }` assertion** to disambiguate `/options` vs `/model` vs `/permissions` (which all share `modal_active = "config"`). Today scenarios depend on substring-matching section labels in the rendered frame.
 - **H3 — No `dispatch_outcome_contains` / `action_step_status_contains` assertion** to inspect agent-side command status without driving the full TUI. Lifts the typed `DispatchOutcome` value off the trace.
 - **H4 — No `capture_session_id` (or template var) action** for chained scenarios that need to reference the agent's current session id. Today only the missing-id error path is testable for `/session-export`, `/checkpoint <id>`, `/resume <id>`.

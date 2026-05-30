@@ -454,21 +454,6 @@ pub(crate) fn apply_overlay_selection(app: &mut TuiApp) {
                 )));
             }
         }
-        overlay::Overlay::Verbosity(picker) => {
-            if let Some(entry) = picker.selected() {
-                app.response_verbosity = entry.0;
-                app.status = format!("response verbosity {}", entry.0.as_str());
-            }
-        }
-        overlay::Overlay::ToolVerbosity(picker) => {
-            if let Some(entry) = picker.selected() {
-                app.tool_output_verbosity = entry.0;
-                app.status = format!("tool output verbosity {}", entry.0.as_str());
-            }
-        }
-        overlay::Overlay::Permissions(_) => {
-            app.status = "permission overlay closed".to_string();
-        }
     }
 }
 

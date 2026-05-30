@@ -2,10 +2,9 @@ id = "audit-config-statusline"
 title = "Audit · /statusline opens status-line setup modal"
 description = """
 `/statusline` opens its own dedicated setup modal (status_line_setup),
-NOT the unified config_screen. The `current_modal` accessor does NOT
-cover this overlay, so modal_active reports "none" — we assert via
-status text and frame substring instead. Esc closes it (status reports
-"closed").
+NOT the unified config_screen. `current_modal` covers this overlay
+since H1 (squeezy-nq30) — assert `modal_active = "statusline"`.
+Esc closes it (status reports "cancelled").
 """
 
 [workspace]
@@ -32,8 +31,8 @@ command = "/statusline"
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_status_contains"
-text = "/statusline"
+kind = "modal_active"
+name = "statusline"
 
 [[steps]]
 kind = "action"
@@ -44,8 +43,8 @@ key = "Esc"
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_status_contains"
-text = "cancelled"
+kind = "modal_active"
+name = "none"
 
 [expect]
 max_wall_clock_seconds = 30

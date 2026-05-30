@@ -457,12 +457,12 @@ impl TuiHarness {
         if self.app.config_screen.is_some() {
             return Some("config");
         }
+        if self.app.status_line_setup.is_some() {
+            return Some("statusline");
+        }
         if let Some(overlay) = self.app.overlay.as_ref() {
             return Some(match overlay {
                 crate::overlay::Overlay::Model(_) => "model",
-                crate::overlay::Overlay::Verbosity(_) => "verbosity",
-                crate::overlay::Overlay::ToolVerbosity(_) => "tool_verbosity",
-                crate::overlay::Overlay::Permissions(_) => "permissions",
             });
         }
         if self.app.prompt_queue_overlay.is_some() {

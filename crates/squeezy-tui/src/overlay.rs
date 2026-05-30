@@ -1,32 +1,23 @@
-//! Interactive overlays for `/model`, `/verbosity`, `/tool-verbosity`,
-//! and `/permissions`.
+//! Interactive overlay for `/model`.
 //!
-//! The audit calls out that today these commands print snapshots into
-//! the transcript with no way to pick visually. The overlay replaces
-//! that with an inline list-of-options picker reusing the slash/mention
-//! popup pattern: Up/Down to move, Enter to apply, Esc to cancel.
-//!
-//! Permissions overlay is read-only here (it lists current rules); the
-//! editing flow stays with the existing `/permissions allow ...` slash
-//! command. That keeps the persistence path inside `squeezy-agent`
-//! unchanged for this PR.
+//! Today this is the only inline list-of-options picker reachable from
+//! a slash command. `/verbosity`, `/tool-verbosity`, and `/permissions`
+//! all route through `toggle_config_screen` instead — their former
+//! Overlay variants were removed in the 2026-05 slash-command audit
+//! cleanup (see `squeezy-h2ab`).
 
 #![allow(dead_code)]
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use squeezy_core::{ResponseVerbosity, ToolOutputVerbosity};
 use squeezy_llm::{MODEL_REGISTRY, ModelInfo};
 
 use crate::render::palette;
-use crate::{AMBER, GOLD, QUIET};
+use crate::{GOLD, QUIET};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Overlay {
     Model(SelectOverlay<ModelEntry>),
-    Verbosity(SelectOverlay<VerbosityEntry>),
-    ToolVerbosity(SelectOverlay<ToolVerbosityEntry>),
-    Permissions(ReadOnlyOverlay),
 }
 
 /// Where focus should return to when an overlay closes.
@@ -138,27 +129,18 @@ impl Overlay {
     pub(crate) fn title(&self) -> &'static str {
         match self {
             Overlay::Model(_) => "Select model",
-            Overlay::Verbosity(_) => "Select response verbosity",
-            Overlay::ToolVerbosity(_) => "Select tool output verbosity",
-            Overlay::Permissions(_) => "Permission rules",
         }
     }
 
     pub(crate) fn move_up(&mut self) {
         match self {
             Overlay::Model(o) => o.move_up(),
-            Overlay::Verbosity(o) => o.move_up(),
-            Overlay::ToolVerbosity(o) => o.move_up(),
-            Overlay::Permissions(_) => {}
         }
     }
 
     pub(crate) fn move_down(&mut self) {
         match self {
             Overlay::Model(o) => o.move_down(),
-            Overlay::Verbosity(o) => o.move_down(),
-            Overlay::ToolVerbosity(o) => o.move_down(),
-            Overlay::Permissions(_) => {}
         }
     }
 
@@ -166,9 +148,6 @@ impl Overlay {
         let mut lines = vec![header_line(self.title())];
         match self {
             Overlay::Model(o) => lines.extend(o.render(|e| e.label())),
-            Overlay::Verbosity(o) => lines.extend(o.render(|e| e.label())),
-            Overlay::ToolVerbosity(o) => lines.extend(o.render(|e| e.label())),
-            Overlay::Permissions(o) => lines.extend(o.render()),
         }
         lines.push(footer_line());
         lines
@@ -256,20 +235,6 @@ impl<T> SelectOverlay<T> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ReadOnlyOverlay {
-    pub lines: Vec<String>,
-}
-
-impl ReadOnlyOverlay {
-    fn render(&self) -> Vec<Line<'static>> {
-        self.lines
-            .iter()
-            .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(AMBER))))
-            .collect()
-    }
-}
-
 // ---- Model overlay ----
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,57 +269,3 @@ pub(crate) fn build_model_overlay(current_provider: &str, current_id: &str) -> O
         .unwrap_or(0);
     Overlay::Model(SelectOverlay::new(entries, default_index))
 }
-
-// ---- Verbosity overlays ----
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VerbosityEntry(pub ResponseVerbosity);
-
-impl VerbosityEntry {
-    fn label(&self) -> String {
-        let descr = match self.0 {
-            ResponseVerbosity::Concise => "short answers, minimal preamble",
-            ResponseVerbosity::Normal => "balanced; default",
-            ResponseVerbosity::Verbose => "detailed walkthroughs",
-        };
-        format!("{}  ·  {}", self.0.as_str(), descr)
-    }
-}
-
-pub(crate) fn build_verbosity_overlay(current: ResponseVerbosity) -> Overlay {
-    let entries = vec![
-        VerbosityEntry(ResponseVerbosity::Concise),
-        VerbosityEntry(ResponseVerbosity::Normal),
-        VerbosityEntry(ResponseVerbosity::Verbose),
-    ];
-    let default_index = entries.iter().position(|e| e.0 == current).unwrap_or(1);
-    Overlay::Verbosity(SelectOverlay::new(entries, default_index))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ToolVerbosityEntry(pub ToolOutputVerbosity);
-
-impl ToolVerbosityEntry {
-    fn label(&self) -> String {
-        let descr = match self.0 {
-            ToolOutputVerbosity::Compact => "first error, last few lines only",
-            ToolOutputVerbosity::Normal => "balanced; default",
-            ToolOutputVerbosity::Verbose => "full stdout/stderr",
-        };
-        format!("{}  ·  {}", self.0.as_str(), descr)
-    }
-}
-
-pub(crate) fn build_tool_verbosity_overlay(current: ToolOutputVerbosity) -> Overlay {
-    let entries = vec![
-        ToolVerbosityEntry(ToolOutputVerbosity::Compact),
-        ToolVerbosityEntry(ToolOutputVerbosity::Normal),
-        ToolVerbosityEntry(ToolOutputVerbosity::Verbose),
-    ];
-    let default_index = entries.iter().position(|e| e.0 == current).unwrap_or(1);
-    Overlay::ToolVerbosity(SelectOverlay::new(entries, default_index))
-}
-
-#[cfg(test)]
-#[path = "overlay_tests.rs"]
-mod tests;
