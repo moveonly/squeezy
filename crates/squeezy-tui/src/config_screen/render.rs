@@ -33,7 +33,7 @@ fn display_path(path: &std::path::Path) -> String {
 
 /// Shrink `s` to at most `max` display columns with a middle ellipsis,
 /// keeping both the head and the tail so the user can still recognise the
-/// home prefix and the trailing filename. Used to keep the /options tab
+/// home prefix and the trailing filename. Used to keep the /config tab
 /// strip on a single row when long repo paths (worktrees, deep nested
 /// project layouts) would otherwise push the rightmost tab off-screen.
 fn middle_ellipsize(s: &str, max: usize) -> String {
@@ -477,7 +477,7 @@ fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScree
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Each tier file is restored to the bytes captured when /options opened.",
+        "  Each tier file is restored to the bytes captured when /config opened.",
         Style::default().fg(QUIET),
     )));
     lines.push(Line::raw(""));
@@ -734,8 +734,21 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(CONFIG_SECTIONS.len());
-    for (idx, section) in CONFIG_SECTIONS.iter().enumerate() {
+    let height = area.height as usize;
+    let total = CONFIG_SECTIONS.len();
+    if height == 0 {
+        return;
+    }
+    let (start, end) = sidebar_window(total, state.section_index, height);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            "  ▲ more",
+            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+        )));
+    }
+    for (idx, section) in CONFIG_SECTIONS[start..end].iter().enumerate() {
+        let idx = start + idx;
         let active = idx == state.section_index;
         let prefix = if active { "› " } else { "  " };
         let style = if active {
@@ -751,38 +764,49 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
             Span::styled(section.label, style),
         ]));
     }
-    // The sidebar lists CONFIG_SECTIONS verbatim; on shorter terminals it
-    // overflows and items at the bottom (notably Reset) get clipped. Pin
-    // the active row inside the visible window by scrolling just enough
-    // to keep it on-screen, then stamp ▲/▼ markers at the edges so the
-    // user knows there's more above or below.
-    let height = area.height as usize;
-    let total = lines.len();
-    let scroll = if height == 0 || total <= height {
-        0u16
-    } else {
-        state
-            .section_index
-            .saturating_sub(height - 1)
-            .min(total - height) as u16
-    };
-    if scroll > 0
-        && let Some(first) = lines.first_mut()
-    {
-        *first = Line::from(Span::styled(
-            "  ▲ more",
-            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
-        ));
-    }
-    if total > height + scroll as usize
-        && let Some(last) = lines.get_mut(scroll as usize + height.saturating_sub(1))
-    {
-        *last = Line::from(Span::styled(
+    if end < total {
+        lines.push(Line::from(Span::styled(
             "  ▼ more",
             Style::default().fg(QUIET).add_modifier(Modifier::DIM),
-        ));
+        )));
     }
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn sidebar_window(total: usize, cursor: usize, available_rows: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    if total <= available_rows {
+        return (0, total);
+    }
+    let cursor = cursor.min(total - 1);
+    if available_rows <= 1 {
+        return (cursor, cursor + 1);
+    }
+
+    let mut row_slots = available_rows.saturating_sub(1).max(1);
+    let mut start = centered_scroll_start(total, cursor, row_slots);
+    loop {
+        let marker_rows = usize::from(start > 0) + usize::from(start + row_slots < total);
+        let next_slots = available_rows.saturating_sub(marker_rows).max(1);
+        let next_start = centered_scroll_start(total, cursor, next_slots);
+        if next_slots == row_slots && next_start == start {
+            break;
+        }
+        row_slots = next_slots;
+        start = next_start;
+    }
+    (start, (start + row_slots).min(total))
+}
+
+fn centered_scroll_start(total: usize, cursor: usize, visible_rows: usize) -> usize {
+    if total <= visible_rows {
+        0
+    } else {
+        let half = visible_rows / 2;
+        cursor.saturating_sub(half).min(total - visible_rows)
+    }
 }
 
 fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {

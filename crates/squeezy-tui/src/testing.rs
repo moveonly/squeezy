@@ -258,11 +258,11 @@ impl TuiHarness {
         Ok(want_exit)
     }
 
-    /// Dispatch a slash command (e.g. `"/options"`, `"/permissions"`,
+    /// Dispatch a slash command (e.g. `"/config"`, `"/permissions"`,
     /// `"/effort high"`) through the TUI's `handle_slash_command`
     /// path — the same code path a user typing the command into the
     /// composer would take. This is the only way to exercise
-    /// `DispatchOutcome::TuiOnly` commands (`/options`, `/model`,
+    /// `DispatchOutcome::TuiOnly` commands (`/config`, `/model`,
     /// `/permissions`, `/effort`, `/verbosity`, `/tool-verbosity`,
     /// `/theme`, `/statusline`, `/keymap`, `/collapse`, `/expand`,
     /// `/copy`, `/help`, etc.) from an eval driver — those commands
@@ -446,7 +446,7 @@ impl TuiHarness {
     /// Slug for the currently-focused section in the config_screen
     /// modal, or `None` when no config_screen is open. Maps onto
     /// `squeezy_core::config_schema::SectionId::slug` so scenarios
-    /// can disambiguate `/options` vs `/model` (`"models"`) vs
+    /// can disambiguate `/config` vs `/model` (`"models"`) vs
     /// `/permissions` (`"permissions"`) when `current_modal()` only
     /// reports `"config"` for all three. squeezy-qr9e (audit H2).
     pub fn config_section(&self) -> Option<&'static str> {

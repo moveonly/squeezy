@@ -566,13 +566,13 @@ fn path_editor_commits_pathbuf() {
     assert_eq!(p, std::path::PathBuf::from("/tmp/c"));
 }
 
-// ─── /options UX/UI eval fixture ──────────────────────────────────────────
+// ─── /config UX/UI eval fixture ───────────────────────────────────────────
 //
 // Companion to `crates/squeezy-eval/fixtures/scenarios/options-screen-routing.toml`
-// (slash-router level) and to the `unknown_options_slug_…` tests in
+// (slash-router level) and to the `unknown_config_slug_…` tests in
 // `lib_tests.rs` (TuiApp dispatch). The tests in this block drive
 // `ConfigScreenState` directly to cover the rendering, key handling,
-// and runtime-efficacy invariants identified by the /options UX audit.
+// and runtime-efficacy invariants identified by the /config UX audit.
 
 fn render_screen_to_text(state: &ConfigScreenState, width: u16, height: u16) -> String {
     use ratatui::Terminal;
@@ -1003,6 +1003,22 @@ fn sidebar_shows_more_below_marker_when_clipped() {
         rendered.contains("▼"),
         "short pane should show ▼ marker on the sidebar to flag clipping, got:\n{rendered}"
     );
+}
+
+#[test]
+fn sidebar_keeps_late_sections_visible_before_reset() {
+    for (section, label) in [
+        (SectionId::Feedback, "Feedback"),
+        (SectionId::Redaction, "Redaction"),
+        (SectionId::Web, "Web"),
+    ] {
+        let state = ConfigScreenState::new(AppConfig::default(), Some(section));
+        let rendered = render_screen_to_text(&state, 80, 14);
+        assert!(
+            rendered.contains(&format!("› {label}")),
+            "sidebar should scroll before Reset so {label} is visibly selected, got:\n{rendered}"
+        );
+    }
 }
 
 #[test]

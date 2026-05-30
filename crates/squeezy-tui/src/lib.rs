@@ -133,13 +133,13 @@ const TOOL_CALL_MAX_LINES: usize = 5;
 /// `local_shell_command_call` in the agent). 50 lines fits a typical
 /// command's full output without truncation.
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
-const PROMPT_MIN_HEIGHT: u16 = 5;
+const PROMPT_MIN_HEIGHT: u16 = 4;
 const PROMPT_MAX_HEIGHT: u16 = 30;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
 // The slash-command roster grew well past 30 entries, so a 5-row
 // window forced users to scroll for almost any non-top-5 command.
 // 10 fits comfortably in a standard 24-row terminal alongside the
-// prompt + status row and matches the picker height used by /options
+// prompt + status row and matches the picker height used by /config
 // search and the model picker.
 const SLASH_MENU_MAX_ITEMS: usize = 10;
 
@@ -2037,7 +2037,7 @@ fn save_status_line(
 
 /// Whether the transcript should show a styled banner for this slash
 /// command's invocation. Commands that open their own UI overlay
-/// (`/options`, `/statusline`, …) are silenced — the overlay is the
+/// (`/config`, `/statusline`, …) are silenced — the overlay is the
 /// affordance. Commands that route through `start_user_turn` and
 /// already produce a user-message bubble (`/help`) are also silenced
 /// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
@@ -2049,8 +2049,8 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
-        | "/expand" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy"
+        | "/collapse" | "/expand" | "/help" => false,
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -2079,6 +2079,7 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
         }
     };
 
+    let raw_head = input.split_whitespace().next().unwrap_or_default();
     let slash = cmd.slash_name();
     if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == slash)
         && !spec.available_during_task
@@ -2088,8 +2089,11 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
         return true;
     }
 
-    let rest = input.strip_prefix(slash).map(str::trim).unwrap_or_default();
-    if should_echo_slash_command(slash, rest) {
+    let rest = input
+        .strip_prefix(raw_head)
+        .map(str::trim)
+        .unwrap_or_default();
+    if should_echo_slash_command(raw_head, rest) {
         app.push_slash_command_echo(input);
     }
 
@@ -2133,7 +2137,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Config { section } => {
             let slug = section.as_deref();
             let id = slug.and_then(squeezy_core::config_schema::section_from_slug);
-            // `/options <slug>` used to silently fall back to the Models
+            // `/config <slug>` used to silently fall back to the Models
             // section when the slug was a valid `SectionId` variant that
             // had no `ConfigSectionMeta` entry (Skills, Tools, Providers,
             // Context, McpServers, ShellSandbox, PermissionRules) or was
@@ -2145,7 +2149,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             {
                 app.app_notifications.push(
                     format!(
-                        "/options: '{raw}' is not a navigable section — opening the default view. \
+                        "/config: '{raw}' is not a navigable section — opening the default view. \
                          Press / to search field labels."
                     ),
                     NotifySeverity::Warn,
@@ -3268,7 +3272,7 @@ fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
 /// next turn picks it up via `request_reasoning_effort`. `auto` (or `clear`,
 /// `unset`, `none`) drops the override and falls back to the model default. The
 /// command is session-scoped — to persist across runs, edit `model.reasoning_effort`
-/// via `/options`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
+/// via `/config`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
 /// surface that fact when set.
 fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
@@ -3319,7 +3323,7 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
 /// value and usage hint into the transcript (matches `/effort`'s
 /// surface); with an explicit value, sets `tui.response_verbosity`
 /// and reports via the status line. Previously the bare form
-/// short-circuited to the `/options` config_screen — surprising
+/// short-circuited to the `/config` config_screen — surprising
 /// mode-switch on argument presence (squeezy-3ys0 / audit U2).
 fn handle_slash_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
@@ -5415,16 +5419,11 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
-    // `model` and `languages` are intentionally omitted: in inline mode
-    // the card lives in terminal scrollback and can't be rewritten, so
-    // both would freeze on a model change or filesystem edit. The live
-    // status line (`provider-and-model`, `reasoning-effort`, `languages`)
-    // is the source of truth for those instead.
-    vec![
-        startup_phase_strip(card_width, app.version),
-        Line::from(""),
-        startup_meta_row("directory", app.directory.clone(), card_width),
-    ]
+    // Dynamic metadata belongs in the live status line. In inline mode
+    // the startup card lives in scrollback and cannot be rewritten, so
+    // repeating fields such as directory/model/languages here makes the
+    // first frame stale and visually redundant.
+    vec![startup_phase_strip(card_width, app.version)]
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
@@ -5474,21 +5473,6 @@ fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(version_text, Style::default().fg(AMBER)),
-    ])
-}
-
-fn startup_meta_row(label: &'static str, value: String, card_width: usize) -> Line<'static> {
-    const INDENT: usize = 4;
-    const LABEL_WIDTH: usize = 11;
-    let label_len = label.chars().count();
-    let trailing = LABEL_WIDTH.saturating_sub(label_len);
-    let max_value = card_width.saturating_sub(INDENT + LABEL_WIDTH);
-    let value = fit_chars(&value, max_value);
-    Line::from(vec![
-        Span::raw(" ".repeat(INDENT)),
-        Span::styled(label.to_string(), Style::default().fg(AMBER)),
-        Span::raw(" ".repeat(trailing)),
-        Span::styled(value, Style::default().fg(Color::White)),
     ])
 }
 
@@ -9333,7 +9317,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         queue_overlay_lines + overlay_lines + mention_lines + suggestion_lines + indicator_lines;
     let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
-        .saturating_add(4)
+        .saturating_add(3)
         .saturating_add(queue_overlay_lines)
         .saturating_add(overlay_lines)
         .saturating_add(mention_lines)
@@ -9460,18 +9444,18 @@ fn composer_bubble_lines(
 ) -> Vec<Line<'static>> {
     let width = width as usize;
     let height = height as usize;
-    if width < 4 || height < 3 {
+    if width < 4 || height < 2 {
         return content;
     }
     let amber = Style::default().fg(AMBER);
 
-    // Open layout: just a top and bottom horizontal rule with the typed
-    // content sandwiched between blank padding rows. No vertical sides —
-    // they read as visual noise when the composer is on the default
-    // terminal background.
+    // Open layout: a single top rule with the typed content floating
+    // underneath. No vertical sides or bottom rule — the latter added a
+    // heavy extra divider below the cursor and made the composer feel boxed
+    // in on the default terminal background.
     let rule = Line::from(Span::styled("─".repeat(width), amber));
 
-    let interior_rows = height.saturating_sub(2);
+    let interior_rows = height.saturating_sub(1);
     let mut content = content;
     if content.len() > interior_rows {
         // Pick the visible window so the cursor's line stays on screen.
@@ -9494,7 +9478,7 @@ fn composer_bubble_lines(
     let bot_pad = spare - top_pad;
 
     let mut lines = Vec::with_capacity(height);
-    lines.push(rule.clone());
+    lines.push(rule);
     for _ in 0..top_pad {
         lines.push(Line::from(""));
     }
@@ -9506,7 +9490,6 @@ fn composer_bubble_lines(
     for _ in 0..bot_pad {
         lines.push(Line::from(""));
     }
-    lines.push(rule);
     lines
 }
 
@@ -10549,7 +10532,7 @@ pub(crate) struct TuiApp {
     pub(crate) show_reasoning_usage: bool,
     /// Render-time grouping of adjacent same-tool same-status calls into
     /// one card. Mirrors `config.tui.coalesce_tool_runs` at startup;
-    /// flipped at runtime via `/options coalesce_tool_runs = …`. Default
+    /// flipped at runtime via `/config coalesce_tool_runs = …`. Default
     /// `true`. Independent of the push-time retry coalescer
     /// ([`coalesce_tool_transcript_entry`]).
     pub(crate) coalesce_tool_runs: bool,
@@ -11460,6 +11443,7 @@ impl TranscriptEntry {
     fn message(id: u64, item: TranscriptItem, transcript_default: TranscriptDefault) -> Self {
         let collapsed = transcript_default == TranscriptDefault::Compact
             && item.role != Role::Assistant
+            && system_message_can_collapse(&item)
             && item.content.chars().count() > LONG_ASSISTANT_CHARS;
         Self {
             id,
@@ -11708,6 +11692,15 @@ impl TranscriptEntry {
             }
         }
     }
+}
+
+fn system_message_can_collapse(item: &TranscriptItem) -> bool {
+    item.role != Role::System
+        || !item
+            .content
+            .lines()
+            .next()
+            .is_some_and(|header| header == "Context window")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

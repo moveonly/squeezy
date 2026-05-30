@@ -168,7 +168,7 @@ impl DispatchCommand {
     pub fn slash_name(&self) -> &'static str {
         match self {
             Self::Help { .. } => "/help",
-            Self::Config { .. } => "/options",
+            Self::Config { .. } => "/config",
             Self::Model => "/model",
             Self::Permissions => "/permissions",
             Self::Plan { .. } => "/plan",

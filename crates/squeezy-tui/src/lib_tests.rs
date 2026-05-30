@@ -11,7 +11,7 @@ use squeezy_core::{
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
     StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig,
+    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen, TuiConfig,
     TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
@@ -1447,10 +1447,10 @@ async fn slash_plan_with_trailing_space_still_switches_mode() {
 }
 
 #[tokio::test]
-async fn slash_options_opens_screen() {
+async fn slash_config_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options".to_string());
+    set_input(&mut app, "/config".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -1462,10 +1462,10 @@ async fn slash_options_opens_screen() {
 }
 
 #[tokio::test]
-async fn slash_config_legacy_alias_opens_screen() {
+async fn slash_options_legacy_alias_opens_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/config".to_string());
+    set_input(&mut app, "/options".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -4761,12 +4761,9 @@ fn active_prompt_keeps_one_blank_line_after_header() {
 
     let output = render_to_string(&app, 100, 16);
     let lines = output.lines().collect::<Vec<_>>();
-    // `directory` is now the last row of the startup card (model and
-    // languages moved to the live status line so they stay in sync
-    // with config edits).
     let header_bottom = lines
         .iter()
-        .rposition(|line| line.contains("directory"))
+        .rposition(|line| line.contains("Squeezy v"))
         .expect("header bottom");
 
     assert!(
@@ -4804,14 +4801,13 @@ fn active_prompt_cursor_is_vertically_centered() {
 
     let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT, 80);
 
-    // Composer at min height: top rule + top pad + content + bot pad + bottom rule = 5 rows
-    assert_eq!(lines.len(), 5);
+    // Composer at min height: top rule + top pad + content + bottom pad = 4 rows.
+    assert_eq!(lines.len(), 4);
     let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains('●'));
     assert!(!has_coin(&lines[0]), "{lines:?}");
     assert!(!has_coin(&lines[1]), "{lines:?}");
     assert!(has_coin(&lines[2]), "{lines:?}");
     assert!(!has_coin(&lines[3]), "{lines:?}");
-    assert!(!has_coin(&lines[4]), "{lines:?}");
 }
 
 #[test]
@@ -4923,6 +4919,27 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
         .iter()
         .any(|span| span.content.as_ref() == "Noted");
     assert!(header_has_noted, "{lines:?}");
+}
+
+#[test]
+fn context_snapshot_stays_expanded_in_compact_transcript() {
+    let mut config = test_config(SessionMode::Build);
+    config.tui.transcript_default = TranscriptDefault::Compact;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let body = std::iter::once("Context window".to_string())
+        .chain((0..30).map(|index| format!("source_{index}=tokens")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    app.push_transcript_item(TranscriptItem::system(body));
+    let output = render_to_string(&app, 120, 40);
+
+    assert!(output.contains("Context window"), "{output}");
+    assert!(output.contains("source_25=tokens"), "{output}");
+    assert!(
+        !output.contains("Context window …"),
+        "explicit /context output should not collapse to a summary: {output}"
+    );
 }
 
 #[test]
@@ -5520,7 +5537,7 @@ fn prompt_height_grows_for_multiline_input() {
     assert_eq!(input_panel_height(&app, 100), PROMPT_MIN_HEIGHT);
 
     set_input(&mut app, "one\ntwo\nthree".to_string());
-    assert_eq!(input_panel_height(&app, 100), 7);
+    assert_eq!(input_panel_height(&app, 100), 6);
 
     set_input(
         &mut app,
@@ -7536,7 +7553,7 @@ fn sample_attachment(id: &str) -> ContextAttachment {
 // ---- /verbosity inline back-compat ----
 //
 // `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
-// `/options` screen focused on the matching section; the original overlay
+// `/config` screen focused on the matching section; the original overlay
 // flow was replaced by the full editor. Section-routing coverage lives in
 // `slash_model_opens_config_at_models_section` and friends below.
 
@@ -9592,7 +9609,7 @@ async fn alt_one_skips_when_an_approval_is_pending() {
     let _ = fs::remove_dir_all(root);
 }
 
-// ─── /options dispatch routing — TuiApp-level eval tests ─────────────────
+// ─── /config dispatch routing — TuiApp-level eval tests ─────────────────
 //
 // Companion fixture: crates/squeezy-eval/fixtures/scenarios/options-screen-routing.toml.
 // These tests exercise the slash-router by driving `handle_key` against a
@@ -9600,10 +9617,10 @@ async fn alt_one_skips_when_an_approval_is_pending() {
 // save dispatch) lives in `config_screen_tests.rs` instead.
 
 #[tokio::test]
-async fn unknown_options_slug_emits_warning_then_opens_default() {
+async fn unknown_config_slug_emits_warning_then_opens_default() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options nosuchsection".to_string());
+    set_input(&mut app, "/config nosuchsection".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -9623,10 +9640,10 @@ async fn unknown_options_slug_emits_warning_then_opens_default() {
 }
 
 #[tokio::test]
-async fn options_slug_for_unregistered_meta_warns() {
+async fn config_slug_for_unregistered_meta_warns() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options skills".to_string());
+    set_input(&mut app, "/config skills".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -9643,10 +9660,10 @@ async fn options_slug_for_unregistered_meta_warns() {
 }
 
 #[tokio::test]
-async fn options_with_no_arg_does_not_emit_unknown_slug_warning() {
+async fn config_with_no_arg_does_not_emit_unknown_slug_warning() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options".to_string());
+    set_input(&mut app, "/config".to_string());
     handle_key(
         &mut app,
         &mut agent,
@@ -9658,30 +9675,14 @@ async fn options_with_no_arg_does_not_emit_unknown_slug_warning() {
     let message = note.map(|n| n.message.clone()).unwrap_or_default();
     assert!(
         !message.contains("not a navigable section"),
-        "no-arg /options must not warn about a missing slug, got: {message}"
+        "no-arg /config must not warn about a missing slug, got: {message}"
     );
 }
 
 #[tokio::test]
-async fn options_and_config_alias_open_the_same_screen() {
+async fn config_and_options_alias_open_the_same_screen() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/options".to_string());
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-    let after_options = app.config_screen.as_ref().map(|s| s.current_section().id);
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
     set_input(&mut app, "/config".to_string());
     handle_key(
         &mut app,
@@ -9691,8 +9692,24 @@ async fn options_and_config_alias_open_the_same_screen() {
     .await
     .expect("handle key");
     let after_config = app.config_screen.as_ref().map(|s| s.current_section().id);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    set_input(&mut app, "/options".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let after_options = app.config_screen.as_ref().map(|s| s.current_section().id);
     assert_eq!(
-        after_options, after_config,
-        "/options and /config must land on the same starting section"
+        after_config, after_options,
+        "/config and /options must land on the same starting section"
     );
 }

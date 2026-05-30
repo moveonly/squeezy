@@ -368,7 +368,7 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-            // /options saves on every commit (Enter / Space), so Ctrl+S
+            // /config saves on every commit (Enter / Space), so Ctrl+S
             // is a no-op affordance for muscle memory. Surface the same
             // message regardless of where the cursor sits so the user
             // doesn't think the screen swallowed the chord; mention
