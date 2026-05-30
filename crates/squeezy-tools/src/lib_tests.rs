@@ -4885,6 +4885,50 @@ async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_confli
 }
 
 #[tokio::test]
+async fn checkpoint_undo_on_empty_store_returns_calm_nothing_to_undo_message() {
+    // `/undo` against a fresh checkpoint store is a clean-tree no-op:
+    // nothing has been recorded, so there is nothing to roll back. The
+    // tools layer must distinguish that case from Stale (partial /
+    // conflict) and Error, returning Success with a structured `message`
+    // so downstream chrome can render the calm informational card.
+    let root = temp_workspace("checkpoint_undo_empty_store");
+    let registry = registry_with_checkpoints(&root);
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo-empty".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(
+        undo.status,
+        ToolStatus::Success,
+        "empty checkpoint store is a happy-path no-op, not a failure",
+    );
+    assert_eq!(undo.content["message"], "nothing to undo");
+    assert_eq!(undo.content["rollback"]["skipped"], true);
+    assert_eq!(undo.content["rollback"]["applied"], false);
+    assert!(
+        undo.content["rollback"]["conflicts"]
+            .as_array()
+            .map(|c| c.is_empty())
+            .unwrap_or(false),
+        "skipped rollback should carry no conflicts",
+    );
+    assert!(
+        undo.content.get("error").is_none() && undo.content.get("reason").is_none(),
+        "calm informational result must not carry error/reason fields",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
     let root = temp_workspace("checkpoint_group_revert");
     fs::write(root.join("sample.txt"), "one").expect("write sample");
