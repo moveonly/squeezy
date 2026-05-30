@@ -158,13 +158,16 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         user_exists,
     ));
     spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
+    let repo_subtitle = if repo_sub.is_empty() {
+        String::new()
+    } else if repo_exists {
+        format!("{repo_sub} (committed)")
+    } else {
+        repo_sub.clone()
+    };
     spans.extend(tab(
         "Repo",
-        if repo_sub.is_empty() {
-            String::new()
-        } else {
-            format!("{repo_sub} (committed)")
-        },
+        repo_subtitle,
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
