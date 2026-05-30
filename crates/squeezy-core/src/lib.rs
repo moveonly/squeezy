@@ -3798,9 +3798,9 @@ pub struct SubagentConfig {
     pub max_runtime_secs: Option<u64>,
     /// When `true`, the structured subagent result returned to the parent
     /// carries a `transcript` field with the child's assistant + tool
-    /// trace. Default `false` — the parent sees only the final `summary`
-    /// + `supporting_receipts` + `files_touched`, keeping the parent
-    /// loop's context tight.
+    /// trace. Default `false` — the parent sees only the final fields
+    /// (`summary`, `supporting_receipts`, `files_touched`), keeping the
+    /// parent loop's context tight.
     pub include_transcript: bool,
 }
 
