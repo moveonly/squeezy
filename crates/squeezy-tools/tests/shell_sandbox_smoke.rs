@@ -277,7 +277,12 @@ async fn shell_sandbox_allows_configured_extra_write_root() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(fs::read_to_string(&target).expect("extra write"), "ok");
     let audit = read_audit_log(&root);
-    assert!(audit.contains(&extra.display().to_string()));
+    let extra_basename = extra
+        .file_name()
+        .expect("extra basename")
+        .to_string_lossy()
+        .into_owned();
+    assert!(audit.contains(&extra_basename));
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(extra);
 }

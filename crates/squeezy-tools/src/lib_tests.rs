@@ -5607,7 +5607,18 @@ async fn shell_workdir_accepts_configured_extra_root() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
     let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
-    assert!(audit.contains(&extra.display().to_string()));
+    // The audit row JSON-encodes paths with whichever separator the host
+    // uses (`\\` on Windows), so assert on the unique basename rather than
+    // the full path string.
+    let extra_basename = extra
+        .file_name()
+        .expect("extra basename")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        audit.contains(&extra_basename),
+        "audit log must mention configured extra write root basename {extra_basename}: {audit}"
+    );
 
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(extra);
