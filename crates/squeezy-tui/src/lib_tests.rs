@@ -3449,6 +3449,87 @@ fn failed_tool_result_starts_expanded_so_error_is_visible() {
     );
 }
 
+#[test]
+fn checkpoint_undo_empty_store_renders_calm_not_red() {
+    // When `/undo` runs on a clean tree (no checkpoints to roll back),
+    // the tools layer surfaces a Success ToolResult with a structured
+    // "nothing to undo" message. The render path must pick the calm
+    // success chrome (green coin, "✔ Ran" label) and the detail helper
+    // must surface the structured message instead of falling through to
+    // the generic "no output" tombstone.
+    let result = ToolResult {
+        call_id: "tui-checkpoint_undo".to_string(),
+        tool_name: "checkpoint_undo".to_string(),
+        status: ToolStatus::Success,
+        content: serde_json::json!({
+            "rollback": {
+                "mode": "atomic",
+                "checkpoint_ids": [],
+                "planned_files": 0,
+                "restored_files": [],
+                "deleted_files": [],
+                "conflicts": [],
+                "skipped": true,
+                "applied": false,
+            },
+            "message": "nothing to undo",
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let tool = ToolTranscript {
+        call: Some(ToolCall {
+            call_id: "tui-checkpoint_undo".to_string(),
+            name: "checkpoint_undo".to_string(),
+            arguments: serde_json::json!({}),
+        }),
+        result,
+        repeat_count: 1,
+    };
+
+    assert_eq!(
+        tool_result_display_color(&tool),
+        SUCCESS_GREEN,
+        "empty-store /undo must paint with the calm success accent, not ERROR_RED",
+    );
+    assert_ne!(
+        tool_result_display_color(&tool),
+        ERROR_RED,
+        "empty-store /undo must not paint red",
+    );
+
+    let (glyph, label) = tool_result_action(&tool);
+    assert_eq!(
+        glyph, "✔ ",
+        "empty-store /undo must use the success check glyph"
+    );
+    assert_eq!(
+        label, "Ran",
+        "empty-store /undo must not display the Failed label"
+    );
+
+    // Status text is built off the Success branch, so neither the
+    // failure label nor the "no output" tombstone may appear.
+    let status_text = tool_result_status_text(&tool.result);
+    assert!(
+        !status_text.contains("no output"),
+        "calm /undo status text must not fall through to \"no output\": {status_text}",
+    );
+    assert!(
+        !status_text.contains("failed"),
+        "calm /undo status text must not contain the failure label: {status_text}",
+    );
+
+    // The detail helper surfaces the structured `message` field rather
+    // than the generic "no output" tombstone, so any caller that
+    // consults it for an empty-store result gets an actionable line.
+    assert_eq!(tool_result_error_detail(&tool.result), "nothing to undo");
+}
+
 #[tokio::test]
 async fn ctrl_e_dispatches_expand_all() {
     let mut agent = test_agent(SessionMode::Build);

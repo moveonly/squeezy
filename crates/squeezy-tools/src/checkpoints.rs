@@ -113,6 +113,26 @@ impl ToolRegistry {
         match checkpoints.rollback(RollbackTarget::Latest, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
+                // `rollback` returns `skipped && !applied` with no
+                // conflicts when the journal had nothing to select. That
+                // is the clean-tree happy path — no checkpoints exist to
+                // undo. Surface it as a Success result carrying a
+                // structured `message`, distinct from Stale (which is
+                // reserved for partial rollbacks and conflicts).
+                let nothing_to_undo =
+                    result.skipped && !result.applied && result.conflicts.is_empty();
+                if nothing_to_undo {
+                    return make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({
+                            "rollback": result,
+                            "message": "nothing to undo",
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
                 make_result(
                     call,
                     if result.conflicts.is_empty() && !result.skipped && result.applied {

@@ -8987,6 +8987,21 @@ fn tool_result_error_detail(result: &ToolResult) -> String {
             return compact_text(line, 140);
         }
     }
+    // Informational tool results (no error / reason / stderr, no exit
+    // code) can still carry a structured `message` summarising the
+    // outcome — e.g. an empty-store undo's "nothing to undo". Surface
+    // that here so the detail line stays actionable instead of
+    // tombstoning to "no output" whenever this helper is consulted off
+    // the failure path.
+    if let Some(message) = result
+        .content
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return compact_text(message, 140);
+    }
     if result.cost_hint.truncated {
         "output shortened".to_string()
     } else {
