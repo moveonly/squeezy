@@ -167,6 +167,11 @@ export const languageRows: MatrixRow[] = [
     name: "Ruby",
     detail: "Classes, modules, methods, singleton methods, attr_* synthesis, require_relative imports, include/extend/prepend mixins, calls, and references.",
     status: "first-class graph"
+  },
+  {
+    name: "Swift",
+    detail: "Imports, classes, structs, actors, protocols, enums with associated cases, extensions, generics with constraints, property wrappers, and module hints.",
+    status: "first-class graph"
   }
 ];
 

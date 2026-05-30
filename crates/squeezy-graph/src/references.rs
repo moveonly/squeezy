@@ -349,6 +349,9 @@ impl SemanticGraph {
         if symbol_language.map(is_js_ts_language).unwrap_or(false) {
             return self.js_ts_import_matches_symbol(import, symbol);
         }
+        if symbol_language == Some(squeezy_core::LanguageKind::Swift) {
+            return self.swift_import_matches_symbol(import, symbol);
+        }
         let mut import_path = path_segments(&import.path);
         if import.is_glob {
             if import_path.last().map(String::as_str) == Some("*") {

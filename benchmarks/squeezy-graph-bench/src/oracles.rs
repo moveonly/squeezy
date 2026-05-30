@@ -12,6 +12,7 @@ pub(crate) mod php_oracle;
 pub(crate) mod roslyn;
 pub(crate) mod ruby_oracle;
 pub(crate) mod rust_analyzer;
+pub(crate) mod swift_sourcekit;
 pub(crate) mod tsc;
 
 pub(crate) use clang::*;
@@ -105,8 +106,13 @@ static RUBY_PRISM: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::Ruby,
     language: BenchmarkLanguage::Ruby,
 };
+static SOURCEKIT_LSP: OracleDescriptor = OracleDescriptor {
+    id: "sourcekit_lsp",
+    family: LanguageFamily::Swift,
+    language: BenchmarkLanguage::Swift,
+};
 
-static ORACLES: [&'static dyn LanguageOracle; 10] = [
+static ORACLES: [&'static dyn LanguageOracle; 11] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
@@ -117,6 +123,7 @@ static ORACLES: [&'static dyn LanguageOracle; 10] = [
     &TSC,
     &PHP_PARSER,
     &RUBY_PRISM,
+    &SOURCEKIT_LSP,
 ];
 
 pub fn inventory() -> &'static [&'static dyn LanguageOracle] {

@@ -19,6 +19,7 @@ uses the same family names so coverage claims stay checkable.
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
 | `php` | PHP | `php` | `tree-sitter-php` | `nikic/php-parser` | yes | `benchmarks/fixtures/php/semantic-cases` | `benchmarks/specs/php-smoke-queries.json` | symfony-console |
 | `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
+| `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` (scan-only fallback) | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
 
 ## Rust
 
@@ -207,6 +208,30 @@ effort because Ruby lacks parameter types.
 Oracle: Ruby Prism subprocess. CI installs Ruby 3.3 via `ruby/setup-ruby`
 with `continue-on-error: true`; when the toolchain is missing the oracle
 degrades to a `mode = "scan-only"` self-compare.
+
+## Swift
+
+Indexed: classes, structs, actors, protocols, enums (with associated-value cases),
+extensions (members carry `language_identity = ExtendedType` for cross-file
+receiver resolution), `init` / `deinit` / `subscript`, computed and stored
+properties (computed properties carry `swift:computed`), property wrappers
+(`@Published` etc. as attribute references), `@MainActor` / `@objc` /
+`@Sendable` attributes, generic constraints from both the type parameter clause
+and `where` clauses, module imports (`import M`, `import struct M.T`), and
+SwiftPM module hints derived from `Sources/<Module>/...` paths.
+
+Known limitations: `@dynamicMemberLookup` runtime resolution, full protocol
+witness tracking, Objective-C bridging (`.h`/`.m` siblings and `@objc(name)`
+mappings), `#externalMacro`/`#freestanding` macro expansion, and SwiftPM
+`Package.swift` parsing for module facts are deferred follow-ups. Closures
+contribute body hits to their enclosing symbol but do not produce symbols of
+their own.
+
+Oracle: SourceKit-LSP. The first PR ships the scan-only path that exercises the
+Swift extractor against a corpus-shaped fixture; CI installs the Swift 5.10
+toolchain on Linux and uses the bundled `sourcekit-lsp`. macOS-only frameworks
+(`Combine`, `SwiftUI`, `Network`) are intentionally absent from the fixture so
+the smoke run works on `ubuntu-latest`.
 
 ## Benchmark Corpus Reporting
 

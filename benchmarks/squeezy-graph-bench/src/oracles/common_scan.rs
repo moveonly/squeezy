@@ -52,6 +52,21 @@ pub(crate) fn default_oracle_exclusions(root: &Path) -> Result<OracleExclusions>
             files.insert(excluded.relative_path);
         }
     }
+    // Swift fixtures conventionally place generated SwiftGen output under
+    // a `generated/` tree and vendored SwiftPM sources under `vendor/`.
+    // Both are excluded from the oracle to match SourceKit-LSP's
+    // workspace-symbol scan behaviour (spec §9). Files matching
+    // `*.generated.swift` are filtered by `is_swift_oracle_excluded_file`
+    // in the SourceKit oracle path; the directory exclusions here keep
+    // common-scan reports consistent for mixed-language corpus runs.
+    for swift_excluded_dir in ["vendor/", "generated/"] {
+        if !dirs
+            .iter()
+            .any(|existing| existing.as_str() == swift_excluded_dir)
+        {
+            dirs.push(swift_excluded_dir.to_string());
+        }
+    }
     dirs.sort();
     Ok(OracleExclusions { files, dirs })
 }

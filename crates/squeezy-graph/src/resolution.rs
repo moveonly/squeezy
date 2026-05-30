@@ -374,6 +374,14 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.swift_extension_receiver_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "swift extension receiver",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.python_receiver_alias_method(caller_id, call) {
                 return (
                     Some(id),
@@ -872,6 +880,9 @@ impl SemanticGraph {
         }
         if is_js_ts_language(file.language) {
             return self.js_ts_import_matches_symbol(import, symbol);
+        }
+        if file.language == squeezy_core::LanguageKind::Swift {
+            return self.swift_import_matches_symbol(import, symbol);
         }
         if last_path_segment(&import.path) != symbol.name {
             return false;

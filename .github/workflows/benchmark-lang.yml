@@ -42,6 +42,7 @@ on:
           - kotlin
           - php
           - ruby
+          - swift
       tier:
         description: Benchmark tier.
         required: true
@@ -64,7 +65,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp' || inputs.language == 'kotlin') && 90 || (inputs.language == 'go' || inputs.language == 'php') && 60 || inputs.language == 'ruby' && 45 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp' || inputs.language == 'kotlin') && 90 || (inputs.language == 'go' || inputs.language == 'php' || inputs.language == 'swift') && 60 || inputs.language == 'ruby' && 45 || 120 }}
 
     steps:
       - name: Checkout
@@ -112,6 +113,23 @@ jobs:
           sudo apt-get install -y php8.3-cli php8.3-mbstring php8.3-xml composer
           ( cd benchmarks/oracle-helpers/php-oracle \
             && composer install --no-interaction --prefer-dist )
+
+      - name: Install Swift toolchain
+        if: inputs.language == 'swift'
+        continue-on-error: true
+        run: |
+          set -e
+          SWIFT_VERSION=5.10
+          SWIFT_PLATFORM=ubuntu22.04
+          ARCHIVE="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}.tar.gz"
+          # https://swift.org/install/linux/#tarball-installation
+          curl -fL -o swift.tar.gz \
+            "https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_PLATFORM//./}/swift-${SWIFT_VERSION}-RELEASE/${ARCHIVE}"
+          sudo mkdir -p /opt/swift
+          sudo tar -xzf swift.tar.gz -C /opt/swift --strip-components=1
+          echo "/opt/swift/usr/bin" >> "$GITHUB_PATH"
+          /opt/swift/usr/bin/swift --version
+          /opt/swift/usr/bin/sourcekit-lsp --version || true
 
       - name: Run semantic graph benchmark corpus
         run: |

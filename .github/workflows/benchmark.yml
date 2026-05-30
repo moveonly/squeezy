@@ -45,6 +45,7 @@ on:
           - csharp
           - js-ts
           - kotlin
+          - swift
       tier:
         description: "Benchmark tier"
         required: true
@@ -162,3 +163,13 @@ jobs:
       tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
       artifact-suffix: kotlin
       summary-file: __kotlin_summary.md
+
+  swift-semantic-graph-smoke:
+    name: Swift semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'swift' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: swift
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: swift
+      summary-file: __swift_summary.md

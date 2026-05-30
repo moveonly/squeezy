@@ -4588,6 +4588,429 @@ end
     assert_eq!(audit.parent_id, Some(module.id));
 }
 
+#[test]
+fn graph_indexes_swift_class_struct_actor_protocol_enum_declarations() {
+    let mut parser = LanguageParser::new().unwrap();
+    let endpoint = swift_record(
+        "Sources/Networking/Endpoint.swift",
+        r#"
+import Foundation
+
+protocol Endpoint {
+    var path: String { get }
+    func encode() -> Data
+}
+
+struct UserEndpoint: Endpoint {
+    let path: String = "/users"
+    func encode() -> Data { return Data() }
+}
+"#,
+    );
+    let cache = swift_record(
+        "Sources/Storage/Cache.swift",
+        r#"
+import Foundation
+
+actor Cache<Key: Hashable, Value> {
+    private var storage: [Key: Value] = [:]
+}
+"#,
+    );
+    let result = swift_record(
+        "Sources/Models/Result.swift",
+        r#"
+enum APIResult<Value, Failure: Error> {
+    case success(Value)
+    case failure(Failure)
+}
+"#,
+    );
+    let parsed = vec![&endpoint, &cache, &result]
+        .into_iter()
+        .map(|record| {
+            parser
+                .parse_source(record, fs::read_to_string(&record.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        graph
+            .find_symbol_by_name("Endpoint")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Trait),
+        "protocol Endpoint must surface as Trait"
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("UserEndpoint")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Struct
+                && s.attributes.contains(&"base:Endpoint".to_string())),
+        "struct UserEndpoint must record `base:Endpoint`"
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("Cache")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Class
+                && s.attributes.contains(&"swift:actor".to_string())),
+        "actor Cache surfaces as Class with swift:actor attribute"
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("APIResult")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Enum),
+        "enum APIResult"
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("success")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Variant),
+        "success case"
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("failure")
+            .iter()
+            .any(|s| s.kind == SymbolKind::Variant),
+        "failure case"
+    );
+}
+
+#[test]
+fn graph_indexes_swift_imports_and_module_facts() {
+    let mut parser = LanguageParser::new().unwrap();
+    let endpoint = swift_record(
+        "Sources/Networking/Endpoint.swift",
+        r#"
+import Foundation
+import struct CoreGraphics.CGRect
+
+protocol Endpoint {}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&endpoint, fs::read_to_string(&endpoint.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert_eq!(
+        graph.packages.get(&endpoint.id).map(String::as_str),
+        Some("Networking"),
+        "Sources/<Module>/... layout should set package = \"Networking\""
+    );
+    let imports = graph
+        .imports_for_file(&endpoint.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        imports.iter().any(|i| i.path == "Foundation"),
+        "Foundation import"
+    );
+    assert!(
+        imports.iter().any(
+            |i| i.path == "CoreGraphics.CGRect" && i.imported_name.as_deref() == Some("CGRect")
+        ),
+        "import struct CoreGraphics.CGRect"
+    );
+}
+
+#[test]
+fn graph_resolves_swift_extension_method_via_language_identity() {
+    let mut parser = LanguageParser::new().unwrap();
+    let extension_file = swift_record(
+        "Sources/Extensions/String+Sanitize.swift",
+        r#"
+import Foundation
+
+extension String {
+    func sanitized() -> String { return self }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(
+            &extension_file,
+            fs::read_to_string(&extension_file.path).unwrap(),
+        )
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let sanitized = graph
+        .find_symbol_by_name("sanitized")
+        .pop()
+        .expect("sanitized method present");
+    assert_eq!(
+        sanitized.language_identity.as_deref(),
+        Some("String"),
+        "extension members carry language_identity = extended type"
+    );
+    // Parent should either be None (the extractor emits parent_id = None on
+    // extension members) or the synthetic file symbol assigned by the graph.
+    if let Some(pid) = sanitized.parent_id.as_ref() {
+        assert!(
+            pid.0.starts_with("file:"),
+            "extension members must not have an explicit type parent, got {:?}",
+            pid
+        );
+    }
+}
+
+#[test]
+fn graph_indexes_swift_property_wrappers_and_main_actor() {
+    let mut parser = LanguageParser::new().unwrap();
+    let repo = swift_record(
+        "Sources/Networking/Repository.swift",
+        r#"
+import Foundation
+
+@MainActor
+final class UserRepository {
+    @Published var users: [String] = []
+    func refresh() async {}
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&repo, fs::read_to_string(&repo.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let class = graph
+        .find_symbol_by_name("UserRepository")
+        .pop()
+        .expect("UserRepository class");
+    assert!(class.attributes.iter().any(|a| a == "MainActor"));
+    let users = graph
+        .find_symbol_by_name("users")
+        .pop()
+        .expect("users field");
+    assert_eq!(users.kind, SymbolKind::Field);
+    assert!(users.attributes.iter().any(|a| a == "Published"));
+}
+
+#[test]
+fn graph_indexes_swift_typealias() {
+    let mut parser = LanguageParser::new().unwrap();
+    let aliases = swift_record(
+        "Sources/Models/Aliases.swift",
+        r#"
+typealias UserId = Int
+typealias Mapping<K, V> = [K: V]
+"#,
+    );
+    let parsed = parser
+        .parse_source(&aliases, fs::read_to_string(&aliases.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    assert!(
+        graph
+            .find_symbol_by_name("UserId")
+            .iter()
+            .any(|s| s.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        graph
+            .find_symbol_by_name("Mapping")
+            .iter()
+            .any(|s| s.kind == SymbolKind::TypeAlias)
+    );
+}
+
+#[test]
+fn graph_swift_generic_constraints_recorded_as_base_attributes() {
+    let mut parser = LanguageParser::new().unwrap();
+    let r = swift_record(
+        "Sources/Models/Where.swift",
+        r#"
+func transform<T, U>(_ x: T, _ y: U) where T: Codable, U: Equatable {}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&r, fs::read_to_string(&r.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let func = graph
+        .find_symbol_by_name("transform")
+        .pop()
+        .expect("transform fn");
+    assert!(
+        func.attributes.iter().any(|a| a == "base:Codable"),
+        "where T: Codable should record `base:Codable`, got {:?}",
+        func.attributes
+    );
+    assert!(
+        func.attributes.iter().any(|a| a == "base:Equatable"),
+        "where U: Equatable should record `base:Equatable`, got {:?}",
+        func.attributes
+    );
+}
+
+#[test]
+fn graph_swift_protocol_with_conforming_type_references_resolve() {
+    let mut parser = LanguageParser::new().unwrap();
+    let endpoint = swift_record(
+        "Sources/Networking/Endpoint.swift",
+        r#"
+protocol Endpoint {}
+struct UserEndpoint: Endpoint {}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&endpoint, fs::read_to_string(&endpoint.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let endpoint_sym = graph
+        .find_symbol_by_name("Endpoint")
+        .pop()
+        .expect("Endpoint protocol");
+    let refs = graph.references_to_symbol(&endpoint_sym.id);
+    assert!(
+        !refs.is_empty(),
+        "Endpoint must have at least one reference from UserEndpoint conformance"
+    );
+}
+
+#[test]
+fn graph_swift_computed_property_emits_field_not_method() {
+    let mut parser = LanguageParser::new().unwrap();
+    let p = swift_record(
+        "Sources/Models/Person.swift",
+        r#"
+struct Person {
+    let first: String
+    let last: String
+    var fullName: String {
+        get { "x" }
+    }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&p, fs::read_to_string(&p.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let full = graph
+        .find_symbol_by_name("fullName")
+        .pop()
+        .expect("fullName field");
+    assert_eq!(full.kind, SymbolKind::Field);
+    assert!(full.attributes.iter().any(|a| a == "swift:computed"));
+}
+
+#[test]
+fn graph_swift_extension_call_from_method_resolves_to_extension_target() {
+    // Spec gotcha (a): when `foo.bar()` is called with `foo: Foo`, and
+    // `bar` is defined on `extension Foo { ... }` in a different file,
+    // the receiver-method resolver must find it via `language_identity`.
+    let mut parser = LanguageParser::new().unwrap();
+    let str_ext = swift_record(
+        "Sources/Extensions/String+Sanitize.swift",
+        r#"
+import Foundation
+
+extension String {
+    func sanitized() -> String { return self }
+}
+"#,
+    );
+    let user = swift_record(
+        "Sources/Networking/Repository.swift",
+        r#"
+import Foundation
+
+class Repo {
+    let name: String = "x"
+    func go() {
+        let _ = name.sanitized()
+    }
+}
+"#,
+    );
+    let parsed: Vec<_> = [&str_ext, &user]
+        .into_iter()
+        .map(|r| {
+            parser
+                .parse_source(r, fs::read_to_string(&r.path).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    // The extension method must exist with `language_identity = "String"`.
+    let sanitized = graph
+        .find_symbol_by_name("sanitized")
+        .pop()
+        .expect("sanitized in graph");
+    assert_eq!(sanitized.language_identity.as_deref(), Some("String"));
+
+    // The body-hit / call must exist.
+    let go = graph.find_symbol_by_name("go").pop().expect("go method");
+    assert!(
+        graph.call_chain(&go.id, &sanitized.id, 3).is_some(),
+        "go() -> sanitized() chain must resolve via extension receiver matching"
+    );
+}
+
+#[test]
+fn graph_swift_actor_attribute_searchable_via_signature_query() {
+    let mut parser = LanguageParser::new().unwrap();
+    let cache = swift_record(
+        "Sources/Storage/Cache.swift",
+        r#"
+actor Cache {}
+class Plain {}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&cache, fs::read_to_string(&cache.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let results = graph.signature_search(&SignatureQuery {
+        text: String::new(),
+        kind: Some(SymbolKind::Class),
+        visibility: None,
+        attribute: Some("swift:actor".to_string()),
+    });
+    assert!(
+        results.iter().any(|s| s.name == "Cache"),
+        "swift:actor attribute should filter Cache, got {:?}",
+        results.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        results.iter().all(|s| s.name != "Plain"),
+        "non-actor class Plain should not match swift:actor filter"
+    );
+}
+
+#[test]
+fn graph_swift_main_actor_attribute_search() {
+    let mut parser = LanguageParser::new().unwrap();
+    let repo = swift_record(
+        "Sources/Networking/Repository.swift",
+        r#"
+@MainActor
+class A {}
+class B {}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&repo, fs::read_to_string(&repo.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let results = graph.signature_search(&SignatureQuery {
+        text: String::new(),
+        kind: None,
+        visibility: None,
+        attribute: Some("MainActor".to_string()),
+    });
+    assert!(results.iter().any(|s| s.name == "A"));
+    assert!(results.iter().all(|s| s.name != "B"));
+}
+
 fn parsed_imports(graph: &SemanticGraph) -> impl Iterator<Item = &ParsedImport> {
     graph.imports.iter()
 }
@@ -4666,6 +5089,12 @@ fn kotlin_record(relative_path: &str, source: &str) -> FileRecord {
 fn php_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Php;
+    record
+}
+
+fn swift_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Swift;
     record
 }
 

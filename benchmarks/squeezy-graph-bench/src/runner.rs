@@ -208,6 +208,10 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
                 ),
             }
         }
+        BenchmarkLanguage::Swift => (
+            0,
+            "Swift validation oracle not run in first-iteration CI (SwiftPM build is expensive)".to_string(),
+        ),
     };
 
     let build = build_graph(&args.fixture)?;
@@ -245,6 +249,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
             collect_js_ts_accuracy(&args.fixture, &graph, args.ra_lsp_probes)
         }
+        BenchmarkLanguage::Swift => empty_accuracy("rust-analyzer oracle not used for Swift"),
     };
     let python_oracle = match args.language {
         BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
@@ -292,6 +297,12 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         )?),
         _ => None,
     };
+    let swift_oracle = match args.language {
+        BenchmarkLanguage::Swift => Some(
+            crate::oracles::swift_sourcekit::collect_swift_oracle_accuracy(&args.fixture, &graph)?,
+        ),
+        _ => None,
+    };
     let faster_than_validation =
         validation_status.starts_with("skipped") || squeezy_total_ms < validation_ms;
 
@@ -329,6 +340,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         &go_oracle,
         &php_oracle,
         &ruby_oracle,
+        &swift_oracle,
     );
 
     Ok(BenchmarkReport {
@@ -366,6 +378,7 @@ fn run_benchmark(args: &Args, corpus_case: Option<CorpusCaseReport>) -> Result<B
         go_oracle,
         php_oracle,
         ruby_oracle,
+        swift_oracle,
         refresh_probe,
         heuristic_iterations,
         queries: query_reports,
@@ -409,6 +422,7 @@ fn answer_quality_report(
     go_oracle: &Option<GoOracleReport>,
     php_oracle: &Option<PhpOracleReport>,
     ruby_oracle: &Option<RubyOracleReport>,
+    swift_oracle: &Option<SwiftOracleReport>,
 ) -> AnswerQualityReport {
     let expected_checks = query_reports
         .iter()
@@ -437,6 +451,7 @@ fn answer_quality_report(
         go_oracle,
         php_oracle,
         ruby_oracle,
+        swift_oracle,
     );
 
     AnswerQualityReport {
@@ -465,6 +480,7 @@ fn oracle_summary(
     go_oracle: &Option<GoOracleReport>,
     php_oracle: &Option<PhpOracleReport>,
     ruby_oracle: &Option<RubyOracleReport>,
+    swift_oracle: &Option<SwiftOracleReport>,
 ) -> (String, Option<f64>, Option<f64>) {
     match language {
         BenchmarkLanguage::Python => python_oracle
@@ -510,6 +526,12 @@ fn oracle_summary(
                 symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
             }),
         BenchmarkLanguage::Ruby => ruby_oracle
+            .as_ref()
+            .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
+            .unwrap_or_else(|| {
+                symbol_oracle_tuple(&accuracy.rust_analyzer_symbol_status, &accuracy.symbols)
+            }),
+        BenchmarkLanguage::Swift => swift_oracle
             .as_ref()
             .map(|oracle| symbol_oracle_tuple(&oracle.status, &oracle.symbols))
             .unwrap_or_else(|| {

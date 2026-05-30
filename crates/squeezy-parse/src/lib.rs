@@ -238,6 +238,7 @@ pub struct LanguageParser {
     kotlin_parser: Parser,
     python_parser: Parser,
     ruby_parser: Parser,
+    swift_parser: Parser,
     typescript_parser: Parser,
     tsx_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
@@ -274,6 +275,7 @@ impl LanguageParser {
         let kotlin_parser = parser_with_kotlin_language()?;
         let python_parser = parser_with_python_language()?;
         let ruby_parser = parser_with_ruby_language()?;
+        let swift_parser = parser_with_swift_language()?;
         let typescript_parser = parser_with_typescript_language()?;
         let tsx_parser = parser_with_tsx_language()?;
         Ok(Self {
@@ -289,6 +291,7 @@ impl LanguageParser {
             kotlin_parser,
             python_parser,
             ruby_parser,
+            swift_parser,
             typescript_parser,
             tsx_parser,
             cache: HashMap::new(),
@@ -479,6 +482,7 @@ impl LanguageParser {
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
             LanguageKind::Ruby => Ok(&mut self.ruby_parser),
+            LanguageKind::Swift => Ok(&mut self.swift_parser),
             LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
             LanguageKind::Tsx => Ok(&mut self.tsx_parser),
             _ => Err(SqueezyError::Parse(format!(
@@ -502,6 +506,7 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
         LanguageKind::Python => parser_with_python_language(),
         LanguageKind::Ruby => parser_with_ruby_language(),
         LanguageKind::Rust => parser_with_rust_language(),
+        LanguageKind::Swift => parser_with_swift_language(),
         LanguageKind::TypeScript => parser_with_typescript_language(),
         LanguageKind::Tsx => parser_with_tsx_language(),
         _ => Err(SqueezyError::Parse(format!(
@@ -524,6 +529,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
         kotlin: parser_with_kotlin_language()?,
         python: parser_with_python_language()?,
         ruby: parser_with_ruby_language()?,
+        swift: parser_with_swift_language()?,
         typescript: parser_with_typescript_language()?,
         tsx: parser_with_tsx_language()?,
     };
@@ -547,6 +553,7 @@ struct WorkerParsers {
     kotlin: Parser,
     python: Parser,
     ruby: Parser,
+    swift: Parser,
     typescript: Parser,
     tsx: Parser,
 }
@@ -566,6 +573,7 @@ impl WorkerParsers {
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
             LanguageKind::Ruby => Ok(&mut self.ruby),
+            LanguageKind::Swift => Ok(&mut self.swift),
             LanguageKind::TypeScript => Ok(&mut self.typescript),
             LanguageKind::Tsx => Ok(&mut self.tsx),
             _ => Err(SqueezyError::Parse(format!(
@@ -784,6 +792,15 @@ fn parser_with_kotlin_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_swift_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = swift_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Swift grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_c_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = c_language();
@@ -820,6 +837,10 @@ fn java_language() -> tree_sitter::Language {
 
 fn kotlin_language() -> tree_sitter::Language {
     tree_sitter_kotlin_ng::LANGUAGE.into()
+}
+
+fn swift_language() -> tree_sitter::Language {
+    tree_sitter_swift::LANGUAGE.into()
 }
 
 fn python_language() -> tree_sitter::Language {
@@ -876,10 +897,10 @@ fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
         LanguageKind::Rust => Some(rust_language()),
         LanguageKind::Ruby => Some(ruby_language()),
         LanguageKind::Php => Some(php_language()),
+        LanguageKind::Swift => Some(swift_language()),
         LanguageKind::TypeScript => Some(typescript_language()),
         LanguageKind::Tsx => Some(tsx_language()),
-        LanguageKind::Swift
-        | LanguageKind::Scala
+        LanguageKind::Scala
         | LanguageKind::Dart
         | LanguageKind::Unsupported
         | LanguageKind::Unknown => None,

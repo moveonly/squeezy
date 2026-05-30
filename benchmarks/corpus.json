@@ -777,6 +777,33 @@
         "rev": "v4.1.1",
         "checkout": "target/benchmark-repos/sinatra"
       }
+    },
+    {
+      "name": "swift-smoke",
+      "family": "swift",
+      "language": "swift",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/swift/semantic-cases",
+      "spec": "benchmarks/specs/swift-smoke-queries.json",
+      "report": "swift/swift-smoke.json",
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true
+    },
+    {
+      "name": "swift-nio",
+      "family": "swift",
+      "language": "swift",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/swift-nio/Sources/NIOCore",
+      "spec": "benchmarks/specs/swift-smoke-queries.json",
+      "report": "swift/swift-nio.json",
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/apple/swift-nio",
+        "rev": "2.65.0",
+        "checkout": "target/benchmark-repos/swift-nio"
+      }
     }
   ]
 }

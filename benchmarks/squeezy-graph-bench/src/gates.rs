@@ -104,6 +104,36 @@ pub(crate) fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Re
         )));
     }
 
+    // Spec §10: Swift first-PR thresholds. precision >= 0.92, recall >=
+    // 0.80. The speed gate stays disabled per the corpus entry
+    // (`no_speed_gate: true`). We enforce thresholds only when the
+    // oracle was actually invoked.
+    if let Some(swift) = &report.swift_oracle {
+        let precision = swift.symbols.precision;
+        let recall = swift.symbols.recall;
+        let denom = swift.symbols.true_positive
+            + swift.symbols.false_positive
+            + swift.symbols.false_negative;
+        if denom > 0 {
+            if precision < 0.92 {
+                return Err(SqueezyError::Graph(format!(
+                    "Swift symbol precision {precision:.3} below 0.92 gate (tp={} fp={} fn={})",
+                    swift.symbols.true_positive,
+                    swift.symbols.false_positive,
+                    swift.symbols.false_negative,
+                )));
+            }
+            if recall < 0.80 {
+                return Err(SqueezyError::Graph(format!(
+                    "Swift symbol recall {recall:.3} below 0.80 gate (tp={} fp={} fn={})",
+                    swift.symbols.true_positive,
+                    swift.symbols.false_positive,
+                    swift.symbols.false_negative,
+                )));
+            }
+        }
+    }
+
     if let Some(mixed) = &report.mixed_workload
         && mixed.refresh_probe.reparsed_files != mixed.refresh_probe.edited_files
     {

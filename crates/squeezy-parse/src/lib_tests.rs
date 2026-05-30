@@ -2527,6 +2527,206 @@ end
         && s.parent_id == Some(greeter.id.clone())));
 }
 
+#[test]
+fn parser_extracts_swift_symbols_imports_calls_and_references() {
+    let source = r#"
+import Foundation
+import struct CoreGraphics.CGRect
+
+@MainActor
+public final class UserRepository {
+    @Published var users: [String] = []
+
+    public init() {}
+
+    public func refresh() async {
+        users.removeAll()
+    }
+}
+
+protocol Endpoint {
+    var path: String { get }
+    func encode() -> Data
+}
+
+struct UserEndpoint: Endpoint {
+    let path: String = "/users"
+    func encode() -> Data {
+        return Data()
+    }
+}
+
+actor Cache<Key: Hashable, Value> {
+    private var storage: [Key: Value] = [:]
+}
+
+extension String {
+    func sanitized() -> String {
+        return self
+    }
+}
+
+enum APIResult<Value, Failure: Error> {
+    case success(Value)
+    case failure(Failure)
+}
+
+typealias Endpoints = [Endpoint]
+
+func freeFunction() -> Int { return 1 }
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Models.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed.unsupported.is_none(),
+        "swift parser must not return unsupported"
+    );
+
+    // Imports
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "Foundation" && i.kind == ImportKind::Named)
+    );
+    assert!(
+        parsed.imports.iter().any(
+            |i| i.path == "CoreGraphics.CGRect" && i.imported_name.as_deref() == Some("CGRect")
+        )
+    );
+
+    // SwiftPM module hint
+    assert_eq!(parsed.package.as_deref(), Some("Models"));
+
+    // Symbols: top-level types
+    let by_name = |name: &str, kind: SymbolKind| {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name && s.kind == kind)
+    };
+
+    let repo = by_name("UserRepository", SymbolKind::Class).expect("UserRepository class");
+    assert!(repo.attributes.iter().any(|a| a == "MainActor"));
+    assert!(repo.attributes.iter().any(|a| a == "swift:final"));
+
+    let cache = by_name("Cache", SymbolKind::Class).expect("Cache actor");
+    assert!(cache.attributes.iter().any(|a| a == "swift:actor"));
+    assert!(
+        cache.attributes.iter().any(|a| a == "base:Hashable"),
+        "Cache should record `base:Hashable` from generic constraint, got {:?}",
+        cache.attributes
+    );
+
+    let user_endpoint = by_name("UserEndpoint", SymbolKind::Struct).expect("UserEndpoint struct");
+    assert!(
+        user_endpoint
+            .attributes
+            .iter()
+            .any(|a| a == "base:Endpoint")
+    );
+
+    assert!(by_name("Endpoint", SymbolKind::Trait).is_some(), "protocol");
+    assert!(by_name("APIResult", SymbolKind::Enum).is_some(), "enum");
+    assert!(
+        by_name("Endpoints", SymbolKind::TypeAlias).is_some(),
+        "typealias"
+    );
+    assert!(
+        by_name("freeFunction", SymbolKind::Function).is_some(),
+        "file-scope func"
+    );
+
+    // Enum cases
+    assert!(by_name("success", SymbolKind::Variant).is_some());
+    assert!(by_name("failure", SymbolKind::Variant).is_some());
+
+    // Methods + arity
+    let refresh = by_name("refresh", SymbolKind::Method).expect("refresh method");
+    assert!(refresh.attributes.iter().any(|a| a == "swift:async"));
+    assert!(by_name("encode", SymbolKind::Method).is_some());
+    let init = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "init" && s.kind == SymbolKind::Method)
+        .expect("init method");
+    assert!(init.attributes.iter().any(|a| a == "swift:init"));
+
+    // Fields
+    let users_field = by_name("users", SymbolKind::Field).expect("users field");
+    assert!(users_field.attributes.iter().any(|a| a == "Published"));
+
+    let path_field = by_name("path", SymbolKind::Field).expect("path field");
+    assert!(path_field.attributes.iter().any(|a| a == "type:String"));
+
+    // Extension propagates language_identity
+    let sanitized = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "sanitized" && s.kind == SymbolKind::Method)
+        .expect("sanitized method");
+    assert_eq!(sanitized.language_identity.as_deref(), Some("String"));
+    assert!(
+        sanitized.parent_id.is_none(),
+        "extension members emit at file scope"
+    );
+
+    // References: at least one Endpoint type reference
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|r| r.text == "Endpoint" && r.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
+fn parser_extracts_swift_computed_properties_and_attributes() {
+    let source = r#"
+import Foundation
+
+struct Person {
+    let first: String
+    let last: String
+
+    var fullName: String {
+        get { "\(first) \(last)" }
+    }
+}
+
+@objc(MyHandler)
+class Handler {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Person.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+    let full_name = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "fullName" && s.kind == SymbolKind::Field)
+        .expect("fullName field");
+    assert!(
+        full_name.attributes.iter().any(|a| a == "swift:computed"),
+        "computed property must carry swift:computed attribute"
+    );
+    let handler = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Handler" && s.kind == SymbolKind::Class)
+        .expect("Handler class");
+    assert!(handler.attributes.iter().any(|a| a == "objc"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|r| r.text == "MyHandler" && r.kind == ReferenceKind::Attribute),
+        "objc(MyHandler) records MyHandler as attribute"
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);
@@ -2613,6 +2813,12 @@ fn kotlin_record(relative_path: &str, source: &str) -> FileRecord {
 fn php_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Php;
+    record
+}
+
+fn swift_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Swift;
     record
 }
 
