@@ -1104,6 +1104,7 @@ impl Driver {
                 "run_prompt_through_harness called without a harness".into(),
             ));
         };
+        let turn_start = Instant::now();
         let mut h = harness.lock().await;
         h.start_user_turn(prompt.clone());
 
@@ -1151,17 +1152,119 @@ impl Driver {
                 )));
             }
         }
+
+        // Synthesize a turn id for capture / frame parity. The TUI's
+        // own `TurnId` is consumed inside `drain_agent_events` and never
+        // surfaces back to the harness, so we mint a deterministic
+        // `harness-<n>` label off the existing turn counter that
+        // already drives `last_turn_id` for the non-drive_tui path.
+        let assistant_text = h.last_assistant_text();
+        let status_text = h.status_text().to_string();
+        let transcript_count = h.transcript_entries().len();
+        drop(h);
+
+        let prior_turn = self.last_turn_id.lock().await.clone();
+        let next_index = prior_turn
+            .as_deref()
+            .and_then(|s| s.strip_prefix("harness-"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .map(|n| n + 1)
+            .unwrap_or(1);
+        let turn_str = format!("harness-{next_index}");
+        *self.last_turn_id.lock().await = Some(turn_str.clone());
+
+        // Mirror the run_prompt path so findings rules and downstream
+        // tools see the same shape under drive_tui = true. Order
+        // matters: TurnStarted → AssistantDelta → TurnCompleted so the
+        // findings.rs trace walker fills `per_turn_text` and
+        // `last_completed_turn`.
+        self.capture
+            .record(Some(turn_str.clone()), EvalEventKind::TurnStarted)?;
+        if !assistant_text.is_empty() {
+            self.capture.record(
+                Some(turn_str.clone()),
+                EvalEventKind::AssistantDelta {
+                    delta: assistant_text.clone(),
+                },
+            )?;
+        }
+        self.capture.record(
+            Some(turn_str.clone()),
+            EvalEventKind::TurnCompleted {
+                metrics: Value::Null,
+                cost: Value::Null,
+                stop_reason: None,
+                reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
+            },
+        )?;
         self.capture.record(
             None,
             EvalEventKind::ActionStep {
                 action: json!({"kind": "harness_prompt", "text": prompt}),
                 status: format!(
-                    "drained · {} transcript entries · status={:?}",
-                    h.transcript_entries().len(),
-                    h.status_text(),
+                    "drained · {transcript_count} transcript entries · status={status_text:?}",
                 ),
             },
         )?;
+
+        // Also push the assistant text into `last_assistant_text` so
+        // `Assertion::TextContains` works under the harness path. The
+        // run_prompt path does the same via the AssistantDelta event
+        // handler.
+        {
+            let mut lat = self.last_assistant_text.lock().await;
+            lat.clear();
+            lat.push_str(&assistant_text);
+        }
+
+        // Build a FrameRecord for frames.jsonl + a TuiFrame for
+        // frames_tui.jsonl. Without these, expect_final_text_contains
+        // false-positives on every drive_tui scenario (squeezy-bnz) and
+        // `view` / `replay.tui` report zero rows.
+        let mut frame = FrameRecord {
+            turn_id: turn_str.clone(),
+            prompt: prompt.clone(),
+            assistant_text: assistant_text.clone(),
+            elapsed_ms: turn_start.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+        let (styled, ansi) = crate::frames::render_styled(&frame.assistant_text);
+        frame.styled_lines = styled;
+        frame.ansi = ansi;
+        self.frames.write(&frame)?;
+
+        if let Some(writer) = self.tui_capture.as_ref() {
+            let overlays = self.pending_overlays.lock().await.clone();
+            let rendered = crate::tui_capture::render_capture_to_grid(
+                &frame.assistant_text,
+                &overlays,
+                writer.width(),
+                writer.height(),
+            )?;
+            let tui_frame = crate::tui_capture::TuiFrame {
+                turn_id: frame.turn_id.clone(),
+                width: writer.width(),
+                height: writer.height(),
+                cells: rendered.cells,
+                plain_text: rendered.plain_text,
+                ansi: rendered.ansi,
+                visual_truncated: rendered.visual_truncated,
+                omitted_line_count: rendered.omitted_line_count,
+                overlays,
+                trigger: Some(crate::tui_capture::TuiFrameTrigger {
+                    kind: "turn_completed".into(),
+                    step_index: None,
+                    key: None,
+                }),
+                transcript: Vec::new(),
+                status_text: Some(status_text),
+            };
+            writer.write(&tui_frame)?;
+        }
+        *self.wall_clock_seconds.lock().await = self.run_start.elapsed().as_secs();
         Ok(())
     }
 
