@@ -202,16 +202,14 @@ pub(crate) fn indicator_line(
         ButtonState::Collapsed
     };
     let hint = if overlay_open {
-        "click to close"
+        "Ctrl+X Q to close"
     } else if turn_running {
-        "click to reorder · Esc cancels current (queue keeps draining)"
+        "Ctrl+X Q to reorder · Esc cancels current (queue keeps draining)"
     } else {
-        "click to reorder"
+        "Ctrl+X Q to reorder"
     };
     let mut spans = button_spans(&format!("queued: {n}"), state);
     spans.push(Span::raw("  "));
     spans.push(Span::styled(hint, Style::default().fg(QUIET)));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled("(Ctrl+X Q)", Style::default().fg(QUIET)));
     Some(Line::from(spans))
 }
