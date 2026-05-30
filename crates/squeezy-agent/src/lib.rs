@@ -1715,6 +1715,14 @@ impl Agent {
         self.provider.name()
     }
 
+    /// Current per-language file counts from the workspace graph, or
+    /// `None` when the graph has not finished its initial open yet.
+    /// Cheap to poll (graph state is in-memory; opportunistically
+    /// refreshes only when the file watcher has queued changes).
+    pub fn current_language_report(&self) -> Option<squeezy_tools::LanguageReport> {
+        self.tools.current_language_report()
+    }
+
     pub fn session_mode(&self) -> SessionMode {
         load_session_mode(&self.session_mode)
     }

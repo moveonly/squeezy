@@ -7,7 +7,7 @@ use squeezy_core::{
 fn resolve_opus_alias_for_anthropic() {
     assert_eq!(
         resolve_model_alias("anthropic", "opus"),
-        Some(DEFAULT_ANTHROPIC_MODEL),
+        Some("claude-opus-4-7"),
     );
     assert_eq!(
         resolve_model_alias("anthropic", "OPUS"),
@@ -19,7 +19,7 @@ fn resolve_opus_alias_for_anthropic() {
     );
     assert_eq!(
         resolve_model_alias("anthropic", "sonnet"),
-        Some("claude-sonnet-4-6"),
+        Some(DEFAULT_ANTHROPIC_MODEL),
     );
     assert_eq!(
         resolve_model_alias("anthropic", "haiku"),

@@ -92,11 +92,16 @@ fn build_harness() -> TuiHarness {
 }
 
 #[test]
-fn harness_banner_uses_real_provider_name_not_eval_harness() {
-    let config = AppConfig {
+fn harness_status_line_uses_real_provider_name_not_eval_harness() {
+    // `model` / `languages` no longer appear in the startup banner —
+    // both are now status-line items so they stay live across config
+    // edits (inline scrollback can't be rewritten). The opt-in
+    // `provider-and-model` item carries the provider:model pair.
+    let mut config = AppConfig {
         model: "test-model".to_string(),
         ..AppConfig::default()
     };
+    config.tui.status_line = Some(vec!["provider-and-model".to_string()]);
     let provider: Arc<dyn LlmProvider> = Arc::new(NamedProvider("anthropic"));
     let mut harness = TuiHarness::new(config, SessionMode::default(), provider, 120, 36, None)
         .expect("build TuiHarness");
@@ -104,11 +109,11 @@ fn harness_banner_uses_real_provider_name_not_eval_harness() {
     let plain = snapshot.plain_text;
     assert!(
         plain.contains("anthropic:test-model"),
-        "expected banner to contain `anthropic:test-model`, frame was:\n{plain}"
+        "expected status line to contain `anthropic:test-model`, frame was:\n{plain}"
     );
     assert!(
         !plain.contains("eval-harness:"),
-        "banner still carries the harness literal `eval-harness:`; frame was:\n{plain}"
+        "rendering still carries the harness literal `eval-harness:`; frame was:\n{plain}"
     );
 }
 

@@ -639,6 +639,21 @@ async fn run_inner(
             apply_external_settings_reload(&mut app, &mut agent);
             app.needs_redraw = true;
         }
+        // Refresh the language-summary status item from the graph at
+        // the same cadence as the settings poll. The agent call is
+        // cheap when the file watcher hasn't queued changes (graph
+        // refresh is throttled by `idle_refresh_interval` = 15s) and
+        // only triggers a redraw when the rendered string actually
+        // changes, so idle workspaces pay no draw cost.
+        if app.animation_tick.is_multiple_of(settings_poll_every)
+            && let Some(report) = agent.current_language_report()
+        {
+            let next = format_language_report(&report);
+            if next != app.language_summary {
+                app.language_summary = next;
+                app.needs_redraw = true;
+            }
+        }
         // Only repaint when state actually changed (`needs_redraw`), a
         // resize is pending, or something visible is currently animating.
         // Skipping the draw on idle iterations stops the continuous
@@ -924,6 +939,8 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     set_shell_diff_inline(new_cfg.tui.shell_diff_inline);
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
+    app.provider_name = new_provider;
+    app.apply_config_change(&new_cfg);
     if old_provider == new_provider {
         agent.replace_config(new_cfg);
         app.app_notifications
@@ -3292,6 +3309,7 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     let mut next = agent.config_snapshot();
     next.reasoning_effort = next_effort;
     agent.replace_config(next);
+    app.reasoning_effort = next_effort;
     let label = next_effort.map_or_else(
         || "auto (model default)".to_string(),
         |e| e.as_str().to_string(),
@@ -5390,16 +5408,15 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
+    // `model` and `languages` are intentionally omitted: in inline mode
+    // the card lives in terminal scrollback and can't be rewritten, so
+    // both would freeze on a model change or filesystem edit. The live
+    // status line (`provider-and-model`, `reasoning-effort`, `languages`)
+    // is the source of truth for those instead.
     vec![
         startup_phase_strip(card_width, app.version),
         Line::from(""),
-        startup_meta_row(
-            "model",
-            format!("{}:{}", app.provider_name, app.model),
-            card_width,
-        ),
         startup_meta_row("directory", app.directory.clone(), card_width),
-        startup_meta_row("languages", app.language_summary.clone(), card_width),
     ]
 }
 
@@ -10432,6 +10449,37 @@ fn configured_language_summary(config: &AppConfig) -> String {
     }
 }
 
+/// Render a `LanguageReport` (live workspace file counts from the graph)
+/// into the same shape `startup_language_summary` in `squeezy-cli` uses
+/// at first paint, so the status-line value stays visually identical
+/// across the initial render and subsequent watcher-driven refreshes.
+/// Families are merged (jsx/tsx → JS/TS, c/cpp → C/C++) and sorted by
+/// display name; zero-count families are omitted.
+fn format_language_report(report: &squeezy_tools::LanguageReport) -> String {
+    let entries: [(&str, usize); 7] = [
+        ("C/C++", report.c_files + report.cpp_files),
+        ("C#", report.csharp_files),
+        ("Go", report.go_files),
+        ("Java", report.java_files),
+        (
+            "JS/TS",
+            report.javascript_files + report.jsx_files + report.typescript_files + report.tsx_files,
+        ),
+        ("Python", report.python_files),
+        ("Rust", report.rust_files),
+    ];
+    let pieces: Vec<String> = entries
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect();
+    if pieces.is_empty() {
+        "none".to_string()
+    } else {
+        pieces.join(", ")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PermissionStatus {
     read: String,
@@ -10485,6 +10533,11 @@ pub(crate) struct TuiApp {
     pub(crate) provider_name: &'static str,
     pub(crate) version: &'static str,
     pub(crate) model: String,
+    /// Mirror of `AppConfig::reasoning_effort`. `None` means "let the
+    /// model choose"; the status-line `reasoning-effort` item hides
+    /// itself in that case and shows the level (`low`, `medium`, …)
+    /// when the user has set one explicitly.
+    pub(crate) reasoning_effort: Option<squeezy_core::ReasoningEffort>,
     pub(crate) directory: String,
     pub(crate) language_summary: String,
     pub(crate) mode: SessionMode,
@@ -10905,6 +10958,7 @@ impl TuiApp {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort,
             directory: compact_path(&config.workspace_root),
             language_summary: if startup.languages.trim().is_empty() {
                 configured_language_summary(config)
@@ -11033,6 +11087,40 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             settings_path_override: None,
+        }
+    }
+
+    /// Mirror every config-derived field the status line and header
+    /// read so external `settings.toml` edits surface live in the
+    /// running TUI without a restart. Runtime-only fields (transcript,
+    /// turn state, repo polling) are deliberately left alone — they
+    /// are owned by the session, not the config tier.
+    pub(crate) fn apply_config_change(&mut self, config: &AppConfig) {
+        self.model = config.model.clone();
+        self.reasoning_effort = config.reasoning_effort;
+        self.directory = compact_path(&config.workspace_root);
+        self.workspace_root = config.workspace_root.clone();
+        self.config_sources = config.config_source_labels().join(",");
+        self.status_verbosity = config.tui.status_verbosity;
+        self.response_verbosity = config.tui.response_verbosity;
+        self.tool_output_verbosity = config.tui.tool_output_verbosity;
+        self.transcript_default = config.tui.transcript_default;
+        self.show_reasoning_usage = config.tui.show_reasoning_usage;
+        self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
+        self.permissions = PermissionStatus::from_policy(&config.permissions);
+        self.telemetry = TelemetryStatus::from_config(&config.telemetry);
+        self.context_compaction_threshold = config.context_compaction.estimated_tokens;
+        self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
+        self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
+        self.status_line_use_colors = config.tui.status_line_use_colors;
+        self.animation_tick_rate = config.tick_rate;
+        // Languages only refresh from config when no filesystem
+        // detection populated them (the fallback path). Filesystem
+        // counts are owned by the startup walk and shouldn't be
+        // clobbered by a settings reload.
+        let summary = self.language_summary.trim();
+        if summary.is_empty() || summary == "none" {
+            self.language_summary = configured_language_summary(config);
         }
     }
 

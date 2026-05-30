@@ -562,8 +562,11 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
 /// budget that would 400 every turn.
 #[test]
 fn request_body_omits_thinking_when_max_output_tokens_below_1024_floor() {
+    // Use a non-adaptive model: the budget-floor logic only runs on the
+    // explicit-budget path; sonnet/opus 4.6+ go through adaptive thinking
+    // (no budget_tokens, no floor) and would skip this assertion.
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        model: "claude-haiku-4-5-20251001".to_string().into(),
         instructions: "be brief".to_string().into(),
         input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(256),
@@ -597,7 +600,8 @@ fn request_body_omits_thinking_when_max_output_tokens_below_1024_floor() {
 #[test]
 fn request_body_emits_thinking_clamped_to_max_output_minus_reply_headroom() {
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        // Non-adaptive model so the explicit-budget clamp logic runs.
+        model: "claude-haiku-4-5-20251001".to_string().into(),
         instructions: "be brief".to_string().into(),
         input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         // Tight output cap: clears the 2048 gate but smaller than the
@@ -630,6 +634,104 @@ fn request_body_emits_thinking_clamped_to_max_output_minus_reply_headroom() {
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert_eq!(body["thinking"]["budget_tokens"], 4_096);
+}
+
+#[test]
+fn model_uses_adaptive_thinking_covers_4_6_and_later_opus_and_sonnet() {
+    // 4.6+ opus/sonnet must opt in, including unreleased versions
+    // (forward-compat: a new opus-4-8 / sonnet-5-0 shouldn't need a
+    // squeezy update to pick the right wire shape).
+    for model in [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5-0",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5-2",
+        "anthropic/claude-opus-4-7",
+    ] {
+        assert!(model_uses_adaptive_thinking(model), "{model}");
+    }
+
+    // Pre-4.6 opus/sonnet and haiku (any version) must keep the
+    // explicit-budget shape.
+    for model in [
+        "claude-opus-4-5",
+        "claude-opus-3-5",
+        "claude-sonnet-4-5",
+        "claude-sonnet-3-7",
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-5-0",
+    ] {
+        assert!(!model_uses_adaptive_thinking(model), "{model}");
+    }
+}
+
+#[test]
+fn request_body_uses_adaptive_thinking_for_claude_4_6_and_4_7() {
+    use squeezy_core::ReasoningEffort;
+
+    for (model, effort, label) in [
+        ("claude-opus-4-7", ReasoningEffort::High, "high"),
+        ("claude-sonnet-4-6", ReasoningEffort::Medium, "medium"),
+        ("claude-opus-4-7", ReasoningEffort::XHigh, "max"),
+    ] {
+        let request = LlmRequest {
+            model: model.to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+            max_output_tokens: Some(32_000),
+            response_verbosity: None,
+            reasoning_effort: Some(effort),
+            previous_response_id: None,
+            cache_key: None,
+            cache: CacheSpec::default(),
+            tools: Arc::from(Vec::new()),
+            store: false,
+            tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
+        };
+
+        let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+        assert_eq!(body["thinking"]["type"], "adaptive", "{model} {effort:?}");
+        assert!(
+            body["thinking"].get("budget_tokens").is_none(),
+            "adaptive thinking must not carry budget_tokens ({model})"
+        );
+        assert_eq!(body["output_config"]["effort"], label, "{model} {effort:?}");
+    }
+}
+
+#[test]
+fn request_body_keeps_enabled_thinking_for_legacy_anthropic_models() {
+    use squeezy_core::ReasoningEffort;
+
+    let request = LlmRequest {
+        model: "claude-haiku-4-5-20251001".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(64_000),
+        response_verbosity: None,
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert!(body["thinking"]["budget_tokens"].is_number());
+    assert!(body.get("output_config").is_none());
 }
 
 #[test]
