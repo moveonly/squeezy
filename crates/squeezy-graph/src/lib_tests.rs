@@ -3908,6 +3908,70 @@ fn main() {
 }
 
 #[test]
+fn references_to_symbol_finds_cpp_namespace_qualified_call_through_include() {
+    // C++ A/B finding: spdlog `pattern_formatter-inl.h` calls
+    // `details::os::localtime(0)` through an `#include` of
+    // `spdlog/details/os-inl.h`. The graph used to silently miss this
+    // site for two reasons: (1) parser misnamed the function (a stale
+    // suspicion this test guards against — actual extracted name must
+    // be just `localtime`, not `tm localtime` or similar); (2)
+    // namespace-qualified call binding chain didn't bind the receiver
+    // chain `details::os` to a workspace symbol. Both ride on the
+    // earlier reference-binding fix that fell through when the
+    // `call_edge_for_reference` returns an unresolved edge.
+    let mut parser = LanguageParser::new().unwrap();
+    let header = cpp_record(
+        "include/spdlog/details/os-inl.h",
+        r#"
+#include <ctime>
+namespace spdlog { namespace details { namespace os {
+inline std::tm localtime(const std::time_t &time_tt) {
+    std::tm out{};
+    return out;
+}
+} } }
+"#,
+    );
+    let caller = cpp_record(
+        "include/spdlog/pattern_formatter-inl.h",
+        r#"
+#include "spdlog/details/os-inl.h"
+namespace spdlog {
+class pattern_formatter {
+public:
+    std::tm get_time_() const { return details::os::localtime(0); }
+};
+}
+"#,
+    );
+    let parsed = [header, caller]
+        .into_iter()
+        .map(|r| {
+            let source = fs::read_to_string(&r.path).unwrap();
+            parser.parse_source(&r, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let localtime = graph
+        .find_symbol_by_name("localtime")
+        .into_iter()
+        .find(|s| s.kind == SymbolKind::Function && s.body_span.is_some())
+        .expect("`localtime` (NOT `tm localtime`) must be indexed as a Function");
+    let hits = graph.references_to_symbol(&localtime.id);
+    assert!(
+        hits.iter().any(
+            |hit| hit.reference.file_id.0 == "include/spdlog/pattern_formatter-inl.h"
+                && hit.reference.text.contains("localtime")
+        ),
+        "expected `details::os::localtime(0)` site in pattern_formatter-inl.h to \
+         surface, got {:?}",
+        hits.iter()
+            .map(|h| (h.reference.file_id.0.clone(), h.reference.text.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
 fn references_to_symbol_finds_go_cross_package_qualified_call() {
     // Go A/B finding: cobra's `doc/*.go` files import
     // `"github.com/spf13/cobra"` and call `cmd.VisitParents(...)` on

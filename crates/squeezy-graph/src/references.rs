@@ -122,6 +122,9 @@ impl SemanticGraph {
         if self.go_cross_package_method_match(symbol, reference) {
             return Some(Confidence::Heuristic);
         }
+        if self.c_family_namespace_qualified_callable_match(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if !self.reference_is_in_symbol_package(symbol, reference) {
             return None;
         }
@@ -509,6 +512,176 @@ impl SemanticGraph {
             }
         }
         symbol_seen && count == 1
+    }
+
+    /// Bind C/C++ namespace-qualified function calls like
+    /// `details::os::localtime(...)`. The reference text after the
+    /// tree-sitter `Path`-kind reduction is just `localtime`; the
+    /// scope qualifier `details::os` sits in the source bytes
+    /// preceding the reference span. Tail-match those scope segments
+    /// against the symbol's enclosing-module chain (Squeezy stores
+    /// C++ namespaces as `SymbolKind::Module` ancestors) and bind
+    /// when the symbol is the unique callable of its name under that
+    /// namespace.
+    ///
+    /// Mirrors [`Self::self_crate_qualified_callable_matches`] but
+    /// keys off the namespace chain rather than the Rust crate
+    /// underscore alias.
+    pub(crate) fn c_family_namespace_qualified_callable_match(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+        ) {
+            return false;
+        }
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        if !matches!(reference_file.language, LanguageKind::C | LanguageKind::Cpp) {
+            return false;
+        }
+        if !matches!(symbol_file.language, LanguageKind::C | LanguageKind::Cpp) {
+            return false;
+        }
+        // Reference text must match the symbol's bare name (or its
+        // leaf when the parser produced a longer path).
+        if reference.text != symbol.name && last_path_segment(&reference.text) != symbol.name {
+            return false;
+        }
+        // Scope qualifier — what `details::os::` would look like
+        // immediately before the reference start in the source.
+        let Some(scope_prefix) = self.reference_source_scope_prefix(reference) else {
+            return false;
+        };
+        let scope_segments: Vec<String> = scope_prefix
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+        if scope_segments.is_empty() {
+            return false;
+        }
+        // Symbol's enclosing namespace chain (innermost last).
+        let symbol_namespaces = self.namespace_chain_for_symbol(symbol);
+        if symbol_namespaces.is_empty() {
+            return false;
+        }
+        // The scope tail must equal a suffix of the symbol's
+        // namespace chain.
+        if scope_segments.len() > symbol_namespaces.len() {
+            return false;
+        }
+        let tail_start = symbol_namespaces.len() - scope_segments.len();
+        if symbol_namespaces[tail_start..] != scope_segments[..] {
+            return false;
+        }
+        // Conservatism: the symbol must be the unique workspace
+        // candidate of its name living under the same namespace tail.
+        let mut count = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if !matches!(candidate_file.language, LanguageKind::C | LanguageKind::Cpp) {
+                continue;
+            }
+            let candidate_ns = self.namespace_chain_for_symbol(candidate);
+            if candidate_ns.len() < scope_segments.len() {
+                continue;
+            }
+            let candidate_tail_start = candidate_ns.len() - scope_segments.len();
+            if candidate_ns[candidate_tail_start..] != scope_segments[..] {
+                continue;
+            }
+            count += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if count > 1 {
+                return false;
+            }
+        }
+        symbol_seen && count == 1
+    }
+
+    /// Walk a symbol's parent chain collecting consecutive
+    /// `SymbolKind::Module` parents. Outermost namespace first,
+    /// innermost last.
+    fn namespace_chain_for_symbol(&self, symbol: &GraphSymbol) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut current = symbol.parent_id.clone();
+        while let Some(id) = current {
+            let Some(parent) = self.symbols.get(&id) else {
+                break;
+            };
+            if parent.kind != SymbolKind::Module {
+                break;
+            }
+            chain.push(parent.name.clone());
+            current = parent.parent_id.clone();
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Read the raw `::`-delimited scope qualifier sitting in the
+    /// source bytes immediately before `reference`. Returns the
+    /// qualifier with trailing `::` stripped, or `None` when no scope
+    /// is present. The qualifier may contain multiple `::` segments
+    /// (e.g. `details::os` for `details::os::localtime`).
+    fn reference_source_scope_prefix(&self, reference: &ParsedReference) -> Option<String> {
+        let file = self.files.get(&reference.file_id)?;
+        let source = std::fs::read_to_string(&file.path).ok()?;
+        // First try the source bytes COVERED BY the reference span.
+        // Some parsers (e.g. tree-sitter-cpp for `scoped_identifier`)
+        // keep the full qualified path in the span while reducing
+        // `reference.text` to just the leaf identifier; the qualifier
+        // then lives inside the span, not before it.
+        if let Some(span_text) =
+            source.get(reference.span.start_byte as usize..reference.span.end_byte as usize)
+            && span_text.contains("::")
+            && let Some((qualifier, _)) = span_text.trim().rsplit_once("::")
+        {
+            let qualifier = qualifier.trim();
+            if !qualifier.is_empty() {
+                return Some(qualifier.to_string());
+            }
+        }
+        // Fallback: walk backward from the reference start byte and
+        // pick up an identifier/`::` chain immediately preceding it.
+        // Covers the `Foo.Bar` (dot-style) and Rust `crate::Bar`
+        // qualified shapes.
+        let prefix = source.get(..reference.span.start_byte as usize)?;
+        let scope = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let scope = scope.trim_end_matches("::");
+        if scope.is_empty() {
+            return None;
+        }
+        Some(scope.to_string())
     }
 
     /// For a bare-identifier reference whose enclosing file contains

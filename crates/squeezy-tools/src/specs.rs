@@ -237,7 +237,6 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "diff_only": {"type": "boolean", "description": "When true, search only files changed in the current Git worktree diff. Default false."},
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_FILES},
-                "max_bytes_per_file": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_BYTES_PER_FILE},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
