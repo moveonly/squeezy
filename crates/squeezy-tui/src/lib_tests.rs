@@ -5886,7 +5886,7 @@ async fn slash_pin_pins_and_unpins_transcript_context() {
 }
 
 #[tokio::test]
-async fn slash_feedback_previews_redacted_message_before_send() {
+async fn slash_feedback_previews_redacted_message_and_prompts_for_decision() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
@@ -5899,7 +5899,7 @@ async fn slash_feedback_previews_redacted_message_before_send() {
         .await
     );
 
-    assert_eq!(app.status, "feedback preview ready");
+    assert_eq!(app.status, "feedback ready: Enter send · Esc discard");
     assert!(app.pending_feedback.is_some());
     let TranscriptEntryKind::Message(item) = &app.transcript.last().expect("preview").kind else {
         panic!("feedback preview should be a message entry");
@@ -5908,7 +5908,35 @@ async fn slash_feedback_previews_redacted_message_before_send() {
     assert!(preview.contains("feedback preview"), "{preview}");
     assert!(preview.contains("<redacted:"), "{preview}");
     assert!(!preview.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
-    assert!(preview.contains("/feedback send"));
+    assert!(
+        preview.contains("Press Enter to send or Esc to discard."),
+        "{preview}"
+    );
+
+    let output = render_to_string(&app, 100, 24);
+    assert!(output.contains("Send feedback?"), "{output}");
+    assert!(output.contains("Enter/Y Send"), "{output}");
+    assert!(output.contains("Esc/N Discard"), "{output}");
+}
+
+#[tokio::test]
+async fn slash_feedback_escape_discards_pending_preview() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/feedback too much ceremony").await);
+    assert!(app.pending_feedback.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+    )
+    .await
+    .expect("handle feedback discard");
+
+    assert!(app.pending_feedback.is_none());
+    assert_eq!(app.status, "feedback discarded");
 }
 
 #[tokio::test]
@@ -8564,6 +8592,29 @@ fn slash_parameter_hint_appears_in_render() {
         output.contains("concise|normal|verbose"),
         "expected parameter hint to render the response-verbosity options actually accepted \
          by `/verbosity`: {output}"
+    );
+}
+
+#[test]
+fn slash_parameter_hint_uses_cyan_style() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/attach".to_string());
+
+    let lines = slash_suggestion_lines(&app);
+    let attach_line = lines
+        .iter()
+        .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
+        .expect("attach suggestion line");
+    let hint_span = attach_line
+        .spans
+        .iter()
+        .find(|span| span.content.trim() == "<path>")
+        .expect("attach parameter hint span");
+
+    assert_eq!(
+        hint_span.style.fg,
+        Some(crate::render::palette::ACCENT_CYAN),
+        "parameter hints should render in cyan"
     );
 }
 

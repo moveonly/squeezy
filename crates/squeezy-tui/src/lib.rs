@@ -818,6 +818,37 @@ async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
     true
 }
 
+async fn handle_feedback_prompt_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> bool {
+    if app.pending_feedback.is_none() {
+        return false;
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return true;
+    }
+    match key.code {
+        KeyCode::Enter
+        | KeyCode::Char('y')
+        | KeyCode::Char('Y')
+        | KeyCode::Char('s')
+        | KeyCode::Char('S') => {
+            submit_pending_feedback(app, agent).await;
+            true
+        }
+        KeyCode::Esc
+        | KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('d')
+        | KeyCode::Char('D') => {
+            discard_pending_feedback(app);
+            true
+        }
+        _ => true,
+    }
+}
+
 async fn apply_plan_choice(
     app: &mut TuiApp,
     agent: &mut Agent,
@@ -999,6 +1030,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
         || app.pending_plan_choice.is_some()
+        || app.pending_feedback.is_some()
         || app.config_screen.is_some()
         || app.status_line_setup.is_some()
         || app.overlay.is_some()
@@ -1388,6 +1420,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if handle_plan_choice_key(app, agent, key).await {
+        return Ok(false);
+    }
+
+    if handle_feedback_prompt_key(app, agent, key).await {
         return Ok(false);
     }
 
@@ -2900,48 +2936,55 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
 async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     match rest {
         "send" => {
-            let Some(feedback) = app.pending_feedback.take() else {
-                app.status = "no feedback pending".to_string();
-                return;
-            };
-            match agent.submit_feedback(&feedback).await {
-                Ok(result) => {
-                    app.status = format!("feedback sent {}", result.id);
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "feedback sent\nfeedback_id={}",
-                        result.id
-                    )));
-                }
-                Err(error) => {
-                    app.pending_feedback = Some(feedback);
-                    app.status = format!("feedback send failed: {error}");
-                }
-            }
+            submit_pending_feedback(app, agent).await;
         }
         "cancel" => {
-            app.pending_feedback = None;
-            app.status = "feedback cancelled".to_string();
+            discard_pending_feedback(app);
         }
         "" => {
-            app.status =
-                "usage: /feedback <what happened> | /feedback send | /feedback cancel".to_string();
+            app.status = "usage: /feedback <what happened>".to_string();
         }
         message => match agent.prepare_feedback(message) {
             Ok(feedback) => {
                 let preview = format!(
-                    "feedback preview\nfeedback_id={}\nbytes={} redactions={}\n\n{}\n\nRun /feedback send to submit or /feedback cancel.",
+                    "feedback preview\nfeedback_id={}\nbytes={} redactions={}\n\n{}\n\nPress Enter to send or Esc to discard.",
                     feedback.feedback_id,
                     feedback.message_bytes,
                     feedback.redactions,
                     feedback.message
                 );
                 app.pending_feedback = Some(feedback);
-                app.status = "feedback preview ready".to_string();
+                app.status = "feedback ready: Enter send · Esc discard".to_string();
                 app.push_transcript_item(TranscriptItem::system(preview));
             }
             Err(error) => app.status = format!("feedback preview failed: {error}"),
         },
     }
+}
+
+async fn submit_pending_feedback(app: &mut TuiApp, agent: &Agent) {
+    let Some(feedback) = app.pending_feedback.take() else {
+        app.status = "no feedback pending".to_string();
+        return;
+    };
+    match agent.submit_feedback(&feedback).await {
+        Ok(result) => {
+            app.status = format!("feedback sent {}", result.id);
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "feedback sent\nfeedback_id={}",
+                result.id
+            )));
+        }
+        Err(error) => {
+            app.pending_feedback = Some(feedback);
+            app.status = format!("feedback send failed: {error}");
+        }
+    }
+}
+
+fn discard_pending_feedback(app: &mut TuiApp) {
+    app.pending_feedback = None;
+    app.status = "feedback discarded".to_string();
 }
 
 async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
@@ -3633,7 +3676,8 @@ fn switch_mode(
         && (app.turn_rx.is_some()
             || app.pending_approval.is_some()
             || app.pending_mcp_elicitation.is_some()
-            || app.pending_request_user_input.is_some())
+            || app.pending_request_user_input.is_some()
+            || app.pending_feedback.is_some())
     {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
@@ -4256,6 +4300,33 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         ]));
     }
     lines
+}
+
+fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "Send feedback?",
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}", feedback.feedback_id),
+                Style::default().fg(QUIET),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                compact_text(&feedback.message, 160),
+                Style::default().fg(palette::muted_fg()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("› Enter/Y Send", Style::default().fg(GOLD)),
+            Span::styled(" · ", Style::default().fg(QUIET)),
+            Span::styled("Esc/N Discard", Style::default().fg(palette::muted_fg())),
+        ]),
+    ]
 }
 
 fn format_request_user_input_menu_lines(
@@ -5030,6 +5101,8 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
         )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         visual_line_count(&format_plan_choice_menu_lines(pending), width)
+    } else if let Some(feedback) = app.pending_feedback.as_ref() {
+        visual_line_count(&format_feedback_prompt_lines(feedback), width)
     } else {
         0
     }
@@ -5059,6 +5132,8 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
         )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         format_plan_choice_menu_lines(pending)
+    } else if let Some(feedback) = app.pending_feedback.as_ref() {
+        format_feedback_prompt_lines(feedback)
     } else {
         Vec::new()
     }
@@ -9546,8 +9621,8 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 spans.push(Span::styled(
                     hint_text,
                     Style::default()
-                        .fg(QUIET)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                        .fg(palette::ACCENT_CYAN)
+                        .add_modifier(Modifier::ITALIC),
                 ));
             }
             let badges = command.capability_badges();
@@ -10020,6 +10095,8 @@ fn format_status_hint_base(app: &TuiApp) -> String {
     } else if app.pending_approval.is_some() {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
+    } else if app.pending_feedback.is_some() {
+        return "Enter/Y send feedback · Esc/N discard".to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
             "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",

@@ -198,7 +198,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash_args("/unpin", "remove pinned context", false, "<id>"),
     slash_caps(
         "/feedback",
-        "preview or send product feedback",
+        "preview feedback and ask to send",
         true,
         &[PermissionCapability::Network],
     ),
