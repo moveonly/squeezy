@@ -9280,10 +9280,6 @@ pub struct TranscriptItem {
     pub cancelled: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 impl TranscriptItem {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
