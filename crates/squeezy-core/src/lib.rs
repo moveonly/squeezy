@@ -9272,6 +9272,16 @@ pub struct TranscriptItem {
     /// `large_enum_variant` threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Box<ReasoningSnapshot>>,
+    /// Set on assistant messages whose turn was cancelled mid-stream. The
+    /// `content` is the partial text that was streamed before the user
+    /// pressed Esc; downstream renderers append a `(cancelled)` marker so
+    /// the next turn (and `/diff`/`/undo`) can reference the cut-off work.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancelled: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TranscriptItem {
@@ -9280,6 +9290,7 @@ impl TranscriptItem {
             role: Role::User,
             content: content.into(),
             reasoning: None,
+            cancelled: false,
         }
     }
 
@@ -9288,6 +9299,7 @@ impl TranscriptItem {
             role: Role::Assistant,
             content: content.into(),
             reasoning: None,
+            cancelled: false,
         }
     }
 
@@ -9299,6 +9311,19 @@ impl TranscriptItem {
             role: Role::Assistant,
             content: content.into(),
             reasoning: reasoning.map(Box::new),
+            cancelled: false,
+        }
+    }
+
+    /// Builds an assistant transcript item from a turn that was cancelled
+    /// mid-stream. The `content` is whatever streamed before the cancel —
+    /// possibly empty if the model never started producing text.
+    pub fn assistant_cancelled(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            reasoning: None,
+            cancelled: true,
         }
     }
 
@@ -9307,6 +9332,7 @@ impl TranscriptItem {
             role: Role::System,
             content: content.into(),
             reasoning: None,
+            cancelled: false,
         }
     }
 }

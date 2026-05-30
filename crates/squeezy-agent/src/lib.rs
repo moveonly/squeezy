@@ -5060,6 +5060,21 @@ impl TurnRuntime {
                     .await?
             {
                 if self.cancel.is_cancelled() {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    let partial = std::mem::take(&mut assistant_message);
+                    self.preserve_partial_assistant_on_cancel(
+                        partial,
+                        &mut conversation,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await;
                     self.finish_cancelled_turn(
                         &task_title,
                         &total_cost,
@@ -5233,6 +5248,21 @@ impl TurnRuntime {
                         break;
                     }
                     LlmEvent::Cancelled => {
+                        if let Some(tail) = self
+                            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                            .await
+                        {
+                            self.record_replay_model_text_delta(&tail);
+                        }
+                        broker.metrics.redactions += assistant_stream.total_redactions();
+                        let partial = std::mem::take(&mut assistant_message);
+                        self.preserve_partial_assistant_on_cancel(
+                            partial,
+                            &mut conversation,
+                            user_transcript.clone(),
+                            context_compaction.clone(),
+                        )
+                        .await;
                         self.finish_cancelled_turn(
                             &task_title,
                             &total_cost,
@@ -6014,6 +6044,45 @@ impl TurnRuntime {
                 turn_id: self.turn_id,
             })
             .await;
+    }
+
+    /// Mirror the success path's conversation/transcript push for a turn
+    /// that was cancelled mid-stream. Without this, the partial assistant
+    /// text accumulated from `AgentEvent::AssistantDelta` goes out of
+    /// scope when the cancel branch returns — leaving the next turn (and
+    /// `/diff`/`/undo`) with no in-conversation evidence that anything
+    /// was cancelled.
+    ///
+    /// The partial text is pushed even when empty (the model may have
+    /// been cancelled before producing any visible content) so the
+    /// transcript carries a `(cancelled)` marker either way; the
+    /// conversation buffer skips the push when the text is empty so we
+    /// do not stuff an empty assistant turn into the provider prompt.
+    async fn preserve_partial_assistant_on_cancel(
+        &self,
+        partial_assistant_text: String,
+        conversation: &mut Vec<LlmInputItem>,
+        user_transcript: TranscriptItem,
+        context_compaction: ContextCompactionState,
+    ) {
+        if !partial_assistant_text.is_empty() {
+            conversation.push(redact_input_item(
+                LlmInputItem::AssistantText(partial_assistant_text.clone()),
+                &self.redactor,
+            ));
+        }
+        let assistant = TranscriptItem::assistant_cancelled(plan_mode::strip_proposed_plan_blocks(
+            &partial_assistant_text,
+        ));
+        let mut state = self.conversation_state.lock().await;
+        state.conversation = conversation.clone();
+        // `previous_response_id` is left alone: the provider-side response
+        // chain must not jump past a turn we never persisted as completed.
+        state.transcript.push(user_transcript);
+        state.transcript.push(assistant);
+        let mut merged_compaction = context_compaction;
+        merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
+        state.context_compaction = merged_compaction;
     }
 
     async fn current_task_summary(&self) -> Option<String> {

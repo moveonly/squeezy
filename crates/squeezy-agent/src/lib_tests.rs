@@ -327,6 +327,77 @@ async fn llm_stream_observes_cancellation_within_one_yield() {
 }
 
 #[tokio::test]
+async fn cancel_preserves_partial_assistant_text_in_conversation_state() {
+    // Streaming cancel: the model streams a few text deltas, then the
+    // provider raises `LlmEvent::Cancelled` (the synthesised event the
+    // turn runner emits when the cancel token tripped mid-stream). The
+    // partial assistant text accumulated from `AgentEvent::AssistantDelta`
+    // must land in `conversation_state.conversation` so the next turn's
+    // prompt assembly can reference it, and a `cancelled = true`
+    // transcript item must mirror it on the display/persistence path so
+    // `(cancelled)` markers and `/diff`/`/undo` can see what was streamed
+    // before the user pressed Esc. Wave-2-11 eval bug squeezy-3hr4.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("1. Add tests\n".to_string())),
+        Ok(LlmEvent::TextDelta("2. Wire fix\n".to_string())),
+        Ok(LlmEvent::TextDelta("3. Land it\n".to_string())),
+        Ok(LlmEvent::Cancelled),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("draft a plan".to_string(), CancellationToken::new());
+    let mut saw_cancelled = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Cancelled { .. } => saw_cancelled = true,
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_cancelled,
+        "cancel branch must emit AgentEvent::Cancelled"
+    );
+
+    let state = agent.conversation_state.lock().await;
+    let partial = "1. Add tests\n2. Wire fix\n3. Land it\n";
+
+    // Conversation slice: the next turn's prompt assembly must see the
+    // user message AND the partial assistant text. Without the fix the
+    // assistant item is silently dropped (only the user item remains).
+    let assistant_in_conversation = state
+        .conversation
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_in_conversation,
+        vec![partial],
+        "partial assistant text must be pushed onto `conversation_state.conversation` on cancel; \
+         next turn's prompt build assembles the wire request from this slice"
+    );
+
+    // Transcript: the display/persistence side carries the partial text
+    // tagged `cancelled = true` so renderers can append a `(cancelled)`
+    // marker and `/undo`/`/diff` can find the cut-off turn.
+    let cancelled_assistant = state
+        .transcript
+        .iter()
+        .find(|item| item.role == squeezy_core::Role::Assistant)
+        .expect("transcript must record the cancelled assistant turn");
+    assert_eq!(cancelled_assistant.content, partial);
+    assert!(
+        cancelled_assistant.cancelled,
+        "cancelled assistant transcript item must carry the `cancelled` flag so renderers \
+         can mark it (cancelled) and the next turn can reference it"
+    );
+}
+
+#[tokio::test]
 async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let root = temp_workspace("task_state_session");
     let provider = Arc::new(MockProvider::new(vec![
