@@ -4295,7 +4295,7 @@ fn format_mcp_elicitation_menu_lines(
         let label_style = if is_selected {
             Style::default().fg(GOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -4420,7 +4420,7 @@ fn format_request_user_input_menu_lines(
     if request.allow_freeform {
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
-        let entry_style = Style::default().fg(Color::White);
+        let entry_style = Style::default().fg(palette::muted_fg());
         let label_style = Style::default().fg(Color::Indexed(33));
         let cursor_style = Style::default().fg(Color::Black).bg(Color::Indexed(33));
         let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
@@ -4633,7 +4633,10 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(current.message.as_str(), Style::default().fg(Color::White)),
+        Span::styled(
+            current.message.as_str(),
+            Style::default().fg(palette::muted_fg()),
+        ),
     ];
     if let Some(hint) = current.action_hint {
         spans.push(Span::raw("  "));

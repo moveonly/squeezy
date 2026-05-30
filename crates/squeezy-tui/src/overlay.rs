@@ -13,11 +13,12 @@
 
 #![allow(dead_code)]
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use squeezy_core::{ResponseVerbosity, ToolOutputVerbosity};
 use squeezy_llm::{MODEL_REGISTRY, ModelInfo};
 
+use crate::render::palette;
 use crate::{AMBER, GOLD, QUIET};
 
 #[derive(Debug, Clone)]
@@ -241,7 +242,7 @@ impl<T> SelectOverlay<T> {
                 let style = if is_selected {
                     Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(palette::muted_fg())
                 };
                 Line::from(vec![
                     Span::styled(
