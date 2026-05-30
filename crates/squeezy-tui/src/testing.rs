@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub use crossterm::event::KeyEvent;
 use crossterm::event::{KeyEventKind, KeyEventState};
 use ratatui::{Terminal, backend::TestBackend};
-use squeezy_agent::Agent;
+use squeezy_agent::{Agent, ToolApprovalDecision};
 use squeezy_core::{AppConfig, Result, SessionMode, SqueezyError};
 use squeezy_llm::LlmProvider;
 
@@ -93,6 +93,14 @@ impl TuiHarness {
     /// `drain_pending_diff`) until no turn is active and the prompt
     /// queue is empty. Bounded so a stuck channel surfaces as an error
     /// rather than hanging the calling scenario.
+    ///
+    /// "Idle" includes any open operator-input modal: a parked
+    /// `pending_approval`, `pending_mcp_elicitation`, or
+    /// `pending_request_user_input` is the agent waiting on the
+    /// scenario driver, not a deadlock. Returning early lets the driver
+    /// drain its queued `Approve`/`Deny`/`RespondElicitation`/
+    /// `RespondUserInput` action and feed the response back through
+    /// the matching `respond_*` method before pumping again.
     pub async fn pump_until_idle(&mut self) -> Result<()> {
         // Bounded by wall clock, not iterations: a real LLM turn can
         // sit between deltas for seconds. `try_recv` returns
@@ -121,6 +129,12 @@ impl TuiHarness {
                 false
             };
             drain_pending_diff(&mut self.app);
+            let waiting_on_operator = self.app.pending_approval.is_some()
+                || self.app.pending_mcp_elicitation.is_some()
+                || self.app.pending_request_user_input.is_some();
+            if waiting_on_operator {
+                return Ok(());
+            }
             if !queued && self.app.turn_rx.is_none() && self.app.prompt_queue.is_empty() {
                 return Ok(());
             }
@@ -133,6 +147,54 @@ impl TuiHarness {
             // progress; 10 ms balances latency against CPU spin.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// True iff the agent is parked on a `pending_approval` slot —
+    /// the harness needs the scenario driver to issue an
+    /// `Approve`/`Deny` (routed through `respond_approval` /
+    /// `respond_deny`) before the next pump can make progress.
+    pub fn has_pending_approval(&self) -> bool {
+        self.app.pending_approval.is_some()
+    }
+
+    /// Name of the tool the agent is waiting approval for, if any.
+    /// Exposed so the eval driver can match a queued
+    /// `Action::Approve { match: { tool } }` against the live
+    /// request without peeking at private TuiApp state.
+    pub fn pending_approval_tool(&self) -> Option<&str> {
+        self.app
+            .pending_approval
+            .as_ref()
+            .map(|p| p.request.tool_name.as_str())
+    }
+
+    /// Approve the currently-parked approval request with the same
+    /// `ToolApprovalDecision::Approved` the non-drive_tui driver
+    /// emits from `Driver::decide_approval`. Returns true when a slot
+    /// was actually consumed; false if nothing was pending so the
+    /// caller can record an `unfired` outcome instead of silently
+    /// pretending it worked.
+    pub fn respond_approval(&mut self) -> bool {
+        let Some(pending) = self.app.pending_approval.take() else {
+            return false;
+        };
+        let tool = pending.request.tool_name.clone();
+        let _ = pending.decision_tx.send(ToolApprovalDecision::Approved);
+        self.app.status = format!("approved {tool}");
+        true
+    }
+
+    /// Deny the currently-parked approval request with
+    /// `ToolApprovalDecision::Denied`. Mirrors `respond_approval`'s
+    /// return contract: true when a slot was consumed.
+    pub fn respond_deny(&mut self) -> bool {
+        let Some(pending) = self.app.pending_approval.take() else {
+            return false;
+        };
+        let tool = pending.request.tool_name.clone();
+        let _ = pending.decision_tx.send(ToolApprovalDecision::Denied);
+        self.app.status = format!("denied {tool}");
+        true
     }
 
     /// Inject a single key event at `handle_key`. Drains both before
@@ -320,3 +382,7 @@ impl Clipboard for NoopClipboard {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "testing_tests.rs"]
+mod tests;
