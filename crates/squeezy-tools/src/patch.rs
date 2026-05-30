@@ -162,13 +162,32 @@ pub(crate) const APPROVAL_DIFF_MAX_LINES: usize = 40;
 /// Render the `apply_patch` arguments as a unified-diff blob suitable for
 /// the approval preview's gutter+syntax-highlighted renderer.
 ///
-/// The blob is a synthesised view: each search/replace pair becomes a
-/// hunk with `-` lines for the old text and `+` lines for the new text;
-/// `create_file` operations show as all-add; `delete_file` as all-delete;
-/// `move_file` becomes a header. The hunk header carries `1` for both
-/// sides because we have no real file state at approval time — the
-/// renderer's gutter still prints sequential numbers that mark *position
-/// within the proposed patch*, which is what the reviewer needs.
+/// The blob is a synthesised view of what the model is asking us to do,
+/// with one section per patch / operation. Section headers mirror the
+/// canonical unified-diff shape produced by [`build_unified_diff`] so that
+/// the renderer can distinguish create / delete / move from in-place
+/// edits:
+///
+/// * `search_replace` → `--- a/<path>` / `+++ b/<path>` / `@@ -1 +1 @@` +
+///   `-old` / `+new` body lines.
+/// * `create_file`    → `--- /dev/null` / `+++ b/<path>` /
+///   `@@ -0,0 +1,N @@` + `+new` body lines (N = total file line count;
+///   the body may be truncated for display by [`APPROVAL_DIFF_MAX_LINES`]).
+/// * `delete_file`    → `--- a/<path>` / `+++ /dev/null` /
+///   `@@ -1,0 +0,0 @@` + a single marker line naming the deleted path
+///   (we have no body at preview time, but the reviewer must still see
+///   *something* per op).
+/// * `move_file`      → `--- a/<from>` / `+++ b/<to>` / `@@ -1,0 +1,0 @@`
+///   + a marker line naming both endpoints.
+///
+/// Marker lines start with `@@ ` so they read as section dividers but
+/// deliberately carry non-numeric tokens, which makes
+/// [`crate::diff parser`](../../squeezy-tui/src/render/diff.rs)
+/// `parse_hunk_header` reject them — they fall through to the renderer's
+/// "raw context" branch and stay visible in the preview body. Without
+/// them the multi-file approval preview would collapse adjacent ops into
+/// one undelimited block (the renderer's `is_diff_metadata_line` filter
+/// strips `---` / `+++` lines before display).
 pub(crate) fn render_apply_patch_diff(args: &ApplyPatchArgs) -> Option<String> {
     let mut out = String::new();
     let mut remaining = APPROVAL_DIFF_MAX_LINES;
@@ -200,13 +219,13 @@ pub(crate) fn render_apply_patch_diff(args: &ApplyPatchArgs) -> Option<String> {
                 append_search_replace_hunk(&mut out, path, search, replace, &mut remaining);
             }
             ApplyPatchOperation::CreateFile { path, contents, .. } => {
-                append_create_or_delete_hunk(&mut out, path, contents, '+', &mut remaining);
+                append_create_hunk(&mut out, path, contents, &mut remaining);
             }
             ApplyPatchOperation::DeleteFile { path, .. } => {
-                append_create_or_delete_hunk(&mut out, path, "", '-', &mut remaining);
+                append_delete_hunk(&mut out, path, &mut remaining);
             }
             ApplyPatchOperation::MoveFile { from, to, .. } => {
-                out.push_str(&format!("--- a/{from}\n+++ b/{to}\n@@ -1 +1 @@\n"));
+                append_move_hunk(&mut out, from, to, &mut remaining);
             }
         }
         emitted_any = true;
@@ -269,19 +288,35 @@ fn append_search_replace_hunk(
     }
 }
 
-fn append_create_or_delete_hunk(
-    out: &mut String,
-    path: &str,
-    contents: &str,
-    sign: char,
-    remaining: &mut usize,
-) {
-    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"));
+fn append_create_hunk(out: &mut String, path: &str, contents: &str, remaining: &mut usize) {
+    let total = contents.lines().count();
+    out.push_str(&format!("--- /dev/null\n+++ b/{path}\n"));
+    out.push_str(&format!("@@ -0,0 +1,{total} @@\n"));
+    if *remaining > 0 {
+        out.push_str(&format!("@@ create b/{path} @@\n"));
+        *remaining -= 1;
+    }
     for line in contents.lines() {
         if *remaining == 0 {
             return;
         }
-        out.push_str(&format!("{sign}{line}\n"));
+        out.push_str(&format!("+{line}\n"));
+        *remaining -= 1;
+    }
+}
+
+fn append_delete_hunk(out: &mut String, path: &str, remaining: &mut usize) {
+    out.push_str(&format!("--- a/{path}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n"));
+    if *remaining > 0 {
+        out.push_str(&format!("@@ delete a/{path} @@\n"));
+        *remaining -= 1;
+    }
+}
+
+fn append_move_hunk(out: &mut String, from: &str, to: &str, remaining: &mut usize) {
+    out.push_str(&format!("--- a/{from}\n+++ b/{to}\n@@ -1,0 +1,0 @@\n"));
+    if *remaining > 0 {
+        out.push_str(&format!("@@ rename a/{from} -> b/{to} @@\n"));
         *remaining -= 1;
     }
 }
@@ -1374,3 +1409,7 @@ fn codeowner_pattern_matches(pattern: &str, path: &str) -> bool {
         .map(|set| set.is_match(path))
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+#[path = "patch_tests.rs"]
+mod tests;
