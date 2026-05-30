@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload, Result,
-    SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload,
+    ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1537,6 +1537,8 @@ impl SessionHandle {
         let (events, _warnings) = read_jsonl(&self.dir().join("events.jsonl"))?;
         let mut conversation: Vec<ResumeItem> = Vec::new();
         let mut transcript: Vec<TranscriptItem> = Vec::new();
+        let mut hydrated: Vec<HydratedTranscriptItem> = Vec::new();
+        let mut replay = ReplayState::default();
         for (idx, event) in events.iter().enumerate().rev() {
             if let Some(SessionEventKind::ContextCompacted {
                 conversation: snapshot,
@@ -1549,26 +1551,40 @@ impl SessionHandle {
                 // order — events at idx or earlier are subsumed by the
                 // checkpoint snapshot.
                 for forward in events.iter().skip(idx + 1) {
-                    apply_event_to_replay(forward, &mut conversation, &mut transcript);
+                    apply_event_to_replay(
+                        forward,
+                        &mut conversation,
+                        &mut transcript,
+                        &mut hydrated,
+                        &mut replay,
+                    );
                 }
                 return Ok(SessionResumeState {
                     resume_available: true,
                     previous_response_id: None,
                     conversation,
                     transcript,
+                    hydrated_transcript: hydrated,
                     context_attachments: self.context_attachments().unwrap_or_default(),
                     context_compaction: ContextCompactionState::default(),
                 });
             }
         }
         for event in &events {
-            apply_event_to_replay(event, &mut conversation, &mut transcript);
+            apply_event_to_replay(
+                event,
+                &mut conversation,
+                &mut transcript,
+                &mut hydrated,
+                &mut replay,
+            );
         }
         Ok(SessionResumeState {
             resume_available: true,
             previous_response_id: None,
             conversation,
             transcript,
+            hydrated_transcript: hydrated,
             context_attachments: self.context_attachments().unwrap_or_default(),
             context_compaction: ContextCompactionState::default(),
         })
@@ -2387,11 +2403,67 @@ pub struct SessionResumeState {
     pub resume_available: bool,
     pub previous_response_id: Option<String>,
     pub conversation: Vec<ResumeItem>,
+    /// Legacy message-only transcript. Kept for back-compat with
+    /// `resume_state.json` files written by older binaries; new
+    /// consumers should read `hydrated_transcript` instead, which
+    /// also carries tool-result cards needed for full UI parity on
+    /// resume. We continue to populate this field on write so a
+    /// future binary that rolled back to a pre-hydrated build can
+    /// still resume.
     pub transcript: Vec<TranscriptItem>,
+    /// Full UI-hydration list — messages, tool results, and (via
+    /// the embedded reasoning attached to assistant messages)
+    /// reasoning chips. The TUI iterates this on resume and routes
+    /// each variant to the matching `TuiApp::push_*` method, so a
+    /// resumed session renders the same shape a fresh turn does.
+    /// `#[serde(default)]` keeps old session files readable —
+    /// missing means the file pre-dates hydration support and the
+    /// loader falls back to wrapping `transcript` items.
+    #[serde(default)]
+    pub hydrated_transcript: Vec<HydratedTranscriptItem>,
     #[serde(default)]
     pub context_attachments: Vec<ContextAttachment>,
     #[serde(default)]
     pub context_compaction: ContextCompactionState,
+}
+
+/// One entry the TUI knows how to push into its transcript on
+/// resume. Mirrors the kinds emitted live during a turn: assistant
+/// / user / system messages (`TranscriptItem`) and tool-result
+/// cards (`ToolResult`). Reasoning isn't a separate variant
+/// because the live renderer attaches reasoning to assistant
+/// messages via `TranscriptItem.reasoning`, and the resume replay
+/// keeps that contract.
+///
+/// `result` is the raw `serde_json::Value` the agent serialized
+/// at write time — `squeezy-store` deliberately doesn't pull in
+/// `squeezy-tools` (which defines the typed `ToolResult` struct)
+/// to keep the dep graph one-directional, so the TUI consumes
+/// these via `serde_json::from_value::<squeezy_tools::ToolResult>`
+/// at hydration time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HydratedTranscriptItem {
+    Message {
+        item: TranscriptItem,
+    },
+    ToolResult {
+        #[serde(default)]
+        call: Option<HydratedToolCall>,
+        result: Value,
+    },
+}
+
+/// Lightweight `ToolCall` projection that survives the
+/// `squeezy-store` ↔ `squeezy-tools` crate split. The TUI rebuilds
+/// a full `squeezy_tools::ToolCall` from these three fields when
+/// pushing a tool-result card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedToolCall {
+    pub call_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub arguments: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2791,10 +2863,68 @@ fn attachment_file_stem(id: &str) -> Result<&str> {
     )))
 }
 
+/// Per-replay state that survives across `apply_event_to_replay`
+/// calls. Carries:
+///
+/// - `pending_reasoning`: provider streams emit `Reasoning` events
+///   independently of the assistant message that follows. The
+///   rendered transcript only has a place to attach a reasoning
+///   snapshot via `TranscriptItem.reasoning` on the assistant
+///   message itself, so we buffer reasoning here until the next
+///   `AssistantCompleted` drains it.
+/// - `pending_tool_calls`: tool-result hydration needs the matching
+///   `ToolCall` (for the tool name + arguments) to rebuild the
+///   transcript card. The agent emits `ToolCall` and `ToolResult`
+///   as separate events linked by `call_id`; we hash the call by
+///   id when we see it and look it up when the result lands.
+///
+/// Without this buffering, resume drops every reasoning chip and
+/// every tool-result card the original turn produced — what the
+/// LLM had in its context, the user did not see on screen.
+#[derive(Debug, Default)]
+struct ReplayState {
+    pending_reasoning: Vec<ReasoningSnapshot>,
+    pending_tool_calls: std::collections::HashMap<String, HydratedToolCall>,
+}
+
+impl ReplayState {
+    fn drain_combined_reasoning(&mut self) -> Option<ReasoningSnapshot> {
+        if self.pending_reasoning.is_empty() {
+            return None;
+        }
+        // Concatenate every buffered segment's display text so the
+        // resumed chip carries the full reasoning the user originally
+        // watched stream in, separated by blank lines so a reviewer
+        // can still see the segment boundaries. The payload comes
+        // from the last segment so per-provider metadata (item_id,
+        // encrypted_content, thought_signature) stays consistent
+        // with what the provider would return on a fresh turn.
+        let mut display = String::new();
+        for snap in &self.pending_reasoning {
+            if !display.is_empty() {
+                display.push_str("\n\n");
+            }
+            display.push_str(&snap.display_text);
+        }
+        let last_payload = self
+            .pending_reasoning
+            .last()
+            .map(|s| s.payload.clone())
+            .expect("non-empty");
+        self.pending_reasoning.clear();
+        Some(ReasoningSnapshot {
+            display_text: display,
+            payload: last_payload,
+        })
+    }
+}
+
 fn apply_event_to_replay(
     event: &SessionEvent,
     conversation: &mut Vec<ResumeItem>,
     transcript: &mut Vec<TranscriptItem>,
+    hydrated: &mut Vec<HydratedTranscriptItem>,
+    replay: &mut ReplayState,
 ) {
     let Some(typed) = SessionEventKind::try_from_event(event) else {
         return;
@@ -2802,14 +2932,23 @@ fn apply_event_to_replay(
     match typed {
         SessionEventKind::UserMessage { text } => {
             conversation.push(ResumeItem::UserText { text: text.clone() });
-            transcript.push(TranscriptItem::user(text));
+            let item = TranscriptItem::user(text);
+            transcript.push(item.clone());
+            hydrated.push(HydratedTranscriptItem::Message { item });
         }
         SessionEventKind::AssistantCompleted { text, .. } => {
             if text.is_empty() {
                 return;
             }
             conversation.push(ResumeItem::AssistantText { text: text.clone() });
-            transcript.push(TranscriptItem::assistant(text));
+            // Drain any reasoning buffered since the last assistant
+            // message and attach it to this one so the resumed
+            // transcript shows the reasoning chip via the
+            // `format_assistant_message_entry` embedded-chip path.
+            let attached = replay.drain_combined_reasoning();
+            let item = TranscriptItem::assistant_with_reasoning(text, attached);
+            transcript.push(item.clone());
+            hydrated.push(HydratedTranscriptItem::Message { item });
         }
         SessionEventKind::ToolCall {
             call_id,
@@ -2819,6 +2958,18 @@ fn apply_event_to_replay(
             if call_id.is_empty() {
                 return;
             }
+            // Buffer for the matching ToolResult event so the
+            // hydrated transcript can carry the call's name + args
+            // alongside the result body — without it the resumed
+            // card has no tool label and no command preview.
+            replay.pending_tool_calls.insert(
+                call_id.clone(),
+                HydratedToolCall {
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                    arguments: arguments.clone(),
+                },
+            );
             conversation.push(ResumeItem::FunctionCall {
                 call_id,
                 name: tool,
@@ -2829,14 +2980,26 @@ fn apply_event_to_replay(
             let Some(call_id) = output.get("call_id").and_then(Value::as_str) else {
                 return;
             };
+            let call_id_owned = call_id.to_string();
             let body = output
                 .get("output")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| output.to_string());
             conversation.push(ResumeItem::FunctionCallOutput {
-                call_id: call_id.to_string(),
+                call_id: call_id_owned.clone(),
                 output: body,
+            });
+            // Pair with the buffered call (if we saw one) so the
+            // TUI can rebuild a full tool-result card on hydration.
+            // A missing call is rare — the agent always writes
+            // `ToolCall` before `ToolResult` for the same id — but
+            // we still record the result so a resumed session
+            // doesn't silently drop tool output entirely.
+            let call = replay.pending_tool_calls.remove(&call_id_owned);
+            hydrated.push(HydratedTranscriptItem::ToolResult {
+                call,
+                result: output,
             });
         }
         // Compaction events are handled by the snap-to-checkpoint path in
@@ -2845,7 +3008,12 @@ fn apply_event_to_replay(
         // linear replay continue.
         SessionEventKind::ContextCompacted { .. } => {}
         SessionEventKind::Reasoning { payload } => {
-            conversation.push(ResumeItem::Reasoning { payload });
+            conversation.push(ResumeItem::Reasoning {
+                payload: payload.clone(),
+            });
+            replay
+                .pending_reasoning
+                .push(ReasoningSnapshot::from_payload(payload));
         }
         // Approval and session-lifecycle events are bookkeeping rather
         // than conversation items; they do not modify the resume state's

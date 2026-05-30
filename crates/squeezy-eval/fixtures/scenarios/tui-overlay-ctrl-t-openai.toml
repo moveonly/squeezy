@@ -1,0 +1,144 @@
+id = "tui-overlay-ctrl-t-openai"
+title = "Ctrl+T opens the full-transcript overlay end-to-end"
+description = """
+Pins the user-visible contract of the post-#157 transcript-expand
+UX: there is exactly one key — `Ctrl+T` — that opens a full
+overlay showing the entire conversation with every reasoning
+chip and tool-result card expanded; a second `Ctrl+T` (or `Esc`)
+closes it. No per-entry expand/collapse keys.
+
+Runs against a real `gpt-5.4-mini` turn at `reasoning_effort = high`
+so the produced reasoning has multi-line body content the user
+would actually want to see. After the turn lands:
+
+  1. Inline view shows `▸ reasoning: ... (Ctrl-T for full
+     transcript)` — chip is collapsed, the affordance hint
+     points at Ctrl+T.
+  2. `Ctrl+T` opens the overlay. The overlay forces every entry
+     into its expanded form, so the rendered frame must contain
+     the title `Transcript — Ctrl-T or Esc to close` and the
+     `▾ reasoning` expanded header plus body marker `▏`.
+  3. `Ctrl+T` again closes the overlay. The overlay title
+     drops from the frame; we're back to the inline collapsed
+     chip with the `(Ctrl-T for full transcript)` hint.
+
+Requires `OPENAI_API_KEY`. Run with:
+
+    OPENAI_API_KEY=... cargo run -p squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/tui-overlay-ctrl-t-openai.toml
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+reasoning_effort = "high"
+max_output_tokens = 800
+show_reasoning_usage = true
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+
+[[steps]]
+kind = "prompt"
+text = "Think about the trade-offs between a hash map and a B-tree for a small (~100 entry) keyed cache. Answer in one short sentence."
+wait_for = "turn_completed"
+
+# Sanity: pre-overlay frame is the inline view. Reasoning chip is
+# collapsed; the chip hint points at Ctrl+T.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Ctrl-T for full transcript"
+
+# Open the overlay.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+T"
+
+# Inside the overlay: the title row + everything-expanded form.
+# Reasoning chip is `▾ reasoning (...)` with body lines prefixed
+# by `▏`.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Transcript — Ctrl-T or Esc to close"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▾ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▏"
+
+# Inline-only chip hint should NOT appear inside the overlay —
+# inside the overlay everything is forced expanded, so no chip
+# truncation suffix is rendered.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_does_not_contain"
+text = "Ctrl-T for full transcript"
+
+# Close the overlay.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Ctrl+T"
+
+# Back to inline view: title is gone, the collapsed chip hint
+# returns.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_does_not_contain"
+text = "Transcript — Ctrl-T or Esc to close"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "▸ reasoning"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Ctrl-T for full transcript"
+
+[expect]
+max_wall_clock_seconds = 120
+no_tool_errors = false
+
+[triage]
+enabled = false

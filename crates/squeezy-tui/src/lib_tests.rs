@@ -422,26 +422,6 @@ fn raw_control_byte_normalises_to_char_plus_control() {
 }
 
 #[tokio::test]
-async fn raw_ctrl_e_dispatches_expand_action() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    assert!(app.transcript[0].collapsed);
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("raw ctrl+e");
-    assert!(
-        !app.transcript[0].collapsed,
-        "raw \\x05 must reach the ExpandSelectedTranscriptEntry keymap arm",
-    );
-}
-
-#[tokio::test]
 async fn chord_leader_accepts_raw_ctrl_x_byte() {
     // Some terminals emit Ctrl+X as the literal ASCII control byte
     // (`\x18`) with no modifiers when they don't fully honour kitty's
@@ -2340,37 +2320,6 @@ async fn prompt_line_editing_matches_common_terminal_shortcuts() {
 }
 
 #[tokio::test]
-async fn prompt_ctrl_o_expands_single_entry() {
-    // Ctrl+O is dedicated to single-entry expand. It fires regardless
-    // of composer state — no more dual-mode readline fall-through.
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-o expands");
-    assert!(!app.transcript[0].collapsed);
-
-    // With text in the composer, Ctrl+O still toggles the entry.
-    set_input(&mut app, "abc".to_string());
-    app.input_cursor = 0;
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-o collapses");
-    assert!(app.transcript[0].collapsed);
-    assert_eq!(app.input, "abc", "composer must be untouched by Ctrl+O");
-}
-
-#[tokio::test]
 async fn prompt_word_editing_matches_codex_shortcuts() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -3314,11 +3263,14 @@ fn transcript_item_formats_role_label() {
 }
 
 #[test]
-fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
-    // Long-output regression: under the 5-line collapsed cap, a short
-    // grep result fits inside the preview window so the body shows even
-    // in the collapsed state — but a long body must be head-tail truncated
-    // with the Ctrl-E ellipsis, then fully expand when toggled.
+fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
+    // Long tool outputs collapse to a head-tail preview by default,
+    // with the chip's truncation hint pointing the user at the
+    // full-screen transcript overlay (Ctrl+T) — the only mode that
+    // can reliably show every line regardless of inline vs alt-screen
+    // rendering. Single-entry expand keys were removed because they
+    // worked only in alt-screen mode (inline writes entries to
+    // terminal scrollback, which is immutable once flushed).
     let mut app = test_app(SessionMode::Build);
     let payload = (0..30)
         .map(|i| format!("match-{i:02}"))
@@ -3333,106 +3285,24 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     assert!(!collapsed.contains("receipt="), "{collapsed}");
     assert!(!collapsed.contains("B receipt"), "{collapsed}");
     assert!(
-        collapsed.contains("Ctrl-O to expand"),
-        "collapsed view should show truncation hint: {collapsed}"
+        collapsed.contains("Ctrl-T for full transcript"),
+        "collapsed view should point at the overlay: {collapsed}"
     );
     assert!(
         !collapsed.contains("match-15"),
         "middle of the body must be elided: {collapsed}"
     );
 
-    select_previous_transcript_entry(&mut app);
-    toggle_selected_transcript_entry(&mut app);
+    // `/expand all` is the slash-command path for users who want the
+    // expanded view inline (works in alt-screen; in inline mode the
+    // most recent turn's entries flip but already-flushed ones stay
+    // in scrollback — a limitation the overlay sidesteps entirely).
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     assert!(!app.transcript[0].collapsed);
     let expanded = render_to_string(&app, 100, 40);
     assert!(expanded.contains("match-15"), "{expanded}");
     assert!(!expanded.contains("receipt output="), "{expanded}");
-}
-
-#[test]
-fn toggle_selected_without_selection_toggles_latest_transcript_entry() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-
-    assert!(app.selected_entry.is_none());
-    assert!(app.transcript[0].collapsed);
-
-    toggle_selected_transcript_entry(&mut app);
-    assert!(!app.transcript[0].collapsed);
-    assert_eq!(
-        app.status,
-        "expanded transcript entry 1 · Ctrl+E expand all"
-    );
-
-    toggle_selected_transcript_entry(&mut app);
-    assert!(app.transcript[0].collapsed);
-    assert_eq!(
-        app.status,
-        "collapsed transcript entry 1 · Ctrl+E expand all"
-    );
-}
-
-#[test]
-fn toggle_selected_skips_prompt_rows_and_expands_collapsed_content() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_transcript_item(TranscriptItem::user("next prompt"));
-
-    assert!(app.transcript[0].collapsed);
-    assert!(!app.transcript[1].is_toggleable());
-
-    toggle_selected_transcript_entry(&mut app);
-
-    assert!(!app.transcript[0].collapsed);
-    assert_eq!(
-        app.status,
-        "expanded transcript entry 1 · Ctrl+E expand all"
-    );
-}
-
-#[test]
-fn toggle_expand_all_expands_every_collapsed_entry_when_any_are_collapsed() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_tool_result(sample_tool_result("read", "file body"));
-    app.push_tool_result(sample_tool_result("glob", "file list"));
-
-    assert!(app.transcript.iter().all(|e| e.collapsed));
-
-    toggle_expand_all_transcript_entries(&mut app);
-
-    assert!(
-        app.transcript.iter().all(|e| !e.collapsed),
-        "every toggleable entry should be expanded"
-    );
-    assert!(app.status.contains("expanded 3 of 3"));
-}
-
-#[test]
-fn toggle_expand_all_collapses_all_when_already_expanded() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_tool_result(sample_tool_result("read", "file body"));
-
-    toggle_expand_all_transcript_entries(&mut app);
-    assert!(app.transcript.iter().all(|e| !e.collapsed));
-
-    toggle_expand_all_transcript_entries(&mut app);
-    assert!(
-        app.transcript.iter().all(|e| e.collapsed),
-        "second press should collapse every entry"
-    );
-    assert!(app.status.contains("collapsed 2 of 2"));
-}
-
-#[test]
-fn toggle_expand_all_reports_nothing_to_expand_when_transcript_empty() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("just a prompt"));
-
-    toggle_expand_all_transcript_entries(&mut app);
-    assert_eq!(app.status, "nothing expandable yet");
 }
 
 #[test]
@@ -3451,28 +3321,6 @@ fn failed_tool_result_starts_expanded_so_error_is_visible() {
     );
 }
 
-#[tokio::test]
-async fn ctrl_e_dispatches_expand_all() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    app.push_tool_result(sample_tool_result("read", "file body"));
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl+e fires expand-all");
-
-    assert!(
-        app.transcript.iter().all(|e| !e.collapsed),
-        "Ctrl+E should expand both transcript entries"
-    );
-    assert!(app.status.contains("expanded"));
-}
-
 #[test]
 fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
     assert!(matches!(
@@ -3484,32 +3332,6 @@ fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
         Some(TranscriptCategory::Reasoning)
     ));
     assert!(parse_transcript_category("rambling").is_none());
-}
-
-#[tokio::test]
-async fn ctrl_e_with_composer_text_still_expands_transcript() {
-    // Ctrl+E now fires expand-all unconditionally — composer state
-    // does not gate it (use `End` for cursor-to-line-end).
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-    set_input(&mut app, "abc".to_string());
-    app.input_cursor = 0;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-e expands transcript");
-
-    assert!(
-        !app.transcript[0].collapsed,
-        "Ctrl+E should expand the tool result"
-    );
-    assert_eq!(app.input, "abc", "composer text untouched");
-    assert_eq!(app.input_cursor, 0, "composer cursor untouched");
 }
 
 #[tokio::test]
@@ -3618,8 +3440,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
-    select_previous_transcript_entry(&mut app);
-    toggle_selected_transcript_entry(&mut app);
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     let output = render_to_string(&app, 140, 18);
 
@@ -3813,8 +3634,7 @@ fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
             arguments: serde_json::json!({}),
         }),
     );
-    select_previous_transcript_entry(&mut app);
-    toggle_selected_transcript_entry(&mut app);
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     let output = render_to_string(&app, 120, 16);
 
@@ -3853,7 +3673,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
             arguments: serde_json::json!({}),
         }),
     );
-    toggle_selected_transcript_entry(&mut app);
+    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
 
     let lines = format_transcript_entry_with_width(
         &app.transcript[0],
@@ -4996,13 +4816,16 @@ fn active_prompt_keeps_one_blank_line_after_header() {
 }
 
 #[test]
-fn footer_mentions_expand_and_transcript_shortcuts() {
+fn footer_mentions_transcript_shortcut() {
     let app = test_app(SessionMode::Build);
 
     let output = render_to_string(&app, 140, 16);
 
-    assert!(output.contains("Ctrl-E expand"), "{output}");
-    assert!(output.contains("Ctrl-T transcript"), "{output}");
+    assert!(output.contains("Ctrl-T full transcript"), "{output}");
+    assert!(
+        !output.contains("Ctrl-O expand") && !output.contains("Ctrl-E expand all"),
+        "the removed per-entry expand keys must not be advertised: {output}"
+    );
 }
 
 #[test]
@@ -8829,7 +8652,7 @@ fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
         "middle should be elided: {output}"
     );
     assert!(
-        output.contains("Ctrl-O to expand"),
+        output.contains("Ctrl-T for full transcript"),
         "ellipsis hint missing: {output}"
     );
 }

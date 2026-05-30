@@ -55,15 +55,6 @@ pub(crate) enum Action {
     /// Jump to the bottom of the transcript when the composer is
     /// empty (`End` default; falls through to line-end otherwise).
     TranscriptEnd,
-    /// Toggle expand/collapse on the currently selected (or latest
-    /// collapsed) transcript entry (`Ctrl+E` default; falls through
-    /// to readline line-end when the composer has text).
-    ExpandSelectedTranscriptEntry,
-    /// Toggle expand-all across every toggleable transcript entry —
-    /// expands when any is collapsed, collapses all back to default
-    /// otherwise (`Alt+E` default; always fires regardless of
-    /// composer state).
-    ExpandAllTranscriptEntries,
 }
 
 impl Action {
@@ -78,8 +69,6 @@ impl Action {
             Self::ScrollTranscriptPageDown => "page_down",
             Self::TranscriptHome => "transcript_home",
             Self::TranscriptEnd => "transcript_end",
-            Self::ExpandSelectedTranscriptEntry => "expand_selected_transcript_entry",
-            Self::ExpandAllTranscriptEntries => "expand_all_transcript_entries",
         }
     }
 
@@ -93,8 +82,6 @@ impl Action {
         Action::ScrollTranscriptPageDown,
         Action::TranscriptHome,
         Action::TranscriptEnd,
-        Action::ExpandSelectedTranscriptEntry,
-        Action::ExpandAllTranscriptEntries,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -121,22 +108,6 @@ impl Action {
             }
             Self::TranscriptHome => KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
             Self::TranscriptEnd => KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
-            // `Ctrl+O` is virtually unused in modern terminal apps and
-            // every terminal we care about delivers it as a plain
-            // `Char('o') + CONTROL` after normalisation, so single-entry
-            // expand stays one keystroke without needing the
-            // "Use Option as Meta key" preference that `Alt+letter`
-            // requires on default macOS Terminal.app.
-            Self::ExpandSelectedTranscriptEntry => {
-                KeyBinding::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
-            }
-            // `Ctrl+E` for "expand all" instead of `Alt+E` for the same
-            // terminal-portability reason. Trades the readline
-            // line-end-of-line convention away in this app — `End` /
-            // `Cmd+Right` still work.
-            Self::ExpandAllTranscriptEntries => {
-                KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
-            }
         }
     }
 }

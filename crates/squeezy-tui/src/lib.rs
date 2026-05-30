@@ -534,7 +534,7 @@ async fn run_inner(
         app.push_log(banner);
     }
     for item in initial_transcript {
-        app.push_transcript_item(item);
+        hydrate_transcript_item(&mut app, item);
     }
     app.attachments = agent.context_attachments_snapshot().await;
     app.context_compaction = agent.context_compaction_snapshot().await;
@@ -664,12 +664,9 @@ fn maybe_pick_resume_session(
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
-    let choice = resume_picker::run_picker(
-        &mut terminal.terminal,
-        candidates,
-        config.workspace_root.clone(),
-    )
-    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    let choice =
+        resume_picker::run_picker(terminal.term(), candidates, config.workspace_root.clone())
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         // `branch_tip` is captured by the picker but not yet wired through
@@ -987,7 +984,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.selected_entry = None;
             app.next_entry_id = 0;
             for item in transcript {
-                app.push_transcript_item(item);
+                hydrate_transcript_item(app, item);
             }
             app.attachments = agent.context_attachments_snapshot().await;
             app.pending_assistant.clear();
@@ -998,6 +995,39 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => app.status = format!("resume failed: {error}"),
+    }
+}
+
+/// Apply one `HydratedTranscriptItem` from the resume state to the
+/// live `TuiApp`, routing each variant to the matching `push_*`
+/// helper so the rebuilt transcript renders the same shape a fresh
+/// turn would. Tool-result cards need a roundtrip from
+/// `serde_json::Value` back to the typed `squeezy_tools::ToolResult`
+/// — done here so `squeezy-store` can stay independent of
+/// `squeezy-tools`. Malformed entries log a transcript warning and
+/// otherwise no-op rather than abort the whole hydration.
+fn hydrate_transcript_item(app: &mut TuiApp, item: squeezy_store::HydratedTranscriptItem) {
+    match item {
+        squeezy_store::HydratedTranscriptItem::Message { item } => {
+            app.push_transcript_item(item);
+        }
+        squeezy_store::HydratedTranscriptItem::ToolResult { call, result } => {
+            let parsed_result: ToolResult = match serde_json::from_value(result) {
+                Ok(result) => result,
+                Err(err) => {
+                    app.push_warn(format!(
+                        "resume: dropped a malformed tool-result card ({err})"
+                    ));
+                    return;
+                }
+            };
+            let parsed_call = call.map(|call| ToolCall {
+                call_id: call.call_id,
+                name: call.tool,
+                arguments: call.arguments,
+            });
+            app.push_tool_result_with_call(parsed_result, parsed_call);
+        }
     }
 }
 
@@ -1719,43 +1749,6 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             } else {
                 false
             }
-        }
-        keymap::Action::ExpandSelectedTranscriptEntry => {
-            tracing::debug!(
-                target: "squeezy_tui::keymap",
-                action = "expand_selected_transcript_entry",
-                composer_empty = app.input.is_empty(),
-                config_screen_open = app.config_screen.is_some(),
-                status_line_setup_open = app.status_line_setup.is_some(),
-                key_modifiers = ?key.modifiers,
-                key_code = ?key.code,
-                "Ctrl+O dispatched"
-            );
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            // `Ctrl+O` is dedicated — fires regardless of composer
-            // state. No need for the readline-line-end fall-through
-            // the previous `Ctrl+E` binding required.
-            toggle_selected_transcript_entry(app);
-            true
-        }
-        keymap::Action::ExpandAllTranscriptEntries => {
-            tracing::debug!(
-                target: "squeezy_tui::keymap",
-                action = "expand_all_transcript_entries",
-                composer_empty = app.input.is_empty(),
-                config_screen_open = app.config_screen.is_some(),
-                status_line_setup_open = app.status_line_setup.is_some(),
-                key_modifiers = ?key.modifiers,
-                key_code = ?key.code,
-                "Ctrl+E dispatched"
-            );
-            if app.config_screen.is_some() || app.status_line_setup.is_some() {
-                return false;
-            }
-            toggle_expand_all_transcript_entries(app);
-            true
         }
     }
 }
@@ -3394,177 +3387,6 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         prompt_queue::QueueDispatch::Ignored => true, // stay modal
     }
-}
-
-fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let selected = app
-        .selected_entry
-        .filter(|index| {
-            app.transcript
-                .get(*index)
-                .is_some_and(|entry| entry_targets_toggle(entry, app.show_reasoning_usage))
-        })
-        .map(|index| resolve_toggle_target(&app.transcript, index));
-    let Some(index) = selected
-        .or_else(|| latest_collapsed_transcript_entry(app))
-        .or_else(|| latest_toggleable_transcript_entry(app))
-    else {
-        app.status = "nothing expandable yet · /expand all also works".to_string();
-        return;
-    };
-    let Some(entry) = app.transcript.get_mut(index) else {
-        app.selected_entry = None;
-        app.status = "select a transcript entry first".to_string();
-        return;
-    };
-    entry.collapsed = !entry.collapsed;
-    entry.bump_revision();
-    app.status = format!(
-        "{} transcript entry {} · Ctrl+E expand all",
-        if entry.collapsed {
-            "collapsed"
-        } else {
-            "expanded"
-        },
-        entry.id + 1
-    );
-}
-
-/// Bulk expand / collapse across every toggleable transcript entry.
-///
-/// Semantics: if any toggleable entry is currently collapsed, expand
-/// all of them; otherwise (everything already expanded), collapse all
-/// back to default. One-shot toggle so the user can rapidly switch
-/// between "show me everything" and "back to compact" states.
-///
-/// Reports the count operated on via `app.status` so the user always
-/// gets feedback — silent UI is the whole reason the original
-/// transcript expand surface felt broken on small screens.
-fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
-    let show_reasoning = app.show_reasoning_usage;
-    let mut total_toggleable = 0usize;
-    let mut total_collapsed = 0usize;
-    for entry in &app.transcript {
-        if entry_targets_toggle(entry, show_reasoning) {
-            total_toggleable += 1;
-            if entry.collapsed {
-                total_collapsed += 1;
-            }
-        }
-    }
-    if total_toggleable == 0 {
-        app.status = "nothing expandable yet".to_string();
-        return;
-    }
-    let target_collapsed = total_collapsed == 0;
-    let mut changed = 0usize;
-    for entry in app.transcript.iter_mut() {
-        if !entry_targets_toggle(entry, show_reasoning) {
-            continue;
-        }
-        if entry.collapsed != target_collapsed {
-            entry.collapsed = target_collapsed;
-            entry.bump_revision();
-            changed += 1;
-        }
-    }
-    app.status = if target_collapsed {
-        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+O expand one")
-    } else {
-        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+O collapse one")
-    };
-}
-
-/// True when `entry` is a candidate for Ctrl-O / Ctrl-E. Mirrors
-/// `is_toggleable` but additionally skips reasoning entries when the
-/// user has hidden them via `show_reasoning_usage = false` — toggling
-/// a reasoning entry that renders zero lines has no visible effect and
-/// looks broken from the keyboard side.
-fn entry_targets_toggle(entry: &TranscriptEntry, show_reasoning: bool) -> bool {
-    if !entry.is_toggleable() {
-        return false;
-    }
-    if !show_reasoning && matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
-        return false;
-    }
-    true
-}
-
-/// Walk back through a run of adjacent reasoning entries to find the
-/// Lead — the entry whose `collapsed` flag actually drives what the
-/// user sees on screen. `reasoning_run_info` coalesces adjacent
-/// reasoning entries into one rendered chip; toggling a Suppressed
-/// member flips a flag nothing renders. Mapping the toggle target back
-/// to the Lead ensures Ctrl-O / Ctrl-E acts on the visible chip.
-fn resolve_toggle_target(transcript: &[TranscriptEntry], index: usize) -> usize {
-    let mut cursor = index;
-    while cursor > 0
-        && matches!(
-            transcript.get(cursor).map(|e| &e.kind),
-            Some(TranscriptEntryKind::Reasoning(_))
-        )
-        && matches!(
-            transcript.get(cursor - 1).map(|e| &e.kind),
-            Some(TranscriptEntryKind::Reasoning(_))
-        )
-    {
-        cursor -= 1;
-    }
-    cursor
-}
-
-fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
-    let show_reasoning = app.show_reasoning_usage;
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry_targets_toggle(entry, show_reasoning))
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
-}
-
-fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
-    // Prefer the most recent collapsed reasoning entry when one exists.
-    // Without this preference Ctrl-E falls through to the most recent
-    // collapsed *peer* — which after a turn lands is the assistant
-    // message (also collapsed on `transcript_default = compact`). The
-    // assistant body is usually a short single line, so toggling it has
-    // no visible effect and the reasoning chevron the user actually
-    // wanted to expand stays collapsed. Reasoning blocks are by far the
-    // most common Ctrl-E target, so prefer them when the user hasn't
-    // explicitly navigated to a specific entry.
-    //
-    // Adjacent reasoning entries coalesce into one chip rendered off the
-    // *Lead* entry's `collapsed` flag — toggling a `Suppressed` member
-    // would flip a flag nothing renders. `resolve_toggle_target` maps a
-    // Suppressed reasoning index back to its Lead so the chip the user
-    // sees is the one that actually toggles.
-    let show_reasoning = app.show_reasoning_usage;
-    if show_reasoning {
-        let latest_reasoning = app
-            .transcript
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, entry)| {
-                matches!(entry.kind, TranscriptEntryKind::Reasoning(_))
-                    && entry.collapsed
-                    && entry.is_toggleable()
-            })
-            .map(|(index, _)| index)
-            .map(|index| resolve_toggle_target(&app.transcript, index));
-        if latest_reasoning.is_some() {
-            return latest_reasoning;
-        }
-    }
-    app.transcript
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry.collapsed && entry_targets_toggle(entry, show_reasoning))
-        .map(|(index, _)| index)
-        .map(|index| resolve_toggle_target(&app.transcript, index))
 }
 
 /// Kick off a user-driven turn. Drains any pending config swap, consumes a
@@ -6614,7 +6436,10 @@ fn reasoning_block_lines_with_extras(
             .map(|first| compact_text(first, 120))
             .unwrap_or_default();
         let mut suffix = if body_lines.len() > 1 {
-            format!(" … +{} lines (Ctrl-O to expand)", body_lines.len() - 1)
+            format!(
+                " … +{} lines (Ctrl-T for full transcript)",
+                body_lines.len() - 1
+            )
         } else {
             String::new()
         };
@@ -6795,14 +6620,13 @@ fn collapsed_content_summary(content: &str) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.len() > 1 {
         let first = compact_text(lines.first().copied().unwrap_or_default(), 120);
-        format!("{first} … +{} lines (Ctrl-O to expand)", lines.len() - 1)
+        format!(
+            "{first} … +{} lines (Ctrl-T for full transcript)",
+            lines.len() - 1
+        )
     } else {
         compact_text(content, 160)
     }
-}
-
-fn text_has_collapsible_content(content: &str) -> bool {
-    content.lines().count() > 1 || content.len() > 160
 }
 
 fn format_tool_result_entry(
@@ -6852,7 +6676,7 @@ fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'
 /// `extras + 1` consecutive same-tool same-status entries.
 ///
 /// In collapsed form the header reads `"Read 3 files"` etc., the body is
-/// one summary row per member followed by a `(Ctrl-E to expand all)`
+/// one summary row per member followed by a `(Ctrl-T for full transcript)`
 /// affordance row. In expanded form the header is followed by each
 /// member's normal tool-card body rendered inline so the user can scan
 /// their full output.
@@ -6883,7 +6707,7 @@ fn format_grouped_tool_result_entry(
         body.push(detail_line(
             false,
             QUIET,
-            "(Ctrl-E to expand all)".to_string(),
+            "(Ctrl-T for full transcript)".to_string(),
         ));
     } else {
         // Stack each child's full single-tool render. Each is already
@@ -7010,11 +6834,12 @@ fn collapsed_tool_preview_lines(
     head_tail_truncate_lines(detail, cap)
 }
 
-/// Head-tail truncate a list of rendered detail lines, inserting a
-/// single "… +N lines (Ctrl-O to expand)" ellipsis between the head and
-/// tail when the total exceeds `2 * cap`. Cap is the maximum number of
-/// lines to keep on EACH end. Wording stays consistent with the existing
-/// diff renderer (see `render::diff::head_tail`).
+/// Head-tail truncate a list of rendered detail lines, inserting a single
+/// "… +N lines (Ctrl-T for full transcript)" ellipsis between the head and tail
+/// when the total exceeds `2 * cap`. Cap is the maximum number of lines
+/// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
+/// wording stays consistent with the existing diff renderer
+/// (see `render::diff::head_tail`).
 fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'static>> {
     if cap == 0 || lines.len() <= cap.saturating_mul(2) {
         return lines;
@@ -7025,7 +6850,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.push(detail_line(
         false,
         QUIET,
-        format!("… +{omitted} lines (Ctrl-O to expand)"),
+        format!("… +{omitted} lines (Ctrl-T for full transcript)"),
     ));
     out.extend(
         lines
@@ -8054,7 +7879,10 @@ fn expanded_symbol_context_detail_lines(
         lines.push(detail_line(
             false,
             QUIET,
-            format!("+{} more packets (Ctrl-O to expand)", total - packet_cap),
+            format!(
+                "+{} more packets (Ctrl-T for full transcript)",
+                total - packet_cap
+            ),
         ));
     }
     lines
@@ -8542,7 +8370,10 @@ fn expanded_generic_tool_detail_lines(
         lines.push(detail_line(
             false,
             QUIET,
-            format!("+{} more fields (Ctrl-O to expand)", total_keys - shown),
+            format!(
+                "+{} more fields (Ctrl-T for full transcript)",
+                total_keys - shown
+            ),
         ));
     }
     lines
@@ -8641,7 +8472,7 @@ fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
         })
         .collect::<Vec<_>>();
     preview.push(PreviewLine {
-        text: format!("… +{omitted} lines (Ctrl-O to expand)"),
+        text: format!("… +{omitted} lines (Ctrl-T for full transcript)"),
         truncated_marker: true,
     });
     preview.extend(
@@ -9939,6 +9770,25 @@ const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
 pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
+    let base = format_status_hint_base(app);
+    // `app.status` carries the per-action acknowledgement string set
+    // by `toggle_*`, `dispatch_command`, mode-switch, and friends.
+    // Before this branch surfaced anything visible the field was
+    // effectively write-only — keystrokes confirmed silently. When
+    // the value matches a user-action allowlist (toggle, mode switch,
+    // slash result, etc.), prepend it as a transient badge in FRONT
+    // of the full hint row so the user gets visible feedback without
+    // losing the help text. The ack stays put until the next state
+    // change overwrites `app.status` — that's fine: it's always
+    // adjacent to, not in place of, the affordance list.
+    if let Some(transient) = transient_status_message(app) {
+        format!("{transient} · {base}")
+    } else {
+        base
+    }
+}
+
+fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -9962,7 +9812,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help",
+            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
         );
         if !app.prompt_queue.is_empty() {
             hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
@@ -9977,10 +9827,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-T full transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0
@@ -9998,6 +9848,51 @@ fn format_status_hints(app: &TuiApp) -> String {
         ));
     }
     base
+}
+
+/// Allowlisted prefixes for status strings the user explicitly
+/// triggered (toggle, mode switch, slash command result, prompt
+/// queue op). The agent's mid-turn `app.status` writes ("running
+/// grep", "queued shell", "thinking", subagent lifecycle) are NOT
+/// listed — those already surface via `turn_progress_segment` /
+/// `active_tool`, and double-rendering them would make every
+/// tool-call event flicker the hint row.
+const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
+    "expanded ",
+    "collapsed ",
+    "mode switched ",
+    "already in ",
+    "stay in ",
+    "plan prompt dismissed",
+    "chord cancelled",
+    "exit cancelled",
+    "Ctrl+X…",
+    "transcript overlay",
+    "task panel ",
+    "/expand",
+    "/collapse",
+    "/statusline cancelled",
+    "no recent session",
+    "session quick-switch",
+    "resume failed",
+    "restored last prompt",
+    "nothing expandable",
+    "select a transcript entry",
+];
+
+/// `app.status` value to surface as a transient acknowledgement, or
+/// `None` when the current value is a lifecycle placeholder
+/// (`"ready"`, `"thinking"`, tool-progress writes) that the hint row
+/// shouldn't clobber.
+fn transient_status_message(app: &TuiApp) -> Option<String> {
+    let status = app.status.trim();
+    if status.is_empty() {
+        return None;
+    }
+    USER_ACTION_STATUS_PREFIXES
+        .iter()
+        .any(|prefix| status.starts_with(prefix))
+        .then(|| status.to_string())
 }
 
 pub(crate) fn format_mcp_status(app: &TuiApp) -> String {
@@ -11407,42 +11302,6 @@ impl TranscriptEntry {
         }
     }
 
-    fn is_toggleable(&self) -> bool {
-        match &self.kind {
-            TranscriptEntryKind::Message(item) => {
-                if item.role == Role::User {
-                    return false;
-                }
-                if text_has_collapsible_content(&item.content) {
-                    return true;
-                }
-                // Assistant messages can carry an embedded reasoning
-                // snapshot whose chip's ▸/▾ state follows the parent
-                // entry's `collapsed` flag (see
-                // `format_assistant_message_entry`). When the
-                // assistant text is short but the embedded reasoning is
-                // multi-line, the entry must still be toggleable —
-                // otherwise the picker rejects it and Ctrl-O / Ctrl-E
-                // surface "nothing expandable yet" even though the
-                // chip is visible on screen.
-                if let Some(snapshot) = item.reasoning.as_deref()
-                    && text_has_collapsible_content(&snapshot.display_text)
-                {
-                    return true;
-                }
-                false
-            }
-            TranscriptEntryKind::ToolResult(_) => true,
-            TranscriptEntryKind::Log(entry) => {
-                entry.kind == LogKind::Normal && text_has_collapsible_content(&entry.message)
-            }
-            TranscriptEntryKind::PlanCard(_) => true,
-            TranscriptEntryKind::Diff(_) => true,
-            TranscriptEntryKind::Reasoning(_) => true,
-            TranscriptEntryKind::SlashEcho(_) => false,
-        }
-    }
-
     /// True when the entry is a tool-result card whose status already
     /// communicates a turn-ending cancellation (rendered with `⚠`).
     /// Used to suppress the redundant `⚠ turn cancelled` log that the
@@ -11765,8 +11624,31 @@ impl From<TuiAlternateScreen> for TerminalMode {
 }
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<TerminalWriter>>,
+    /// `Option` so we can drop and rebuild the ratatui `Terminal`
+    /// Primary terminal in the user-configured mode. For inline
+    /// mode this is a `Viewport::Inline(N)` terminal pinned to the
+    /// bottom N rows of the main buffer; for alt-screen mode it's
+    /// a fullscreen terminal. Always `Some` after `enter`.
+    terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
+    /// Secondary fullscreen terminal used only when the configured
+    /// mode is inline and the transcript overlay is open. Built
+    /// lazily on the first overlay open so a session that never
+    /// opens the overlay never pays for it. Once constructed it
+    /// stays alive for the rest of the session — re-using it
+    /// avoids ratatui's `Terminal::with_options(Inline(N))`
+    /// `append_lines` scroll-up that fires on every fresh inline
+    /// Terminal construction (the bug that ghosted the pre-overlay
+    /// viewport above the new one on overlay close).
+    overlay_terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
+    /// User-configured mode (`Inline` or `AlternateScreen`). Stays
+    /// constant for the session — overlay-screen swaps only flip
+    /// `overlay_screen_active`, not `mode`.
     mode: TerminalMode,
+    /// True while the inline guard is currently routing draws to
+    /// the alt-screen overlay terminal. Always `false` when
+    /// `mode == AlternateScreen` (that mode is already fullscreen —
+    /// no swap needed).
+    overlay_screen_active: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
@@ -11775,6 +11657,23 @@ struct TerminalGuard {
     /// terminal-capability detection; consulted around every frame
     /// draw to wrap output in Begin/End Synchronized Update sequences.
     synchronized_output: bool,
+}
+
+impl TerminalGuard {
+    /// The terminal that should receive the next draw. Routes to
+    /// `overlay_terminal` while the alt-screen overlay is up, back
+    /// to the primary `terminal` otherwise.
+    fn term(&mut self) -> &mut Terminal<CrosstermBackend<TerminalWriter>> {
+        if self.overlay_screen_active {
+            self.overlay_terminal
+                .as_mut()
+                .expect("overlay terminal must be built when overlay-screen is active")
+        } else {
+            self.terminal
+                .as_mut()
+                .expect("primary terminal lost — unreachable after `enter`")
+        }
+    }
 }
 
 impl TerminalGuard {
@@ -11852,8 +11751,10 @@ impl TerminalGuard {
         }
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
-            terminal,
+            terminal: Some(terminal),
+            overlay_terminal: None,
             mode,
+            overlay_screen_active: false,
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
@@ -11871,7 +11772,7 @@ impl TerminalGuard {
     /// user just stares at empty space until the main loop starts.
     fn draw_startup_placeholder(&mut self, message: &str) -> Result<()> {
         let message = message.to_string();
-        self.terminal
+        self.term()
             .draw(|frame| {
                 let area = frame.area();
                 if area.width == 0 || area.height == 0 {
@@ -11900,7 +11801,7 @@ impl TerminalGuard {
             })
             .map(|_| ())
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let _ = self.terminal.backend_mut().flush();
+        let _ = self.term().backend_mut().flush();
         Ok(())
     }
 
@@ -11910,15 +11811,32 @@ impl TerminalGuard {
             self.wipe_inline_viewport_for_resize()?;
         }
         self.apply_terminal_title(app)?;
+        // Promote into / demote out of the alt-screen buffer based on
+        // whether the user has the transcript overlay open. No-op when
+        // `mode == AlternateScreen` (the whole terminal is already
+        // fullscreen there). Must run BEFORE we borrow the terminal
+        // for the draw, because it swaps `self.terminal`.
+        self.sync_overlay_screen(app.transcript_overlay.is_some())?;
+        // After the swap, decide which render path to take. Inline
+        // mode + no overlay = `render_inline` (small viewport painted
+        // over scrollback). Alt-screen mode OR overlay-screen swap =
+        // `render` (fullscreen draw, with the overlay branch picking
+        // the right widget).
+        let use_fullscreen_render =
+            self.mode == TerminalMode::AlternateScreen || self.overlay_screen_active;
+        if !use_fullscreen_render {
+            self.flush_history(app)?;
+        }
+        let synchronized = self.synchronized_output;
+        let terminal = self.term();
         // DEC 2026 Begin Synchronized Update bracket. Writing it through
         // the backend buffer puts it ahead of the cell-diff bytes that
         // `terminal.draw` is about to emit; capable terminals start
         // buffering at parse time and commit the whole frame when they
         // see the matching End Synchronized Update written below.
         // Unsupported terminals silently ignore both sequences.
-        if self.synchronized_output {
-            let _ = self
-                .terminal
+        if synchronized {
+            let _ = terminal
                 .backend_mut()
                 .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
         }
@@ -11926,27 +11844,126 @@ impl TerminalGuard {
         // which would block the post-draw `backend_mut` reborrow below.
         // Collapse to `Result<(), io::Error>` immediately so the borrow
         // ends before we reach for the backend again.
-        let draw_outcome: io::Result<()> = match self.mode {
-            TerminalMode::Inline => {
-                self.flush_history(app)?;
-                self.terminal
-                    .draw(|frame| render_inline(frame, app))
-                    .map(|_| ())
-            }
-            TerminalMode::AlternateScreen => {
-                self.terminal.draw(|frame| render(frame, app)).map(|_| ())
-            }
+        let draw_outcome: io::Result<()> = if use_fullscreen_render {
+            terminal.draw(|frame| render(frame, app)).map(|_| ())
+        } else {
+            terminal.draw(|frame| render_inline(frame, app)).map(|_| ())
         };
         // Always emit ESU (even when draw fails) so the terminal does
         // not stay parked in a buffered-update state — the spec lets a
         // capable terminal time the bracket out on its own, but closing
         // it promptly keeps the visible frame in sync with our state.
-        if self.synchronized_output {
-            let backend = self.terminal.backend_mut();
+        if synchronized {
+            let backend = terminal.backend_mut();
             let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
             let _ = backend.flush();
         }
         draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
+    }
+
+    /// Reconcile the alt-screen-for-overlay swap state with the
+    /// caller's request. No-op when we're already in alt-screen mode
+    /// for the whole session, or when the requested state already
+    /// matches. Otherwise:
+    ///
+    /// - **Inline → overlay**: drop the inline `Terminal` so its
+    ///   writer releases stdout, send `EnterAlternateScreen`
+    ///   directly, then build a fresh fullscreen `Terminal` over a
+    ///   new stdout writer. The original inline-mode terminal
+    ///   scrollback is preserved by the terminal emulator's main
+    ///   buffer; the overlay paints into the separate alt-screen
+    ///   buffer.
+    /// - **Overlay → inline**: reverse — drop the alt-screen
+    ///   `Terminal`, send `LeaveAlternateScreen` (which restores the
+    ///   main buffer with all the pre-overlay scrollback intact),
+    ///   then build a fresh `Viewport::Inline` `Terminal` to resume
+    ///   painting the bottom-anchored TUI viewport.
+    fn sync_overlay_screen(&mut self, want_overlay_full: bool) -> Result<()> {
+        if self.mode != TerminalMode::Inline {
+            return Ok(());
+        }
+        match (self.overlay_screen_active, want_overlay_full) {
+            (false, true) => self.enter_overlay_screen(),
+            (true, false) => self.leave_overlay_screen(),
+            _ => Ok(()),
+        }
+    }
+
+    fn enter_overlay_screen(&mut self) -> Result<()> {
+        // Lazily build the alt-screen ratatui `Terminal` the first
+        // time the overlay opens. `Viewport::Fullscreen` is the
+        // important detail: ratatui's fullscreen construction does
+        // NOT call `append_lines`, so it never scrolls main-buffer
+        // content. The terminal stays alive for the rest of the
+        // session — subsequent opens just re-enter alt-screen via
+        // ANSI without rebuilding the ratatui state.
+        if self.overlay_terminal.is_none() {
+            let writer = TerminalWriter::from_env(io::stdout());
+            let backend = CrosstermBackend::new(writer);
+            self.overlay_terminal = Some(
+                Terminal::new(backend).map_err(|err| SqueezyError::Terminal(err.to_string()))?,
+            );
+        }
+        // Switch the terminal emulator into the alt-screen buffer.
+        // Write through the inline Terminal's backend so the bytes
+        // serialize with any pending inline output.
+        {
+            let inline = self
+                .terminal
+                .as_mut()
+                .expect("primary inline terminal lost — unreachable after `enter`");
+            execute!(
+                inline.backend_mut(),
+                EnterAlternateScreen,
+                Clear(ClearType::All),
+                MoveTo(0, 0)
+            )
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // Force the overlay terminal to paint from scratch — its
+        // internal "previously drawn" buffer is stale (from the
+        // last overlay open, or empty on first use) but the
+        // alt-screen buffer we're about to draw into is blank.
+        self.overlay_terminal
+            .as_mut()
+            .expect("just built / persistent")
+            .clear()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.overlay_screen_active = true;
+        Ok(())
+    }
+
+    fn leave_overlay_screen(&mut self) -> Result<()> {
+        // Last write through the overlay Terminal's backend before
+        // we leave alt-screen — same reasoning as
+        // `enter_overlay_screen`: serialize the escape sequence
+        // with any final overlay-render bytes.
+        {
+            let overlay = self
+                .overlay_terminal
+                .as_mut()
+                .expect("overlay terminal must be built when overlay-screen is active");
+            execute!(overlay.backend_mut(), LeaveAlternateScreen)
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        // The terminal emulator has restored the main buffer. The
+        // pre-overlay inline TUI viewport content (input row,
+        // status, hint) is still sitting in the bottom rows where
+        // it was when alt-screen entered, because we never touched
+        // the main buffer during the overlay. The inline Terminal's
+        // internal "last drawn" state still matches that visible
+        // content, so the next `draw` diffs against the correct
+        // baseline and only emits cells that genuinely changed.
+        //
+        // What CAN have changed during the overlay: new transcript
+        // entries (committed reasoning, assistant message) that
+        // arrived while we were suppressing `flush_history`. The
+        // next `draw_app` call will pick them up and push them
+        // into scrollback via `insert_before`, scrolling the
+        // pre-overlay viewport down into its new position
+        // naturally.
+        self.overlay_screen_active = false;
+        Ok(())
     }
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
@@ -11955,7 +11972,7 @@ impl TerminalGuard {
         if desired == app.last_terminal_title {
             return Ok(());
         }
-        let backend = self.terminal.backend_mut();
+        let backend = self.term().backend_mut();
         match &desired {
             Some(title) => write!(backend, "\x1b]0;{title}\x07"),
             None => write!(backend, "\x1b]0;\x07"),
@@ -11974,27 +11991,28 @@ impl TerminalGuard {
     /// scroll to pull up. Alternate-screen mode handles resize cleanly via
     /// the terminal itself, so the work is inline-only.
     fn wipe_inline_viewport_for_resize(&mut self) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
+        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
             return Ok(());
         }
-        let viewport_top = self.terminal.get_frame().area().y;
+        let viewport_top = self.term().get_frame().area().y;
+        let terminal = self.term();
         execute!(
-            self.terminal.backend_mut(),
+            terminal.backend_mut(),
             MoveTo(0, viewport_top),
             Clear(ClearType::FromCursorDown)
         )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        self.terminal
+        terminal
             .clear()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
+        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
             return Ok(());
         }
         let width = self
-            .terminal
+            .term()
             .size()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?
             .width;
@@ -12014,7 +12032,7 @@ impl TerminalGuard {
             return Ok(());
         }
         let height = visual_line_count(&lines, width);
-        self.terminal
+        self.term()
             .insert_before(height, |buffer| render_lines_to_buffer(buffer, lines))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
@@ -12023,10 +12041,28 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        // If we exited while the overlay-screen swap was active,
+        // leave the alt-screen buffer first so the user's main-buffer
+        // scrollback (the inline conversation history) is what stays
+        // visible after the process tears down. The overlay terminal
+        // owns the writer that's currently routed to alt-screen.
+        if self.overlay_screen_active
+            && let Some(overlay) = self.overlay_terminal.as_mut()
+        {
+            let _ = execute!(overlay.backend_mut(), LeaveAlternateScreen);
+            self.overlay_screen_active = false;
+        }
+        // Drop the overlay terminal explicitly so its writer
+        // releases stdout before the primary terminal does its
+        // teardown writes below.
+        drop(self.overlay_terminal.take());
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
         match self.mode {
             TerminalMode::Inline => {
                 let _ = execute!(
-                    self.terminal.backend_mut(),
+                    terminal.backend_mut(),
                     PopKeyboardEnhancementFlags,
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
@@ -12040,7 +12076,7 @@ impl Drop for TerminalGuard {
             }
             TerminalMode::AlternateScreen => {
                 let _ = execute!(
-                    self.terminal.backend_mut(),
+                    terminal.backend_mut(),
                     PopKeyboardEnhancementFlags,
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
@@ -12055,9 +12091,9 @@ impl Drop for TerminalGuard {
                 );
             }
         }
-        let _ = self.terminal.show_cursor();
+        let _ = terminal.show_cursor();
         if let Some(hint) = &self.exit_hint {
-            let _ = writeln!(self.terminal.backend_mut(), "{hint}");
+            let _ = writeln!(terminal.backend_mut(), "{hint}");
         }
     }
 }

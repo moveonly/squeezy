@@ -1765,6 +1765,37 @@ fn replay_resume_state_round_trips_reasoning_items() {
         ],
         "reasoning items must round-trip with id and content preserved",
     );
+    // The replayed transcript (the UI hydration path) must surface the
+    // reasoning attached to the assistant message that immediately
+    // follows it via `TranscriptItem.reasoning`. Without this the TUI
+    // resume flow rebuilds the screen as user → assistant with no
+    // reasoning chip, which is the user-visible "resumed session lost
+    // my reasoning" regression.
+    assert_eq!(replayed.transcript.len(), 2, "user + assistant");
+    let assistant = &replayed.transcript[1];
+    assert_eq!(assistant.role, squeezy_core::Role::Assistant);
+    let attached = assistant
+        .reasoning
+        .as_deref()
+        .expect("assistant message must carry buffered reasoning after resume hydration");
+    assert!(
+        attached
+            .display_text
+            .contains("Read the file before patching it."),
+        "first reasoning segment must be preserved in the chip body, got {:?}",
+        attached.display_text,
+    );
+    assert!(
+        attached
+            .display_text
+            .contains("First check the failing test."),
+        "second reasoning segment must also be preserved, got {:?}",
+        attached.display_text,
+    );
+    assert!(
+        matches!(attached.payload, ReasoningPayload::Anthropic { .. }),
+        "the last segment's payload metadata wins so per-provider fields stay consistent",
+    );
 }
 
 fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
@@ -3064,4 +3095,153 @@ fn custom_session_events_are_ignored_by_core_readers() {
         ],
         "Custom events must be ignored by the replay reducer",
     );
+}
+
+#[test]
+fn replay_resume_state_hydrates_tool_result_cards() {
+    // A resumed session must surface tool-result cards (shell
+    // commands, file edits, grep results) the same way a fresh
+    // turn does. Before `HydratedTranscriptItem` landed,
+    // `apply_event_to_replay` pushed `SessionEventKind::ToolResult`
+    // only into `conversation` (the LLM context) and silently
+    // dropped it from the UI hydration path — so a resumed
+    // session went from `user → tool_call → tool_result → assistant`
+    // to `user → assistant` with the tool work invisible.
+    let root = temp_root("replay-tool-result-hydration");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let tool_call_args = json!({"command": "ls", "workdir": "."});
+    let tool_result_payload = json!({
+        "call_id": "call-1",
+        "tool_name": "shell",
+        "status": "Success",
+        "content": {
+            "command": "ls",
+            "stdout": "Cargo.toml\nsrc",
+            "stderr": "",
+            "exit_code": 0,
+        },
+        "cost_hint": { "output_bytes": 16 },
+        "receipt": {
+            "output_sha256": "deadbeef",
+            "content_sha256": null,
+        },
+    });
+
+    handle
+        .append_typed_event(
+            SessionEventKind::UserMessage {
+                text: "list the files".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("user message");
+    handle
+        .append_typed_event(
+            SessionEventKind::ToolCall {
+                call_id: "call-1".to_string(),
+                tool: "shell".to_string(),
+                arguments: tool_call_args.clone(),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("tool call");
+    handle
+        .append_typed_event(
+            SessionEventKind::ToolResult {
+                output: tool_result_payload.clone(),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("tool result");
+    handle
+        .append_typed_event(
+            SessionEventKind::AssistantCompleted {
+                text: "found Cargo.toml and src".to_string(),
+                response_id: Some("resp-1".to_string()),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("assistant completion");
+    handle.flush_events().expect("flush events");
+
+    let session_dir = store.root().join(handle.session_id());
+    fs::remove_file(session_dir.join("resume_state.json"))
+        .expect("force the events.jsonl replay path");
+
+    let replayed = handle
+        .replay_resume_state()
+        .expect("replay reconstructs from events.jsonl");
+    assert!(replayed.resume_available);
+
+    // `hydrated_transcript` must carry: the user message, the
+    // tool-result card (with the matching tool_call paired in),
+    // and the assistant message.
+    assert_eq!(
+        replayed.hydrated_transcript.len(),
+        3,
+        "expected user + tool-result + assistant entries, got {:#?}",
+        replayed.hydrated_transcript
+    );
+
+    match &replayed.hydrated_transcript[0] {
+        HydratedTranscriptItem::Message { item } => {
+            assert_eq!(item.role, squeezy_core::Role::User);
+            assert_eq!(item.content, "list the files");
+        }
+        other => panic!("entry 0 should be the user message, got {other:?}"),
+    }
+
+    match &replayed.hydrated_transcript[1] {
+        HydratedTranscriptItem::ToolResult { call, result } => {
+            let call = call.as_ref().expect("matching ToolCall must be paired");
+            assert_eq!(call.call_id, "call-1");
+            assert_eq!(call.tool, "shell");
+            assert_eq!(call.arguments, tool_call_args);
+            assert_eq!(
+                result.get("call_id").and_then(|v| v.as_str()),
+                Some("call-1")
+            );
+            assert_eq!(
+                result.get("tool_name").and_then(|v| v.as_str()),
+                Some("shell")
+            );
+            assert_eq!(
+                result.get("status").and_then(|v| v.as_str()),
+                Some("Success")
+            );
+        }
+        other => panic!("entry 1 should be a ToolResult card, got {other:?}"),
+    }
+
+    match &replayed.hydrated_transcript[2] {
+        HydratedTranscriptItem::Message { item } => {
+            assert_eq!(item.role, squeezy_core::Role::Assistant);
+            assert_eq!(item.content, "found Cargo.toml and src");
+        }
+        other => panic!("entry 2 should be the assistant message, got {other:?}"),
+    }
+
+    // Legacy `transcript` field is also still populated — older
+    // binaries that haven't learned about `hydrated_transcript`
+    // continue to read user / assistant messages out of it without
+    // crashing on the missing tool-result card.
+    assert_eq!(replayed.transcript.len(), 2);
+    assert_eq!(replayed.transcript[0].role, squeezy_core::Role::User);
+    assert_eq!(replayed.transcript[1].role, squeezy_core::Role::Assistant);
 }

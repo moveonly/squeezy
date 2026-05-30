@@ -466,6 +466,10 @@ pub enum Assertion {
     /// Substring match — reads the same projection the eval
     /// `frames_tui.jsonl` records.
     TuiFrameContains { text: String },
+    /// Inverse of `TuiFrameContains` — fails when the frame still
+    /// holds `text`. Used to pin "every chip flipped" invariants
+    /// after a bulk toggle.
+    TuiFrameDoesNotContain { text: String },
 }
 
 /// Selector for `Assertion::TuiTranscriptEntry`. Mirrors the way TUI

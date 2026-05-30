@@ -38,10 +38,10 @@ use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
 };
 use squeezy_store::{
-    BugReportBundle, BugReportOptions, CleanupMode, CleanupReport, ResumeItem, SessionEvent,
-    SessionEventKind, SessionHandle, SessionMetadata, SessionQuery, SessionRecord,
-    SessionReplayEvent, SessionReplayEventKind, SessionReplayTape, SessionResumeState,
-    SessionStatus, SessionStore, SqueezyStore,
+    BugReportBundle, BugReportOptions, CleanupMode, CleanupReport, HydratedTranscriptItem,
+    ResumeItem, SessionEvent, SessionEventKind, SessionHandle, SessionMetadata, SessionQuery,
+    SessionRecord, SessionReplayEvent, SessionReplayEventKind, SessionReplayTape,
+    SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -217,6 +217,14 @@ impl ConversationState {
                 .map(llm_input_to_resume_item)
                 .collect(),
             transcript: self.transcript.clone(),
+            // The live `ConversationState` doesn't track the
+            // hydrated-transcript shape because we don't need it
+            // for the LLM context — it's a UI concern. Persist it
+            // empty here; `Agent::resume` will detect "snapshot
+            // has transcript but no hydrated_transcript" and
+            // rebuild via `replay_resume_state` (which walks
+            // events.jsonl and produces both forms in one shot).
+            hydrated_transcript: Vec::new(),
             context_attachments: self.context_attachments.clone(),
             context_compaction: self.context_compaction.clone(),
         }
@@ -1212,13 +1220,21 @@ impl Agent {
         config: AppConfig,
         provider: Arc<dyn LlmProvider>,
         session_id: &str,
-    ) -> squeezy_core::Result<(Self, Vec<TranscriptItem>)> {
+    ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
         let store = SessionStore::open(&config);
         let handle = store.open_session(session_id.to_string());
         // Prefer the durable snapshot, but fall back to replaying
-        // events.jsonl when resume_state.json is missing, corrupt, or
-        // marks the session non-resumable. The event log is appended on
-        // every turn, so it survives a crash that ate the snapshot.
+        // events.jsonl when:
+        //   - `resume_state.json` is missing / corrupt / non-resumable,
+        //   - or the snapshot pre-dates hydrated-transcript support
+        //     (`hydrated_transcript` empty alongside a non-empty
+        //     `transcript`). The live `ConversationState` no longer
+        //     persists `hydrated_transcript` because it's a UI
+        //     concern, so the snapshot only knows the rich shape
+        //     when it came straight from `replay_resume_state`.
+        //     The event log is appended on every turn, so it
+        //     survives both a crash that ate the snapshot AND a
+        //     pre-hydrated binary that wrote a thin one.
         let resume_state = match handle.read_resume_state() {
             Ok(state) if state.resume_available => state,
             _ => match handle.replay_resume_state() {
@@ -1236,7 +1252,31 @@ impl Agent {
             )));
         }
         let metadata = handle.metadata()?;
-        let transcript = resume_state.transcript.clone();
+        // The snapshot is authoritative for the LLM-facing conversation,
+        // but the live `ConversationState` does not track the hydrated
+        // (tool-result-bearing) transcript shape — that's a UI concern.
+        // When the snapshot omits it, run an events.jsonl replay just to
+        // recover the rich shape so the resumed TUI still shows prior
+        // tool-result cards, then discard the rest of the replay state.
+        let hydrated_transcript = if !resume_state.hydrated_transcript.is_empty() {
+            resume_state.hydrated_transcript.clone()
+        } else if !resume_state.transcript.is_empty() {
+            handle
+                .replay_resume_state()
+                .ok()
+                .map(|replay| replay.hydrated_transcript)
+                .filter(|items| !items.is_empty())
+                .unwrap_or_else(|| {
+                    resume_state
+                        .transcript
+                        .iter()
+                        .cloned()
+                        .map(|item| HydratedTranscriptItem::Message { item })
+                        .collect()
+                })
+        } else {
+            Vec::new()
+        };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
         let agent = Self::build(
             config,
@@ -1255,7 +1295,7 @@ impl Agent {
             None,
             Some("session resumed".to_string()),
         );
-        Ok((agent, transcript))
+        Ok((agent, hydrated_transcript))
     }
 
     pub async fn replay_session(
@@ -2063,7 +2103,7 @@ impl Agent {
     pub fn resume_current(
         &mut self,
         session_id: &str,
-    ) -> squeezy_core::Result<Vec<TranscriptItem>> {
+    ) -> squeezy_core::Result<Vec<HydratedTranscriptItem>> {
         let (agent, transcript) =
             Self::resume(self.config.clone(), self.provider.clone(), session_id)?;
         *self = agent;
@@ -2083,7 +2123,7 @@ impl Agent {
     pub async fn switch_session(
         &mut self,
         session_id: &str,
-    ) -> squeezy_core::Result<Vec<TranscriptItem>> {
+    ) -> squeezy_core::Result<Vec<HydratedTranscriptItem>> {
         if let Some(bus) = self.agent_hook_bus.clone()
             && let Decision::Deny { message } = bus.before_session_switch(session_id).await
         {
