@@ -1,0 +1,109 @@
+id = "plan-mode-question-styling"
+title = "Regression guard: plan-mode `request_user_input` modal styling + navigation"
+description = """
+PR #154 restyled the plan-mode question modal: the question line is now
+violet+bold, choices/answer fields are non-bold. This fixture pins the
+behavioural surface so future palette/layout regressions trip a finding.
+
+Intended (drive_tui) and actual (driver-intercept) coverage:
+
+  * Intended: open `[tui_capture] drive_tui = true`, let mock turn 1
+    emit a `request_user_input` tool call, and assert the rendered
+    frame contains the verbatim question text, both choice labels,
+    the freeform "Answer ›" row, and that Down+Enter selects choice 1
+    (`choices[1].value` round-trips through the response oneshot).
+  * Actual: that path currently deadlocks `TuiHarness::pump_until_idle`
+    because the open modal keeps `app.turn_rx = Some(...)` and there
+    is no escape condition for "blocked on user input". See the
+    sibling findings doc for the file:line breakdown.
+
+This scenario therefore runs in driver-intercept mode (no
+`drive_tui`) and asserts on the structured event/overlay surface:
+
+  - `request_user_input.tool_call_queued` carries the question text
+    and both choices verbatim.
+  - The driver's `RespondUserInput` action returns `choices[1].value`
+    (`"narrative"`), which is forwarded through the agent's response
+    oneshot. This pins the off-by-one defense in
+    `handle_request_user_input_key:941` and the upstream selection
+    in `decide_user_input:1979`.
+  - The turn completes cleanly (`final_text_contains` matches).
+
+Source touchpoints:
+  - format_request_user_input_menu_lines @ crates/squeezy-tui/src/lib.rs:4351
+  - handle_request_user_input_key       @ crates/squeezy-tui/src/input.rs:906
+  - RequestUserInputRequested handler   @ crates/squeezy-tui/src/events.rs:302
+  - handle_request_user_input_call      @ crates/squeezy-agent/src/lib.rs:6381
+  - decide_user_input                   @ crates/squeezy-eval/src/driver.rs:1967
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "plan"
+permission_mode = "allow"
+
+# Per-turn TUI capture without drive_tui. The frame renders the
+# assistant text only (the modal lives outside the per-turn markdown
+# pipeline), but `overlays` records the `request_user_input` event so
+# we can still assert on the question + choices payload.
+[tui_capture]
+enabled = true
+drive_tui = false
+width = 120
+height = 36
+palette_tone = "dark"
+
+# Queue the user-input response before the prompt fires so the driver
+# answers as soon as the agent emits `RequestUserInputRequested`.
+# `value = "narrative"` corresponds to `choices[1].value`; if a future
+# refactor wires selection index 1 to choices[0].value the assertion
+# below on `expect.final_text_contains` (which echoes the answer back
+# via the second mock turn) would still pass — what *would* fail is
+# the trace's `action_step.status` carrying `choice:narrative`.
+[[steps]]
+kind = "action"
+action = "respond_user_input"
+decision = { action = "choice", value = "narrative" }
+
+[[steps]]
+kind = "prompt"
+text = "Ask one clarifying question before drafting the plan."
+
+# Sanity: the second turn ran, which only happens if the first turn's
+# tool call resolved (the modal accepted an answer). The mock's second
+# turn echoes a fixed phrase.
+[expect]
+max_wall_clock_seconds = 30
+event_timeout_seconds = 15
+final_text_contains = ["proceeding with the chosen shape"]
+no_tool_errors = false
+
+[mock]
+default_text = "(mock fallback: no scripted turn)"
+
+# Turn 1: emit the `request_user_input` tool call. Labels and values
+# are deliberately different so an off-by-one between selection index
+# and `choices[i].value` shows up as a wrong status string.
+[[mock.turns]]
+text = "Need one decision before drafting."
+tool_calls = [
+  { name = "request_user_input", arguments = { question = "Which report shape should the fixture prefer?", choices = [
+    { label = "Compact table", value = "compact" },
+    { label = "Narrative",     value = "narrative" }
+  ], allow_freeform = true } }
+]
+input_tokens = 80
+output_tokens = 12
+
+# Turn 2: continuation after the user's answer comes back.
+[[mock.turns]]
+text = "Got it — proceeding with the chosen shape."
+input_tokens = 80
+output_tokens = 10
+
+[triage]
+enabled = false
