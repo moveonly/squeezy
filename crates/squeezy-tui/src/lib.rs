@@ -5357,16 +5357,15 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
+    // `model` and `languages` are intentionally omitted: in inline mode
+    // the card lives in terminal scrollback and can't be rewritten, so
+    // both would freeze on a model change or filesystem edit. The live
+    // status line (`provider-and-model`, `reasoning-effort`, `languages`)
+    // is the source of truth for those instead.
     vec![
         startup_phase_strip(card_width, app.version),
         Line::from(""),
-        startup_meta_row(
-            "model",
-            format!("{}:{}", app.provider_name, app.model),
-            card_width,
-        ),
         startup_meta_row("directory", app.directory.clone(), card_width),
-        startup_meta_row("languages", app.language_summary.clone(), card_width),
     ]
 }
 

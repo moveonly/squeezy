@@ -4567,7 +4567,9 @@ fn render_uses_two_line_status_footer() {
 
     let output = render_to_string(&app, 140, 18);
     assert!(output.contains("Squeezy v"), "{output}");
-    assert!(output.contains("openai:gpt-test"), "{output}");
+    // model/provider used to ride in the banner; it moved to the live
+    // status line (`provider-and-model` item) so changing models surfaces
+    // without a restart. This test now exercises the footer rows only.
     assert!(output.contains("dir "), "{output}");
     assert!(output.contains("feature"), "{output}");
     assert!(
@@ -4612,7 +4614,8 @@ fn render_keeps_header_when_transcript_has_content() {
 
     let output = render_to_string(&app, 120, 24);
     assert!(output.contains("Squeezy v"), "{output}");
-    assert!(output.contains("scripted:gpt-test"), "{output}");
+    // provider:model moved out of the banner into the live status line;
+    // see `render_uses_two_line_status_footer` for the reason.
     assert!(output.contains("hello"), "{output}");
     assert!(output.contains("● answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
@@ -4796,9 +4799,12 @@ fn active_prompt_keeps_one_blank_line_after_header() {
 
     let output = render_to_string(&app, 100, 16);
     let lines = output.lines().collect::<Vec<_>>();
+    // `directory` is now the last row of the startup card (model and
+    // languages moved to the live status line so they stay in sync
+    // with config edits).
     let header_bottom = lines
         .iter()
-        .rposition(|line| line.contains("languages"))
+        .rposition(|line| line.contains("directory"))
         .expect("header bottom");
 
     assert!(
