@@ -29,6 +29,17 @@ const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
+/// Anthropic's hard floor for `thinking.budget_tokens` — the API rejects
+/// any request below this with `invalid_request_error`.
+const ANTHROPIC_MIN_THINKING_BUDGET_TOKENS: u64 = 1024;
+
+/// Tokens we reserve for the assistant's reply on top of the thinking
+/// budget. Anthropic requires `max_tokens > budget_tokens`; a 1024-token
+/// reply headroom keeps the assistant from being truncated immediately
+/// after thinking completes while still leaving thinking the bulk of
+/// the budget.
+const ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS: u64 = 1024;
+
 /// Identity preamble Anthropic requires on OAuth-driven requests so
 /// the call counts against the Claude Pro/Max subscription quota
 /// rather than failing the OAuth quota check. Anthropic pins the
@@ -136,12 +147,33 @@ impl AnthropicProvider {
             && crate::capabilities_for("anthropic", &request.model)
                 .is_some_and(|caps| caps.reasoning_effort)
         {
-            let budget =
-                u64::from(effort.thinking_budget_tokens()).min(max_tokens.saturating_sub(1));
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            });
+            // Anthropic requires `budget_tokens >= 1024` AND
+            // `max_tokens > budget_tokens`. When `max_output_tokens` is
+            // too small to satisfy both at once, emitting `thinking`
+            // earns a hard 400 on every turn. Skip the block in that
+            // case and warn so the operator can either raise
+            // `max_output_tokens` or unset `reasoning_effort`.
+            let ceiling = max_tokens.saturating_sub(ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS);
+            if ceiling >= ANTHROPIC_MIN_THINKING_BUDGET_TOKENS {
+                let budget = u64::from(effort.thinking_budget_tokens())
+                    .min(ceiling)
+                    .max(ANTHROPIC_MIN_THINKING_BUDGET_TOKENS);
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            } else {
+                tracing::warn!(
+                    provider = "anthropic",
+                    model = %request.model,
+                    max_output_tokens = max_tokens,
+                    min_required = ANTHROPIC_MIN_THINKING_BUDGET_TOKENS
+                        + ANTHROPIC_THINKING_REPLY_HEADROOM_TOKENS,
+                    "anthropic thinking disabled: max_output_tokens too small to satisfy \
+                     thinking.budget_tokens >= 1024 with a reply headroom; raise \
+                     max_output_tokens or clear reasoning_effort to silence this warning"
+                );
+            }
         }
         if !request.tools.is_empty() {
             let mut tool_values: Vec<Value> = request
