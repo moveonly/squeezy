@@ -3400,7 +3400,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
-        app.status = "nothing expandable yet · /expand all also works".to_string();
+        app.status = "nothing to expand".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -3504,13 +3504,20 @@ fn resolve_toggle_target(transcript: &[TranscriptEntry], index: usize) -> usize 
     cursor
 }
 
+/// Ctrl+O is bound to `ExpandSelectedTranscriptEntry` and must never
+/// collapse an already-expanded entry when the user has not explicitly
+/// selected one. Restricting this picker to `collapsed = true` entries
+/// keeps an OpenAI turn that emitted no reasoning summary from being
+/// silently folded by a press the user meant as "show me more". The
+/// caller treats `None` as "nothing to expand" and surfaces a status
+/// hint rather than falling through to an expand-by-collapsing footgun.
 fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
     let show_reasoning = app.show_reasoning_usage;
     app.transcript
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, entry)| entry_targets_toggle(entry, show_reasoning))
+        .find(|(_, entry)| entry.collapsed && entry_targets_toggle(entry, show_reasoning))
         .map(|(index, _)| index)
         .map(|index| resolve_toggle_target(&app.transcript, index))
 }
@@ -11411,9 +11418,9 @@ impl TranscriptEntry {
                 // `format_assistant_message_entry`). When the
                 // assistant text is short but the embedded reasoning is
                 // multi-line, the entry must still be toggleable —
-                // otherwise the picker rejects it and Ctrl-O / Ctrl-E
-                // surface "nothing expandable yet" even though the
-                // chip is visible on screen.
+                // otherwise the picker rejects it and the toggle paths
+                // surface a no-op even though the chip is visible on
+                // screen.
                 if let Some(snapshot) = item.reasoning.as_deref()
                     && text_has_collapsible_content(&snapshot.display_text)
                 {
