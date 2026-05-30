@@ -663,12 +663,9 @@ fn maybe_pick_resume_session(
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
-    let choice = resume_picker::run_picker(
-        &mut terminal.terminal,
-        candidates,
-        config.workspace_root.clone(),
-    )
-    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    let choice =
+        resume_picker::run_picker(terminal.term(), candidates, config.workspace_root.clone())
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         // `branch_tip` is captured by the picker but not yet wired through
@@ -11544,8 +11541,23 @@ impl From<TuiAlternateScreen> for TerminalMode {
 }
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<TerminalWriter>>,
+    /// `Option` so we can drop and rebuild the ratatui `Terminal`
+    /// at runtime when swapping between inline-mode and the
+    /// alt-screen buffer for a full-terminal overlay. The field is
+    /// `Some` everywhere except inside the brief swap window in
+    /// `sync_overlay_screen`; the `term`/`term_opt` helpers below
+    /// give the rest of the impl a clean accessor.
+    terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
+    /// User-configured mode (`Inline` or `AlternateScreen`). Stays
+    /// constant for the session — overlay-screen swaps only flip
+    /// `overlay_screen_active`, not `mode`.
     mode: TerminalMode,
+    /// True while the inline guard has swapped into the alt-screen
+    /// buffer for a transcript overlay. The contained `terminal`
+    /// is a fullscreen ratatui `Terminal` during that window.
+    /// Always `false` when `mode == AlternateScreen` (that mode is
+    /// already fullscreen — no swap needed).
+    overlay_screen_active: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
@@ -11554,6 +11566,14 @@ struct TerminalGuard {
     /// terminal-capability detection; consulted around every frame
     /// draw to wrap output in Begin/End Synchronized Update sequences.
     synchronized_output: bool,
+}
+
+impl TerminalGuard {
+    fn term(&mut self) -> &mut Terminal<CrosstermBackend<TerminalWriter>> {
+        self.terminal
+            .as_mut()
+            .expect("terminal taken during overlay-screen swap")
+    }
 }
 
 impl TerminalGuard {
@@ -11631,8 +11651,9 @@ impl TerminalGuard {
         }
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
-            terminal,
+            terminal: Some(terminal),
             mode,
+            overlay_screen_active: false,
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
@@ -11650,7 +11671,7 @@ impl TerminalGuard {
     /// user just stares at empty space until the main loop starts.
     fn draw_startup_placeholder(&mut self, message: &str) -> Result<()> {
         let message = message.to_string();
-        self.terminal
+        self.term()
             .draw(|frame| {
                 let area = frame.area();
                 if area.width == 0 || area.height == 0 {
@@ -11679,7 +11700,7 @@ impl TerminalGuard {
             })
             .map(|_| ())
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        let _ = self.terminal.backend_mut().flush();
+        let _ = self.term().backend_mut().flush();
         Ok(())
     }
 
@@ -11689,15 +11710,32 @@ impl TerminalGuard {
             self.wipe_inline_viewport_for_resize()?;
         }
         self.apply_terminal_title(app)?;
+        // Promote into / demote out of the alt-screen buffer based on
+        // whether the user has the transcript overlay open. No-op when
+        // `mode == AlternateScreen` (the whole terminal is already
+        // fullscreen there). Must run BEFORE we borrow the terminal
+        // for the draw, because it swaps `self.terminal`.
+        self.sync_overlay_screen(app.transcript_overlay.is_some())?;
+        // After the swap, decide which render path to take. Inline
+        // mode + no overlay = `render_inline` (small viewport painted
+        // over scrollback). Alt-screen mode OR overlay-screen swap =
+        // `render` (fullscreen draw, with the overlay branch picking
+        // the right widget).
+        let use_fullscreen_render =
+            self.mode == TerminalMode::AlternateScreen || self.overlay_screen_active;
+        if !use_fullscreen_render {
+            self.flush_history(app)?;
+        }
+        let synchronized = self.synchronized_output;
+        let terminal = self.term();
         // DEC 2026 Begin Synchronized Update bracket. Writing it through
         // the backend buffer puts it ahead of the cell-diff bytes that
         // `terminal.draw` is about to emit; capable terminals start
         // buffering at parse time and commit the whole frame when they
         // see the matching End Synchronized Update written below.
         // Unsupported terminals silently ignore both sequences.
-        if self.synchronized_output {
-            let _ = self
-                .terminal
+        if synchronized {
+            let _ = terminal
                 .backend_mut()
                 .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
         }
@@ -11705,27 +11743,95 @@ impl TerminalGuard {
         // which would block the post-draw `backend_mut` reborrow below.
         // Collapse to `Result<(), io::Error>` immediately so the borrow
         // ends before we reach for the backend again.
-        let draw_outcome: io::Result<()> = match self.mode {
-            TerminalMode::Inline => {
-                self.flush_history(app)?;
-                self.terminal
-                    .draw(|frame| render_inline(frame, app))
-                    .map(|_| ())
-            }
-            TerminalMode::AlternateScreen => {
-                self.terminal.draw(|frame| render(frame, app)).map(|_| ())
-            }
+        let draw_outcome: io::Result<()> = if use_fullscreen_render {
+            terminal.draw(|frame| render(frame, app)).map(|_| ())
+        } else {
+            terminal.draw(|frame| render_inline(frame, app)).map(|_| ())
         };
         // Always emit ESU (even when draw fails) so the terminal does
         // not stay parked in a buffered-update state — the spec lets a
         // capable terminal time the bracket out on its own, but closing
         // it promptly keeps the visible frame in sync with our state.
-        if self.synchronized_output {
-            let backend = self.terminal.backend_mut();
+        if synchronized {
+            let backend = terminal.backend_mut();
             let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
             let _ = backend.flush();
         }
         draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
+    }
+
+    /// Reconcile the alt-screen-for-overlay swap state with the
+    /// caller's request. No-op when we're already in alt-screen mode
+    /// for the whole session, or when the requested state already
+    /// matches. Otherwise:
+    ///
+    /// - **Inline → overlay**: drop the inline `Terminal` so its
+    ///   writer releases stdout, send `EnterAlternateScreen`
+    ///   directly, then build a fresh fullscreen `Terminal` over a
+    ///   new stdout writer. The original inline-mode terminal
+    ///   scrollback is preserved by the terminal emulator's main
+    ///   buffer; the overlay paints into the separate alt-screen
+    ///   buffer.
+    /// - **Overlay → inline**: reverse — drop the alt-screen
+    ///   `Terminal`, send `LeaveAlternateScreen` (which restores the
+    ///   main buffer with all the pre-overlay scrollback intact),
+    ///   then build a fresh `Viewport::Inline` `Terminal` to resume
+    ///   painting the bottom-anchored TUI viewport.
+    fn sync_overlay_screen(&mut self, want_overlay_full: bool) -> Result<()> {
+        if self.mode != TerminalMode::Inline {
+            return Ok(());
+        }
+        match (self.overlay_screen_active, want_overlay_full) {
+            (false, true) => self.enter_overlay_screen(),
+            (true, false) => self.leave_overlay_screen(),
+            _ => Ok(()),
+        }
+    }
+
+    fn enter_overlay_screen(&mut self) -> Result<()> {
+        // Drop the inline ratatui Terminal first so its
+        // CrosstermBackend's TerminalWriter releases stdout — we
+        // need exclusive write access to send the alt-screen-enter
+        // escape sequence before the fullscreen Terminal takes over.
+        drop(self.terminal.take());
+        let mut writer = TerminalWriter::from_env(io::stdout());
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        // Drop the temporary writer so stdout is free again before
+        // the new Terminal grabs it.
+        drop(writer);
+        let writer = TerminalWriter::from_env(io::stdout());
+        let backend = CrosstermBackend::new(writer);
+        let terminal =
+            Terminal::new(backend).map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.terminal = Some(terminal);
+        self.overlay_screen_active = true;
+        Ok(())
+    }
+
+    fn leave_overlay_screen(&mut self) -> Result<()> {
+        drop(self.terminal.take());
+        let mut writer = TerminalWriter::from_env(io::stdout());
+        execute!(writer, LeaveAlternateScreen)
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        drop(writer);
+        let writer = TerminalWriter::from_env(io::stdout());
+        let backend = CrosstermBackend::new(writer);
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+            },
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.terminal = Some(terminal);
+        self.overlay_screen_active = false;
+        Ok(())
     }
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
@@ -11734,7 +11840,7 @@ impl TerminalGuard {
         if desired == app.last_terminal_title {
             return Ok(());
         }
-        let backend = self.terminal.backend_mut();
+        let backend = self.term().backend_mut();
         match &desired {
             Some(title) => write!(backend, "\x1b]0;{title}\x07"),
             None => write!(backend, "\x1b]0;\x07"),
@@ -11753,27 +11859,28 @@ impl TerminalGuard {
     /// scroll to pull up. Alternate-screen mode handles resize cleanly via
     /// the terminal itself, so the work is inline-only.
     fn wipe_inline_viewport_for_resize(&mut self) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
+        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
             return Ok(());
         }
-        let viewport_top = self.terminal.get_frame().area().y;
+        let viewport_top = self.term().get_frame().area().y;
+        let terminal = self.term();
         execute!(
-            self.terminal.backend_mut(),
+            terminal.backend_mut(),
             MoveTo(0, viewport_top),
             Clear(ClearType::FromCursorDown)
         )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        self.terminal
+        terminal
             .clear()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
+        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
             return Ok(());
         }
         let width = self
-            .terminal
+            .term()
             .size()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?
             .width;
@@ -11793,7 +11900,7 @@ impl TerminalGuard {
             return Ok(());
         }
         let height = visual_line_count(&lines, width);
-        self.terminal
+        self.term()
             .insert_before(height, |buffer| render_lines_to_buffer(buffer, lines))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
@@ -11802,10 +11909,23 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        // If we exited while the overlay-screen swap was active,
+        // leave the alt-screen buffer first so the user's main-buffer
+        // scrollback (the inline conversation history) is what stays
+        // visible after the process tears down.
+        if self.overlay_screen_active
+            && let Some(terminal) = self.terminal.as_mut()
+        {
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            self.overlay_screen_active = false;
+        }
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
         match self.mode {
             TerminalMode::Inline => {
                 let _ = execute!(
-                    self.terminal.backend_mut(),
+                    terminal.backend_mut(),
                     PopKeyboardEnhancementFlags,
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
@@ -11819,7 +11939,7 @@ impl Drop for TerminalGuard {
             }
             TerminalMode::AlternateScreen => {
                 let _ = execute!(
-                    self.terminal.backend_mut(),
+                    terminal.backend_mut(),
                     PopKeyboardEnhancementFlags,
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
@@ -11834,9 +11954,9 @@ impl Drop for TerminalGuard {
                 );
             }
         }
-        let _ = self.terminal.show_cursor();
+        let _ = terminal.show_cursor();
         if let Some(hint) = &self.exit_hint {
-            let _ = writeln!(self.terminal.backend_mut(), "{hint}");
+            let _ = writeln!(terminal.backend_mut(), "{hint}");
         }
     }
 }
