@@ -48,14 +48,15 @@ impl TuiHarness {
         height: u16,
     ) -> Result<Self> {
         apply_theme_overrides(config.tui.theme);
+        // Mirror production (`crates/squeezy-tui/src/lib.rs:525`): the
+        // banner / status-line provider label comes from the live
+        // provider, not a harness literal. `Agent::provider_name()` is
+        // defined as `self.provider.name()`, so reading it directly off
+        // the trait keeps eval and production in lock-step.
+        let provider_name = provider.name();
         let agent = Agent::new(config.clone(), provider);
-        let app = TuiApp::new_with_clipboard(
-            "eval-harness",
-            &config,
-            mode,
-            None,
-            Box::new(NoopClipboard),
-        );
+        let app =
+            TuiApp::new_with_clipboard(provider_name, &config, mode, None, Box::new(NoopClipboard));
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)
             .map_err(|e| SqueezyError::Terminal(format!("test backend init: {e}")))?;
@@ -318,5 +319,46 @@ struct NoopClipboard;
 impl Clipboard for NoopClipboard {
     fn copy_text(&mut self, _text: &str) -> std::result::Result<(), String> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use squeezy_llm::{LlmProvider, LlmRequest, LlmStream};
+    use tokio_util::sync::CancellationToken;
+
+    /// Minimal provider stub: returns its configured name and never
+    /// streams. Lets the harness build without a live LLM, so the test
+    /// can render a frame and read the banner-derived model row.
+    struct NamedProvider(&'static str);
+
+    impl LlmProvider for NamedProvider {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+            use futures_util::stream;
+            Box::pin(stream::iter(Vec::new()))
+        }
+    }
+
+    #[test]
+    fn harness_banner_uses_real_provider_name_not_eval_harness() {
+        let mut config = AppConfig::default();
+        config.model = "test-model".to_string();
+        let provider: Arc<dyn LlmProvider> = Arc::new(NamedProvider("anthropic"));
+        let mut harness = TuiHarness::new(config, SessionMode::default(), provider, 120, 36)
+            .expect("build TuiHarness");
+        let snapshot = harness.render_frame().expect("render frame");
+        let plain = snapshot.plain_text;
+        assert!(
+            plain.contains("anthropic:test-model"),
+            "expected banner to contain `anthropic:test-model`, frame was:\n{plain}"
+        );
+        assert!(
+            !plain.contains("eval-harness:"),
+            "banner still carries the harness literal `eval-harness:`; frame was:\n{plain}"
+        );
     }
 }
