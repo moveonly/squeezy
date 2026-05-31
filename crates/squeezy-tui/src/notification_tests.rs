@@ -75,10 +75,10 @@ fn identical_messages_coalesce_even_when_non_adjacent() {
 
 #[test]
 fn severity_color_matches_palette() {
-    assert_eq!(Severity::Info.color(), AMBER);
-    assert_eq!(Severity::Success.color(), SUCCESS_GREEN);
-    assert_eq!(Severity::Warn.color(), GOLD);
-    assert_eq!(Severity::Error.color(), ERROR_RED);
+    assert_eq!(Severity::Info.color(), crate::render::theme::accent());
+    assert_eq!(Severity::Success.color(), crate::render::theme::green());
+    assert_eq!(Severity::Warn.color(), crate::render::theme::secondary());
+    assert_eq!(Severity::Error.color(), crate::render::theme::red());
 }
 
 // ---- DesktopNotifier byte-sequence acceptance ----------------------------

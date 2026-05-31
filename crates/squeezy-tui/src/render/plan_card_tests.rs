@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::proposed_plan::{self, PlanMeta};
-use crate::render::palette;
 
 const TEST_SESSION: &str = "card-tests";
 
@@ -75,7 +74,10 @@ fn render_plan_card_uses_amber_box_not_full_amber_body() {
         .expect("body line");
 
     assert!(top.starts_with("╭─ Plan "), "{top}");
-    assert_eq!(lines[0].spans[0].style.fg, Some(palette::AMBER));
+    assert_eq!(
+        lines[0].spans[0].style.fg,
+        Some(crate::render::theme::accent())
+    );
     assert!(
         lines
             .iter()
@@ -87,7 +89,8 @@ fn render_plan_card_uses_amber_box_not_full_amber_body() {
     assert!(
         body.spans
             .iter()
-            .any(|span| span.content.contains("Context") && span.style.fg != Some(palette::AMBER)),
+            .any(|span| span.content.contains("Context")
+                && span.style.fg != Some(crate::render::theme::accent())),
         "body text should not be painted amber: {body:?}"
     );
     assert!(

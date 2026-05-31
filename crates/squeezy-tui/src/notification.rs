@@ -19,8 +19,6 @@ use std::{
 use ratatui::style::Color;
 use squeezy_core::NotificationMethod;
 
-use crate::render::palette::{AMBER, ERROR_RED, GOLD, QUIET, SUCCESS_GREEN};
-
 /// Visual severity. Drives the fg color used to render the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Severity {
@@ -33,10 +31,10 @@ pub(crate) enum Severity {
 impl Severity {
     pub(crate) fn color(self) -> Color {
         match self {
-            Self::Info => AMBER,
-            Self::Success => SUCCESS_GREEN,
-            Self::Warn => GOLD,
-            Self::Error => ERROR_RED,
+            Self::Info => crate::render::theme::accent(),
+            Self::Success => crate::render::theme::green(),
+            Self::Warn => crate::render::theme::secondary(),
+            Self::Error => crate::render::theme::red(),
         }
     }
 
@@ -234,9 +232,6 @@ impl NotificationQueue {
         self.rotate_every = every;
     }
 }
-
-#[allow(dead_code)]
-const _: Color = QUIET;
 
 /// Emit OSC 9 / BEL surfaces for off-tab attention events (turn-complete,
 /// approval-pending). The in-terminal `NotificationQueue` already covers

@@ -1,233 +1,511 @@
-//! Token-based theme schema with `@token.name` var-indirection.
+//! Runtime TUI theme registry.
 //!
-//! A `Theme` is a flat `BTreeMap` keyed by dotted token name (`ui.background`,
-//! `syntax.keyword`, `palette.accent`, …). Each value is either a concrete
-//! [`ratatui::style::Color`] or a string `Ref` pointing at another token,
-//! which lets palettes compose without duplicating RGB values.
-//!
-//! The default theme ships ~40 named tokens whose colors come straight from
-//! the existing 3-tone palette in `super::palette`, so themed renderers
-//! migrated onto this schema produce byte-identical output until a
-//! follow-up commit actually wires it into the render path.
-//!
-//! `load_from_toml` overlays a user file (typically `~/.squeezy/theme.toml`)
-//! on top of the default tokens. The expected document shape is flat
-//! dotted-key TOML — either grouped via headers or written as compound keys.
-//! Compound keys must appear before any section header so they bind to the
-//! document root rather than the active table:
-//!
-//! ```toml
-//! palette.accent = "@palette.cyan"
-//!
-//! [ui]
-//! background = "#101014"
-//! ```
-//!
-//! Values that begin with `@` are stored as `Ref`s and resolve through
-//! [`Theme::resolve`] with cycle detection. Values starting with `#` are
-//! parsed as `#rrggbb` hex. Other strings are ignored so user files can
-//! carry comments or future metadata fields without parse errors.
+//! All user-facing colors should flow through this module. Builtin themes
+//! provide a full token table; user settings overlay RGB triples onto those
+//! tokens and the active table is swapped atomically when `/theme` or the
+//! config screen changes a theme.
 
-// Scaffolding-only module: nothing in the crate consumes these items yet.
-// The follow-up commit that wires the schema into the render path removes
-// this allow. Keep this allow narrow to this module so the rest of the
-// `render` tree still benefits from dead-code linting.
-#![allow(dead_code)]
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::sync::{
+    OnceLock, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use ratatui::style::Color;
-use toml_edit::{DocumentMut, Item, Value};
+use squeezy_core::{
+    AppConfig, BUILTIN_TUI_THEME_NAMES, DEFAULT_TUI_THEME_NAME, TUI_THEME_COLOR_TOKENS, TuiRgb,
+    is_builtin_tui_theme_name,
+};
 
-use super::palette;
-
-/// One entry in a [`Theme`]: either a concrete color or a textual reference
-/// to another token name (`palette.accent` -> `Ref("palette.amber")`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TokenValue {
-    Color(Color),
-    Ref(String),
+pub(crate) mod token {
+    pub(crate) const PALETTE_ACCENT: &str = "palette.accent";
+    pub(crate) const PALETTE_SECONDARY: &str = "palette.secondary";
+    pub(crate) const PALETTE_RED: &str = "palette.red";
+    pub(crate) const PALETTE_GREEN: &str = "palette.green";
+    pub(crate) const PALETTE_YELLOW: &str = "palette.yellow";
+    pub(crate) const PALETTE_BLUE: &str = "palette.blue";
+    pub(crate) const PALETTE_MAGENTA: &str = "palette.magenta";
+    pub(crate) const PALETTE_CYAN: &str = "palette.cyan";
+    pub(crate) const UI_BACKGROUND: &str = "ui.background";
+    pub(crate) const UI_FOREGROUND: &str = "ui.foreground";
+    pub(crate) const UI_BORDER: &str = "ui.border";
+    pub(crate) const UI_MUTED: &str = "ui.muted";
+    pub(crate) const UI_QUIET: &str = "ui.quiet";
+    pub(crate) const UI_FOOTER: &str = "ui.footer";
+    pub(crate) const UI_SURFACE: &str = "ui.surface";
+    pub(crate) const UI_PROMPT_BG: &str = "ui.prompt_bg";
+    pub(crate) const SYNTAX_KEYWORD: &str = "syntax.keyword";
+    pub(crate) const SYNTAX_STRING: &str = "syntax.string";
+    pub(crate) const SYNTAX_COMMENT: &str = "syntax.comment";
+    pub(crate) const SYNTAX_LITERAL: &str = "syntax.literal";
+    pub(crate) const SYNTAX_FUNCTION: &str = "syntax.function";
+    pub(crate) const SYNTAX_TYPE: &str = "syntax.type";
+    pub(crate) const SYNTAX_OPERATOR: &str = "syntax.operator";
+    pub(crate) const SYNTAX_VARIABLE: &str = "syntax.variable";
+    pub(crate) const STATUS_OK: &str = "status.ok";
+    pub(crate) const STATUS_WARN: &str = "status.warn";
+    pub(crate) const STATUS_ERR: &str = "status.err";
+    pub(crate) const STATUS_INFO: &str = "status.info";
+    pub(crate) const TRANSCRIPT_USER: &str = "transcript.user";
+    pub(crate) const TRANSCRIPT_ASSISTANT: &str = "transcript.assistant";
+    pub(crate) const TRANSCRIPT_TOOL: &str = "transcript.tool";
+    pub(crate) const TRANSCRIPT_SYSTEM: &str = "transcript.system";
+    pub(crate) const DIFF_ADDED: &str = "diff.added";
+    pub(crate) const DIFF_REMOVED: &str = "diff.removed";
+    pub(crate) const DIFF_ADDED_BG: &str = "diff.added_bg";
+    pub(crate) const DIFF_REMOVED_BG: &str = "diff.removed_bg";
+    pub(crate) const DIFF_CONTEXT: &str = "diff.context";
+    pub(crate) const DIFF_HUNK: &str = "diff.hunk";
+    pub(crate) const EFFECTS_SHIMMER: &str = "effects.shimmer";
+    pub(crate) const SEPARATOR_PRIMARY: &str = "separator.primary";
+    pub(crate) const INLINE_CODE: &str = "inline.code";
+    pub(crate) const INLINE_MODEL: &str = "inline.model";
+    pub(crate) const PATH_HINT: &str = "path.hint";
 }
 
-/// A flat, name-keyed token table. Built from [`Theme::default`] plus an
-/// optional user overlay loaded by [`Theme::load_from_toml`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Theme {
-    tokens: BTreeMap<String, TokenValue>,
+pub(crate) struct Theme {
+    pub(crate) name: String,
+    colors: BTreeMap<String, TuiRgb>,
 }
 
 impl Theme {
-    /// Resolve a token name to a concrete color, walking `Ref` chains until
-    /// either a `Color` is reached or a cycle / missing target is detected
-    /// (in which case the function returns `None`).
-    pub fn resolve(&self, key: &str) -> Option<Color> {
-        let mut visited = BTreeSet::new();
-        let mut current = key;
-        loop {
-            if !visited.insert(current.to_string()) {
-                return None;
+    pub(crate) fn resolve(&self, token: &str) -> Option<TuiRgb> {
+        self.colors.get(token).copied()
+    }
+
+    pub(crate) fn color(&self, token: &str) -> Color {
+        self.resolve(token)
+            .map(|[r, g, b]| Color::Rgb(r, g, b))
+            .unwrap_or(Color::Reset)
+    }
+
+    pub(crate) fn colors(&self) -> &BTreeMap<String, TuiRgb> {
+        &self.colors
+    }
+}
+
+static ACTIVE_THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
+static THEME_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn active_theme() -> &'static RwLock<Theme> {
+    ACTIVE_THEME.get_or_init(|| RwLock::new(builtin_theme(DEFAULT_TUI_THEME_NAME)))
+}
+
+pub(crate) fn theme_generation() -> u64 {
+    THEME_GENERATION.load(Ordering::Relaxed)
+}
+
+pub(crate) fn bump_theme_generation() {
+    THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn set_active_theme(config: &AppConfig) {
+    let next = resolve_theme(config, &config.tui.theme);
+    if let Ok(mut active) = active_theme().write()
+        && *active != next
+    {
+        *active = next;
+        bump_theme_generation();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn current_theme_name() -> String {
+    active_theme()
+        .read()
+        .map(|theme| theme.name.clone())
+        .unwrap_or_else(|_| DEFAULT_TUI_THEME_NAME.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn current_theme() -> Theme {
+    active_theme()
+        .read()
+        .map(|theme| theme.clone())
+        .unwrap_or_else(|_| builtin_theme(DEFAULT_TUI_THEME_NAME))
+}
+
+pub(crate) fn resolve_theme(config: &AppConfig, name: &str) -> Theme {
+    let canonical = squeezy_core::normalize_tui_theme_name(name)
+        .unwrap_or_else(|| DEFAULT_TUI_THEME_NAME.to_string());
+    let base_name = if is_builtin_tui_theme_name(&canonical) {
+        canonical.as_str()
+    } else {
+        DEFAULT_TUI_THEME_NAME
+    };
+    let mut theme = builtin_theme(base_name);
+    theme.name = canonical.clone();
+    if let Some(overrides) = config.tui.themes.get(&canonical) {
+        for (token, rgb) in &overrides.colors {
+            if squeezy_core::is_tui_theme_color_token(token) {
+                theme.colors.insert(token.clone(), *rgb);
             }
-            match self.tokens.get(current)? {
-                TokenValue::Color(color) => return Some(*color),
-                TokenValue::Ref(next) => current = next.as_str(),
-            }
         }
     }
-
-    /// Load a theme by overlaying `path` on top of [`Theme::default`].
-    /// File I/O errors propagate as-is; TOML parse failures are wrapped as
-    /// [`io::ErrorKind::InvalidData`] so callers only have to handle one
-    /// error type.
-    pub fn load_from_toml(path: &Path) -> io::Result<Self> {
-        let src = fs::read_to_string(path)?;
-        let doc: DocumentMut = src
-            .parse()
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-
-        let mut theme = Self::default();
-        collect_tokens("", doc.as_table(), &mut theme.tokens);
-        Ok(theme)
-    }
-
-    /// Direct token insertion. Intended for tests and for tools that want
-    /// to build a theme programmatically without going through TOML.
-    #[cfg(test)]
-    pub fn insert(&mut self, key: impl Into<String>, value: TokenValue) {
-        self.tokens.insert(key.into(), value);
-    }
-
-    /// Token count — useful for sanity checks in tests and tooling.
-    pub fn len(&self) -> usize {
-        self.tokens.len()
-    }
-
-    /// `true` when the theme has no tokens. Provided alongside [`Self::len`]
-    /// to satisfy clippy's `len_without_is_empty` lint.
-    pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
-    }
+    theme
 }
 
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            tokens: default_tokens(),
+pub(crate) fn available_theme_names(config: &AppConfig) -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_TUI_THEME_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for name in config.tui.themes.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
         }
     }
+    names
 }
 
-fn default_tokens() -> BTreeMap<String, TokenValue> {
-    use TokenValue::{Color as C, Ref as R};
-
-    // ~40 tokens grouped by surface. Concrete colors come from the existing
-    // palette so behavior is preserved when this schema is later wired into
-    // the render path. A handful of `Ref`s (e.g. `palette.accent`) seed the
-    // var-indirection so downstream surfaces can rebind the accent without
-    // re-specifying every token that depends on it.
-    let entries: [(&str, TokenValue); 40] = [
-        // Palette primitives — the named colors a theme overlay is most
-        // likely to retarget.
-        ("palette.red", C(palette::ERROR_RED)),
-        ("palette.green", C(palette::SUCCESS_GREEN)),
-        ("palette.yellow", C(palette::GOLD)),
-        ("palette.blue", C(palette::SEPARATOR_BLUE)),
-        ("palette.magenta", C(palette::MODE_PURPLE)),
-        ("palette.cyan", C(palette::ACCENT_CYAN)),
-        ("palette.amber", C(palette::AMBER)),
-        ("palette.gold", C(palette::GOLD)),
-        ("palette.accent", R("palette.amber".into())),
-        ("palette.secondary", R("palette.gold".into())),
-        // UI chrome.
-        ("ui.background", C(Color::Rgb(24, 24, 28))),
-        ("ui.foreground", C(Color::Rgb(220, 220, 220))),
-        ("ui.border", C(Color::DarkGray)),
-        ("ui.muted", C(palette::QUIET)),
-        ("ui.quiet", C(palette::QUIET)),
-        ("ui.footer", C(palette::QUIET)),
-        ("ui.surface", C(palette::PROMPT_BG)),
-        ("ui.prompt_bg", C(palette::PROMPT_BG)),
-        // Syntax highlighting.
-        ("syntax.keyword", R("palette.magenta".into())),
-        ("syntax.string", R("palette.green".into())),
-        ("syntax.comment", R("ui.muted".into())),
-        ("syntax.literal", R("palette.yellow".into())),
-        ("syntax.function", R("palette.blue".into())),
-        ("syntax.type", R("palette.cyan".into())),
-        ("syntax.operator", R("ui.foreground".into())),
-        ("syntax.variable", R("palette.amber".into())),
-        // Status callouts.
-        ("status.ok", R("palette.green".into())),
-        ("status.warn", R("palette.yellow".into())),
-        ("status.err", R("palette.red".into())),
-        ("status.info", R("palette.blue".into())),
-        // Transcript roles.
-        ("transcript.user", R("palette.accent".into())),
-        ("transcript.assistant", R("ui.foreground".into())),
-        ("transcript.tool", R("ui.muted".into())),
-        ("transcript.system", R("palette.magenta".into())),
-        // Diff surfaces.
-        ("diff.added", C(palette::DIFF_ADD_FG)),
-        ("diff.removed", C(palette::DIFF_DEL_FG)),
-        ("diff.context", R("ui.muted".into())),
-        ("diff.hunk", C(palette::DIFF_HUNK_FG)),
-        // Misc effects.
-        ("shimmer.highlight", C(palette::WORKING_SHIMMER_HIGHLIGHT)),
-        ("separator.primary", R("palette.blue".into())),
-    ];
-
-    entries
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect()
+pub(crate) fn theme_exists(config: &AppConfig, name: &str) -> bool {
+    let Some(name) = squeezy_core::normalize_tui_theme_name(name) else {
+        return false;
+    };
+    is_builtin_tui_theme_name(&name) || config.tui.themes.contains_key(&name)
 }
 
-/// Walk a `toml_edit::Table`, flattening dotted-key paths back into the
-/// token namespace used by [`Theme`] and overwriting matching entries. We
-/// only descend into `Item::Table`; inline tables and arrays are ignored so
-/// user files can hold scratch keys without confusing the loader.
-fn collect_tokens(prefix: &str, table: &toml_edit::Table, out: &mut BTreeMap<String, TokenValue>) {
-    for (key, item) in table.iter() {
-        let path = if prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        match item {
-            Item::Table(sub) => collect_tokens(&path, sub, out),
-            Item::Value(Value::String(s)) => {
-                if let Some(value) = parse_token_value(s.value()) {
-                    out.insert(path, value);
-                }
-            }
-            _ => {}
-        }
+pub(crate) fn color(token: &str) -> Color {
+    active_theme()
+        .read()
+        .map(|theme| theme.color(token))
+        .unwrap_or(Color::Reset)
+}
+
+pub(crate) fn rgb(token: &str) -> TuiRgb {
+    active_theme()
+        .read()
+        .ok()
+        .and_then(|theme| theme.resolve(token))
+        .unwrap_or([255, 255, 255])
+}
+
+pub(crate) fn token_rows() -> &'static [&'static str] {
+    TUI_THEME_COLOR_TOKENS
+}
+
+pub(crate) fn token_category(token: &str) -> &str {
+    token
+        .split_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or("other")
+}
+
+pub(crate) fn accent() -> Color {
+    color(token::PALETTE_ACCENT)
+}
+
+pub(crate) fn secondary() -> Color {
+    color(token::PALETTE_SECONDARY)
+}
+
+pub(crate) fn red() -> Color {
+    color(token::PALETTE_RED)
+}
+
+pub(crate) fn green() -> Color {
+    color(token::PALETTE_GREEN)
+}
+
+pub(crate) fn blue() -> Color {
+    color(token::PALETTE_BLUE)
+}
+
+pub(crate) fn magenta() -> Color {
+    color(token::PALETTE_MAGENTA)
+}
+
+pub(crate) fn cyan() -> Color {
+    color(token::PALETTE_CYAN)
+}
+
+pub(crate) fn foreground() -> Color {
+    color(token::UI_FOREGROUND)
+}
+
+pub(crate) fn muted() -> Color {
+    color(token::UI_MUTED)
+}
+
+pub(crate) fn quiet() -> Color {
+    color(token::UI_QUIET)
+}
+
+pub(crate) fn footer() -> Color {
+    color(token::UI_FOOTER)
+}
+
+pub(crate) fn surface() -> Color {
+    color(token::UI_SURFACE)
+}
+
+pub(crate) fn prompt_bg() -> Color {
+    color(token::UI_PROMPT_BG)
+}
+
+pub(crate) fn shimmer() -> Color {
+    color(token::EFFECTS_SHIMMER)
+}
+
+pub(crate) fn path_hint() -> Color {
+    color(token::PATH_HINT)
+}
+
+pub(crate) fn inline_code() -> Color {
+    color(token::INLINE_CODE)
+}
+
+pub(crate) fn inline_model() -> Color {
+    color(token::INLINE_MODEL)
+}
+
+fn builtin_theme(name: &str) -> Theme {
+    let entries = match name {
+        "bright" => BRIGHT_COLORS,
+        "fun" => FUN_COLORS,
+        "catppuccin" => CATPPUCCIN_COLORS,
+        "high-contrast" => HIGH_CONTRAST_COLORS,
+        _ => DEFAULT_COLORS,
+    };
+    Theme {
+        name: name.to_string(),
+        colors: entries
+            .iter()
+            .map(|(token, rgb)| ((*token).to_string(), *rgb))
+            .collect(),
     }
 }
 
-fn parse_token_value(raw: &str) -> Option<TokenValue> {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix('@') {
-        if rest.is_empty() {
-            return None;
-        }
-        return Some(TokenValue::Ref(rest.to_string()));
-    }
-    parse_hex(trimmed).map(TokenValue::Color)
-}
+const DEFAULT_COLORS: &[(&str, TuiRgb)] = &[
+    (token::PALETTE_ACCENT, [252, 211, 77]),
+    (token::PALETTE_SECONDARY, [254, 240, 138]),
+    (token::PALETTE_RED, [248, 113, 113]),
+    (token::PALETTE_GREEN, [22, 101, 52]),
+    (token::PALETTE_YELLOW, [254, 240, 138]),
+    (token::PALETTE_BLUE, [96, 165, 250]),
+    (token::PALETTE_MAGENTA, [149, 117, 205]),
+    (token::PALETTE_CYAN, [64, 158, 158]),
+    (token::UI_BACKGROUND, [24, 24, 28]),
+    (token::UI_FOREGROUND, [220, 220, 220]),
+    (token::UI_BORDER, [80, 80, 80]),
+    (token::UI_MUTED, [132, 132, 140]),
+    (token::UI_QUIET, [80, 80, 80]),
+    (token::UI_FOOTER, [98, 98, 104]),
+    (token::UI_SURFACE, [31, 31, 35]),
+    (token::UI_PROMPT_BG, [31, 31, 35]),
+    (token::SYNTAX_KEYWORD, [175, 135, 215]),
+    (token::SYNTAX_STRING, [175, 175, 135]),
+    (token::SYNTAX_COMMENT, [128, 128, 128]),
+    (token::SYNTAX_LITERAL, [215, 175, 95]),
+    (token::SYNTAX_FUNCTION, [95, 215, 255]),
+    (token::SYNTAX_TYPE, [135, 175, 215]),
+    (token::SYNTAX_OPERATOR, [188, 188, 188]),
+    (token::SYNTAX_VARIABLE, [208, 208, 208]),
+    (token::STATUS_OK, [22, 101, 52]),
+    (token::STATUS_WARN, [254, 240, 138]),
+    (token::STATUS_ERR, [248, 113, 113]),
+    (token::STATUS_INFO, [96, 165, 250]),
+    (token::TRANSCRIPT_USER, [252, 211, 77]),
+    (token::TRANSCRIPT_ASSISTANT, [220, 220, 220]),
+    (token::TRANSCRIPT_TOOL, [132, 132, 140]),
+    (token::TRANSCRIPT_SYSTEM, [149, 117, 205]),
+    (token::DIFF_ADDED, [21, 128, 61]),
+    (token::DIFF_REMOVED, [252, 165, 165]),
+    (token::DIFF_ADDED_BG, [33, 58, 43]),
+    (token::DIFF_REMOVED_BG, [74, 34, 29]),
+    (token::DIFF_CONTEXT, [80, 80, 80]),
+    (token::DIFF_HUNK, [254, 240, 138]),
+    (token::EFFECTS_SHIMMER, [220, 190, 130]),
+    (token::SEPARATOR_PRIMARY, [96, 165, 250]),
+    (token::INLINE_CODE, [96, 158, 158]),
+    (token::INLINE_MODEL, [176, 110, 176]),
+    (token::PATH_HINT, [89, 86, 140]),
+];
 
-fn parse_hex(raw: &str) -> Option<Color> {
-    let body = raw.strip_prefix('#')?;
-    if body.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&body[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&body[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&body[4..6], 16).ok()?;
-    Some(Color::Rgb(r, g, b))
-}
+const BRIGHT_COLORS: &[(&str, TuiRgb)] = &[
+    (token::PALETTE_ACCENT, [255, 214, 85]),
+    (token::PALETTE_SECONDARY, [255, 245, 155]),
+    (token::PALETTE_RED, [255, 120, 120]),
+    (token::PALETTE_GREEN, [80, 210, 120]),
+    (token::PALETTE_YELLOW, [255, 230, 105]),
+    (token::PALETTE_BLUE, [105, 190, 255]),
+    (token::PALETTE_MAGENTA, [190, 150, 255]),
+    (token::PALETTE_CYAN, [85, 220, 220]),
+    (token::UI_BACKGROUND, [18, 20, 24]),
+    (token::UI_FOREGROUND, [245, 248, 255]),
+    (token::UI_BORDER, [120, 130, 145]),
+    (token::UI_MUTED, [165, 175, 190]),
+    (token::UI_QUIET, [115, 125, 140]),
+    (token::UI_FOOTER, [135, 145, 160]),
+    (token::UI_SURFACE, [32, 36, 44]),
+    (token::UI_PROMPT_BG, [32, 36, 44]),
+    (token::SYNTAX_KEYWORD, [205, 155, 255]),
+    (token::SYNTAX_STRING, [195, 220, 125]),
+    (token::SYNTAX_COMMENT, [145, 155, 165]),
+    (token::SYNTAX_LITERAL, [245, 180, 105]),
+    (token::SYNTAX_FUNCTION, [110, 220, 255]),
+    (token::SYNTAX_TYPE, [120, 205, 255]),
+    (token::SYNTAX_OPERATOR, [225, 230, 238]),
+    (token::SYNTAX_VARIABLE, [235, 238, 245]),
+    (token::STATUS_OK, [80, 210, 120]),
+    (token::STATUS_WARN, [255, 230, 105]),
+    (token::STATUS_ERR, [255, 120, 120]),
+    (token::STATUS_INFO, [105, 190, 255]),
+    (token::TRANSCRIPT_USER, [255, 214, 85]),
+    (token::TRANSCRIPT_ASSISTANT, [245, 248, 255]),
+    (token::TRANSCRIPT_TOOL, [165, 175, 190]),
+    (token::TRANSCRIPT_SYSTEM, [190, 150, 255]),
+    (token::DIFF_ADDED, [70, 190, 105]),
+    (token::DIFF_REMOVED, [255, 145, 145]),
+    (token::DIFF_ADDED_BG, [14, 82, 47]),
+    (token::DIFF_REMOVED_BG, [118, 35, 35]),
+    (token::DIFF_CONTEXT, [115, 125, 140]),
+    (token::DIFF_HUNK, [255, 230, 105]),
+    (token::EFFECTS_SHIMMER, [255, 245, 155]),
+    (token::SEPARATOR_PRIMARY, [105, 190, 255]),
+    (token::INLINE_CODE, [85, 220, 220]),
+    (token::INLINE_MODEL, [220, 150, 220]),
+    (token::PATH_HINT, [145, 145, 220]),
+];
+
+const FUN_COLORS: &[(&str, TuiRgb)] = &[
+    (token::PALETTE_ACCENT, [255, 118, 182]),
+    (token::PALETTE_SECONDARY, [255, 201, 102]),
+    (token::PALETTE_RED, [255, 92, 122]),
+    (token::PALETTE_GREEN, [70, 220, 150]),
+    (token::PALETTE_YELLOW, [255, 214, 90]),
+    (token::PALETTE_BLUE, [86, 184, 255]),
+    (token::PALETTE_MAGENTA, [192, 132, 252]),
+    (token::PALETTE_CYAN, [54, 211, 225]),
+    (token::UI_BACKGROUND, [20, 18, 30]),
+    (token::UI_FOREGROUND, [238, 241, 255]),
+    (token::UI_BORDER, [105, 92, 140]),
+    (token::UI_MUTED, [150, 145, 175]),
+    (token::UI_QUIET, [95, 88, 126]),
+    (token::UI_FOOTER, [120, 112, 150]),
+    (token::UI_SURFACE, [31, 26, 45]),
+    (token::UI_PROMPT_BG, [31, 26, 45]),
+    (token::SYNTAX_KEYWORD, [192, 132, 252]),
+    (token::SYNTAX_STRING, [118, 220, 142]),
+    (token::SYNTAX_COMMENT, [136, 128, 160]),
+    (token::SYNTAX_LITERAL, [255, 180, 100]),
+    (token::SYNTAX_FUNCTION, [86, 184, 255]),
+    (token::SYNTAX_TYPE, [54, 211, 225]),
+    (token::SYNTAX_OPERATOR, [230, 225, 245]),
+    (token::SYNTAX_VARIABLE, [255, 206, 235]),
+    (token::STATUS_OK, [70, 220, 150]),
+    (token::STATUS_WARN, [255, 214, 90]),
+    (token::STATUS_ERR, [255, 92, 122]),
+    (token::STATUS_INFO, [86, 184, 255]),
+    (token::TRANSCRIPT_USER, [255, 118, 182]),
+    (token::TRANSCRIPT_ASSISTANT, [238, 241, 255]),
+    (token::TRANSCRIPT_TOOL, [150, 145, 175]),
+    (token::TRANSCRIPT_SYSTEM, [192, 132, 252]),
+    (token::DIFF_ADDED, [70, 220, 150]),
+    (token::DIFF_REMOVED, [255, 122, 146]),
+    (token::DIFF_ADDED_BG, [21, 75, 62]),
+    (token::DIFF_REMOVED_BG, [89, 34, 76]),
+    (token::DIFF_CONTEXT, [95, 88, 126]),
+    (token::DIFF_HUNK, [255, 214, 90]),
+    (token::EFFECTS_SHIMMER, [255, 201, 102]),
+    (token::SEPARATOR_PRIMARY, [54, 211, 225]),
+    (token::INLINE_CODE, [54, 211, 225]),
+    (token::INLINE_MODEL, [255, 118, 182]),
+    (token::PATH_HINT, [150, 145, 230]),
+];
+
+const CATPPUCCIN_COLORS: &[(&str, TuiRgb)] = &[
+    (token::PALETTE_ACCENT, [203, 166, 247]),
+    (token::PALETTE_SECONDARY, [245, 194, 231]),
+    (token::PALETTE_RED, [243, 139, 168]),
+    (token::PALETTE_GREEN, [166, 227, 161]),
+    (token::PALETTE_YELLOW, [249, 226, 175]),
+    (token::PALETTE_BLUE, [137, 180, 250]),
+    (token::PALETTE_MAGENTA, [203, 166, 247]),
+    (token::PALETTE_CYAN, [148, 226, 213]),
+    (token::UI_BACKGROUND, [30, 30, 46]),
+    (token::UI_FOREGROUND, [205, 214, 244]),
+    (token::UI_BORDER, [88, 91, 112]),
+    (token::UI_MUTED, [147, 153, 178]),
+    (token::UI_QUIET, [108, 112, 134]),
+    (token::UI_FOOTER, [127, 132, 156]),
+    (token::UI_SURFACE, [49, 50, 68]),
+    (token::UI_PROMPT_BG, [49, 50, 68]),
+    (token::SYNTAX_KEYWORD, [203, 166, 247]),
+    (token::SYNTAX_STRING, [166, 227, 161]),
+    (token::SYNTAX_COMMENT, [127, 132, 156]),
+    (token::SYNTAX_LITERAL, [249, 226, 175]),
+    (token::SYNTAX_FUNCTION, [137, 180, 250]),
+    (token::SYNTAX_TYPE, [148, 226, 213]),
+    (token::SYNTAX_OPERATOR, [205, 214, 244]),
+    (token::SYNTAX_VARIABLE, [245, 224, 220]),
+    (token::STATUS_OK, [166, 227, 161]),
+    (token::STATUS_WARN, [249, 226, 175]),
+    (token::STATUS_ERR, [243, 139, 168]),
+    (token::STATUS_INFO, [137, 180, 250]),
+    (token::TRANSCRIPT_USER, [203, 166, 247]),
+    (token::TRANSCRIPT_ASSISTANT, [205, 214, 244]),
+    (token::TRANSCRIPT_TOOL, [147, 153, 178]),
+    (token::TRANSCRIPT_SYSTEM, [245, 194, 231]),
+    (token::DIFF_ADDED, [166, 227, 161]),
+    (token::DIFF_REMOVED, [243, 139, 168]),
+    (token::DIFF_ADDED_BG, [40, 74, 59]),
+    (token::DIFF_REMOVED_BG, [83, 49, 67]),
+    (token::DIFF_CONTEXT, [108, 112, 134]),
+    (token::DIFF_HUNK, [249, 226, 175]),
+    (token::EFFECTS_SHIMMER, [245, 194, 231]),
+    (token::SEPARATOR_PRIMARY, [137, 180, 250]),
+    (token::INLINE_CODE, [148, 226, 213]),
+    (token::INLINE_MODEL, [245, 194, 231]),
+    (token::PATH_HINT, [180, 190, 254]),
+];
+
+const HIGH_CONTRAST_COLORS: &[(&str, TuiRgb)] = &[
+    (token::PALETTE_ACCENT, [255, 255, 0]),
+    (token::PALETTE_SECONDARY, [255, 255, 255]),
+    (token::PALETTE_RED, [255, 60, 60]),
+    (token::PALETTE_GREEN, [0, 190, 80]),
+    (token::PALETTE_YELLOW, [255, 255, 0]),
+    (token::PALETTE_BLUE, [0, 140, 255]),
+    (token::PALETTE_MAGENTA, [190, 80, 255]),
+    (token::PALETTE_CYAN, [0, 210, 255]),
+    (token::UI_BACKGROUND, [0, 0, 0]),
+    (token::UI_FOREGROUND, [255, 255, 255]),
+    (token::UI_BORDER, [180, 180, 180]),
+    (token::UI_MUTED, [190, 190, 190]),
+    (token::UI_QUIET, [150, 150, 150]),
+    (token::UI_FOOTER, [180, 180, 180]),
+    (token::UI_SURFACE, [18, 18, 18]),
+    (token::UI_PROMPT_BG, [18, 18, 18]),
+    (token::SYNTAX_KEYWORD, [190, 80, 255]),
+    (token::SYNTAX_STRING, [0, 220, 90]),
+    (token::SYNTAX_COMMENT, [170, 170, 170]),
+    (token::SYNTAX_LITERAL, [255, 255, 0]),
+    (token::SYNTAX_FUNCTION, [0, 180, 255]),
+    (token::SYNTAX_TYPE, [0, 210, 255]),
+    (token::SYNTAX_OPERATOR, [255, 255, 255]),
+    (token::SYNTAX_VARIABLE, [255, 255, 255]),
+    (token::STATUS_OK, [0, 220, 90]),
+    (token::STATUS_WARN, [255, 255, 0]),
+    (token::STATUS_ERR, [255, 60, 60]),
+    (token::STATUS_INFO, [0, 180, 255]),
+    (token::TRANSCRIPT_USER, [255, 255, 0]),
+    (token::TRANSCRIPT_ASSISTANT, [255, 255, 255]),
+    (token::TRANSCRIPT_TOOL, [190, 190, 190]),
+    (token::TRANSCRIPT_SYSTEM, [190, 80, 255]),
+    (token::DIFF_ADDED, [0, 190, 80]),
+    (token::DIFF_REMOVED, [255, 60, 60]),
+    (token::DIFF_ADDED_BG, [0, 80, 0]),
+    (token::DIFF_REMOVED_BG, [110, 0, 0]),
+    (token::DIFF_CONTEXT, [150, 150, 150]),
+    (token::DIFF_HUNK, [255, 255, 0]),
+    (token::EFFECTS_SHIMMER, [255, 255, 255]),
+    (token::SEPARATOR_PRIMARY, [0, 180, 255]),
+    (token::INLINE_CODE, [0, 210, 255]),
+    (token::INLINE_MODEL, [190, 80, 255]),
+    (token::PATH_HINT, [180, 180, 255]),
+];
 
 #[cfg(test)]
 #[path = "theme_tests.rs"]

@@ -17,7 +17,6 @@ use ratatui::text::{Line, Span};
 
 use crate::render::button::{ButtonState, button_spans};
 use crate::render::palette;
-use crate::{GOLD, QUIET};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PromptQueueState {
@@ -135,18 +134,20 @@ pub(crate) fn render_lines(
     let header = Line::from(vec![
         Span::styled(
             "Queued prompts",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  ↑↓ select · Shift+↑↓ reorder · Del remove · Enter close",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
     let mut lines = vec![header];
     if queue.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (queue is empty)",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
         return lines;
     }
@@ -163,7 +164,9 @@ pub(crate) fn render_lines(
         let is_selected = index == state.selected;
         let marker = if is_selected { "› " } else { "  " };
         let style = if is_selected {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(palette::muted_fg())
         };
@@ -171,7 +174,11 @@ pub(crate) fn render_lines(
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(body, style),
         ]));
@@ -211,6 +218,9 @@ pub(crate) fn indicator_line(
     };
     let mut spans = button_spans(&format!("queued: {n}"), state);
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(hint, Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        hint,
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
     Some(Line::from(spans))
 }

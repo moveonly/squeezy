@@ -130,6 +130,21 @@ pub async fn check_for_update() -> UpdateStatus {
     check_with_clock(current_version(), now_secs()).await
 }
 
+/// Return a startup banner from a fresh local cache only. This intentionally
+/// never performs network I/O: the TUI should paint immediately even when DNS
+/// or outbound HTTP is slow. `doctor` and explicit refresh paths can still call
+/// [`check_for_update`] when they want a live probe.
+pub fn cached_banner_for_startup() -> Option<String> {
+    let current_norm = strip_v_prefix(current_version()).to_string();
+    let cache = read_cache().ok().flatten()?;
+    if !cache.is_fresh(now_secs()) {
+        return None;
+    }
+    let latest = cache.latest.as_deref()?;
+    let status = status_from_versions(&current_norm, latest, /*from_cache=*/ true);
+    banner_for_startup(&status)
+}
+
 /// Same as `check_for_update` but with the clock + current version threaded
 /// in for tests. Keeps the deterministic logic out of the live `tokio::main`
 /// entrypoint.

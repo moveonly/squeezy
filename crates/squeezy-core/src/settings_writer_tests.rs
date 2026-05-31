@@ -308,6 +308,50 @@ fn remove_array_of_tables_by_match_is_noop_when_no_match() {
     let _ = fs::remove_file(&p);
 }
 
+#[test]
+fn theme_color_edits_write_nested_rgb_tables() {
+    let p = tmp_path("theme_color.toml");
+    let outcome = apply_edits(
+        &SettingsScope::user(&p),
+        &[SettingsEdit {
+            path: &[],
+            op: EditOp::SetThemeColor {
+                theme: "fun".to_string(),
+                token: "palette.accent".to_string(),
+                rgb: [12, 34, 56],
+            },
+        }],
+    )
+    .unwrap();
+    assert_eq!(outcome.edits_applied, 1);
+    let text = fs::read_to_string(&p).unwrap();
+    assert!(text.contains("[tui.themes.fun.colors]"));
+    assert!(text.contains("\"palette.accent\" = [12, 34, 56]"));
+    let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn removing_missing_theme_color_does_not_create_theme_table() {
+    let p = tmp_path("theme_color_missing.toml");
+    fs::write(&p, "[tui]\ntheme = \"default\"\n").unwrap();
+    let outcome = apply_edits(
+        &SettingsScope::user(&p),
+        &[SettingsEdit {
+            path: &[],
+            op: EditOp::RemoveThemeColor {
+                theme: "fun".to_string(),
+                token: "palette.accent".to_string(),
+            },
+        }],
+    )
+    .unwrap();
+    assert_eq!(outcome.edits_applied, 0);
+    let text = fs::read_to_string(&p).unwrap();
+    assert!(!text.contains("[tui.themes.fun.colors]"));
+    assert_eq!(text, "[tui]\ntheme = \"default\"\n");
+    let _ = fs::remove_file(&p);
+}
+
 #[cfg(unix)]
 #[test]
 fn user_scope_writes_mode_0600() {

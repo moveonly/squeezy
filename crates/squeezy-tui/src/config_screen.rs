@@ -33,7 +33,9 @@ pub(crate) use keys::{handle_key, handle_paste};
 pub(crate) use render::render;
 pub(crate) use save::{
     clear_scope_override, clear_scope_override_silent, discard_all_session_writes, perform_reset,
-    save_field, save_field_silent, save_inline_provider_api_key, undo_last_write,
+    save_field, save_field_silent, save_inline_provider_api_key, save_theme_color,
+    save_theme_delete, save_theme_rename, save_theme_selection, save_theme_snapshot,
+    undo_last_write, unset_theme_color,
 };
 
 /// Synthetic row index in the Models section that exposes the API-key
@@ -124,6 +126,7 @@ pub(crate) struct ConfigScreenState {
     pub picker: Option<ModelPickerState>,
     pub search: Option<SearchOverlayState>,
     pub secret_entry: Option<SecretEntryState>,
+    pub theme_editor: Option<ThemeEditor>,
     /// Pending tier-file deletion awaiting `y/n` confirmation. Set when the
     /// user presses Enter on a Reset-section row; cleared by `y` (after the
     /// delete fires) or `n` / Esc (cancel).
@@ -166,6 +169,32 @@ pub(crate) struct SecretEntryState {
     /// and the disclosure are the user's own action, so reveal in full
     /// rather than hiding the suffix.
     pub reveal: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ThemeEditor {
+    Name {
+        draft: String,
+        cursor: usize,
+    },
+    Rename {
+        original: String,
+        draft: String,
+        cursor: usize,
+    },
+    Rgb {
+        theme: String,
+        token: &'static str,
+        draft: String,
+        cursor: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThemeRow {
+    Theme(String),
+    New,
+    Color(&'static str),
 }
 
 impl SecretEntryState {
@@ -320,6 +349,7 @@ impl ConfigScreenState {
             picker: None,
             search: None,
             secret_entry: None,
+            theme_editor: None,
             reset_confirm: None,
             discard_confirm: false,
             effective,
@@ -374,6 +404,11 @@ impl ConfigScreenState {
             // confusing and the tier-tab context already disambiguates which
             // file is being targeted.
             SectionId::Reset => 1,
+            SectionId::Themes => {
+                crate::render::theme::available_theme_names(&self.effective).len()
+                    + 1
+                    + crate::render::theme::token_rows().len()
+            }
             _ => section.fields.len(),
         }
     }
@@ -402,9 +437,26 @@ impl ConfigScreenState {
                     None
                 }
             }
-            SectionId::Reset => None,
+            SectionId::Reset | SectionId::Themes => None,
             _ => section.fields.get(row),
         }
+    }
+
+    pub(crate) fn theme_row_at(&self, row: usize) -> Option<ThemeRow> {
+        if self.current_section().id != SectionId::Themes {
+            return None;
+        }
+        let names = crate::render::theme::available_theme_names(&self.effective);
+        if row < names.len() {
+            return Some(ThemeRow::Theme(names[row].clone()));
+        }
+        if row == names.len() {
+            return Some(ThemeRow::New);
+        }
+        crate::render::theme::token_rows()
+            .get(row.saturating_sub(names.len() + 1))
+            .copied()
+            .map(ThemeRow::Color)
     }
 
     /// Reset action for the focused row when the active section is `Reset`.

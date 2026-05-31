@@ -21,10 +21,11 @@ use crate::{
     DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
-    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_WEBSEARCH_PROVIDER,
-    OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort,
-    ResponseVerbosity, SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
-    TuiAlternateScreen, TuiSynchronizedOutput,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_THEME_NAME,
+    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode,
+    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity,
+    ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen, TuiSynchronizedOutput,
+    normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -265,6 +266,7 @@ pub type SettingsPath = &'static [&'static str];
 pub enum SectionId {
     Models,
     Permissions,
+    Themes,
     Verbosity,
     Limits,
     Telemetry,
@@ -295,6 +297,7 @@ impl SectionId {
         match self {
             Self::Models => "models",
             Self::Permissions => "permissions",
+            Self::Themes => "themes",
             Self::Verbosity => "verbosity",
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
@@ -383,7 +386,7 @@ pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
     &["default", "auto_review", "full_access", "custom"];
 pub const PERMISSION_MODE_OPTIONS: &[&str] = &["allow", "ask", "deny"];
-pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light", "catppuccin", "high-contrast"];
+pub const THEME_OPTIONS: &[&str] = crate::BUILTIN_TUI_THEME_NAMES;
 
 pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
     ConfigSectionMeta {
@@ -669,6 +672,12 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
         ],
     },
     ConfigSectionMeta {
+        id: SectionId::Themes,
+        label: "Themes",
+        description: "Choose, create, and edit RGB colors",
+        fields: &[],
+    },
+    ConfigSectionMeta {
         id: SectionId::Verbosity,
         label: "Verbosity & TUI",
         description: "Terminal UI output detail and behavior",
@@ -848,15 +857,13 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
             FieldMeta {
                 label: "theme",
                 toml_path: &["tui", "theme"],
-                kind: FieldKind::Enum {
-                    options: THEME_OPTIONS,
-                },
+                kind: FieldKind::String { multiline: false },
                 tier: ApplyTier::Immediate,
                 get: get_theme,
                 set: set_theme,
-                default_display: "system",
-                default: || FieldValue::Enum("system"),
-                help: "Theme + palette tone. `system` follows the terminal, `dark`/`light` pin the tone with the default amber/gold accents, `catppuccin` and `high-contrast` swap accent identities. Configure via /theme.",
+                default_display: "default",
+                default: || FieldValue::String(DEFAULT_TUI_THEME_NAME.to_string()),
+                help: "Active named theme. Configure colors in the Themes section or via /theme.",
                 env_override: None,
                 secret: false,
             },
@@ -2044,14 +2051,15 @@ fn set_synchronized_output(cfg: &mut AppConfig, value: FieldValue) -> Result<(),
 }
 
 fn get_theme(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Enum(cfg.tui.theme.as_str())
+    FieldValue::String(cfg.tui.theme.clone())
 }
 fn set_theme(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
     let s = match value {
-        FieldValue::Enum(s) => s,
-        _ => return Err("expects enum"),
+        FieldValue::String(s) => s,
+        FieldValue::Enum(s) => s.to_string(),
+        _ => return Err("expects theme name"),
     };
-    cfg.tui.theme = crate::TuiTheme::parse(s).ok_or("invalid theme")?;
+    cfg.tui.theme = normalize_tui_theme_name(&s).ok_or("invalid theme")?;
     Ok(())
 }
 

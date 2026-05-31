@@ -21,8 +21,6 @@ use std::{
 
 use ratatui::style::Color;
 
-use crate::render::palette::{AMBER, ERROR_RED, GOLD, SUCCESS_GREEN};
-
 /// How long a freshly pushed toast stays on screen before auto-dismiss.
 /// 5s is long enough to read a one-line notice without forcing the user
 /// to dismiss it manually, short enough that stale toasts don't pile up.
@@ -52,10 +50,10 @@ pub(crate) enum ToastVariant {
 impl ToastVariant {
     pub(crate) fn color(self) -> Color {
         match self {
-            Self::Info => AMBER,
-            Self::Success => SUCCESS_GREEN,
-            Self::Warning => GOLD,
-            Self::Error => ERROR_RED,
+            Self::Info => crate::render::theme::accent(),
+            Self::Success => crate::render::theme::green(),
+            Self::Warning => crate::render::theme::secondary(),
+            Self::Error => crate::render::theme::red(),
         }
     }
 

@@ -23,7 +23,7 @@ use similar::TextDiff;
 use std::path::{Path, PathBuf};
 
 use crate::proposed_plan;
-use crate::render::{markdown, palette};
+use crate::render::markdown;
 
 /// Static metadata captured at the moment a plan was persisted. The
 /// actual body is *not* cached here — readers go through
@@ -72,7 +72,7 @@ fn missing_file_card(data: &PlanCardData) -> Vec<Line<'static>> {
         format!("Plan {} · file missing", data.plan_id),
         vec![Line::from(vec![Span::styled(
             data.path.display().to_string(),
-            Style::default().fg(palette::ERROR_RED),
+            Style::default().fg(crate::render::theme::red()),
         )])],
     )
 }
@@ -88,7 +88,7 @@ fn plan_title(plan_id: &str, step_count: usize) -> String {
 fn card_path_line(path: &Path) -> Line<'static> {
     Line::from(vec![Span::styled(
         path.display().to_string(),
-        Style::default().fg(palette::QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )])
 }
 
@@ -104,7 +104,7 @@ fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'stati
         .max(title_width.saturating_add(3))
         .max(24);
     let border = Style::default()
-        .fg(palette::AMBER)
+        .fg(crate::render::theme::accent())
         .add_modifier(Modifier::BOLD);
     let mut lines = Vec::with_capacity(inner.len() + 2);
     let title_fill = inner_width.saturating_sub(title_width.saturating_add(3));
@@ -125,7 +125,7 @@ fn boxed_card_lines(title: String, inner: Vec<Line<'static>>) -> Vec<Line<'stati
 
 fn boxed_content_line(line: Line<'static>, inner_width: usize) -> Line<'static> {
     let border = Style::default()
-        .fg(palette::AMBER)
+        .fg(crate::render::theme::accent())
         .add_modifier(Modifier::BOLD);
     let content_width = line_width(&line);
     let padding = inner_width.saturating_sub(content_width.saturating_add(2));
@@ -151,11 +151,14 @@ fn text_width(text: &str) -> usize {
 
 fn diff_header_line(parent_id: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("diff vs ", Style::default().fg(palette::QUIET)),
+        Span::styled(
+            "diff vs ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
         Span::styled(
             parent_id.to_string(),
             Style::default()
-                .fg(palette::MODE_PURPLE)
+                .fg(crate::render::theme::magenta())
                 .add_modifier(Modifier::ITALIC),
         ),
     ])
@@ -178,9 +181,15 @@ pub(crate) fn render_plan_diff(parent: &str, current: &str) -> Vec<Line<'static>
     let mut out = Vec::new();
     for change in diff.iter_all_changes() {
         let (sigil, fg) = match change.tag() {
-            similar::ChangeTag::Equal => (' ', palette::QUIET),
-            similar::ChangeTag::Insert => ('+', palette::DIFF_ADD_FG),
-            similar::ChangeTag::Delete => ('-', palette::DIFF_DEL_FG),
+            similar::ChangeTag::Equal => (' ', crate::render::theme::quiet()),
+            similar::ChangeTag::Insert => (
+                '+',
+                crate::render::theme::color(crate::render::theme::token::DIFF_ADDED),
+            ),
+            similar::ChangeTag::Delete => (
+                '-',
+                crate::render::theme::color(crate::render::theme::token::DIFF_REMOVED),
+            ),
         };
         let text = change.to_string();
         let text = text.trim_end_matches('\n').to_string();

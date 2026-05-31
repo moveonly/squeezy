@@ -1,14 +1,19 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use squeezy_agent::Agent;
-use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue};
+use squeezy_core::{
+    config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue, SectionId},
+    is_builtin_tui_theme_name, is_tui_theme_color_token, normalize_tui_theme_name,
+};
 
 use super::{
     ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome, ModelPickerState,
-    SearchOverlayState, SecretEntryState, clear_scope_override, clear_scope_override_silent,
-    compute_search_matches, cycle_to_next_registry_model, discard_all_session_writes,
-    handle_editor_key, model_field_meta, open_editor_for, perform_reset, picker_matches,
-    provider_api_key_env, provider_inline_api_key, provider_section_name, save_field,
-    save_field_silent, save_inline_provider_api_key, undo_last_write,
+    SearchOverlayState, SecretEntryState, ThemeEditor, ThemeRow, clear_scope_override,
+    clear_scope_override_silent, compute_search_matches, cycle_to_next_registry_model,
+    discard_all_session_writes, handle_editor_key, model_field_meta, open_editor_for,
+    perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
+    provider_section_name, save_field, save_field_silent, save_inline_provider_api_key,
+    save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
+    save_theme_snapshot, undo_last_write, unset_theme_color,
 };
 use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 
@@ -27,6 +32,9 @@ pub(crate) fn handle_key(
     }
     if state.secret_entry.is_some() {
         return handle_secret_entry_key(state, agent, notifications, key);
+    }
+    if state.theme_editor.is_some() {
+        return handle_theme_editor_key(state, agent, notifications, key);
     }
     if state.search.is_some() {
         return handle_search_key(state, key);
@@ -105,6 +113,10 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char(' '), _) => {
+            if state.current_section().id == SectionId::Themes {
+                handle_theme_row_action(state, agent, notifications);
+                return KeyOutcome::KeepOpen;
+            }
             if state.on_synthetic_api_key_row() {
                 open_api_key_entry_for_current_provider(state, notifications);
                 return KeyOutcome::KeepOpen;
@@ -252,6 +264,10 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Enter, _) => {
+            if state.current_section().id == SectionId::Themes {
+                handle_theme_row_action(state, agent, notifications);
+                return KeyOutcome::KeepOpen;
+            }
             if state.on_synthetic_api_key_row() {
                 open_api_key_entry_for_current_provider(state, notifications);
                 return KeyOutcome::KeepOpen;
@@ -330,7 +346,29 @@ pub(crate) fn handle_key(
             });
             KeyOutcome::KeepOpen
         }
+        (KeyCode::Char('n'), m)
+            if m.is_empty() && state.current_section().id == SectionId::Themes =>
+        {
+            open_theme_name_editor(state);
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('r'), m)
+            if m.is_empty() && state.current_section().id == SectionId::Themes =>
+        {
+            handle_theme_rename(state, notifications);
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('d'), m)
+            if m.is_empty() && state.current_section().id == SectionId::Themes =>
+        {
+            handle_theme_delete(state, agent, notifications);
+            KeyOutcome::KeepOpen
+        }
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            if state.current_section().id == SectionId::Themes {
+                handle_theme_clear(state, agent, notifications);
+                return KeyOutcome::KeepOpen;
+            }
             if state.on_synthetic_api_key_row() {
                 notifications.push(
                     "API key has no default — use Enter / Space here to set, or clear it from the OS keychain manually.",
@@ -380,6 +418,10 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            if state.current_section().id == SectionId::Themes {
+                handle_theme_clear(state, agent, notifications);
+                return KeyOutcome::KeepOpen;
+            }
             if state.on_synthetic_api_key_row() || state.on_reset_action_row() {
                 return KeyOutcome::KeepOpen;
             }
@@ -604,6 +646,293 @@ fn commit_model_picker(
     }
 }
 
+fn handle_theme_row_action(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    match state.theme_row_at(state.field_index) {
+        Some(ThemeRow::Theme(name)) => {
+            save_theme_selection(state, agent, notifications, name);
+        }
+        Some(ThemeRow::New) => open_theme_name_editor(state),
+        Some(ThemeRow::Color(token)) => {
+            let theme = state.effective.tui.theme.clone();
+            let [r, g, b] = crate::render::theme::resolve_theme(&state.effective, &theme)
+                .resolve(token)
+                .unwrap_or_else(|| crate::render::theme::rgb(token));
+            let draft = format!("{r},{g},{b}");
+            state.theme_editor = Some(ThemeEditor::Rgb {
+                theme,
+                token,
+                cursor: draft.chars().count(),
+                draft,
+            });
+        }
+        None => {}
+    }
+}
+
+fn handle_theme_clear(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    match state.theme_row_at(state.field_index) {
+        Some(ThemeRow::Color(token)) => {
+            let theme = state.effective.tui.theme.clone();
+            unset_theme_color(state, agent, notifications, theme, token.to_string());
+        }
+        Some(ThemeRow::Theme(_)) | Some(ThemeRow::New) | None => {
+            notifications.push(
+                "Move to a color row to clear that RGB override.",
+                NotifySeverity::Info,
+            );
+        }
+    }
+}
+
+fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut NotificationQueue) {
+    match state.theme_row_at(state.field_index) {
+        Some(ThemeRow::Theme(name)) => open_theme_rename_editor(state, notifications, name),
+        Some(ThemeRow::Color(_)) => {
+            notifications.push(
+                "Move to a custom theme row to rename it.",
+                NotifySeverity::Info,
+            );
+        }
+        Some(ThemeRow::New) | None => {
+            notifications.push(
+                "Press n or Enter here to create a theme.",
+                NotifySeverity::Info,
+            );
+        }
+    }
+}
+
+fn handle_theme_delete(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    match state.theme_row_at(state.field_index) {
+        Some(ThemeRow::Theme(name)) => {
+            if is_builtin_tui_theme_name(&name) {
+                notifications.push(
+                    "Built-in themes cannot be deleted. Press n to create an editable copy.",
+                    NotifySeverity::Info,
+                );
+                return;
+            }
+            save_theme_delete(state, agent, notifications, name);
+        }
+        Some(ThemeRow::Color(_)) => {
+            notifications.push(
+                "Move to a custom theme row to delete it. Ctrl+R clears the selected color override.",
+                NotifySeverity::Info,
+            );
+        }
+        Some(ThemeRow::New) | None => {
+            notifications.push(
+                "Move to a custom theme row to delete it.",
+                NotifySeverity::Info,
+            );
+        }
+    }
+}
+
+fn open_theme_name_editor(state: &mut ConfigScreenState) {
+    let draft = next_theme_name(state);
+    state.theme_editor = Some(ThemeEditor::Name {
+        cursor: draft.chars().count(),
+        draft,
+    });
+}
+
+fn open_theme_rename_editor(
+    state: &mut ConfigScreenState,
+    notifications: &mut NotificationQueue,
+    name: String,
+) {
+    if is_builtin_tui_theme_name(&name) {
+        notifications.push(
+            "Built-in themes cannot be renamed. Press n to create an editable copy.",
+            NotifySeverity::Info,
+        );
+        return;
+    }
+    let cursor = name.chars().count();
+    state.theme_editor = Some(ThemeEditor::Rename {
+        original: name.clone(),
+        draft: name,
+        cursor,
+    });
+}
+
+fn next_theme_name(state: &ConfigScreenState) -> String {
+    for i in 1..1000 {
+        let candidate = if i == 1 {
+            "custom-theme".to_string()
+        } else {
+            format!("custom-theme-{i}")
+        };
+        if !crate::render::theme::theme_exists(&state.effective, &candidate) {
+            return candidate;
+        }
+    }
+    "custom-theme".to_string()
+}
+
+fn handle_theme_editor_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    key: KeyEvent,
+) -> KeyOutcome {
+    if key.code == KeyCode::Esc {
+        state.theme_editor = None;
+        return KeyOutcome::KeepOpen;
+    }
+
+    if key.code == KeyCode::Enter {
+        commit_theme_editor(state, agent, notifications);
+        return KeyOutcome::KeepOpen;
+    }
+
+    if let Some(editor) = state.theme_editor.as_mut() {
+        match editor {
+            ThemeEditor::Name { draft, cursor } | ThemeEditor::Rename { draft, cursor, .. } => {
+                edit_theme_text(draft, cursor, key, |c| {
+                    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+                });
+            }
+            ThemeEditor::Rgb { draft, cursor, .. } => {
+                edit_theme_text(draft, cursor, key, |c| {
+                    c.is_ascii_digit() || c == ',' || c == ' '
+                });
+            }
+        }
+    }
+    KeyOutcome::KeepOpen
+}
+
+fn commit_theme_editor(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    let Some(editor) = state.theme_editor.take() else {
+        return;
+    };
+    match editor {
+        ThemeEditor::Name { draft, .. } => {
+            let Some(name) = normalize_tui_theme_name(&draft) else {
+                notifications.push("Invalid theme name.", NotifySeverity::Error);
+                return;
+            };
+            if crate::render::theme::theme_exists(&state.effective, &name) {
+                notifications.push(
+                    format!("Theme {name} already exists."),
+                    NotifySeverity::Warn,
+                );
+                return;
+            }
+            save_theme_snapshot(state, agent, notifications, name);
+        }
+        ThemeEditor::Rename {
+            original, draft, ..
+        } => {
+            let Some(name) = normalize_tui_theme_name(&draft) else {
+                notifications.push("Invalid theme name.", NotifySeverity::Error);
+                return;
+            };
+            if name == original {
+                notifications.push("Theme name unchanged.", NotifySeverity::Info);
+                return;
+            }
+            if is_builtin_tui_theme_name(&name)
+                || crate::render::theme::theme_exists(&state.effective, &name)
+            {
+                notifications.push(
+                    format!("Theme {name} already exists."),
+                    NotifySeverity::Warn,
+                );
+                return;
+            }
+            save_theme_rename(state, agent, notifications, original, name);
+        }
+        ThemeEditor::Rgb {
+            theme,
+            token,
+            draft,
+            ..
+        } => {
+            if !is_tui_theme_color_token(token) {
+                notifications.push(
+                    format!("Unknown theme token {token}."),
+                    NotifySeverity::Error,
+                );
+                return;
+            }
+            let Some(rgb) = parse_rgb_draft(&draft) else {
+                notifications.push(
+                    "RGB must be three values from 0 to 255.",
+                    NotifySeverity::Error,
+                );
+                return;
+            };
+            save_theme_color(state, agent, notifications, theme, token.to_string(), rgb);
+        }
+    }
+}
+
+fn edit_theme_text(
+    draft: &mut String,
+    cursor: &mut usize,
+    key: KeyEvent,
+    allow: impl Fn(char) -> bool,
+) {
+    match key.code {
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && allow(c) =>
+        {
+            let mut chars: Vec<char> = draft.chars().collect();
+            let idx = (*cursor).min(chars.len());
+            chars.insert(idx, c);
+            *draft = chars.into_iter().collect();
+            *cursor = idx + 1;
+        }
+        KeyCode::Backspace => {
+            if *cursor > 0 {
+                let mut chars: Vec<char> = draft.chars().collect();
+                let idx = (*cursor - 1).min(chars.len().saturating_sub(1));
+                chars.remove(idx);
+                *draft = chars.into_iter().collect();
+                *cursor -= 1;
+            }
+        }
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(draft.chars().count()),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = draft.chars().count(),
+        _ => {}
+    }
+}
+
+fn parse_rgb_draft(draft: &str) -> Option<[u8; 3]> {
+    let parts: Vec<&str> = draft.split(',').map(str::trim).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some([
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ])
+}
+
 fn open_api_key_entry_for_current_provider(
     state: &mut ConfigScreenState,
     notifications: &mut NotificationQueue,
@@ -716,6 +1045,28 @@ pub(crate) fn handle_paste(state: &mut ConfigScreenState, text: &str) {
     if let Some(entry) = state.secret_entry.as_mut() {
         for c in line.chars() {
             entry.insert_char(c);
+        }
+        return;
+    }
+
+    if let Some(editor) = state.theme_editor.as_mut() {
+        match editor {
+            ThemeEditor::Name { draft, cursor } | ThemeEditor::Rename { draft, cursor, .. } => {
+                insert_chars_at(
+                    draft,
+                    cursor,
+                    line.chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_'),
+                );
+            }
+            ThemeEditor::Rgb { draft, cursor, .. } => {
+                insert_chars_at(
+                    draft,
+                    cursor,
+                    line.chars()
+                        .filter(|c| c.is_ascii_digit() || *c == ',' || *c == ' '),
+                );
+            }
         }
         return;
     }

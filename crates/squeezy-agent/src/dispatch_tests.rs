@@ -397,14 +397,14 @@ fn parse_verbosity_effort_theme_detach_keymap() {
             id: "att-1".to_string()
         }
     );
-    assert!(matches!(
-        parse("/theme").unwrap_err(),
-        DispatchCommandParseError::Usage { .. }
-    ));
+    assert_eq!(
+        parse("/theme").unwrap(),
+        DispatchCommand::Theme { theme: None }
+    );
     assert_eq!(
         parse("/theme dark").unwrap(),
         DispatchCommand::Theme {
-            theme: "dark".to_string()
+            theme: Some("dark".to_string())
         }
     );
 }
@@ -437,7 +437,7 @@ fn slash_name_matches_input_command() {
         (
             "/theme",
             DispatchCommand::Theme {
-                theme: "dark".to_string(),
+                theme: Some("dark".to_string()),
             },
         ),
         (

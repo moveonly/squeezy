@@ -9,12 +9,12 @@
 //! Per the implementation plan, decision options stay at the existing
 //! three (`Once / Project / Deny`); only the preview block changes.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use squeezy_agent::ToolApprovalRequest;
 use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRule};
 
-use crate::{AMBER, GOLD, QUIET, compact_text};
+use crate::compact_text;
 
 /// Maximum number of diff lines we surface inline in an approval preview.
 /// Anything beyond this is summarised by a "… (N more lines)" tail so the
@@ -55,11 +55,13 @@ fn append_context(lines: &mut Vec<Line<'static>>, context: &str) {
         Span::raw("  "),
         Span::styled(
             "context: ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             trimmed.replace('\n', " "),
-            Style::default().fg(Color::White),
+            Style::default().fg(crate::render::theme::foreground()),
         ),
     ]));
 }
@@ -69,7 +71,9 @@ fn header_line(request: &ToolApprovalRequest) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             "Approval needed",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
@@ -78,7 +82,7 @@ fn header_line(request: &ToolApprovalRequest) -> Line<'static> {
                 permission.capability.as_str(),
                 permission.risk.as_str(),
             ),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
 }
@@ -202,9 +206,14 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
         Span::raw("  "),
         Span::styled(
             "Allow Project: ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(rule, Style::default().fg(Color::White)),
+        Span::styled(
+            rule,
+            Style::default().fg(crate::render::theme::foreground()),
+        ),
     ]));
 }
 
@@ -215,14 +224,17 @@ fn format_rule(rule: &PermissionRule) -> String {
 fn plain_white(text: String) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(text, Style::default().fg(Color::White)),
+        Span::styled(
+            text,
+            Style::default().fg(crate::render::theme::foreground()),
+        ),
     ])
 }
 
 fn dim(text: String) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(text, Style::default().fg(QUIET)),
+        Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
     ])
 }
 

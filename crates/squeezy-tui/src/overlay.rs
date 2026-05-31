@@ -13,7 +13,6 @@ use ratatui::text::{Line, Span};
 use squeezy_llm::{MODEL_REGISTRY, ModelInfo};
 
 use crate::render::palette;
-use crate::{GOLD, QUIET};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Overlay {
@@ -158,17 +157,22 @@ fn header_line(title: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             title,
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "  ↑↓ choose · Enter apply · Esc cancel",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
 }
 
 fn footer_line() -> Line<'static> {
-    Line::from(Span::styled("", Style::default().fg(QUIET)))
+    Line::from(Span::styled(
+        "",
+        Style::default().fg(crate::render::theme::quiet()),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -219,14 +223,20 @@ impl<T> SelectOverlay<T> {
                 let is_selected = index == self.selected;
                 let marker = if is_selected { "› " } else { "  " };
                 let style = if is_selected {
-                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(palette::muted_fg())
                 };
                 Line::from(vec![
                     Span::styled(
                         marker,
-                        Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                        Style::default().fg(if is_selected {
+                            crate::render::theme::secondary()
+                        } else {
+                            crate::render::theme::quiet()
+                        }),
                     ),
                     Span::styled(label(entry), style),
                 ])

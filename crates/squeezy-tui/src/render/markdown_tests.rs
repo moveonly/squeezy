@@ -1,5 +1,4 @@
 use super::render_markdown;
-use crate::render::palette;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
@@ -142,14 +141,14 @@ fn markdown_preserves_confidence_and_code_styles_inside_tables() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "label_missing")
         .expect("confidence label in table");
-    assert_eq!(label_span.style.fg, Some(palette::ERROR_RED));
+    assert_eq!(label_span.style.fg, Some(crate::render::theme::red()));
 
     let code_span = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.contains("session-"))
         .expect("inline code in table");
-    assert_eq!(code_span.style.fg, Some(palette::QUIET));
+    assert_eq!(code_span.style.fg, Some(crate::render::theme::quiet()));
 }
 
 #[test]
@@ -172,7 +171,7 @@ fn markdown_styles_unordered_bullet_markers() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "- ")
         .expect("bullet marker");
-    assert_eq!(marker.style.fg, Some(ratatui::style::Color::LightBlue));
+    assert_eq!(marker.style.fg, Some(crate::render::theme::blue()));
 }
 
 #[test]
@@ -183,7 +182,7 @@ fn markdown_colors_standalone_confidence_labels_in_prose() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "label_missing")
         .expect("standalone confidence label span");
-    assert_eq!(span.style.fg, Some(palette::ERROR_RED));
+    assert_eq!(span.style.fg, Some(crate::render::theme::red()));
 }
 
 #[test]

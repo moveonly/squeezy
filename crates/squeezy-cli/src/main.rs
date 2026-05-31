@@ -4,6 +4,7 @@ use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -540,7 +541,7 @@ async fn main() -> squeezy_core::Result<()> {
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
-    telemetry.record(TelemetryEvent::app_started(&config)).await;
+    telemetry.spawn(TelemetryEvent::app_started(&config));
 
     let provider = provider_from_app_config(&config);
     // Resolve `--session <prefix>` against the on-disk session store
@@ -589,7 +590,7 @@ async fn main() -> squeezy_core::Result<()> {
         let store = SessionStore::open(&config);
         if !confirm_cross_project_resume_stdio(&store, id, cli.force_cross_project)? {
             println!("resume cancelled");
-            let _ = telemetry.flush().await;
+            flush_telemetry_best_effort(&telemetry).await;
             return Ok(());
         }
         Some(id.to_string())
@@ -636,15 +637,13 @@ async fn main() -> squeezy_core::Result<()> {
             resume_resolution.session_id,
         )
         .await;
-        let _ = telemetry.flush().await;
+        flush_telemetry_best_effort(&telemetry).await;
         return result;
     }
 
-    // Best-effort update probe before the TUI takes over the terminal. The
-    // helper consults a 24h cache, so this is a no-op HTTP-wise on most
-    // startups; the banner stays quiet unless GitHub reports a new release
-    // we haven't already nagged the user about.
-    let update_banner = update::banner_for_startup(&update::check_for_update().await);
+    // Never block first paint on network I/O. Startup may show a cached update
+    // banner, while live update probing remains available through `doctor`.
+    let update_banner = update::cached_banner_for_startup();
     let resume_session_id = resume_session_id_opt;
     let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let result = squeezy_tui::run_with_startup_profile(
@@ -659,8 +658,12 @@ async fn main() -> squeezy_core::Result<()> {
         },
     )
     .await;
-    let _ = telemetry.flush().await;
+    flush_telemetry_best_effort(&telemetry).await;
     result
+}
+
+async fn flush_telemetry_best_effort(telemetry: &TelemetryClient) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), telemetry.flush()).await;
 }
 
 fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {

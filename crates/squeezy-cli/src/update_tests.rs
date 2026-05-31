@@ -150,6 +150,41 @@ fn check_with_clock_uses_fresh_cache_without_network() {
 }
 
 #[test]
+fn cached_banner_for_startup_uses_only_fresh_local_cache() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let dir = isolated_cache_dir("startup-cache-only");
+    let cache_file = dir.join("version_check.json");
+    let mut env = ScopedEnv::new();
+    env.set("SQUEEZY_VERSION_CACHE_PATH", cache_file.to_str().unwrap());
+    env.set(
+        "SQUEEZY_RELEASE_API_OVERRIDE",
+        "http://127.0.0.1:1/should-never-be-hit",
+    );
+
+    assert!(
+        cached_banner_for_startup().is_none(),
+        "missing cache should not trigger a startup network probe"
+    );
+
+    write_cache(&VersionCache {
+        checked_at: now_secs(),
+        latest: Some("9.9.9".to_string()),
+        banner_acked_version: None,
+    })
+    .expect("seed cache");
+
+    let banner = cached_banner_for_startup().expect("fresh newer cache should render banner");
+    assert!(banner.contains("v9.9.9"), "{banner}");
+    let cache = read_cache().expect("read cache").expect("cache present");
+    assert_eq!(
+        cache.banner_acked_version.as_deref(),
+        Some("9.9.9"),
+        "startup banner should still preserve the one-shot ack behavior"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_with_clock_reports_up_to_date_when_current_matches_cache() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     let dir = isolated_cache_dir("up-to-date");

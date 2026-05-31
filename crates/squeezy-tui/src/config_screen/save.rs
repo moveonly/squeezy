@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use squeezy_agent::{Agent, PendingConfigSwap};
 use squeezy_core::{
-    AppConfig,
+    AppConfig, TuiThemeSettings,
     config_schema::{ApplyTier, FieldMeta, FieldValue},
     load_separated_settings_sources,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, WriteOutcome, apply_edits},
@@ -132,6 +134,378 @@ fn set_effective_provider_api_key(cfg: &mut AppConfig, value: &str) {
         // surface a no-op for these variants.
         P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::Faux(_) => {}
     }
+}
+
+pub(crate) fn save_theme_selection(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    theme: String,
+) {
+    let (target_path, scope_target) = scope_write_target(state);
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let edit = SettingsEdit {
+        path: &["tui", "theme"],
+        op: EditOp::SetString(theme.clone()),
+    };
+    let outcome = match apply_edits(&scope_target, &[edit]) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+
+    state.effective.tui.theme = theme.clone();
+    finish_theme_save(state, agent, notifications);
+    notifications.push(
+        format!("✓ theme {theme} saved to {}", outcome.path.display()),
+        NotifySeverity::Success,
+    );
+}
+
+pub(crate) fn save_theme_snapshot(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    theme: String,
+) {
+    let snapshot =
+        crate::render::theme::resolve_theme(&state.effective, &state.effective.tui.theme);
+    let colors: Vec<(String, [u8; 3])> = snapshot
+        .colors()
+        .iter()
+        .map(|(token, rgb)| (token.clone(), *rgb))
+        .collect();
+    let (target_path, scope_target) = scope_write_target(state);
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let edits = [
+        SettingsEdit {
+            path: &[],
+            op: EditOp::SetThemeColors {
+                theme: theme.clone(),
+                colors: colors.clone(),
+            },
+        },
+        SettingsEdit {
+            path: &["tui", "theme"],
+            op: EditOp::SetString(theme.clone()),
+        },
+    ];
+    let outcome = match apply_edits(&scope_target, &edits) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+
+    state.effective.tui.themes.insert(
+        theme.clone(),
+        TuiThemeSettings {
+            colors: colors.into_iter().collect::<BTreeMap<_, _>>(),
+        },
+    );
+    state.effective.tui.theme = theme.clone();
+    finish_theme_save(state, agent, notifications);
+    notifications.push(
+        format!("✓ created theme {theme} in {}", outcome.path.display()),
+        NotifySeverity::Success,
+    );
+}
+
+pub(crate) fn save_theme_color(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    theme: String,
+    token: String,
+    rgb: [u8; 3],
+) {
+    let (target_path, scope_target) = scope_write_target(state);
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetThemeColor {
+            theme: theme.clone(),
+            token: token.clone(),
+            rgb,
+        },
+    };
+    let outcome = match apply_edits(&scope_target, &[edit]) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+
+    state
+        .effective
+        .tui
+        .themes
+        .entry(theme.clone())
+        .or_default()
+        .colors
+        .insert(token.clone(), rgb);
+    finish_theme_save(state, agent, notifications);
+    notifications.push(
+        format!("✓ saved {token} for {theme} to {}", outcome.path.display()),
+        NotifySeverity::Success,
+    );
+}
+
+pub(crate) fn save_theme_rename(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    old_theme: String,
+    new_theme: String,
+) {
+    let Some(settings) = state.effective.tui.themes.get(&old_theme).cloned() else {
+        notifications.push(
+            format!("Theme {old_theme} is not a custom theme."),
+            NotifySeverity::Warn,
+        );
+        return;
+    };
+
+    let colors: Vec<(String, [u8; 3])> = settings
+        .colors
+        .iter()
+        .map(|(token, rgb)| (token.clone(), *rgb))
+        .collect();
+    let active = state.effective.tui.theme == old_theme;
+    let (target_path, scope_target) = scope_write_target(state);
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let mut edits = vec![
+        SettingsEdit {
+            path: &[],
+            op: EditOp::SetThemeColors {
+                theme: new_theme.clone(),
+                colors,
+            },
+        },
+        SettingsEdit {
+            path: &[],
+            op: EditOp::RemoveTableEntry {
+                table_path: &["tui", "themes"],
+                key: old_theme.clone(),
+            },
+        },
+    ];
+    if active {
+        edits.push(SettingsEdit {
+            path: &["tui", "theme"],
+            op: EditOp::SetString(new_theme.clone()),
+        });
+    }
+
+    let outcome = match apply_edits(&scope_target, &edits) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+
+    state.effective.tui.themes.remove(&old_theme);
+    state
+        .effective
+        .tui
+        .themes
+        .insert(new_theme.clone(), settings);
+    if active {
+        state.effective.tui.theme = new_theme.clone();
+    }
+    finish_theme_save(state, agent, notifications);
+    notifications.push(
+        format!(
+            "✓ renamed theme {old_theme} to {new_theme} in {}",
+            outcome.path.display()
+        ),
+        NotifySeverity::Success,
+    );
+}
+
+pub(crate) fn save_theme_delete(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    theme: String,
+) {
+    if !state.effective.tui.themes.contains_key(&theme) {
+        notifications.push(
+            format!("Theme {theme} is not a custom theme."),
+            NotifySeverity::Warn,
+        );
+        return;
+    }
+
+    let active = state.effective.tui.theme == theme;
+    let (target_path, scope_target) = scope_write_target(state);
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let mut edits = vec![SettingsEdit {
+        path: &[],
+        op: EditOp::RemoveTableEntry {
+            table_path: &["tui", "themes"],
+            key: theme.clone(),
+        },
+    }];
+    if active {
+        edits.push(SettingsEdit {
+            path: &["tui", "theme"],
+            op: EditOp::SetString(squeezy_core::DEFAULT_TUI_THEME_NAME.to_string()),
+        });
+    }
+
+    let outcome = match apply_edits(&scope_target, &edits) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+
+    state.effective.tui.themes.remove(&theme);
+    if active {
+        state.effective.tui.theme = squeezy_core::DEFAULT_TUI_THEME_NAME.to_string();
+    }
+    finish_theme_save(state, agent, notifications);
+    state.field_index = state.field_index.min(state.row_count().saturating_sub(1));
+    notifications.push(
+        format!("✓ deleted theme {theme} from {}", outcome.path.display()),
+        NotifySeverity::Success,
+    );
+}
+
+pub(crate) fn unset_theme_color(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    theme: String,
+    token: String,
+) {
+    let (target_path, scope_target) = scope_write_target(state);
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::RemoveThemeColor {
+            theme: theme.clone(),
+            token: token.clone(),
+        },
+    };
+    let outcome = match apply_edits(&scope_target, &[edit]) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+    if outcome.edits_applied == 0 {
+        state.undo_stack.pop();
+        notifications.push(
+            format!("{token} has no {} override to clear", state.scope.label()),
+            NotifySeverity::Info,
+        );
+        return;
+    }
+
+    if let Some(settings) = state.effective.tui.themes.get_mut(&theme) {
+        settings.colors.remove(&token);
+    }
+    finish_theme_save(state, agent, notifications);
+    notifications.push(
+        format!(
+            "✓ cleared {token} for {theme} in {}",
+            outcome.path.display()
+        ),
+        NotifySeverity::Success,
+    );
+}
+
+fn scope_write_target(state: &ConfigScreenState) -> (std::path::PathBuf, SettingsScope) {
+    match state.scope {
+        ConfigScope::User => {
+            let p = state.sources.user_path_default.clone();
+            (p.clone(), SettingsScope::user(p))
+        }
+        ConfigScope::Repo => {
+            let p = state.sources.project_path_default.clone();
+            (p.clone(), SettingsScope::project(p))
+        }
+        ConfigScope::Local => {
+            let p = state.sources.repo_path_default.clone();
+            (p.clone(), SettingsScope::repo(p))
+        }
+    }
+}
+
+fn finish_theme_save(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+) {
+    state.dirty = true;
+    match load_separated_settings_sources() {
+        Ok(reloaded) => state.sources = reloaded,
+        Err(err) => {
+            notifications.push(
+                format!("inheritance map stale: {err}"),
+                NotifySeverity::Warn,
+            );
+        }
+    }
+    crate::apply_theme_overrides(&state.effective);
+    agent.replace_config(state.effective.clone());
 }
 
 pub(crate) fn save_field(

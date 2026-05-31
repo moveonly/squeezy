@@ -44,7 +44,7 @@ use squeezy_core::{
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
     ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
-    TuiSynchronizedOutput, TuiTheme,
+    TuiSynchronizedOutput,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_skills::PromptTemplateCatalog;
@@ -110,12 +110,7 @@ use input::{
 };
 
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
-#[cfg(test)]
-use render::palette::WORKING_SHIMMER_HIGHLIGHT;
-use render::palette::{
-    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
-    SUCCESS_GREEN, blend_color,
-};
+use render::palette::{self, blend_color};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
 
@@ -514,7 +509,7 @@ async fn run_inner(
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
-    apply_theme_overrides(config.tui.theme);
+    apply_theme_overrides(&config);
     let mut terminal =
         TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
     let resume_session_id =
@@ -994,7 +989,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     // Mirror an external theme edit into the runtime palette override
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
-    apply_theme_overrides(new_cfg.tui.theme);
+    apply_theme_overrides(&new_cfg);
     // Same pattern for the shell-diff inline preference: TuiApp keeps the
     // canonical value, but the deep render path reads the static.
     app.shell_diff_inline = new_cfg.tui.shell_diff_inline;
@@ -2017,35 +2012,10 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
     app.status = "/statusline".to_string();
 }
 
-/// Convert a [`TuiTheme`] preference into the runtime palette tone override.
-/// `System` clears the override so terminal detection (`COLORFGBG`) wins;
-/// `Catppuccin` pins Dark and `HighContrast` pins Light because each named
-/// theme expects a specific background tone for its accent palette to read
-/// correctly.
-fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTone> {
-    match theme {
-        TuiTheme::System => None,
-        TuiTheme::Dark | TuiTheme::Catppuccin => Some(render::palette::PaletteTone::Dark),
-        TuiTheme::Light | TuiTheme::HighContrast => Some(render::palette::PaletteTone::Light),
-    }
-}
-
-/// Map a [`TuiTheme`] to the accent family it owns. The amber/gold default
-/// is shared by `System`, `Dark`, and `Light`; only the named themes flip
-/// the accent.
-fn theme_to_accent_variant(theme: TuiTheme) -> render::palette::AccentVariant {
-    match theme {
-        TuiTheme::Catppuccin => render::palette::AccentVariant::Catppuccin,
-        TuiTheme::HighContrast => render::palette::AccentVariant::HighContrast,
-        _ => render::palette::AccentVariant::Default,
-    }
-}
-
-/// Apply both the tone and accent overrides for `theme` in one shot so
-/// callers don't accidentally update one and forget the other.
-pub(crate) fn apply_theme_overrides(theme: TuiTheme) {
-    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
-    render::palette::set_accent_variant(theme_to_accent_variant(theme));
+/// Apply the resolved theme table in one shot so all token lookups and
+/// render caches observe the same generation.
+pub(crate) fn apply_theme_overrides(config: &AppConfig) {
+    render::theme::set_active_theme(config);
 }
 
 /// Apply a `/theme` switch: flip the runtime palette override, mirror the
@@ -2053,27 +2023,24 @@ pub(crate) fn apply_theme_overrides(theme: TuiTheme) {
 /// scope settings file so the choice survives a restart. Persistence failures
 /// surface in the status line but the live switch still takes effect — the
 /// user can re-run later to retry the save.
-fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
+fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    apply_theme_overrides(theme);
-
     let mut next = agent.config_snapshot();
-    next.tui.theme = theme;
+    next.tui.theme = theme.clone();
+    apply_theme_overrides(&next);
     agent.replace_config(next);
 
     let target_path = app.user_settings_path();
     let scope_target = SettingsScope::user(&target_path);
     let edits = [SettingsEdit {
         path: &["tui", "theme"],
-        op: EditOp::SetString(theme.as_str().to_string()),
+        op: EditOp::SetString(theme.clone()),
     }];
     match apply_edits(&scope_target, &edits) {
         Ok(_) => {
-            app.app_notifications.push(
-                format!("theme → {}", theme.as_str()),
-                NotifySeverity::Success,
-            );
+            app.app_notifications
+                .push(format!("theme → {theme}"), NotifySeverity::Success);
             app.status = format!("theme saved to {}", target_path.display());
         }
         Err(err) => {
@@ -2475,13 +2442,25 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::ToolVerbosity { value } => {
             handle_slash_tool_verbosity(app, agent, value.as_deref());
         }
-        DispatchCommand::Theme { theme } => {
-            let Some(parsed) = TuiTheme::parse(&theme) else {
-                app.status = format!(
-                    "unknown theme {theme:?}; expected system, dark, light, catppuccin, or high-contrast",
-                );
+        DispatchCommand::Theme { theme: None } => {
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::Themes),
+            );
+        }
+        DispatchCommand::Theme { theme: Some(theme) } => {
+            let Some(parsed) = squeezy_core::normalize_tui_theme_name(&theme) else {
+                app.status = format!("unknown theme {theme:?}; expected a theme slug",);
                 return;
             };
+            if !render::theme::theme_exists(&agent.config_snapshot(), &parsed) {
+                app.status = format!(
+                    "unknown theme {theme:?}; available: {}",
+                    render::theme::available_theme_names(&agent.config_snapshot()).join(", ")
+                );
+                return;
+            }
             apply_theme_change(app, agent, parsed);
         }
         DispatchCommand::Keymap => {
@@ -4257,7 +4236,9 @@ fn format_mcp_elicitation_menu_lines(
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "MCP request",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
@@ -4265,7 +4246,7 @@ fn format_mcp_elicitation_menu_lines(
                 request.server,
                 mcp_elicitation_kind_label(&request.kind)
             ),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ])];
     lines.push(Line::from(vec![
@@ -4273,7 +4254,7 @@ fn format_mcp_elicitation_menu_lines(
         Span::styled(
             compact_text(&request.message, 180),
             Style::default()
-                .fg(MODE_PURPLE)
+                .fg(crate::render::theme::magenta())
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -4286,7 +4267,7 @@ fn format_mcp_elicitation_menu_lines(
                     Span::raw("  "),
                     Span::styled(
                         format!("schema {}", compact_text(&schema, 160)),
-                        Style::default().fg(QUIET),
+                        Style::default().fg(crate::render::theme::quiet()),
                     ),
                 ]));
             }
@@ -4294,7 +4275,7 @@ fn format_mcp_elicitation_menu_lines(
                 Span::raw("  "),
                 Span::styled(
                     format!("response {}", mcp_elicitation_response_preview(input)),
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 ),
             ]));
         }
@@ -4302,7 +4283,10 @@ fn format_mcp_elicitation_menu_lines(
             if let Some(url) = request.url.as_ref() {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(compact_text(url, 180), Style::default().fg(QUIET)),
+                    Span::styled(
+                        compact_text(url, 180),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
                 ]));
             }
         }
@@ -4311,17 +4295,24 @@ fn format_mcp_elicitation_menu_lines(
         let is_selected = index == selected.min(mcp_elicitation_options().len() - 1);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default().fg(crate::render::theme::secondary())
         } else {
             Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(option.label, label_style),
-            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+            Span::styled(
+                format!(" · {}", option.hint),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
     }
     lines
@@ -4348,11 +4339,13 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "Plan ready",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" · {}", pending.plan_id),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ])];
     lines.push(Line::from(vec![
@@ -4366,20 +4359,27 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         let is_selected = idx == selected;
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default().fg(crate::render::theme::secondary())
         } else {
             Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(
                 format!("[{}] {}", option.shortcut, option.label),
                 label_style,
             ),
-            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+            Span::styled(
+                format!(" · {}", option.hint),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
     }
     lines
@@ -4390,11 +4390,13 @@ fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static
         Line::from(vec![
             Span::styled(
                 "Send feedback?",
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" · {}", feedback.feedback_id),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
         ]),
         Line::from(vec![
@@ -4405,8 +4407,11 @@ fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static
             ),
         ]),
         Line::from(vec![
-            Span::styled("› Enter/Y Send", Style::default().fg(GOLD)),
-            Span::styled(" · ", Style::default().fg(QUIET)),
+            Span::styled(
+                "› Enter/Y Send",
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+            Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled("Esc/N Discard", Style::default().fg(palette::muted_fg())),
         ]),
     ]
@@ -4420,12 +4425,14 @@ fn format_request_user_input_menu_lines(
     let mut lines = vec![{
         let mut spans = vec![Span::styled(
             "Plan-mode question",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         )];
         if request.allow_freeform {
             spans.push(Span::styled(
                 " · freeform allowed",
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         Line::from(spans)
@@ -4435,7 +4442,7 @@ fn format_request_user_input_menu_lines(
         Span::styled(
             compact_text(&request.question, 240),
             Style::default()
-                .fg(MODE_PURPLE)
+                .fg(crate::render::theme::magenta())
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -4455,14 +4462,18 @@ fn format_request_user_input_menu_lines(
         let mut spans = vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { AMBER } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::accent()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(compact_text(&choice.label, 180), label_style),
         ];
         if choice.value != choice.label {
             spans.push(Span::styled(
                 format!(" · {}", compact_text(&choice.value, 120)),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         lines.push(Line::from(spans));
@@ -4470,18 +4481,24 @@ fn format_request_user_input_menu_lines(
     if request.allow_freeform {
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
-        // Label + cursor share the `MODE_PURPLE` warm-taupe accent so the
+        // Label + cursor share the `crate::render::theme::magenta()` warm-taupe accent so the
         // whole modal reads as one semantic surface; the typed body uses
         // a dim+bold tone-aware foreground for legibility without
         // overpowering the question line.
         let is_selected = selected >= request.choices.len();
         let marker = if is_selected { "● " } else { "  " };
-        let marker_style = Style::default().fg(if is_selected { AMBER } else { QUIET });
+        let marker_style = Style::default().fg(if is_selected {
+            crate::render::theme::accent()
+        } else {
+            crate::render::theme::quiet()
+        });
         let entry_style = Style::default()
             .fg(palette::footer_fg())
             .add_modifier(Modifier::BOLD);
-        let label_style = Style::default().fg(MODE_PURPLE);
-        let cursor_style = Style::default().fg(Color::Black).bg(MODE_PURPLE);
+        let label_style = Style::default().fg(crate::render::theme::magenta());
+        let cursor_style = Style::default()
+            .fg(Color::Black)
+            .bg(crate::render::theme::magenta());
         let mut spans = vec![
             Span::styled(marker, marker_style),
             Span::styled("Answer › ", label_style),
@@ -4489,7 +4506,7 @@ fn format_request_user_input_menu_lines(
         if input.is_empty() {
             spans.push(Span::styled(
                 "(type your answer · Enter sends when selected)",
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         } else {
             // Render the answer with an inline cursor block. The cursor
@@ -4517,17 +4534,24 @@ fn format_approval_menu_lines(
         let is_selected = index == selected.min(max_index);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD)
+            Style::default().fg(crate::render::theme::secondary())
         } else {
             Style::default().fg(palette::muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
-                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(option.label.to_string(), label_style),
-            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+            Span::styled(
+                format!(" · {}", option.hint),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
     }
     lines
@@ -4702,19 +4726,22 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     ];
     if let Some(hint) = current.action_hint {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(hint, Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            hint,
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     if app.app_notifications.len() > 1 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("({}+)", app.app_notifications.len() - 1),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         format!("· {remaining_secs}s"),
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -4928,7 +4955,7 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
     }
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(QUIET))
+        .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -4942,7 +4969,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     if app.pending_diff.is_some() {
         return Some(Line::from(Span::styled(
             "    ↳ computing diff…",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     }
     if let Some(snapshot) = app.mcp_status.as_ref() {
@@ -4959,7 +4986,10 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
         }
         if starting > 0 && total > 0 {
             let text = format!("    ↳ mcp: starting {ready}/{total} servers");
-            return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+            return Some(Line::from(Span::styled(
+                text,
+                Style::default().fg(crate::render::theme::quiet()),
+            )));
         }
     }
 
@@ -4975,7 +5005,10 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
             "    ↳ +{extra} more tool call{} queued",
             if extra == 1 { "" } else { "s" }
         );
-        return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+        return Some(Line::from(Span::styled(
+            text,
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
     }
     None
 }
@@ -4994,7 +5027,7 @@ fn turn_in_progress(app: &TuiApp) -> bool {
 fn working_line(app: &TuiApp) -> Line<'static> {
     let interrupting = app.status == "interrupting";
     let activity_color = if interrupting {
-        ERROR_RED
+        crate::render::theme::red()
     } else {
         render::palette::accent_primary()
     };
@@ -5010,7 +5043,9 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     spans.extend(if interrupting {
         vec![Span::styled(
             "Interrupting",
-            Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::red())
+                .add_modifier(Modifier::BOLD),
         )]
     } else {
         working_word_spans(app)
@@ -5020,14 +5055,17 @@ fn working_line(app: &TuiApp) -> Line<'static> {
             " ({} • esc to interrupt)",
             format_turn_duration(current_turn_duration(app))
         ),
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     ));
     if let Some(call) = app
         .active_tool_calls
         .values()
         .find(|call| !is_control_tool_name(&call.name))
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.extend(active_tool_spans(call));
         if let Some(elapsed_ms) = app.active_tool_elapsed_ms {
             spans.extend(active_tool_elapsed_spans(elapsed_ms));
@@ -5088,7 +5126,10 @@ fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
     let fill_width = (width as usize).saturating_sub(label_width);
     let mut text = label;
     text.push_str(&"─".repeat(fill_width));
-    Line::from(Span::styled(text, Style::default().fg(QUIET)))
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(crate::render::theme::quiet()),
+    ))
 }
 
 fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
@@ -5103,11 +5144,11 @@ fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
 
 fn task_status_label_color(status: squeezy_core::TaskStateStatus) -> (&'static str, Color) {
     match status {
-        squeezy_core::TaskStateStatus::Running => ("Working", AMBER),
-        squeezy_core::TaskStateStatus::Blocked => ("Blocked", GOLD),
-        squeezy_core::TaskStateStatus::Completed => ("Done", SUCCESS_GREEN),
-        squeezy_core::TaskStateStatus::Cancelled => ("Cancelled", ERROR_RED),
-        squeezy_core::TaskStateStatus::Failed => ("Failed", ERROR_RED),
+        squeezy_core::TaskStateStatus::Running => ("Working", crate::render::theme::accent()),
+        squeezy_core::TaskStateStatus::Blocked => ("Blocked", crate::render::theme::secondary()),
+        squeezy_core::TaskStateStatus::Completed => ("Done", crate::render::theme::green()),
+        squeezy_core::TaskStateStatus::Cancelled => ("Cancelled", crate::render::theme::red()),
+        squeezy_core::TaskStateStatus::Failed => ("Failed", crate::render::theme::red()),
     }
 }
 
@@ -5125,7 +5166,10 @@ fn turn_state_line(label: &'static str, detail: Option<String>, color: Color) ->
     ];
     if let Some(detail) = detail.filter(|value| !value.trim().is_empty()) {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(detail, Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            detail,
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     Line::from(spans)
 }
@@ -5202,7 +5246,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(approval_lines(app))
-        .style(Style::default().fg(QUIET))
+        .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -5260,10 +5304,12 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(GOLD))
+        .border_style(Style::default().fg(crate::render::theme::secondary()))
         .title(Span::styled(
             title,
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = transcript_overlay_inner(area);
     frame.render_widget(block, area);
@@ -5387,9 +5433,14 @@ fn render_transcript_overlay_scrollbar(
         .map(|offset| {
             let in_thumb = offset >= geometry.thumb_top && offset < thumb_end;
             let (symbol, style) = if in_thumb {
-                ("█", Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+                (
+                    "█",
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                ("░", Style::default().fg(QUIET))
+                ("░", Style::default().fg(crate::render::theme::quiet()))
             };
             Line::from(Span::styled(symbol, style))
         })
@@ -5736,17 +5787,26 @@ fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
             let pad_right = pad_total.saturating_sub(pad_left);
             return Line::from(vec![
                 Span::raw(" ".repeat(pad_left)),
-                Span::styled(left_strip, Style::default().fg(AMBER)),
+                Span::styled(
+                    left_strip,
+                    Style::default().fg(crate::render::theme::accent()),
+                ),
                 Span::raw("  "),
                 Span::styled(
                     title.to_string(),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(crate::render::theme::foreground())
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(version_text.clone(), Style::default().fg(AMBER)),
+                Span::styled(
+                    version_text.clone(),
+                    Style::default().fg(crate::render::theme::accent()),
+                ),
                 Span::raw("  "),
-                Span::styled(right_strip, Style::default().fg(AMBER)),
+                Span::styled(
+                    right_strip,
+                    Style::default().fg(crate::render::theme::accent()),
+                ),
                 Span::raw(" ".repeat(pad_right)),
             ]);
         }
@@ -5758,10 +5818,13 @@ fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
         Span::styled(
             title.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(crate::render::theme::foreground())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(version_text, Style::default().fg(AMBER)),
+        Span::styled(
+            version_text,
+            Style::default().fg(crate::render::theme::accent()),
+        ),
     ])
 }
 
@@ -5791,12 +5854,12 @@ fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         if let Some(last) = lines.last_mut() {
             last.spans.push(Span::styled(
                 format!(" · +{hidden} more (/attachments)"),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
     }
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(QUIET))
+        .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -5813,16 +5876,19 @@ fn plan_mode_indicator_height(app: &TuiApp) -> u16 {
 }
 
 /// Build the styled "[PLAN MODE] Shift+Tab to exit" line. Uses the
-/// existing `MODE_PURPLE` palette entry (no new colors) and ASCII
+/// existing `crate::render::theme::magenta()` palette entry (no new colors) and ASCII
 /// brackets with a Unicode `⊕` glyph — matches the other status glyphs
 /// (`⟳`, `▸`) already used in this file.
 pub(crate) fn format_plan_mode_indicator_line() -> Line<'static> {
     let label_style = Style::default()
-        .fg(MODE_PURPLE)
+        .fg(crate::render::theme::magenta())
         .add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled("⊕ PLAN MODE", label_style),
-        Span::styled(" · Shift+Tab to exit", Style::default().fg(QUIET)),
+        Span::styled(
+            " · Shift+Tab to exit",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ])
 }
 
@@ -5935,16 +6001,23 @@ fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static>
         Span::raw(marker),
         Span::styled(
             "›  ",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             data.cmd.clone(),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if !data.args.is_empty() {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(data.args.clone(), Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            data.args.clone(),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     Line::from(spans)
 }
@@ -6066,7 +6139,9 @@ fn build_diff_card(snapshot: &squeezy_vcs::DiffSnapshot) -> DiffCardData {
         );
         lines.push(Line::from(Span::styled(
             header.clone(),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         )));
         plain.push_str(&header);
         plain.push('\n');
@@ -6099,12 +6174,12 @@ fn format_diff_card_entry(
     let header = action_line_spans(
         selected,
         "✱",
-        GOLD,
+        crate::render::theme::secondary(),
         "Diff",
-        GOLD,
+        crate::render::theme::secondary(),
         vec![Span::styled(
             data.summary.clone(),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )],
     );
     if collapsed {
@@ -6496,8 +6571,16 @@ fn format_message_entry_with_width(
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
-    let label_color = if failed { ERROR_RED } else { color };
-    let action_color = if failed { ERROR_RED } else { color };
+    let label_color = if failed {
+        crate::render::theme::red()
+    } else {
+        color
+    };
+    let action_color = if failed {
+        crate::render::theme::red()
+    } else {
+        color
+    };
     let content_style = message_content_style(&item.role);
     if collapsed {
         return vec![action_line_styled(
@@ -6528,8 +6611,8 @@ fn format_message_entry_with_width(
 }
 
 /// Render the `/cost` and `/context` outputs with per-token coloring:
-/// group words pop in `GOLD`, `key=` labels dim to `QUIET`, dollar values
-/// pop in `AMBER`, and zero/dash/unknown values fade to `QUIET` so the
+/// group words pop in `crate::render::theme::secondary()`, `key=` labels dim to `crate::render::theme::quiet()`, dollar values
+/// pop in `crate::render::theme::accent()`, and zero/dash/unknown values fade to `crate::render::theme::quiet()` so the
 /// real numbers carry the eye. Returns `None` for any system message that
 /// is not an accounting block — the caller falls through to the default
 /// single-style renderer.
@@ -6541,15 +6624,17 @@ fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Li
     }
     let header_span = Span::styled(
         header.to_string(),
-        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
     );
     let mut lines = Vec::with_capacity(content.lines().count());
     lines.push(action_line_spans(
         selected,
         "• ",
-        GOLD,
+        crate::render::theme::secondary(),
         "Noted",
-        GOLD,
+        crate::render::theme::secondary(),
         vec![header_span],
     ));
     for body in iter {
@@ -6564,7 +6649,10 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
     // Sentences without any `key=value` token are dimmed wholesale (the
     // accuracy epilogue, the `provider_stored_context=...` narrative line).
     if !line.contains('=') || line.starts_with("accuracy=") {
-        return vec![Span::styled(line.to_string(), Style::default().fg(QUIET))];
+        return vec![Span::styled(
+            line.to_string(),
+            Style::default().fg(crate::render::theme::quiet()),
+        )];
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut first_token = true;
@@ -6577,7 +6665,10 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
         if let Some(eq_idx) = text.find('=') {
             let (key, rest) = text.split_at(eq_idx);
             let value = &rest[1..];
-            spans.push(Span::styled(format!("{key}="), Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                format!("{key}="),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
             spans.push(Span::styled(
                 value.to_string(),
                 accounting_value_style(value),
@@ -6587,9 +6678,9 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
             // `subagents`, `transmitted_request`, …) or a trailing
             // parenthetical like `(estimated from ...)`.
             let style = if first_token {
-                Style::default().fg(GOLD)
+                Style::default().fg(crate::render::theme::secondary())
             } else {
-                Style::default().fg(QUIET)
+                Style::default().fg(crate::render::theme::quiet())
             };
             spans.push(Span::styled(text.to_string(), style));
         }
@@ -6603,10 +6694,10 @@ fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
 
 fn accounting_value_style(value: &str) -> Style {
     if value.is_empty() {
-        return Style::default().fg(QUIET);
+        return Style::default().fg(crate::render::theme::quiet());
     }
     if value.starts_with('$') {
-        return Style::default().fg(AMBER);
+        return Style::default().fg(crate::render::theme::accent());
     }
     // Values that signal absence/zero fade so the eye lands on the real
     // numbers. Percent strings like `0.00%` count as zero too.
@@ -6619,7 +6710,7 @@ fn accounting_value_style(value: &str) -> Style {
         "-" | "0" | "unknown" | "inactive" | "absent" | "false"
     ) || is_zero_percent
     {
-        return Style::default().fg(QUIET);
+        return Style::default().fg(crate::render::theme::quiet());
     }
     Style::default()
 }
@@ -6640,7 +6731,7 @@ fn format_user_prompt_entry(
         .max()
         .unwrap_or(0)
         .max(1);
-    let amber = Style::default().fg(AMBER);
+    let amber = Style::default().fg(crate::render::theme::accent());
     let bullet_style = amber.add_modifier(Modifier::BOLD);
     const INDENT: &str = "  ";
     // Cycle through the moon-phase set so consecutive prompts get a
@@ -6667,15 +6758,15 @@ fn format_user_prompt_entry(
         let bang_ref = bang_range.as_ref();
         let style_text_at = |abs_offset: usize| -> Style {
             if bang_ref.is_some_and(|range| range.contains(&abs_offset)) {
-                Style::default().fg(BANG_RED)
+                Style::default().fg(crate::render::theme::red())
             } else if let Some(len) = slash_len {
                 if abs_offset < len {
-                    Style::default().fg(AMBER)
+                    Style::default().fg(crate::render::theme::accent())
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(crate::render::theme::foreground())
                 }
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(crate::render::theme::foreground())
             }
         };
         // First line gets the cycling moon-phase bullet; continuation
@@ -6704,7 +6795,7 @@ fn format_user_prompt_entry(
 /// (double-bang, runs locally but skips LLM context) marker after any
 /// leading whitespace, or `None` if the line is not a bang command.
 /// Returned as a range — rather than the previous single offset — so the
-/// prompt renderer can paint both bangs in `BANG_RED` for `!!cmd`.
+/// prompt renderer can paint both bangs in `crate::render::theme::red()` for `!!cmd`.
 fn bang_command_marker_range(text: &str) -> Option<std::ops::Range<usize>> {
     let mut chars = text.char_indices().skip_while(|(_, ch)| ch.is_whitespace());
     let (start, first) = chars.next()?;
@@ -6728,9 +6819,9 @@ fn format_assistant_message_entry(
     show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
-        ERROR_RED
+        crate::render::theme::red()
     } else {
-        SUCCESS_GREEN
+        crate::render::theme::green()
     };
     let mut lines = Vec::new();
     if show_reasoning
@@ -7046,7 +7137,7 @@ fn format_grouped_tool_result_entry(
     let action_label = grouped_action_label(lead);
     let header_summary = vec![Span::styled(
         format!("{count} {}", grouped_action_noun(lead, count)),
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )];
     let header = action_line_spans(selected, marker, color, action_label, color, header_summary);
 
@@ -7057,7 +7148,7 @@ fn format_grouped_tool_result_entry(
         }
         body.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             "(Ctrl-T for full transcript)".to_string(),
         ));
     } else {
@@ -7127,7 +7218,7 @@ fn grouped_action_noun(lead: &ToolTranscript, count: usize) -> String {
 /// card. Reuses [`tool_result_summary_spans`] which already produces a
 /// concise per-tool summary (e.g. `path · 4.9KB of 26.4KB` for reads,
 /// `pattern · N matches` for grep). The group header already carries
-/// the verb and status color, so the row itself stays QUIET.
+/// the verb and status color, so the row itself stays crate::render::theme::quiet().
 fn tool_oneline_summary(tool: &ToolTranscript) -> Vec<Span<'static>> {
     tool_result_summary_spans(tool)
 }
@@ -7218,7 +7309,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.extend(lines.iter().take(cap).cloned());
     out.push(detail_line(
         false,
-        QUIET,
+        crate::render::theme::quiet(),
         format!("… +{omitted} lines (Ctrl-T for full transcript)"),
     ));
     out.extend(
@@ -7260,7 +7351,12 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
             Span::raw(marker),
-            Span::styled("⚠ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "⚠ ",
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(preview, Style::default().fg(palette::muted_fg())),
         ])];
     }
@@ -7274,24 +7370,26 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
 
 fn role_action(role: &Role) -> (&'static str, Color) {
     match role {
-        Role::User => ("Asked", AMBER),
-        Role::Assistant => ("Answered", SUCCESS_GREEN),
-        Role::System => ("Noted", GOLD),
+        Role::User => ("Asked", crate::render::theme::accent()),
+        Role::Assistant => ("Answered", crate::render::theme::green()),
+        Role::System => ("Noted", crate::render::theme::secondary()),
     }
 }
 
 fn message_content_style(role: &Role) -> Style {
     match role {
-        Role::User => Style::default().fg(palette::muted_fg()).bg(PROMPT_BG),
+        Role::User => Style::default()
+            .fg(palette::muted_fg())
+            .bg(crate::render::theme::prompt_bg()),
         Role::Assistant | Role::System => Style::default(),
     }
 }
 
 fn log_color(message: &str) -> Color {
     if is_failure_log(message) {
-        ERROR_RED
+        crate::render::theme::red()
     } else {
-        GOLD
+        crate::render::theme::secondary()
     }
 }
 
@@ -7491,19 +7589,28 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         if let Some(call) = tool.call.as_ref() {
             let label = tool_call_label(call);
             if label != result.tool_name {
-                spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
-                spans.push(Span::styled(label, Style::default().fg(QUIET)));
+                spans.push(Span::styled(
+                    " · ",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ));
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(crate::render::theme::quiet()),
+                ));
             }
         }
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             tool_result_error_detail(result),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
         if tool.repeat_count > 1 {
             spans.push(Span::styled(
                 format!(" ({}x)", tool.repeat_count),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         return spans;
@@ -7527,43 +7634,55 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         )],
     };
     if tool_result_not_run(tool) {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             tool_result_error_detail(result),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
         if tool.repeat_count > 1 {
             spans.push(Span::styled(
                 format!(" ({}x)", tool.repeat_count),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         return spans;
     }
     match result.status {
         ToolStatus::Error | ToolStatus::Stale => {
-            spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
             spans.push(Span::styled(
                 tool_result_error_detail(result),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         ToolStatus::Denied => {
-            spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
             spans.push(Span::styled(
                 tool_result_denied_detail(result),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ));
         }
         ToolStatus::Cancelled => {
-            spans.push(Span::styled(" · cancelled", Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                " · cancelled",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
         }
         ToolStatus::Success => {}
     }
     if tool.repeat_count > 1 {
         spans.push(Span::styled(
             format!(" ({}x)", tool.repeat_count),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     spans
@@ -7633,10 +7752,13 @@ fn decl_search_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     if let Some(total) = number_field(&tool.result.content, "total_matches")
         .or_else(|| number_field(&tool.result.content, "returned_matches"))
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{total} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7657,10 +7779,13 @@ fn semantic_tool_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
                 .map(|items| items.len() as u64)
         })
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{matches} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     spans
@@ -7672,17 +7797,23 @@ fn repo_map_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{files} files"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     if let Some(symbols) = tool.result.content["stats"]["symbols"].as_u64() {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{symbols} symbols"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7717,10 +7848,13 @@ fn grep_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
                 .map(|items| items.len() as u64)
         })
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{matches} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7744,10 +7878,13 @@ fn glob_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .as_array()
         .map(|items| items.len() as u64)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{paths} paths"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7761,16 +7898,25 @@ fn read_file_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
-        spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            format_bytes(bytes),
+            Style::default().fg(crate::render::theme::secondary()),
+        ));
     } else if let Some(ranges) = tool.result.content["ranges"]
         .as_array()
         .map(|items| items.len() as u64)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{ranges} ranges"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -7789,8 +7935,14 @@ fn read_tool_output_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         Style::default().fg(palette::muted_fg()),
     )];
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
-        spans.push(Span::styled(format_bytes(bytes), Style::default().fg(GOLD)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            format_bytes(bytes),
+            Style::default().fg(crate::render::theme::secondary()),
+        ));
     }
     append_truncation_hint(&mut spans, tool);
     spans
@@ -7812,16 +7964,22 @@ fn edit_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     let additions = files.iter().map(|file| file.additions).sum::<u64>();
     let deletions = files.iter().map(|file| file.deletions).sum::<u64>();
     if additions > 0 || deletions > 0 {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("+{additions} -{deletions}"),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     } else if let Some(count) = number_field(&tool.result.content, "matches") {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{count} matches"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     spans
@@ -8115,19 +8273,25 @@ fn diff_context_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
                 .map(|items| items.len() as u64)
         });
     if let Some(files) = files {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{files} files"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     let additions = tool.result.content["summary"]["additions"].as_u64();
     let deletions = tool.result.content["summary"]["deletions"].as_u64();
     if additions.unwrap_or(0) > 0 || deletions.unwrap_or(0) > 0 {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("+{} -{}", additions.unwrap_or(0), deletions.unwrap_or(0)),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -8152,10 +8316,13 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .map(|items| items.len() as u64)
         .filter(|count| *count > 0)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{symbols} symbols"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     if let Some(paths) = tool.result.content["impact"]["neighborhood_paths"]
@@ -8163,16 +8330,19 @@ fn plan_patch_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         .map(|items| items.len() as u64)
         .filter(|count| *count > 0)
     {
-        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             format!("{paths} paths"),
-            Style::default().fg(GOLD),
+            Style::default().fg(crate::render::theme::secondary()),
         ));
     }
     if tool.result.content["graph_available"].as_bool() == Some(false) {
         spans.push(Span::styled(
             " · graph unavailable",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     append_truncation_hint(&mut spans, tool);
@@ -8261,7 +8431,9 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
 fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     let name_span = Span::styled(
         friendly_tool_name(&call.name),
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
     );
     let args = active_tool_args(call);
     if args.is_empty() {
@@ -8271,7 +8443,9 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
         name_span,
         Span::styled(
             ": ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if matches!(call.name.as_str(), "shell" | "verify") {
@@ -8294,8 +8468,11 @@ fn active_tool_elapsed_spans(elapsed_ms: u64) -> Vec<Span<'static>> {
         return Vec::new();
     }
     vec![
-        Span::styled(" · ", Style::default().fg(QUIET)),
-        Span::styled(format!("{secs}s"), Style::default().fg(QUIET)),
+        Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
+        Span::styled(
+            format!("{secs}s"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]
 }
 
@@ -8413,19 +8590,31 @@ fn expanded_symbol_context_detail_lines(
     if let Some(call) = tool.call.as_ref()
         && let Some(query) = string_arg(&call.arguments, "query")
     {
-        lines.push(detail_line(false, QUIET, format!("query `{query}`")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("query `{query}`"),
+        ));
     }
     let packets = tool.result.content["packets"].as_array();
     let total = packets.map(|p| p.len()).unwrap_or(0);
     if total == 0 {
         if let Some(reason) = string_arg(&tool.result.content, "reason") {
-            lines.push(detail_line(false, QUIET, reason));
+            lines.push(detail_line(false, crate::render::theme::quiet(), reason));
         } else {
-            lines.push(detail_line(false, QUIET, "no symbols matched".to_string()));
+            lines.push(detail_line(
+                false,
+                crate::render::theme::quiet(),
+                "no symbols matched".to_string(),
+            ));
         }
         return lines;
     }
-    lines.push(detail_line(false, QUIET, format!("packets {total}")));
+    lines.push(detail_line(
+        false,
+        crate::render::theme::quiet(),
+        format!("packets {total}"),
+    ));
     if let Some(packets) = packets {
         for packet in packets.iter().take(packet_cap) {
             let name = packet["name"].as_str().unwrap_or("?");
@@ -8449,7 +8638,7 @@ fn expanded_symbol_context_detail_lines(
             };
             lines.push(detail_line(
                 false,
-                QUIET,
+                crate::render::theme::quiet(),
                 format!("{path}:{line} {name}{kind_suffix}{counts}"),
             ));
         }
@@ -8457,7 +8646,7 @@ fn expanded_symbol_context_detail_lines(
     if total > packet_cap {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!(
                 "+{} more packets (Ctrl-T for full transcript)",
                 total - packet_cap
@@ -8484,7 +8673,11 @@ fn expanded_shell_detail_lines(
     if tool.result.status != ToolStatus::Success
         && let Some(workdir) = string_arg(&tool.result.content, "workdir")
     {
-        lines.push(detail_line(false, QUIET, format!("cwd {workdir}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("cwd {workdir}"),
+        ));
     }
     if tool.result.status != ToolStatus::Success
         && let Some(exit_code) = tool
@@ -8493,7 +8686,11 @@ fn expanded_shell_detail_lines(
             .get("exit_code")
             .and_then(|value| value.as_i64())
     {
-        lines.push(detail_line(false, QUIET, format!("exit {exit_code}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("exit {exit_code}"),
+        ));
     }
     if tool.result.status != ToolStatus::Success {
         lines.extend(output_block_lines(
@@ -8541,7 +8738,7 @@ fn shell_output_block_lines(
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
     lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
         if line.truncated_marker {
-            detail_line(false, QUIET, line.text)
+            detail_line(false, crate::render::theme::quiet(), line.text)
         } else if is_diff {
             shell_output_diff_line(&line.text)
         } else {
@@ -8556,16 +8753,24 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             "│ ",
-            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     spans.extend(command_spans(command));
-    spans.push(Span::styled(" in ", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        " in ",
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
     spans.push(Span::styled(
         workdir.to_string(),
         Style::default().fg(palette::muted_fg()),
     ));
-    spans.push(Span::styled(":", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        ":",
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
     Line::from(spans)
 }
 
@@ -8616,7 +8821,9 @@ fn detail_output_diff_line(content: &str) -> Line<'static> {
             Span::raw("  "),
             Span::styled(
                 "│ ",
-                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
             ),
         ],
     )
@@ -8649,7 +8856,7 @@ fn diff_output_line(content: &str, mut spans: Vec<Span<'static>>) -> Line<'stati
         return line;
     } else if trimmed.starts_with("@@") {
         Style::default()
-            .fg(palette::MODE_PURPLE)
+            .fg(crate::render::theme::magenta())
             .add_modifier(Modifier::BOLD)
     } else {
         spans.extend(styled_output_spans(trimmed));
@@ -8690,20 +8897,32 @@ fn expanded_decl_search_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(total) = number_field(&tool.result.content, "total_matches") {
-        lines.push(detail_line(false, QUIET, format!("total matches {total}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("total matches {total}"),
+        ));
     }
     if let Some(returned) = number_field(&tool.result.content, "returned_matches") {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("shown matches {returned}"),
         ));
     }
     if let Some(languages) = compact_json_object(&tool.result.content["counts_by_language"]) {
-        lines.push(detail_line(false, QUIET, format!("languages {languages}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("languages {languages}"),
+        ));
     }
     if let Some(kinds) = compact_json_object(&tool.result.content["counts_by_kind"]) {
-        lines.push(detail_line(false, QUIET, format!("kinds {kinds}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("kinds {kinds}"),
+        ));
     }
     lines
 }
@@ -8711,13 +8930,25 @@ fn expanded_decl_search_detail_lines(
 fn expanded_repo_map_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(files) = tool.result.content["stats"]["files"].as_u64() {
-        lines.push(detail_line(false, QUIET, format!("files {files}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("files {files}"),
+        ));
     }
     if let Some(symbols) = tool.result.content["stats"]["symbols"].as_u64() {
-        lines.push(detail_line(false, QUIET, format!("symbols {symbols}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("symbols {symbols}"),
+        ));
     }
     if let Some(languages) = compact_json_object(&tool.result.content["languages"]) {
-        lines.push(detail_line(false, QUIET, format!("languages {languages}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("languages {languages}"),
+        ));
     }
     lines
 }
@@ -8725,7 +8956,11 @@ fn expanded_repo_map_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
 fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(mode) = string_arg(&tool.result.content, "mode") {
-        lines.push(detail_line(false, QUIET, format!("mode {mode}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("mode {mode}"),
+        ));
     }
     let summary = &tool.result.content["summary"];
     if let Some(files) = summary["files_changed"].as_u64() {
@@ -8733,7 +8968,7 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
         let deletions = summary["deletions"].as_u64().unwrap_or(0);
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("changed {files} files, +{additions} -{deletions}"),
         ));
     }
@@ -8749,7 +8984,7 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
             if file.patch_truncated {
                 summary.push_str(" · diff truncated");
             }
-            lines.push(detail_line(false, QUIET, summary));
+            lines.push(detail_line(false, crate::render::theme::quiet(), summary));
             if file
                 .patch
                 .as_ref()
@@ -8781,27 +9016,44 @@ fn diff_context_files(tool: &ToolTranscript) -> Vec<squeezy_vcs::DiffFile> {
 fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(objective) = string_arg(&tool.result.content, "objective") {
-        lines.push(detail_line(false, QUIET, format!("objective {objective}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("objective {objective}"),
+        ));
     }
     if let Some(plan_id) = string_arg(&tool.result.content, "plan_id") {
-        lines.push(detail_line(false, QUIET, format!("plan {plan_id}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("plan {plan_id}"),
+        ));
     }
     if let Some(symbols) = tool.result.content["symbols"].as_array() {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("symbols {}", symbols.len()),
         ));
     }
     if let Some(paths) = tool.result.content["impact"]["neighborhood_paths"].as_array() {
-        lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("paths {}", paths.len()),
+        ));
         lines.extend(paths.iter().take(5).filter_map(|path| {
-            path.as_str()
-                .map(|path| detail_line(false, QUIET, format!("path {path}")))
+            path.as_str().map(|path| {
+                detail_line(false, crate::render::theme::quiet(), format!("path {path}"))
+            })
         }));
     }
     if let Some(next) = tool.result.content["next_action"]["reason"].as_str() {
-        lines.push(detail_line(false, QUIET, format!("next {next}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("next {next}"),
+        ));
     }
     lines
 }
@@ -8820,14 +9072,18 @@ fn expanded_edit_detail_lines(
         if file.patch_truncated {
             summary.push_str(" · diff truncated");
         }
-        lines.push(detail_line(false, QUIET, summary));
+        lines.push(detail_line(false, crate::render::theme::quiet(), summary));
         if let Some(patch) = file.patch.as_deref().filter(|patch| !patch.is_empty()) {
-            lines.push(detail_line(false, QUIET, "diff"));
+            lines.push(detail_line(false, crate::render::theme::quiet(), "diff"));
             lines.extend(render_diff_patch_full_lines(patch, file.path.as_str()));
         }
     }
     if let Some(matches) = number_field(&tool.result.content, "matches") {
-        lines.push(detail_line(false, QUIET, format!("matches {matches}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("matches {matches}"),
+        ));
     }
     if let Some(contexts) = tool.result.content["match_contexts"].as_array() {
         lines.extend(contexts.iter().take(5).filter_map(|context| {
@@ -8836,7 +9092,7 @@ fn expanded_edit_detail_lines(
             let preview = context["preview"].as_str()?;
             Some(detail_line(
                 false,
-                QUIET,
+                crate::render::theme::quiet(),
                 format!("match {index} line {line}: {preview}"),
             ))
         }));
@@ -8876,18 +9132,31 @@ fn expanded_glob_detail_lines_v(
     };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
-        lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("pattern {pattern}"),
+        ));
     }
     if !matches!(verbosity, ToolOutputVerbosity::Compact)
         && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
     {
-        lines.push(detail_line(false, QUIET, format!("root {path}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("root {path}"),
+        ));
     }
     if let Some(paths) = tool.result.content["paths"].as_array() {
-        lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("paths {}", paths.len()),
+        ));
         lines.extend(paths.iter().take(path_cap).filter_map(|path| {
-            path.as_str()
-                .map(|path| detail_line(false, QUIET, format!("path {path}")))
+            path.as_str().map(|path| {
+                detail_line(false, crate::render::theme::quiet(), format!("path {path}"))
+            })
         }));
     }
     lines
@@ -8907,15 +9176,27 @@ fn expanded_grep_detail_lines_v(
     };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
-        lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("pattern {pattern}"),
+        ));
     }
     if !matches!(verbosity, ToolOutputVerbosity::Compact)
         && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
     {
-        lines.push(detail_line(false, QUIET, format!("root {path}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("root {path}"),
+        ));
     }
     if let Some(count) = number_field(&tool.result.content, "count") {
-        lines.push(detail_line(false, QUIET, format!("matches {count}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("matches {count}"),
+        ));
     }
     lines.extend(path_detail_lines(
         &tool.result.content["paths"],
@@ -8929,7 +9210,7 @@ fn expanded_grep_detail_lines_v(
             let text = item["text"].as_str().unwrap_or_default();
             lines.push(detail_line(
                 false,
-                QUIET,
+                crate::render::theme::quiet(),
                 format!("{path}:{line} {}", compact_text(text, 100)),
             ));
         }
@@ -8966,23 +9247,31 @@ fn expanded_read_file_detail_lines(
         if ranges > 1 {
             summary.push_str(&format!(" · {ranges} ranges"));
         }
-        return vec![detail_line(false, QUIET, summary)];
+        return vec![detail_line(false, crate::render::theme::quiet(), summary)];
     }
 
     let mut lines = Vec::new();
     if let Some(path) = path {
-        lines.push(detail_line(false, QUIET, format!("path {path}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("path {path}"),
+        ));
     }
     if let Some(bytes) = bytes {
         let total = total.unwrap_or(bytes);
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
     if ranges > 0 {
-        lines.push(detail_line(false, QUIET, format!("ranges {ranges}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("ranges {ranges}"),
+        ));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         lines.extend(output_block_lines("content", &content, verbosity));
@@ -8996,20 +9285,24 @@ fn expanded_read_tool_output_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(handle) = string_arg(&tool.result.content, "handle") {
-        lines.push(detail_line(false, QUIET, format!("handle {handle}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("handle {handle}"),
+        ));
     }
     if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
         let total = number_field(&tool.result.content, "total_bytes").unwrap_or(bytes);
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
     if let Some(saved) = saved_tool_output_meta(tool) {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!("saved {}", saved_tool_output_label(&saved.tool_name)),
         ));
         if let Some(result) = saved.parsed {
@@ -9027,33 +9320,41 @@ fn expanded_read_tool_output_detail_lines(
             } else {
                 "content saved tool-result JSON (hidden in normal mode)"
             };
-            lines.push(detail_line(false, QUIET, detail));
+            lines.push(detail_line(false, crate::render::theme::quiet(), detail));
             return lines;
         }
     }
     if let Some(summary) = saved_compiler_output_summary(tool) {
-        lines.push(detail_line(false, QUIET, "saved compiler output"));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            "saved compiler output",
+        ));
         if !summary.messages.is_empty() {
-            lines.push(detail_line(false, QUIET, "compiler messages"));
+            lines.push(detail_line(
+                false,
+                crate::render::theme::quiet(),
+                "compiler messages",
+            ));
             for line in head_tail_lines(
                 &summary.messages.join("\n"),
                 saved_output_preview_limit(verbosity),
             ) {
                 if line.truncated_marker {
-                    lines.push(detail_line(false, QUIET, line.text));
+                    lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     lines.push(detail_spans_line(styled_output_spans(&line.text)));
                 }
             }
         }
         if !summary.stderr.is_empty() {
-            lines.push(detail_line(false, QUIET, "stderr"));
+            lines.push(detail_line(false, crate::render::theme::quiet(), "stderr"));
             for line in head_tail_lines(
                 &summary.stderr.join("\n"),
                 saved_output_preview_limit(verbosity),
             ) {
                 if line.truncated_marker {
-                    lines.push(detail_line(false, QUIET, line.text));
+                    lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     lines.push(detail_spans_line(styled_output_spans(&line.text)));
                 }
@@ -9067,7 +9368,7 @@ fn expanded_read_tool_output_detail_lines(
             if summary.partial {
                 detail.push_str(" · partial result");
             }
-            lines.push(detail_line(false, QUIET, detail));
+            lines.push(detail_line(false, crate::render::theme::quiet(), detail));
             return lines;
         }
     }
@@ -9079,10 +9380,10 @@ fn expanded_read_tool_output_detail_lines(
         // existing "expand grep → see every match" behaviour is preserved.
         let limit = saved_output_preview_limit(verbosity);
         if !content.trim().is_empty() {
-            lines.push(detail_line(false, QUIET, "content"));
+            lines.push(detail_line(false, crate::render::theme::quiet(), "content"));
             for line in head_tail_lines(&content, limit) {
                 if line.truncated_marker {
-                    lines.push(detail_line(false, QUIET, line.text));
+                    lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     lines.push(detail_spans_line(styled_output_spans(&line.text)));
                 }
@@ -9291,13 +9592,17 @@ fn expanded_generic_tool_detail_lines(
             break;
         }
         let summary = summarize_json_value(value);
-        lines.push(detail_line(false, QUIET, format!("{key} {summary}")));
+        lines.push(detail_line(
+            false,
+            crate::render::theme::quiet(),
+            format!("{key} {summary}"),
+        ));
         shown += 1;
     }
     if total_keys > shown {
         lines.push(detail_line(
             false,
-            QUIET,
+            crate::render::theme::quiet(),
             format!(
                 "+{} more fields (Ctrl-T for full transcript)",
                 total_keys - shown
@@ -9357,10 +9662,10 @@ fn output_block_lines(
     let limit = usize::MAX;
     let lines = head_tail_lines(content, limit);
     let is_diff = shell_text_looks_like_diff(content);
-    let mut rendered = vec![detail_line(false, QUIET, label)];
+    let mut rendered = vec![detail_line(false, crate::render::theme::quiet(), label)];
     rendered.extend(lines.into_iter().map(|line| {
         if line.truncated_marker {
-            detail_line(false, QUIET, line.text)
+            detail_line(false, crate::render::theme::quiet(), line.text)
         } else if is_diff {
             detail_output_diff_line(&line.text)
         } else {
@@ -9427,7 +9732,9 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             "│ ",
-            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     spans.extend(content);
@@ -9440,7 +9747,9 @@ fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             "│ ",
-            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     spans.extend(line.spans);
@@ -9466,15 +9775,17 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
         }
         let style = if !command_seen && !looks_like_env_assignment(token) {
             command_seen = true;
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
         } else if token.starts_with('-') {
-            Style::default().fg(AMBER)
+            Style::default().fg(crate::render::theme::accent())
         } else if token.starts_with('"') || token.starts_with('\'') {
-            Style::default().fg(SUCCESS_GREEN)
+            Style::default().fg(crate::render::theme::green())
         } else if token.contains('/') || token.contains('.') {
             Style::default().fg(palette::muted_fg())
         } else {
-            Style::default().fg(QUIET)
+            Style::default().fg(crate::render::theme::quiet())
         };
         spans.push(Span::styled(token.clone(), style));
     }
@@ -9515,7 +9826,10 @@ fn keyword_spans(line: &str) -> Vec<Span<'static>> {
             token.push(ch);
         } else {
             push_keyword_token(&mut spans, &mut token);
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
         }
     }
     push_keyword_token(&mut spans, &mut token);
@@ -9534,12 +9848,16 @@ fn push_keyword_token(spans: &mut Vec<Span<'static>>, token: &mut String) {
         lower.as_str(),
         "error" | "failed" | "failure" | "panic" | "fatal"
     ) {
-        Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(crate::render::theme::red())
+            .add_modifier(Modifier::BOLD)
     } else if matches!(lower.as_str(), "warning" | "warn") {
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD)
     } else if matches!(lower.as_str(), "ok" | "passed" | "success" | "done") {
         Style::default()
-            .fg(SUCCESS_GREEN)
+            .fg(crate::render::theme::green())
             .add_modifier(Modifier::BOLD)
     } else if matches!(
         lower.as_str(),
@@ -9557,7 +9875,9 @@ fn push_keyword_token(spans: &mut Vec<Span<'static>>, token: &mut String) {
             | "enum"
             | "impl"
     ) {
-        Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -9607,7 +9927,7 @@ fn path_detail_lines(
                 item[object_key].as_str()
             }
         })
-        .map(|path| detail_line(false, QUIET, format!("path {path}")))
+        .map(|path| detail_line(false, crate::render::theme::quiet(), format!("path {path}")))
         .collect()
 }
 
@@ -9632,7 +9952,7 @@ fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript)
             .unwrap_or_else(|| "spilled to disk".to_string());
         spans.push(Span::styled(
             format!(" · saved {path}"),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
         return;
     }
@@ -9641,7 +9961,7 @@ fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript)
     {
         spans.push(Span::styled(
             " · partial result",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
 }
@@ -9855,15 +10175,15 @@ fn tool_result_output_text(result: &ToolResult) -> Option<String> {
 
 fn status_color(status: ToolStatus) -> Color {
     match status {
-        ToolStatus::Success => SUCCESS_GREEN,
-        ToolStatus::Error | ToolStatus::Stale => ERROR_RED,
-        ToolStatus::Denied | ToolStatus::Cancelled => GOLD,
+        ToolStatus::Success => crate::render::theme::green(),
+        ToolStatus::Error | ToolStatus::Stale => crate::render::theme::red(),
+        ToolStatus::Denied | ToolStatus::Cancelled => crate::render::theme::secondary(),
     }
 }
 
 fn tool_result_display_color(tool: &ToolTranscript) -> Color {
     if tool_result_not_run(tool) || is_retryable_tool_result(&tool.result) {
-        GOLD
+        crate::render::theme::secondary()
     } else {
         status_color(tool.result.status)
     }
@@ -9932,16 +10252,16 @@ pub(crate) enum TurnVisualState {
 impl TurnVisualState {
     fn color(self, tick: u64) -> Color {
         match self {
-            Self::Idle => AMBER,
+            Self::Idle => crate::render::theme::accent(),
             Self::Running => {
                 if tick % 8 < 4 {
-                    GOLD
+                    crate::render::theme::secondary()
                 } else {
-                    AMBER
+                    crate::render::theme::accent()
                 }
             }
-            Self::Succeeded => SUCCESS_GREEN,
-            Self::Failed => ERROR_RED,
+            Self::Succeeded => crate::render::theme::green(),
+            Self::Failed => crate::render::theme::red(),
         }
     }
 }
@@ -9960,17 +10280,22 @@ fn assistant_static_span(color: Color) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    // At idle the coin is a steady AMBER ●. Animating it forced a real
+    // At idle the coin is a steady crate::render::theme::accent() ●. Animating it forced a real
     // cell change every 320 ms, which kept terminal-emulator per-tab
     // activity indicators buzzing forever even though the agent was
     // doing nothing.
     if app.turn_visual == TurnVisualState::Idle {
-        return Span::styled("●", Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
+        return Span::styled(
+            "●",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        );
     }
     let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
-        GOLD
+        crate::render::theme::secondary()
     } else {
-        AMBER
+        crate::render::theme::accent()
     };
     Span::styled(
         prompt_coin_frame(app),
@@ -9999,7 +10324,7 @@ fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
 }
 
 fn prompt_cursor_span() -> Span<'static> {
-    Span::styled("┃", Style::default().fg(AMBER))
+    Span::styled("┃", Style::default().fg(crate::render::theme::accent()))
 }
 
 pub(crate) fn compact_text(text: &str, limit: usize) -> String {
@@ -10059,9 +10384,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
         // no slack for the actual window — and the menu rendered the
         // bottom slice of the SLASH_MENU_MAX_ITEMS window instead of
         // the top.
-        slash_suggestions(&app.input)
-            .len()
-            .min(SLASH_MENU_MAX_ITEMS)
+        slash_suggestion_lines(app, width).len()
     } else {
         0
     };
@@ -10134,11 +10457,13 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
                     .as_ref()
                     .is_some_and(|range| range.contains(&abs_offset))
                 {
-                    Style::default().fg(BANG_RED)
+                    Style::default().fg(crate::render::theme::red())
                 } else {
                     match slash_split {
-                        Some(len) if abs_offset < len => Style::default().fg(AMBER),
-                        _ => Style::default().fg(Color::White),
+                        Some(len) if abs_offset < len => {
+                            Style::default().fg(crate::render::theme::accent())
+                        }
+                        _ => Style::default().fg(crate::render::theme::foreground()),
                     }
                 }
             };
@@ -10207,7 +10532,7 @@ fn composer_bubble_lines(
     if width < 4 || height < 2 {
         return content;
     }
-    let amber = Style::default().fg(AMBER);
+    let amber = Style::default().fg(crate::render::theme::accent());
 
     // Open layout: a single top rule with the typed content floating
     // underneath. No vertical sides or bottom rule — the latter added a
@@ -10253,7 +10578,7 @@ fn composer_bubble_lines(
     lines
 }
 
-fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
+fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let suggestions = slash_suggestions(&app.input);
     let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index);
     let command_width = visible
@@ -10263,77 +10588,126 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .unwrap_or(0)
         .max(12);
     let task_active = turn_in_progress(app);
-    visible
-        .iter()
-        .enumerate()
-        .map(|(index, command)| {
-            let absolute_index = slash_menu_window_start(suggestions.len(), app.slash_menu_index)
-                .saturating_add(index);
-            let selected = absolute_index
-                == app
-                    .slash_menu_index
-                    .min(suggestions.len().saturating_sub(1));
-            let dimmed = command.is_dimmed(task_active);
-            let marker = if selected { "› " } else { "  " };
-            let command_padding =
-                " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
-            let name_color = if dimmed {
-                QUIET
-            } else if selected {
-                GOLD
+    let mut lines = Vec::new();
+    for (index, command) in visible.iter().enumerate() {
+        let absolute_index =
+            slash_menu_window_start(suggestions.len(), app.slash_menu_index).saturating_add(index);
+        let selected = absolute_index
+            == app
+                .slash_menu_index
+                .min(suggestions.len().saturating_sub(1));
+        let dimmed = command.is_dimmed(task_active);
+        let marker = if selected { "› " } else { "  " };
+        let command_padding =
+            " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
+        let name_color = if dimmed {
+            crate::render::theme::quiet()
+        } else if selected {
+            crate::render::theme::secondary()
+        } else {
+            crate::render::theme::accent()
+        };
+        let mut name_style = Style::default().fg(name_color);
+        if dimmed {
+            name_style = name_style.add_modifier(Modifier::DIM);
+        }
+        let mut description_style = Style::default().fg(crate::render::theme::quiet());
+        if dimmed {
+            description_style = description_style.add_modifier(Modifier::DIM);
+        }
+        let mut hint_style = Style::default()
+            .fg(crate::render::theme::cyan())
+            .add_modifier(Modifier::ITALIC);
+        if dimmed {
+            hint_style = hint_style.add_modifier(Modifier::DIM);
+        }
+        let mut spans = vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(command.name, name_style),
+            Span::styled(
+                command_padding,
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(command.description.to_string(), description_style),
+        ];
+        let hint_span = command
+            .parameter_hint
+            .map(|hint| Span::styled(format!(" {hint}"), hint_style));
+        let badges = command.capability_badges();
+        let badge_span = if badges.is_empty() {
+            None
+        } else {
+            Some(Span::styled(
+                format!("  [{}]", badges.join("|")),
+                Style::default()
+                    .fg(if dimmed {
+                        crate::render::theme::quiet()
+                    } else {
+                        crate::render::theme::accent()
+                    })
+                    .add_modifier(if dimmed {
+                        Modifier::DIM | Modifier::ITALIC
+                    } else {
+                        Modifier::ITALIC
+                    }),
+            ))
+        };
+        let dimmed_span = if dimmed {
+            Some(Span::styled(
+                "  (unavailable during turn)",
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ))
+        } else {
+            None
+        };
+        if let Some(hint_span) = hint_span {
+            let mut inline_spans = spans.clone();
+            inline_spans.push(hint_span.clone());
+            if let Some(badge_span) = badge_span.clone() {
+                inline_spans.push(badge_span);
+            }
+            if let Some(dimmed_span) = dimmed_span.clone() {
+                inline_spans.push(dimmed_span);
+            }
+            if spans_width(&inline_spans) <= width.max(1) as usize {
+                lines.push(Line::from(inline_spans));
             } else {
-                AMBER
-            };
-            let mut name_style = Style::default().fg(name_color);
-            if dimmed {
-                name_style = name_style.add_modifier(Modifier::DIM);
+                if let Some(badge_span) = badge_span {
+                    spans.push(badge_span);
+                }
+                if let Some(dimmed_span) = dimmed_span {
+                    spans.push(dimmed_span);
+                }
+                lines.push(Line::from(spans));
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(command_width + 4)),
+                    hint_span,
+                ]));
             }
-            let mut description_style = Style::default().fg(QUIET);
-            if dimmed {
-                description_style = description_style.add_modifier(Modifier::DIM);
+        } else {
+            if let Some(badge_span) = badge_span {
+                spans.push(badge_span);
             }
-            let mut spans = vec![
-                Span::styled(
-                    marker,
-                    Style::default().fg(if selected { GOLD } else { QUIET }),
-                ),
-                Span::styled(command.name, name_style),
-                Span::styled(command_padding, Style::default().fg(QUIET)),
-                Span::styled(compact_text(command.description, 72), description_style),
-            ];
-            if let Some(hint) = command.parameter_hint {
-                let hint_text = format!(" {}", compact_text(hint, 36));
-                spans.push(Span::styled(
-                    hint_text,
-                    Style::default()
-                        .fg(palette::ACCENT_CYAN)
-                        .add_modifier(Modifier::ITALIC),
-                ));
+            if let Some(dimmed_span) = dimmed_span {
+                spans.push(dimmed_span);
             }
-            let badges = command.capability_badges();
-            if !badges.is_empty() {
-                spans.push(Span::styled(
-                    format!("  [{}]", compact_text(&badges.join("|"), 32)),
-                    Style::default()
-                        .fg(if dimmed { QUIET } else { AMBER })
-                        .add_modifier(if dimmed {
-                            Modifier::DIM | Modifier::ITALIC
-                        } else {
-                            Modifier::ITALIC
-                        }),
-                ));
-            }
-            if dimmed {
-                spans.push(Span::styled(
-                    "  (unavailable during turn)",
-                    Style::default()
-                        .fg(QUIET)
-                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                ));
-            }
-            Line::from(spans)
-        })
-        .collect()
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 fn slash_menu_window_start(total: usize, selected: usize) -> usize {
@@ -10374,7 +10748,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let suggestion_lines = if queue_open || !overlay_lines.is_empty() || !mention_lines.is_empty() {
         Vec::new()
     } else {
-        slash_suggestion_lines(app)
+        slash_suggestion_lines(app, area.width)
     };
     // Keep the indicator visible even when the overlay is open so the
     // same row stays clickable to toggle it back closed. The glyph
@@ -10416,7 +10790,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(crate::render::theme::foreground()))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -10445,14 +10819,20 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let marker = if selected { "› " } else { "  " };
             let display = path.display().to_string();
             let style = if selected {
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(palette::muted_fg())
             };
             Line::from(vec![
                 Span::styled(
                     marker,
-                    Style::default().fg(if selected { GOLD } else { QUIET }),
+                    Style::default().fg(if selected {
+                        crate::render::theme::secondary()
+                    } else {
+                        crate::render::theme::quiet()
+                    }),
                 ),
                 Span::styled(display, style),
             ])
@@ -10465,7 +10845,9 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let footer = format!("  {}/{}", popup.selected + 1, total);
     lines.push(Line::from(Span::styled(
         footer,
-        Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+        Style::default()
+            .fg(crate::render::theme::quiet())
+            .add_modifier(Modifier::DIM),
     )));
     lines
 }
@@ -10609,8 +10991,8 @@ pub(crate) fn title_case_mode(mode: SessionMode) -> &'static str {
 
 fn mode_status_color(mode: SessionMode) -> Color {
     match mode {
-        SessionMode::Plan => MODE_PURPLE,
-        SessionMode::Build => MODE_BUILD_GREEN,
+        SessionMode::Plan => crate::render::theme::magenta(),
+        SessionMode::Build => crate::render::theme::green(),
     }
 }
 
@@ -10632,14 +11014,17 @@ fn format_status_tokens(app: &TuiApp) -> String {
 }
 
 fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let hints_span = Span::styled(format_status_hints(app), Style::default().fg(QUIET));
+    let hints_span = Span::styled(
+        format_status_hints(app),
+        Style::default().fg(crate::render::theme::quiet()),
+    );
     let detail = configured_status_line_items(app).and_then(|items| {
         status::render_status_detail_line(app, &items, app.status_line_use_colors)
     });
-    // When the user has configured `[tui].status_line`, the detail items
-    // take the place of `dir … · git …` on row 1 (otherwise both rows
-    // duplicate the same data). Mode label stays right-aligned. Without a
-    // configured list, fall back to the historical overview layout.
+    // Active detail items (configured, or the built-in default list) take the
+    // place of `dir … · git …` on row 1; otherwise both rows duplicate the
+    // same data. Mode label stays right-aligned. An explicit empty list, or a
+    // list whose items all render empty, falls back to the historical overview.
     let top = match detail {
         Some(detail_line) => compose_status_overview_with_detail(detail_line, app, width),
         None => format_status_overview_line(app, width),
@@ -10653,7 +11038,7 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
                 format_status_details(app),
                 format_status_hints(app)
             ),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ))
     } else {
         Line::from(hints_span)
@@ -10691,14 +11076,13 @@ fn detail_was_present(app: &TuiApp) -> bool {
     configured_status_line_items(app).is_some()
 }
 
-/// User-configured `[tui].status_line`. `None` when the TOML key is unset
-/// (so the renderer falls back to the historical hints-only second row)
-/// or when the user deliberately set an empty list (also "no detail row").
+/// User-configured `[tui].status_line`, or the built-in default list when the
+/// TOML key is unset. An explicit empty list still disables the detail row.
 fn configured_status_line_items(app: &TuiApp) -> Option<Vec<status::StatusLineItem>> {
     match &app.status_line_items {
         Some(list) if list.is_empty() => None,
         Some(list) => Some(list.clone()),
-        None => None,
+        None => Some(status::DEFAULT_STATUS_LINE_ITEMS.to_vec()),
     }
 }
 
@@ -12711,7 +13095,7 @@ enum TerminalMode {
 impl From<TuiAlternateScreen> for TerminalMode {
     fn from(value: TuiAlternateScreen) -> Self {
         match value {
-            TuiAlternateScreen::Auto => Self::Inline,
+            TuiAlternateScreen::Auto => Self::AlternateScreen,
             TuiAlternateScreen::Never => Self::Inline,
             TuiAlternateScreen::Always => Self::AlternateScreen,
         }
@@ -12882,11 +13266,15 @@ impl TerminalGuard {
                 let line = Line::from(vec![
                     Span::styled(
                         "● ",
-                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(crate::render::theme::accent())
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         message,
-                        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(crate::render::theme::secondary())
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]);
                 let paragraph =

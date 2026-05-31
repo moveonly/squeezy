@@ -103,6 +103,22 @@ pub enum EditOp {
         path: SettingsPath,
         predicate: ArrayOfTablesMatch,
     },
+    /// Set one RGB token override under `[tui.themes.<theme>.colors]`.
+    SetThemeColor {
+        theme: String,
+        token: String,
+        rgb: [u8; 3],
+    },
+    /// Set many RGB token overrides under `[tui.themes.<theme>.colors]`.
+    SetThemeColors {
+        theme: String,
+        colors: Vec<(String, [u8; 3])>,
+    },
+    /// Remove one RGB token override from `[tui.themes.<theme>.colors]`.
+    RemoveThemeColor {
+        theme: String,
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +179,9 @@ fn requires_outer_path(op: &EditOp) -> bool {
             | EditOp::RemoveTableEntry { .. }
             | EditOp::AppendArrayOfTables { .. }
             | EditOp::RemoveArrayOfTablesByMatch { .. }
+            | EditOp::SetThemeColor { .. }
+            | EditOp::SetThemeColors { .. }
+            | EditOp::RemoveThemeColor { .. }
     )
 }
 
@@ -190,6 +209,11 @@ fn apply_one(doc: &mut DocumentMut, edit: &SettingsEdit) -> bool {
         EditOp::RemoveArrayOfTablesByMatch { path, predicate } => {
             apply_remove_array_of_tables_by_match(doc, path, predicate)
         }
+        EditOp::SetThemeColor { theme, token, rgb } => {
+            apply_set_theme_color(doc, theme, token, *rgb)
+        }
+        EditOp::SetThemeColors { theme, colors } => apply_set_theme_colors(doc, theme, colors),
+        EditOp::RemoveThemeColor { theme, token } => apply_remove_theme_color(doc, theme, token),
         _ => {
             let (leaf, parents) = edit.path.split_last().expect("path empty check above");
             apply_scalar(doc.as_table_mut(), parents, leaf, &edit.op)
@@ -223,7 +247,10 @@ fn apply_scalar(root: &mut Table, parents: &[&str], leaf: &str, op: &EditOp) -> 
         EditOp::SetTableEntry { .. }
         | EditOp::RemoveTableEntry { .. }
         | EditOp::AppendArrayOfTables { .. }
-        | EditOp::RemoveArrayOfTablesByMatch { .. } => unreachable!("dispatched in apply_one"),
+        | EditOp::RemoveArrayOfTablesByMatch { .. }
+        | EditOp::SetThemeColor { .. }
+        | EditOp::SetThemeColors { .. }
+        | EditOp::RemoveThemeColor { .. } => unreachable!("dispatched in apply_one"),
     }
 }
 
@@ -326,6 +353,113 @@ fn apply_remove_array_of_tables_by_match(
         }
         None => false,
     }
+}
+
+fn apply_set_theme_color(doc: &mut DocumentMut, theme: &str, token: &str, rgb: [u8; 3]) -> bool {
+    let colors = theme_colors_table(doc, theme);
+    set_leaf(colors, token, rgb_item(rgb))
+}
+
+fn apply_set_theme_colors(
+    doc: &mut DocumentMut,
+    theme: &str,
+    colors: &[(String, [u8; 3])],
+) -> bool {
+    let existed = doc
+        .as_table()
+        .get("tui")
+        .and_then(Item::as_table)
+        .and_then(|tui| tui.get("themes"))
+        .and_then(Item::as_table)
+        .is_some_and(|themes| themes.contains_key(theme));
+    let table = theme_colors_table(doc, theme);
+    let mut changed = !existed;
+    for (token, rgb) in colors {
+        if set_leaf(table, token, rgb_item(*rgb)) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn apply_remove_theme_color(doc: &mut DocumentMut, theme: &str, token: &str) -> bool {
+    let Some(colors) = existing_theme_colors_table(doc, theme) else {
+        return false;
+    };
+    if colors.contains_key(token) {
+        colors.remove(token);
+        true
+    } else {
+        false
+    }
+}
+
+fn existing_theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> Option<&'a mut Table> {
+    let tui = doc.as_table_mut().get_mut("tui")?.as_table_mut()?;
+    let themes = tui.get_mut("themes")?.as_table_mut()?;
+
+    if matches!(themes.get(theme), Some(Item::Value(Value::InlineTable(_)))) {
+        let promoted = match themes.get(theme) {
+            Some(Item::Value(Value::InlineTable(inline))) => {
+                let mut table = Table::new();
+                for (k, v) in inline.iter() {
+                    table.insert(k, Item::Value(v.clone()));
+                }
+                table
+            }
+            _ => return None,
+        };
+        themes.insert(theme, Item::Table(promoted));
+    }
+
+    let theme_table = themes.get_mut(theme)?.as_table_mut()?;
+    if matches!(
+        theme_table.get("colors"),
+        Some(Item::Value(Value::InlineTable(_)))
+    ) {
+        let promoted = match theme_table.get("colors") {
+            Some(Item::Value(Value::InlineTable(inline))) => {
+                let mut table = Table::new();
+                for (k, v) in inline.iter() {
+                    table.insert(k, Item::Value(v.clone()));
+                }
+                table
+            }
+            _ => return None,
+        };
+        theme_table.insert("colors", Item::Table(promoted));
+    }
+
+    theme_table.get_mut("colors")?.as_table_mut()
+}
+
+fn theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> &'a mut Table {
+    let themes = descend_or_create_table(doc.as_table_mut(), &["tui", "themes"]);
+    if !themes.contains_key(theme) {
+        themes.insert(theme, Item::Table(Table::new()));
+    } else if let Some(Item::Value(Value::InlineTable(inline))) = themes.get(theme) {
+        let mut promoted = Table::new();
+        for (k, v) in inline.iter() {
+            promoted.insert(k, Item::Value(v.clone()));
+        }
+        themes.insert(theme, Item::Table(promoted));
+    }
+    let theme_table = themes
+        .get_mut(theme)
+        .and_then(|item| match item {
+            Item::Table(t) => Some(t),
+            _ => None,
+        })
+        .expect("theme entry was just inserted/promoted as a table");
+    descend_or_create_table(theme_table, &["colors"])
+}
+
+fn rgb_item(rgb: [u8; 3]) -> Item {
+    let mut arr = Array::new();
+    arr.push(i64::from(rgb[0]));
+    arr.push(i64::from(rgb[1]));
+    arr.push(i64::from(rgb[2]));
+    Item::Value(Value::Array(arr))
 }
 
 fn row_matches(row: &Table, predicate: &ArrayOfTablesMatch) -> bool {

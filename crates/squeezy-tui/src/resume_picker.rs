@@ -18,7 +18,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
@@ -27,8 +27,6 @@ use squeezy_store::{
     EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionQuery, SessionStore,
     detect_branches,
 };
-
-use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, PATH_HINT, QUIET};
 
 /// Maximum number of sessions shown in the overlay. Keep small — the user
 /// is choosing one of "most recent" and a longer list is just noise.
@@ -537,19 +535,24 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     frame.render_widget(Clear, full);
 
     let title = Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(AMBER)),
+        Span::styled(" ◆ ", Style::default().fg(crate::render::theme::accent())),
         Span::styled(
             "squeezy",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · ", Style::default().fg(QUIET)),
-        Span::styled("resume a recent session", Style::default().fg(Color::White)),
+        Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
+        Span::styled(
+            "resume a recent session",
+            Style::default().fg(crate::render::theme::foreground()),
+        ),
         Span::raw(" "),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(AMBER))
+        .border_style(Style::default().fg(crate::render::theme::accent()))
         .title(title)
         .title_alignment(Alignment::Left);
     let inner = block.inner(area);
@@ -575,11 +578,13 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     let intro = Paragraph::new(Line::from(vec![
         Span::styled(
             format!("{}", state.candidates.len()),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             scope.replace("{}", if state.candidates.len() == 1 { "" } else { "s" }),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ]))
     .alignment(Alignment::Left);
@@ -608,16 +613,37 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         "all projects"
     };
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("↑/↓ ", Style::default().fg(GOLD)),
-        Span::styled("move  ", Style::default().fg(QUIET)),
-        Span::styled("Enter ", Style::default().fg(GOLD)),
-        Span::styled("confirm  ", Style::default().fg(QUIET)),
-        Span::styled("Tab ", Style::default().fg(GOLD)),
-        Span::styled(format!("{tab_hint}  "), Style::default().fg(QUIET)),
-        Span::styled("Esc ", Style::default().fg(GOLD)),
-        Span::styled("start fresh  ", Style::default().fg(QUIET)),
-        Span::styled("Q ", Style::default().fg(GOLD)),
-        Span::styled("quit", Style::default().fg(QUIET)),
+        Span::styled(
+            "↑/↓ ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::styled("move  ", Style::default().fg(crate::render::theme::quiet())),
+        Span::styled(
+            "Enter ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::styled(
+            "confirm  ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled(
+            "Tab ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::styled(
+            format!("{tab_hint}  "),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled(
+            "Esc ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::styled(
+            "start fresh  ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled("Q ", Style::default().fg(crate::render::theme::secondary())),
+        Span::styled("quit", Style::default().fg(crate::render::theme::quiet())),
     ]))
     .alignment(Alignment::Left);
     frame.render_widget(footer, layout[4]);
@@ -632,17 +658,22 @@ fn render_candidate_row(
     let summary = &entry.summary;
     let (prefix_color, label_style) = if active {
         (
-            AMBER,
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            crate::render::theme::accent(),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         )
     } else {
-        (QUIET, Style::default().fg(Color::White))
+        (
+            crate::render::theme::quiet(),
+            Style::default().fg(crate::render::theme::foreground()),
+        )
     };
     let prefix = if active { "▸ " } else { "  " };
     let timestamp_style = if active {
-        Style::default().fg(AMBER)
+        Style::default().fg(crate::render::theme::accent())
     } else {
-        Style::default().fg(QUIET)
+        Style::default().fg(crate::render::theme::quiet())
     };
     // Branched rows replace the default session label with the branch's
     // first user message (if any) so the user can disambiguate two paths
@@ -668,18 +699,27 @@ fn render_candidate_row(
         Span::styled(label, label_style),
     ];
     if let Some(marker) = branch_marker {
-        spans.push(Span::styled(marker, Style::default().fg(MODE_PURPLE)));
+        spans.push(Span::styled(
+            marker,
+            Style::default().fg(crate::render::theme::magenta()),
+        ));
     }
     let label_hint = summary.label_hint();
     if !label_hint.is_empty() {
         spans.push(Span::styled("  ", Style::default()));
-        spans.push(Span::styled(label_hint, Style::default().fg(GOLD)));
+        spans.push(Span::styled(
+            label_hint,
+            Style::default().fg(crate::render::theme::secondary()),
+        ));
     }
     if cross_project {
-        spans.push(Span::styled("  · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            "  · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
         spans.push(Span::styled(
             summary.project_hint(),
-            Style::default().fg(PATH_HINT),
+            Style::default().fg(crate::render::theme::path_hint()),
         ));
     }
     Line::from(spans)
@@ -688,17 +728,17 @@ fn render_candidate_row(
 fn render_start_fresh_row(active: bool) -> Line<'static> {
     let (prefix_color, label_style, hint_style) = if active {
         (
-            MODE_PURPLE,
+            crate::render::theme::magenta(),
             Style::default()
-                .fg(MODE_PURPLE)
+                .fg(crate::render::theme::magenta())
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )
     } else {
         (
-            QUIET,
-            Style::default().fg(MODE_PURPLE),
-            Style::default().fg(QUIET),
+            crate::render::theme::quiet(),
+            Style::default().fg(crate::render::theme::magenta()),
+            Style::default().fg(crate::render::theme::quiet()),
         )
     };
     let prefix = if active { "▸ " } else { "  " };

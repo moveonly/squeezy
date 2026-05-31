@@ -1573,10 +1573,7 @@ impl AppConfig {
             "synchronized_output = {}\n",
             toml_string(self.tui.synchronized_output.as_str())
         ));
-        output.push_str(&format!(
-            "theme = {}\n",
-            toml_string(self.tui.theme.as_str())
-        ));
+        output.push_str(&format!("theme = {}\n", toml_string(&self.tui.theme)));
         output.push_str(&format!(
             "show_reasoning_usage = {}\n",
             self.tui.show_reasoning_usage
@@ -1585,6 +1582,25 @@ impl AppConfig {
             "persist_prompt_history = {}\n\n",
             self.tui.persist_prompt_history
         ));
+        for (name, theme) in &self.tui.themes {
+            if theme.colors.is_empty() {
+                continue;
+            }
+            output.push_str(&format!(
+                "[tui.themes.{}.colors]\n",
+                toml_bare_or_quoted_key(name)
+            ));
+            for (token, rgb) in &theme.colors {
+                output.push_str(&format!(
+                    "{} = [{}, {}, {}]\n",
+                    toml_bare_or_quoted_key(token),
+                    rgb[0],
+                    rgb[1],
+                    rgb[2]
+                ));
+            }
+            output.push('\n');
+        }
 
         for (name, server) in &self.mcp_servers {
             output.push_str(&format!(
@@ -6971,42 +6987,100 @@ impl TuiSynchronizedOutput {
     }
 }
 
-/// User-controlled palette for the TUI. `System` defers to terminal-tone
-/// detection (`COLORFGBG`); `Dark` and `Light` pin the tone but keep the
-/// default amber/gold accent identity; `Catppuccin` swaps to mauve accents
-/// on a dark background; `HighContrast` pins a light tone with a black/
-/// yellow accent profile for accessibility-strict configs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TuiTheme {
-    System,
-    Dark,
-    Light,
-    Catppuccin,
-    HighContrast,
+pub const DEFAULT_TUI_THEME_NAME: &str = "default";
+
+pub const BUILTIN_TUI_THEME_NAMES: &[&str] =
+    &["default", "bright", "fun", "catppuccin", "high-contrast"];
+
+pub const TUI_THEME_COLOR_TOKENS: &[&str] = &[
+    "palette.accent",
+    "palette.secondary",
+    "palette.red",
+    "palette.green",
+    "palette.yellow",
+    "palette.blue",
+    "palette.magenta",
+    "palette.cyan",
+    "ui.background",
+    "ui.foreground",
+    "ui.border",
+    "ui.muted",
+    "ui.quiet",
+    "ui.footer",
+    "ui.surface",
+    "ui.prompt_bg",
+    "syntax.keyword",
+    "syntax.string",
+    "syntax.comment",
+    "syntax.literal",
+    "syntax.function",
+    "syntax.type",
+    "syntax.operator",
+    "syntax.variable",
+    "status.ok",
+    "status.warn",
+    "status.err",
+    "status.info",
+    "transcript.user",
+    "transcript.assistant",
+    "transcript.tool",
+    "transcript.system",
+    "diff.added",
+    "diff.removed",
+    "diff.added_bg",
+    "diff.removed_bg",
+    "diff.context",
+    "diff.hunk",
+    "effects.shimmer",
+    "separator.primary",
+    "inline.code",
+    "inline.model",
+    "path.hint",
+];
+
+pub type TuiRgb = [u8; 3];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiThemeSettings {
+    pub colors: BTreeMap<String, TuiRgb>,
 }
 
-impl TuiTheme {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Dark => "dark",
-            Self::Light => "light",
-            Self::Catppuccin => "catppuccin",
-            Self::HighContrast => "high-contrast",
+impl TuiThemeSettings {
+    fn merge(&mut self, next: Self) {
+        for (token, rgb) in next.colors {
+            self.colors.insert(token, rgb);
         }
     }
+}
 
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "system" | "auto" => Some(Self::System),
-            "dark" => Some(Self::Dark),
-            "light" => Some(Self::Light),
-            "catppuccin" | "mauve" => Some(Self::Catppuccin),
-            "high-contrast" | "high_contrast" | "highcontrast" | "hc" => Some(Self::HighContrast),
-            _ => None,
-        }
-    }
+pub fn normalize_tui_theme_name(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let canonical = match normalized.as_str() {
+        "system" | "auto" | "dark" => DEFAULT_TUI_THEME_NAME,
+        "light" => "bright",
+        "mauve" => "catppuccin",
+        "highcontrast" | "hc" => "high-contrast",
+        other if is_valid_tui_theme_name(other) => other,
+        _ => return None,
+    };
+    Some(canonical.to_string())
+}
+
+pub fn is_builtin_tui_theme_name(value: &str) -> bool {
+    BUILTIN_TUI_THEME_NAMES.contains(&value)
+}
+
+pub fn is_tui_theme_color_token(value: &str) -> bool {
+    TUI_THEME_COLOR_TOKENS.contains(&value)
+}
+
+pub fn is_valid_tui_theme_name(value: &str) -> bool {
+    let len = value.len();
+    len > 0
+        && len <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// Off-screen notification surface for turn-complete and approval-pending
@@ -7070,8 +7144,12 @@ pub struct TuiConfig {
     /// Color status-line items with their accent palette.
     /// Defaults to `true`.
     pub status_line_use_colors: bool,
-    /// Palette tone preference. `System` defers to terminal detection.
-    pub theme: TuiTheme,
+    /// Active named TUI theme. Builtins are `default`, `bright`, `fun`,
+    /// `catppuccin`, and `high-contrast`; user settings may add more names.
+    pub theme: String,
+    /// User-defined or overridden theme colors, merged through the normal
+    /// settings precedence chain.
+    pub themes: BTreeMap<String, TuiThemeSettings>,
     /// Off-screen attention surface (OSC 9 desktop notification / BEL).
     /// Fires on turn-complete and approval-pending; default `Off`.
     pub desktop_notifications: NotificationMethod,
@@ -7118,7 +7196,10 @@ impl TuiConfig {
             coalesce_tool_runs: settings.coalesce_tool_runs.unwrap_or(true),
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
-            theme: settings.theme.unwrap_or(TuiTheme::System),
+            theme: settings
+                .theme
+                .unwrap_or_else(|| DEFAULT_TUI_THEME_NAME.to_string()),
+            themes: settings.themes.unwrap_or_default(),
             desktop_notifications: settings
                 .desktop_notifications
                 .unwrap_or(NotificationMethod::Off),
@@ -7148,7 +7229,8 @@ pub struct TuiSettings {
     pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
-    pub theme: Option<TuiTheme>,
+    pub theme: Option<String>,
+    pub themes: Option<BTreeMap<String, TuiThemeSettings>>,
     pub desktop_notifications: Option<NotificationMethod>,
     pub persist_prompt_history: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
@@ -7172,6 +7254,7 @@ impl TuiSettings {
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+                "themes",
                 "desktop_notifications",
                 "persist_prompt_history",
                 "keymap",
@@ -7243,6 +7326,7 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+            themes: tui_themes_value(table, "themes", source, &field(path, "themes"))?,
             desktop_notifications: notification_method_value(
                 table,
                 "desktop_notifications",
@@ -7280,6 +7364,7 @@ impl TuiSettings {
             next.status_line_use_colors,
         );
         replace_if_some(&mut self.theme, next.theme);
+        merge_option(&mut self.themes, next.themes, merge_tui_theme_maps);
         replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
         replace_if_some(
             &mut self.persist_prompt_history,
@@ -9456,15 +9541,109 @@ fn tui_theme_value(
     key: &str,
     source: &str,
     path: &str,
-) -> Result<Option<TuiTheme>> {
+) -> Result<Option<String>> {
     let Some(value) = string_value(table, key, source, path)? else {
         return Ok(None);
     };
-    TuiTheme::parse(&value).map(Some).ok_or_else(|| {
+    normalize_tui_theme_name(&value).map(Some).ok_or_else(|| {
         SqueezyError::Config(format!(
-            "{source}: {path}: invalid TUI theme {value:?}; expected system, dark, or light"
+            "{source}: {path}: invalid TUI theme {value:?}; expected a theme slug"
         ))
     })
+}
+
+fn tui_themes_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<BTreeMap<String, TuiThemeSettings>>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let themes = value
+        .as_table()
+        .ok_or_else(|| type_error(source, path, "table"))?;
+    let mut out = BTreeMap::new();
+    for (raw_name, value) in themes {
+        let name = normalize_tui_theme_name(raw_name).ok_or_else(|| {
+            SqueezyError::Config(format!(
+                "{source}: {path}.{raw_name}: invalid TUI theme name"
+            ))
+        })?;
+        let theme_table = value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field(path, raw_name), "table"))?;
+        reject_unknown_keys(theme_table, &["colors"], source, &field(path, raw_name))?;
+        let Some(colors_value) = theme_table.get("colors") else {
+            out.insert(name, TuiThemeSettings::default());
+            continue;
+        };
+        let colors_table = colors_value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field(&field(path, raw_name), "colors"), "table"))?;
+        let mut colors = BTreeMap::new();
+        collect_tui_theme_colors(
+            colors_table,
+            None,
+            source,
+            &field(&field(path, raw_name), "colors"),
+            &mut colors,
+        )?;
+        out.insert(name, TuiThemeSettings { colors });
+    }
+    Ok(Some(out))
+}
+
+fn collect_tui_theme_colors(
+    table: &toml::value::Table,
+    prefix: Option<&str>,
+    source: &str,
+    path: &str,
+    out: &mut BTreeMap<String, TuiRgb>,
+) -> Result<()> {
+    for (key, color_value) in table {
+        let token = match prefix {
+            Some(prefix) => format!("{prefix}.{key}"),
+            None => key.to_string(),
+        };
+        let token_path = field(path, key);
+        if let Some(child) = color_value.as_table() {
+            collect_tui_theme_colors(child, Some(&token), source, &token_path, out)?;
+            continue;
+        }
+        if !is_tui_theme_color_token(&token) {
+            return Err(SqueezyError::Config(format!(
+                "{source}: {token_path}: unknown TUI theme color token {token:?}"
+            )));
+        }
+        out.insert(token, rgb_array_value(color_value, source, &token_path)?);
+    }
+    Ok(())
+}
+
+fn rgb_array_value(value: &toml::Value, source: &str, path: &str) -> Result<TuiRgb> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| type_error(source, path, "RGB array"))?;
+    if array.len() != 3 {
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: expected RGB array with exactly 3 integers"
+        )));
+    }
+    let mut rgb = [0u8; 3];
+    for (idx, item) in array.iter().enumerate() {
+        let Some(value) = item.as_integer() else {
+            return Err(type_error(source, path, "RGB integer"));
+        };
+        let Ok(channel) = u8::try_from(value) else {
+            return Err(SqueezyError::Config(format!(
+                "{source}: {path}: RGB channel {value} is outside 0..=255"
+            )));
+        };
+        rgb[idx] = channel;
+    }
+    Ok(rgb)
 }
 
 fn notification_method_value(
@@ -9599,6 +9778,18 @@ fn merge_provider_maps(
             .entry(name)
             .and_modify(|existing| existing.merge(provider.clone()))
             .or_insert(provider);
+    }
+}
+
+fn merge_tui_theme_maps(
+    target: &mut BTreeMap<String, TuiThemeSettings>,
+    next: BTreeMap<String, TuiThemeSettings>,
+) {
+    for (name, theme) in next {
+        target
+            .entry(name)
+            .and_modify(|existing| existing.merge(theme.clone()))
+            .or_insert(theme);
     }
 }
 

@@ -5,16 +5,18 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use squeezy_core::config_schema::{ApplyTier, CONFIG_SECTIONS, FieldSource, SectionId};
+use squeezy_core::{
+    config_schema::{ApplyTier, CONFIG_SECTIONS, FieldSource, SectionId},
+    is_builtin_tui_theme_name,
+};
 
 use super::RESET_ACTIONS;
 use super::{
     ConfigScope, ConfigScreenState, FieldEditor, ModelPickerState, SearchOverlayState,
-    SecretEntryState, inheritance_label, picker_matches, provider_api_key_env, tier_path,
+    SecretEntryState, ThemeEditor, ThemeRow, inheritance_label, picker_matches,
+    provider_api_key_env, tier_path,
 };
-use crate::render::palette::{
-    AMBER, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN, footer_fg, muted_fg,
-};
+use crate::render::palette::{footer_fg, muted_fg};
 
 /// Pretty-print an absolute config path: replace `$HOME` with `~` so the
 /// tab subtitle stays compact, while still surfacing the per-machine
@@ -93,7 +95,9 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         // when the middle/last tab is active. Dropping the active marker
         // keeps the row aligned and leaves a single clear indicator.
         let label_style = if active {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(muted_fg())
         };
@@ -102,9 +106,11 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         // existence is still encoded via ●/○ shape, but the colour
         // dimension is reserved for "this is the tab you're editing".
         let dot_style = if active {
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(QUIET)
+            Style::default().fg(crate::render::theme::quiet())
         };
         let subtitle_text = if subtitle.is_empty() {
             String::new()
@@ -115,7 +121,10 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
             Span::styled(label, label_style),
             Span::raw(" "),
             Span::styled(dot, dot_style),
-            Span::styled(subtitle_text, Style::default().fg(QUIET)),
+            Span::styled(
+                subtitle_text,
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]
     }
     let user_exists = std::fs::metadata(&state.sources.user_path_default).is_ok();
@@ -148,16 +157,24 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
         "  Config  ",
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
+    spans.push(Span::styled(
+        " │ ",
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
     spans.extend(tab(
         "User",
         user_sub,
         state.scope == ConfigScope::User,
         user_exists,
     ));
-    spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
+    spans.push(Span::styled(
+        " ▸ ",
+        Style::default().fg(crate::render::theme::blue()),
+    ));
     let repo_subtitle = if repo_sub.is_empty() {
         String::new()
     } else if repo_exists {
@@ -171,7 +188,10 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
-    spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
+    spans.push(Span::styled(
+        " ▸ ",
+        Style::default().fg(crate::render::theme::blue()),
+    ));
     spans.extend(tab(
         "Local",
         local_sub,
@@ -181,12 +201,12 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     if state.dirty {
         spans.push(Span::styled(
             "    (changes applied)",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ));
     }
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(QUIET));
+        .border_style(Style::default().fg(crate::render::theme::quiet()));
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
@@ -264,7 +284,7 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     render_sidebar(frame, chunks[0], state);
     let sep_lines: Vec<Line> = (0..area.height).map(|_| Line::from("│")).collect();
     frame.render_widget(
-        Paragraph::new(sep_lines).style(Style::default().fg(QUIET)),
+        Paragraph::new(sep_lines).style(Style::default().fg(crate::render::theme::quiet())),
         chunks[1],
     );
     if state.reset_confirm.is_some() {
@@ -279,6 +299,8 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         render_search_overlay(frame, chunks[2], search);
     } else if state.current_section().id == SectionId::Reset {
         render_reset_section(frame, chunks[2], state);
+    } else if state.current_section().id == SectionId::Themes {
+        render_theme_section(frame, chunks[2], state);
     } else {
         render_field_pane(frame, chunks[2], state);
     }
@@ -294,45 +316,343 @@ fn render_reset_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     lines.push(Line::from(vec![
         Span::styled(
             section.label,
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(section.description, Style::default().fg(QUIET)),
+        Span::styled(
+            section.description,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     lines.push(Line::raw(""));
 
     let tier_path = tier_path(state, action.scope);
     let exists = std::fs::metadata(&tier_path).is_ok();
     let status = if exists {
-        Span::styled("[file present]", Style::default().fg(SUCCESS_GREEN))
+        Span::styled(
+            "[file present]",
+            Style::default().fg(crate::render::theme::green()),
+        )
     } else {
-        Span::styled("[no file]", Style::default().fg(QUIET))
+        Span::styled(
+            "[no file]",
+            Style::default().fg(crate::render::theme::quiet()),
+        )
     };
     lines.push(Line::from(vec![
-        Span::styled("› ", Style::default().fg(GOLD)),
+        Span::styled("› ", Style::default().fg(crate::render::theme::secondary())),
         Span::styled(
             format!("{:<28}", action.label),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         status,
     ]));
     lines.push(Line::from(vec![
         Span::raw("    "),
-        Span::styled(action.detail, Style::default().fg(QUIET)),
+        Span::styled(
+            action.detail,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::raw("    "),
-        Span::styled(tier_path.display().to_string(), Style::default().fg(QUIET)),
+        Span::styled(
+            tier_path.display().to_string(),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled("? ", Style::default().fg(QUIET)),
+        Span::styled("? ", Style::default().fg(crate::render::theme::quiet())),
         Span::styled(
             "Enter to delete this tier's file (with y/n confirmation). Ctrl+Z restores it.",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ),
     ]));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_theme_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    let section = state.current_section();
+    let active_theme = state.effective.tui.theme.clone();
+    let active_snapshot = crate::render::theme::resolve_theme(&state.effective, &active_theme);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            section.label,
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            section.description,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "active ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled(
+            active_theme.clone(),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+
+    let total_rows = state.row_count();
+    let editing = state.theme_editor.is_some();
+    let (rows, hidden_above, hidden_below) = if editing {
+        (vec![state.field_index], 0, 0)
+    } else {
+        let detail_rows = 4usize + usize::from(state.theme_editor.is_some()) * 4;
+        let row_area = (area.height as usize).saturating_sub(detail_rows);
+        let (start, end) = field_row_window(total_rows, state.field_index, row_area);
+        (
+            (start..end).collect(),
+            start,
+            total_rows.saturating_sub(end),
+        )
+    };
+
+    if hidden_above > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ▲ {hidden_above} more above"),
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
+    }
+
+    for row in rows {
+        let focused = row == state.field_index;
+        let prefix = if focused { "› " } else { "  " };
+        let prefix_style = Style::default().fg(if focused {
+            crate::render::theme::secondary()
+        } else {
+            crate::render::theme::quiet()
+        });
+        match state.theme_row_at(row) {
+            Some(ThemeRow::Theme(name)) => {
+                let snapshot = crate::render::theme::resolve_theme(&state.effective, &name);
+                let accent = snapshot
+                    .resolve(crate::render::theme::token::PALETTE_ACCENT)
+                    .unwrap_or([255, 255, 255]);
+                let active = name == active_theme;
+                let style = if focused {
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
+                } else if active {
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(muted_fg())
+                };
+                let badge = if is_builtin_tui_theme_name(&name) {
+                    "[builtin]"
+                } else {
+                    "[custom]"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    theme_swatch(accent),
+                    Span::raw("  "),
+                    Span::styled(format!("{:<22}", name), style),
+                    Span::styled(
+                        if active { "● active " } else { "         " },
+                        Style::default().fg(if active {
+                            crate::render::theme::green()
+                        } else {
+                            crate::render::theme::quiet()
+                        }),
+                    ),
+                    Span::styled(badge, Style::default().fg(crate::render::theme::quiet())),
+                    Span::raw("  "),
+                    Span::styled(
+                        if is_builtin_tui_theme_name(&name) {
+                            "Enter select"
+                        } else {
+                            "Enter select · r rename · d delete"
+                        },
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                ]));
+            }
+            Some(ThemeRow::New) => {
+                let style = if focused {
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(crate::render::theme::magenta())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled("+", Style::default().fg(crate::render::theme::magenta())),
+                    Span::raw("   "),
+                    Span::styled(format!("{:<22}", "new theme"), style),
+                    Span::styled(
+                        "Enter create · n anywhere",
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                ]));
+            }
+            Some(ThemeRow::Color(token)) => {
+                let rgb = active_snapshot.resolve(token).unwrap_or([255, 255, 255]);
+                let overridden = state
+                    .effective
+                    .tui
+                    .themes
+                    .get(&active_theme)
+                    .is_some_and(|theme| theme.colors.contains_key(token));
+                let token_style = if focused {
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(muted_fg())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    theme_swatch(rgb),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:<13}", crate::render::theme::token_category(token)),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(format!("{:<28}", token), token_style),
+                    Span::styled(format_rgb(rgb), Style::default().fg(muted_fg())),
+                    Span::raw(" "),
+                    Span::styled(
+                        if overridden { "[override]" } else { "" },
+                        Style::default().fg(crate::render::theme::magenta()),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        "Enter edit RGB",
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                ]));
+            }
+            None => {}
+        }
+    }
+
+    if hidden_below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ▼ {hidden_below} more below"),
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Theme rows: Enter select · r rename custom · d delete custom · n new",
+        Style::default().fg(crate::render::theme::quiet()),
+    )));
+    lines.push(Line::from(Span::styled(
+        "Color rows: Enter edit RGB · Ctrl+R clear selected override · Ctrl+Z undo last write",
+        Style::default().fg(crate::render::theme::quiet()),
+    )));
+
+    if let Some(editor) = &state.theme_editor {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled(
+            "── editing ──",
+            Style::default().fg(crate::render::theme::accent()),
+        )]));
+        lines.extend(render_theme_editor_lines(editor));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn theme_swatch(rgb: [u8; 3]) -> Span<'static> {
+    Span::styled(
+        "██",
+        Style::default().fg(crate::render::palette::best_color((rgb[0], rgb[1], rgb[2]))),
+    )
+}
+
+fn format_rgb(rgb: [u8; 3]) -> String {
+    format!("[{:>3}, {:>3}, {:>3}]", rgb[0], rgb[1], rgb[2])
+}
+
+fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
+    match editor {
+        ThemeEditor::Name { draft, cursor } => {
+            let _ = cursor;
+            vec![
+                Line::from(Span::raw(format!("  {draft}_"))),
+                Line::from(Span::styled(
+                    "Enter to create from the active theme · Esc to cancel",
+                    Style::default().fg(crate::render::theme::quiet()),
+                )),
+            ]
+        }
+        ThemeEditor::Rename {
+            original,
+            draft,
+            cursor,
+        } => {
+            let _ = cursor;
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        "rename ",
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(
+                        original.clone(),
+                        Style::default().fg(crate::render::theme::secondary()),
+                    ),
+                ]),
+                Line::from(Span::raw(format!("  {draft}_"))),
+                Line::from(Span::styled(
+                    "Enter to rename · Esc to cancel",
+                    Style::default().fg(crate::render::theme::quiet()),
+                )),
+            ]
+        }
+        ThemeEditor::Rgb {
+            theme,
+            token,
+            draft,
+            cursor,
+        } => {
+            let _ = cursor;
+            vec![
+                Line::from(vec![
+                    Span::styled("theme ", Style::default().fg(crate::render::theme::quiet())),
+                    Span::styled(
+                        theme.clone(),
+                        Style::default().fg(crate::render::theme::secondary()),
+                    ),
+                    Span::styled(
+                        "  token ",
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(
+                        *token,
+                        Style::default().fg(crate::render::theme::secondary()),
+                    ),
+                ]),
+                Line::from(Span::raw(format!("  {draft}_"))),
+                Line::from(Span::styled(
+                    "RGB as r,g,b · Enter to commit · Esc to cancel",
+                    Style::default().fg(crate::render::theme::quiet()),
+                )),
+            ]
+        }
+    }
 }
 
 fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
@@ -348,27 +668,41 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         "Reset confirmation",
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::raw("  Delete the "),
         Span::styled(
             scope.label(),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" settings file?"),
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled("    path   ", Style::default().fg(QUIET)),
+        Span::styled(
+            "    path   ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
         Span::raw(path.display().to_string()),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("    status ", Style::default().fg(QUIET)),
+        Span::styled(
+            "    status ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
         Span::styled(
             if exists { "exists" } else { "(no file)" },
-            Style::default().fg(if exists { SUCCESS_GREEN } else { QUIET }),
+            Style::default().fg(if exists {
+                crate::render::theme::green()
+            } else {
+                crate::render::theme::quiet()
+            }),
         ),
     ]));
     lines.push(Line::raw(""));
@@ -377,7 +711,7 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
         lines.push(Line::from(Span::styled(
             "  Nothing to delete — that tier file does not exist on disk. \
              Confirming is harmless: the effective config doesn't change.",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     } else if preview.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -385,7 +719,7 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
              would still be effective after deletion (env override, identical \
              higher-priority tier value, or the binary default). \
              Confirming deletes the file without changing any displayed value.",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     } else {
         let plural = if preview.len() == 1 { "" } else { "s" };
@@ -394,7 +728,7 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
                 "  {} key{plural} will change effective value:",
                 preview.len()
             ),
-            Style::default().fg(AMBER),
+            Style::default().fg(crate::render::theme::accent()),
         )]));
         lines.push(Line::raw(""));
         // Cap the list to a reasonable height so the confirm overlay doesn't
@@ -412,9 +746,15 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
             ]));
             lines.push(Line::from(vec![
                 Span::raw("       "),
-                Span::styled(entry.before.clone(), Style::default().fg(GOLD)),
+                Span::styled(
+                    entry.before.clone(),
+                    Style::default().fg(crate::render::theme::secondary()),
+                ),
                 Span::raw("  →  "),
-                Span::styled(entry.after.clone(), Style::default().fg(SUCCESS_GREEN)),
+                Span::styled(
+                    entry.after.clone(),
+                    Style::default().fg(crate::render::theme::green()),
+                ),
                 Span::raw(" "),
                 Span::styled(after_label, source_style(entry.after_source)),
             ]));
@@ -423,26 +763,47 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 format!("    … and {} more", preview.len() - max_rows),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             )));
         }
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![Span::styled(
         "  Other tabs are not touched. Ctrl+Z restores the deleted file.",
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-        Span::styled(" delete   ", Style::default().fg(QUIET)),
-        Span::styled("n", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-        Span::styled(" cancel   ", Style::default().fg(QUIET)),
+        Span::styled(
+            "y",
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " delete   ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled(
+            "n",
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " cancel   ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
         Span::styled(
             "Esc",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" cancel", Style::default().fg(QUIET)),
+        Span::styled(
+            " cancel",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -451,7 +812,9 @@ fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScree
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         "Discard all session writes",
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::raw(""));
     let count = state.undo_stack.len();
@@ -460,7 +823,9 @@ fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScree
         Span::raw("  Revert "),
         Span::styled(
             format!("{count} write{plural}"),
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" made since the screen opened?"),
     ]));
@@ -471,26 +836,50 @@ fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScree
             continue;
         }
         lines.push(Line::from(vec![
-            Span::styled("    file  ", Style::default().fg(QUIET)),
+            Span::styled(
+                "    file  ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
             Span::raw(path.display().to_string()),
         ]));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Each tier file is restored to the bytes captured when /config opened.",
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled("y", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-        Span::styled(" discard   ", Style::default().fg(QUIET)),
-        Span::styled("n", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-        Span::styled(" cancel   ", Style::default().fg(QUIET)),
+        Span::styled(
+            "y",
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " discard   ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled(
+            "n",
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " cancel   ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
         Span::styled(
             "Esc",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" cancel", Style::default().fg(QUIET)),
+        Span::styled(
+            " cancel",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -506,46 +895,57 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
         Line::from(vec![
             Span::styled(
                 "Set API key",
-                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
                 format!("for {}", entry.provider_label),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
         ]),
         Line::from(vec![
-            Span::styled("env  ", Style::default().fg(QUIET)),
+            Span::styled("env  ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled(entry.env_var.as_str(), Style::default().fg(muted_fg())),
         ]),
         Line::raw(""),
         Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(display, Style::default().fg(muted_fg())),
-            Span::styled("_", Style::default().fg(AMBER)),
+            Span::styled("_", Style::default().fg(crate::render::theme::accent())),
         ]),
         Line::raw(""),
         Line::from(vec![Span::styled(
             "Paste your key. Saved as inline `api_key` in the active scope's settings \
              TOML (User or Local). Refuses the committed repo TOML. The running \
              provider client is rebuilt on the next prompt.",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )]),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("Enter ", Style::default().fg(GOLD)),
-            Span::styled("save  ", Style::default().fg(QUIET)),
-            Span::styled("Ctrl+T ", Style::default().fg(GOLD)),
+            Span::styled(
+                "Enter ",
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+            Span::styled("save  ", Style::default().fg(crate::render::theme::quiet())),
+            Span::styled(
+                "Ctrl+T ",
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
             Span::styled(
                 if entry.reveal {
                     "hide key  "
                 } else {
                     "reveal full key  "
                 },
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
-            Span::styled("Esc ", Style::default().fg(GOLD)),
-            Span::styled("cancel", Style::default().fg(QUIET)),
+            Span::styled(
+                "Esc ",
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+            Span::styled("cancel", Style::default().fg(crate::render::theme::quiet())),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -556,21 +956,26 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
     lines.push(Line::from(vec![
         Span::styled(
             "Search",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled("fuzzy match field labels", Style::default().fg(QUIET)),
+        Span::styled(
+            "fuzzy match field labels",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("/", Style::default().fg(QUIET)),
+        Span::styled("/", Style::default().fg(crate::render::theme::quiet())),
         Span::raw(search.query.clone()),
-        Span::styled("_", Style::default().fg(AMBER)),
+        Span::styled("_", Style::default().fg(crate::render::theme::accent())),
     ]));
     lines.push(Line::raw(""));
     if search.matches.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matches",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     } else {
         // Reserve rows for: 3 above (header + query + blank) and 2 below
@@ -592,7 +997,7 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
         if start > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  ▲ {} more above", start),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             )));
         }
         for (idx, (sidx, fidx, _score)) in search.matches[start..end].iter().enumerate() {
@@ -602,30 +1007,39 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
             let active = row_idx == cursor;
             let prefix = if active { "› " } else { "  " };
             let style = if active {
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(muted_fg())
             };
             lines.push(Line::from(vec![
                 Span::styled(
                     prefix,
-                    Style::default().fg(if active { GOLD } else { QUIET }),
+                    Style::default().fg(if active {
+                        crate::render::theme::secondary()
+                    } else {
+                        crate::render::theme::quiet()
+                    }),
                 ),
-                Span::styled(format!("{:<22}", section.label), Style::default().fg(QUIET)),
+                Span::styled(
+                    format!("{:<22}", section.label),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
                 Span::styled(format!("{:<28}", field.label), style),
             ]));
         }
         if end < total {
             lines.push(Line::from(Span::styled(
                 format!("  ▼ {} more below", total - end),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             )));
         }
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Type to filter · ↑/↓ move · Enter jump · Esc cancel",
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -641,22 +1055,30 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
     lines.push(Line::from(vec![
         Span::styled(
             "Pick model",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(format!("scope: {scope_label}"), Style::default().fg(QUIET)),
+        Span::styled(
+            format!("scope: {scope_label}"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("filter ", Style::default().fg(QUIET)),
+        Span::styled(
+            "filter ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
         Span::raw("› "),
         Span::raw(picker.filter.clone()),
-        Span::styled("_", Style::default().fg(AMBER)),
+        Span::styled("_", Style::default().fg(crate::render::theme::accent())),
     ]));
     lines.push(Line::raw(""));
     if matches.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matches · Enter to commit the filter as a custom model id",
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     } else {
         // Same scrolling treatment as the search overlay — large
@@ -677,7 +1099,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
         if start > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  ▲ {} more above", start),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             )));
         }
         for (idx, info) in matches[start..end].iter().enumerate() {
@@ -685,21 +1107,27 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
             let active = row_idx == cursor;
             let prefix = if active { "› " } else { "  " };
             let style = if active {
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(muted_fg())
             };
             let mut row = vec![
                 Span::styled(
                     prefix,
-                    Style::default().fg(if active { GOLD } else { QUIET }),
+                    Style::default().fg(if active {
+                        crate::render::theme::secondary()
+                    } else {
+                        crate::render::theme::quiet()
+                    }),
                 ),
                 Span::styled(format!("{:<32}", info.id), style),
             ];
             if picker.all_providers {
                 row.push(Span::styled(
                     format!("{:<12}", info.provider),
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 ));
             }
             for (tag, present) in [
@@ -712,7 +1140,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
                 if present {
                     row.push(Span::styled(
                         format!(" [{tag}]"),
-                        Style::default().fg(SUCCESS_GREEN),
+                        Style::default().fg(crate::render::theme::green()),
                     ));
                 }
             }
@@ -721,14 +1149,14 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
         if end < total {
             lines.push(Line::from(Span::styled(
                 format!("  ▼ {} more below", total - end),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             )));
         }
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Type filter · ↑/↓ move · Enter commit (or custom id if no match) · Tab all-providers · Esc cancel",
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
@@ -744,7 +1172,9 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
     if start > 0 {
         lines.push(Line::from(Span::styled(
             "  ▲ more",
-            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::DIM),
         )));
     }
     for (idx, section) in CONFIG_SECTIONS[start..end].iter().enumerate() {
@@ -752,14 +1182,20 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
         let active = idx == state.section_index;
         let prefix = if active { "› " } else { "  " };
         let style = if active {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(muted_fg())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 prefix,
-                Style::default().fg(if active { GOLD } else { QUIET }),
+                Style::default().fg(if active {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
             ),
             Span::styled(section.label, style),
         ]));
@@ -767,7 +1203,9 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
     if end < total {
         lines.push(Line::from(Span::styled(
             "  ▼ more",
-            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::DIM),
         )));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -815,10 +1253,15 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
     lines.push(Line::from(vec![
         Span::styled(
             section.label,
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(section.description, Style::default().fg(QUIET)),
+        Span::styled(
+            section.description,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
     ]));
     lines.push(Line::raw(""));
 
@@ -859,20 +1302,26 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
     if hidden_above > 0 {
         lines.push(Line::from(Span::styled(
             format!("  ▲ {hidden_above} more above"),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     }
     for row in rows {
         let active = row == state.field_index;
         let prefix = if active { "› " } else { "  " };
-        let prefix_style = Style::default().fg(if active { GOLD } else { QUIET });
+        let prefix_style = Style::default().fg(if active {
+            crate::render::theme::secondary()
+        } else {
+            crate::render::theme::quiet()
+        });
         match state.field_at_row(row) {
             Some(field) => {
                 let (value, source) = state.displayed_value_and_source(field);
                 let value_str = value.as_display();
                 let source_label = inheritance_label(state.scope, source);
                 let label_style = if active {
-                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(muted_fg())
                 };
@@ -884,7 +1333,11 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     ),
                     Span::styled(
                         value_str,
-                        Style::default().fg(if active { GOLD } else { muted_fg() }),
+                        Style::default().fg(if active {
+                            crate::render::theme::secondary()
+                        } else {
+                            muted_fg()
+                        }),
                     ),
                 ];
                 if !source_label.is_empty() {
@@ -911,10 +1364,10 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                     !env_var.is_empty() && std::env::var(&env_var).is_ok_and(|v| !v.is_empty());
                 let label_style = if active {
                     Style::default()
-                        .fg(MODE_PURPLE)
+                        .fg(crate::render::theme::magenta())
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(MODE_PURPLE)
+                    Style::default().fg(crate::render::theme::magenta())
                 };
                 let env_text = if env_var.is_empty() {
                     "n/a for this provider".to_string()
@@ -940,11 +1393,14 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                         format!("{:<width$}", api_key_label, width = max_label + 2),
                         label_style,
                     ),
-                    Span::styled(env_text, Style::default().fg(QUIET)),
+                    Span::styled(env_text, Style::default().fg(crate::render::theme::quiet())),
                 ];
                 if !badge.is_empty() {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled(badge, Style::default().fg(MODE_PURPLE)));
+                    spans.push(Span::styled(
+                        badge,
+                        Style::default().fg(crate::render::theme::magenta()),
+                    ));
                 }
                 lines.push(Line::from(spans));
             }
@@ -953,7 +1409,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
     if hidden_below > 0 {
         lines.push(Line::from(Span::styled(
             format!("  ▼ {hidden_below} more below"),
-            Style::default().fg(QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         )));
     }
 
@@ -964,7 +1420,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
             None => ("this provider".to_string(), "—".to_string()),
         };
         lines.push(Line::from(vec![
-            Span::styled("? ", Style::default().fg(QUIET)),
+            Span::styled("? ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled(
                 format!(
                     "Enter / Space sets the API key for {} (env var {}). Saved as \
@@ -972,17 +1428,23 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                      (User or Local; Repo is refused).",
                     provider_label, env_var
                 ),
-                Style::default().fg(QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
         ]));
     } else {
         let field = state.current_field();
         lines.push(Line::from(vec![
-            Span::styled("? ", Style::default().fg(QUIET)),
-            Span::styled(field.help, Style::default().fg(QUIET)),
+            Span::styled("? ", Style::default().fg(crate::render::theme::quiet())),
+            Span::styled(
+                field.help,
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  apply: ", Style::default().fg(QUIET)),
+            Span::styled(
+                "  apply: ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
             Span::styled(
                 field.tier.label(),
                 Style::default().fg(tier_color(field.tier)),
@@ -994,7 +1456,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![Span::styled(
             "── editing ──",
-            Style::default().fg(AMBER),
+            Style::default().fg(crate::render::theme::accent()),
         )]));
         lines.extend(render_editor_lines(editor));
     }
@@ -1053,7 +1515,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(Span::raw(cursor_str)),
                 Line::from(Span::styled(
                     "Enter to commit · Esc to cancel",
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
@@ -1074,7 +1536,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(Span::raw(format!("  {draft}"))),
                 Line::from(Span::styled(
                     format!("range: {min}..={max} · Enter to commit · Esc to cancel"),
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
@@ -1087,7 +1549,9 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 if i == *cursor {
                     spans.push(Span::styled(
                         format!("[{opt}]"),
-                        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(crate::render::theme::secondary())
+                            .add_modifier(Modifier::BOLD),
                     ));
                 } else {
                     spans.push(Span::styled(
@@ -1100,7 +1564,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(spans),
                 Line::from(Span::styled(
                     "← / → to move · Enter to commit · Esc to cancel",
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
@@ -1110,7 +1574,9 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Span::styled(
                     label,
                     if sel {
-                        Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(crate::render::theme::secondary())
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(muted_fg())
                     },
@@ -1140,19 +1606,23 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(spans),
                 Line::from(Span::styled(
                     "← / → to move · Enter to commit · Esc to cancel",
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
         FieldEditor::Bool(v) => {
             let mut spans = vec![Span::raw("  ")];
             let on_style = if *v {
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(muted_fg())
             };
             let off_style = if !*v {
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(muted_fg())
             };
@@ -1177,7 +1647,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(spans),
                 Line::from(Span::styled(
                     "Space / ← / → to toggle · Enter to commit · Esc to cancel",
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
@@ -1187,7 +1657,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(Span::raw(format!("  {draft}"))),
                 Line::from(Span::styled(
                     "comma-separated · Enter to commit · Esc to cancel",
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
@@ -1197,7 +1667,7 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(Span::raw(format!("  {draft}"))),
                 Line::from(Span::styled(
                     "filesystem path · Enter to commit · Esc to cancel",
-                    Style::default().fg(QUIET),
+                    Style::default().fg(crate::render::theme::quiet()),
                 )),
             ]
         }
@@ -1211,34 +1681,64 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
     // the most-used navigation visible on narrow terminals while the
     // less-discovered chords stay one glance away.
     let primary = Line::from(vec![
-        Span::styled(" Tab/Shift+Tab", Style::default().fg(GOLD)),
+        Span::styled(
+            " Tab/Shift+Tab",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" scope · "),
-        Span::styled("↑/↓", Style::default().fg(GOLD)),
+        Span::styled(
+            "↑/↓",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" field · "),
-        Span::styled("←/→", Style::default().fg(GOLD)),
+        Span::styled(
+            "←/→",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" section · "),
-        Span::styled("Enter", Style::default().fg(GOLD)),
+        Span::styled(
+            "Enter",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" edit · "),
-        Span::styled("Space", Style::default().fg(GOLD)),
+        Span::styled(
+            "Space",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" cycle · "),
-        Span::styled("/", Style::default().fg(GOLD)),
+        Span::styled("/", Style::default().fg(crate::render::theme::secondary())),
         Span::raw(" search · "),
-        Span::styled("Esc", Style::default().fg(GOLD)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" close "),
     ]);
     let secondary = Line::from(vec![
-        Span::styled(" Ctrl+R", Style::default().fg(GOLD)),
+        Span::styled(
+            " Ctrl+R",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" reset to default · "),
-        Span::styled("Ctrl+D", Style::default().fg(GOLD)),
+        Span::styled(
+            "Ctrl+D",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" clear override · "),
-        Span::styled("Ctrl+Z", Style::default().fg(GOLD)),
+        Span::styled(
+            "Ctrl+Z",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" undo · "),
-        Span::styled("Shift+X", Style::default().fg(GOLD)),
+        Span::styled(
+            "Shift+X",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
         Span::raw(" discard all (with y/n) "),
     ]);
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(QUIET));
+        .border_style(Style::default().fg(crate::render::theme::quiet()));
     frame.render_widget(
         Paragraph::new(vec![primary, secondary])
             .style(Style::default().fg(footer_fg()))
@@ -1249,22 +1749,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
 
 fn source_style(source: FieldSource) -> Style {
     match source {
-        FieldSource::Default => Style::default().fg(QUIET),
-        FieldSource::User => Style::default().fg(AMBER),
-        FieldSource::Project => Style::default().fg(GOLD),
-        FieldSource::Repo => Style::default().fg(SUCCESS_GREEN),
+        FieldSource::Default => Style::default().fg(crate::render::theme::quiet()),
+        FieldSource::User => Style::default().fg(crate::render::theme::accent()),
+        FieldSource::Project => Style::default().fg(crate::render::theme::secondary()),
+        FieldSource::Repo => Style::default().fg(crate::render::theme::green()),
         // Env overrides are informational ("this value comes from $SQUEEZY_*"),
-        // not an error. Painting them ERROR_RED used to look like a warning
-        // banner on otherwise-fine rows. MODE_PURPLE matches how the API-key
+        // not an error. Painting them crate::render::theme::red() used to look like a warning
+        // banner on otherwise-fine rows. crate::render::theme::magenta() matches how the API-key
         // synthetic row already flags an env-derived secret.
-        FieldSource::Env => Style::default().fg(MODE_PURPLE),
+        FieldSource::Env => Style::default().fg(crate::render::theme::magenta()),
     }
 }
 
 fn tier_color(tier: ApplyTier) -> Color {
     match tier {
-        ApplyTier::Immediate => SUCCESS_GREEN,
-        ApplyTier::NextPrompt => AMBER,
-        ApplyTier::Restart => GOLD,
+        ApplyTier::Immediate => crate::render::theme::green(),
+        ApplyTier::NextPrompt => crate::render::theme::accent(),
+        ApplyTier::Restart => crate::render::theme::secondary(),
     }
 }

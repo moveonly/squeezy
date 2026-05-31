@@ -4,7 +4,7 @@
 //! module so tool-call cards can apply the same subtle surface tint, with
 //! a single gate against terminals that can't render bg blends cleanly.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::render::palette::{self, ColorLevel};
@@ -16,11 +16,12 @@ pub(crate) fn card_background_style() -> Option<Style> {
     if !matches!(palette::color_level(), ColorLevel::TrueColor) {
         return None;
     }
-    let (r, g, b) = match palette::palette_tone() {
-        palette::PaletteTone::Dark => (28, 28, 34),
-        palette::PaletteTone::Light => (244, 244, 248),
-    };
-    Some(Style::default().bg(palette::best_color((r, g, b))))
+    let bg = crate::render::theme::surface();
+    if bg == Color::Reset {
+        None
+    } else {
+        Some(Style::default().bg(bg))
+    }
 }
 
 /// Patch `bg` onto every span in `line`. No-op when `bg` is `None`.

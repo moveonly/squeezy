@@ -26,7 +26,7 @@ pub(crate) fn render_diff_file(file: &DiffFile) -> Vec<Line<'static>> {
     if file.binary {
         return vec![Line::from(Span::styled(
             "binary file",
-            Style::default().fg(palette::QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ))];
     }
     let Some(patch) = file
@@ -36,7 +36,7 @@ pub(crate) fn render_diff_file(file: &DiffFile) -> Vec<Line<'static>> {
     else {
         return vec![Line::from(Span::styled(
             "no patch available",
-            Style::default().fg(palette::QUIET),
+            Style::default().fg(crate::render::theme::quiet()),
         ))];
     };
     // Key on `(path, patch_hash)` so identical patches against different
@@ -145,13 +145,13 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
         return Line::from(vec![
             Span::styled(
                 format!("{:>width$} ", "", width = gutter_width),
-                Style::default().fg(palette::QUIET),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
             Span::styled(
                 line.content.clone(),
                 Style::default()
                     .fg(palette::best_color(palette::rgb_components(
-                        palette::DIFF_HUNK_FG,
+                        crate::render::theme::color(crate::render::theme::token::DIFF_HUNK),
                     )))
                     .add_modifier(Modifier::BOLD),
             ),
@@ -172,7 +172,7 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
     };
     let fg_style = match line.kind {
         DiffLineKind::Add | DiffLineKind::Delete => Style::default(),
-        DiffLineKind::Context => Style::default().fg(palette::QUIET),
+        DiffLineKind::Context => Style::default().fg(crate::render::theme::quiet()),
         DiffLineKind::Hunk => Style::default(),
     };
     let bg = match line.kind {
@@ -184,7 +184,7 @@ fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>
     let gutter_text = number
         .map(|number| format!("{number:>width$} ", width = gutter_width))
         .unwrap_or_else(|| format!("{:>width$} ", "", width = gutter_width));
-    let mut gutter_style = Style::default().fg(palette::QUIET);
+    let mut gutter_style = Style::default().fg(crate::render::theme::quiet());
     if let Some(bg) = bg {
         gutter_style = gutter_style.bg(bg);
     }
@@ -237,25 +237,14 @@ fn content_spans(
     vec![Span::styled(content.to_string(), fallback_style)]
 }
 
-/// Soft green tint behind added lines. The `#213A2B` dark / `#dafbe1`
-/// light pair matches conventional patch-review styling and reads on
-/// both themes via `palette::best_color` quantisation.
+/// Soft tint behind added lines.
 pub(crate) fn diff_add_bg() -> Color {
-    let rgb = match palette::palette_tone() {
-        palette::PaletteTone::Dark => (33, 58, 43),
-        palette::PaletteTone::Light => (218, 251, 225),
-    };
-    palette::best_color(rgb)
+    crate::render::theme::color(crate::render::theme::token::DIFF_ADDED_BG)
 }
 
-/// Soft red tint behind removed lines. `#4A221D` dark / `#ffebe9` light
-/// matches conventional patch-review styling.
+/// Soft tint behind removed lines.
 pub(crate) fn diff_del_bg() -> Color {
-    let rgb = match palette::palette_tone() {
-        palette::PaletteTone::Dark => (74, 34, 29),
-        palette::PaletteTone::Light => (255, 235, 233),
-    };
-    palette::best_color(rgb)
+    crate::render::theme::color(crate::render::theme::token::DIFF_REMOVED_BG)
 }
 
 pub(crate) fn language_hint_from_path(path: &str) -> Option<&str> {

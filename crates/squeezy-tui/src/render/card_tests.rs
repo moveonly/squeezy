@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn card_background_preserves_existing_line_background() {
-    let diff_bg = Style::default().bg(Color::Green);
+    let diff_bg = Style::default().bg(crate::render::theme::green());
     let card_bg = Style::default().bg(Color::Blue);
     let line = Line::from(vec![
         Span::styled("│ ", Style::default().fg(Color::Gray)),
@@ -16,7 +16,7 @@ fn card_background_preserves_existing_line_background() {
 
     let styled = apply_background(line, Some(card_bg));
 
-    assert_eq!(styled.style.bg, Some(Color::Green));
+    assert_eq!(styled.style.bg, Some(crate::render::theme::green()));
     for span in styled.spans {
         assert_ne!(span.style.bg, Some(Color::Blue));
     }
@@ -24,7 +24,7 @@ fn card_background_preserves_existing_line_background() {
 
 #[test]
 fn card_background_preserves_existing_span_background() {
-    let diff_bg = Style::default().bg(Color::Green);
+    let diff_bg = Style::default().bg(crate::render::theme::green());
     let card_bg = Style::default().bg(Color::Blue);
     let line = Line::from(vec![
         Span::styled("prefix", Style::default()),
@@ -35,5 +35,8 @@ fn card_background_preserves_existing_span_background() {
 
     assert_eq!(styled.style.bg, Some(Color::Blue));
     assert_eq!(styled.spans[0].style.bg, Some(Color::Blue));
-    assert_eq!(styled.spans[1].style.bg, Some(Color::Green));
+    assert_eq!(
+        styled.spans[1].style.bg,
+        Some(crate::render::theme::green())
+    );
 }

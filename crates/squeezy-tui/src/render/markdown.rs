@@ -4,7 +4,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::render::{cache, highlight, palette};
+use crate::render::{cache, highlight};
 
 /// Render Markdown source as styled ratatui `Line`s.
 ///
@@ -211,7 +211,7 @@ impl TableBuilder {
                 if i > 0 {
                     spans.push(Span::styled(
                         " | ",
-                        style.patch(Style::default().fg(palette::QUIET)),
+                        style.patch(Style::default().fg(crate::render::theme::quiet())),
                     ));
                 }
                 let rendered = row
@@ -235,7 +235,7 @@ impl TableBuilder {
             }
             out.push(Line::from(Span::styled(
                 divider,
-                style.patch(Style::default().fg(palette::QUIET)),
+                style.patch(Style::default().fg(crate::render::theme::quiet())),
             )));
         }
         for row in &self.rows {
@@ -305,13 +305,16 @@ impl Writer {
             Event::SoftBreak | Event::HardBreak => self.finish_line(),
             Event::Rule => {
                 self.finish_line();
-                self.push_text("----------", Style::default().fg(palette::QUIET));
+                self.push_text(
+                    "----------",
+                    Style::default().fg(crate::render::theme::quiet()),
+                );
                 self.finish_line();
             }
             Event::TaskListMarker(checked) => {
                 // Checkboxes render unstyled. The `[ ]` / `[x]` glyph
-                // itself is structural enough; painting it (GOLD or
-                // QUIET) competes with the item content.
+                // itself is structural enough; painting it (crate::render::theme::secondary() or
+                // crate::render::theme::quiet()) competes with the item content.
                 self.push_text(if checked { "[x] " } else { "[ ] " }, Style::default());
             }
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
@@ -329,7 +332,7 @@ impl Writer {
                 // Block-quote *content* paints the same green as the
                 // leading `> ` prefix so the whole quoted run reads as
                 // one visual region.
-                self.push_style(Style::default().fg(Color::Green));
+                self.push_style(Style::default().fg(crate::render::theme::green()));
             }
             Tag::CodeBlock(kind) => {
                 self.finish_line();
@@ -356,7 +359,7 @@ impl Writer {
                 // it's pushed via `current_style`.
                 self.push_style(
                     Style::default()
-                        .fg(palette::INLINE_CODE_FG)
+                        .fg(crate::render::theme::inline_code())
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
@@ -487,7 +490,7 @@ impl Writer {
         };
         // Ordered and unordered markers share a quiet structural color so
         // bullets do not disappear next to numbered lists in dense output.
-        let style = Style::default().fg(Color::LightBlue);
+        let style = Style::default().fg(crate::render::theme::blue());
         self.push_text(&marker, style);
     }
 
@@ -550,7 +553,7 @@ impl Writer {
         if self.spans.is_empty() && self.quote_depth > 0 {
             self.spans.push(Span::styled(
                 "> ".repeat(self.quote_depth),
-                Style::default().fg(Color::Green),
+                Style::default().fg(crate::render::theme::green()),
             ));
         }
     }
@@ -580,7 +583,7 @@ impl Writer {
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
-    // Hierarchy through modifiers, not color. A wall of GOLD-painted
+    // Hierarchy through modifiers, not color. A wall of crate::render::theme::secondary()-painted
     // headings competed with everything else for the eye. Bold for
     // every level; underline H1/H2; italic for H3-H6 so the deeper
     // levels still differ from H2.
@@ -599,19 +602,19 @@ fn heading_style(level: HeadingLevel) -> Style {
 fn inline_code_style_for(text: &str) -> Style {
     let lower = text.to_ascii_lowercase();
     let color = if looks_like_session_id(text) || lower.starts_with("session") {
-        palette::QUIET
+        crate::render::theme::quiet()
     } else if lower.contains("model") || text.starts_with('@') {
-        palette::INLINE_MODEL_FG
+        crate::render::theme::inline_model()
     } else if lower.contains("branch") || lower.contains("refs/") || lower.contains('/') {
-        palette::PATH_HINT
+        crate::render::theme::path_hint()
     } else if lower.contains("cost")
         || lower.contains("token")
         || lower.contains("ctx")
         || lower.contains("read:")
     {
-        palette::AMBER
+        crate::render::theme::accent()
     } else {
-        palette::INLINE_CODE_FG
+        crate::render::theme::inline_code()
     };
     Style::default().fg(color)
 }
@@ -664,12 +667,12 @@ fn confidence_label_exact_match(text: &str) -> Option<&'static str> {
 
 fn confidence_label_color(label: &str) -> Color {
     match label {
-        "exact_syntax" => palette::SUCCESS_GREEN,
-        "import_resolved" => palette::AMBER,
-        "candidate_set" => palette::GOLD,
-        "external" | "unknown" => palette::QUIET,
-        "label_missing" => palette::ERROR_RED,
-        _ => palette::QUIET,
+        "exact_syntax" => crate::render::theme::green(),
+        "import_resolved" => crate::render::theme::accent(),
+        "candidate_set" => crate::render::theme::secondary(),
+        "external" | "unknown" => crate::render::theme::quiet(),
+        "label_missing" => crate::render::theme::red(),
+        _ => crate::render::theme::quiet(),
     }
 }
 

@@ -60,7 +60,7 @@ impl TuiHarness {
         height: u16,
         settings_path_override: Option<PathBuf>,
     ) -> Result<Self> {
-        apply_theme_overrides(config.tui.theme);
+        apply_theme_overrides(&config);
         // Mirror production (`crates/squeezy-tui/src/lib.rs:525`): the
         // banner / status-line provider label comes from the live
         // provider, not a harness literal. `Agent::provider_name()` is

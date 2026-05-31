@@ -1,90 +1,78 @@
-use std::env;
-use std::fs;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::BTreeMap;
 
-use ratatui::style::Color;
+use squeezy_core::{AppConfig, TUI_THEME_COLOR_TOKENS, TuiThemeSettings};
 
 use super::*;
 
-/// Sibling counter so concurrent tests in this file don't race on the
-/// same TOML path inside `std::env::temp_dir()`.
-static SUFFIX: AtomicU64 = AtomicU64::new(0);
+#[test]
+fn default_theme_resolves_every_token() {
+    let cfg = AppConfig::default();
+    let theme = resolve_theme(&cfg, "default");
 
-fn temp_toml(body: &str) -> std::path::PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let suffix = SUFFIX.fetch_add(1, Ordering::Relaxed);
-    let path = env::temp_dir().join(format!(
-        "squeezy-theme-test-{}-{}-{}.toml",
-        std::process::id(),
-        ts,
-        suffix,
-    ));
-    fs::write(&path, body).expect("write temp theme");
-    path
+    assert_eq!(theme.name, "default");
+    assert_eq!(
+        theme.colors().len(),
+        TUI_THEME_COLOR_TOKENS.len(),
+        "builtin default should define every public color token"
+    );
+    assert_eq!(theme.resolve(token::PALETTE_ACCENT), Some([252, 211, 77]));
+    assert_eq!(theme.resolve(token::DIFF_ADDED), Some([21, 128, 61]));
 }
 
 #[test]
-fn default_resolves_known_concrete_token() {
-    let theme = Theme::default();
-    assert_eq!(theme.resolve("palette.amber"), Some(palette::AMBER));
-    assert_eq!(theme.resolve("diff.added"), Some(palette::DIFF_ADD_FG));
-    assert!(theme.len() >= 40, "default theme should ship ~40 tokens");
-    assert!(!theme.is_empty());
-}
-
-#[test]
-fn ref_indirection_walks_to_concrete_color() {
-    let theme = Theme::default();
-    // palette.accent -> palette.amber (Ref), palette.amber -> Color
-    assert_eq!(theme.resolve("palette.accent"), Some(palette::AMBER));
-    // syntax.comment -> ui.muted -> Color
-    assert_eq!(theme.resolve("syntax.comment"), Some(palette::QUIET));
-    // transcript.user -> palette.accent -> palette.amber -> Color (two hops)
-    assert_eq!(theme.resolve("transcript.user"), Some(palette::AMBER));
-}
-
-#[test]
-fn ref_cycle_returns_none() {
-    let mut theme = Theme::default();
-    theme.insert("cycle.a", TokenValue::Ref("cycle.b".into()));
-    theme.insert("cycle.b", TokenValue::Ref("cycle.a".into()));
-    assert_eq!(theme.resolve("cycle.a"), None);
-
-    // Missing target also returns None (no panic, no infinite loop).
-    theme.insert("dangling", TokenValue::Ref("does.not.exist".into()));
-    assert_eq!(theme.resolve("dangling"), None);
-}
-
-#[test]
-fn toml_overlay_applies_on_top_of_defaults() {
-    // Dotted keys at the document root must come before any `[header]`
-    // because TOML walks the active table per-line — once `[ui]` is in
-    // scope, `palette.red = ...` writes to `ui.palette.red`, not to the
-    // top-level `palette.red`. The loader handles either grouping the user
-    // chooses; this layout exercises both shapes side-by-side.
-    let path = temp_toml(
-        r##"
-palette.red = "#ff00aa"
-palette.accent = "@palette.cyan"
-
-[ui]
-background = "#101014"
-"##,
+fn custom_theme_overlays_default_tokens() {
+    let mut cfg = AppConfig::default();
+    cfg.tui.themes.insert(
+        "solarized".to_string(),
+        TuiThemeSettings {
+            colors: BTreeMap::from([(token::PALETTE_ACCENT.to_string(), [1, 2, 3])]),
+        },
     );
 
-    let theme = Theme::load_from_toml(&path).expect("load");
-    let _ = fs::remove_file(&path);
+    let theme = resolve_theme(&cfg, "solarized");
+    let default = resolve_theme(&cfg, "default");
+    assert_eq!(theme.name, "solarized");
+    assert_eq!(theme.resolve(token::PALETTE_ACCENT), Some([1, 2, 3]));
+    assert_eq!(
+        theme.resolve(token::PALETTE_SECONDARY),
+        default.resolve(token::PALETTE_SECONDARY)
+    );
+}
 
-    assert_eq!(theme.resolve("ui.background"), Some(Color::Rgb(16, 16, 20)));
-    assert_eq!(theme.resolve("palette.red"), Some(Color::Rgb(255, 0, 170)));
-    // Overlay rebinds accent to cyan; transcript.user (-> palette.accent)
-    // should now resolve through to the new cyan target.
-    assert_eq!(theme.resolve("palette.accent"), Some(palette::ACCENT_CYAN));
-    assert_eq!(theme.resolve("transcript.user"), Some(palette::ACCENT_CYAN));
-    // Untouched defaults survive the overlay.
-    assert_eq!(theme.resolve("palette.amber"), Some(palette::AMBER));
+#[test]
+fn builtin_theme_overrides_can_be_modified_by_settings() {
+    let mut cfg = AppConfig::default();
+    cfg.tui.themes.insert(
+        "fun".to_string(),
+        TuiThemeSettings {
+            colors: BTreeMap::from([(token::UI_FOREGROUND.to_string(), [9, 8, 7])]),
+        },
+    );
+
+    let theme = resolve_theme(&cfg, "fun");
+    assert_eq!(theme.resolve(token::UI_FOREGROUND), Some([9, 8, 7]));
+    assert_ne!(
+        theme.resolve(token::PALETTE_ACCENT),
+        resolve_theme(&cfg, "default").resolve(token::PALETTE_ACCENT),
+        "fun still keeps its builtin palette for tokens that settings do not override"
+    );
+}
+
+#[test]
+fn setting_active_theme_swaps_snapshot_and_bumps_generation() {
+    let mut cfg = AppConfig::default();
+    cfg.tui.theme = "bright".to_string();
+    let before_name = current_theme_name();
+    let before = theme_generation();
+
+    set_active_theme(&cfg);
+
+    assert_eq!(current_theme_name(), "bright");
+    if before_name != "bright" {
+        assert!(theme_generation() > before);
+    }
+    assert_eq!(
+        current_theme().resolve(token::PALETTE_ACCENT),
+        Some([255, 214, 85])
+    );
 }

@@ -1,5 +1,8 @@
 use super::*;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 // A trivial provider so we can build an Agent for testing.
 struct NoOpProvider;
@@ -20,6 +23,39 @@ impl squeezy_llm::LlmProvider for NoOpProvider {
 fn make_agent() -> Agent {
     let provider: Arc<dyn squeezy_llm::LlmProvider> = Arc::new(NoOpProvider);
     Agent::new(AppConfig::default(), provider)
+}
+
+static TEMP_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_config_state(focus: Option<SectionId>) -> ConfigScreenState {
+    let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("squeezy_config_screen_{nonce}"));
+    std::fs::create_dir_all(&root).expect("create temp config dir");
+    let mut state = ConfigScreenState::new(AppConfig::default(), focus);
+    let user = root.join("user-settings.toml");
+    let project = root.join("repo-settings.toml");
+    let repo = root.join("local-settings.toml");
+    state.sources.user_path_default = user.clone();
+    state.sources.project_path_default = project.clone();
+    state.sources.repo_path_default = repo.clone();
+    state.sources.user = None;
+    state.sources.project = None;
+    state.sources.repo = None;
+    state.baseline = vec![(user, None), (project, None), (repo, None)];
+    state
+}
+
+fn field_index(section_id: SectionId, toml_path: &[&str]) -> usize {
+    CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == section_id)
+        .and_then(|section| {
+            section
+                .fields
+                .iter()
+                .position(|field| field.toml_path == toml_path)
+        })
+        .expect("field exists")
 }
 
 #[test]
@@ -62,6 +98,247 @@ fn tab_cycles_through_three_scopes() {
 }
 
 #[test]
+fn themes_section_exposes_builtins_new_row_and_color_tokens() {
+    let state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Themes));
+
+    assert_eq!(state.current_section().id, SectionId::Themes);
+    assert_eq!(
+        state.row_count(),
+        crate::render::theme::available_theme_names(&state.effective).len()
+            + 1
+            + squeezy_core::TUI_THEME_COLOR_TOKENS.len()
+    );
+    assert_eq!(
+        state.theme_row_at(0),
+        Some(ThemeRow::Theme("default".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn themes_section_selects_builtin_theme_immediately() {
+    let mut state = temp_config_state(Some(SectionId::Themes));
+    let settings_path = state.sources.user_path_default.clone();
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = crate::render::theme::available_theme_names(&state.effective)
+        .iter()
+        .position(|name| name == "bright")
+        .expect("bright builtin exists");
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert_eq!(state.effective.tui.theme, "bright");
+    assert_eq!(agent.config_snapshot().tui.theme, "bright");
+    let saved = std::fs::read_to_string(settings_path).expect("theme selection saved");
+    assert!(saved.contains("theme = \"bright\""), "{saved}");
+}
+
+#[tokio::test]
+async fn themes_section_edits_active_theme_rgb_token() {
+    let mut state = temp_config_state(Some(SectionId::Themes));
+    let settings_path = state.sources.user_path_default.clone();
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    let token = crate::render::theme::token::PALETTE_ACCENT;
+    let color_row = crate::render::theme::available_theme_names(&state.effective).len()
+        + 1
+        + crate::render::theme::token_rows()
+            .iter()
+            .position(|candidate| *candidate == token)
+            .expect("token exists");
+    state.field_index = color_row;
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    match state.theme_editor.as_mut().expect("rgb editor opens") {
+        ThemeEditor::Rgb { draft, cursor, .. } => {
+            *draft = "1,2,3".to_string();
+            *cursor = draft.chars().count();
+        }
+        other => panic!("expected RGB editor, got {other:?}"),
+    }
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert_eq!(
+        state
+            .effective
+            .tui
+            .themes
+            .get("default")
+            .and_then(|theme| theme.colors.get(token)),
+        Some(&[1, 2, 3])
+    );
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .tui
+            .themes
+            .get("default")
+            .and_then(|theme| theme.colors.get(token)),
+        Some(&[1, 2, 3])
+    );
+    let saved = std::fs::read_to_string(settings_path).expect("theme color saved");
+    assert!(saved.contains("\"palette.accent\" = [1, 2, 3]"), "{saved}");
+}
+
+#[tokio::test]
+async fn themes_section_creates_custom_theme_snapshot() {
+    let mut state = temp_config_state(Some(SectionId::Themes));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = crate::render::theme::available_theme_names(&state.effective).len();
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(matches!(
+        &state.theme_editor,
+        Some(ThemeEditor::Name { .. })
+    ));
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    let custom = state
+        .effective
+        .tui
+        .themes
+        .get("custom-theme")
+        .expect("custom theme saved");
+    assert_eq!(state.effective.tui.theme, "custom-theme");
+    assert_eq!(agent.config_snapshot().tui.theme, "custom-theme");
+    assert_eq!(
+        custom.colors.len(),
+        squeezy_core::TUI_THEME_COLOR_TOKENS.len(),
+        "custom themes start as a full editable snapshot"
+    );
+}
+
+#[tokio::test]
+async fn themes_section_renames_custom_theme() {
+    let mut state = temp_config_state(Some(SectionId::Themes));
+    let settings_path = state.sources.user_path_default.clone();
+    std::fs::write(
+        &settings_path,
+        "[tui]\ntheme = \"ocean\"\n\n[tui.themes.ocean.colors]\n\"palette.accent\" = [1, 2, 3]\n",
+    )
+    .expect("seed settings");
+    state.effective.tui.theme = "ocean".to_string();
+    state.effective.tui.themes.insert(
+        "ocean".to_string(),
+        squeezy_core::TuiThemeSettings {
+            colors: [(
+                crate::render::theme::token::PALETTE_ACCENT.to_string(),
+                [1, 2, 3],
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = crate::render::theme::available_theme_names(&state.effective)
+        .iter()
+        .position(|name| name == "ocean")
+        .expect("custom theme row exists");
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
+    );
+    match state.theme_editor.as_mut().expect("rename editor opens") {
+        ThemeEditor::Rename { draft, cursor, .. } => {
+            *draft = "ocean-renamed".to_string();
+            *cursor = draft.chars().count();
+        }
+        other => panic!("expected rename editor, got {other:?}"),
+    }
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert!(!state.effective.tui.themes.contains_key("ocean"));
+    assert!(state.effective.tui.themes.contains_key("ocean-renamed"));
+    assert_eq!(state.effective.tui.theme, "ocean-renamed");
+    assert_eq!(agent.config_snapshot().tui.theme, "ocean-renamed");
+    let saved = std::fs::read_to_string(settings_path).expect("renamed theme saved");
+    assert!(saved.contains("theme = \"ocean-renamed\""), "{saved}");
+    assert!(
+        saved.contains("[tui.themes.ocean-renamed.colors]"),
+        "{saved}"
+    );
+    assert!(!saved.contains("[tui.themes.ocean.colors]"), "{saved}");
+}
+
+#[tokio::test]
+async fn themes_section_deletes_custom_theme_and_falls_back_when_active() {
+    let mut state = temp_config_state(Some(SectionId::Themes));
+    let settings_path = state.sources.user_path_default.clone();
+    std::fs::write(
+        &settings_path,
+        "[tui]\ntheme = \"ocean\"\n\n[tui.themes.ocean.colors]\n\"palette.accent\" = [1, 2, 3]\n",
+    )
+    .expect("seed settings");
+    state.effective.tui.theme = "ocean".to_string();
+    state.effective.tui.themes.insert(
+        "ocean".to_string(),
+        squeezy_core::TuiThemeSettings {
+            colors: [(
+                crate::render::theme::token::PALETTE_ACCENT.to_string(),
+                [1, 2, 3],
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = crate::render::theme::available_theme_names(&state.effective)
+        .iter()
+        .position(|name| name == "ocean")
+        .expect("custom theme row exists");
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+    );
+
+    assert!(!state.effective.tui.themes.contains_key("ocean"));
+    assert_eq!(state.effective.tui.theme, "default");
+    assert_eq!(agent.config_snapshot().tui.theme, "default");
+    let saved = std::fs::read_to_string(settings_path).expect("theme deletion saved");
+    assert!(saved.contains("theme = \"default\""), "{saved}");
+    assert!(!saved.contains("[tui.themes.ocean.colors]"), "{saved}");
+}
+
+#[test]
 fn arrow_keys_navigate_sections_and_fields() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
@@ -89,12 +366,11 @@ fn space_toggles_bool_field() {
     // Use a field whose schema declares no env_override so the assertion
     // can't race with `enter_on_env_shadowed_field_emits_warning_*` setting
     // SQUEEZY_TELEMETRY in parallel.
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    // show_reasoning_usage is at index 4 in Verbosity: env_override=None, Bool.
-    state.field_index = 4;
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     let before = state.effective.tui.show_reasoning_usage;
     handle_key(
         &mut state,
@@ -228,7 +504,7 @@ async fn space_cycles_model_field_to_next_registry_entry() {
         std::env::remove_var("SQUEEZY_MODEL");
         std::env::remove_var("SQUEEZY_PROVIDER");
     }
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.field_index = 1; // model row (synthetic API-key now lives at row 2)
@@ -281,7 +557,7 @@ async fn space_cycles_enum_field_to_next_option() {
     unsafe {
         std::env::remove_var("SQUEEZY_PROVIDER");
     }
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
@@ -349,11 +625,10 @@ async fn slash_opens_search_and_enter_jumps_to_field() {
 async fn ctrl_r_resets_field_to_default() {
     // Use a field whose schema declares no env_override, so the test stays
     // robust against other tests setting SQUEEZY_* env vars in parallel.
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    // response_verbosity is index 0: env_override=None, default=Normal.
-    state.field_index = 0;
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "response_verbosity"]);
     state.effective.tui.response_verbosity = squeezy_core::ResponseVerbosity::Verbose;
     handle_key(
         &mut state,
@@ -416,7 +691,7 @@ async fn space_cycling_provider_resets_model_in_memory() {
         std::env::remove_var("SQUEEZY_PROVIDER");
         std::env::remove_var("SQUEEZY_MODEL");
     }
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
@@ -609,11 +884,11 @@ fn default_scope_is_user() {
 
 #[tokio::test]
 async fn shift_x_arms_discard_confirmation_then_n_cancels() {
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 4; // show_reasoning_usage (Bool, no env_override)
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
         &mut state,
         &mut agent,
@@ -677,11 +952,11 @@ async fn shift_x_on_empty_undo_stack_short_circuits_without_confirm() {
 
 #[tokio::test]
 async fn discard_confirm_y_wipes_session_writes() {
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 4;
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
         &mut state,
         &mut agent,
@@ -738,7 +1013,6 @@ fn footer_documents_shift_tab_for_reverse_scope_cycle() {
 
 #[test]
 fn env_source_badge_no_longer_uses_error_red() {
-    use crate::render::palette::ERROR_RED;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -778,7 +1052,7 @@ fn env_source_badge_no_longer_uses_error_red() {
     );
     assert_ne!(
         env_badge_colour,
-        Some(ERROR_RED),
+        Some(crate::render::theme::red()),
         "[env] badge must not be coloured as an error"
     );
 }
@@ -818,7 +1092,7 @@ async fn model_picker_provider_swap_writes_once_not_twice() {
         std::env::remove_var("SQUEEZY_MODEL");
         std::env::remove_var("SQUEEZY_PROVIDER");
     }
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    let mut state = temp_config_state(Some(SectionId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.field_index = 1;
@@ -966,11 +1240,11 @@ async fn picker_open_path_locates_provider_field_by_toml_path() {
 
 #[tokio::test]
 async fn discard_confirm_overlay_renders_with_file_list() {
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 4;
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
         &mut state,
         &mut agent,
@@ -1066,11 +1340,11 @@ async fn tab_from_default_user_scope_advances_to_repo() {
 
 #[tokio::test]
 async fn immediate_tier_bool_save_propagates_to_agent() {
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 4;
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     let before = agent.config_snapshot().tui.show_reasoning_usage;
     handle_key(
         &mut state,
@@ -1088,11 +1362,11 @@ async fn immediate_tier_bool_save_propagates_to_agent() {
 #[tokio::test]
 async fn immediate_tier_enum_save_propagates_to_agent() {
     use squeezy_core::ResponseVerbosity;
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
-    state.field_index = 0;
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "response_verbosity"]);
     state.effective.tui.response_verbosity = ResponseVerbosity::Normal;
     agent.replace_config(state.effective.clone());
     handle_key(
@@ -1112,12 +1386,12 @@ async fn immediate_tier_enum_save_propagates_to_agent() {
 #[tokio::test]
 async fn immediate_tier_permission_save_propagates_to_agent() {
     use squeezy_core::{PermissionMode, PermissionPolicyMode};
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Permissions));
+    let mut state = temp_config_state(Some(SectionId::Permissions));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
     state.effective.permissions.mode = PermissionPolicyMode::Custom;
-    state.field_index = 1;
+    state.field_index = field_index(SectionId::Permissions, &["permissions", "read"]);
     state.effective.permissions.read = PermissionMode::Allow;
     agent.replace_config(state.effective.clone());
     handle_key(
@@ -1138,7 +1412,7 @@ async fn next_prompt_tier_save_arms_pending_swap() {
     use squeezy_core::config_schema::ApplyTier;
     // SAFETY: tests in this module run single-threaded.
     unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Subagents));
+    let mut state = temp_config_state(Some(SectionId::Subagents));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;
@@ -1180,7 +1454,7 @@ async fn next_prompt_tier_save_arms_pending_swap() {
 async fn next_prompt_swap_applies_on_drain() {
     // SAFETY: tests in this module run single-threaded.
     unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Subagents));
+    let mut state = temp_config_state(Some(SectionId::Subagents));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     state.scope = ConfigScope::User;

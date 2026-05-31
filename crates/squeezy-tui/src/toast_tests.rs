@@ -69,10 +69,13 @@ fn clear_drops_everything() {
 
 #[test]
 fn variant_color_matches_palette() {
-    assert_eq!(ToastVariant::Info.color(), AMBER);
-    assert_eq!(ToastVariant::Success.color(), SUCCESS_GREEN);
-    assert_eq!(ToastVariant::Warning.color(), GOLD);
-    assert_eq!(ToastVariant::Error.color(), ERROR_RED);
+    assert_eq!(ToastVariant::Info.color(), crate::render::theme::accent());
+    assert_eq!(ToastVariant::Success.color(), crate::render::theme::green());
+    assert_eq!(
+        ToastVariant::Warning.color(),
+        crate::render::theme::secondary()
+    );
+    assert_eq!(ToastVariant::Error.color(), crate::render::theme::red());
 }
 
 #[test]

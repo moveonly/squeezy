@@ -9,15 +9,14 @@ use tree_sitter::Language;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
 use crate::render::cache;
-use crate::render::palette::{self, PaletteTone, best_color};
+use crate::render::theme::{self, token};
 
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
 /// Foreground colors for each highlight category. Built per render from the
-/// runtime [`PaletteTone`] so a `/theme` flip is reflected on the next draw
-/// without rebuilding any highlighter state. RGB triples flow through
-/// [`best_color`] for ANSI-256 / ANSI-16 / `NO_COLOR` adaptation.
+/// active theme so a `/theme` flip is reflected on the next draw without
+/// rebuilding any highlighter state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HighlightPalette {
     pub keyword: Color,
@@ -33,74 +32,22 @@ pub(crate) struct HighlightPalette {
 }
 
 impl HighlightPalette {
-    /// Picks readable foregrounds for the supplied tone. Dark values match
-    /// the original ANSI-256 palette (light purple / cyan / amber on black);
-    /// light values are darker, more saturated hues (deep purple / teal /
-    /// brown / dark slate) chosen to retain WCAG-AA contrast on white.
-    pub(crate) fn for_tone(tone: PaletteTone) -> Self {
-        match tone {
-            PaletteTone::Dark => Self {
-                keyword: best_color(KEYWORD_DARK),
-                r#type: best_color(TYPE_DARK),
-                string: best_color(STRING_DARK),
-                number: best_color(NUMBER_DARK),
-                comment: best_color(COMMENT_DARK),
-                function: best_color(FUNCTION_DARK),
-                variable: best_color(VARIABLE_DARK),
-                constant: best_color(CONSTANT_DARK),
-                operator: best_color(OPERATOR_DARK),
-                punctuation: best_color(PUNCTUATION_DARK),
-            },
-            PaletteTone::Light => Self {
-                keyword: best_color(KEYWORD_LIGHT),
-                r#type: best_color(TYPE_LIGHT),
-                string: best_color(STRING_LIGHT),
-                number: best_color(NUMBER_LIGHT),
-                comment: best_color(COMMENT_LIGHT),
-                function: best_color(FUNCTION_LIGHT),
-                variable: best_color(VARIABLE_LIGHT),
-                constant: best_color(CONSTANT_LIGHT),
-                operator: best_color(OPERATOR_LIGHT),
-                punctuation: best_color(PUNCTUATION_LIGHT),
-            },
+    /// Snapshot of the palette to use for the current draw.
+    pub(crate) fn current() -> Self {
+        Self {
+            keyword: theme::color(token::SYNTAX_KEYWORD),
+            r#type: theme::color(token::SYNTAX_TYPE),
+            string: theme::color(token::SYNTAX_STRING),
+            number: theme::color(token::SYNTAX_LITERAL),
+            comment: theme::color(token::SYNTAX_COMMENT),
+            function: theme::color(token::SYNTAX_FUNCTION),
+            variable: theme::color(token::SYNTAX_VARIABLE),
+            constant: theme::color(token::SYNTAX_LITERAL),
+            operator: theme::color(token::SYNTAX_OPERATOR),
+            punctuation: theme::color(token::SYNTAX_OPERATOR),
         }
     }
-
-    /// Snapshot of the palette to use for the *current* draw — reads
-    /// [`palette::palette_tone`] at call time.
-    pub(crate) fn current() -> Self {
-        Self::for_tone(palette::palette_tone())
-    }
 }
-
-// Dark-tone RGB approximations of the original `Color::Indexed` palette
-// (xterm-256 indices 141 / 110 / 143 / 173 / 244 / 81 / 252 / 179 / 250 / 245).
-// Listed in absolute terms so the values remain auditable even if the
-// ANSI-256 mapping is refreshed.
-const KEYWORD_DARK: (u8, u8, u8) = (175, 135, 215);
-const TYPE_DARK: (u8, u8, u8) = (135, 175, 215);
-const STRING_DARK: (u8, u8, u8) = (175, 175, 135);
-const NUMBER_DARK: (u8, u8, u8) = (215, 135, 95);
-const COMMENT_DARK: (u8, u8, u8) = (128, 128, 128);
-const FUNCTION_DARK: (u8, u8, u8) = (95, 215, 255);
-const VARIABLE_DARK: (u8, u8, u8) = (208, 208, 208);
-const CONSTANT_DARK: (u8, u8, u8) = (215, 175, 95);
-const OPERATOR_DARK: (u8, u8, u8) = (188, 188, 188);
-const PUNCTUATION_DARK: (u8, u8, u8) = (138, 138, 138);
-
-// Light-tone foregrounds — darker, higher-saturation analogues that read
-// against a white background. Modeled on VS Code's "Light+" theme so the
-// pairing keyword/type/string is familiar (deep purple / teal / brown).
-const KEYWORD_LIGHT: (u8, u8, u8) = (175, 0, 219);
-const TYPE_LIGHT: (u8, u8, u8) = (38, 127, 153);
-const STRING_LIGHT: (u8, u8, u8) = (163, 21, 21);
-const NUMBER_LIGHT: (u8, u8, u8) = (9, 134, 88);
-const COMMENT_LIGHT: (u8, u8, u8) = (106, 117, 122);
-const FUNCTION_LIGHT: (u8, u8, u8) = (121, 94, 38);
-const VARIABLE_LIGHT: (u8, u8, u8) = (0, 16, 128);
-const CONSTANT_LIGHT: (u8, u8, u8) = (170, 55, 49);
-const OPERATOR_LIGHT: (u8, u8, u8) = (53, 53, 53);
-const PUNCTUATION_LIGHT: (u8, u8, u8) = (82, 82, 82);
 
 const HIGHLIGHT_NAMES: [&str; 15] = [
     "attribute",

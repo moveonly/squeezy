@@ -21,7 +21,6 @@ use ratatui::{
 };
 
 use crate::TuiApp;
-use crate::render::palette::QUIET;
 use crate::status::{self, StatusLineAccent, StatusLineItem};
 
 /// Result of a key event on the picker — propagated up so the caller can
@@ -219,7 +218,9 @@ impl StatusLineSetupState {
 }
 
 fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM).fg(QUIET)
+    Style::default()
+        .add_modifier(Modifier::DIM)
+        .fg(crate::render::theme::quiet())
 }
 
 pub(crate) fn render(
@@ -275,7 +276,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, state: &StatusLineSetupState) 
         state.use_colors,
         "Use theme colors",
         "Color status items with their accent palette",
-        Style::default().fg(QUIET),
+        Style::default().fg(crate::render::theme::quiet()),
     ));
     lines.push(Line::from(Span::styled(
         "─".repeat(area.width as usize),
@@ -315,7 +316,11 @@ fn row_line(
     Line::from(vec![
         Span::styled(
             pointer.to_string(),
-            Style::default().fg(if cursor { Color::Yellow } else { QUIET }),
+            Style::default().fg(if cursor {
+                Color::Yellow
+            } else {
+                crate::render::theme::quiet()
+            }),
         ),
         Span::styled(checkbox.to_string(), label_style),
         Span::styled(label.to_string(), label_style),

@@ -156,7 +156,7 @@ pub enum DispatchCommand {
     },
     Statusline,
     Theme {
-        theme: String,
+        theme: Option<String>,
     },
     Keymap,
 }
@@ -396,22 +396,9 @@ impl DispatchCommand {
                 id: require_id(head, rest, "<attachment_id>")?,
             },
             "/statusline" => Self::Statusline,
-            "/theme" => {
-                if rest.is_empty() {
-                    return Err(DispatchCommandParseError::Usage {
-                        command: head.to_string(),
-                        hint: "usage: /theme [system|dark|light|catppuccin|high-contrast]"
-                            .to_string(),
-                    });
-                }
-                Self::Theme {
-                    theme: rest
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
-                }
-            }
+            "/theme" => Self::Theme {
+                theme: rest.split_whitespace().next().map(str::to_string),
+            },
             "/keymap" => Self::Keymap,
             unknown => {
                 return Err(DispatchCommandParseError::Unknown {

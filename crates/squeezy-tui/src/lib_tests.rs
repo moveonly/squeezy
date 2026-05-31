@@ -74,12 +74,16 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Up/Down menu/history"),
+        status.contains("Up/Down menu"),
         "missing menu/history hint: {status}"
     );
     assert!(
-        !status.contains("Wheel/PgUp/PgDn scroll"),
-        "default inline mode should leave wheel scrolling to the terminal: {status}"
+        status.contains("Alt+Up/Down history"),
+        "missing prompt history hint: {status}"
+    );
+    assert!(
+        status.contains("Wheel/PgUp/PgDn scroll"),
+        "auto mode uses alternate screen scrolling by default: {status}"
     );
 }
 
@@ -90,14 +94,14 @@ fn status_mode_color_distinguishes_build_and_plan() {
     let build = format_status_overview_line(&app, 120);
     assert_eq!(
         build.spans.last().and_then(|span| span.style.fg),
-        Some(MODE_BUILD_GREEN)
+        Some(crate::render::theme::green())
     );
 
     app.mode = SessionMode::Plan;
     let plan = format_status_overview_line(&app, 120);
     assert_eq!(
         plan.spans.last().and_then(|span| span.style.fg),
-        Some(MODE_PURPLE)
+        Some(crate::render::theme::magenta())
     );
 }
 
@@ -141,7 +145,7 @@ fn plan_mode_indicator_line_uses_existing_mode_purple_palette() {
         .first()
         .expect("plan-mode line must have at least one span");
     assert!(label_span.content.contains("PLAN MODE"));
-    assert_eq!(label_span.style.fg, Some(MODE_PURPLE));
+    assert_eq!(label_span.style.fg, Some(crate::render::theme::magenta()));
 }
 
 #[tokio::test]
@@ -1774,11 +1778,7 @@ async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
     ));
     std::fs::create_dir_all(&tmpdir).expect("mkdir");
     let settings_path = tmpdir.join("settings.toml");
-    // SAFETY: tests run sequentially per file with --test-threads=1 if needed;
-    // this env var is read at save time only.
-    unsafe {
-        std::env::set_var("SQUEEZY_SETTINGS_PATH", &settings_path);
-    }
+    let _guard = ScopedSettingsPath::new(settings_path);
     set_input(&mut app, "/statusline".to_string());
     handle_key(
         &mut app,
@@ -1823,9 +1823,6 @@ async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
         !row1.contains("scripted:gpt-test"),
         "row 1 should no longer show provider-and-model after toggling it off; got: {row1}"
     );
-    unsafe {
-        std::env::remove_var("SQUEEZY_SETTINGS_PATH");
-    }
 }
 
 #[tokio::test]
@@ -1835,6 +1832,8 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
     // chosen items.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("statusline_save");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
     set_input(&mut app, "/statusline".to_string());
     handle_key(
         &mut app,
@@ -2819,7 +2818,15 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         &names[..SLASH_MENU_MAX_ITEMS]
     );
     assert!(names[0] < names[1] && names[1] < names[2], "alphabetical");
-    assert_eq!(slash_suggestion_lines(&app).len(), SLASH_MENU_MAX_ITEMS);
+    let command_rows = slash_suggestion_lines(&app, 120)
+        .iter()
+        .filter(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref().starts_with('/'))
+        })
+        .count();
+    assert_eq!(command_rows, SLASH_MENU_MAX_ITEMS);
 
     // Step the selection forward by one page; the visible window
     // should slide forward by the same offset.
@@ -2928,7 +2935,7 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
     // absence (`/cost` → no badge).
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/help".to_string());
-    let lines = slash_suggestion_lines(&app);
+    let lines = slash_suggestion_lines(&app, 120);
     let serialised = lines
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -2940,7 +2947,7 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
     assert!(help_line.contains("[net]"), "{help_line}");
 
     set_input(&mut app, "/cost".to_string());
-    let lines = slash_suggestion_lines(&app);
+    let lines = slash_suggestion_lines(&app, 120);
     let serialised = lines
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -2956,20 +2963,49 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
 }
 
 #[test]
-fn slash_suggestion_lines_cap_description_width() {
+fn slash_suggestion_lines_keep_theme_hint_full() {
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/".to_string());
-    for line in slash_suggestion_lines(&app) {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(
-            text.chars().count() <= 140,
-            "slash menu line should stay bounded: {text}"
-        );
-    }
+    set_input(&mut app, "/theme".to_string());
+    let rendered = slash_suggestion_lines(&app, 80)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("[default|bright|fun|catppuccin|high-contrast|<custom>]"),
+        "slash menu should render the complete theme hint: {rendered}"
+    );
+    assert!(
+        !rendered.contains("high-..."),
+        "slash menu must not truncate the high-contrast builtin: {rendered}"
+    );
+}
+
+#[test]
+fn slash_suggestion_lines_keep_short_hints_inline_when_width_allows() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/attach".to_string());
+    let lines = slash_suggestion_lines(&app, 120);
+    let attach_line = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .find(|line| line.contains("/attach ") && line.contains("attach a file"))
+        .expect("attach suggestion line");
+
+    assert!(
+        attach_line.contains("<path>"),
+        "short parameter hint should stay on the command row when it fits: {attach_line}"
+    );
 }
 
 #[tokio::test]
@@ -4388,7 +4424,7 @@ fn plan_mode_question_marks_freeform_answer_when_selected() {
         .iter()
         .find(|span| span.content.as_ref() == "● ")
         .expect("answer marker");
-    assert_eq!(marker.style.fg, Some(AMBER));
+    assert_eq!(marker.style.fg, Some(crate::render::theme::accent()));
     assert!(
         answer
             .spans
@@ -4429,15 +4465,15 @@ fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
         .iter()
         .find(|span| span.content.as_ref() == "● ")
         .expect("selected marker");
-    assert_eq!(marker.style.fg, Some(AMBER));
+    assert_eq!(marker.style.fg, Some(crate::render::theme::accent()));
 
     let label = selected
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "Behavior-preserving only")
         .expect("selected label");
-    assert_ne!(label.style.fg, Some(GOLD));
-    assert_ne!(label.style.fg, Some(AMBER));
+    assert_ne!(label.style.fg, Some(crate::render::theme::secondary()));
+    assert_ne!(label.style.fg, Some(crate::render::theme::accent()));
 }
 
 #[test]
@@ -4464,22 +4500,20 @@ fn repeated_invalid_tool_arguments_are_coalesced() {
 #[test]
 fn command_and_output_highlighters_style_key_parts() {
     let command = command_spans("cargo test -p squeezy-tui");
-    assert_eq!(command[0].style.fg, Some(GOLD));
+    assert_eq!(command[0].style.fg, Some(crate::render::theme::secondary()));
     assert!(
-        command
-            .iter()
-            .any(|span| span.content.as_ref() == "-p" && span.style.fg == Some(AMBER)),
+        command.iter().any(|span| span.content.as_ref() == "-p"
+            && span.style.fg == Some(crate::render::theme::accent())),
         "{command:?}"
     );
 
     let ansi = ansi_spans("\u{1b}[32mok\u{1b}[0m error");
-    assert_eq!(ansi[0].style.fg, Some(Color::Green));
+    assert_eq!(ansi[0].style.fg, Some(ratatui::style::Color::Green));
 
     let keyword = keyword_spans("public class Foo { return ok; }");
     assert!(
-        keyword
-            .iter()
-            .any(|span| span.content.as_ref() == "class" && span.style.fg == Some(GOLD)),
+        keyword.iter().any(|span| span.content.as_ref() == "class"
+            && span.style.fg == Some(crate::render::theme::secondary())),
         "{keyword:?}"
     );
 }
@@ -4489,7 +4523,7 @@ fn ansi_passthrough_renders_colors() {
     let line = render::ansi::ansi_to_line("\u{1b}[32mhello\u{1b}[0m world");
 
     assert_eq!(line.spans[0].content.as_ref(), "hello");
-    assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+    assert_eq!(line.spans[0].style.fg, Some(ratatui::style::Color::Green));
 }
 
 #[test]
@@ -4646,12 +4680,12 @@ fn markdown_renders_heading_and_code() {
 #[test]
 fn markdown_colors_confidence_labels_after_em_dash() {
     let cases = [
-        ("exact_syntax", render::palette::SUCCESS_GREEN),
-        ("import_resolved", render::palette::AMBER),
-        ("candidate_set", render::palette::GOLD),
-        ("external", render::palette::QUIET),
-        ("unknown", render::palette::QUIET),
-        ("label_missing", render::palette::ERROR_RED),
+        ("exact_syntax", crate::render::theme::green()),
+        ("import_resolved", crate::render::theme::accent()),
+        ("candidate_set", crate::render::theme::secondary()),
+        ("external", crate::render::theme::quiet()),
+        ("unknown", crate::render::theme::quiet()),
+        ("label_missing", crate::render::theme::red()),
     ];
     for (label, expected) in cases {
         let lines = render::markdown::render_markdown(&format!(
@@ -4675,7 +4709,7 @@ fn markdown_colors_confidence_labels_in_brackets() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "candidate_set")
         .expect("bracketed label should render its own span");
-    assert_eq!(span.style.fg, Some(render::palette::GOLD));
+    assert_eq!(span.style.fg, Some(crate::render::theme::secondary()));
 }
 
 #[test]
@@ -4688,7 +4722,7 @@ fn markdown_leaves_identifier_lookalikes_uncoloured() {
     // identifier inside a code span.
     let any_styled_label = lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
         span.content.as_ref() == "exact_syntax"
-            && span.style.fg == Some(render::palette::SUCCESS_GREEN)
+            && span.style.fg == Some(crate::render::theme::green())
     });
     assert!(
         !any_styled_label,
@@ -5090,17 +5124,18 @@ fn render_uses_two_line_status_footer() {
 
     let output = render_to_string(&app, 140, 18);
     assert!(output.contains("Squeezy v"), "{output}");
-    // model/provider used to ride in the banner; it moved to the live
-    // status line (`provider-and-model` item) so changing models surfaces
-    // without a restart. This test now exercises the footer rows only.
-    assert!(output.contains("dir "), "{output}");
+    // model/provider used to ride in the banner; it now comes from the
+    // default status-line detail row so changing models surfaces without a
+    // restart.
+    assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("feature"), "{output}");
     assert!(
         output.contains("Build mode (Shift+Tab to cycle)"),
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Up/Down menu/history"), "{output}");
+    assert!(output.contains("Up/Down menu"), "{output}");
+    assert!(output.contains("Alt+Up/Down history"), "{output}");
 }
 
 #[test]
@@ -5115,7 +5150,7 @@ fn status_footer_sits_directly_below_prompt_area() {
         .expect("prompt cursor");
     let status_line = lines
         .iter()
-        .position(|line| line.contains("dir "))
+        .position(|line| line.contains("scripted:gpt-test"))
         .expect("status line");
     let help_line = lines
         .iter()
@@ -5202,13 +5237,13 @@ fn compact_viewport_hides_attachment_panel_before_prompt_footer() {
 }
 
 #[test]
-fn auto_mode_is_default_terminal_model() {
+fn auto_mode_uses_alternate_screen_to_avoid_inline_cursor_probe() {
     let config = test_config(SessionMode::Build);
 
     assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
     assert_eq!(
         TerminalMode::from(config.tui.alternate_screen),
-        TerminalMode::Inline
+        TerminalMode::AlternateScreen
     );
     assert_eq!(
         TerminalMode::from(TuiAlternateScreen::Never),
@@ -5445,7 +5480,10 @@ fn assistant_marker_uses_answer_color() {
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "●");
-    assert_eq!(lines[0].spans[1].style.fg, Some(SUCCESS_GREEN));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(crate::render::theme::green())
+    );
     assert_eq!(lines[0].spans[3].content.as_ref(), "done");
     assert_eq!(
         lines.last().expect("trailing blank").spans.len(),
@@ -5467,7 +5505,10 @@ fn failed_assistant_marker_uses_error_color() {
     let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "●");
-    assert_eq!(lines[0].spans[1].style.fg, Some(ERROR_RED));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(crate::render::theme::red())
+    );
 }
 
 #[test]
@@ -5493,32 +5534,56 @@ accuracy=provider token counters are provider-reported when available.";
     };
 
     // Header still renders the `• Noted` chrome plus the bolded
-    // "Cost accounting" body, in GOLD.
+    // "Cost accounting" body, in crate::render::theme::secondary().
     let header_style = span_for(&lines[0], "Cost accounting");
-    assert_eq!(header_style.fg, Some(GOLD));
+    assert_eq!(header_style.fg, Some(crate::render::theme::secondary()));
     assert!(header_style.add_modifier.contains(Modifier::BOLD));
 
     // `session=` is the dim label, `abc` is the bright value.
     let session_line = &lines[1];
-    assert_eq!(span_for(session_line, "session=").fg, Some(QUIET));
+    assert_eq!(
+        span_for(session_line, "session=").fg,
+        Some(crate::render::theme::quiet())
+    );
     assert_eq!(span_for(session_line, "abc").fg, None);
 
-    // The dollar amount pops in AMBER; the trailing parenthetical fades.
+    // The dollar amount pops in crate::render::theme::accent(); the trailing parenthetical fades.
     let usd_line = &lines[3];
-    assert_eq!(span_for(usd_line, "estimated_usd=").fg, Some(QUIET));
-    assert_eq!(span_for(usd_line, "$0.415300").fg, Some(AMBER));
-    assert_eq!(span_for(usd_line, "(estimated").fg, Some(QUIET));
+    assert_eq!(
+        span_for(usd_line, "estimated_usd=").fg,
+        Some(crate::render::theme::quiet())
+    );
+    assert_eq!(
+        span_for(usd_line, "$0.415300").fg,
+        Some(crate::render::theme::accent())
+    );
+    assert_eq!(
+        span_for(usd_line, "(estimated").fg,
+        Some(crate::render::theme::quiet())
+    );
 
     // Zero / dash values fade so real numbers carry the eye.
     let tokens_line = &lines[4];
-    assert_eq!(span_for(tokens_line, "provider_tokens").fg, Some(GOLD));
+    assert_eq!(
+        span_for(tokens_line, "provider_tokens").fg,
+        Some(crate::render::theme::secondary())
+    );
     assert_eq!(span_for(tokens_line, "1200").fg, None);
-    assert_eq!(span_for(tokens_line, "-").fg, Some(QUIET));
-    assert_eq!(span_for(tokens_line, "0").fg, Some(QUIET));
+    assert_eq!(
+        span_for(tokens_line, "-").fg,
+        Some(crate::render::theme::quiet())
+    );
+    assert_eq!(
+        span_for(tokens_line, "0").fg,
+        Some(crate::render::theme::quiet())
+    );
 
-    // The leading group word on tool rows is GOLD.
+    // The leading group word on tool rows is crate::render::theme::secondary().
     let tools_line = &lines[5];
-    assert_eq!(span_for(tools_line, "tools").fg, Some(GOLD));
+    assert_eq!(
+        span_for(tools_line, "tools").fg,
+        Some(crate::render::theme::secondary())
+    );
     assert_eq!(span_for(tools_line, "4").fg, None);
 
     // The accuracy epilogue is wholly dimmed.
@@ -5528,7 +5593,7 @@ accuracy=provider token counters are provider-reported when available.";
             .spans
             .iter()
             .all(|span| span.style.fg.is_none()
-                || span.style.fg == Some(QUIET)
+                || span.style.fg == Some(crate::render::theme::quiet())
                 || span.content.as_ref().chars().all(char::is_whitespace)),
         "{accuracy_line:?}"
     );
@@ -5664,11 +5729,11 @@ fn working_shimmer_sweeps_left_to_right() {
     let right_foregrounds = right.iter().map(|span| span.style.fg).collect::<Vec<_>>();
 
     assert!(
-        left_foregrounds.contains(&Some(WORKING_SHIMMER_HIGHLIGHT)),
+        left_foregrounds.contains(&Some(crate::render::theme::shimmer())),
         "{left_foregrounds:?}"
     );
     assert!(
-        right_foregrounds.contains(&Some(WORKING_SHIMMER_HIGHLIGHT)),
+        right_foregrounds.contains(&Some(crate::render::theme::shimmer())),
         "{right_foregrounds:?}"
     );
     assert!(left.iter().all(|span| span.style.bg.is_none()));
@@ -5702,13 +5767,13 @@ fn working_shimmer_changes_rendered_cells_across_ticks() {
     assert!(
         first
             .iter()
-            .any(|(fg, bg, _)| *fg != AMBER && *bg == Color::Reset),
+            .any(|(fg, bg, _)| *fg != crate::render::theme::accent() && *bg == Color::Reset),
         "{first:?}"
     );
     assert!(
         second
             .iter()
-            .any(|(fg, bg, _)| *fg != AMBER && *bg == Color::Reset),
+            .any(|(fg, bg, _)| *fg != crate::render::theme::accent() && *bg == Color::Reset),
         "{second:?}"
     );
     assert_ne!(
@@ -6018,14 +6083,20 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         message_outcome(&app.transcript, 0),
     );
     // Open bubble: lines[0] = bullet + content text.
-    assert_eq!(user_lines[0].spans[1].style.fg, Some(AMBER));
+    assert_eq!(
+        user_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::accent())
+    );
     assert!(
         user_lines[0].spans[1].content.ends_with(' '),
         "{:?}",
         user_lines[0].spans[1].content
     );
     assert_eq!(user_lines[0].spans[2].content.as_ref(), "hi");
-    assert_eq!(user_lines[0].spans[2].style.fg, Some(Color::White));
+    assert_eq!(
+        user_lines[0].spans[2].style.fg,
+        Some(crate::render::theme::foreground())
+    );
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -6033,8 +6104,14 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 1),
     );
-    assert_eq!(log_lines[0].spans[1].style.fg, Some(ERROR_RED));
-    assert_eq!(log_lines[0].spans[2].style.fg, Some(QUIET));
+    assert_eq!(
+        log_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::red())
+    );
+    assert_eq!(
+        log_lines[0].spans[2].style.fg,
+        Some(crate::render::theme::muted())
+    );
 }
 
 #[test]
@@ -6049,14 +6126,20 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .collect::<String>();
 
     // Open bubble: lines[0].spans = [indent "  ", bullet (phase + space), text]
-    assert_eq!(lines[0].spans[1].style.fg, Some(AMBER));
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(crate::render::theme::accent())
+    );
     assert!(
         lines[0].spans[1].content.ends_with(' '),
         "{:?}",
         lines[0].spans[1].content
     );
     assert_eq!(lines[0].spans[2].content.as_ref(), "find getFoo");
-    assert_eq!(lines[0].spans[2].style.fg, Some(Color::White));
+    assert_eq!(
+        lines[0].spans[2].style.fg,
+        Some(crate::render::theme::foreground())
+    );
 }
 
 #[test]
@@ -6076,8 +6159,8 @@ fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
         .find(|span| span.content.as_ref() == "ls")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
 }
 
 #[test]
@@ -6097,14 +6180,14 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
         .find(|span| span.content.as_ref() == "ls")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
 }
 
 #[test]
 fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
     // `!!cmd` runs locally but skips the LLM context (F01). Both bangs
-    // need to glow `BANG_RED` so the user can tell quiet bangs apart from
+    // need to glow `crate::render::theme::red()` so the user can tell quiet bangs apart from
     // the regular single-bang at a glance.
     let item = TranscriptItem::user("  !!git status");
 
@@ -6120,8 +6203,8 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
         .find(|span| span.content.as_ref() == "git status")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
     assert!(
         lines[1]
             .spans
@@ -6148,8 +6231,8 @@ fn live_double_bang_prompt_marks_both_bangs_dark_red() {
         .find(|span| span.content.as_ref() == "git status")
         .expect("command body span");
 
-    assert_eq!(bang.style.fg, Some(BANG_RED));
-    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(bang.style.fg, Some(crate::render::theme::red()));
+    assert_eq!(rest.style.fg, Some(crate::render::theme::foreground()));
 }
 
 #[test]
@@ -8313,13 +8396,10 @@ async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
 
 // ---- /theme palette switch ----
 
-/// `/theme dark` and `/theme light` flip the runtime palette override and
-/// mirror the choice into the agent's config so a settings-screen open
-/// reflects the new value.
+/// `/theme dark` is a backwards-compatible alias for the bundled default
+/// theme and mirrors the choice into the agent's config.
 #[tokio::test]
-async fn slash_theme_dark_flips_palette_and_config() {
-    use crate::render::palette;
-
+async fn slash_theme_dark_selects_default_theme_and_config() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     // Point settings writes at a tempfile so the test never touches HOME.
@@ -8329,23 +8409,18 @@ async fn slash_theme_dark_flips_palette_and_config() {
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme dark").await;
     assert!(ran, "/theme dark should dispatch");
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::Dark
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
+    assert_eq!(agent.config_snapshot().tui.theme, "default");
     let saved = std::fs::read_to_string(&settings_path).expect("settings file written");
     assert!(
-        saved.contains("theme = \"dark\""),
+        saved.contains("theme = \"default\""),
         "settings.toml should record the theme; got {saved}"
     );
 }
 
-/// `/theme light` flips the override to the light tone.
+/// `/theme light` is a backwards-compatible alias for the brighter builtin.
 #[tokio::test]
-async fn slash_theme_light_flips_palette() {
-    use crate::render::palette;
-
+async fn slash_theme_light_selects_bright_theme() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_light");
@@ -8353,55 +8428,45 @@ async fn slash_theme_light_flips_palette() {
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme light").await;
     assert!(ran);
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::Light
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "bright");
+    assert_eq!(agent.config_snapshot().tui.theme, "bright");
 }
 
-/// `/theme system` clears the override so terminal detection wins again.
+/// `/theme system` is a backwards-compatible alias for the bundled default.
 #[tokio::test]
-async fn slash_theme_system_clears_override() {
-    use crate::render::palette;
-
+async fn slash_theme_system_selects_default_theme() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_system");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
-    // Pin to Dark first so the System branch has something visible to clear.
-    palette::set_palette_tone_override(Some(palette::PaletteTone::Dark));
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme light").await;
+    assert!(ran);
+    assert_eq!(crate::render::theme::current_theme_name(), "bright");
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
     assert!(ran);
-    // With the override cleared the visible tone is whichever the detector
-    // returns for the current process — we only assert that the override
-    // really was reset back to the detector's value.
-    assert_eq!(palette::palette_tone(), palette::detected_palette_tone());
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::System
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
+    assert_eq!(agent.config_snapshot().tui.theme, "default");
 }
 
 /// Unknown sub-arguments don't mutate anything — the user sees a usage hint
 /// instead of a silent tone change.
 #[tokio::test]
 async fn slash_theme_unknown_value_does_not_change_palette() {
-    use crate::render::palette;
-
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_bad");
     let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
-    let before_tone = palette::palette_tone();
+    let before_theme_name = crate::render::theme::current_theme_name();
     let before_theme = agent.config_snapshot().tui.theme;
     let ran = handle_slash_command(&mut app, &mut agent, "/theme zebra").await;
     assert!(ran);
-    assert_eq!(palette::palette_tone(), before_tone);
+    assert_eq!(
+        crate::render::theme::current_theme_name(),
+        before_theme_name
+    );
     assert_eq!(agent.config_snapshot().tui.theme, before_theme);
     assert!(
         app.status.contains("unknown theme"),
@@ -8410,32 +8475,25 @@ async fn slash_theme_unknown_value_does_not_change_palette() {
     );
 }
 
-/// Bare `/theme` (no sub-arg) shows usage — used to remind the user of the
-/// allowed values without forcing them to open the config screen.
+/// Bare `/theme` opens the config screen focused on Themes, matching `/model`
+/// and the other no-argument config shortcuts.
 #[tokio::test]
-async fn slash_theme_without_arg_shows_usage() {
+async fn slash_theme_without_arg_opens_theme_config_section() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    let dir = temp_workspace("theme_usage");
-    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme").await;
     assert!(ran);
-    assert!(
-        app.status.starts_with("usage:") && app.status.contains("/theme"),
-        "expected usage hint, got: {}",
-        app.status
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Themes
     );
 }
 
-/// `/theme catppuccin` pins the Dark tone *and* flips the accent variant
-/// so the working-shimmer and prompt cursor render in mauve. Verifies that
-/// each named theme drives both the tone and the accent override — the two
-/// must move together or the result is a mismatched palette.
+/// `/theme catppuccin` selects the bundled mauve palette.
 #[tokio::test]
-async fn slash_theme_catppuccin_pins_dark_tone_and_mauve_accent() {
-    use crate::render::palette;
-
+async fn slash_theme_catppuccin_selects_mauve_theme() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_catppuccin");
@@ -8443,30 +8501,20 @@ async fn slash_theme_catppuccin_pins_dark_tone_and_mauve_accent() {
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme catppuccin").await;
     assert!(ran, "/theme catppuccin should dispatch");
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
-    assert_eq!(
-        palette::accent_variant(),
-        palette::AccentVariant::Catppuccin
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "catppuccin");
     assert_ne!(
-        palette::accent_primary(),
-        palette::AMBER,
+        crate::render::theme::rgb(crate::render::theme::token::PALETTE_ACCENT),
+        crate::render::theme::resolve_theme(&agent.config_snapshot(), "default")
+            .resolve(crate::render::theme::token::PALETTE_ACCENT)
+            .expect("default accent"),
         "catppuccin must override the amber default to the mauve accent",
     );
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::Catppuccin
-    );
+    assert_eq!(agent.config_snapshot().tui.theme, "catppuccin");
 }
 
-/// `/theme high-contrast` pins the Light tone with a bright accessibility
-/// accent. Validates the hyphenated-argument path users will type and that
-/// the accent override flips to HighContrast independently of `dark`/
-/// `light` so reverting via `/theme system` restores the default.
+/// `/theme high-contrast` selects the bundled high-contrast palette.
 #[tokio::test]
-async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
-    use crate::render::palette;
-
+async fn slash_theme_high_contrast_selects_builtin_theme() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("theme_hc");
@@ -8474,22 +8522,12 @@ async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
 
     let ran = handle_slash_command(&mut app, &mut agent, "/theme high-contrast").await;
     assert!(ran);
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
-    assert_eq!(
-        palette::accent_variant(),
-        palette::AccentVariant::HighContrast
-    );
-    assert_eq!(
-        agent.config_snapshot().tui.theme,
-        squeezy_core::TuiTheme::HighContrast,
-    );
+    assert_eq!(crate::render::theme::current_theme_name(), "high-contrast");
+    assert_eq!(agent.config_snapshot().tui.theme, "high-contrast");
 
-    // Reverting clears both overrides so the next session paints the
-    // detector-derived tone with the amber/gold default again.
     let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
     assert!(ran);
-    assert_eq!(palette::accent_variant(), palette::AccentVariant::Default);
-    assert_eq!(palette::accent_primary(), palette::AMBER);
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
 }
 
 /// Regression for `squeezy-ramu`: when the eval harness pins a settings
@@ -8500,7 +8538,6 @@ async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
 /// operator's real config mid-run.
 #[tokio::test]
 async fn tui_harness_settings_override_pins_theme_writes_to_scratch() {
-    use crate::render::palette;
     use crate::testing::TuiHarness;
 
     let dir = temp_workspace("ramu_harness_override");
@@ -8544,13 +8581,13 @@ async fn tui_harness_settings_override_pins_theme_writes_to_scratch() {
         handle_slash_command(app, agent, "/theme dark").await
     };
     assert!(ran, "/theme dark should dispatch");
-    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    assert_eq!(crate::render::theme::current_theme_name(), "default");
 
     // Scratch file got the override; the env-pointed "home" file did
     // NOT — that's the whole point of the fix.
     let saved = std::fs::read_to_string(&scratch_settings).expect("scratch settings file written");
     assert!(
-        saved.contains("theme = \"dark\""),
+        saved.contains("theme = \"default\""),
         "scratch should record the theme; got {saved}",
     );
     assert!(
@@ -8726,10 +8763,12 @@ impl ScopedSettingsPath {
         let lock = THEME_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Start every theme test from a known palette state — even if a
-        // previous test left an override behind.
-        crate::render::palette::set_palette_tone_override(None);
-        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
+        // Start every theme test from a known runtime theme — even if a
+        // previous test left the process-global theme snapshot behind.
+        let mut default_cfg = squeezy_core::AppConfig::default();
+        default_cfg.tui.theme = "default".to_string();
+        default_cfg.tui.themes.clear();
+        crate::render::theme::set_active_theme(&default_cfg);
         let previous = std::env::var_os("SQUEEZY_SETTINGS_PATH");
         // SAFETY: the global mutex above ensures no other theme test is
         // mutating this env var at the same time.
@@ -8748,8 +8787,10 @@ impl Drop for ScopedSettingsPath {
             Some(value) => unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", value) },
             None => unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") },
         }
-        crate::render::palette::set_palette_tone_override(None);
-        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
+        let mut default_cfg = squeezy_core::AppConfig::default();
+        default_cfg.tui.theme = "default".to_string();
+        default_cfg.tui.themes.clear();
+        crate::render::theme::set_active_theme(&default_cfg);
     }
 }
 
@@ -9226,7 +9267,7 @@ fn slash_parameter_hint_uses_status_model_color() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/attach".to_string());
 
-    let lines = slash_suggestion_lines(&app);
+    let lines = slash_suggestion_lines(&app, 120);
     let attach_line = lines
         .iter()
         .find(|line| line.spans.iter().any(|span| span.content == "/attach"))
@@ -9236,20 +9277,20 @@ fn slash_parameter_hint_uses_status_model_color() {
         .iter()
         .find(|span| span.content.contains("attach a file as prompt context"))
         .expect("attach description span");
-    let hint_span = attach_line
-        .spans
+    let hint_span = lines
         .iter()
+        .flat_map(|line| line.spans.iter())
         .find(|span| span.content.trim() == "<path>")
         .expect("attach parameter hint span");
 
     assert_eq!(
         description_span.style.fg,
-        Some(QUIET),
+        Some(crate::render::theme::quiet()),
         "description color should stay unchanged"
     );
     assert_eq!(
         hint_span.style.fg,
-        Some(crate::render::palette::ACCENT_CYAN),
+        Some(crate::render::theme::cyan()),
         "parameter hints should render with the status-line model color"
     );
 }
@@ -9942,22 +9983,37 @@ fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
         );
         let span = prompt_coin_span(&app);
         assert_eq!(span.content.as_ref(), "●");
-        assert_eq!(span.style.fg, Some(crate::render::palette::AMBER));
+        assert_eq!(span.style.fg, Some(crate::render::theme::accent()));
     }
 }
 
 #[test]
-fn status_line_unset_keeps_legacy_two_row_layout() {
+fn status_line_unset_uses_builtin_colored_detail_items() {
     let app = test_app(SessionMode::Build);
-    // No /statusline configured ⇒ row 2 is the hints line, not a detail
-    // line. Existing users see no visible change until they opt in.
+    // No /statusline configured means "use the built-in detail list" with
+    // colors enabled by default. Row 2 remains the hints line.
     let lines = format_status_lines(&app, 120);
     assert_eq!(lines.len(), 2);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row1.contains("scripted:gpt-test"),
+        "default detail row should include provider:model: {row1}"
+    );
     assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
     assert!(
         !row2.contains("openai:"),
         "row 2 should not include the detail line: {row2}"
+    );
+    let provider_span = lines[0]
+        .spans
+        .iter()
+        .find(|s| s.content.contains("scripted:gpt-test"))
+        .expect("provider span");
+    assert_eq!(
+        provider_span.style.fg,
+        Some(crate::render::theme::cyan()),
+        "unset status_line should still use the default colored detail row"
     );
 }
 
@@ -9996,7 +10052,7 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
         .expect("provider span");
     assert_eq!(
         provider_span.style.fg,
-        Some(crate::render::palette::ACCENT_CYAN),
+        Some(crate::render::theme::cyan()),
         "provider-and-model should paint with the Model accent (cyan)"
     );
 }
@@ -10024,12 +10080,12 @@ fn status_line_languages_use_squeezy_amber() {
 
     assert_eq!(
         language_span.style.fg,
-        Some(AMBER),
+        Some(crate::render::theme::accent()),
         "languages should use Squeezy's darker brand accent"
     );
     assert_eq!(
         dir_span.style.fg,
-        Some(crate::render::palette::ACCENT_GREEN),
+        Some(crate::render::theme::green()),
         "other path-family status items should keep their existing color"
     );
 }
