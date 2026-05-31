@@ -203,6 +203,41 @@ fn default_policy_prunes_well_known_directories_at_dir_level() {
 }
 
 #[test]
+fn generated_file_name_patterns_are_classified_as_generated() {
+    let root = temp_root("generated_file_name_patterns_are_classified_as_generated");
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Empty content so classification must come from the filename, not the
+    // `// @generated` content marker.
+    let cases = [
+        "src/Bindings.generated.rs",
+        "src/api.pb.go",
+        "src/R.generated.swift",
+        "src/widget.g.dart",
+        "src/model.freezed.dart",
+        "src/router.gr.dart",
+    ];
+    for path in cases {
+        fs::write(root.join(path), "").unwrap();
+    }
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    for path in cases {
+        assert!(
+            snapshot.excluded.iter().any(|file| {
+                file.relative_path == path
+                    && file.reason == ExclusionReason::Generated
+                    && !file.is_dir
+            }),
+            "{path} should be excluded as Generated: {:?}",
+            snapshot.excluded
+        );
+    }
+}
+
+#[test]
 fn policy_include_classes_re_enables_lockfile_indexing() {
     let root = temp_root("policy_include_classes_re_enables_lockfile_indexing");
     fs::create_dir_all(root.join("vendor/allowed")).unwrap();

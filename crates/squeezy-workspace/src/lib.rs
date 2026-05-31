@@ -1099,7 +1099,13 @@ fn default_path_reason(relative_path: &str, is_dir: bool) -> Option<ExclusionRea
     if is_lockfile_name(&name) {
         return Some(ExclusionReason::Lockfile);
     }
-    if name.ends_with(".generated.rs") || name.ends_with(".pb.go") {
+    if name.ends_with(".generated.rs")
+        || name.ends_with(".pb.go")
+        || name.ends_with(".generated.swift")
+        || name.ends_with(".g.dart")
+        || name.ends_with(".freezed.dart")
+        || name.ends_with(".gr.dart")
+    {
         return Some(ExclusionReason::Generated);
     }
     if is_binary_extension(&name) {
