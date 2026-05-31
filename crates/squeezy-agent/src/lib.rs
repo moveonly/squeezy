@@ -5257,7 +5257,7 @@ impl TurnRuntime {
             .expect("routing state lock")
             .sticky
             .tick();
-        let decision = turn_router::classify_turn(
+        let classify_result = turn_router::classify_turn(
             turn_router::ClassifyTurnInputs {
                 user_input: &task_title,
                 provider: &self.provider,
@@ -5271,6 +5271,28 @@ impl TurnRuntime {
             self.cancel.clone(),
         )
         .await;
+        let decision = classify_result.decision;
+        let judge_cost = classify_result.judge_cost;
+        // Fold the judge call's spend into the broker so its tokens
+        // count against `max_session_cost_usd_micros` and surface in
+        // the turn's provider cost — that's the bill the provider
+        // already sent over the wire. Stamp the same number into
+        // `routing_judge_usd_micros` so the audit field shows the
+        // judge's share separately from the main turn's request.
+        // `record_provider_cost` may return a warning status; we
+        // discard it here so the routing layer never emits the
+        // session-cap warning event itself — the main turn's later
+        // `record_provider_cost` will fire the warning if applicable.
+        if judge_cost.estimated_usd_micros.is_some()
+            || judge_cost.input_tokens.is_some()
+            || judge_cost.output_tokens.is_some()
+        {
+            let _ = broker.record_provider_cost(&judge_cost);
+            broker.metrics.routing_judge_usd_micros = judge_cost
+                .estimated_usd_micros
+                .unwrap_or(0)
+                .saturating_add(broker.metrics.routing_judge_usd_micros);
+        }
         let mut current_model: Arc<str> = match &decision {
             turn_router::TurnRoutingDecision::Cheap { model, .. } => model.clone(),
             turn_router::TurnRoutingDecision::Parent => parent_model.clone(),
@@ -5326,6 +5348,7 @@ impl TurnRuntime {
                 )
             });
             if let Some(status) = cap_status {
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(
                     TaskStateStatus::Failed,
                     Some(format_cap_reached_reason(status)),
@@ -5489,6 +5512,7 @@ impl TurnRuntime {
                         round_output_bytes,
                     )
                     .await;
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.finish_cancelled_turn(
                         &task_title,
                         &total_cost,
@@ -5696,6 +5720,7 @@ impl TurnRuntime {
                             round_output_bytes,
                         )
                         .await;
+                        self.stamp_routing_savings(&mut broker.metrics);
                         self.finish_cancelled_turn(
                             &task_title,
                             &total_cost,
@@ -5734,6 +5759,7 @@ impl TurnRuntime {
                 let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
                     &raw_assistant_text,
                 ));
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -5783,6 +5809,7 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
                         Some("response truncated by max_tokens".to_string()),
@@ -5808,6 +5835,7 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
                         Some("context window exceeded".to_string()),
@@ -5833,6 +5861,7 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
                         Some("model refused the request".to_string()),
@@ -5969,6 +5998,7 @@ impl TurnRuntime {
                 let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
                     &raw_assistant_text,
                 ));
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -6043,6 +6073,7 @@ impl TurnRuntime {
                 .await
             };
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
+                self.stamp_routing_savings(&mut broker.metrics);
                 self.finish_cancelled_turn(
                     &task_title,
                     &total_cost,
@@ -6317,6 +6348,24 @@ impl TurnRuntime {
         // Stop fires after telemetry persistence so audit handlers
         // see the final TurnMetrics already on disk.
         self.dispatch_stop();
+    }
+
+    /// Stamp `routing_estimated_savings_usd_micros` on a turn's
+    /// metrics just before they are emitted to the TUI / telemetry /
+    /// session metrics. No-op for non-routed turns or when either
+    /// model lacks a pricing entry in the registry. Called at every
+    /// terminal-state site in the main turn loop so the event the
+    /// user sees, the cumulative session counter, and the telemetry
+    /// stream agree on the savings figure.
+    fn stamp_routing_savings(&self, metrics: &mut TurnMetrics) {
+        if !metrics.routed_to_cheap {
+            return;
+        }
+        metrics.routing_estimated_savings_usd_micros = turn_router::estimate_routing_savings(
+            self.provider.name(),
+            &self.config.model,
+            &metrics.provider,
+        );
     }
 
     async fn persist_turn_state(&self, input: TurnPersistInput<'_>) {

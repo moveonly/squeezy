@@ -1,8 +1,12 @@
 use squeezy_core::{
-    DEFAULT_ROUTING_HEURISTIC_MAX_CHARS, DEFAULT_ROUTING_JUDGE_MAX_CHARS, RoutingConfig,
+    CostSnapshot, DEFAULT_ROUTING_HEURISTIC_MAX_CHARS, DEFAULT_ROUTING_JUDGE_MAX_CHARS,
+    RoutingConfig,
 };
 
-use super::{EscalationReason, EscalationState, contains_refusal_phrase, heuristic_slam_dunk};
+use super::{
+    EscalationReason, EscalationState, contains_refusal_phrase, estimate_routing_savings,
+    heuristic_slam_dunk,
+};
 
 fn default_routing_config() -> RoutingConfig {
     RoutingConfig {
@@ -387,4 +391,59 @@ fn count_sentences_handles_terminators() {
     assert_eq!(super::count_sentences("run cargo test. then commit."), 2);
     assert_eq!(super::count_sentences("first. second. third."), 3);
     assert_eq!(super::count_sentences("first? then second!"), 2);
+}
+
+// -- Routing savings math --------------------------------------------------
+
+fn cost_with(input_tokens: u64, output_tokens: u64) -> CostSnapshot {
+    CostSnapshot {
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
+        estimated_usd_micros: squeezy_llm::estimate_cost(
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            &CostSnapshot {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn estimate_routing_savings_returns_positive_when_both_priced() {
+    let cheap_cost = cost_with(10_000, 1_000);
+    let savings = estimate_routing_savings("anthropic", "claude-opus-4-7", &cheap_cost);
+    assert!(
+        savings > 0,
+        "running cheap cost on Opus rates must cost more than Haiku, savings={savings}",
+    );
+}
+
+#[test]
+fn estimate_routing_savings_returns_zero_when_parent_unpriced() {
+    let cheap_cost = cost_with(10_000, 1_000);
+    // Bogus model id has no registry entry, so estimate_cost returns None.
+    let savings = estimate_routing_savings("anthropic", "nonexistent-parent-model", &cheap_cost);
+    assert_eq!(savings, 0);
+}
+
+#[test]
+fn estimate_routing_savings_returns_zero_when_provider_unknown() {
+    let cheap_cost = cost_with(10_000, 1_000);
+    let savings = estimate_routing_savings("nonexistent-provider", "claude-opus-4-7", &cheap_cost);
+    assert_eq!(savings, 0);
+}
+
+#[test]
+fn estimate_routing_savings_zero_when_actual_already_above_parent_estimate() {
+    // Degenerate case: cheap turn somehow billed more than parent
+    // would have. saturating_sub keeps the result non-negative; we
+    // expect 0 rather than panic / wrap-around.
+    let mut cheap_cost = cost_with(10, 0);
+    cheap_cost.estimated_usd_micros = Some(u64::MAX); // pretend cheap cost is enormous
+    let savings = estimate_routing_savings("anthropic", "claude-opus-4-7", &cheap_cost);
+    assert_eq!(savings, 0);
 }

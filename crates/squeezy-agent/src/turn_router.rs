@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use squeezy_core::{AppConfig, ReasoningEffort, RoutingConfig};
-use squeezy_llm::{CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_core::{AppConfig, CostSnapshot, ReasoningEffort, RoutingConfig};
+use squeezy_llm::{CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
 
 use crate::cheap_model_for;
@@ -321,66 +321,120 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub sticky: bool,
 }
 
+/// Result of classifying a single turn. Carries the routing decision
+/// plus any cost the LLM judge actually billed — zero `CostSnapshot`
+/// when the heuristic fired, the judge was disabled, the prompt fell
+/// outside `judge_max_chars`, or the judge call errored before
+/// emitting a `Completed` event.
+pub(crate) struct ClassifyResult {
+    pub decision: TurnRoutingDecision,
+    pub judge_cost: CostSnapshot,
+}
+
+impl ClassifyResult {
+    fn parent() -> Self {
+        Self {
+            decision: TurnRoutingDecision::Parent,
+            judge_cost: CostSnapshot::default(),
+        }
+    }
+
+    fn cheap(reason: CheapReason, model: Arc<str>) -> Self {
+        Self {
+            decision: TurnRoutingDecision::Cheap { reason, model },
+            judge_cost: CostSnapshot::default(),
+        }
+    }
+}
+
 pub(crate) async fn classify_turn(
     inputs: ClassifyTurnInputs<'_>,
     cancel: CancellationToken,
-) -> TurnRoutingDecision {
+) -> ClassifyResult {
     let cfg = &inputs.config.routing;
 
     if inputs.overrides.force_parent {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
     // The master switch (config or `/router off`) gates implicit
     // routing but never blocks an explicit `/cheap` request.
     let auto_disabled = inputs.overrides.session_disabled || !cfg.auto_cheap;
     if auto_disabled && !inputs.overrides.force_cheap {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
     if inputs.sticky {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
     if inputs.has_image_input && cfg.bypass_for_images {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
 
     let Some(cheap) = cheap_model_for(inputs.provider_name, inputs.config) else {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     };
     if cheap == inputs.parent_model {
         // Routing to the same model would be a no-op — skip the
         // classifier and the judge call entirely.
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
     let cheap: Arc<str> = Arc::from(cheap);
 
     if inputs.overrides.force_cheap {
-        return TurnRoutingDecision::Cheap {
-            reason: CheapReason::UserExplicit,
-            model: cheap,
-        };
+        return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
     }
 
     if let Some(rule) = heuristic_slam_dunk(inputs.user_input, cfg) {
-        return TurnRoutingDecision::Cheap {
-            reason: CheapReason::HeuristicSlamDunk(rule),
-            model: cheap,
-        };
+        return ClassifyResult::cheap(CheapReason::HeuristicSlamDunk(rule), cheap);
     }
 
     if !cfg.auto_cheap_llm_judge {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
     let prompt_chars = inputs.user_input.chars().count() as u32;
     if prompt_chars == 0 || prompt_chars > cfg.judge_max_chars {
-        return TurnRoutingDecision::Parent;
+        return ClassifyResult::parent();
     }
-    match run_judge(inputs.provider, &cheap, inputs.user_input, cancel).await {
-        Some(true) => TurnRoutingDecision::Cheap {
-            reason: CheapReason::LlmJudge,
-            model: cheap,
+    let (verdict, judge_cost) = run_judge(
+        inputs.provider,
+        inputs.provider_name,
+        &cheap,
+        inputs.user_input,
+        cancel,
+    )
+    .await;
+    match verdict {
+        Some(true) => ClassifyResult {
+            decision: TurnRoutingDecision::Cheap {
+                reason: CheapReason::LlmJudge,
+                model: cheap,
+            },
+            judge_cost,
         },
-        _ => TurnRoutingDecision::Parent,
+        _ => ClassifyResult {
+            decision: TurnRoutingDecision::Parent,
+            judge_cost,
+        },
     }
+}
+
+/// Estimate the savings of running this turn on the cheap tier
+/// instead of the parent model. Re-prices the actual provider-reported
+/// `cost` (token counts) at the parent's per-Mtok rate via the same
+/// `squeezy_llm::estimate_cost` helper the cap pre-flight uses, then
+/// subtracts the cheap-tier bill. Returns `0` when either side has no
+/// pricing entry in the registry — the field is best-effort.
+pub(crate) fn estimate_routing_savings(
+    provider: &str,
+    parent_model: &str,
+    actual_cheap_cost: &CostSnapshot,
+) -> u64 {
+    let Some(parent_estimate) =
+        squeezy_llm::estimate_cost(provider, parent_model, actual_cheap_cost)
+    else {
+        return 0;
+    };
+    let actual = actual_cheap_cost.estimated_usd_micros.unwrap_or(0);
+    parent_estimate.saturating_sub(actual)
 }
 
 const JUDGE_INSTRUCTIONS: &str = concat!(
@@ -400,10 +454,23 @@ const JUDGE_MAX_OUTPUT_TOKENS: u32 = 80;
 
 async fn run_judge(
     provider: &Arc<dyn LlmProvider>,
+    provider_name: &str,
     cheap_model: &Arc<str>,
     user_input: &str,
     cancel: CancellationToken,
-) -> Option<bool> {
+) -> (Option<bool>, CostSnapshot) {
+    // The judge's system prompt is static, so we mark the request for
+    // long-retention provider prompt caching keyed by the provider's
+    // short name. Anthropic plants a `cache_control` block on the
+    // system prompt, OpenAI Responses forwards `prompt_cache_key` +
+    // `prompt_cache_retention: 24h`, Bedrock plants a typed
+    // `CachePoint` block — the routing-judge prefix becomes a cache
+    // hit on every subsequent borderline turn within the retention
+    // window, which is the bulk of the judge's cost.
+    let cache = CacheSpec {
+        key: Some(format!("routing-judge-v1:{provider_name}")),
+        retention: CacheRetention::Long,
+    };
     let request = LlmRequest {
         model: cheap_model.clone(),
         instructions: Arc::from(JUDGE_INSTRUCTIONS.to_string()),
@@ -413,7 +480,7 @@ async fn run_judge(
         reasoning_effort: Some(ReasoningEffort::Low),
         previous_response_id: None,
         cache_key: None,
-        cache: CacheSpec::default(),
+        cache,
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -424,23 +491,33 @@ async fn run_judge(
     let mut stream = provider.stream_response(request, cancel.clone());
     let fetch = async {
         let mut text = String::new();
+        let mut cost = CostSnapshot::default();
         while let Some(event) = stream.next().await {
             match event {
                 Ok(LlmEvent::TextDelta(delta)) => text.push_str(&delta),
-                Ok(LlmEvent::Completed { .. }) => break,
+                Ok(LlmEvent::Completed {
+                    cost: completed_cost,
+                    ..
+                }) => {
+                    cost = completed_cost;
+                    break;
+                }
                 Ok(_) => continue,
-                Err(_) => return None,
+                Err(_) => return (None, CostSnapshot::default()),
             }
         }
-        Some(text)
+        (Some(text), cost)
     };
-    let raw = tokio::select! {
+    let (raw, cost) = tokio::select! {
         biased;
-        _ = cancel.cancelled() => return None,
-        _ = tokio::time::sleep(Duration::from_millis(JUDGE_TIMEOUT_MS)) => return None,
-        result = fetch => result?,
+        _ = cancel.cancelled() => return (None, CostSnapshot::default()),
+        _ = tokio::time::sleep(Duration::from_millis(JUDGE_TIMEOUT_MS)) => {
+            return (None, CostSnapshot::default());
+        }
+        result = fetch => result,
     };
-    parse_judge_reply(&raw)
+    let verdict = raw.and_then(|text| parse_judge_reply(&text));
+    (verdict, cost)
 }
 
 fn parse_judge_reply(raw: &str) -> Option<bool> {
