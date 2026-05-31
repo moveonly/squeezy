@@ -57,6 +57,15 @@ fn context_attachment_detection_handles_common_text_artifacts() {
 }
 
 #[test]
+fn context_attachment_detection_matches_large_stack_markers_case_insensitively() {
+    let text = format!("{}\nSTACK BACKTRACE:\n 0: foo\n", "prefix\n".repeat(1_024));
+    assert_eq!(
+        detect_context_attachment_kind(Some("panic.txt"), text.as_bytes(), Some(&text)),
+        ContextAttachmentKind::StackTrace
+    );
+}
+
+#[test]
 fn context_attachment_detection_routes_canonical_images_to_vision_kind() {
     // PNG magic bytes round-trip into the routable `Image` kind so
     // F18 paste/file attachments can fan into `LlmInputItem::Image`
@@ -1250,6 +1259,7 @@ fn wildcard_match_anchors_prefix_and_suffix_with_multiple_stars() {
     assert!(!wildcard_match("rm -rf /", "git *"));
     assert!(!wildcard_match("path:src/foo.txt", "path:*.rs"));
     assert!(!wildcard_match("ab", "a*b*c"));
+    assert!(!wildcard_match("acd", "a*c*cd"));
 }
 
 #[test]
@@ -1577,6 +1587,17 @@ read_roots = [{}]
     ))
     .expect_err("file roots must be rejected");
     assert!(format!("{file}").contains("not a directory"));
+
+    let sensitive = ShellSandboxConfig::from_settings(
+        Some(ShellSandboxSettings {
+            read_roots: Some(vec![ssh_root.display().to_string()]),
+            ..ShellSandboxSettings::default()
+        }),
+        "test",
+        &root,
+    )
+    .expect_err("workspace-sensitive roots must be rejected");
+    assert!(format!("{sensitive}").contains("inside sensitive path"));
 
     let duplicate = try_app_config(&format!(
         r#"
@@ -2252,6 +2273,7 @@ fn stream_redactor_emits_safe_prefix_only_after_tail_grows() {
     assert!(chunk.text.starts_with("hello world"));
 
     let tail = stream.finish();
+    assert_eq!(tail.text.len(), STREAM_TAIL_BYTES);
     let combined = format!("{}{}", chunk.text, tail.text);
     assert_eq!(combined.len(), "hello world".len() + padded.len());
 }
