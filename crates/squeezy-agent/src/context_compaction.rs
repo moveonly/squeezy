@@ -1484,7 +1484,7 @@ fn read_snapshot_from_result(
         .content
         .get("bytes_returned")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| content.len() as u64);
+        .unwrap_or(content.len() as u64);
     Some(StoredReadSnapshot {
         path,
         tool_name: seen.tool_name.clone(),

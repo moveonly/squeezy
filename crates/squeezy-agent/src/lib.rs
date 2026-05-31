@@ -10582,10 +10582,7 @@ fn is_graph_indexing_retryable_fallback(result: &ToolResult) -> bool {
     if result.status != ToolStatus::Success {
         return false;
     }
-    if !GRAPH_RETRYABLE_TOOL_NAMES
-        .iter()
-        .any(|name| *name == result.tool_name.as_str())
-    {
+    if !GRAPH_RETRYABLE_TOOL_NAMES.contains(&result.tool_name.as_str()) {
         return false;
     }
     let Some(fallback) = result.content.get("fallback") else {

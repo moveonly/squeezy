@@ -119,7 +119,7 @@ fn concurrent_provisioned_workspaces_isolated_under_drop() {
     // Simulate run A finishing first and triggering Drop.
     drop(ws_a);
     assert!(!file_a.exists(), "ws_a directory should be cleaned up");
-    let read_b = fs::read(&ws_b.path.join("qt_sinks.h"))
+    let read_b = fs::read(ws_b.path.join("qt_sinks.h"))
         .expect("ws_b file must still be readable after ws_a is dropped");
     assert_eq!(read_b, b"// B");
 

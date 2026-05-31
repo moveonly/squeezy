@@ -229,10 +229,7 @@ fn planner_graph_max_results_caps_above_realistic_subclass_fanout() {
     // in a Flutter app) reliably produce 15+ siblings. The cap must clear
     // that headroom by a wide margin so the planner doesn't silently
     // truncate the tail before the model ever sees it.
-    assert!(
-        PLANNER_GRAPH_MAX_RESULTS >= 32,
-        "planner cap regressed below 32: was {PLANNER_GRAPH_MAX_RESULTS}",
-    );
+    const { assert!(PLANNER_GRAPH_MAX_RESULTS >= 32) };
 }
 
 #[test]

@@ -8413,13 +8413,11 @@ async fn explore_subagent_emits_tool_progress_heartbeats_during_slow_first_round
             }
             AgentEvent::ToolProgress {
                 tool_name, call_id, ..
-            } if tool_name == "explore" && call_id == "call_explore_heartbeat" => {
-                // Only count heartbeats that fire after the SubagentStarted
-                // line so we are measuring the parent-side ticker, not a
-                // pre-start emission.
-                if subagent_started {
-                    explore_progress_count += 1;
-                }
+            } if tool_name == "explore"
+                && call_id == "call_explore_heartbeat"
+                && subagent_started =>
+            {
+                explore_progress_count += 1;
             }
             AgentEvent::SubagentCompleted { agent, .. } if agent == "explore" => {
                 subagent_completed = true;
