@@ -48,8 +48,8 @@ hand-graded against the ground truth captured in each scenario's
 | dart   | bloc_lint `_Listener` override classification | no_graph    |  6 | $0.0192 | 14/15 (93%)  | `target/eval/graph-vs-nograph-dart-realworld-no-graph-1780219693878` |
 | go     | spf13/cobra `*Command` setter scope audit    | with_graph  |  7 | $0.0257 | 17/17 (100%) | `target/eval/graph-vs-nograph-go-realworld-with-graph-1780218535992` |
 | go     | spf13/cobra `*Command` setter scope audit    | no_graph    |  5 | $0.0175 | 17/17 (100%) | `target/eval/graph-vs-nograph-go-realworld-no-graph-1780219184410` |
-| java   | gson `TypeAdapter` override audit            | with_graph  | 17 | n/a*    | 0/N (failed) | `target/eval/graph-vs-nograph-java-realworld-with-graph-1780219165874` |
-| java   | gson `TypeAdapter` override audit            | no_graph    |  0 | n/a*    | 0/N (failed) | `target/eval/graph-vs-nograph-java-realworld-no-graph-1780219172380` |
+| java   | gson `TypeAdapter` override audit            | with_graph  | 35 | $0.1020 | 18/18 (100%) | `target/eval/graph-vs-nograph-java-realworld-with-graph-1780222413962` |
+| java   | gson `TypeAdapter` override audit            | no_graph    | 34 | $0.0747 | 18/18 (100%) | `target/eval/graph-vs-nograph-java-realworld-no-graph-1780222672822` |
 | scala  | akka `RequiresMessageQueue` mailbox audit     | with_graph  | 30 | $0.0552 | 12/12 (100%) | `target/eval/smoke-scala-realworld/graph-vs-nograph-scala-realworld-with-graph-1780219137011` |
 | scala  | akka `RequiresMessageQueue` mailbox audit     | no_graph    | 49 | $0.0911 | 12/12 (100%) | `target/eval/smoke-scala-realworld/graph-vs-nograph-scala-realworld-no-graph-1780219769654` |
 | cpp    | spdlog `sink_it_` override audit             | both        | — | — | not yet run at n=1 | — |
@@ -61,14 +61,9 @@ hand-graded against the ground truth captured in each scenario's
 | swift  | RoutesBuilder HTTP-method extension audit    | both        | — | — | not yet run at n=1 | — |
 | php    | laravel Eloquent Relation concern audit      | both        | — | — | PHP scenario in flight | — |
 
-\* Java turns failed mid-run. The with-graph turn issued 17 tool calls
-then emitted a `turn_failed` event without a cost record; the no-graph
-turn delegated to the `explore` subagent and never returned. Both
-`run.json` totals show `$0.0000`.
-
 ## Headline finding
 
-At n=1 on the five languages that smoke-ran successfully:
+At n=1 on the six languages that smoke-ran successfully:
 
 - **scala** is the cleanest win for the graph half: 30 vs 49 tool calls
   (-39%) and $0.0552 vs $0.0911 (-39%) at identical 12/12 recall. The
@@ -86,19 +81,29 @@ At n=1 on the five languages that smoke-ran successfully:
   this Newtonsoft workspace, so the with-graph half effectively ran on
   grep + read_slice with the cost overhead of attempting graph tools
   first.
-- **java** failed on both sides. The with-graph half over-fanned-out
-  on `read_slice` after `repo_map` and crashed the turn; the no-graph
-  half delegated to a subagent that produced no answer.
+- **java** is a tie on recall (18/18 both sides) but the graph half
+  loses on cost: $0.1020 vs $0.0747 (+36%) at 35 vs 34 tool calls. The
+  with-graph half called `decl_search attribute=base:TypeAdapter
+  path=gson/src/main/java` and got 27 packets back — correct on
+  signal, but the response spilled to disk (~26 KB > inline budget)
+  and the suffix-or-fuzzy `path` filter pulled in `gson/src/test/`
+  classes the model still had to drop by hand. The model then issued
+  23 grep calls and 6 read_slices to confirm `read(JsonReader)` /
+  `write(JsonWriter, T)` overrides per candidate, which is exactly
+  what the no-graph half did directly without the graph round-trip.
+  This is structural for enumeration prompts where the answer needs
+  a per-row body check: graph names the candidates but doesn't
+  shortcut the body inspection grep already does cheaply.
 
-Per-variant aggregates (sum across the four langs where both sides
-completed — scala, dart, go, csharp):
+Per-variant aggregates (sum across the five langs where both sides
+completed — scala, dart, go, csharp, java):
 
 | variant     | total tool_calls | total cost | wins (recall) |
 |-------------|-----------------:|-----------:|---------------|
-| with_graph  | 72  | $0.1594 | 3/4 ties or wins (scala, dart, go); csharp regression |
-| no_graph    | 87  | $0.2002 | 4/4 ties or perfect (29/29 on csharp) |
+| with_graph  | 107 | $0.2614 | 4/5 ties or wins (scala, dart, go, java); csharp regression |
+| no_graph    | 121 | $0.2749 | 5/5 ties or perfect (29/29 on csharp, 18/18 on java) |
 
-Graph wins on aggregate cost (-20%) and matches or beats no-graph on
+Graph wins on aggregate cost (-5%) and matches or beats no-graph on
 recall everywhere except csharp.
 
 ## Bugs surfaced
