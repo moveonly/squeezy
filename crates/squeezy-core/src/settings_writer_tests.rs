@@ -88,7 +88,8 @@ fn unset_removes_leaf_but_keeps_parent_and_comments() {
 #[test]
 fn no_op_edit_reports_skipped() {
     let p = tmp_path("noop.toml");
-    fs::write(&p, "[model]\nprovider = \"openai\"\n").unwrap();
+    let original = "[model]\n# keep this exact document\nprovider = \"openai\"\n";
+    fs::write(&p, original).unwrap();
     let edits = vec![SettingsEdit {
         path: &["model", "provider"],
         op: EditOp::SetString("openai".to_string()),
@@ -96,7 +97,29 @@ fn no_op_edit_reports_skipped() {
     let outcome = apply_edits(&SettingsScope::user(&p), &edits).unwrap();
     assert_eq!(outcome.edits_applied, 0);
     assert_eq!(outcome.edits_skipped, 1);
+    assert_eq!(fs::read_to_string(&p).unwrap(), original);
     let _ = fs::remove_file(&p);
+}
+
+#[test]
+fn no_op_removal_does_not_create_file_or_parent_tables() {
+    let dir = tmp_path("noop-remove-parent");
+    let p = dir.join("settings.toml");
+    let outcome = apply_edits(
+        &SettingsScope::user(&p),
+        &[SettingsEdit {
+            path: &[],
+            op: EditOp::RemoveTableEntry {
+                table_path: &["mcp", "servers"],
+                key: "missing".to_string(),
+            },
+        }],
+    )
+    .unwrap();
+    assert_eq!(outcome.edits_applied, 0);
+    assert_eq!(outcome.edits_skipped, 1);
+    assert!(!p.exists());
+    assert!(!dir.exists());
 }
 
 #[test]
