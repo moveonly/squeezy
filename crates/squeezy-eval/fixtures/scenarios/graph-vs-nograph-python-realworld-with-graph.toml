@@ -1,0 +1,85 @@
+id = "graph-vs-nograph-python-realworld-with-graph"
+title = "psf/requests Session intra-class call graph — with graph (openai mini)"
+description = """
+Realistic Python A/B half. Pinned `psf/requests` SHA. Models the user
+request "I want to factor out the Session intra-class call graph so I
+can reason about which methods are safe to override without breaking
+sibling methods. For every public method on `Session` (and its parent
+`SessionRedirectMixin`), tell me which OTHER methods on the same
+hierarchy it calls via `self.<method>(...)`. The set of methods is
+defined by the class hierarchy, so I need the graph closed over both
+classes; then per-method body inspection to enumerate intra-hierarchy
+self-calls."
+
+The hierarchy has 20 non-dunder methods (7 on `SessionRedirectMixin`,
+13 on `Session`); `request`, `resolve_redirects`, and `send` are the
+hubs of the call graph. Naive shell tools can grep `self.<word>(`
+inside the file, but the model still needs to (a) restrict matches to
+methods defined on the two target classes, (b) attribute each call to
+the enclosing method body (not the surrounding class), and (c) ignore
+self-calls to the same method. Graph + hierarchy + reference_search
+closes the method set and definition_search slices each body cleanly.
+Pair with `graph-vs-nograph-python-realworld-no-graph.toml` and run
+`squeezy-eval diff`.
+"""
+
+[workspace.github]
+repo = "psf/requests"
+sha = "cd90742ed94d901759e26766197d0ce7c7bd9c8e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+I want a per-method intra-hierarchy call graph for the `Session`
+class (and its parent `SessionRedirectMixin`) in
+`src/requests/sessions.py`. Treat the two classes as a single
+hierarchy — `Session(SessionRedirectMixin)` — and let H be the set of
+non-dunder method names defined on either class. (`__init__`,
+`__enter__`, `__exit__`, `__getstate__`, `__setstate__` are dunders
+and MUST be excluded from H. The `send` stub at line 132 on
+`SessionRedirectMixin` is overridden by the real `send` on `Session`
+at line 752 — use the Session body when analyzing `send`.)
+
+For EACH method name in H, inspect the body of the most-specific
+definition in the hierarchy and list every OTHER name in H that the
+body calls via a `self.<name>(...)` expression. Rules:
+- Only count direct `self.<name>(...)` calls. Do not count
+  `super().<name>(...)`, `cls.<name>(...)`, or calls through any
+  other object.
+- Do not count a method calling ITSELF (recursive self-calls are
+  ignored).
+- Do not count names that are NOT in H (e.g. `self.mount` IS in H,
+  but `self.cookies.update(...)` is NOT — `update` is not in H).
+- Deduplicate: each callee appears at most once per caller.
+- Callees within a single line are sorted alphabetically.
+
+Output one line per method in H, sorted alphabetically by method
+name, in this EXACT format:
+
+  <method_name>: <comma-separated alphabetically-sorted callees, or `(none)`>
+
+No prose, no extra commentary, no headers. Include methods whose
+bodies make no intra-hierarchy self-calls — show them with `(none)`.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false
