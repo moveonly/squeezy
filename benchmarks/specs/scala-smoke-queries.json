@@ -1,0 +1,94 @@
+{
+  "queries": [
+    {
+      "id": "scala-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:Runner",
+        "Trait:Greeter",
+        "Struct:FriendlyGreeter",
+        "Enum:Names",
+        "Variant:Alice",
+        "Variant:Bob",
+        "Variant:Carol",
+        "Method:run",
+        "Method:greet",
+        "Method:default",
+        "Function:buildDefault",
+        "Function:shout",
+        "Function:secondOpt",
+        "TypeAlias:Money",
+        "Const:intOrd"
+      ]
+    },
+    {
+      "id": "scala-trait-signature",
+      "kind": "signature_search",
+      "text": "trait Greeter",
+      "symbol_kind": "Trait",
+      "expected_contains": [
+        "Trait:Greeter"
+      ]
+    },
+    {
+      "id": "scala-trait-abstract-member",
+      "kind": "signature_search",
+      "text": "def greet(name: String): String",
+      "symbol_kind": "Method",
+      "expected_contains": [
+        "Method:greet"
+      ]
+    },
+    {
+      "id": "scala-inheritance-reference",
+      "kind": "references_to_symbol",
+      "to": "Greeter",
+      "expected_contains": [
+        "Greeter"
+      ]
+    },
+    {
+      "id": "scala-extension-cross-file-call",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "shout",
+      "expected_contains": [
+        "run -> shout"
+      ]
+    },
+    {
+      "id": "scala-companion-factory-call",
+      "kind": "call_chain",
+      "from": "buildDefault",
+      "to": "default",
+      "expected_contains": [
+        "buildDefault -> default"
+      ]
+    },
+    {
+      "id": "scala-enum-case-resolution",
+      "kind": "reference_search",
+      "text": "Alice",
+      "expected_contains": [
+        "Alice"
+      ]
+    },
+    {
+      "id": "scala-given-emission",
+      "kind": "signature_search",
+      "text": "given",
+      "symbol_kind": "Const",
+      "expected_contains": [
+        "Const:intOrd"
+      ]
+    },
+    {
+      "id": "scala-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
+    }
+  ]
+}

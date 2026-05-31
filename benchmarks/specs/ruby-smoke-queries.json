@@ -1,0 +1,99 @@
+{
+  "queries": [
+    {
+      "id": "ruby-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:User",
+        "Class:Admin",
+        "Class:Greeter",
+        "Module:Auditable",
+        "Method:full_name",
+        "Method:find_by_email",
+        "Method:promote",
+        "Method:greet",
+        "Method:audit!",
+        "Function:build_runner"
+      ]
+    },
+    {
+      "id": "ruby-class-signature",
+      "kind": "signature_search",
+      "text": "class User",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:User"
+      ]
+    },
+    {
+      "id": "ruby-singleton-method-signature",
+      "kind": "signature_search",
+      "text": "def self.find_by_email",
+      "symbol_kind": "Method",
+      "expected_contains": [
+        "Method:find_by_email"
+      ]
+    },
+    {
+      "id": "ruby-attr-accessor-synth",
+      "kind": "signature_search",
+      "text": "attr_accessor :name",
+      "symbol_kind": "Method",
+      "attribute": "ruby:synthesized",
+      "expected_contains": [
+        "Method:name",
+        "Method:name="
+      ]
+    },
+    {
+      "id": "ruby-references",
+      "kind": "reference_search",
+      "text": "User",
+      "expected_contains": [
+        "User"
+      ]
+    },
+    {
+      "id": "ruby-references-to-symbol",
+      "kind": "references_to_symbol",
+      "to": "full_name",
+      "expected_contains": [
+        "user.full_name"
+      ]
+    },
+    {
+      "id": "ruby-call-chain-cross-file",
+      "kind": "call_chain",
+      "from": "promote",
+      "to": "full_name",
+      "expected_contains": [
+        "promote -> full_name"
+      ]
+    },
+    {
+      "id": "ruby-call-chain-mixin",
+      "kind": "call_chain",
+      "from": "audit!",
+      "to": "log",
+      "expected_contains": [
+        "audit! -> log"
+      ]
+    },
+    {
+      "id": "ruby-import-resolution",
+      "kind": "signature_search",
+      "text": "require_relative \"user\"",
+      "expected_contains": [
+        "Function:require_relative"
+      ]
+    },
+    {
+      "id": "ruby-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
+    }
+  ]
+}

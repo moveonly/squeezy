@@ -10493,12 +10493,18 @@ pub enum LanguageKind {
     C,
     CSharp,
     Cpp,
+    Dart,
     Go,
     Java,
     JavaScript,
     Jsx,
+    Kotlin,
+    Php,
     Python,
+    Ruby,
     Rust,
+    Scala,
+    Swift,
     TypeScript,
     Tsx,
     Unsupported,
@@ -10514,10 +10520,16 @@ pub enum LanguageFamily {
     Go,
     CFamily,
     JsTs,
+    Ruby,
+    Php,
+    Kotlin,
+    Swift,
+    Scala,
+    Dart,
 }
 
 impl LanguageFamily {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 13] = [
         Self::Rust,
         Self::Python,
         Self::Java,
@@ -10525,6 +10537,12 @@ impl LanguageFamily {
         Self::Go,
         Self::CFamily,
         Self::JsTs,
+        Self::Ruby,
+        Self::Php,
+        Self::Kotlin,
+        Self::Swift,
+        Self::Scala,
+        Self::Dart,
     ];
 
     pub const fn all() -> &'static [Self] {
@@ -10540,6 +10558,12 @@ impl LanguageFamily {
             Self::Go => "go",
             Self::CFamily => "c-family",
             Self::JsTs => "js-ts",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+            Self::Scala => "scala",
+            Self::Dart => "dart",
         }
     }
 
@@ -10553,6 +10577,12 @@ impl LanguageFamily {
             Self::Go => "Go",
             Self::CFamily => "C/C++",
             Self::JsTs => "JavaScript/TypeScript",
+            Self::Ruby => "Ruby",
+            Self::Php => "PHP",
+            Self::Kotlin => "Kotlin",
+            Self::Swift => "Swift",
+            Self::Scala => "Scala",
+            Self::Dart => "Dart",
         }
     }
 
@@ -10568,6 +10598,12 @@ impl LanguageFamily {
             | LanguageKind::Jsx
             | LanguageKind::TypeScript
             | LanguageKind::Tsx => Some(Self::JsTs),
+            LanguageKind::Ruby => Some(Self::Ruby),
+            LanguageKind::Php => Some(Self::Php),
+            LanguageKind::Kotlin => Some(Self::Kotlin),
+            LanguageKind::Swift => Some(Self::Swift),
+            LanguageKind::Scala => Some(Self::Scala),
+            LanguageKind::Dart => Some(Self::Dart),
             LanguageKind::Unsupported | LanguageKind::Unknown => None,
         }
     }
@@ -10586,6 +10622,12 @@ impl LanguageFamily {
                 LanguageKind::TypeScript,
                 LanguageKind::Tsx,
             ],
+            Self::Ruby => &[LanguageKind::Ruby],
+            Self::Php => &[LanguageKind::Php],
+            Self::Kotlin => &[LanguageKind::Kotlin],
+            Self::Swift => &[LanguageKind::Swift],
+            Self::Scala => &[LanguageKind::Scala],
+            Self::Dart => &[LanguageKind::Dart],
         }
     }
 
@@ -10598,6 +10640,12 @@ impl LanguageFamily {
             Self::Go => &["go"],
             Self::CFamily => &["c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx"],
             Self::JsTs => &["cjs", "cts", "js", "jsx", "mjs", "mts", "ts", "tsx"],
+            Self::Ruby => &["rb"],
+            Self::Php => &["php"],
+            Self::Kotlin => &["kt", "kts"],
+            Self::Swift => &["swift"],
+            Self::Scala => &["scala", "sc"],
+            Self::Dart => &["dart"],
         }
     }
 }
@@ -10615,11 +10663,17 @@ impl LanguageKind {
             b"cs" | b"csx" => Self::CSharp,
             b"cjs" | b"js" | b"mjs" => Self::JavaScript,
             b"cts" | b"mts" | b"ts" => Self::TypeScript,
+            b"dart" => Self::Dart,
             b"go" => Self::Go,
             b"java" => Self::Java,
             b"jsx" => Self::Jsx,
+            b"kt" | b"kts" => Self::Kotlin,
+            b"php" => Self::Php,
             b"py" => Self::Python,
+            b"rb" => Self::Ruby,
             b"rs" => Self::Rust,
+            b"scala" | b"sc" => Self::Scala,
+            b"swift" => Self::Swift,
             b"tsx" => Self::Tsx,
             _ => Self::Unsupported,
         }
@@ -10630,12 +10684,18 @@ impl LanguageKind {
             Self::C => "C",
             Self::CSharp => "C#",
             Self::Cpp => "C++",
+            Self::Dart => "Dart",
             Self::Go => "Go",
             Self::Java => "Java",
             Self::JavaScript => "JavaScript",
             Self::Jsx => "JSX",
+            Self::Kotlin => "Kotlin",
+            Self::Php => "PHP",
             Self::Python => "Python",
+            Self::Ruby => "Ruby",
             Self::Rust => "Rust",
+            Self::Scala => "Scala",
+            Self::Swift => "Swift",
             Self::TypeScript => "TypeScript",
             Self::Tsx => "TSX",
             Self::Unsupported => "unsupported",
@@ -10671,6 +10731,11 @@ pub enum SymbolKind {
     Unknown,
 }
 
+/// Stable kind tag attached to every `GraphEdge`. New variants append at the
+/// end so serialized graphs stay forward-compatible: callers that ignore
+/// unknown kinds keep working when a deployment lands a kind they haven't
+/// seen yet. Inheritance-style kinds (`Extends`, `Implements`, `UsesTrait`)
+/// participate in ancestor walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind {
     Contains,
@@ -10687,6 +10752,11 @@ pub enum EdgeKind {
     DefinesMacro,
     InvokesMacro,
     Conditional,
+    /// PHP trait inclusion (`use TraitA;` inside a class/trait body). Modelled
+    /// alongside `Extends`/`Implements` so ancestor-style queries can walk a
+    /// class up through its included traits the same way they walk parents
+    /// and implemented interfaces.
+    UsesTrait,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,0 +1,27 @@
+{
+  "language": "dart",
+  "tier": "smoke",
+  "fixture": "benchmarks/fixtures/dart/semantic-cases",
+  "recorded_at": "2026-05-31",
+  "dart": {
+    "version": "3.12.1",
+    "analyzer_version": "7.7.1"
+  },
+  "build_ms": 4,
+  "build_phases": {
+    "crawl_ms": 1,
+    "parse_ms": 1,
+    "declaration_graph_ms": 0,
+    "full_graph_ms": 0,
+    "total_ms": 4
+  },
+  "oracle_ms": 5145,
+  "symbols": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "true_positive": 21,
+    "false_positive": 0,
+    "false_negative": 0
+  },
+  "notes": "First-iteration baseline for the speed-parity gate (spec dart.md §11). build_ms is the squeezy total over 8 fixture files (vendor/ and codegen widget.g.dart excluded); oracle_ms is wall time of the package:analyzer subprocess (cold start dominates — warm runs land around 1-2s). The analyzer cold start is the long pole because AnalysisContextCollection reads dart:core/dart:async from the SDK; gates do not enforce a speed bound on Dart in the first PR per spec §11."
+}

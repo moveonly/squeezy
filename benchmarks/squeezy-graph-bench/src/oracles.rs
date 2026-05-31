@@ -5,19 +5,30 @@ use crate::cli::BenchmarkLanguage;
 pub(crate) mod clang;
 pub(crate) mod common_scan;
 pub(crate) mod cpython_ast;
+pub(crate) mod dart_oracle;
 pub(crate) mod go_types;
 pub(crate) mod javac;
+pub(crate) mod kotlin_oracle;
+pub(crate) mod php_oracle;
 pub(crate) mod roslyn;
+pub(crate) mod ruby_oracle;
 pub(crate) mod rust_analyzer;
+pub(crate) mod scala_semanticdb;
+pub(crate) mod swift_sourcekit;
 pub(crate) mod tsc;
 
 pub(crate) use clang::*;
 pub(crate) use common_scan::*;
 pub(crate) use cpython_ast::*;
+pub(crate) use dart_oracle::*;
 pub(crate) use go_types::*;
 pub(crate) use javac::*;
+pub(crate) use kotlin_oracle::*;
+pub(crate) use php_oracle::*;
 pub(crate) use roslyn::*;
+pub(crate) use ruby_oracle::*;
 pub(crate) use rust_analyzer::*;
+pub(crate) use scala_semanticdb::*;
 pub(crate) use tsc::*;
 
 pub trait LanguageOracle: Sync {
@@ -64,6 +75,16 @@ static JAVAC: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::Java,
     language: BenchmarkLanguage::Java,
 };
+static KOTLIN_ORACLE: OracleDescriptor = OracleDescriptor {
+    id: "kotlin_compiler_embeddable",
+    family: LanguageFamily::Kotlin,
+    language: BenchmarkLanguage::Kotlin,
+};
+static SCALA_SEMANTICDB: OracleDescriptor = OracleDescriptor {
+    id: "scala_semanticdb",
+    family: LanguageFamily::Scala,
+    language: BenchmarkLanguage::Scala,
+};
 static ROSLYN: OracleDescriptor = OracleDescriptor {
     id: "roslyn",
     family: LanguageFamily::CSharp,
@@ -84,15 +105,41 @@ static TSC: OracleDescriptor = OracleDescriptor {
     family: LanguageFamily::JsTs,
     language: BenchmarkLanguage::TypeScript,
 };
+static PHP_PARSER: OracleDescriptor = OracleDescriptor {
+    id: "nikic_php_parser",
+    family: LanguageFamily::Php,
+    language: BenchmarkLanguage::Php,
+};
+static RUBY_PRISM: OracleDescriptor = OracleDescriptor {
+    id: "ruby_prism",
+    family: LanguageFamily::Ruby,
+    language: BenchmarkLanguage::Ruby,
+};
+static SOURCEKIT_LSP: OracleDescriptor = OracleDescriptor {
+    id: "sourcekit_lsp",
+    family: LanguageFamily::Swift,
+    language: BenchmarkLanguage::Swift,
+};
+static DART_ANALYZER: OracleDescriptor = OracleDescriptor {
+    id: "dart_analyzer",
+    family: LanguageFamily::Dart,
+    language: BenchmarkLanguage::Dart,
+};
 
-static ORACLES: [&'static dyn LanguageOracle; 7] = [
+static ORACLES: [&'static dyn LanguageOracle; 13] = [
     &RUST_ANALYZER,
     &CPYTHON_AST,
     &JAVAC,
+    &KOTLIN_ORACLE,
+    &SCALA_SEMANTICDB,
     &ROSLYN,
     &GO_TYPES,
     &CLANG,
     &TSC,
+    &PHP_PARSER,
+    &RUBY_PRISM,
+    &SOURCEKIT_LSP,
+    &DART_ANALYZER,
 ];
 
 pub fn inventory() -> &'static [&'static dyn LanguageOracle] {

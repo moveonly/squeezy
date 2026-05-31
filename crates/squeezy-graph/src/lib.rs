@@ -36,6 +36,10 @@ use crate::languages::{
         java_paths_signature, java_source_root_facts,
     },
     js_ts::{JsTsResolver, is_js_ts_language},
+    kotlin::{
+        kotlin_build_metadata_provider, kotlin_configured_source_facts, kotlin_dependency_facts,
+        kotlin_paths_signature, kotlin_source_root_facts,
+    },
     python::{python_module_path_for_file, python_path_segments},
 };
 
@@ -316,10 +320,20 @@ pub struct DotnetProjectFact {
     pub provenance: Provenance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KotlinProjectFact {
+    pub provider: String,
+    pub kind: String,
+    pub value: String,
+    pub source_file: FileId,
+    pub provenance: Provenance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageFact {
     Java(JavaProjectFact),
     Dotnet(DotnetProjectFact),
+    Kotlin(KotlinProjectFact),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -352,9 +366,12 @@ pub struct SemanticGraph {
     body_hits: Vec<BodyHit>,
     java_project_facts: Vec<JavaProjectFact>,
     dotnet_project_facts: Vec<DotnetProjectFact>,
+    kotlin_project_facts: Vec<KotlinProjectFact>,
     cargo_facts: Option<CargoCompilerFacts>,
     java_project_facts_cache: HashMap<FileId, CachedJavaProjectFacts>,
     java_project_facts_cache_java_paths_signature: u64,
+    kotlin_project_facts_cache: HashMap<FileId, CachedKotlinProjectFacts>,
+    kotlin_project_facts_cache_kotlin_paths_signature: u64,
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
     symbol_signature_lower: HashMap<SymbolId, String>,
     signature_trigram_index: HashMap<[u8; 3], Vec<SymbolId>>,
@@ -382,6 +399,8 @@ pub struct SemanticGraph {
     /// they are scanned alongside the by-target hit list.
     wildcard_aliased_imports: Vec<usize>,
     java_package_by_file: HashMap<FileId, Vec<String>>,
+    kotlin_package_by_file: HashMap<FileId, Vec<String>>,
+    scala_package_by_file: HashMap<FileId, Vec<String>>,
     js_ts_resolver: JsTsResolver,
     /// Parallel index of `(file, name, arity) -> symbol` so the resolver
     /// can disambiguate overloaded callees by exact positional-parameter
@@ -404,6 +423,15 @@ pub struct SemanticGraph {
 struct CachedJavaProjectFacts {
     hash: ContentHash,
     java_paths_signature: u64,
+    dependency_values: Vec<String>,
+    configured_source_facts: Vec<(&'static str, String, &'static str)>,
+    source_root_facts: Vec<(&'static str, String, &'static str)>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedKotlinProjectFacts {
+    hash: ContentHash,
+    kotlin_paths_signature: u64,
     dependency_values: Vec<String>,
     configured_source_facts: Vec<(&'static str, String, &'static str)>,
     source_root_facts: Vec<(&'static str, String, &'static str)>,
@@ -436,9 +464,12 @@ impl SemanticGraph {
             body_hits: Vec::new(),
             java_project_facts: Vec::new(),
             dotnet_project_facts: Vec::new(),
+            kotlin_project_facts: Vec::new(),
             cargo_facts: None,
             java_project_facts_cache: HashMap::new(),
             java_project_facts_cache_java_paths_signature: 0,
+            kotlin_project_facts_cache: HashMap::new(),
+            kotlin_project_facts_cache_kotlin_paths_signature: 0,
             symbols_by_name: HashMap::new(),
             symbol_signature_lower: HashMap::new(),
             signature_trigram_index: HashMap::new(),
@@ -453,6 +484,8 @@ impl SemanticGraph {
             imports_by_alias_target: HashMap::new(),
             wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
+            kotlin_package_by_file: HashMap::new(),
+            scala_package_by_file: HashMap::new(),
             js_ts_resolver: JsTsResolver::default(),
             arity_index: HashMap::new(),
             importers_by_file: HashMap::new(),
@@ -467,6 +500,7 @@ impl SemanticGraph {
         }
         graph.rebuild_java_project_facts();
         graph.rebuild_dotnet_project_facts();
+        graph.rebuild_kotlin_project_facts();
         graph.rebuild_semantic_edges();
         graph.rebuild_indexes();
         graph
@@ -483,6 +517,7 @@ impl SemanticGraph {
         }
         self.rebuild_java_project_facts();
         self.rebuild_dotnet_project_facts();
+        self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -491,6 +526,7 @@ impl SemanticGraph {
         self.remove_file_data(file_id);
         self.rebuild_java_project_facts();
         self.rebuild_dotnet_project_facts();
+        self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -507,6 +543,8 @@ impl SemanticGraph {
         self.java_project_facts
             .retain(|fact| &fact.source_file != file_id);
         self.dotnet_project_facts
+            .retain(|fact| &fact.source_file != file_id);
+        self.kotlin_project_facts
             .retain(|fact| &fact.source_file != file_id);
         self.edges.retain(|edge| {
             self.symbols.contains_key(&edge.from)
@@ -548,6 +586,10 @@ impl SemanticGraph {
 
     pub fn dotnet_project_facts(&self) -> &[DotnetProjectFact] {
         &self.dotnet_project_facts
+    }
+
+    pub fn kotlin_project_facts(&self) -> &[KotlinProjectFact] {
+        &self.kotlin_project_facts
     }
 
     pub fn cargo_facts(&self) -> Option<&CargoCompilerFacts> {
@@ -647,6 +689,12 @@ impl SemanticGraph {
                     .iter()
                     .cloned()
                     .map(LanguageFact::Dotnet),
+            )
+            .chain(
+                self.kotlin_project_facts
+                    .iter()
+                    .cloned()
+                    .map(LanguageFact::Kotlin),
             )
             .collect()
     }
@@ -787,8 +835,28 @@ impl SemanticGraph {
     }
 
     pub fn reference_search(&self, text: &str) -> Vec<ReferenceHit> {
-        let mut hits = self
+        let mut indexes = self
             .reference_candidate_indexes(text)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        // Alias-aware lookup: when `text` is the local alias of an aliased
+        // import (e.g. Kotlin / Python / JS-TS `import x.Target as Friendly`),
+        // also surface references to the original `Target` so a search for
+        // the alias finds the underlying name. The reverse direction —
+        // `references_to_symbol` — already does this via
+        // `reference_candidate_indexes_for_symbol`; this is the symmetric
+        // forward path.
+        for import in &self.imports {
+            if import.alias.as_deref() != Some(text) {
+                continue;
+            }
+            let leaf = last_path_segment(&import.path);
+            if leaf.is_empty() || leaf == "*" || leaf == text {
+                continue;
+            }
+            indexes.extend(self.reference_candidate_indexes(&leaf));
+        }
+        let mut hits = indexes
             .into_iter()
             .filter_map(|index| self.references.get(index))
             .map(|reference| self.reference_hit(reference, Confidence::Heuristic))
@@ -1188,6 +1256,131 @@ impl SemanticGraph {
         });
     }
 
+    fn rebuild_kotlin_project_facts(&mut self) {
+        self.kotlin_project_facts.clear();
+        let metadata_files = self
+            .files
+            .values()
+            .filter_map(|file| {
+                kotlin_build_metadata_provider(file).map(|provider| (provider, file.clone()))
+            })
+            .collect::<Vec<_>>();
+        if metadata_files.is_empty() {
+            self.kotlin_project_facts_cache.clear();
+            self.kotlin_project_facts_cache_kotlin_paths_signature = 0;
+            return;
+        }
+
+        let mut kotlin_paths = self
+            .files
+            .values()
+            .filter(|file| file.language == LanguageKind::Kotlin)
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        kotlin_paths.sort();
+        let kotlin_paths_sig = kotlin_paths_signature(&kotlin_paths);
+        self.kotlin_project_facts_cache_kotlin_paths_signature = kotlin_paths_sig;
+
+        let metadata_ids = metadata_files
+            .iter()
+            .map(|(_, file)| file.id.clone())
+            .collect::<HashSet<_>>();
+        self.kotlin_project_facts_cache
+            .retain(|file_id, _| metadata_ids.contains(file_id));
+
+        let mut dedup = BTreeSet::new();
+        for (provider, file) in metadata_files {
+            let cache_hit = self
+                .kotlin_project_facts_cache
+                .get(&file.id)
+                .map(|entry| {
+                    entry.hash == file.hash && entry.kotlin_paths_signature == kotlin_paths_sig
+                })
+                .unwrap_or(false);
+
+            if !cache_hit {
+                let kotlin_path_refs = kotlin_paths.iter().map(String::as_str).collect::<Vec<_>>();
+                let source_root_facts = kotlin_source_root_facts(provider, &kotlin_path_refs);
+                let (dependency_values, configured_source_facts) =
+                    if let Ok(source) = std::fs::read_to_string(&file.path) {
+                        (
+                            kotlin_dependency_facts(provider, &source),
+                            kotlin_configured_source_facts(provider, &source),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                self.kotlin_project_facts_cache.insert(
+                    file.id.clone(),
+                    CachedKotlinProjectFacts {
+                        hash: file.hash.clone(),
+                        kotlin_paths_signature: kotlin_paths_sig,
+                        dependency_values,
+                        configured_source_facts,
+                        source_root_facts,
+                    },
+                );
+            }
+
+            let entry = self
+                .kotlin_project_facts_cache
+                .get(&file.id)
+                .expect("just inserted")
+                .clone();
+            for (kind, value, reason) in entry.source_root_facts {
+                self.push_kotlin_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+            for value in entry.dependency_values {
+                self.push_kotlin_project_fact(
+                    &mut dedup,
+                    provider,
+                    "dependency",
+                    value,
+                    &file,
+                    "build dependency coordinate",
+                );
+            }
+            for (kind, value, reason) in entry.configured_source_facts {
+                self.push_kotlin_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+        }
+
+        self.kotlin_project_facts.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.value.cmp(&right.value))
+        });
+    }
+
+    fn push_kotlin_project_fact(
+        &mut self,
+        dedup: &mut BTreeSet<(String, String, String, String)>,
+        provider: &str,
+        kind: &str,
+        value: String,
+        file: &FileRecord,
+        reason: &str,
+    ) {
+        if value.is_empty()
+            || !dedup.insert((
+                provider.to_string(),
+                kind.to_string(),
+                value.clone(),
+                file.id.0.clone(),
+            ))
+        {
+            return;
+        }
+        self.kotlin_project_facts.push(KotlinProjectFact {
+            provider: provider.to_string(),
+            kind: kind.to_string(),
+            value,
+            source_file: file.id.clone(),
+            provenance: Provenance::new(provider, reason),
+        });
+    }
+
     fn hierarchy_node(&self, id: &SymbolId, max_depth: usize) -> Option<HierarchyNode> {
         let symbol = self.symbols.get(id)?;
         let children = if max_depth == 0 {
@@ -1383,7 +1576,7 @@ impl SemanticGraph {
             }
         }
         for import in &self.imports {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
             let Some(slot) = self.resolver_slots.get_mut(&import.file_id) else {
@@ -1410,7 +1603,7 @@ impl SemanticGraph {
         // the same loop.
         let mut updates: HashMap<FileId, Vec<FileId>> = HashMap::new();
         for import in &self.imports {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
             let target_name = import
@@ -1442,19 +1635,34 @@ impl SemanticGraph {
         self.imports_by_alias_target.clear();
         self.wildcard_aliased_imports.clear();
         self.java_package_by_file.clear();
+        self.kotlin_package_by_file.clear();
+        self.scala_package_by_file.clear();
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
                 .entry(import.file_id.clone())
                 .or_default()
                 .push(index);
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 let segments = path_segments(&import.path);
                 if !segments.is_empty() {
-                    self.java_package_by_file
-                        .insert(import.file_id.clone(), segments);
+                    let alias = import.alias.as_deref().unwrap_or_default();
+                    match alias {
+                        "__scala_package__" => {
+                            self.scala_package_by_file
+                                .insert(import.file_id.clone(), segments);
+                        }
+                        "__kotlin_package__" => {
+                            self.kotlin_package_by_file
+                                .insert(import.file_id.clone(), segments);
+                        }
+                        _ => {
+                            self.java_package_by_file
+                                .insert(import.file_id.clone(), segments);
+                        }
+                    }
                 }
-                // Java package markers never name a target symbol; they live
-                // only in the by-file index. Skip both alias-target buckets.
+                // Package markers never name a target symbol; they live only
+                // in the by-file index. Skip both alias-target buckets.
                 continue;
             }
             if import.alias.is_none() {
@@ -1636,12 +1844,18 @@ pub struct LanguageReport {
     pub c_files: usize,
     pub csharp_files: usize,
     pub cpp_files: usize,
+    pub dart_files: usize,
     pub go_files: usize,
     pub java_files: usize,
     pub javascript_files: usize,
     pub jsx_files: usize,
+    pub kotlin_files: usize,
+    pub php_files: usize,
     pub python_files: usize,
+    pub ruby_files: usize,
     pub rust_files: usize,
+    pub scala_files: usize,
+    pub swift_files: usize,
     pub typescript_files: usize,
     pub tsx_files: usize,
     pub supported_files: usize,
@@ -2128,6 +2342,7 @@ impl GraphManager {
         } else if metadata_refresh_needed {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
+            self.graph.rebuild_kotlin_project_facts();
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
         }
@@ -2329,6 +2544,24 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
             }
             LanguageKind::Tsx => {
                 report.tsx_files += 1;
+            }
+            LanguageKind::Ruby => {
+                report.ruby_files += 1;
+            }
+            LanguageKind::Php => {
+                report.php_files += 1;
+            }
+            LanguageKind::Kotlin => {
+                report.kotlin_files += 1;
+            }
+            LanguageKind::Swift => {
+                report.swift_files += 1;
+            }
+            LanguageKind::Scala => {
+                report.scala_files += 1;
+            }
+            LanguageKind::Dart => {
+                report.dart_files += 1;
             }
             LanguageKind::Unsupported => report.unsupported_files += 1,
             LanguageKind::Unknown => report.unknown_files += 1,
@@ -2847,6 +3080,12 @@ fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
         | LanguageKind::TypeScript
         | LanguageKind::Tsx
         | LanguageKind::Python
+        | LanguageKind::Ruby
+        | LanguageKind::Php
+        | LanguageKind::Kotlin
+        | LanguageKind::Swift
+        | LanguageKind::Scala
+        | LanguageKind::Dart
         | LanguageKind::Unknown
         | LanguageKind::Unsupported => return false,
     };
@@ -2873,6 +3112,17 @@ fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
         _ => &[],
     };
     externals.contains(&first_segment)
+}
+
+/// Returns true when `alias` is one of the package-marker sentinel aliases
+/// that language extractors stash on file-level `ParsedImport`s to encode
+/// the file's package path without inventing a dedicated field. These
+/// imports must be filtered out of regular import-resolution traversals.
+pub(crate) fn is_package_marker_alias(alias: Option<&str>) -> bool {
+    matches!(
+        alias,
+        Some("__java_package__") | Some("__kotlin_package__") | Some("__scala_package__"),
+    )
 }
 
 fn path_segments(path: &str) -> Vec<String> {
@@ -3115,6 +3365,15 @@ fn single_unique<I: IntoIterator<Item = SymbolId>>(iter: I) -> Option<SymbolId> 
         }
     }
     seen
+}
+
+/// Pseudo-imports synthesised by language extractors to communicate the
+/// file-level package binding (e.g. `__java_package__`, `__kotlin_package__`).
+/// These never name a target symbol and must be skipped by the cross-file
+/// resolver, the importers index, and any code that maps imports to
+/// candidate symbols by name.
+pub(crate) fn is_package_marker(import: &ParsedImport) -> bool {
+    is_package_marker_alias(import.alias.as_deref())
 }
 
 fn package_key(path: &str) -> String {

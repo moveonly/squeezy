@@ -202,6 +202,11 @@ pub(crate) fn run_query(
             .iter()
             .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
             .collect(),
+        "kotlin_project_facts" => graph
+            .kotlin_project_facts()
+            .iter()
+            .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
+            .collect(),
         "edges" => graph
             .edges()
             .iter()

@@ -1,0 +1,15 @@
+{
+  "name": "squeezy/php-semantic-cases",
+  "description": "Synthetic PHP fixture exercising namespace, class, interface, trait, enum, and import shapes the squeezy graph must recognise. Nothing actually runs this; it documents intent and mirrors the C# fixture's .csproj shape.",
+  "type": "library",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "Foo\\": "src/Foo/"
+    }
+  },
+  "require": {
+    "php": "^8.1",
+    "psr/log": "^3.0"
+  }
+}

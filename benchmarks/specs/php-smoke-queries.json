@@ -1,0 +1,92 @@
+{
+  "queries": [
+    {
+      "id": "php-declarations",
+      "kind": "signature_search",
+      "text": "",
+      "expected_contains": [
+        "Interface:IRunner",
+        "Trait:Loggable",
+        "Class:Service",
+        "Class:Repository",
+        "Class:Magic",
+        "Enum:Status",
+        "Method:run",
+        "Method:log",
+        "Method:__call",
+        "Variant:Ok",
+        "Field:prefix"
+      ]
+    },
+    {
+      "id": "php-namespace-hierarchy",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "php:namespace:Foo.Bar",
+      "expected_contains": [
+        "Class:Service",
+        "Class:Repository"
+      ]
+    },
+    {
+      "id": "php-attribute-search",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "php:backed:string",
+      "expected_contains": [
+        "Enum:Status"
+      ]
+    },
+    {
+      "id": "php-references",
+      "kind": "references_to_symbol",
+      "to": "IRunner",
+      "expected_contains": [
+        "IRunner"
+      ]
+    },
+    {
+      "id": "php-call-chain",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "log",
+      "expected_contains": [
+        "run -> log"
+      ]
+    },
+    {
+      "id": "php-trait-inclusion",
+      "kind": "edges",
+      "expected_contains": [
+        "Implements:Service->IRunner:IRunner:Heuristic",
+        "UsesTrait:Service->Loggable:Loggable:Heuristic"
+      ]
+    },
+    {
+      "id": "php-magic-method-partial",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "php:magic",
+      "expected_contains": [
+        "Method:__call"
+      ]
+    },
+    {
+      "id": "php-body-search",
+      "kind": "body_search",
+      "text": "log",
+      "owner_kind": "Method",
+      "expected_contains": [
+        "log:'log: '"
+      ]
+    },
+    {
+      "id": "php-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "vendor",
+        "generated"
+      ]
+    }
+  ]
+}

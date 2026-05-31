@@ -62,6 +62,16 @@ pub(crate) fn heuristic_iteration_reports(
     language: BenchmarkLanguage,
     go_oracle: &Option<GoOracleReport>,
 ) -> Vec<HeuristicIterationReport> {
+    if language == BenchmarkLanguage::Ruby {
+        return vec![HeuristicIterationReport {
+            name: "baseline-tree-sitter-ruby".to_string(),
+            status: "accepted".to_string(),
+            notes: vec![
+                "Ruby extractor mines class/module/method/singleton_method declarations plus attr_* synthesis; dynamic dispatch through method_missing/define_method/eval is documented as a recall gap and excluded symmetrically by the oracle.".to_string(),
+            ],
+            ..Default::default()
+        }];
+    }
     if language != BenchmarkLanguage::Go {
         return Vec::new();
     }
@@ -75,6 +85,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Package/import/declaration extraction is the baseline for Go heuristic comparisons.".to_string(),
             ],
+            ..Default::default()
         },
         HeuristicIterationReport {
             name: "top-level-declaration-scope".to_string(),
@@ -82,6 +93,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Function-local var/const/type declarations, blank identifiers, and declarations inside top-level function literals are excluded from top-level symbol accuracy.".to_string(),
             ],
+            ..Default::default()
         },
         HeuristicIterationReport {
             name: "go-alias-and-declaration-lists".to_string(),
@@ -89,6 +101,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Grouped var/const specs and tree-sitter-go type_alias nodes are expanded so multi-name declarations and aliases count as symbols.".to_string(),
             ],
+            ..Default::default()
         },
         HeuristicIterationReport {
             name: "go-test-method-normalization".to_string(),
@@ -96,6 +109,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Suite-style _test.go methods with Test/Benchmark/Fuzz names are normalized to test functions for oracle comparison.".to_string(),
             ],
+            ..Default::default()
         },
         HeuristicIterationReport {
             name: "go-external-package-examples".to_string(),
@@ -103,6 +117,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Remaining etcd FNs are concentrated in external-package example test files; keep them visible instead of broad lexical matching.".to_string(),
             ],
+            ..Default::default()
         },
         HeuristicIterationReport {
             name: "go-lazy-reference-materialization".to_string(),
@@ -110,6 +125,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Prometheus and etcd are slower than the declaration-only Go oracle because cold build materializes references, body hits, calls, and edges eagerly.".to_string(),
             ],
+            ..Default::default()
         },
         HeuristicIterationReport {
             name: "broad-lexical-reference-binding".to_string(),
@@ -117,6 +133,7 @@ pub(crate) fn heuristic_iteration_reports(
             notes: vec![
                 "Broad same-name binding is not enabled by default; Go navigation favors exact package/import/receiver evidence before recall-only expansion.".to_string(),
             ],
+            ..Default::default()
         },
     ]
 }

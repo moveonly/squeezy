@@ -35,10 +35,16 @@ on:
           - rust
           - python
           - java
+          - scala
           - go
           - c-family
           - csharp
           - js-ts
+          - kotlin
+          - php
+          - ruby
+          - swift
+          - dart
       tier:
         description: Benchmark tier.
         required: true
@@ -61,7 +67,7 @@ jobs:
   benchmark:
     name: ${{ inputs.language }} benchmark
     runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
-    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || 120 }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp' || inputs.language == 'kotlin' || inputs.language == 'scala') && 90 || (inputs.language == 'go' || inputs.language == 'php' || inputs.language == 'swift') && 60 || (inputs.language == 'ruby' || inputs.language == 'dart') && 45 || 120 }}
 
     steps:
       - name: Checkout
@@ -73,11 +79,77 @@ jobs:
           language: ${{ inputs.language }}
           typescript-version: ${{ env.SQUEEZY_TYPESCRIPT_VERSION }}
 
+      - name: Setup Ruby 3.3 (Prism oracle)
+        if: inputs.language == 'ruby'
+        continue-on-error: true
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Verify Prism availability
+        if: inputs.language == 'ruby'
+        continue-on-error: true
+        run: ruby -rprism -e 'puts Prism::VERSION'
+
       - name: Pre-build Roslyn C# oracle
         if: inputs.language == 'csharp'
         run: |
           dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
             -c Release --nologo -v minimal
+
+      - name: Build Kotlin oracle jar
+        if: inputs.language == 'kotlin'
+        shell: bash
+        run: |
+          # Requires kotlinc + JDK 17, installed by the setup-bench action's
+          # Kotlin steps. The build script writes
+          # benchmarks/oracle/kotlin/kotlin-oracle.jar (~20MB), which the
+          # Rust harness looks up by exact path. Not checked into the repo.
+          bash benchmarks/oracle/kotlin/build.sh
+
+      - name: Install PHP oracle toolchain
+        if: inputs.language == 'php'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php8.3-cli php8.3-mbstring php8.3-xml composer
+          ( cd benchmarks/oracle-helpers/php-oracle \
+            && composer install --no-interaction --prefer-dist )
+
+      - name: Install Swift toolchain
+        if: inputs.language == 'swift'
+        continue-on-error: true
+        run: |
+          set -e
+          SWIFT_VERSION=5.10
+          SWIFT_PLATFORM=ubuntu22.04
+          ARCHIVE="swift-${SWIFT_VERSION}-RELEASE-${SWIFT_PLATFORM}.tar.gz"
+          # https://swift.org/install/linux/#tarball-installation
+          curl -fL -o swift.tar.gz \
+            "https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_PLATFORM//./}/swift-${SWIFT_VERSION}-RELEASE/${ARCHIVE}"
+          sudo mkdir -p /opt/swift
+          sudo tar -xzf swift.tar.gz -C /opt/swift --strip-components=1
+          echo "/opt/swift/usr/bin" >> "$GITHUB_PATH"
+          /opt/swift/usr/bin/swift --version
+          /opt/swift/usr/bin/sourcekit-lsp --version || true
+
+      - name: Setup Dart 3.x (analyzer oracle)
+        if: inputs.language == 'dart'
+        continue-on-error: true
+        uses: dart-lang/setup-dart@e51d8e571e22473a2ddebf0ef8a2123f0ab2c02c # v1.6.5
+        with:
+          sdk: stable
+
+      - name: Install Dart oracle helper deps
+        if: inputs.language == 'dart'
+        continue-on-error: true
+        working-directory: benchmarks/oracle-helpers/dart-oracle
+        run: dart pub get
+
+      - name: Verify Dart analyzer availability
+        if: inputs.language == 'dart'
+        continue-on-error: true
+        run: dart --version
 
       - name: Run semantic graph benchmark corpus
         run: |

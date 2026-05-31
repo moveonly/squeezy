@@ -1,0 +1,25 @@
+{
+  "fixture": "benchmarks/fixtures/swift/semantic-cases",
+  "recorded_at": "2026-05-30T21:48:34Z",
+  "branch": "langs/swift-sourcekit-probes",
+  "platform": "darwin/arm64",
+  "toolchain": "Xcode 15 sourcekit-lsp (Swift 5.10)",
+  "swift_files": 6,
+  "squeezy_total_ms": 11,
+  "squeezy_build_ms": 10,
+  "squeezy_query_ms": 1,
+  "build_phases_ms": {
+    "crawl": 5,
+    "parse": 3,
+    "declaration_graph": 0,
+    "full_graph": 0
+  },
+  "oracle_ms": 838,
+  "navigation_lsp_ms": 1636,
+  "refresh_ms": 1,
+  "notes": [
+    "First measurement; the SwiftPM build validation oracle is intentionally not run in CI (see runner.rs BenchmarkLanguage::Swift arm).",
+    "oracle_ms covers sourcekit-lsp launch + per-file documentSymbol RPCs for 6 Swift files.",
+    "navigation_lsp_ms covers 18 definition probes + 14 reference probes against sourcekit-lsp."
+  ]
+}

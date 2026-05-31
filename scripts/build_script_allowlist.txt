@@ -90,13 +90,17 @@ tree-sitter-html
 tree-sitter-java
 tree-sitter-javascript
 tree-sitter-json
+tree-sitter-dart
+tree-sitter-kotlin-ng
 tree-sitter-language
 tree-sitter-lua
 tree-sitter-php
 tree-sitter-python
 tree-sitter-ruby
 tree-sitter-rust
+tree-sitter-scala
 tree-sitter-sequel
+tree-sitter-swift
 tree-sitter-toml-updated
 tree-sitter-typescript
 tree-sitter-yaml

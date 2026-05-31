@@ -1,0 +1,85 @@
+{
+  "queries": [
+    {
+      "id": "swift-declarations",
+      "kind": "signature_search",
+      "text": "",
+      "expected_contains": [
+        "Trait:Endpoint",
+        "Struct:UserEndpoint",
+        "Class:Cache",
+        "Class:UserRepository",
+        "Enum:APIResult",
+        "Method:encode",
+        "Method:get",
+        "Method:set",
+        "Method:sanitized",
+        "Method:map",
+        "Method:refresh",
+        "Field:path",
+        "Field:users",
+        "Variant:success",
+        "Variant:failure",
+        "TypeAlias:Endpoints"
+      ]
+    },
+    {
+      "id": "swift-actor-attribute",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "swift:actor",
+      "expected_contains": [
+        "Class:Cache"
+      ]
+    },
+    {
+      "id": "swift-mainactor-attribute",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "MainActor",
+      "expected_contains": [
+        "Class:UserRepository"
+      ]
+    },
+    {
+      "id": "swift-published-attribute",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "Published",
+      "expected_contains": [
+        "Field:users"
+      ]
+    },
+    {
+      "id": "swift-computed-attribute",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "swift:computed",
+      "expected_contains": []
+    },
+    {
+      "id": "swift-protocol-references",
+      "kind": "references_to_symbol",
+      "to": "Endpoint",
+      "expected_contains": [
+        "Endpoint"
+      ]
+    },
+    {
+      "id": "swift-body-search",
+      "kind": "body_search",
+      "text": "trimmingCharacters",
+      "expected_contains": [
+        "sanitized:trimmingCharacters"
+      ]
+    },
+    {
+      "id": "swift-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
+    }
+  ]
+}

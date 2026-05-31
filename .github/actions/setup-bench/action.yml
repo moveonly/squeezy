@@ -34,6 +34,33 @@ runs:
           8.0.x
           10.0.x
 
+    - name: Set up JDK 17 for Kotlin oracle
+      if: inputs.language == 'kotlin'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Install Kotlin compiler
+      if: inputs.language == 'kotlin'
+      shell: bash
+      run: |
+        # KotlinOracle.kt imports `org.jetbrains.kotlin.com.intellij.*`, the
+        # shaded IntelliJ namespace that only ships in the kotlin-compiler-
+        # embeddable Maven artifact. The standalone kotlinc distribution
+        # only carries the unshaded `com.intellij.*` classes, so we install
+        # both: the standalone tarball provides the `kotlinc` launcher and
+        # stdlib jars; the embeddable jar is dropped next to them so
+        # build.sh can find it via the lib/ directory.
+        # Pin in lockstep with the tree-sitter-kotlin-ng grammar release.
+        KOTLIN_VERSION="1.9.24"
+        curl -sLo /tmp/kotlin.zip \
+          "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
+        sudo unzip -q /tmp/kotlin.zip -d /opt
+        sudo curl -fL -o /opt/kotlinc/lib/kotlin-compiler-embeddable.jar \
+          "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-compiler-embeddable/${KOTLIN_VERSION}/kotlin-compiler-embeddable-${KOTLIN_VERSION}.jar"
+        echo "/opt/kotlinc/bin" >> "$GITHUB_PATH"
+
     - name: Install C/C++ validation tools
       if: inputs.language == 'c-family'
       shell: bash
@@ -42,6 +69,25 @@ runs:
         sudo apt-get install -y clang
         clang --version
         clang++ --version
+
+    - name: Set up JDK 17 for Scala
+      if: inputs.language == 'scala'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Install Coursier + Scala 3 toolchain
+      if: inputs.language == 'scala'
+      shell: bash
+      run: |
+        curl -fL https://github.com/coursier/launchers/raw/master/cs-x86_64-pc-linux.gz \
+          | gunzip > cs
+        chmod +x cs
+        sudo mv cs /usr/local/bin/cs
+        cs setup --yes
+        cs install --quiet scala3-compiler scala-cli
+        echo "$HOME/.local/share/coursier/bin" >> "$GITHUB_PATH"
 
     - name: Ensure rust-analyzer when available
       if: inputs.language == 'rust'
@@ -68,12 +114,21 @@ runs:
           java)
             java -version
             ;;
+          kotlin)
+            java -version
+            kotlinc -version
+            ;;
           js-ts)
             node --version
             npm --version
             ;;
           python)
             python --version
+            ;;
+          scala)
+            java -version
+            scalac -version || true
+            scala-cli --version || true
             ;;
         esac
 

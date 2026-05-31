@@ -124,6 +124,16 @@ export const languageRows: MatrixRow[] = [
     status: "first-class graph"
   },
   {
+    name: "Kotlin",
+    detail: "Packages, imports (aliased/wildcard), classes, objects, companion objects, data/sealed types, extension functions, suspend, typealiases, and Gradle facts.",
+    status: "first-class graph"
+  },
+  {
+    name: "Scala",
+    detail: "Packages, classes, traits, case classes, enums, companion objects, extension methods, given declarations, top-level defs, and Scala 3 imports.",
+    status: "first-class graph"
+  },
+  {
     name: "C#",
     detail: "Namespaces, types, members, partial links, inheritance, references, and .csproj/.sln project facts.",
     status: "first-class graph"
@@ -151,6 +161,26 @@ export const languageRows: MatrixRow[] = [
   {
     name: "TypeScript",
     detail: "Imports, exports, classes, interfaces, type aliases, enums, decorators, type references, calls, and TSX declarations.",
+    status: "first-class graph"
+  },
+  {
+    name: "PHP",
+    detail: "Namespaces, use imports (named/aliased/group/function/const), classes, interfaces, traits, enums, backed enums, methods, properties, attributes, calls, and references.",
+    status: "first-class graph"
+  },
+  {
+    name: "Ruby",
+    detail: "Classes, modules, methods, singleton methods, attr_* synthesis, require_relative imports, include/extend/prepend mixins, calls, and references.",
+    status: "first-class graph"
+  },
+  {
+    name: "Swift",
+    detail: "Imports, classes, structs, actors, protocols, enums with associated cases, extensions, generics with constraints, property wrappers, and module hints.",
+    status: "first-class graph"
+  },
+  {
+    name: "Dart",
+    detail: "Libraries, parts, classes, mixins, extensions, extension types, sealed classes, enums, named and factory constructors, getters/setters, async modifiers, and prefix imports with show/hide combinators.",
     status: "first-class graph"
   }
 ];

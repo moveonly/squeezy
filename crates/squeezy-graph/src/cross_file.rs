@@ -10,10 +10,12 @@
 
 pub mod scheduler;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use squeezy_core::{FileId, SymbolId};
+use squeezy_core::{EdgeKind, FileId, SymbolId};
+
+use crate::SemanticGraph;
 
 /// Shape of an exported binding. Captures whether a name leaves a module as
 /// the default export, a named binding, a star re-export, etc., so the
@@ -159,3 +161,73 @@ pub struct ResolverSlot {
 
 /// Map keyed by `FileId` holding a [`ResolverSlot`] for each scanned file.
 pub type ResolverSlots = HashMap<FileId, ResolverSlot>;
+
+/// Inheritance-style edge kinds the ancestor walker consults. Order matters
+/// — PHP method resolution looks up the trait ancestors first (in declaration
+/// order), then the `Extends` parent, then the `Implements` interfaces. The
+/// generic walker in [`SemanticGraph::walk_inheritance_ancestors`] enumerates
+/// in this same priority so a per-language method lookup can pick the first
+/// hit and match PHP's runtime semantics. Java's `extends` / `implements` and
+/// C#'s `base` walks already work because they only ever see the
+/// `Extends`/`Implements` slots — adding `UsesTrait` does not change their
+/// behavior when no trait edges are present.
+const ANCESTOR_EDGE_KINDS: [EdgeKind; 3] =
+    [EdgeKind::UsesTrait, EdgeKind::Extends, EdgeKind::Implements];
+
+impl SemanticGraph {
+    /// Breadth-first walk of the inheritance-style ancestors of `start`,
+    /// following `UsesTrait` / `Extends` / `Implements` edges in that
+    /// declaration order. Returns every reachable ancestor symbol id in
+    /// visit order with `start` excluded.
+    ///
+    /// PHP semantics drive the per-class ordering: traits (in declaration
+    /// order) shadow the `Extends` parent, which shadows `Implements`
+    /// interfaces. Walking traits before extends in BFS lets a caller pick
+    /// the first hit and match the language's actual method-resolution
+    /// order. Java and C# never emit `UsesTrait` edges, so the walker is a
+    /// no-op extension for them and they keep the existing
+    /// `Extends`/`Implements` behavior.
+    ///
+    /// Cycle safety: trait usage can be diamond-shaped (`trait A { use B; }
+    /// trait B { use A; }`), and language extractors may emit cyclic
+    /// `Extends` chains for malformed code. The walker tracks visited
+    /// symbol ids in a `HashSet`, so each ancestor is enumerated exactly
+    /// once and a cycle terminates the walk for that branch.
+    ///
+    /// This consults `self.edges` directly rather than `edges_by_from`
+    /// because [`SemanticGraph::rebuild_semantic_edges`] pushes the new
+    /// type edges (including `UsesTrait`) BEFORE `add_call_edges` runs but
+    /// only refreshes the indexed `edges_by_from` map afterward in
+    /// `rebuild_indexes`. The direct scan keeps the walker correct from
+    /// call-resolution time onward.
+    pub(crate) fn walk_inheritance_ancestors(&self, start: &SymbolId) -> Vec<SymbolId> {
+        let mut visited: HashSet<SymbolId> = HashSet::new();
+        visited.insert(start.clone());
+        let mut order = Vec::new();
+        let mut queue: VecDeque<SymbolId> = VecDeque::new();
+        queue.push_back(start.clone());
+        while let Some(current) = queue.pop_front() {
+            // Visit edge kinds in the PHP method-resolution order so trait
+            // ancestors land in `order` before the `Extends` parent and
+            // before any `Implements` interface. We pay the small cost of
+            // three filtered passes per node so the per-kind enumeration
+            // order is preserved even when the underlying `self.edges()`
+            // slice is in insertion order.
+            for kind in ANCESTOR_EDGE_KINDS {
+                for edge in self.edges() {
+                    if edge.from != current || edge.kind != kind {
+                        continue;
+                    }
+                    let Some(target) = edge.to.clone() else {
+                        continue;
+                    };
+                    if visited.insert(target.clone()) {
+                        order.push(target.clone());
+                        queue.push_back(target);
+                    }
+                }
+            }
+        }
+        order
+    }
+}

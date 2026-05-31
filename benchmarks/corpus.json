@@ -39,6 +39,16 @@
       "ra_lsp_probes": 0
     },
     {
+      "name": "scala-smoke",
+      "family": "scala",
+      "language": "scala",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/scala/semantic-cases",
+      "spec": "benchmarks/specs/scala-smoke-queries.json",
+      "report": "scala/scala-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
       "name": "go-smoke",
       "family": "go",
       "language": "go",
@@ -79,6 +89,34 @@
       "spec": "benchmarks/specs/csharp-smoke-queries.json",
       "report": "csharp/csharp-smoke.json",
       "ra_lsp_probes": 0
+    },
+    {
+      "name": "php-smoke",
+      "family": "php",
+      "language": "php",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/php/semantic-cases",
+      "spec": "benchmarks/specs/php-smoke-queries.json",
+      "report": "php/php-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "symfony-console",
+      "family": "php",
+      "language": "php",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/symfony-console/src/Symfony/Component/Console",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "php/symfony-console.json",
+      "mixed_repo": "target/benchmark-repos/symfony-console/src/Symfony/Component/Console",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/symfony/console",
+        "rev": "TBD-pin-v7.2.0-commit-sha-when-landing",
+        "checkout": "target/benchmark-repos/symfony-console"
+      }
     },
     {
       "name": "js-ts-smoke",
@@ -697,6 +735,111 @@
         "rev": "6ae5fecd46f1a787c9cac9531420c510ec8d2c0d",
         "checkout": "target/benchmark-repos/prettier"
       }
+    },
+    {
+      "name": "kotlin-smoke",
+      "family": "kotlin",
+      "language": "kotlin",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/kotlin/semantic-cases",
+      "spec": "benchmarks/specs/kotlin-smoke-queries.json",
+      "report": "kotlin/kotlin-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "kotlinx-coroutines",
+      "family": "kotlin",
+      "language": "kotlin",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/kotlinx-coroutines/kotlinx-coroutines-core/common/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "kotlin/kotlinx-coroutines.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/Kotlin/kotlinx.coroutines",
+        "rev": "1.10.1",
+        "checkout": "target/benchmark-repos/kotlinx-coroutines"
+      }
+    },
+    {
+      "name": "ruby-smoke",
+      "family": "ruby",
+      "language": "ruby",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/ruby/semantic-cases",
+      "spec": "benchmarks/specs/ruby-smoke-queries.json",
+      "report": "ruby/ruby-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "sinatra",
+      "family": "ruby",
+      "language": "ruby",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/sinatra/lib",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "ruby/sinatra.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/sinatra/sinatra",
+        "rev": "v4.1.1",
+        "checkout": "target/benchmark-repos/sinatra"
+      }
+    },
+    {
+      "name": "swift-smoke",
+      "family": "swift",
+      "language": "swift",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/swift/semantic-cases",
+      "spec": "benchmarks/specs/swift-smoke-queries.json",
+      "report": "swift/swift-smoke.json",
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true
+    },
+    {
+      "name": "swift-nio",
+      "family": "swift",
+      "language": "swift",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/swift-nio/Sources/NIOCore",
+      "spec": "benchmarks/specs/swift-smoke-queries.json",
+      "report": "swift/swift-nio.json",
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/apple/swift-nio",
+        "rev": "2.65.0",
+        "checkout": "target/benchmark-repos/swift-nio"
+      }
+    },
+    {
+      "name": "utest",
+      "family": "scala",
+      "language": "scala",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/utest/utest/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "scala/utest.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/com-lihaoyi/utest",
+        "rev": "fb8aa9ddb73153e1693d072464d2ddf6976631ba",
+        "checkout": "target/benchmark-repos/utest"
+      }
+    },
+    {
+      "name": "dart-smoke",
+      "family": "dart",
+      "language": "dart",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/dart/semantic-cases",
+      "spec": "benchmarks/specs/dart-smoke-queries.json",
+      "report": "dart/dart-smoke.json",
+      "ra_lsp_probes": 25
     }
   ]
 }

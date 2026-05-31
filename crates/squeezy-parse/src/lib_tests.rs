@@ -1016,6 +1016,240 @@ record Helper(String name) {
 }
 
 #[test]
+fn parser_extracts_kotlin_package_imports_classes_and_calls() {
+    let source = r#"package com.example.app
+
+import com.example.services.Greeter
+import com.example.services.FriendlyGreeter as Friendly
+import kotlin.text.*
+
+class Runner(private val greeter: Greeter) {
+    suspend fun run() {
+        val name = greeter.greet()
+        Friendly.create()
+    }
+}
+
+fun String.prepare(): String = this.trim()
+
+object StringOps {
+    fun normalize(s: String): String = s.lowercase()
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/app/Runner.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none(), "expected supported parse");
+    assert_eq!(parsed.package.as_deref(), Some("com.example.app"));
+    // Package marker import.
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "com.example.app" && import.alias.as_deref() == Some("__kotlin_package__")
+    }));
+    // Aliased import.
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "com.example.services.FriendlyGreeter"
+            && import.alias.as_deref() == Some("Friendly")
+    }));
+    // Wildcard import.
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.is_glob && import.path == "kotlin.text"),
+    );
+
+    // Class with primary-constructor field promotion.
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "Runner" && symbol.kind == SymbolKind::Class })
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "greeter"
+            && symbol.kind == SymbolKind::Field
+            && symbol
+                .attributes
+                .contains(&"kotlin:ctor_property".to_string())
+    }));
+    // Suspend function.
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "run"
+            && symbol.kind == SymbolKind::Method
+            && symbol.attributes.contains(&"kotlin:suspend".to_string())
+    }));
+    // Extension function with receiver captured into language_identity.
+    let prepare = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "prepare")
+        .expect("prepare extension function");
+    assert_eq!(prepare.kind, SymbolKind::Function);
+    assert_eq!(prepare.language_identity.as_deref(), Some("String"));
+    assert!(prepare.attributes.contains(&"kotlin:extension".to_string()));
+
+    // Object declaration tagged.
+    let string_ops = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "StringOps")
+        .expect("StringOps object");
+    assert_eq!(string_ops.kind, SymbolKind::Class);
+    assert!(string_ops.attributes.contains(&"kotlin:object".to_string()));
+
+    // Calls: navigation-form should be Method; bare-name should be Direct.
+    assert!(parsed.calls.iter().any(|call| call.name == "greet"
+        && call.kind == ParsedCallKind::Method
+        && call.receiver.as_deref() == Some("greeter")));
+}
+
+#[test]
+fn parser_handles_kotlin_data_class_and_sealed_interface() {
+    let source = r#"package com.example.services
+
+sealed interface Greeter {
+    fun greet(): String
+}
+
+class FriendlyGreeter : Greeter {
+    companion object {
+        fun create(): FriendlyGreeter = FriendlyGreeter()
+    }
+    override fun greet(): String = "hi"
+}
+
+data class Person(val name: String, val age: Int)
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/services/Greeter.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+
+    // sealed interface -> Trait + kotlin:sealed attribute
+    let greeter = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Greeter")
+        .expect("Greeter trait");
+    assert_eq!(greeter.kind, SymbolKind::Trait);
+    assert!(greeter.attributes.contains(&"kotlin:sealed".to_string()));
+
+    // delegation base recorded on FriendlyGreeter
+    let friendly = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "FriendlyGreeter")
+        .expect("FriendlyGreeter class");
+    assert_eq!(friendly.kind, SymbolKind::Class);
+    assert!(friendly.attributes.contains(&"base:Greeter".to_string()));
+
+    // companion-object child re-parented to host class
+    let create = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "create")
+        .expect("create method");
+    assert_eq!(create.kind, SymbolKind::Method);
+    assert_eq!(create.parent_id.as_ref(), Some(&friendly.id));
+
+    // data class flag
+    let person = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Person")
+        .expect("Person class");
+    assert!(person.attributes.contains(&"kotlin:data".to_string()));
+    // primary-constructor fields promoted
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "name"
+            && symbol.kind == SymbolKind::Field
+            && symbol.parent_id.as_ref() == Some(&person.id)
+    }));
+}
+
+#[test]
+fn parser_handles_kotlin_top_level_decls_typealias_and_enums() {
+    let source = r#"package com.example.util
+
+typealias UserId = String
+
+val GREETING: String = "Hello"
+
+var counter: Int = 0
+
+suspend fun fetchDefault(): String = "default"
+
+enum class Color {
+    RED, GREEN, BLUE
+}
+
+val lazyVal: Int by lazy { 42 }
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/util/Util.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+
+    let alias = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "UserId")
+        .expect("UserId typealias");
+    assert_eq!(alias.kind, SymbolKind::TypeAlias);
+    assert_eq!(alias.language_identity.as_deref(), Some("String"));
+
+    let greeting = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "GREETING")
+        .expect("GREETING top-level val");
+    assert_eq!(greeting.kind, SymbolKind::Const);
+    assert!(greeting.parent_id.is_none(), "top-level val has no parent");
+
+    let counter = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "counter")
+        .expect("counter top-level var");
+    assert_eq!(counter.kind, SymbolKind::Static);
+
+    let fetch = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "fetchDefault")
+        .expect("fetchDefault function");
+    assert_eq!(fetch.kind, SymbolKind::Function);
+    assert!(fetch.attributes.contains(&"kotlin:suspend".to_string()));
+
+    let color = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Color")
+        .expect("Color enum");
+    assert_eq!(color.kind, SymbolKind::Enum);
+    let red = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "RED")
+        .expect("RED variant");
+    assert_eq!(red.kind, SymbolKind::Variant);
+    assert_eq!(red.parent_id.as_ref(), Some(&color.id));
+
+    let delegated = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "lazyVal")
+        .expect("delegated lazyVal");
+    assert!(
+        delegated
+            .attributes
+            .contains(&"kotlin:delegated".to_string())
+    );
+    assert_eq!(delegated.confidence, Confidence::Partial);
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
@@ -1579,6 +1813,120 @@ public:
 }
 
 #[test]
+fn parser_extracts_php_symbols_imports_calls_and_references() {
+    let source = r#"<?php
+namespace Foo\Bar;
+
+use Foo\Traits\Loggable;
+use Foo\Bar\Service as Svc;
+
+interface IRunner {
+    public function run(int $id): void;
+}
+
+trait Loggable {
+    protected function log(string $msg): void {
+    }
+}
+
+class Service implements IRunner {
+    use Loggable;
+
+    public string $prefix = 'svc-';
+
+    public function run(int $id): void {
+        $this->log("running $id");
+    }
+}
+
+enum Status: string {
+    case Ok = 'ok';
+    case Failed = 'fail';
+}
+
+class Magic {
+    public function __call($name, $args) {
+        return null;
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = php_record("src/all.php", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert_eq!(parsed.package.as_deref(), Some("Foo.Bar"));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Interface && symbol.name == "IRunner" })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Trait && symbol.name == "Loggable" })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Class && symbol.name == "Service" })
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.kind == SymbolKind::Enum
+            && symbol.name == "Status"
+            && symbol
+                .attributes
+                .iter()
+                .any(|attr| attr == "php:backed:string")
+    }));
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.kind == SymbolKind::Method
+            && symbol.name == "__call"
+            && symbol.attributes.iter().any(|attr| attr == "php:magic")
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Field && symbol.name == "prefix" })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.kind == SymbolKind::Variant && symbol.name == "Ok" })
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "Foo.Traits.Loggable" && import.alias.is_none())
+    );
+    assert!(
+        parsed.imports.iter().any(
+            |import| import.path == "Foo.Bar.Service" && import.alias.as_deref() == Some("Svc")
+        )
+    );
+    let service = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Service")
+        .unwrap();
+    assert!(
+        service
+            .attributes
+            .iter()
+            .any(|attr| attr == "uses_trait:Loggable"),
+        "Service should carry uses_trait:Loggable attribute"
+    );
+    assert!(service.attributes.iter().any(|attr| attr == "base:IRunner"));
+    assert!(parsed.calls.iter().any(|call| call.name == "log"));
+}
+
+#[test]
 fn parser_parallel_records_preserve_order_and_cache_changes() {
     let mut parser = LanguageParser::new().unwrap();
     let mut records = (0..10)
@@ -2010,6 +2358,497 @@ export function noisy(items) {
     }
 }
 
+#[test]
+fn parser_extracts_ruby_symbols_imports_calls_and_references() {
+    let source = r#"
+require "json"
+require_relative "user"
+
+class Admin < User
+  include Auditable
+
+  attr_accessor :name, :email
+  attr_reader :role
+
+  def promote(target)
+    target.full_name
+  end
+
+  def self.find_by_email(email)
+    nil
+  end
+end
+
+def standalone_runner(arg)
+  arg.do_thing
+end
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/models/admin.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    let admin = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Admin" && s.kind == SymbolKind::Class)
+        .expect("Admin class");
+    assert!(admin.attributes.contains(&"base:User".to_string()));
+    assert!(
+        admin
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:include:Auditable")
+    );
+    assert!(parsed.symbols.iter().any(|s| s.name == "promote"
+        && s.kind == SymbolKind::Method
+        && s.parent_id == Some(admin.id.clone())));
+    let find_by_email = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "find_by_email")
+        .expect("find_by_email symbol");
+    assert_eq!(find_by_email.kind, SymbolKind::Method);
+    assert!(
+        find_by_email
+            .attributes
+            .iter()
+            .any(|a| a == "ruby:singleton")
+    );
+    assert!(parsed.symbols.iter().any(|s| s.name == "name"
+        && s.kind == SymbolKind::Method
+        && s.attributes.iter().any(|a| a == "ruby:synthesized")
+        && s.attributes.iter().any(|a| a == "ruby:attr-reader")));
+    assert!(parsed.symbols.iter().any(|s| s.name == "name="
+        && s.kind == SymbolKind::Method
+        && s.attributes.iter().any(|a| a == "ruby:attr-writer")));
+    assert!(parsed.symbols.iter().any(|s| s.name == "role"
+        && s.kind == SymbolKind::Method
+        && s.attributes.iter().any(|a| a == "ruby:attr-reader")));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "standalone_runner" && s.kind == SymbolKind::Function)
+    );
+    assert!(parsed.imports.iter().any(|i| i.path == "json"));
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "app/models/user.rb")
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|c| c.name == "full_name" && c.receiver.as_deref() == Some("target"))
+    );
+}
+
+#[test]
+fn parser_handles_ruby_module_and_class_variables() {
+    let source = r#"
+module Auditable
+  CONST_VAL = 42
+  @@cvar = "x"
+
+  def audit!(event)
+    @event = event
+    log(event)
+    sql = <<~SQL
+      SELECT bogus FROM tbl WHERE id = 1
+    SQL
+    Foo::Bar.new(sql)
+  end
+end
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/concerns/auditable.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    let module = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Auditable" && s.kind == SymbolKind::Module)
+        .expect("Auditable module");
+    assert!(parsed.symbols.iter().any(|s| s.name == "audit!"
+        && s.kind == SymbolKind::Method
+        && s.parent_id == Some(module.id.clone())));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "CONST_VAL" && s.kind == SymbolKind::Const)
+    );
+    assert!(parsed.symbols.iter().any(|s| s.name == "@@cvar"
+        && s.kind == SymbolKind::Field
+        && s.attributes.iter().any(|a| a == "ruby:cvar")));
+    assert!(parsed.symbols.iter().any(|s| s.name == "@event"
+        && s.kind == SymbolKind::Field
+        && s.attributes.iter().any(|a| a == "ruby:ivar")));
+    // The heredoc body should not surface as an identifier reference.
+    for reference in &parsed.references {
+        assert_ne!(reference.text, "bogus");
+    }
+    // The `Foo::Bar.new(sql)` call should still register inside the method.
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|c| c.name == "new" && c.receiver.as_deref() == Some("Foo::Bar"))
+    );
+}
+
+#[test]
+fn parser_records_singleton_class_methods() {
+    let source = r#"
+class Greeter
+  class << self
+    def make
+      Greeter.new
+    end
+  end
+end
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/services/greeter.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let greeter = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Greeter" && s.kind == SymbolKind::Class)
+        .expect("Greeter class");
+    // The `make` method must be hosted by the Greeter class via the
+    // singleton_class descend path.
+    assert!(parsed.symbols.iter().any(|s| s.name == "make"
+        && s.kind == SymbolKind::Method
+        && s.parent_id == Some(greeter.id.clone())));
+}
+
+#[test]
+fn parser_extracts_swift_symbols_imports_calls_and_references() {
+    let source = r#"
+import Foundation
+import struct CoreGraphics.CGRect
+
+@MainActor
+public final class UserRepository {
+    @Published var users: [String] = []
+
+    public init() {}
+
+    public func refresh() async {
+        users.removeAll()
+    }
+}
+
+protocol Endpoint {
+    var path: String { get }
+    func encode() -> Data
+}
+
+struct UserEndpoint: Endpoint {
+    let path: String = "/users"
+    func encode() -> Data {
+        return Data()
+    }
+}
+
+actor Cache<Key: Hashable, Value> {
+    private var storage: [Key: Value] = [:]
+}
+
+extension String {
+    func sanitized() -> String {
+        return self
+    }
+}
+
+enum APIResult<Value, Failure: Error> {
+    case success(Value)
+    case failure(Failure)
+}
+
+typealias Endpoints = [Endpoint]
+
+func freeFunction() -> Int { return 1 }
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Models.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed.unsupported.is_none(),
+        "swift parser must not return unsupported"
+    );
+
+    // Imports
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|i| i.path == "Foundation" && i.kind == ImportKind::Named)
+    );
+    assert!(
+        parsed.imports.iter().any(
+            |i| i.path == "CoreGraphics.CGRect" && i.imported_name.as_deref() == Some("CGRect")
+        )
+    );
+
+    // SwiftPM module hint
+    assert_eq!(parsed.package.as_deref(), Some("Models"));
+
+    // Symbols: top-level types
+    let by_name = |name: &str, kind: SymbolKind| {
+        parsed
+            .symbols
+            .iter()
+            .find(|s| s.name == name && s.kind == kind)
+    };
+
+    let repo = by_name("UserRepository", SymbolKind::Class).expect("UserRepository class");
+    assert!(repo.attributes.iter().any(|a| a == "MainActor"));
+    assert!(repo.attributes.iter().any(|a| a == "swift:final"));
+
+    let cache = by_name("Cache", SymbolKind::Class).expect("Cache actor");
+    assert!(cache.attributes.iter().any(|a| a == "swift:actor"));
+    assert!(
+        cache.attributes.iter().any(|a| a == "base:Hashable"),
+        "Cache should record `base:Hashable` from generic constraint, got {:?}",
+        cache.attributes
+    );
+
+    let user_endpoint = by_name("UserEndpoint", SymbolKind::Struct).expect("UserEndpoint struct");
+    assert!(
+        user_endpoint
+            .attributes
+            .iter()
+            .any(|a| a == "base:Endpoint")
+    );
+
+    assert!(by_name("Endpoint", SymbolKind::Trait).is_some(), "protocol");
+    assert!(by_name("APIResult", SymbolKind::Enum).is_some(), "enum");
+    assert!(
+        by_name("Endpoints", SymbolKind::TypeAlias).is_some(),
+        "typealias"
+    );
+    assert!(
+        by_name("freeFunction", SymbolKind::Function).is_some(),
+        "file-scope func"
+    );
+
+    // Enum cases
+    assert!(by_name("success", SymbolKind::Variant).is_some());
+    assert!(by_name("failure", SymbolKind::Variant).is_some());
+
+    // Methods + arity
+    let refresh = by_name("refresh", SymbolKind::Method).expect("refresh method");
+    assert!(refresh.attributes.iter().any(|a| a == "swift:async"));
+    assert!(by_name("encode", SymbolKind::Method).is_some());
+    let init = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "init" && s.kind == SymbolKind::Method)
+        .expect("init method");
+    assert!(init.attributes.iter().any(|a| a == "swift:init"));
+
+    // Fields
+    let users_field = by_name("users", SymbolKind::Field).expect("users field");
+    assert!(users_field.attributes.iter().any(|a| a == "Published"));
+
+    let path_field = by_name("path", SymbolKind::Field).expect("path field");
+    assert!(path_field.attributes.iter().any(|a| a == "type:String"));
+
+    // Extension propagates language_identity
+    let sanitized = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "sanitized" && s.kind == SymbolKind::Method)
+        .expect("sanitized method");
+    assert_eq!(sanitized.language_identity.as_deref(), Some("String"));
+    assert!(
+        sanitized.parent_id.is_none(),
+        "extension members emit at file scope"
+    );
+
+    // References: at least one Endpoint type reference
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|r| r.text == "Endpoint" && r.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
+fn parser_extracts_swift_computed_properties_and_attributes() {
+    let source = r#"
+import Foundation
+
+struct Person {
+    let first: String
+    let last: String
+
+    var fullName: String {
+        get { "\(first) \(last)" }
+    }
+}
+
+@objc(MyHandler)
+class Handler {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Person.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+    let full_name = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "fullName" && s.kind == SymbolKind::Field)
+        .expect("fullName field");
+    assert!(
+        full_name.attributes.iter().any(|a| a == "swift:computed"),
+        "computed property must carry swift:computed attribute"
+    );
+    let handler = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Handler" && s.kind == SymbolKind::Class)
+        .expect("Handler class");
+    assert!(handler.attributes.iter().any(|a| a == "objc"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|r| r.text == "MyHandler" && r.kind == ReferenceKind::Attribute),
+        "objc(MyHandler) records MyHandler as attribute"
+    );
+}
+
+#[test]
+fn parser_skips_swift_function_body_and_file_scope_lets() {
+    // SourceKit-LSP's `documentSymbol` reports stored properties at type
+    // scope (kind 7) but classifies file-scope and function-body
+    // `let`/`var` bindings as kind 13 (Variable) and excludes them from
+    // per-file symbol scans. Squeezy should mirror that filter so the
+    // smoke comparison does not produce spurious Field FPs (e.g.
+    // `Repository.swift:Field:trimmed` from a `let trimmed = ...` local
+    // inside `refresh()`, or `Package.swift:Field:package` from the
+    // SwiftPM manifest binding `let package = Package(...)`).
+    let source = r#"
+import Foundation
+
+let manifest = Manifest(name: "App")
+
+public final class Repo {
+    var users: [String] = []
+
+    public func refresh() {
+        let trimmed = " a ".sanitized()
+        users.append(trimmed)
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Repo.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // Type-scope stored property is kept (matches kind 7 Property).
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "users" && s.kind == SymbolKind::Field),
+        "type-scope `var users` must still emit as Field"
+    );
+    // Function-body local: dropped (matches kind 13 Variable, parent=Method).
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "trimmed" && s.kind == SymbolKind::Field),
+        "function-body local `let trimmed` must not emit as Field"
+    );
+    // File-scope binding: dropped (matches kind 13 Variable, no parent).
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|s| s.name == "manifest" && s.kind == SymbolKind::Field),
+        "file-scope `let manifest = ...` must not emit as Field"
+    );
+}
+
+#[test]
+fn parser_skips_swift_call_function_navigation_reference() {
+    // `foo.bar()` produces both a `call_expression` and a
+    // `navigation_expression` for `foo.bar`. The call already records
+    // the method invocation as a `ParsedCall`, so the duplicate
+    // `Field`-kind reference at the suffix would double-count against
+    // SourceKit-LSP's `textDocument/references` (which ties the call to
+    // the method declaration via its index, not the raw suffix). Member
+    // access without invocation (`obj.field`) still emits the reference.
+    let source = r#"
+import Foundation
+
+extension String {
+    public func sanitized() -> String { return self }
+}
+
+public final class Repo {
+    var users: [String] = []
+    public func refresh() {
+        let value = "x".sanitized()
+        users.append(value)
+        let count = users.count
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = swift_record("Sources/Models/Repo.swift", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // Method-call suffixes do not emit a navigation reference.
+    assert!(
+        !parsed
+            .references
+            .iter()
+            .any(|r| r.text == "sanitized" && r.kind == ReferenceKind::Field),
+        "call-function navigation_expression must not emit a `sanitized` reference; got refs={:?}",
+        parsed
+            .references
+            .iter()
+            .map(|r| (r.kind, r.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !parsed
+            .references
+            .iter()
+            .any(|r| r.text == "append" && r.kind == ReferenceKind::Field),
+        "call-function navigation_expression must not emit an `append` reference"
+    );
+    // Property access (`users.count`) is not a call: the suffix
+    // reference is still emitted for member-lookup queries.
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|r| r.text == "count" && r.kind == ReferenceKind::Field),
+        "plain `users.count` member access must still emit the suffix reference"
+    );
+    // The call itself still surfaces in the parsed-call stream.
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|c| c.name == "sanitized" && c.receiver.as_deref() == Some("\"x\"")),
+        "extension-method call must still appear in parsed calls"
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);
@@ -2030,6 +2869,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn ruby_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Ruby;
     record
 }
 
@@ -2078,6 +2923,24 @@ fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
 fn go_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Go;
+    record
+}
+
+fn kotlin_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Kotlin;
+    record
+}
+
+fn php_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Php;
+    record
+}
+
+fn swift_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Swift;
     record
 }
 

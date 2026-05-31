@@ -19,6 +19,16 @@ use crate::{
     report::*,
 };
 
+/// Generic LSP navigation client interface so the `compare_*_probes` helpers
+/// can be shared between rust-analyzer (Rust corpus) and SourceKit-LSP
+/// (Swift corpus). Implementations are responsible for the LSP transport;
+/// the helpers below own the squeezy-vs-LSP TP/FP/FN bookkeeping.
+pub(crate) trait LspNavigationClient {
+    fn did_open(&mut self, uri: &str, path: &Path) -> Result<()>;
+    fn definition(&mut self, uri: &str, position: LspPosition) -> Result<Vec<LocationKey>>;
+    fn references(&mut self, uri: &str, position: LspPosition) -> Result<Vec<LocationKey>>;
+}
+
 pub(crate) fn collect_accuracy(
     root: &Path,
     graph: &SemanticGraph,
@@ -174,10 +184,10 @@ pub(crate) fn navigation_limitations() -> Vec<String> {
     ]
 }
 
-fn compare_definition_probes(
+pub(crate) fn compare_definition_probes<C: LspNavigationClient>(
     root: &Path,
     graph: &SemanticGraph,
-    client: &mut RustAnalyzerLsp,
+    client: &mut C,
     probe_limit: usize,
 ) -> Result<DefinitionAccuracyReport> {
     let (available_probes, probes) = build_definition_probes(graph, probe_limit)?;
@@ -265,10 +275,10 @@ fn compare_definition_probes(
     Ok(report)
 }
 
-fn compare_reference_probes(
+pub(crate) fn compare_reference_probes<C: LspNavigationClient>(
     root: &Path,
     graph: &SemanticGraph,
-    client: &mut RustAnalyzerLsp,
+    client: &mut C,
     probe_limit: usize,
 ) -> Result<ReferenceAccuracyReport> {
     let (available_symbols, probes) = build_reference_probes(root, graph, probe_limit)?;

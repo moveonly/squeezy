@@ -1,7 +1,13 @@
 pub mod c_family;
 pub mod csharp;
+pub mod dart;
 pub mod go;
 pub mod java;
 pub mod js_ts;
+pub mod kotlin;
+pub mod php;
 pub mod python;
+pub mod ruby;
 pub mod rust;
+pub mod scala;
+pub mod swift;

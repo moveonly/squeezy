@@ -27,6 +27,12 @@ struct CSharpBackend;
 struct GoBackend;
 struct CFamilyBackend;
 struct JsTsBackend;
+struct RubyBackend;
+struct PhpBackend;
+struct KotlinBackend;
+struct SwiftBackend;
+struct ScalaBackend;
+struct DartBackend;
 
 macro_rules! backend {
     ($type_name:ty, $family:expr, $extract:path) => {
@@ -69,6 +75,12 @@ backend!(
     crate::extract_c_family
 );
 backend!(JsTsBackend, LanguageFamily::JsTs, crate::extract_js_ts);
+backend!(RubyBackend, LanguageFamily::Ruby, crate::extract_ruby);
+backend!(PhpBackend, LanguageFamily::Php, crate::extract_php);
+backend!(KotlinBackend, LanguageFamily::Kotlin, crate::extract_kotlin);
+backend!(SwiftBackend, LanguageFamily::Swift, crate::extract_swift);
+backend!(ScalaBackend, LanguageFamily::Scala, crate::extract_scala);
+backend!(DartBackend, LanguageFamily::Dart, crate::extract_dart);
 
 static RUST: RustBackend = RustBackend;
 static PYTHON: PythonBackend = PythonBackend;
@@ -77,9 +89,17 @@ static CSHARP: CSharpBackend = CSharpBackend;
 static GO: GoBackend = GoBackend;
 static C_FAMILY: CFamilyBackend = CFamilyBackend;
 static JS_TS: JsTsBackend = JsTsBackend;
+static RUBY: RubyBackend = RubyBackend;
+static PHP: PhpBackend = PhpBackend;
+static KOTLIN: KotlinBackend = KotlinBackend;
+static SWIFT: SwiftBackend = SwiftBackend;
+static SCALA: ScalaBackend = ScalaBackend;
+static DART: DartBackend = DartBackend;
 
-static BACKENDS: [&'static dyn LanguageBackend; 7] =
-    [&RUST, &PYTHON, &JAVA, &CSHARP, &GO, &C_FAMILY, &JS_TS];
+static BACKENDS: [&'static dyn LanguageBackend; 13] = [
+    &RUST, &PYTHON, &JAVA, &CSHARP, &GO, &C_FAMILY, &JS_TS, &RUBY, &PHP, &KOTLIN, &SWIFT, &SCALA,
+    &DART,
+];
 
 pub fn inventory() -> &'static [&'static dyn LanguageBackend] {
     &BACKENDS

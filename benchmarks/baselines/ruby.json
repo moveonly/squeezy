@@ -1,0 +1,27 @@
+{
+  "language": "ruby",
+  "tier": "smoke",
+  "fixture": "benchmarks/fixtures/ruby/semantic-cases",
+  "recorded_at": "2026-05-30",
+  "ruby": {
+    "version": "3.3.11",
+    "prism_version": "0.19.0"
+  },
+  "build_ms": 3,
+  "build_phases": {
+    "crawl_ms": 1,
+    "parse_ms": 1,
+    "declaration_graph_ms": 0,
+    "full_graph_ms": 0,
+    "total_ms": 3
+  },
+  "oracle_ms": 74,
+  "symbols": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "true_positive": 12,
+    "false_positive": 0,
+    "false_negative": 0
+  },
+  "notes": "First-iteration baseline for the speed-parity gate (spec §11). Build_ms is the Squeezy total over 5 fixture files plus vendor/ and generated/ exclusions; oracle_ms is wall time of the Prism subprocess oracle. Re-runs reproduced precision/recall exactly and build_ms within 1ms."
+}

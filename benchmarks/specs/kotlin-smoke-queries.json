@@ -1,0 +1,98 @@
+{
+  "queries": [
+    {
+      "id": "kotlin-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:Runner",
+        "Trait:Greeter",
+        "Class:FriendlyGreeter",
+        "Class:RudeGreeter",
+        "Class:Person",
+        "Class:StringOps",
+        "Method:run",
+        "Method:greet",
+        "Method:create",
+        "Function:prepare",
+        "Function:fetchDefault"
+      ]
+    },
+    {
+      "id": "kotlin-class-signature",
+      "kind": "signature_search",
+      "text": "class Runner",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:Runner"
+      ]
+    },
+    {
+      "id": "kotlin-data-class-copy",
+      "kind": "signature_search",
+      "text": "data class Person",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:Person"
+      ]
+    },
+    {
+      "id": "kotlin-sealed-references",
+      "kind": "references_to_symbol",
+      "to": "Greeter",
+      "expected_contains": [
+        "Greeter"
+      ]
+    },
+    {
+      "id": "kotlin-suspend-call-chain",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "fetchDefault",
+      "expected_contains": [
+        "run -> fetchDefault"
+      ]
+    },
+    {
+      "id": "kotlin-companion-factory-chain",
+      "kind": "call_chain",
+      "from": "buildDefault",
+      "to": "create",
+      "expected_contains": [
+        "buildDefault -> create"
+      ]
+    },
+    {
+      "id": "kotlin-extension-resolution",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "prepare",
+      "expected_contains": [
+        "run -> prepare"
+      ]
+    },
+    {
+      "id": "kotlin-import-alias",
+      "kind": "reference_search",
+      "text": "Friendly",
+      "expected_contains": [
+        "FriendlyGreeter"
+      ]
+    },
+    {
+      "id": "kotlin-project-facts",
+      "kind": "kotlin_project_facts",
+      "expected_contains": [
+        "gradle:source_root:main:src/main/kotlin",
+        "gradle:dependency:implementation:org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1"
+      ]
+    },
+    {
+      "id": "kotlin-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
+    }
+  ]
+}

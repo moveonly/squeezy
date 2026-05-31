@@ -135,6 +135,37 @@ pub(crate) fn print_summary(report: &BenchmarkReport) {
             go.oracle_unparseable_files
         );
     }
+    if let Some(swift) = &report.swift_oracle {
+        println!(
+            "swift_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms status={}",
+            swift.symbols.true_positive,
+            swift.symbols.false_positive,
+            swift.symbols.false_negative,
+            swift.symbols.precision,
+            swift.symbols.recall,
+            swift.symbols.rust_analyzer_total,
+            swift.symbols.squeezy_total,
+            swift.oracle_ms,
+            swift.status,
+        );
+        print_navigation_summary("swift_oracle", &swift.navigation_accuracy);
+    }
+    if let Some(dart) = &report.dart_oracle {
+        println!(
+            "dart_oracle_symbol_accuracy: mode={} tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms oracle_unparseable={} status={}",
+            dart.mode,
+            dart.symbols.true_positive,
+            dart.symbols.false_positive,
+            dart.symbols.false_negative,
+            dart.symbols.precision,
+            dart.symbols.recall,
+            dart.symbols.rust_analyzer_total,
+            dart.symbols.squeezy_total,
+            dart.oracle_ms,
+            dart.oracle_unparseable_files,
+            dart.status,
+        );
+    }
     if let Some(refresh) = &report.refresh_probe {
         println!(
             "refresh_probe: language={} copied={} edited={} reparsed={} refresh_ms={} budget_exhausted={}",

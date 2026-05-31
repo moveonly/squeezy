@@ -12,7 +12,7 @@ use squeezy_core::{LanguageKind, Result, SqueezyError, SymbolKind};
 use squeezy_graph::SemanticGraph;
 
 use crate::{
-    accuracy::{increment_symbol, merge_symbol_scan},
+    accuracy::{LspNavigationClient, increment_symbol, merge_symbol_scan},
     report::{LocationKey, LspPosition, SymbolKey, SymbolScan},
     util::{command_exists, increment, truncate},
 };
@@ -513,6 +513,20 @@ impl RustAnalyzerLsp {
         self.stdout.read_exact(&mut body)?;
         serde_json::from_slice(&body)
             .map_err(|err| SqueezyError::Graph(format!("invalid LSP JSON response: {err}")))
+    }
+}
+
+impl LspNavigationClient for RustAnalyzerLsp {
+    fn did_open(&mut self, uri: &str, path: &Path) -> Result<()> {
+        RustAnalyzerLsp::did_open(self, uri, path)
+    }
+
+    fn definition(&mut self, uri: &str, position: LspPosition) -> Result<Vec<LocationKey>> {
+        RustAnalyzerLsp::definition(self, uri, position)
+    }
+
+    fn references(&mut self, uri: &str, position: LspPosition) -> Result<Vec<LocationKey>> {
+        RustAnalyzerLsp::references(self, uri, position)
     }
 }
 

@@ -1,0 +1,8 @@
+# SwiftPM build artifacts created by sourcekit-lsp during the corpus
+# benchmark run. Bench oracle plumbing in
+# benchmarks/squeezy-graph-bench/src/oracles/swift_sourcekit.rs launches
+# sourcekit-lsp with this directory as the workspace root, and the LSP
+# server materializes a Package.resolved + .build/ tree alongside the
+# fixture.
+.build/
+Package.resolved

@@ -1,0 +1,100 @@
+{
+  "queries": [
+    {
+      "id": "dart-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:HttpClient",
+        "Class:Response",
+        "Class:AuthState",
+        "Class:SignedIn",
+        "Class:SignedOut",
+        "Class:Service",
+        "Class:StringExt",
+        "Trait:Loggable",
+        "Method:fetch",
+        "Method:run",
+        "Method:log",
+        "Method:shout",
+        "Function:main"
+      ]
+    },
+    {
+      "id": "dart-class-signature",
+      "kind": "signature_search",
+      "text": "class HttpClient",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:HttpClient"
+      ]
+    },
+    {
+      "id": "dart-named-constructor-signature",
+      "kind": "signature_search",
+      "text": "const SignedIn(this.userId)",
+      "symbol_kind": "Method",
+      "attribute": "dart:constructor",
+      "expected_contains": [
+        "Method:SignedIn"
+      ]
+    },
+    {
+      "id": "dart-mixin-references",
+      "kind": "references_to_symbol",
+      "to": "Loggable",
+      "expected_contains": [
+        "Loggable"
+      ]
+    },
+    {
+      "id": "dart-async-call-chain-cross-file",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "fetch",
+      "expected_contains": [
+        "run -> fetch"
+      ]
+    },
+    {
+      "id": "dart-mixin-method-call-chain",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "log",
+      "expected_contains": [
+        "run -> log"
+      ]
+    },
+    {
+      "id": "dart-extension-method-resolution",
+      "kind": "call_chain",
+      "from": "main",
+      "to": "shout",
+      "expected_contains": [
+        "main -> shout"
+      ]
+    },
+    {
+      "id": "dart-part-of-resolution",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:Response"
+      ]
+    },
+    {
+      "id": "dart-import-prefix",
+      "kind": "reference_search",
+      "text": "net",
+      "expected_contains": [
+        "net"
+      ]
+    },
+    {
+      "id": "dart-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
+    }
+  ]
+}

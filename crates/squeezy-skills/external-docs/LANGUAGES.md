@@ -12,10 +12,16 @@ uses the same family names so coverage claims stay checkable.
 | `rust` | Rust | `rs` | `tree-sitter-rust` | `rust_analyzer` | yes | `benchmarks/fixtures/rust/semantic-cases` | `benchmarks/specs/smoke-queries.json` | ripgrep, fd, bat, tokio, serde |
 | `python` | Python | `py` | `tree-sitter-python` | `cpython_ast` | no | `benchmarks/fixtures/python/semantic-cases` | `benchmarks/specs/python-smoke-queries.json` | requests, flask, click, black, fastapi |
 | `java` | Java | `java` | `tree-sitter-java` | `javac` | no | `benchmarks/fixtures/java/semantic-cases` | `benchmarks/specs/java-smoke-queries.json` | junit5, mockito, guava, retrofit, picocli |
+| `kotlin` | Kotlin | `kt`, `kts` | `tree-sitter-kotlin-ng` | `kotlin_compiler_embeddable` | no | `benchmarks/fixtures/kotlin/semantic-cases` | `benchmarks/specs/kotlin-smoke-queries.json` | kotlinx-coroutines |
 | `csharp` | C# | `cs`, `csx` | `tree-sitter-c-sharp` | `roslyn` | yes | `benchmarks/fixtures/csharp/semantic-cases` | `benchmarks/specs/csharp-smoke-queries.json` | newtonsoft_json, dapper, automapper, polly, serilog |
 | `go` | Go | `go` | `tree-sitter-go` | `go_types` | yes | `benchmarks/fixtures/go/semantic-cases` | `benchmarks/specs/go-smoke-queries.json` | gin, cobra, prometheus, etcd, zap |
 | `c-family` | C, C++ | `c`, `h`, `cc`, `cpp`, `cxx`, `hh`, `hpp`, `hxx` | `tree-sitter-c`, `tree-sitter-cpp` | `clang` | yes | `benchmarks/fixtures/c/semantic-cases`, `benchmarks/fixtures/cpp/semantic-cases` | `benchmarks/specs/c-smoke-queries.json`, `benchmarks/specs/cpp-smoke-queries.json` | redis, curl, sqlite, protobuf, nlohmann_json |
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
+| `php` | PHP | `php` | `tree-sitter-php` | `nikic_php_parser` | yes | `benchmarks/fixtures/php/semantic-cases` | `benchmarks/specs/php-smoke-queries.json` | symfony-console |
+| `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
+| `scala` | Scala | `scala`, `sc` | `tree-sitter-scala` | `scala_semanticdb` | no | `benchmarks/fixtures/scala/semantic-cases` | `benchmarks/specs/scala-smoke-queries.json` | _(deferred to follow-up PR)_ |
+| `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
+| `dart` | Dart | `dart` | `tree-sitter-dart` | `dart_analyzer` | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(deferred to follow-up PR)_ |
 
 ## Rust
 
@@ -60,6 +66,32 @@ Known follow-ups: overload resolution, classpath completeness, annotation
 processing, and generated-source behavior are not compiler-equivalent.
 
 Oracle: `javac` compiler-tree scans for symbols and navigation query checks.
+
+## Kotlin
+
+Indexed: packages, imports (named/aliased/wildcard), classes, objects,
+companion objects, interfaces, sealed types, enums and enum entries, methods,
+secondary constructors, properties (top-level and class-level, `val`/`var`),
+typealiases, primary-constructor properties (promoted to fields), extension
+functions (receiver captured via `language_identity`), suspend / inline /
+operator / infix / tailrec attributes, override / abstract / open flags, and
+inheritance through `delegation_specifiers` (`base:<parent>` attributes).
+
+Known limitations: delegated-property accessor bodies (`val x by lazy {...}`),
+inline `reified` type-parameter modeling, generated data-class members
+(`copy`, `componentN`, `equals`, `hashCode`, `toString`), anonymous-object
+expressions, and overload resolution stay heuristic for v0; the oracle
+suppresses the same set so the symbol-set gates remain symmetric. Multiplatform
+`expect`/`actual` matching is not attempted.
+
+Known follow-ups: companion-object owner-path collapsing for member
+resolution, sealed-class child enumeration, and a Kotlin LSP-based navigation
+oracle (fwcd/kotlin-language-server) are scoped for a phase-2 follow-up
+once the symbol-set gates hold.
+
+Oracle: JetBrains `kotlin-compiler-embeddable` PSI walker
+(`benchmarks/oracle/kotlin/KotlinOracle.kt`). Build with
+`benchmarks/oracle/kotlin/build.sh` (requires `kotlinc` + JDK 17).
 
 ## C#
 
@@ -131,6 +163,95 @@ framework conventions can improve precision and recall.
 
 Oracle: TypeScript compiler API. CI installs the pinned `typescript` package and
 sets `SQUEEZY_TYPESCRIPT_PATH`.
+
+## PHP
+
+Indexed: namespaces, `use` imports (named, aliased, group, `use function`,
+`use const`), classes, interfaces, traits, enums (including backed enums),
+methods, properties, class constants, magic-method attribution, attribute
+heads (`#[Foo]`), calls (direct, member, scoped), object creation, and
+references. Trait inclusion (`use TraitA;`) is recorded as a `uses_trait`
+attribute on the consuming class plus a Type reference to the trait.
+
+Known limitations: dynamic class names (`new $cls`), variable variables
+(`$$x`), `eval`, heredoc/nowdoc interpolations, and magic-method dispatch
+(`__call`, `__get`, etc.) lower to Partial confidence or are excluded by
+design. Trait conflict resolution (`insteadof`/`as`) is recorded as an
+attribute but not modelled in detail. Inline HTML in mixed-template files
+is surfaced as fallback body content, not graph confidence.
+
+Known follow-ups: Symfony attribute heuristics beyond `#[Route]`,
+`#[AsCommand]`, `#[AsController]`; composer autoload-aware resolution; and
+a navigation oracle backed by phpactor LSP probes remain bounded
+deferrals.
+
+Oracle: nikic/PHP-Parser declaration scan invoked via a subprocess. CI
+installs PHP 8.3 + Composer + `composer install` in the oracle helper
+directory; absent any of those, the oracle status is `skipped` and only
+fixture-query truth gates run.
+
+## Ruby
+
+Indexed: classes, modules, methods, singleton methods (`def self.foo`),
+`class << self` singleton class bodies, top-level functions, synthesized
+`attr_accessor`/`attr_reader`/`attr_writer` accessors, `require`/
+`require_relative`/`load`/`autoload` imports, `include`/`extend`/`prepend`
+mixins (recorded as both Type references and `mixin:include:<Mod>` style
+attributes for ancestor walks), constants, class variables, instance
+variables, calls, and references.
+
+Known limitations: dynamic dispatch through `method_missing`,
+`define_method`, `eval`/`instance_eval`/`class_eval`/`module_eval`-built
+methods, anonymous classes via `Class.new`, runtime monkey-patching, and
+gem-style `require` path resolution are documented recall gaps and are
+excluded from the oracle as well. Receiver-typed call resolution is best
+effort because Ruby lacks parameter types.
+
+Oracle: Ruby Prism subprocess. CI installs Ruby 3.3 via `ruby/setup-ruby`
+with `continue-on-error: true`; when the toolchain is missing the oracle
+degrades to a `mode = "scan-only"` self-compare.
+
+## Swift
+
+Indexed: classes, structs, actors, protocols, enums (with associated-value cases),
+extensions (members carry `language_identity = ExtendedType` for cross-file
+receiver resolution), `init` / `deinit` / `subscript`, computed and stored
+properties (computed properties carry `swift:computed`), property wrappers
+(`@Published` etc. as attribute references), `@MainActor` / `@objc` /
+`@Sendable` attributes, generic constraints from both the type parameter clause
+and `where` clauses, module imports (`import M`, `import struct M.T`), and
+SwiftPM module hints derived from `Sources/<Module>/...` paths.
+
+Known limitations: `@dynamicMemberLookup` runtime resolution, full protocol
+witness tracking, Objective-C bridging (`.h`/`.m` siblings and `@objc(name)`
+mappings), `#externalMacro`/`#freestanding` macro expansion, and SwiftPM
+`Package.swift` parsing for module facts are deferred follow-ups. Closures
+contribute body hits to their enclosing symbol but do not produce symbols of
+their own.
+
+Oracle: SourceKit-LSP. The first PR ships the scan-only path that exercises the
+Swift extractor against a corpus-shaped fixture; CI installs the Swift 5.10
+toolchain on Linux and uses the bundled `sourcekit-lsp`. macOS-only frameworks
+(`Combine`, `SwiftUI`, `Network`) are intentionally absent from the fixture so
+the smoke run works on `ubuntu-latest`.
+
+## Dart
+
+Indexed: libraries, classes (including sealed and abstract), mixins, mixin-class
+declarations, extensions (anonymous and named), extension types, enums (with
+enhanced-enum methods), top-level functions, methods, named constructors,
+factory constructors, getters/setters, fields, typedefs, imports with prefixes
+and `show`/`hide` combinators, exports, `part`/`part of` directives, async
+modifiers, calls, type references, and library identifiers.
+
+Known limitations: `noSuchMethod` runtime dispatch is excluded (mirrors Ruby's
+`method_missing` stance). Conditional imports record both primary and
+alternate URIs as separate imports; the resolver prefers the primary when both
+exist. Generated `*.g.dart` / `*.freezed.dart` / `*.mocks.dart` files parse but
+are excluded from oracle precision/recall accounting via glob.
+
+Oracle: deferred to a follow-up PR. The first PR runs in scan-only mode while
+the `package:analyzer`-backed Dart oracle is wired up in CI.
 
 ## Benchmark Corpus Reporting
 

@@ -492,6 +492,56 @@ def all_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def _generic_oracle_summary(
+    reports: list[tuple[str, dict[str, Any]]],
+    title: str,
+    oracle_field: str,
+) -> str:
+    out = [f"## {title}"]
+    for path, report in reports:
+        oracle = report.get(oracle_field) or {}
+        acc = oracle.get("symbols", {}) or {}
+        out.extend(["", f"### {path}"])
+        out.append(f"- Fixture: {report['fixture']}")
+        out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
+        out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
+        if acc:
+            out.append(
+                "- Oracle symbols: TP={true_positive} FP={false_positive} "
+                "FN={false_negative} precision={precision} recall={recall}".format(**acc)
+            )
+        status = oracle.get("status")
+        if status:
+            out.append(f"- Oracle status: {status}")
+        write_query_table(out, report)
+    return "\n".join(out) + "\n"
+
+
+def ruby_summary(reports):
+    return _generic_oracle_summary(reports, "Ruby Semantic Graph Benchmark", "ruby_oracle")
+
+
+def php_summary(reports):
+    return _generic_oracle_summary(reports, "PHP Semantic Graph Benchmark", "php_oracle")
+
+
+def kotlin_summary(reports):
+    return _generic_oracle_summary(reports, "Kotlin Semantic Graph Benchmark", "kotlin_oracle")
+
+
+def swift_summary(reports):
+    return _generic_oracle_summary(reports, "Swift Semantic Graph Benchmark", "swift_oracle")
+
+
+def scala_summary(reports):
+    return _generic_oracle_summary(reports, "Scala Semantic Graph Benchmark", "scala_oracle")
+
+
+def dart_summary(reports):
+    return _generic_oracle_summary(reports, "Dart Semantic Graph Benchmark", "dart_oracle")
+
+
 SUMMARIZERS = {
     "all": all_summary,
     "rust": rust_summary,
@@ -504,6 +554,12 @@ SUMMARIZERS = {
     "go": go_summary,
     "js-ts": js_ts_summary,
     "typescript": js_ts_summary,
+    "ruby": ruby_summary,
+    "php": php_summary,
+    "kotlin": kotlin_summary,
+    "swift": swift_summary,
+    "scala": scala_summary,
+    "dart": dart_summary,
 }
 
 

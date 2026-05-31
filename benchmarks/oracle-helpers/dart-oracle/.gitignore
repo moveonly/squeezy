@@ -1,0 +1,5 @@
+# Dart pub fetches dependencies into .dart_tool/ on `pub get` / `dart run`.
+# These are regenerated from `pubspec.lock`, so keep the lockfile committed
+# but exclude the resolved cache from version control.
+.dart_tool/
+build/

@@ -15,8 +15,10 @@ use squeezy_workspace::FileRecord;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 pub(crate) use languages::{
-    c_family::extract_c_family, csharp::extract_csharp, go::extract_go, java::extract_java,
-    js_ts::extract_js_ts, python::extract_python, rust::extract_rust,
+    c_family::extract_c_family, csharp::extract_csharp, dart::extract_dart, go::extract_go,
+    java::extract_java, js_ts::extract_js_ts, kotlin::extract_kotlin, php::extract_php,
+    python::extract_python, ruby::extract_ruby, rust::extract_rust, scala::extract_scala,
+    swift::extract_swift,
 };
 
 pub const CRATE_NAME: &str = "squeezy-parse";
@@ -227,12 +229,18 @@ pub struct LanguageParser {
     csharp_parser: Parser,
     c_parser: Parser,
     cpp_parser: Parser,
+    dart_parser: Parser,
     go_parser: Parser,
     javascript_parser: Parser,
     jsx_parser: Parser,
+    php_parser: Parser,
     rust_parser: Parser,
     java_parser: Parser,
+    kotlin_parser: Parser,
     python_parser: Parser,
+    ruby_parser: Parser,
+    scala_parser: Parser,
+    swift_parser: Parser,
     typescript_parser: Parser,
     tsx_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
@@ -260,24 +268,36 @@ impl LanguageParser {
         let csharp_parser = parser_with_csharp_language()?;
         let c_parser = parser_with_c_language()?;
         let cpp_parser = parser_with_cpp_language()?;
+        let dart_parser = parser_with_dart_language()?;
         let go_parser = parser_with_go_language()?;
         let javascript_parser = parser_with_javascript_language()?;
         let jsx_parser = parser_with_jsx_language()?;
+        let php_parser = parser_with_php_language()?;
         let rust_parser = parser_with_rust_language()?;
         let java_parser = parser_with_java_language()?;
+        let kotlin_parser = parser_with_kotlin_language()?;
         let python_parser = parser_with_python_language()?;
+        let ruby_parser = parser_with_ruby_language()?;
+        let scala_parser = parser_with_scala_language()?;
+        let swift_parser = parser_with_swift_language()?;
         let typescript_parser = parser_with_typescript_language()?;
         let tsx_parser = parser_with_tsx_language()?;
         Ok(Self {
             csharp_parser,
             c_parser,
             cpp_parser,
+            dart_parser,
             go_parser,
             javascript_parser,
             jsx_parser,
+            php_parser,
             rust_parser,
             java_parser,
+            kotlin_parser,
             python_parser,
+            ruby_parser,
+            scala_parser,
+            swift_parser,
             typescript_parser,
             tsx_parser,
             cache: HashMap::new(),
@@ -459,12 +479,18 @@ impl LanguageParser {
             LanguageKind::C => Ok(&mut self.c_parser),
             LanguageKind::CSharp => Ok(&mut self.csharp_parser),
             LanguageKind::Cpp => Ok(&mut self.cpp_parser),
+            LanguageKind::Dart => Ok(&mut self.dart_parser),
             LanguageKind::Go => Ok(&mut self.go_parser),
             LanguageKind::Java => Ok(&mut self.java_parser),
             LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
             LanguageKind::Jsx => Ok(&mut self.jsx_parser),
+            LanguageKind::Kotlin => Ok(&mut self.kotlin_parser),
+            LanguageKind::Php => Ok(&mut self.php_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
+            LanguageKind::Ruby => Ok(&mut self.ruby_parser),
+            LanguageKind::Scala => Ok(&mut self.scala_parser),
+            LanguageKind::Swift => Ok(&mut self.swift_parser),
             LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
             LanguageKind::Tsx => Ok(&mut self.tsx_parser),
             _ => Err(SqueezyError::Parse(format!(
@@ -479,12 +505,18 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
         LanguageKind::C => parser_with_c_language(),
         LanguageKind::CSharp => parser_with_csharp_language(),
         LanguageKind::Cpp => parser_with_cpp_language(),
+        LanguageKind::Dart => parser_with_dart_language(),
         LanguageKind::Go => parser_with_go_language(),
         LanguageKind::Java => parser_with_java_language(),
         LanguageKind::JavaScript => parser_with_javascript_language(),
         LanguageKind::Jsx => parser_with_jsx_language(),
+        LanguageKind::Kotlin => parser_with_kotlin_language(),
+        LanguageKind::Php => parser_with_php_language(),
         LanguageKind::Python => parser_with_python_language(),
+        LanguageKind::Ruby => parser_with_ruby_language(),
         LanguageKind::Rust => parser_with_rust_language(),
+        LanguageKind::Scala => parser_with_scala_language(),
+        LanguageKind::Swift => parser_with_swift_language(),
         LanguageKind::TypeScript => parser_with_typescript_language(),
         LanguageKind::Tsx => parser_with_tsx_language(),
         _ => Err(SqueezyError::Parse(format!(
@@ -498,12 +530,18 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
         csharp: parser_with_csharp_language()?,
         c: parser_with_c_language()?,
         cpp: parser_with_cpp_language()?,
+        dart: parser_with_dart_language()?,
         go: parser_with_go_language()?,
         javascript: parser_with_javascript_language()?,
         jsx: parser_with_jsx_language()?,
+        php: parser_with_php_language()?,
         rust: parser_with_rust_language()?,
         java: parser_with_java_language()?,
+        kotlin: parser_with_kotlin_language()?,
         python: parser_with_python_language()?,
+        ruby: parser_with_ruby_language()?,
+        scala: parser_with_scala_language()?,
+        swift: parser_with_swift_language()?,
         typescript: parser_with_typescript_language()?,
         tsx: parser_with_tsx_language()?,
     };
@@ -518,12 +556,18 @@ struct WorkerParsers {
     csharp: Parser,
     c: Parser,
     cpp: Parser,
+    dart: Parser,
     go: Parser,
     javascript: Parser,
     jsx: Parser,
+    php: Parser,
     rust: Parser,
     java: Parser,
+    kotlin: Parser,
     python: Parser,
+    ruby: Parser,
+    scala: Parser,
+    swift: Parser,
     typescript: Parser,
     tsx: Parser,
 }
@@ -534,12 +578,18 @@ impl WorkerParsers {
             LanguageKind::C => Ok(&mut self.c),
             LanguageKind::CSharp => Ok(&mut self.csharp),
             LanguageKind::Cpp => Ok(&mut self.cpp),
+            LanguageKind::Dart => Ok(&mut self.dart),
             LanguageKind::Go => Ok(&mut self.go),
             LanguageKind::Java => Ok(&mut self.java),
             LanguageKind::JavaScript => Ok(&mut self.javascript),
             LanguageKind::Jsx => Ok(&mut self.jsx),
+            LanguageKind::Kotlin => Ok(&mut self.kotlin),
+            LanguageKind::Php => Ok(&mut self.php),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
+            LanguageKind::Ruby => Ok(&mut self.ruby),
+            LanguageKind::Scala => Ok(&mut self.scala),
+            LanguageKind::Swift => Ok(&mut self.swift),
             LanguageKind::TypeScript => Ok(&mut self.typescript),
             LanguageKind::Tsx => Ok(&mut self.tsx),
             _ => Err(SqueezyError::Parse(format!(
@@ -686,6 +736,15 @@ fn parser_with_python_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_ruby_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = ruby_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Ruby grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_javascript_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = javascript_language();
@@ -701,6 +760,15 @@ fn parser_with_jsx_language() -> Result<Parser> {
     parser
         .set_language(&language)
         .map_err(|err| SqueezyError::Parse(format!("failed to load JSX grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_php_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = php_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load PHP grammar: {err}")))?;
     Ok(parser)
 }
 
@@ -731,6 +799,33 @@ fn parser_with_java_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_kotlin_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = kotlin_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Kotlin grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_scala_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = scala_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Scala grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_swift_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = swift_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Swift grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_c_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = c_language();
@@ -746,6 +841,15 @@ fn parser_with_cpp_language() -> Result<Parser> {
     parser
         .set_language(&language)
         .map_err(|err| SqueezyError::Parse(format!("failed to load C++ grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_dart_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = dart_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Dart grammar: {err}")))?;
     Ok(parser)
 }
 
@@ -765,8 +869,24 @@ fn java_language() -> tree_sitter::Language {
     tree_sitter_java::LANGUAGE.into()
 }
 
+fn kotlin_language() -> tree_sitter::Language {
+    tree_sitter_kotlin_ng::LANGUAGE.into()
+}
+
+fn scala_language() -> tree_sitter::Language {
+    tree_sitter_scala::LANGUAGE.into()
+}
+
+fn swift_language() -> tree_sitter::Language {
+    tree_sitter_swift::LANGUAGE.into()
+}
+
 fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
+}
+
+fn ruby_language() -> tree_sitter::Language {
+    tree_sitter_ruby::LANGUAGE.into()
 }
 
 fn javascript_language() -> tree_sitter::Language {
@@ -775,6 +895,14 @@ fn javascript_language() -> tree_sitter::Language {
 
 fn jsx_language() -> tree_sitter::Language {
     tree_sitter_javascript::LANGUAGE.into()
+}
+
+fn php_language() -> tree_sitter::Language {
+    // PHP files routinely interleave inline HTML and `<?php ... ?>` blocks
+    // even when the file is "pure PHP", so the mixed-template grammar is the
+    // single right choice for the workspace. Pure-PHP files still parse fine
+    // under `LANGUAGE_PHP` (the leading `<?php` is just another `php_tag`).
+    tree_sitter_php::LANGUAGE_PHP.into()
 }
 
 fn typescript_language() -> tree_sitter::Language {
@@ -793,17 +921,27 @@ fn cpp_language() -> tree_sitter::Language {
     tree_sitter_cpp::LANGUAGE.into()
 }
 
+fn dart_language() -> tree_sitter::Language {
+    tree_sitter_dart::LANGUAGE.into()
+}
+
 fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
     match language {
         LanguageKind::C => Some(c_language()),
         LanguageKind::CSharp => Some(csharp_language()),
         LanguageKind::Cpp => Some(cpp_language()),
+        LanguageKind::Dart => Some(dart_language()),
         LanguageKind::Go => Some(go_language()),
         LanguageKind::Java => Some(java_language()),
         LanguageKind::JavaScript => Some(javascript_language()),
         LanguageKind::Jsx => Some(jsx_language()),
+        LanguageKind::Kotlin => Some(kotlin_language()),
         LanguageKind::Python => Some(python_language()),
         LanguageKind::Rust => Some(rust_language()),
+        LanguageKind::Ruby => Some(ruby_language()),
+        LanguageKind::Php => Some(php_language()),
+        LanguageKind::Scala => Some(scala_language()),
+        LanguageKind::Swift => Some(swift_language()),
         LanguageKind::TypeScript => Some(typescript_language()),
         LanguageKind::Tsx => Some(tsx_language()),
         LanguageKind::Unsupported | LanguageKind::Unknown => None,

@@ -44,6 +44,12 @@ on:
           - c-family
           - csharp
           - js-ts
+          - kotlin
+          - swift
+          - ruby
+          - php
+          - scala
+          - dart
       tier:
         description: "Benchmark tier"
         required: true
@@ -146,3 +152,68 @@ jobs:
       tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
       artifact-suffix: js-ts
       summary-file: __js_ts_summary.md
+
+  # New language: Kotlin oracle/gates have not yet held two weeks of CI.
+  # The job uses the same reusable workflow as the other languages and
+  # follows the rest of the smoke-tier pattern; remove this comment once
+  # the Kotlin gate has been steady for two weeks of CI per the
+  # repo's convention for newly-added languages.
+  kotlin-semantic-graph-smoke:
+    name: Kotlin semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'kotlin' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: kotlin
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: kotlin
+      summary-file: __kotlin_summary.md
+
+  swift-semantic-graph-smoke:
+    name: Swift semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'swift' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: swift
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: swift
+      summary-file: __swift_summary.md
+
+  ruby-semantic-graph-smoke:
+    name: Ruby semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'ruby' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: ruby
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: ruby
+      summary-file: __ruby_summary.md
+
+  php-semantic-graph-smoke:
+    name: PHP semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'php' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: php
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: php
+      summary-file: __php_summary.md
+
+  scala-semantic-graph-smoke:
+    name: Scala semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'scala' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: scala
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: scala
+      summary-file: __scala_summary.md
+
+  dart-semantic-graph-smoke:
+    name: Dart semantic graph smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'dart' || inputs.language == 'all' }}
+    uses: ./.github/workflows/benchmark-lang.yml
+    with:
+      language: dart
+      tier: ${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+      artifact-suffix: dart
+      summary-file: __dart_summary.md

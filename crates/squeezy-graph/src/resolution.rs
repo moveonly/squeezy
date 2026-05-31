@@ -19,6 +19,7 @@ impl SemanticGraph {
         // the cost of rebuilding the entire workspace path map.
         self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
+        self.add_php_type_edges();
 
         // Move-out, mutate, move-back. Each builder iterates a single
         // field's data while writing edges, and the borrow checker won't
@@ -47,7 +48,7 @@ impl SemanticGraph {
 
     pub(crate) fn add_import_edges(&mut self, imports: &[ParsedImport]) {
         for import in imports {
-            if import.alias.as_deref() == Some("__java_package__") {
+            if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
             let file_symbol_id = file_symbol_id(&import.file_id);
@@ -76,6 +77,19 @@ impl SemanticGraph {
             if self
                 .files
                 .get(&import.file_id)
+                .map(|file| file.language == squeezy_core::LanguageKind::Kotlin)
+                .unwrap_or(false)
+            {
+                candidates.retain(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| self.kotlin_import_matches_symbol(import, symbol))
+                        .unwrap_or(false)
+                });
+            }
+            if self
+                .files
+                .get(&import.file_id)
                 .map(|file| file.language == squeezy_core::LanguageKind::CSharp)
                 .unwrap_or(false)
             {
@@ -83,6 +97,21 @@ impl SemanticGraph {
                     self.symbols
                         .get(id)
                         .map(|symbol| csharp_import_matches_symbol(import, symbol))
+                        .unwrap_or(false)
+                });
+            }
+            if self
+                .files
+                .get(&import.file_id)
+                .map(|file| file.language == squeezy_core::LanguageKind::Php)
+                .unwrap_or(false)
+            {
+                candidates.retain(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| {
+                            crate::languages::php::php_import_matches_symbol(import, symbol)
+                        })
                         .unwrap_or(false)
                 });
             }
@@ -275,6 +304,41 @@ impl SemanticGraph {
             );
         }
 
+        if let Some(callee) = self.inherited_ruby_method(caller_id, call) {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "ruby ancestor",
+                Vec::new(),
+            );
+        }
+
+        if let Some(callee) = self.dart_inherited_method(caller_id, call) {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "dart inherited",
+                Vec::new(),
+            );
+        }
+
+        // PHP's `$this->method()` and `self::`/`static::`/`parent::method()`
+        // need the cross-file ancestor walk to traverse `UsesTrait` edges
+        // alongside the `Extends` parent and `Implements` interfaces. The
+        // generic `inherited_python_method` only knows about `base:`
+        // attributes, so trait methods cross-file would otherwise fall
+        // through to the candidate-set rule and stay unresolved.
+        if call.kind == ParsedCallKind::Method
+            && let Some(callee) = self.inherited_php_method(caller_id, call)
+        {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "inherited php trait or class",
+                Vec::new(),
+            );
+        }
+
         let candidates = self
             .symbols_by_name_or_scan(&call.name)
             .into_iter()
@@ -320,6 +384,30 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.kotlin_extension_function_call(&candidates, caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "kotlin extension receiver",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.kotlin_companion_member_call(&candidates, caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "kotlin companion member",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.swift_extension_receiver_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "swift extension receiver",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.python_receiver_alias_method(caller_id, call) {
                 return (
                     Some(id),
@@ -341,6 +429,46 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::ImportResolved,
                     "go package import",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.scala_companion_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "scala companion object",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.scala_extension_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "scala extension method",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.dart_import_prefix_method_call(&candidates, caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::ImportResolved,
+                    "dart prefix import",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.dart_extension_method_call(&candidates, caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "dart extension method",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.dart_typed_local_method_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "dart typed local receiver",
                     Vec::new(),
                 );
             }
@@ -419,6 +547,14 @@ impl SemanticGraph {
         }
         if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
             return (Some(id), Confidence::Heuristic, "package local", Vec::new());
+        }
+        if let Some(id) = self.scala_top_level_def(&candidates, caller_id, call) {
+            return (
+                Some(id),
+                Confidence::ImportResolved,
+                "scala top-level def",
+                Vec::new(),
+            );
         }
         if let Some(id) = self.arity_unique_candidate(&candidates, call) {
             return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
@@ -606,7 +742,7 @@ impl SemanticGraph {
         for import in self
             .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
         {
             let alias_or_name = import
                 .alias
@@ -785,7 +921,7 @@ impl SemanticGraph {
     ) -> bool {
         self.imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
+            .filter(|import| !is_package_marker(import))
             .filter(|import| {
                 import
                     .alias
@@ -801,7 +937,7 @@ impl SemanticGraph {
         import: &ParsedImport,
         symbol: &GraphSymbol,
     ) -> bool {
-        if import.alias.as_deref() == Some("__java_package__") {
+        if is_package_marker(import) {
             return false;
         }
         let Some(file) = self.files.get(&symbol.file_id) else {
@@ -813,8 +949,17 @@ impl SemanticGraph {
         if file.language == squeezy_core::LanguageKind::Java {
             return self.java_import_matches_symbol(import, symbol);
         }
+        if file.language == squeezy_core::LanguageKind::Kotlin {
+            return self.kotlin_import_matches_symbol(import, symbol);
+        }
+        if file.language == squeezy_core::LanguageKind::Scala {
+            return self.scala_import_matches_symbol(import, symbol);
+        }
         if is_js_ts_language(file.language) {
             return self.js_ts_import_matches_symbol(import, symbol);
+        }
+        if file.language == squeezy_core::LanguageKind::Swift {
+            return self.swift_import_matches_symbol(import, symbol);
         }
         if last_path_segment(&import.path) != symbol.name {
             return false;
