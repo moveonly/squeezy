@@ -563,27 +563,37 @@ fn symbol_context_json(
         .take(max_references)
         .map(|hit| cargo_diagnostic_hit_json(&hit))
         .collect::<Vec<_>>();
-    json!({
-        "id": symbol.id.0,
-        "name": symbol.name,
-        "kind": format!("{:?}", symbol.kind),
-        "path": symbol.file_id.0,
-        "signature": symbol.signature,
-        "visibility": symbol.visibility,
-        "span": span_json(symbol.span),
-        "dirty": symbol.dirty.as_ref().map(|dirty| json!({
-            "status": dirty.status,
-            "ranges": dirty.ranges.iter().map(|range| json!({
-                "start_line": range.start_line,
-                "end_line": range.end_line,
-            })).collect::<Vec<_>>(),
-        })),
-        "references": references,
-        "callers": callers,
-        "diagnostics": diagnostics,
-        "confidence": symbol.confidence.id(),
-        "freshness": format!("{:?}", symbol.freshness),
-    })
+    // Same trim policy as `symbol_json`: drop `freshness` (always "Fresh" in
+    // steady state) and emit `visibility`/`dirty` only when set. `signature`
+    // stays because `diff_context` lists changed symbols and the model needs
+    // it to triage them without an extra `read_slice`.
+    let mut object = serde_json::Map::with_capacity(11);
+    object.insert("id".to_string(), json!(symbol.id.0));
+    object.insert("name".to_string(), json!(symbol.name));
+    object.insert("kind".to_string(), json!(format!("{:?}", symbol.kind)));
+    object.insert("path".to_string(), json!(symbol.file_id.0));
+    object.insert("signature".to_string(), json!(symbol.signature));
+    object.insert("span".to_string(), span_json(symbol.span));
+    if let Some(visibility) = symbol.visibility.as_deref() {
+        object.insert("visibility".to_string(), json!(visibility));
+    }
+    if let Some(dirty) = symbol.dirty.as_ref() {
+        object.insert(
+            "dirty".to_string(),
+            json!({
+                "status": dirty.status,
+                "ranges": dirty.ranges.iter().map(|range| json!({
+                    "start_line": range.start_line,
+                    "end_line": range.end_line,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    object.insert("references".to_string(), json!(references));
+    object.insert("callers".to_string(), json!(callers));
+    object.insert("diagnostics".to_string(), json!(diagnostics));
+    object.insert("confidence".to_string(), json!(symbol.confidence.id()));
+    Value::Object(object)
 }
 
 fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
