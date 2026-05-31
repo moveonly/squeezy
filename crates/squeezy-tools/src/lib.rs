@@ -146,12 +146,12 @@ use web::{
 pub(crate) const DEFAULT_MAX_FILES: usize = 10_000;
 pub(crate) const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
 pub(crate) const CHECKPOINTS_DISABLED_MESSAGE: &str = "checkpointing is disabled by default; commit or stash with git, or set [tools].checkpoints_enabled = true to re-enable Squeezy checkpoints";
-pub(crate) const DEFAULT_READ_LIMIT: usize = 32_000;
+pub(crate) const DEFAULT_READ_LIMIT: usize = 64_000;
 pub(crate) const MAX_READ_LIMIT: usize = 128_000;
 pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
-pub(crate) const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const MAX_SHELL_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
-const MAX_INFLIGHT_SHELLS: usize = 4;
+const MAX_INFLIGHT_SHELLS: usize = 8;
 const MAX_PERMISSION_GRANTS: usize = 256;
 const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -165,7 +165,7 @@ const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// indefinitely.
 pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
-pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 25;
+pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 50;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
 pub(crate) const DEFAULT_GRAPH_MAX_DEPTH: usize = 3;
 pub(crate) const MAX_GRAPH_MAX_DEPTH: usize = 8;

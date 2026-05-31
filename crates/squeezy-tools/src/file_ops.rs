@@ -22,8 +22,9 @@ use crate::{
     workspace_path,
 };
 
-pub(crate) const DEFAULT_MAX_MATCHES: usize = 100;
-pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
+pub(crate) const DEFAULT_MAX_MATCHES: usize = 250;
+pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 48_000;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Detect the canonical image MIME type from a byte prefix using magic
 /// numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP (RIFF / WEBP
@@ -406,7 +407,7 @@ impl ToolRegistry {
                 count += 1;
                 match output_mode {
                     GrepOutputMode::Content => {
-                        let line_text = truncate_text(line, 500);
+                        let line_text = truncate_text(line, 2000);
                         let mut next = serde_json::Map::new();
                         next.insert("path".to_string(), json!(&rel_str));
                         next.insert("line".to_string(), json!(line_index + 1));
@@ -419,7 +420,7 @@ impl ToolRegistry {
                                 .map(|(offset_idx, ctx_line)| {
                                     json!({
                                         "line": before_start + offset_idx + 1,
-                                        "text": truncate_text(ctx_line, 500),
+                                        "text": truncate_text(ctx_line, 2000),
                                     })
                                 })
                                 .collect();
@@ -433,7 +434,7 @@ impl ToolRegistry {
                                 .map(|(offset_idx, ctx_line)| {
                                     json!({
                                         "line": line_index + 2 + offset_idx,
-                                        "text": truncate_text(ctx_line, 500),
+                                        "text": truncate_text(ctx_line, 2000),
                                     })
                                 })
                                 .collect();
@@ -568,6 +569,25 @@ impl ToolRegistry {
         // agent can wrap the bytes in `LlmInputItem::Image` instead of
         // re-serialising binary content as lossy UTF-8 text.
         if let Some(mime) = prefix_bytes.as_deref().and_then(detect_image_mime) {
+            if total_bytes > MAX_IMAGE_BYTES {
+                return make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "error": format!(
+                            "image too large to inline: {} is {} bytes, cap is {} bytes",
+                            rel_str, total_bytes, MAX_IMAGE_BYTES
+                        ),
+                        "path": &rel_str,
+                        "image": true,
+                        "mime_type": mime,
+                        "total_bytes": total_bytes,
+                        "max_image_bytes": MAX_IMAGE_BYTES,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
             let bytes = match read_range(&path, 0, total_bytes as usize) {
                 Ok(bytes) => bytes,
                 Err(err) => return tool_error(call, err),
