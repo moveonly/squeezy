@@ -1948,20 +1948,22 @@ fn parse_numstat(bytes: &[u8]) -> BTreeMap<String, FileStat> {
     let mut output = BTreeMap::new();
     let text = String::from_utf8_lossy(bytes);
     for record in text.split('\0').filter(|record| !record.trim().is_empty()) {
-        let mut parts = record.split('\t');
+        let mut parts = record.splitn(3, '\t');
         let Some(additions) = parts.next() else {
             continue;
         };
         let Some(deletions) = parts.next() else {
             continue;
         };
-        let path = parts.collect::<Vec<_>>().join("\t");
+        let Some(path) = parts.next() else {
+            continue;
+        };
         if path.is_empty() {
             continue;
         }
         let binary = additions == "-" || deletions == "-";
         output.insert(
-            path,
+            path.to_string(),
             FileStat {
                 additions: parse_count(additions),
                 deletions: parse_count(deletions),
