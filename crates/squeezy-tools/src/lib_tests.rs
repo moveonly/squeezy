@@ -10354,7 +10354,7 @@ fn grep_spec_promotes_graph_first() {
         "decl_search",
         "reference_search",
         "symbol_context",
-        "imports, qualified paths, and re-exports",
+        "imports and re-exports",
     ] {
         assert!(
             description.contains(marker),
@@ -10377,7 +10377,7 @@ fn grep_spec_promotes_graph_first() {
 fn glob_spec_promotes_graph_first() {
     let description = glob_spec().description;
     assert!(description.contains("decl_search"));
-    assert!(description.contains("imports, qualified paths, and re-exports"));
+    assert!(description.contains("imports and re-exports"));
     let golden =
         include_str!("../tests/artifacts/tool-spec-descriptions/glob_spec_description.txt").trim();
     assert_eq!(description.trim(), golden);
