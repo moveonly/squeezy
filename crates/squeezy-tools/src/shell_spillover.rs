@@ -118,11 +118,11 @@ impl ShellSpilloverStore {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Option<ShellSpilloverInfo> {
-        let bytes = encode_spill_payload(stdout, stderr);
-        if bytes.is_empty() {
+        let payload = encode_spill_payload(stdout, stderr);
+        if payload.is_empty() {
             return None;
         }
-        let size = bytes.len() as u64;
+        let size = payload.len() as u64;
         // Reserve budget atomically so concurrent shell calls cannot
         // race past the cap. Reservation is rolled back on write
         // failure to keep `bytes_used` honest.
@@ -133,12 +133,12 @@ impl ShellSpilloverStore {
             self.release(size);
             return None;
         }
-        let short_hash = &sha256_hex(&bytes)[..SPILL_SHORT_HASH_HEX];
+        let short_hash = &sha256_hex(payload.as_bytes())[..SPILL_SHORT_HASH_HEX];
         let sanitized = sanitize_call_id(call_id);
         let path = self
             .session_dir
             .join(format!("{sanitized}-{short_hash}.txt"));
-        if fs::write(&path, &bytes).is_err() {
+        if fs::write(&path, payload.as_bytes()).is_err() {
             self.release(size);
             return None;
         }
@@ -249,15 +249,37 @@ fn build_session_dir() -> PathBuf {
     parent.join(format!("{pid}-{now}-{nonce}"))
 }
 
-fn encode_spill_payload(stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
+enum SpillPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl SpillPayload<'_> {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+}
+
+fn encode_spill_payload<'a>(stdout: &'a [u8], stderr: &[u8]) -> SpillPayload<'a> {
     if stderr.is_empty() {
-        return stdout.to_vec();
+        return SpillPayload::Borrowed(stdout);
     }
     let mut bytes = Vec::with_capacity(stdout.len() + STDERR_SEPARATOR.len() + stderr.len());
     bytes.extend_from_slice(stdout);
     bytes.extend_from_slice(STDERR_SEPARATOR.as_bytes());
     bytes.extend_from_slice(stderr);
-    bytes
+    SpillPayload::Owned(bytes)
 }
 
 fn sanitize_call_id(call_id: &str) -> String {

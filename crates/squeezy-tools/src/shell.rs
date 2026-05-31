@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -1365,15 +1365,24 @@ pub(crate) fn shell_env_should_preserve(name: &str, allowlist: &[String]) -> boo
 #[derive(Clone, Default)]
 struct ShellStreamCapture {
     bytes: Arc<Mutex<Vec<u8>>>,
+    len: Arc<AtomicUsize>,
     truncated: Arc<AtomicBool>,
 }
 
 impl ShellStreamCapture {
     async fn append(&self, chunk: &[u8], cap: usize) {
+        if chunk.is_empty() {
+            return;
+        }
+        if self.len.load(Ordering::Acquire) >= cap {
+            self.truncated.store(true, Ordering::Relaxed);
+            return;
+        }
         let mut bytes = self.bytes.lock().await;
         let keep = chunk.len().min(cap.saturating_sub(bytes.len()));
         if keep > 0 {
             bytes.extend_from_slice(&chunk[..keep]);
+            self.len.store(bytes.len(), Ordering::Release);
         }
         if keep < chunk.len() {
             self.truncated.store(true, Ordering::Relaxed);
@@ -1440,9 +1449,9 @@ async fn drain_or_abort(
 }
 
 fn split_shell_output(
-    stdout: Vec<u8>,
+    mut stdout: Vec<u8>,
     stdout_truncated: bool,
-    stderr: Vec<u8>,
+    mut stderr: Vec<u8>,
     stderr_truncated: bool,
     output_cap: usize,
 ) -> (Vec<u8>, bool, Vec<u8>, bool) {
@@ -1456,21 +1465,25 @@ fn split_shell_output(
         (output_cap / 3).max(1)
     }
     .min(output_cap);
-    let mut stdout_take = stdout.len().min(stdout_floor);
-    let mut stderr_take = stderr.len().min(output_cap.saturating_sub(stdout_take));
+    let stdout_len = stdout.len();
+    let stderr_len = stderr.len();
+    let mut stdout_take = stdout_len.min(stdout_floor);
+    let mut stderr_take = stderr_len.min(output_cap.saturating_sub(stdout_take));
     let mut remaining = output_cap.saturating_sub(stdout_take + stderr_take);
-    let extra_stdout = remaining.min(stdout.len().saturating_sub(stdout_take));
+    let extra_stdout = remaining.min(stdout_len.saturating_sub(stdout_take));
     stdout_take += extra_stdout;
     remaining = remaining.saturating_sub(extra_stdout);
-    let extra_stderr = remaining.min(stderr.len().saturating_sub(stderr_take));
+    let extra_stderr = remaining.min(stderr_len.saturating_sub(stderr_take));
     stderr_take += extra_stderr;
 
-    let final_stdout_truncated = stdout_truncated || stdout_take < stdout.len();
-    let final_stderr_truncated = stderr_truncated || stderr_take < stderr.len();
+    let final_stdout_truncated = stdout_truncated || stdout_take < stdout_len;
+    let final_stderr_truncated = stderr_truncated || stderr_take < stderr_len;
+    stdout.truncate(stdout_take);
+    stderr.truncate(stderr_take);
     (
-        stdout[..stdout_take].to_vec(),
+        stdout,
         final_stdout_truncated,
-        stderr[..stderr_take].to_vec(),
+        stderr,
         final_stderr_truncated,
     )
 }
