@@ -63,6 +63,7 @@ use tokio_util::sync::CancellationToken;
 
 mod approval;
 mod commands;
+mod commands_style;
 mod config_screen;
 mod events;
 mod fuzzy;
@@ -7329,7 +7330,14 @@ fn format_message_entry_with_width(
     }
     if item.role == Role::System
         && !failed
-        && let Some(lines) = format_accounting_block_entry(selected, &item.content)
+        && let Some(lines) = format_ansi_system_entry(
+            selected,
+            "• ",
+            label_color,
+            action,
+            action_color,
+            &item.content,
+        )
     {
         return lines;
     }
@@ -7344,109 +7352,40 @@ fn format_message_entry_with_width(
     )
 }
 
-/// Render the `/cost` and `/context` outputs with per-token coloring:
-/// group words pop in `crate::render::theme::secondary()`, `key=` labels dim to `crate::render::theme::quiet()`, dollar values
-/// pop in `crate::render::theme::accent()`, and zero/dash/unknown values fade to `crate::render::theme::quiet()` so the
-/// real numbers carry the eye. Returns `None` for any system message that
-/// is not an accounting block — the caller falls through to the default
-/// single-style renderer.
-fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Line<'static>>> {
-    let mut iter = content.lines();
-    let header = iter.next()?;
-    if header != "Cost accounting" && header != "Context window" {
+/// Render system messages whose content embeds ANSI escape sequences
+/// (currently emitted by `/context` and `/cost` via `commands_style`).
+/// Plain-text system messages fall through to the default single-style
+/// renderer so the dozens of other `TranscriptItem::system` callers stay
+/// byte-identical.
+fn format_ansi_system_entry(
+    selected: bool,
+    label: &'static str,
+    label_color: Color,
+    action: &'static str,
+    action_color: Color,
+    content: &str,
+) -> Option<Vec<Line<'static>>> {
+    if !content.contains('\x1b') {
         return None;
     }
-    let header_span = Span::styled(
-        header.to_string(),
-        Style::default()
-            .fg(crate::render::theme::secondary())
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut lines = Vec::with_capacity(content.lines().count());
-    lines.push(action_line_spans(
+    let parsed = crate::render::ansi::ansi_to_text(content);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(parsed.lines.len().max(1));
+    let mut iter = parsed.lines.into_iter();
+    let first = iter.next().unwrap_or_else(|| Line::from(""));
+    out.push(action_line_spans(
         selected,
-        "• ",
-        crate::render::theme::secondary(),
-        "Noted",
-        crate::render::theme::secondary(),
-        vec![header_span],
+        label,
+        label_color,
+        action,
+        action_color,
+        first.spans,
     ));
-    for body in iter {
+    for line in iter {
         let mut spans = vec![Span::raw("  ")];
-        spans.extend(accounting_body_spans(body));
-        lines.push(Line::from(spans));
+        spans.extend(line.spans);
+        out.push(Line::from(spans));
     }
-    Some(lines)
-}
-
-fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
-    // Sentences without any `key=value` token are dimmed wholesale (the
-    // accuracy epilogue, the `provider_stored_context=...` narrative line).
-    if !line.contains('=') || line.starts_with("accuracy=") {
-        return vec![Span::styled(
-            line.to_string(),
-            Style::default().fg(crate::render::theme::quiet()),
-        )];
-    }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut first_token = true;
-    for token in line.split_inclusive(' ') {
-        let (text, trailing) = if let Some(stripped) = token.strip_suffix(' ') {
-            (stripped, " ")
-        } else {
-            (token, "")
-        };
-        if let Some(eq_idx) = text.find('=') {
-            let (key, rest) = text.split_at(eq_idx);
-            let value = &rest[1..];
-            spans.push(Span::styled(
-                format!("{key}="),
-                Style::default().fg(crate::render::theme::quiet()),
-            ));
-            spans.push(Span::styled(
-                value.to_string(),
-                accounting_value_style(value),
-            ));
-        } else {
-            // A bare word — the leading group label (`tools`,
-            // `subagents`, `transmitted_request`, …) or a trailing
-            // parenthetical like `(estimated from ...)`.
-            let style = if first_token {
-                Style::default().fg(crate::render::theme::secondary())
-            } else {
-                Style::default().fg(crate::render::theme::quiet())
-            };
-            spans.push(Span::styled(text.to_string(), style));
-        }
-        if !trailing.is_empty() {
-            spans.push(Span::raw(trailing));
-        }
-        first_token = false;
-    }
-    spans
-}
-
-fn accounting_value_style(value: &str) -> Style {
-    if value.is_empty() {
-        return Style::default().fg(crate::render::theme::quiet());
-    }
-    if value.starts_with('$') {
-        return Style::default().fg(crate::render::theme::accent());
-    }
-    // Values that signal absence/zero fade so the eye lands on the real
-    // numbers. Percent strings like `0.00%` count as zero too.
-    let is_zero_percent = value
-        .strip_suffix('%')
-        .and_then(|prefix| prefix.parse::<f64>().ok())
-        .is_some_and(|value| value == 0.0);
-    if matches!(
-        value,
-        "-" | "0" | "unknown" | "inactive" | "absent" | "false"
-    ) || is_zero_percent
-    {
-        return Style::default().fg(crate::render::theme::quiet());
-    }
-    Style::default()
+    Some(out)
 }
 
 fn format_user_prompt_entry(
