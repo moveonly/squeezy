@@ -391,28 +391,67 @@ impl ToolRegistry {
             }
 
             let text = String::from_utf8_lossy(&bytes);
-            // F13: collect lines once so we can window into `[i-N, i+N]`
-            // when `context > 0`. Allocating a `Vec<&str>` per file is
-            // cheap relative to the regex scan, and only the
-            // `Content` mode pays for context window construction.
-            let lines: Vec<&str> = text.lines().collect();
-            for (line_index, line) in lines.iter().enumerate() {
-                if !regex.is_match(line) {
-                    continue;
+            if context == 0 {
+                for (line_index, line) in text.lines().enumerate() {
+                    if !regex.is_match(line) {
+                        continue;
+                    }
+                    if skipped_matches < offset {
+                        skipped_matches += 1;
+                        continue;
+                    }
+                    count += 1;
+                    match output_mode {
+                        GrepOutputMode::Content => {
+                            let next = json!({
+                                "path": &rel_str,
+                                "line": line_index + 1,
+                                "text": truncate_text(line, 2000),
+                            });
+                            let next_len =
+                                serde_json::to_string(&next).map_or(0, |text| text.len());
+                            if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
+                                cost.truncated = true;
+                                stop_search = true;
+                                break;
+                            }
+                            cost.output_bytes += next_len as u64;
+                            cost.matches_returned += 1;
+                            matches.push(next);
+                        }
+                        GrepOutputMode::FilesWithMatches => {
+                            if paths.insert(rel_str.clone()) {
+                                cost.matches_returned += 1;
+                            }
+                        }
+                        GrepOutputMode::Count => {
+                            cost.matches_returned = count;
+                        }
+                    }
+                    if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
+                        cost.truncated = true;
+                        stop_search = true;
+                        break;
+                    }
                 }
-                if skipped_matches < offset {
-                    skipped_matches += 1;
-                    continue;
-                }
-                count += 1;
-                match output_mode {
-                    GrepOutputMode::Content => {
-                        let line_text = truncate_text(line, 2000);
-                        let mut next = serde_json::Map::new();
-                        next.insert("path".to_string(), json!(&rel_str));
-                        next.insert("line".to_string(), json!(line_index + 1));
-                        next.insert("text".to_string(), json!(line_text));
-                        if context > 0 {
+            } else {
+                let lines: Vec<&str> = text.lines().collect();
+                for (line_index, line) in lines.iter().enumerate() {
+                    if !regex.is_match(line) {
+                        continue;
+                    }
+                    if skipped_matches < offset {
+                        skipped_matches += 1;
+                        continue;
+                    }
+                    count += 1;
+                    match output_mode {
+                        GrepOutputMode::Content => {
+                            let line_text = truncate_text(line, 2000);
+                            let mut next = serde_json::Map::new();
+                            next.insert("path".to_string(), json!(&rel_str));
+                            next.insert("line".to_string(), json!(line_index + 1));
+                            next.insert("text".to_string(), json!(line_text));
                             let before_start = line_index.saturating_sub(context);
                             let before_lines: Vec<Value> = lines[before_start..line_index]
                                 .iter()
@@ -440,31 +479,32 @@ impl ToolRegistry {
                                 .collect();
                             next.insert("context_before".to_string(), Value::Array(before_lines));
                             next.insert("context_after".to_string(), Value::Array(after_lines));
-                        }
-                        let next = Value::Object(next);
-                        let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
-                        if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
-                            cost.truncated = true;
-                            stop_search = true;
-                            break;
-                        }
-                        cost.output_bytes += next_len as u64;
-                        cost.matches_returned += 1;
-                        matches.push(next);
-                    }
-                    GrepOutputMode::FilesWithMatches => {
-                        if paths.insert(rel_str.clone()) {
+                            let next = Value::Object(next);
+                            let next_len =
+                                serde_json::to_string(&next).map_or(0, |text| text.len());
+                            if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
+                                cost.truncated = true;
+                                stop_search = true;
+                                break;
+                            }
+                            cost.output_bytes += next_len as u64;
                             cost.matches_returned += 1;
+                            matches.push(next);
+                        }
+                        GrepOutputMode::FilesWithMatches => {
+                            if paths.insert(rel_str.clone()) {
+                                cost.matches_returned += 1;
+                            }
+                        }
+                        GrepOutputMode::Count => {
+                            cost.matches_returned = count;
                         }
                     }
-                    GrepOutputMode::Count => {
-                        cost.matches_returned = count;
+                    if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
+                        cost.truncated = true;
+                        stop_search = true;
+                        break;
                     }
-                }
-                if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
-                    cost.truncated = true;
-                    stop_search = true;
-                    break;
                 }
             }
         }
