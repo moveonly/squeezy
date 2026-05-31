@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use squeezy_core::{AppConfig, SqueezyError};
 use squeezy_store::{
@@ -127,7 +127,7 @@ impl SessionSummary {
         if let Some(name) = self.display_name.as_deref() {
             let line = name.lines().next().unwrap_or(name);
             if !line.trim().is_empty() {
-                return truncate(line, 80);
+                return line.to_string();
             }
         }
         let task = self
@@ -138,7 +138,7 @@ impl SessionSummary {
             .lines()
             .next()
             .unwrap_or("(no prompt recorded)");
-        truncate(task, 80)
+        task.to_string()
     }
 
     /// Compact `#label1 #label2` hint rendered after the row title when
@@ -149,13 +149,11 @@ impl SessionSummary {
         if self.labels.is_empty() {
             return String::new();
         }
-        let joined = self
-            .labels
+        self.labels
             .iter()
             .map(|label| format!("#{label}"))
             .collect::<Vec<_>>()
-            .join(" ");
-        truncate(&joined, 40)
+            .join(" ")
     }
 
     /// Short directory hint shown when the entry lives outside the current
@@ -167,22 +165,15 @@ impl SessionSummary {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(raw);
-        truncate(tail, 24)
+        tail.to_string()
     }
-}
-
-fn truncate(input: &str, limit: usize) -> String {
-    if input.chars().count() <= limit {
-        return input.to_string();
-    }
-    let mut out: String = input.chars().take(limit.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeChoice {
-    StartFresh,
+    StartFresh {
+        suppress: ResumePickerSuppress,
+    },
     Resume {
         session_id: String,
         /// When `Some(sequence)`, the user picked a branch tip in a
@@ -199,7 +190,14 @@ pub(crate) enum ResumeChoice {
         session_id: String,
         target_cwd: String,
     },
+    Back,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ResumePickerSuppress {
+    pub(crate) project: bool,
+    pub(crate) user: bool,
 }
 
 /// One selectable row in the picker. Linear sessions produce a single
@@ -337,6 +335,9 @@ pub(crate) struct ResumePickerState {
     all_sessions: Vec<SessionSummary>,
     pub(crate) cursor: usize,
     pub(crate) show_all_projects: bool,
+    pub(crate) never_project: bool,
+    pub(crate) never_user: bool,
+    setup_progress: Option<(usize, usize)>,
     cwd: PathBuf,
 }
 
@@ -346,6 +347,14 @@ impl ResumePickerState {
     /// so the toggle can flip between scoped and unscoped views without
     /// re-applying the recency filter.
     pub(crate) fn new(all_sessions: Vec<SessionSummary>, cwd: PathBuf) -> Self {
+        Self::with_setup_progress(all_sessions, cwd, None)
+    }
+
+    pub(crate) fn with_setup_progress(
+        all_sessions: Vec<SessionSummary>,
+        cwd: PathBuf,
+        setup_progress: Option<(usize, usize)>,
+    ) -> Self {
         let cwd_str = cwd.display().to_string();
         let candidates = expand_entries(scoped_view(&all_sessions, &cwd_str));
         Self {
@@ -353,20 +362,39 @@ impl ResumePickerState {
             all_sessions,
             cursor: 0,
             show_all_projects: false,
+            never_project: false,
+            never_user: false,
+            setup_progress,
             cwd,
         }
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.setup_progress.is_some()
     }
 
     /// Number of selectable rows in the list — the leading "Start fresh"
     /// row plus every candidate.
     fn row_count(&self) -> usize {
-        self.candidates.len() + 1
+        self.candidates.len() + 3
     }
 
     /// Index of the "Start fresh" row — always 0 so the safe default is
     /// pre-selected when the picker opens.
     pub(crate) const fn start_fresh_index(&self) -> usize {
         0
+    }
+
+    fn project_checkbox_index(&self) -> usize {
+        self.candidates.len() + 1
+    }
+
+    fn user_checkbox_index(&self) -> usize {
+        self.candidates.len() + 2
+    }
+
+    fn cursor_on_checkbox(&self) -> bool {
+        self.cursor == self.project_checkbox_index() || self.cursor == self.user_checkbox_index()
     }
 
     /// Flip the project scope and re-derive `candidates`. The cursor is
@@ -385,7 +413,12 @@ impl ResumePickerState {
 
     fn select_at_cursor(&self) -> Option<ResumeChoice> {
         if self.cursor == self.start_fresh_index() {
-            return Some(ResumeChoice::StartFresh);
+            return Some(ResumeChoice::StartFresh {
+                suppress: self.suppress_choice(),
+            });
+        }
+        if self.cursor_on_checkbox() {
+            return None;
         }
         // candidate rows live at indices 1..=N.
         let entry = self.candidates.get(self.cursor - 1)?;
@@ -401,6 +434,31 @@ impl ResumePickerState {
                 target_cwd: entry.summary.cwd.clone(),
             })
         }
+    }
+
+    fn suppress_choice(&self) -> ResumePickerSuppress {
+        ResumePickerSuppress {
+            project: self.never_project || self.never_user,
+            user: self.never_user,
+        }
+    }
+
+    fn toggle_at_cursor(&mut self) -> bool {
+        if self.cursor == self.project_checkbox_index() {
+            self.never_project = !self.never_project;
+            if !self.never_project {
+                self.never_user = false;
+            }
+            return true;
+        }
+        if self.cursor == self.user_checkbox_index() {
+            self.never_user = !self.never_user;
+            if self.never_user {
+                self.never_project = true;
+            }
+            return true;
+        }
+        false
     }
 
     pub(crate) fn dispatch(&mut self, key: KeyEvent) -> Option<ResumeChoice> {
@@ -424,9 +482,24 @@ impl ResumePickerState {
                 self.toggle_all_projects();
                 None
             }
-            (KeyCode::Enter, _) => self.select_at_cursor(),
+            (KeyCode::Left, _) | (KeyCode::Backspace, _) if self.can_go_back() => {
+                Some(ResumeChoice::Back)
+            }
+            (KeyCode::Char(' '), _) => {
+                self.toggle_at_cursor();
+                None
+            }
+            (KeyCode::Enter, _) => {
+                if self.toggle_at_cursor() {
+                    None
+                } else {
+                    self.select_at_cursor()
+                }
+            }
             (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
-                Some(ResumeChoice::StartFresh)
+                Some(ResumeChoice::StartFresh {
+                    suppress: self.suppress_choice(),
+                })
             }
             (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => Some(ResumeChoice::Quit),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(ResumeChoice::Quit),
@@ -437,6 +510,11 @@ impl ResumePickerState {
 
 fn scoped_view(all: &[SessionSummary], cwd_str: &str) -> Vec<SessionSummary> {
     all.iter().filter(|s| s.cwd == cwd_str).cloned().collect()
+}
+
+pub(crate) fn has_scoped_candidates(all: &[SessionSummary], cwd: &Path) -> bool {
+    let cwd_str = cwd.display().to_string();
+    all.iter().any(|summary| summary.cwd == cwd_str)
 }
 
 /// Flatten each summary into selectable rows: linear sessions emit a
@@ -509,10 +587,17 @@ pub(crate) fn run_picker<W: io::Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     all_sessions: Vec<SessionSummary>,
     cwd: PathBuf,
+    setup_progress: Option<(usize, usize)>,
 ) -> io::Result<ResumeChoice> {
-    let mut state = ResumePickerState::new(all_sessions, cwd);
-    if state.candidates.is_empty() && state.all_sessions.is_empty() {
-        return Ok(ResumeChoice::StartFresh);
+    let mut state = if setup_progress.is_some() {
+        ResumePickerState::with_setup_progress(all_sessions, cwd, setup_progress)
+    } else {
+        ResumePickerState::new(all_sessions, cwd)
+    };
+    if state.candidates.is_empty() {
+        return Ok(ResumeChoice::StartFresh {
+            suppress: ResumePickerSuppress::default(),
+        });
     }
     loop {
         terminal.draw(|frame| render_picker(frame, &state))?;
@@ -534,6 +619,11 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
 
     frame.render_widget(Clear, full);
 
+    let title_suffix = if state.can_go_back() {
+        "first run setup"
+    } else {
+        "resume a recent session"
+    };
     let title = Line::from(vec![
         Span::styled(" ◆ ", Style::default().fg(crate::render::theme::accent())),
         Span::styled(
@@ -544,7 +634,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         ),
         Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
         Span::styled(
-            "resume a recent session",
+            title_suffix,
             Style::default().fg(crate::render::theme::foreground()),
         ),
         Span::raw(" "),
@@ -562,13 +652,37 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(1), // intro
+            Constraint::Length(1), // question/title
+            Constraint::Length(1), // count
             Constraint::Length(1), // spacer
             Constraint::Min(3),    // list
             Constraint::Length(1), // spacer
-            Constraint::Length(1), // footer
+            Constraint::Length(2), // footer
         ])
         .split(inner);
+
+    let question = if let Some((current, total)) = state.setup_progress {
+        Line::from(vec![
+            Span::styled(
+                format!("Question {current}/{total} "),
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Resume a session",
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "Resume a recent session",
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(question), layout[0]);
 
     let scope = if state.show_all_projects {
         " recent session{} across all projects"
@@ -588,12 +702,12 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         ),
     ]))
     .alignment(Alignment::Left);
-    frame.render_widget(intro, layout[0]);
+    frame.render_widget(intro, layout[1]);
 
     // Start fresh leads the list as the safe default (cursor opens on it),
     // followed by each candidate session at index 1..=N.
     let cwd_str = state.cwd.display().to_string();
-    let mut rows: Vec<Line<'_>> = Vec::with_capacity(state.candidates.len() + 1);
+    let mut rows: Vec<Line<'_>> = Vec::with_capacity(state.candidates.len() + 3);
     rows.push(render_start_fresh_row(
         state.cursor == state.start_fresh_index(),
     ));
@@ -603,16 +717,26 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         let cross_project = entry.summary.cwd != cwd_str;
         render_candidate_row(idx, entry, row_idx == state.cursor, cross_project)
     }));
+    rows.push(render_checkbox_row(
+        "Never ask again for this project",
+        state.never_project || state.never_user,
+        state.cursor == state.project_checkbox_index(),
+    ));
+    rows.push(render_checkbox_row(
+        "Never ask again for this user",
+        state.never_user,
+        state.cursor == state.user_checkbox_index(),
+    ));
 
-    let body = Paragraph::new(rows);
-    frame.render_widget(body, layout[2]);
+    let body = Paragraph::new(rows).wrap(Wrap { trim: false });
+    frame.render_widget(body, layout[3]);
 
     let tab_hint = if state.show_all_projects {
         "this dir"
     } else {
         "all projects"
     };
-    let footer = Paragraph::new(Line::from(vec![
+    let mut footer_lines = vec![Line::from(vec![
         Span::styled(
             "↑/↓ ",
             Style::default().fg(crate::render::theme::secondary()),
@@ -623,9 +747,30 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             Style::default().fg(crate::render::theme::secondary()),
         ),
         Span::styled(
-            "confirm  ",
+            "confirm/toggle  ",
             Style::default().fg(crate::render::theme::quiet()),
         ),
+        Span::styled(
+            "Space ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::styled(
+            "toggle  ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ])];
+    let mut second_line = Vec::new();
+    if state.can_go_back() {
+        second_line.push(Span::styled(
+            "← ",
+            Style::default().fg(crate::render::theme::secondary()),
+        ));
+        second_line.push(Span::styled(
+            "back  ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    second_line.extend([
         Span::styled(
             "Tab ",
             Style::default().fg(crate::render::theme::secondary()),
@@ -644,9 +789,12 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         ),
         Span::styled("Q ", Style::default().fg(crate::render::theme::secondary())),
         Span::styled("quit", Style::default().fg(crate::render::theme::quiet())),
-    ]))
-    .alignment(Alignment::Left);
-    frame.render_widget(footer, layout[4]);
+    ]);
+    footer_lines.push(Line::from(second_line));
+    let footer = Paragraph::new(footer_lines)
+        .wrap(Wrap { trim: false })
+        .alignment(Alignment::Left);
+    frame.render_widget(footer, layout[5]);
 }
 
 fn render_candidate_row(
@@ -683,7 +831,7 @@ fn render_candidate_row(
             let branch_label = tip
                 .first_message_after_branch
                 .as_deref()
-                .map(|text| truncate(text.lines().next().unwrap_or(text), 80))
+                .map(|text| text.lines().next().unwrap_or(text).to_string())
                 .unwrap_or_else(|| summary.label());
             let marker = format!("  ⎇ branch @{}", tip.tip_sequence);
             (branch_label, Some(marker))
@@ -750,11 +898,34 @@ fn render_start_fresh_row(active: bool) -> Line<'static> {
     ])
 }
 
+fn render_checkbox_row(label: &'static str, checked: bool, active: bool) -> Line<'static> {
+    let (prefix_color, label_style) = if active {
+        (
+            crate::render::theme::accent(),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            crate::render::theme::quiet(),
+            Style::default().fg(crate::render::theme::foreground()),
+        )
+    };
+    let prefix = if active { "▸ " } else { "  " };
+    let mark = if checked { "[x] " } else { "[ ] " };
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(prefix_color)),
+        Span::styled(mark, Style::default().fg(crate::render::theme::accent())),
+        Span::styled(label, label_style),
+    ])
+}
+
 /// Center a fixed-size area inside `full` with reasonable bounds for small
 /// terminals.
 fn centered_area(full: Rect) -> Rect {
-    let max_width = 86u16;
-    let max_height = 18u16;
+    let max_width = 98u16;
+    let max_height = 22u16;
     let width = full.width.min(max_width);
     let height = full.height.min(max_height);
     let x = full.x + full.width.saturating_sub(width) / 2;

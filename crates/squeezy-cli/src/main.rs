@@ -15,7 +15,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
     ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
     SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    project_settings_template, user_settings_template,
+    per_repo_settings_path, project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -532,10 +532,25 @@ async fn main() -> squeezy_core::Result<()> {
         return Ok(());
     }
 
+    let mut startup_setup_question_count = None;
+    let mut startup_open_config_section = None;
+    let startup_trailing_question_count =
+        usize::from(startup_resume_question_available(&cli, &config));
+    let mut startup_terminal = None;
     if should_run_startup_model_selector(&cli, &config)? {
-        if !run_startup_model_selector(&config).await? {
+        let mut terminal = squeezy_tui::enter_startup_terminal(&config)?;
+        let Some(selection) = run_startup_model_selector(
+            &config,
+            startup_trailing_question_count,
+            Some(&mut terminal),
+        )
+        .await?
+        else {
             return Ok(());
-        }
+        };
+        startup_setup_question_count = Some(selection.question_count);
+        startup_open_config_section = selection.open_config_section;
+        startup_terminal = Some(terminal);
         config = config_from_cli(&cli)?;
     }
 
@@ -545,7 +560,6 @@ async fn main() -> squeezy_core::Result<()> {
     let telemetry = TelemetryClient::from_config(&config);
     telemetry.spawn(TelemetryEvent::app_started(&config));
 
-    let provider = provider_from_app_config(&config);
     // Resolve `--session <prefix>` against the on-disk session store
     // before any downstream code sees it, so the user can pass a short
     // unique prefix (`squeezy --session abc12`) the same way `squeezy
@@ -600,6 +614,7 @@ async fn main() -> squeezy_core::Result<()> {
         None
     };
     if prompt_mode_active {
+        let provider = provider_from_app_config(&config);
         let prompts = print_mode::resolve_prompt_inputs(
             &cli.prompt,
             stdin_is_tty,
@@ -648,20 +663,72 @@ async fn main() -> squeezy_core::Result<()> {
     let update_banner = update::cached_banner_for_startup();
     let resume_session_id = resume_session_id_opt;
     let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
-    let result = squeezy_tui::run_with_startup_profile(
-        config,
-        provider,
-        squeezy_tui::StartupProfile {
-            onboarding_summary: onboarding.visible_summary,
-            languages: onboarding.language_summary,
+    let mut onboarding = onboarding;
+    loop {
+        let provider = provider_from_app_config(&config);
+        let startup_profile = squeezy_tui::StartupProfile {
+            onboarding_summary: onboarding.visible_summary.clone(),
+            languages: onboarding.language_summary.clone(),
             skip_resume_picker,
-            update_banner,
-            resume_session_id,
-        },
-    )
-    .await;
-    flush_telemetry_best_effort(&telemetry).await;
-    result
+            update_banner: update_banner.clone(),
+            resume_session_id: resume_session_id.clone(),
+            setup_question_count: startup_setup_question_count,
+            open_config_section: startup_open_config_section,
+        };
+        let run_result = if let Some(terminal) = startup_terminal.take() {
+            squeezy_tui::run_with_startup_profile_in_terminal(
+                terminal,
+                config.clone(),
+                provider,
+                startup_profile,
+            )
+            .await?
+        } else {
+            squeezy_tui::StartupRunResult {
+                outcome: squeezy_tui::run_with_startup_profile(
+                    config.clone(),
+                    provider,
+                    startup_profile,
+                )
+                .await?,
+                terminal: None,
+            }
+        };
+        let outcome = run_result.outcome;
+        match outcome {
+            squeezy_tui::StartupRunOutcome::Finished => {
+                flush_telemetry_best_effort(&telemetry).await;
+                return Ok(());
+            }
+            squeezy_tui::StartupRunOutcome::BackToSetup
+                if startup_setup_question_count.is_some() =>
+            {
+                let mut terminal = match run_result.terminal {
+                    Some(terminal) => terminal,
+                    None => squeezy_tui::enter_startup_terminal(&config)?,
+                };
+                let Some(selection) = run_startup_model_selector(
+                    &config,
+                    startup_trailing_question_count,
+                    Some(&mut terminal),
+                )
+                .await?
+                else {
+                    flush_telemetry_best_effort(&telemetry).await;
+                    return Ok(());
+                };
+                startup_setup_question_count = Some(selection.question_count);
+                startup_open_config_section = selection.open_config_section;
+                startup_terminal = Some(terminal);
+                config = config_from_cli(&cli)?;
+                onboarding = prepare_repo_profile(&mut config);
+            }
+            squeezy_tui::StartupRunOutcome::BackToSetup => {
+                flush_telemetry_best_effort(&telemetry).await;
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn flush_telemetry_best_effort(telemetry: &TelemetryClient) {
@@ -1676,16 +1743,24 @@ struct ProviderChoice {
     label: String,
     api_key_env: Option<String>,
     base_url: Option<String>,
+    requires_key_setup: bool,
     models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupModelSelection {
+    theme: String,
     provider: &'static str,
     model: String,
     api_key_env: Option<String>,
     base_url: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupSetupSelection {
+    question_count: usize,
+    open_config_section: Option<squeezy_core::config_schema::SectionId>,
 }
 
 fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_core::Result<bool> {
@@ -1711,14 +1786,35 @@ fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_c
 fn current_model_selection_state(
     workspace_root: &Path,
 ) -> squeezy_core::Result<ModelSelectionState> {
+    let user_path = default_settings_path();
+    let project_path = find_project_settings_path(workspace_root);
+    let repo_root = project_path
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or(workspace_root);
+    let repo_path = per_repo_settings_path(repo_root);
+    model_selection_state_from_paths(&user_path, project_path.as_deref(), &repo_path)
+}
+
+fn model_selection_state_from_paths(
+    user_path: &Path,
+    project_path: Option<&Path>,
+    repo_path: &Path,
+) -> squeezy_core::Result<ModelSelectionState> {
     let mut state = ModelSelectionState::default();
-    state.merge(model_selection_state_from_settings(
-        &default_settings_path(),
-    )?);
-    if let Some(path) = find_project_settings_path(workspace_root) {
-        state.merge(model_selection_state_from_settings(&path)?);
+    state.merge(model_selection_state_from_settings(user_path)?);
+    if let Some(path) = project_path {
+        state.merge(model_selection_state_from_settings(path)?);
     }
+    state.merge(model_selection_state_from_settings(repo_path)?);
     Ok(state)
+}
+
+fn startup_resume_question_available(cli: &Cli, config: &AppConfig) -> bool {
+    if cli.no_resume_picker || cli.session.is_some() || cli.continue_session {
+        return false;
+    }
+    squeezy_tui::startup_resume_question_available(config)
 }
 
 fn model_selection_state_from_settings(path: &Path) -> squeezy_core::Result<ModelSelectionState> {
@@ -1750,12 +1846,16 @@ fn model_selection_state(settings: &SettingsFile) -> ModelSelectionState {
     }
 }
 
-async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<bool> {
+async fn run_startup_model_selector(
+    config: &AppConfig,
+    trailing_question_count: usize,
+    terminal: Option<&mut squeezy_tui::StartupTerminal>,
+) -> squeezy_core::Result<Option<StartupSetupSelection>> {
     let settings_path = default_settings_path();
     let choices = detect_provider_choices(config).await;
     if choices.is_empty() {
         return Err(SqueezyError::Config(
-            "no provider credentials or local Ollama models detected; set OPENROUTER_API_KEY for the fastest path to many models, or set OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / XAI_API_KEY / DEEPSEEK_API_KEY / MISTRAL_API_KEY / TOGETHER_API_KEY / FIREWORKS_API_KEY / CEREBRAS_API_KEY / AI_GATEWAY_API_KEY / PORTKEY_API_KEY, or start Ollama, then run squeezy again"
+            "no startup provider choices are available; open /config after startup to configure a custom provider"
                 .to_string(),
         ));
     }
@@ -1764,6 +1864,18 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
         .iter()
         .map(|choice| squeezy_tui::StartupModelPickerProvider {
             label: choice.label.clone(),
+            credential: if choice.requires_key_setup {
+                squeezy_tui::StartupProviderCredential::NeedsConfig {
+                    env_var: choice
+                        .api_key_env
+                        .clone()
+                        .unwrap_or_else(|| "API key".to_string()),
+                }
+            } else if choice.api_key_env.is_some() {
+                squeezy_tui::StartupProviderCredential::Configured
+            } else {
+                squeezy_tui::StartupProviderCredential::NotRequired
+            },
             models: choice
                 .models
                 .iter()
@@ -1778,11 +1890,28 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let Some(picked) =
-        squeezy_tui::pick_startup_model_selection(config, &settings_path, picker_choices)?
-    else {
-        return Ok(false);
+    let result = if let Some(terminal) = terminal {
+        squeezy_tui::pick_startup_model_selection_in_terminal(
+            terminal,
+            config,
+            &settings_path,
+            picker_choices,
+            trailing_question_count,
+        )?
+    } else {
+        squeezy_tui::pick_startup_model_selection(
+            config,
+            &settings_path,
+            picker_choices,
+            trailing_question_count,
+        )?
     };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    let squeezy_tui::StartupModelPickerResult::Selected(picked) = result;
+    let question_count =
+        3 + usize::from(picked.open_model_config) + usize::from(picked.reasoning_effort.is_some());
     let provider = choices
         .get(picked.provider_index)
         .ok_or_else(|| SqueezyError::Config("startup provider selection out of range".into()))?;
@@ -1791,6 +1920,7 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
         .get(picked.model_index)
         .ok_or_else(|| SqueezyError::Config("startup model selection out of range".into()))?;
     let selection = StartupModelSelection {
+        theme: picked.theme,
         provider: provider.provider,
         model: parse_model_choice_id(model_choice),
         api_key_env: provider.api_key_env.clone(),
@@ -1798,24 +1928,57 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
         reasoning_effort: picked.reasoning_effort,
     };
     save_startup_model_selection(&settings_path, &selection)?;
-    Ok(true)
+    Ok(Some(StartupSetupSelection {
+        question_count,
+        open_config_section: if picked.open_theme_config {
+            Some(squeezy_core::config_schema::SectionId::Themes)
+        } else {
+            picked
+                .open_model_config
+                .then_some(squeezy_core::config_schema::SectionId::Models)
+        },
+    }))
 }
 
 async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
-    let mut choices = Vec::new();
+    let mut choices = vec![
+        hosted_provider_choice(
+            "openai",
+            "OpenAI",
+            preferred_env_name("OPENAI_API_KEY_ENV", &["OPENAI_API_KEY"]),
+            None,
+        ),
+        hosted_provider_choice(
+            "anthropic",
+            "Anthropic",
+            preferred_env_name("ANTHROPIC_API_KEY_ENV", &["ANTHROPIC_API_KEY"]),
+            None,
+        ),
+        hosted_provider_choice(
+            "google",
+            "Gemini",
+            preferred_env_name("GOOGLE_API_KEY_ENV", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+            None,
+        ),
+        hosted_provider_choice(
+            "azure_openai",
+            "Azure OpenAI",
+            preferred_env_name("AZURE_OPENAI_API_KEY_ENV", &["AZURE_OPENAI_API_KEY"]),
+            env::var("AZURE_OPENAI_BASE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+        ),
+    ];
 
-    // OpenAI-compatible presets surface first when their API keys are set —
-    // aggregators (OpenRouter / Vercel / PortKey) give access to many models
-    // through one credit account and are the recommended starting point.
+    // Aggregators and OpenAI-compatible hosts stay visible even before a key is
+    // exported. Static registry entries make model selection deterministic; a
+    // live catalog refresh only runs when the key is actually available.
     for preset in OpenAiCompatiblePreset::all() {
         if matches!(preset, OpenAiCompatiblePreset::Custom) {
             continue;
         }
         let env_var = preset.default_api_key_env();
         if env_var.is_empty() {
-            continue;
-        }
-        if env::var_os(env_var).is_none() {
             continue;
         }
         let base_url = env::var(format!("{}_BASE_URL", preset.as_str().to_ascii_uppercase()))
@@ -1829,68 +1992,33 @@ async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
         ));
     }
 
-    for api_key_env in detected_env_names("OPENAI_API_KEY_ENV", &["OPENAI_API_KEY"]) {
-        choices.push(hosted_provider_choice(
-            "openai",
-            "OpenAI",
-            api_key_env,
-            None,
-        ));
-    }
-    for api_key_env in detected_env_names("ANTHROPIC_API_KEY_ENV", &["ANTHROPIC_API_KEY"]) {
-        choices.push(hosted_provider_choice(
-            "anthropic",
-            "Anthropic",
-            api_key_env,
-            None,
-        ));
-    }
-    for api_key_env in
-        detected_env_names("GOOGLE_API_KEY_ENV", &["GEMINI_API_KEY", "GOOGLE_API_KEY"])
-    {
-        choices.push(hosted_provider_choice(
-            "google",
-            "Gemini",
-            api_key_env,
-            None,
-        ));
-    }
-    for api_key_env in detected_env_names("AZURE_OPENAI_API_KEY_ENV", &["AZURE_OPENAI_API_KEY"]) {
-        if let Some(base_url) = env::var("AZURE_OPENAI_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            choices.push(hosted_provider_choice(
-                "azure_openai",
-                "Azure OpenAI",
-                api_key_env,
-                Some(base_url),
-            ));
-        }
-    }
-
     let ollama_base_url = env::var("OLLAMA_BASE_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string());
     let ollama_models = fetch_ollama_model_names(&ollama_base_url).await;
-    if !ollama_models.is_empty() {
-        let mut models = ollama_models;
-        models.sort_by_key(|model| {
-            if model.starts_with(squeezy_core::DEFAULT_OLLAMA_MODEL) {
-                0
-            } else {
-                1
-            }
-        });
-        choices.push(ProviderChoice {
-            provider: "ollama",
-            label: format!("Ollama local ({ollama_base_url})"),
-            api_key_env: None,
-            base_url: Some(ollama_base_url),
-            models,
-        });
+    let mut models = ollama_models;
+    models.sort_by_key(|model| {
+        if model.starts_with(squeezy_core::DEFAULT_OLLAMA_MODEL) {
+            0
+        } else {
+            1
+        }
+    });
+    if models.is_empty() {
+        models.push(format!(
+            "{} (local default)",
+            squeezy_core::DEFAULT_OLLAMA_MODEL
+        ));
     }
+    choices.push(ProviderChoice {
+        provider: "ollama",
+        label: format!("Ollama local ({ollama_base_url})"),
+        api_key_env: None,
+        base_url: Some(ollama_base_url),
+        requires_key_setup: false,
+        models,
+    });
 
     choices.retain(|choice| !choice.models.is_empty());
     choices
@@ -1921,7 +2049,8 @@ fn compatible_provider_choice(
             curated.push(discovered_model_label(model));
         }
     }
-    if needs_refresh {
+    let configured = env::var_os(&api_key_env).is_some();
+    if configured && needs_refresh {
         spawn_background_refresh(
             preset.as_str().to_string(),
             base_url.clone(),
@@ -1944,9 +2073,14 @@ fn compatible_provider_choice(
     }
     ProviderChoice {
         provider: preset.as_str(),
-        label: format!("{} via {api_key_env}", preset.display_name()),
+        label: format!(
+            "{} ({})",
+            preset.display_name(),
+            credential_label(&api_key_env, configured)
+        ),
         api_key_env: Some(api_key_env),
         base_url: Some(base_url),
+        requires_key_setup: !configured,
         models,
     }
 }
@@ -1987,21 +2121,22 @@ fn spawn_background_refresh(provider: String, base_url: String, api_key_env: Str
     });
 }
 
-fn detected_env_names(selector_env: &str, defaults: &[&str]) -> Vec<String> {
-    let mut names = Vec::new();
+fn preferred_env_name(selector_env: &str, defaults: &[&str]) -> String {
     if let Some(name) = env::var(selector_env)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .filter(|name| env::var_os(name).is_some())
     {
-        names.push(name);
+        return name;
     }
-    for default in defaults {
-        if env::var_os(default).is_some() && !names.iter().any(|name| name == default) {
-            names.push((*default).to_string());
-        }
+    defaults.first().copied().unwrap_or("API_KEY").to_string()
+}
+
+fn credential_label(api_key_env: &str, configured: bool) -> String {
+    if configured {
+        format!("key from {api_key_env}")
+    } else {
+        format!("add {api_key_env} in /config")
     }
-    names
 }
 
 fn hosted_provider_choice(
@@ -2010,11 +2145,13 @@ fn hosted_provider_choice(
     api_key_env: String,
     base_url: Option<String>,
 ) -> ProviderChoice {
+    let configured = env::var_os(&api_key_env).is_some();
     ProviderChoice {
         provider,
-        label: format!("{label} via {api_key_env}"),
+        label: format!("{label} ({})", credential_label(&api_key_env, configured)),
         api_key_env: Some(api_key_env),
         base_url,
+        requires_key_setup: !configured,
         models: models_for_provider(provider)
             .map(model_choice_label)
             .collect::<Vec<_>>(),
@@ -2055,6 +2192,12 @@ fn save_startup_model_selection(
     let mut doc = text
         .parse::<DocumentMut>()
         .map_err(|err| SqueezyError::Config(format!("{}: {err}", path.display())))?;
+
+    let tui = ensure_doc_table(&mut doc, "tui")?;
+    tui.insert(
+        "theme",
+        Item::Value(TomlValue::from(selection.theme.as_str())),
+    );
 
     let model = ensure_doc_table(&mut doc, "model")?;
     model.insert("provider", Item::Value(TomlValue::from(selection.provider)));
@@ -2554,7 +2697,10 @@ fn format_usd_micros(value: Option<u64>) -> String {
 fn provider_from_app_config(config: &AppConfig) -> Arc<dyn LlmProvider> {
     match provider_from_config(&config.provider) {
         Ok(provider) => provider,
-        Err(error) => Arc::new(UnavailableProvider::new("unavailable", error.to_string())),
+        Err(error) => Arc::new(UnavailableProvider::new(
+            squeezy_llm::provider_name(&config.provider),
+            error.to_string(),
+        )),
     }
 }
 

@@ -51,6 +51,53 @@ model = "claude-sonnet-4-6"
 }
 
 #[test]
+fn model_selection_state_reads_project_scope_selection() {
+    let root = temp_dir("project-model-selection");
+    let user_path = root.join("user.toml");
+    let project_path = root.join("repo").join(PROJECT_SETTINGS_FILE);
+    let repo_path = root.join("local.toml");
+    fs::create_dir_all(project_path.parent().expect("project parent")).expect("mkdir");
+    fs::write(
+        &project_path,
+        r#"
+[model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+"#,
+    )
+    .expect("write project settings");
+
+    let state =
+        model_selection_state_from_paths(&user_path, Some(&project_path), &repo_path).unwrap();
+
+    assert!(state.configured());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn model_selection_state_reads_local_scope_selection() {
+    let root = temp_dir("local-model-selection");
+    let user_path = root.join("user.toml");
+    let project_path = root.join("repo").join(PROJECT_SETTINGS_FILE);
+    let repo_path = root.join("local.toml");
+    fs::write(
+        &repo_path,
+        r#"
+[model]
+provider = "openai"
+model = "gpt-5.4-mini"
+"#,
+    )
+    .expect("write local settings");
+
+    let state =
+        model_selection_state_from_paths(&user_path, Some(&project_path), &repo_path).unwrap();
+
+    assert!(state.configured());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn save_startup_model_selection_preserves_existing_settings() {
     let root = temp_dir("model-selection");
     let path = root.join("settings.toml");
@@ -63,6 +110,7 @@ read = "deny"
     )
     .expect("write settings");
     let selection = StartupModelSelection {
+        theme: "bright".to_string(),
         provider: "openai",
         model: "gpt-5.5".to_string(),
         api_key_env: Some("OPENAI_API_KEY".to_string()),
@@ -74,6 +122,7 @@ read = "deny"
 
     let text = fs::read_to_string(&path).expect("read settings");
     assert!(text.contains("read = \"deny\""));
+    assert!(text.contains("theme = \"bright\""));
     assert!(text.contains("provider = \"openai\""));
     assert!(text.contains("model = \"gpt-5.5\""));
     assert!(text.contains("reasoning_effort = \"xhigh\""));

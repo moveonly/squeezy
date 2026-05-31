@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use squeezy_agent::{Agent, PendingConfigSwap};
 use squeezy_core::{
     AppConfig, TuiThemeSettings,
@@ -657,6 +659,7 @@ fn apply_by_tier(
                 match handle.join() {
                     Ok(Ok(p)) => Some(p),
                     Ok(Err(err)) => {
+                        let label = provider_variant_label(&state.effective.provider);
                         notifications.push(
                             format!(
                                 "saved to {} but the new provider failed to build: {err}",
@@ -664,9 +667,14 @@ fn apply_by_tier(
                             ),
                             NotifySeverity::Error,
                         );
-                        None
+                        Some(Arc::new(squeezy_llm::UnavailableProvider::new(
+                            label,
+                            err.to_string(),
+                        ))
+                            as Arc<dyn squeezy_llm::LlmProvider>)
                     }
                     Err(_) => {
+                        let label = provider_variant_label(&state.effective.provider);
                         notifications.push(
                             format!(
                                 "saved to {} but the provider builder thread panicked",
@@ -674,7 +682,11 @@ fn apply_by_tier(
                             ),
                             NotifySeverity::Error,
                         );
-                        None
+                        Some(Arc::new(squeezy_llm::UnavailableProvider::new(
+                            label,
+                            "provider builder thread panicked",
+                        ))
+                            as Arc<dyn squeezy_llm::LlmProvider>)
                     }
                 }
             } else {

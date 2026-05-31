@@ -815,6 +815,26 @@ default_model = "llama-local"
 }
 
 #[test]
+fn model_table_provider_and_model_override_defaults() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+reasoning_effort = "medium"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(config.model, "claude-haiku-4-5-20251001");
+    assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert!(matches!(config.provider, ProviderConfig::Anthropic(_)));
+}
+
+#[test]
 fn env_overrides_settings_file_provider_and_model() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -2964,6 +2984,7 @@ fn session_log_settings_parse_defaults_and_overrides() {
         r#"
 [session]
 mode = "plan"
+resume_picker = "never"
 log_dir = ".squeezy/history"
 log_retention_days = 45
 max_event_bytes = 1234
@@ -2975,10 +2996,28 @@ max_session_bytes = 5678
 
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
     assert_eq!(config.session_mode, SessionMode::Plan);
+    assert_eq!(config.session_resume_picker, SessionResumePicker::Never);
     assert_eq!(config.session_logs.log_dir, Some(".squeezy/history".into()));
     assert_eq!(config.session_logs.log_retention_days, 45);
     assert_eq!(config.session_logs.max_event_bytes, 1234);
     assert_eq!(config.session_logs.max_session_bytes, 5678);
+}
+
+#[test]
+fn session_resume_picker_validation_reports_source_and_path() {
+    let error = SettingsFile::from_toml_str(
+        r#"
+[session]
+resume_picker = "sometimes"
+"#,
+        "squeezy.toml",
+    )
+    .expect_err("invalid resume picker should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("squeezy.toml"));
+    assert!(message.contains("session.resume_picker"));
+    assert!(message.contains("expected ask or never"));
 }
 
 #[test]

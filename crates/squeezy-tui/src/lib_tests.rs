@@ -37,6 +37,51 @@ fn app_starts_ready_with_empty_transcript() {
     assert!(app.transcript.is_empty());
 }
 
+#[tokio::test]
+async fn pending_provider_swap_refreshes_status_line_model_before_turn() {
+    let mut config = test_config(SessionMode::Build);
+    config.model = "gpt-test".to_string();
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+    let mut next = config.clone();
+    next.provider = squeezy_core::ProviderConfig::Anthropic(squeezy_core::AnthropicConfig {
+        api_key_env: "ANTHROPIC_API_KEY".to_string(),
+        api_key: None,
+        base_url: squeezy_core::DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    });
+    next.model = "claude-haiku-4-5-20251001".to_string();
+    let mut agent = test_agent_without_session_log_with_config(config);
+    agent.arm_config_swap(PendingConfigSwap {
+        config: next,
+        provider: Some(Arc::new(UnavailableProvider::new(
+            "anthropic",
+            "test provider",
+        ))),
+        display_note: Some("provider -> anthropic".to_string()),
+    });
+
+    start_user_turn(&mut app, &mut agent, "hello".to_string());
+
+    assert_eq!(app.provider_name, "anthropic");
+    assert_eq!(app.model, "claude-haiku-4-5-20251001");
+    let status = format_status_lines(&app, 160)
+        .into_iter()
+        .map(|line| rendered_line_text(&line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        status.contains("anthropic:claude-haiku-4-5-20251001"),
+        "{status}"
+    );
+    assert!(!status.contains("openai:gpt-test"), "{status}");
+}
+
 #[test]
 fn app_starts_with_unknown_config_warnings_in_transcript() {
     let mut config = test_config(SessionMode::Build);

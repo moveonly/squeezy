@@ -44,8 +44,8 @@ use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
-    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    SessionResumePicker, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
+    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
     TuiSynchronizedOutput, context_attachment_storage_text, detect_context_attachment_kind,
     detect_image_mime,
 };
@@ -88,7 +88,8 @@ mod terminal_writer;
 mod toast;
 pub use render::markdown::render_markdown;
 pub use startup_model_picker::{
-    StartupModelPickerModel, StartupModelPickerProvider, StartupModelPickerSelection,
+    StartupModelPickerModel, StartupModelPickerProvider, StartupModelPickerResult,
+    StartupModelPickerSelection, StartupProviderCredential, StartupThemeAction, StartupThemeChoice,
 };
 pub use streaming_patch::{
     JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
@@ -432,6 +433,17 @@ pub struct StartupProfile {
     /// `squeezy sessions resume <id>` invocation but keeps the rest of
     /// the startup banner pipeline intact.
     pub resume_session_id: Option<String>,
+    /// Number of first-run setup questions already completed before the
+    /// resume picker. When present, the resume picker keeps the same
+    /// question-flow chrome and allows the user to go back to setup.
+    pub setup_question_count: Option<usize>,
+    pub open_config_section: Option<squeezy_core::config_schema::SectionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRunOutcome {
+    Finished,
+    BackToSetup,
 }
 
 /// Maximum draw rate enforced by the event loop. 60 FPS keeps animations
@@ -475,7 +487,9 @@ impl FrameRateLimiter {
 }
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
-    run_inner(config, provider, None, StartupProfile::default()).await
+    run_inner(config, provider, None, StartupProfile::default())
+        .await
+        .map(|_| ())
 }
 
 pub async fn run_with_onboarding(
@@ -493,16 +507,19 @@ pub async fn run_with_onboarding(
             skip_resume_picker: false,
             update_banner: None,
             resume_session_id: None,
+            setup_question_count: None,
+            open_config_section: None,
         },
     )
     .await
+    .map(|_| ())
 }
 
 pub async fn run_with_startup_profile(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     startup: StartupProfile,
-) -> Result<()> {
+) -> Result<StartupRunOutcome> {
     // Resume target carried inside the profile (`--continue` /
     // `--session`) wins over the picker; surface it to `run_inner` as
     // the canonical resume id so the rest of the boot path is identical
@@ -511,16 +528,90 @@ pub async fn run_with_startup_profile(
     run_inner(config, provider, resume, startup).await
 }
 
+pub struct StartupTerminal {
+    guard: TerminalGuard,
+}
+
+pub struct StartupRunResult {
+    pub outcome: StartupRunOutcome,
+    pub terminal: Option<StartupTerminal>,
+}
+
+pub fn enter_startup_terminal(config: &AppConfig) -> Result<StartupTerminal> {
+    apply_theme_overrides(config);
+    let guard = TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    Ok(StartupTerminal { guard })
+}
+
 pub fn pick_startup_model_selection(
     config: &AppConfig,
     settings_path: &Path,
     choices: Vec<StartupModelPickerProvider>,
-) -> Result<Option<StartupModelPickerSelection>> {
+    trailing_question_count: usize,
+) -> Result<Option<StartupModelPickerResult>> {
+    let mut terminal = enter_startup_terminal(config)?;
+    pick_startup_model_selection_in_terminal(
+        &mut terminal,
+        config,
+        settings_path,
+        choices,
+        trailing_question_count,
+    )
+}
+
+pub fn pick_startup_model_selection_in_terminal(
+    terminal: &mut StartupTerminal,
+    config: &AppConfig,
+    settings_path: &Path,
+    choices: Vec<StartupModelPickerProvider>,
+    trailing_question_count: usize,
+) -> Result<Option<StartupModelPickerResult>> {
     apply_theme_overrides(config);
-    let mut terminal =
-        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
-    startup_model_picker::run_picker(terminal.term(), settings_path, choices)
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))
+    let mut themes = render::theme::available_theme_names(config)
+        .into_iter()
+        .map(|name| StartupThemeChoice {
+            label: name.clone(),
+            name,
+            action: StartupThemeAction::Select,
+        })
+        .collect::<Vec<_>>();
+    themes.push(StartupThemeChoice {
+        name: String::new(),
+        label: "Custom theme in /config".to_string(),
+        action: StartupThemeAction::ConfigureInConfig,
+    });
+    startup_model_picker::run_picker(
+        terminal.guard.term(),
+        config,
+        settings_path,
+        themes,
+        choices,
+        trailing_question_count,
+    )
+    .map_err(|err| SqueezyError::Terminal(err.to_string()))
+}
+
+pub async fn run_with_startup_profile_in_terminal(
+    terminal: StartupTerminal,
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    startup: StartupProfile,
+) -> Result<StartupRunResult> {
+    let resume = startup.resume_session_id.clone();
+    let (outcome, terminal) =
+        run_inner_with_terminal(config, provider, resume, startup, terminal.guard).await?;
+    Ok(StartupRunResult {
+        outcome,
+        terminal: terminal.map(|guard| StartupTerminal { guard }),
+    })
+}
+
+pub fn startup_resume_question_available(config: &AppConfig) -> bool {
+    if config.session_resume_picker == SessionResumePicker::Never {
+        return false;
+    }
+    let candidates = resume_picker::load_candidates(config);
+    resume_picker::has_scoped_candidates(&candidates, &config.workspace_root)
 }
 
 pub async fn resume(
@@ -537,6 +628,7 @@ pub async fn resume(
         StartupProfile::default(),
     )
     .await
+    .map(|_| ())
 }
 
 async fn run_inner(
@@ -544,19 +636,35 @@ async fn run_inner(
     provider: Arc<dyn LlmProvider>,
     resume_session_id: Option<String>,
     startup: StartupProfile,
-) -> Result<()> {
+) -> Result<StartupRunOutcome> {
+    apply_theme_overrides(&config);
+    let terminal =
+        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    let (outcome, _) =
+        run_inner_with_terminal(config, provider, resume_session_id, startup, terminal).await?;
+    Ok(outcome)
+}
+
+async fn run_inner_with_terminal(
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    resume_session_id: Option<String>,
+    startup: StartupProfile,
+    mut terminal: TerminalGuard,
+) -> Result<(StartupRunOutcome, Option<TerminalGuard>)> {
     // Apply the persisted theme preference before the first render so the
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
     apply_theme_overrides(&config);
-    let mut terminal =
-        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
             ResumeStartup::Use(id) => Some(id),
             ResumeStartup::Fresh => None,
-            ResumeStartup::Quit => return Ok(()),
+            ResumeStartup::BackToSetup => {
+                return Ok((StartupRunOutcome::BackToSetup, Some(terminal)));
+            }
+            ResumeStartup::Quit => return Ok((StartupRunOutcome::Finished, None)),
         };
     // Cover the gap between the picker exiting and the main loop's
     // first `draw_app`: `Agent::resume`/`Agent::build` walk the
@@ -750,13 +858,14 @@ async fn run_inner(
         .await;
     agent.flush_telemetry().await;
 
-    Ok(())
+    Ok((StartupRunOutcome::Finished, None))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeStartup {
     Use(String),
     Fresh,
+    BackToSetup,
     Quit,
 }
 
@@ -775,15 +884,28 @@ fn maybe_pick_resume_session(
     if startup.skip_resume_picker {
         return Ok(ResumeStartup::Fresh);
     }
+    if config.session_resume_picker == SessionResumePicker::Never {
+        return Ok(ResumeStartup::Fresh);
+    }
     let candidates = resume_picker::load_candidates(config);
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
-    let choice =
-        resume_picker::run_picker(terminal.term(), candidates, config.workspace_root.clone())
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    let setup_progress = startup
+        .setup_question_count
+        .map(|count| (count.saturating_add(1), count.saturating_add(1)));
+    let choice = resume_picker::run_picker(
+        terminal.term(),
+        candidates,
+        config.workspace_root.clone(),
+        setup_progress,
+    )
+    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
-        resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
+        resume_picker::ResumeChoice::StartFresh { suppress } => {
+            persist_resume_picker_suppression(config, suppress)?;
+            Ok(ResumeStartup::Fresh)
+        }
         // `branch_tip` is captured by the picker but not yet wired through
         // the resume flow — the agent restarts at the most recent event in
         // the session log. Branch-aware resume is a follow-up; the
@@ -803,8 +925,35 @@ fn maybe_pick_resume_session(
             terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
             Ok(ResumeStartup::Quit)
         }
+        resume_picker::ResumeChoice::Back => Ok(ResumeStartup::BackToSetup),
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
+}
+
+fn persist_resume_picker_suppression(
+    config: &AppConfig,
+    suppress: resume_picker::ResumePickerSuppress,
+) -> Result<()> {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    if !suppress.project && !suppress.user {
+        return Ok(());
+    }
+    let edit = SettingsEdit {
+        path: &["session", "resume_picker"],
+        op: EditOp::SetString(SessionResumePicker::Never.as_str().to_string()),
+    };
+    if suppress.project {
+        let path = squeezy_core::per_repo_settings_path(&config.workspace_root);
+        apply_edits(&SettingsScope::repo(&path), std::slice::from_ref(&edit))
+            .map_err(|err| SqueezyError::Config(err.to_string()))?;
+    }
+    if suppress.user {
+        let path = squeezy_core::default_settings_path();
+        apply_edits(&SettingsScope::user(&path), &[edit])
+            .map_err(|err| SqueezyError::Config(err.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Format the exit hint printed when the user picks a cross-project
@@ -4092,6 +4241,12 @@ fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptT
 
 fn start_user_turn_prepared(app: &mut TuiApp, agent: &mut Agent, prompt: PreparedPromptTurn) {
     if let Some(swap) = agent.drain_pending_swap() {
+        app.provider_name = swap
+            .provider
+            .as_ref()
+            .map(|provider| provider.name())
+            .unwrap_or_else(|| squeezy_llm::provider_name(&swap.config.provider));
+        app.apply_config_change(&swap.config);
         let note = swap
             .display_note
             .clone()
@@ -12921,6 +13076,8 @@ impl TuiApp {
                 skip_resume_picker: false,
                 update_banner: None,
                 resume_session_id: None,
+                setup_question_count: None,
+                open_config_section: None,
             },
             clipboard,
         )
@@ -12937,17 +13094,19 @@ impl TuiApp {
         let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
         let keymap = build_keymap_resolver(&config.tui.keymap);
+        let open_config_section = startup.open_config_section;
+        let language_summary = if startup.languages.trim().is_empty() {
+            configured_language_summary(config)
+        } else {
+            startup.languages
+        };
         let mut app = Self {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
             reasoning_effort: config.reasoning_effort,
             directory: compact_path(&config.workspace_root),
-            language_summary: if startup.languages.trim().is_empty() {
-                configured_language_summary(config)
-            } else {
-                startup.languages
-            },
+            language_summary,
             mode,
             config_sources: config.config_source_labels().join(","),
             status_verbosity: config.tui.status_verbosity,
@@ -13077,6 +13236,12 @@ impl TuiApp {
             preserve_input_after_slash_command: false,
             settings_path_override: None,
         };
+        if let Some(section) = open_config_section {
+            app.config_screen = Some(config_screen::ConfigScreenState::new(
+                config.clone(),
+                Some(section),
+            ));
+        }
         for warning in &config.config_warnings {
             app.push_warn(format_config_warning(warning));
         }
