@@ -17,7 +17,7 @@ pub(crate) struct SlashCommand {
     /// the slash menu so a user can see at a glance whether typing the
     /// command will read the filesystem, hit the network, modify settings, or
     /// perform a destructive operation. Empty for purely informational or
-    /// in-memory commands (e.g. `/cost`, `/expand`).
+    /// in-memory commands (e.g. `/cost`, `/tasks`).
     pub(crate) capabilities: &'static [PermissionCapability],
 }
 
@@ -172,18 +172,6 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         parameter_hint: None,
         capabilities: &[PermissionCapability::Network],
     },
-    slash_args(
-        "/collapse",
-        "collapse transcript entries (default: all)",
-        true,
-        "[all|tools|logs|diffs|receipts|assistant|reasoning]",
-    ),
-    slash_args(
-        "/expand",
-        "open full transcript; args expand entries inline",
-        true,
-        "[all|tools|logs|diffs|receipts|assistant|reasoning]",
-    ),
     slash_caps(
         "/diff",
         "show uncommitted changes (tracked + untracked)",

@@ -150,26 +150,6 @@ fn parse_compact_undo_flag() {
 }
 
 #[test]
-fn parse_collapse_and_expand_categories() {
-    assert_eq!(
-        parse("/collapse").unwrap(),
-        DispatchCommand::Collapse { category: None }
-    );
-    assert_eq!(
-        parse("/collapse tools").unwrap(),
-        DispatchCommand::Collapse {
-            category: Some("tools".to_string())
-        }
-    );
-    assert_eq!(
-        parse("/expand reasoning").unwrap(),
-        DispatchCommand::Expand {
-            category: Some("reasoning".to_string())
-        }
-    );
-}
-
-#[test]
 fn parse_diff_keymap_statusline_no_args() {
     assert_eq!(parse("/diff").unwrap(), DispatchCommand::Diff);
     assert_eq!(parse("/keymap").unwrap(), DispatchCommand::Keymap);

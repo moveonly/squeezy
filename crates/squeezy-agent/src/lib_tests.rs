@@ -7840,8 +7840,6 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             "plans",
         ),
         (DispatchCommand::Copy { target: None }, "copy"),
-        (DispatchCommand::Collapse { category: None }, "collapse"),
-        (DispatchCommand::Expand { category: None }, "expand"),
         (
             DispatchCommand::Feedback {
                 args: String::new(),

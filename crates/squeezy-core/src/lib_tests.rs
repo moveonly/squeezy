@@ -2854,7 +2854,7 @@ default_model = "project-default"
     )
     .expect("write project file");
 
-    let (settings, sources) = load_settings_from_paths(
+    let (settings, sources, warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
         Some(project_path.as_path()),
         None,
@@ -2866,6 +2866,7 @@ default_model = "project-default"
     assert!(sources[1].contains("user.toml"));
     assert!(sources[2].starts_with("project:"));
     assert!(sources[2].contains("squeezy.toml"));
+    assert!(warnings.is_empty());
 
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
     assert_eq!(config.model, "project-model");
@@ -2911,7 +2912,7 @@ model = "repo-model"
     )
     .expect("write repo file");
 
-    let (settings, sources) = load_settings_from_paths(
+    let (settings, sources, warnings) = load_settings_from_paths(
         None,
         Some(project_path.as_path()),
         Some(repo_path.as_path()),
@@ -2921,6 +2922,7 @@ model = "repo-model"
     assert_eq!(sources[0], "defaults");
     assert!(sources[1].starts_with("project:"));
     assert!(sources[2].starts_with("repo:"));
+    assert!(warnings.is_empty());
     let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
     assert_eq!(config.model, "repo-model");
 
@@ -2942,7 +2944,7 @@ fn load_settings_from_paths_skips_missing_files() {
     let user_path = dir.join("does_not_exist.toml");
     let project_path = dir.join("also_missing.toml");
 
-    let (settings, sources) = load_settings_from_paths(
+    let (settings, sources, warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
         Some(project_path.as_path()),
         Some(dir.join("repo_missing.toml").as_path()),
@@ -2950,6 +2952,7 @@ fn load_settings_from_paths_skips_missing_files() {
     .expect("merge sources");
 
     assert_eq!(sources, vec!["defaults".to_string()]);
+    assert!(warnings.is_empty());
     assert!(settings.providers.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3281,7 +3284,7 @@ theme = "bad theme!"
 }
 
 #[test]
-fn unknown_fields_are_warned_and_removed_from_settings_file() {
+fn unknown_fields_are_ignored_warned_and_preserved_in_settings_file() {
     let dir = std::env::temp_dir().join(format!(
         "squeezy-unknown-fields-{}-{}",
         std::process::id(),
@@ -3300,18 +3303,44 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
     )
     .expect("write seed settings");
 
-    let (_settings, _sources) =
+    let (settings, sources, warnings) =
         SettingsFile::load_optional_source(&path, "test").expect("load_optional_source");
 
-    let cleaned = std::fs::read_to_string(&path).expect("read cleaned settings");
+    assert_eq!(
+        settings.tui.as_ref().and_then(|tui| tui.tick_rate_ms),
+        Some(100)
+    );
+    assert_eq!(
+        sources,
+        vec!["defaults".to_string(), format!("test:{}", path.display())]
+    );
+    assert_eq!(
+        warnings,
+        vec![ConfigWarning {
+            source: format!("test:{}", path.display()),
+            field: "tui.legacy_widget_padding".to_string(),
+        }]
+    );
+
+    let cleaned = std::fs::read_to_string(&path).expect("read settings");
     assert!(
-        !cleaned.contains("legacy_widget_padding"),
-        "unknown key should be stripped, got: {cleaned}"
+        cleaned.contains("legacy_widget_padding"),
+        "unknown key should be preserved while ignored, got: {cleaned}"
     );
     assert!(
         cleaned.contains("tick_rate_ms = 100"),
         "known key should be preserved, got: {cleaned}"
     );
+
+    let config = AppConfig::try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings,
+        sources,
+        warnings.clone(),
+        None,
+        |_| None,
+    )
+    .expect("config loads with unknown field warnings");
+    assert_eq!(config.config_warnings, warnings);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -130,8 +130,6 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
         "/pins",
         "/pin",
         "/unpin",
-        "/expand",
-        "/collapse",
         "/copy",
         "/attachments",
         "/detach",
@@ -201,26 +199,19 @@ fn slash_suggestions_match_substring_not_just_prefix() {
 #[test]
 fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
     // `/co` should list prefix matches (`/config`, `/cost`, `/copy`,
-    // `/collapse`, `/compact`, `/context`) before subsequence-only hits.
+    // `/compact`, `/context`) before subsequence-only hits.
     // `/options` is a hidden compatibility alias, so it must not duplicate
     // the visible settings command in the menu.
     let names = slash_suggestions("/co")
         .into_iter()
         .map(|cmd| cmd.name)
         .collect::<Vec<_>>();
-    let first_six: Vec<&str> = names.iter().take(6).copied().collect();
-    let mut expected = vec![
-        "/collapse",
-        "/compact",
-        "/config",
-        "/context",
-        "/copy",
-        "/cost",
-    ];
+    let first_five: Vec<&str> = names.iter().take(5).copied().collect();
+    let mut expected = vec!["/compact", "/config", "/context", "/copy", "/cost"];
     expected.sort();
-    let mut got = first_six.clone();
+    let mut got = first_five.clone();
     got.sort();
-    assert_eq!(got, expected, "first six should be /co* prefix hits");
+    assert_eq!(got, expected, "first five should be /co* prefix hits");
     assert!(
         !names.contains(&"/options"),
         "/options should not be suggested alongside /config"

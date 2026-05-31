@@ -40,10 +40,10 @@ use squeezy_vcs::{DiffSnapshot as VcsDiffSnapshot, RollbackResult as VcsRollback
 /// `/job`, `/job-cancel` kept as documented aliases of `/tasks`,
 /// `/task`, `/task-cancel`).
 ///
-/// String-only payloads are intentional: types like `TranscriptCategory`
-/// or `ConfigSectionId` live in higher crates and are only meaningful
-/// to the TUI renderer. Keeping the payloads as `String` lets the
-/// dispatch layer stay in `squeezy-agent` without pulling in TUI types.
+/// String-only payloads are intentional: UI-specific types like
+/// `ConfigSectionId` live in higher crates and are only meaningful to the
+/// TUI renderer. Keeping the payloads as `String` lets the dispatch layer
+/// stay in `squeezy-agent` without pulling in TUI types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "args", rename_all = "kebab-case")]
 pub enum DispatchCommand {
@@ -76,12 +76,6 @@ pub enum DispatchCommand {
     },
     Compact {
         undo: bool,
-    },
-    Collapse {
-        category: Option<String>,
-    },
-    Expand {
-        category: Option<String>,
     },
     Diff,
     Tasks,
@@ -181,8 +175,6 @@ impl DispatchCommand {
             Self::Attachments => "/attachments",
             Self::Copy { .. } => "/copy",
             Self::Compact { .. } => "/compact",
-            Self::Collapse { .. } => "/collapse",
-            Self::Expand { .. } => "/expand",
             Self::Diff => "/diff",
             Self::Tasks => "/tasks",
             Self::Task { .. } => "/task",
@@ -292,12 +284,6 @@ impl DispatchCommand {
                 );
                 Self::Compact { undo }
             }
-            "/collapse" => Self::Collapse {
-                category: first_token(rest),
-            },
-            "/expand" => Self::Expand {
-                category: first_token(rest),
-            },
             "/diff" => Self::Diff,
             "/tasks" => Self::Tasks,
             "/task" => Self::Task {

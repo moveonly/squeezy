@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
+    hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -40,10 +41,10 @@ use squeezy_agent::{
     RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
-    PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
-    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    AppConfig, ConfigWarning, ContextAttachment, ContextCompactionRecord, ContextCompactionState,
+    ContextEstimate, PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role,
+    SessionMode, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
+    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
     TuiSynchronizedOutput,
 };
 use squeezy_llm::LlmProvider;
@@ -76,6 +77,7 @@ mod proposed_plan;
 mod render;
 mod resume_picker;
 mod settings_watcher;
+mod startup_model_picker;
 mod status;
 mod status_line_setup;
 mod streaming;
@@ -83,6 +85,9 @@ mod streaming_patch;
 mod terminal_writer;
 mod toast;
 pub use render::markdown::render_markdown;
+pub use startup_model_picker::{
+    StartupModelPickerModel, StartupModelPickerProvider, StartupModelPickerSelection,
+};
 pub use streaming_patch::{
     JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
 };
@@ -182,6 +187,11 @@ const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 /// requires holding `Shift` on most emulators — the standard tradeoff
 /// when a TUI takes over mouse input.
 const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
+/// Enable button-motion reporting (1002) in addition to basic click
+/// reporting. This is only used while the transcript overlay is in its
+/// explicit scrollbar-drag mode; native unmodified text selection needs
+/// mouse reporting disabled, so drag capture cannot be the overlay default.
+const ENABLE_MOUSE_DRAG_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 // The matching disable sequence (1000l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
@@ -200,6 +210,8 @@ const END_SYNCHRONIZED_UPDATE: &str = "\x1b[?2026l";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
+const MAX_INPUT_EVENTS_PER_POLL: usize = 128;
+const MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL: usize = 4096;
 
 fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
     execute!(
@@ -223,6 +235,20 @@ fn leave_transcript_overlay_screen<W: Write>(
         LeaveAlternateScreen
     )?;
     if restore_mouse_capture {
+        execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
+    }
+    Ok(())
+}
+
+fn set_transcript_overlay_mouse_mode<W: Write>(
+    writer: &mut W,
+    scrollbar_drag: bool,
+    restore_main_mouse_capture: bool,
+) -> io::Result<()> {
+    execute!(writer, Print(DISABLE_MOUSE_MODES))?;
+    if scrollbar_drag {
+        execute!(writer, Print(ENABLE_MOUSE_DRAG_CAPTURE))?;
+    } else if restore_main_mouse_capture {
         execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
     }
     Ok(())
@@ -483,6 +509,18 @@ pub async fn run_with_startup_profile(
     run_inner(config, provider, resume, startup).await
 }
 
+pub fn pick_startup_model_selection(
+    config: &AppConfig,
+    settings_path: &Path,
+    choices: Vec<StartupModelPickerProvider>,
+) -> Result<Option<StartupModelPickerSelection>> {
+    apply_theme_overrides(config);
+    let mut terminal =
+        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    startup_model_picker::run_picker(terminal.term(), settings_path, choices)
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))
+}
+
 pub async fn resume(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
@@ -644,7 +682,7 @@ async fn run_inner(
         // the title clock, which removes the per-frame draw work that
         // would otherwise keep a background window's GPU and emulator
         // pipeline busy.
-        if app.focused {
+        if should_advance_animation_tick(&app) {
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
         if app.app_notifications.tick() {
@@ -1142,22 +1180,124 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         return Ok(false);
     }
 
-    // Any event we read here either drives a state mutation directly or
-    // arms `pending_resize` for the next draw. In every non-timeout
-    // branch we flip `needs_redraw` so the main loop knows to repaint.
-    app.needs_redraw = true;
-    match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
-        Event::Key(key) => handle_key(app, agent, key).await,
+    let mut events = Vec::with_capacity(8);
+    events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
+    let max_events = input_events_per_poll_limit(app);
+    while events.len() < max_events
+        && event::poll(Duration::ZERO).map_err(|err| SqueezyError::Terminal(err.to_string()))?
+    {
+        events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
+    }
+    if let Some(key_event) = take_priority_key_event_for_dispatch(app, &mut events) {
+        return handle_input_event(app, agent, key_event).await;
+    }
+    let events = coalesce_input_events_for_dispatch(app, events);
+    for input_event in events {
+        let is_key = matches!(input_event, Event::Key(_));
+        if handle_input_event(app, agent, input_event).await? {
+            return Ok(true);
+        }
+        if is_key {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+fn take_priority_key_event_for_dispatch(app: &TuiApp, events: &mut Vec<Event>) -> Option<Event> {
+    if !transcript_overlay_drag_mode_active(app) {
+        return None;
+    }
+    let key_index = events
+        .iter()
+        .position(|event| matches!(event, Event::Key(_)))?;
+    Some(events.remove(key_index))
+}
+
+fn input_events_per_poll_limit(app: &TuiApp) -> usize {
+    if transcript_overlay_drag_mode_active(app) {
+        MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL
+    } else {
+        MAX_INPUT_EVENTS_PER_POLL
+    }
+}
+
+fn coalesce_input_events_for_dispatch(app: &TuiApp, events: Vec<Event>) -> Vec<Event> {
+    let mut coalesced = Vec::with_capacity(events.len());
+    let mut pending_drag: Option<crossterm::event::MouseEvent> = None;
+    for input_event in events {
+        match input_event {
+            Event::Mouse(mouse) if should_coalesce_transcript_overlay_drag(app, &mouse) => {
+                pending_drag = Some(mouse);
+            }
+            other => {
+                if let Some(mouse) = pending_drag.take() {
+                    coalesced.push(Event::Mouse(mouse));
+                }
+                coalesced.push(other);
+            }
+        }
+    }
+    if let Some(mouse) = pending_drag {
+        coalesced.push(Event::Mouse(mouse));
+    }
+    coalesced
+}
+
+fn should_coalesce_transcript_overlay_drag(
+    app: &TuiApp,
+    mouse: &crossterm::event::MouseEvent,
+) -> bool {
+    transcript_overlay_drag_mode_active(app)
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+        )
+}
+
+fn transcript_overlay_drag_mode_active(app: &TuiApp) -> bool {
+    app.transcript_overlay
+        .as_ref()
+        .is_some_and(|state| state.mode.mouse_capture())
+}
+
+async fn handle_input_event(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    input_event: Event,
+) -> Result<bool> {
+    // Preserve a deferred redraw if the frame limiter held one back from
+    // the previous loop iteration. Individual event arms below add to this
+    // instead of blindly repainting for mouse-wheel momentum at scroll
+    // boundaries.
+    let was_dirty = app.needs_redraw;
+    match input_event {
+        Event::Key(key) => {
+            let before_overlay = app.transcript_overlay;
+            let overlay_scroll_key = before_overlay.is_some()
+                && is_transcript_overlay_scroll_key(key.code, key.modifiers);
+            let quit = handle_key(app, agent, key).await?;
+            let unchanged_overlay_scroll =
+                overlay_scroll_key && app.transcript_overlay == before_overlay;
+            app.needs_redraw = was_dirty || app.needs_redraw || !unchanged_overlay_scroll;
+            Ok(quit)
+        }
         Event::Mouse(mouse) => {
-            handle_mouse(app, mouse);
+            if handle_mouse(app, mouse) {
+                app.needs_redraw = true;
+            } else {
+                app.needs_redraw = was_dirty || app.needs_redraw;
+            }
             Ok(false)
         }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
+            app.needs_redraw = true;
             Ok(false)
         }
         Event::Resize(_, _) => {
             app.pending_resize = true;
+            app.needs_redraw = true;
             Ok(false)
         }
         // Crossterm only emits these after `EnableFocusChange` succeeded
@@ -1165,25 +1305,27 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         // sequence (older xterm / Apple Terminal / SSH targets without
         // focus reporting) simply never reach this arm, so `focused`
         // stays `true` and animations run as before. We force a redraw
-        // on both transitions (via the unconditional `needs_redraw =
-        // true` above): focus-regain wants the spinner to catch up to
-        // wall-clock state, and focus-loss wants the final "paused"
-        // frame to land before the animation tick driver freezes so
-        // the spinner is not stuck mid-cycle when the user tabs back.
+        // on both transitions: focus-regain wants the spinner to catch
+        // up to wall-clock state, and focus-loss wants the final
+        // "paused" frame to land before the animation tick driver
+        // freezes so the spinner is not stuck mid-cycle when the user
+        // tabs back.
         Event::FocusGained => {
             app.focused = true;
+            app.needs_redraw = true;
             Ok(false)
         }
         Event::FocusLost => {
             app.focused = false;
+            app.needs_redraw = true;
             Ok(false)
         }
     }
 }
 
-fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
-    if handle_transcript_overlay_mouse(app, mouse) {
-        return;
+fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    if let Some(changed) = handle_transcript_overlay_mouse(app, mouse) {
+        return changed;
     }
 
     // Left-click is dispatched via the per-frame click registry so any
@@ -1193,7 +1335,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
         && let Some(action) = app.click_target_at(mouse.column, mouse.row)
     {
         dispatch_click_action(app, action);
-        return;
+        return true;
     }
     // Wheel scroll always scrolls the transcript. The previous
     // `alternate_scroll_enabled` gate dropped wheel events in
@@ -1201,58 +1343,174 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
     // wheel-to-arrow translation is disabled), which left the user
     // with no way to scroll at all once mouse capture was on.
     match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_transcript_up(app, 3),
-        MouseEventKind::ScrollDown => scroll_transcript_down(app, 3),
-        _ => {}
+        MouseEventKind::ScrollUp => {
+            let before = app.transcript_scroll_from_bottom;
+            scroll_transcript_up(app, 3);
+            app.transcript_scroll_from_bottom != before
+        }
+        MouseEventKind::ScrollDown => {
+            let before = app.transcript_scroll_from_bottom;
+            scroll_transcript_down(app, 3);
+            app.transcript_scroll_from_bottom != before
+        }
+        _ => false,
     }
 }
 
-fn handle_transcript_overlay_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
-    if app.transcript_overlay.is_none() {
-        return false;
-    };
-    match mouse.kind {
+fn handle_transcript_overlay_mouse(
+    app: &mut TuiApp,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<bool> {
+    app.transcript_overlay.as_ref()?;
+    let changed = match mouse.kind {
         MouseEventKind::ScrollUp => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_sub(3);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(3))
         }
         MouseEventKind::ScrollDown => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_add(3);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(3))
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
         | MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            if let Some(scroll) = transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
-                && let Some(state) = app.transcript_overlay.as_mut()
+            if app
+                .transcript_overlay
+                .as_ref()
+                .is_some_and(|state| state.mode.mouse_capture())
+                && let Some((scroll, max_scroll)) =
+                    transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
             {
-                state.scroll = scroll;
+                set_transcript_overlay_scroll_from_cached_geometry(app, scroll, max_scroll)
+            } else {
+                false
             }
         }
-        _ => {}
-    }
-    true
+        _ => false,
+    };
+    Some(changed)
 }
 
-fn transcript_overlay_scroll_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<u16> {
+fn adjust_transcript_overlay_scroll(app: &mut TuiApp, f: impl FnOnce(usize) -> usize) -> bool {
+    let scroll = f(resolved_transcript_overlay_scroll(app));
+    set_transcript_overlay_scroll(app, scroll)
+}
+
+fn set_transcript_overlay_scroll(app: &mut TuiApp, scroll: usize) -> bool {
+    let scroll = clamp_transcript_overlay_scroll(app, scroll);
+    set_transcript_overlay_scroll_known_clamped(app, scroll)
+}
+
+fn set_transcript_overlay_scroll_known_clamped(app: &mut TuiApp, scroll: usize) -> bool {
+    let scroll = transcript_overlay_max_scroll(app)
+        .map(|max_scroll| {
+            if scroll >= max_scroll {
+                TRANSCRIPT_OVERLAY_SCROLL_BOTTOM
+            } else {
+                scroll
+            }
+        })
+        .unwrap_or(scroll);
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        if state.scroll == scroll {
+            return false;
+        }
+        state.scroll = scroll;
+        true
+    } else {
+        false
+    }
+}
+
+fn set_transcript_overlay_scroll_from_cached_geometry(
+    app: &mut TuiApp,
+    scroll: usize,
+    max_scroll: usize,
+) -> bool {
+    let scroll = if scroll >= max_scroll {
+        TRANSCRIPT_OVERLAY_SCROLL_BOTTOM
+    } else {
+        scroll
+    };
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        if state.scroll == scroll {
+            return false;
+        }
+        state.scroll = scroll;
+        true
+    } else {
+        false
+    }
+}
+
+fn resolved_transcript_overlay_scroll(app: &TuiApp) -> usize {
+    let Some(state) = app.transcript_overlay else {
+        return 0;
+    };
+    transcript_overlay_max_scroll(app)
+        .map(|max_scroll| {
+            if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+                max_scroll
+            } else {
+                state.scroll.min(max_scroll)
+            }
+        })
+        .unwrap_or(if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+            0
+        } else {
+            state.scroll
+        })
+}
+
+fn clamp_transcript_overlay_scroll(app: &TuiApp, scroll: usize) -> usize {
+    transcript_overlay_max_scroll(app)
+        .map(|max_scroll| scroll.min(max_scroll))
+        .unwrap_or(scroll)
+}
+
+fn is_transcript_overlay_scroll_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
+        && matches!(
+            code,
+            KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        )
+}
+
+fn transcript_overlay_max_scroll(app: &TuiApp) -> Option<usize> {
     let (width, height) = terminal_size().ok()?;
-    let area = Rect {
+    let full_area = Rect {
         x: 0,
         y: 0,
         width,
         height,
     };
+    let (area, _) = transcript_overlay_content_and_status_areas(full_area);
     let inner = transcript_overlay_inner(area);
-    let (text_area, scrollbar_area) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    let (text_area, _) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    Some(with_transcript_overlay_rows(app, text_area.width, |rows| {
+        transcript_overlay_max_scroll_for_content(rows.len(), text_area.height)
+    }))
+}
+
+fn transcript_overlay_scroll_from_mouse(
+    app: &TuiApp,
+    column: u16,
+    row: u16,
+) -> Option<(usize, usize)> {
+    let cached = app.transcript_overlay_scrollbar_cache.get()?;
+    let scrollbar_area = cached.scrollbar_area;
     if column != scrollbar_area.x
         || row < scrollbar_area.y
         || row >= scrollbar_area.y.saturating_add(scrollbar_area.height)
     {
         return None;
     }
-    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
-    transcript_overlay_scroll_for_scrollbar_row(row, scrollbar_area, lines.len())
+    Some((
+        transcript_overlay_scroll_for_cached_scrollbar_row(row, cached),
+        cached.geometry.max_scroll,
+    ))
 }
 
 /// Canonicalise a `KeyEvent` so every downstream dispatcher sees a
@@ -1353,7 +1611,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
 
     // Chord follow-ups run BEFORE any single-key dispatch so the second
     // stroke of a chord never accidentally fires a normal keybinding.
-    if let Some(prefix) = app.pending_chord.take() {
+    if app.transcript_overlay.is_some() {
+        app.pending_chord = None;
+    } else if let Some(prefix) = app.pending_chord.take() {
         // Permissive guard: `Q` may arrive as `Char('q')` or `Char('Q')`
         // and may carry stray SHIFT / CAPS_LOCK / KEYPAD bits depending
         // on the kitty keyboard protocol level the terminal advertises.
@@ -1381,6 +1641,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     if matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::ALT)
+        && app.transcript_overlay.is_none()
     {
         app.pending_chord = Some(ChordPrefix::CtrlX);
         app.status = "Ctrl+X… (Q opens queue · Esc cancels)".to_string();
@@ -1443,7 +1704,11 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // `n` dismisses the current notification, `N` clears all. Only fires
     // when the prompt is empty so we don't eat keystrokes the user is
     // typing into the input area.
-    if app.input.is_empty() && !app.app_notifications.is_empty() && key.modifiers.is_empty() {
+    if app.transcript_overlay.is_none()
+        && app.input.is_empty()
+        && !app.app_notifications.is_empty()
+        && key.modifiers.is_empty()
+    {
         if key.code == KeyCode::Char('n') {
             if app.app_notifications.dismiss_current() {
                 return Ok(false);
@@ -1823,6 +2088,9 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
     let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
         return false;
     };
+    if app.transcript_overlay.is_some() && action != keymap::Action::ToggleTranscriptOverlay {
+        return false;
+    }
     match action {
         keymap::Action::ToggleConfigScreen => {
             toggle_config_screen(app, agent, None);
@@ -1834,6 +2102,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            app.transcript_overlay_scrollbar_cache.set(None);
             app.transcript_overlay = if app.transcript_overlay.is_some() {
                 None
             } else {
@@ -1920,7 +2189,10 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
 /// single-Ctrl-letter defaults collide with terminal flow control
 /// (`Ctrl+Q` = `XON`, `Ctrl+S` = `XOFF`) and with macOS shortcuts.
 fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
-    if app.config_screen.is_some() || app.status_line_setup.is_some() {
+    if app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.transcript_overlay.is_some()
+    {
         return;
     }
     app.prompt_queue_overlay = if app.prompt_queue_overlay.is_some() {
@@ -2130,8 +2402,9 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy"
-        | "/collapse" | "/expand" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/help" => {
+            false
+        }
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -2423,17 +2696,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }
             Err(error) => app.status = format!("unpin failed: {error}"),
         },
-        DispatchCommand::Collapse { category } => {
-            apply_collapse_expand(app, "/collapse", category.as_deref(), true);
-        }
-        DispatchCommand::Expand { category } => {
-            if category.is_none() {
-                app.transcript_overlay = Some(TranscriptOverlayState::default());
-                app.status = "full transcript open".to_string();
-            } else {
-                apply_collapse_expand(app, "/expand", category.as_deref(), false);
-            }
-        }
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Effort { value } => handle_slash_effort(app, agent, value.as_deref()),
         DispatchCommand::Verbosity { value } => {
@@ -2674,40 +2936,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             "checkpoint_revert",
             serde_json::json!({ "group_id": group_id }),
         ),
-    }
-}
-
-fn apply_collapse_expand(app: &mut TuiApp, command: &str, category: Option<&str>, collapsed: bool) {
-    let category_arg = category;
-    let category = match category_arg {
-        Some(value) => match parse_transcript_category(value) {
-            Some(category) => category,
-            None => {
-                app.status =
-                    format!("usage: {command} [all|tools|logs|diffs|receipts|assistant|reasoning]");
-                return;
-            }
-        },
-        None => TranscriptCategory::All,
-    };
-    let changed = set_transcript_collapsed(app, category, collapsed);
-    let verb = if collapsed { "collapse" } else { "expand" };
-    let past = if collapsed { "collapsed" } else { "expanded" };
-    if changed == 0 {
-        // squeezy-o3z0 (audit U3): when nothing matches the requested
-        // category, say so directly instead of leaking a "collapsed 0
-        // transcript entries" line. `category_arg` is the user-typed
-        // slug; falling back to "matching" keeps the bare /collapse
-        // case (TranscriptCategory::All) readable too.
-        let label = category_arg.unwrap_or("matching");
-        app.status = format!("no {label} entries to {verb}");
-    } else {
-        app.status = format!(
-            "{} {} transcript entr{}",
-            past,
-            changed,
-            if changed == 1 { "y" } else { "ies" }
-        );
     }
 }
 
@@ -3342,19 +3570,6 @@ fn transcript_plain_text(app: &TuiApp) -> String {
     lines.join("\n")
 }
 
-fn parse_transcript_category(value: &str) -> Option<TranscriptCategory> {
-    match value {
-        "all" => Some(TranscriptCategory::All),
-        "tools" => Some(TranscriptCategory::Tools),
-        "logs" => Some(TranscriptCategory::Logs),
-        "diffs" => Some(TranscriptCategory::Diffs),
-        "receipts" => Some(TranscriptCategory::Receipts),
-        "assistant" => Some(TranscriptCategory::Assistant),
-        "reasoning" | "thinking" => Some(TranscriptCategory::Reasoning),
-        _ => None,
-    }
-}
-
 fn parse_response_verbosity(value: &str) -> Option<ResponseVerbosity> {
     match value {
         "concise" => Some(ResponseVerbosity::Concise),
@@ -3477,14 +3692,11 @@ fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Optio
     app.status = format!("tool output verbosity → {}", verbosity.as_str());
 }
 
-fn set_transcript_collapsed(
-    app: &mut TuiApp,
-    category: TranscriptCategory,
-    collapsed: bool,
-) -> usize {
+#[cfg(test)]
+fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     let mut changed = 0;
     for entry in &mut app.transcript {
-        if entry.matches_category(category) && entry.collapsed != collapsed {
+        if entry.collapsed != collapsed {
             entry.collapsed = collapsed;
             entry.bump_revision();
             changed += 1;
@@ -3526,50 +3738,64 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.transcript_overlay.is_none() {
         return false;
     }
-    const PAGE: u16 = 10;
+    const PAGE: usize = 10;
     match key.code {
         KeyCode::Esc => {
+            app.transcript_overlay_scrollbar_cache.set(None);
             app.transcript_overlay = None;
             app.status = "transcript overlay closed".to_string();
             true
         }
         KeyCode::PageUp => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_sub(PAGE);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(PAGE));
             true
         }
         KeyCode::PageDown => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_add(PAGE);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(PAGE));
             true
         }
         KeyCode::Up => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_sub(1);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(1));
             true
         }
         KeyCode::Down => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = state.scroll.saturating_add(1);
-            }
+            adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(1));
             true
         }
         KeyCode::Home => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = 0;
-            }
+            set_transcript_overlay_scroll(app, 0);
             true
         }
         KeyCode::End => {
-            if let Some(state) = app.transcript_overlay.as_mut() {
-                state.scroll = u16::MAX;
-            }
+            let end =
+                transcript_overlay_max_scroll(app).unwrap_or(TRANSCRIPT_OVERLAY_SCROLL_BOTTOM);
+            set_transcript_overlay_scroll(app, end);
+            true
+        }
+        KeyCode::Char('m') | KeyCode::Char('M')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            toggle_transcript_overlay_mouse_capture(app);
             true
         }
         _ => true, // swallow everything else so the overlay stays modal
+    }
+}
+
+fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        state.mode = match state.mode {
+            TranscriptOverlayMode::NativeSelection => TranscriptOverlayMode::ScrollbarDrag,
+            TranscriptOverlayMode::ScrollbarDrag => TranscriptOverlayMode::NativeSelection,
+        };
+        app.status = if state.mode.mouse_capture() {
+            "transcript scrollbar drag on (Shift-drag selects text)"
+        } else {
+            "transcript native selection mode"
+        }
+        .to_string();
     }
 }
 
@@ -4561,7 +4787,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
-        render_transcript_overlay(frame, area, app);
+        render_transcript_overlay_surface(frame, area, app);
         return;
     }
     if let Some(state) = &app.status_line_setup {
@@ -4793,7 +5019,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
-        render_transcript_overlay(frame, area, app);
+        render_transcript_overlay_surface(frame, area, app);
         return;
     }
     if let Some(state) = &app.status_line_setup {
@@ -5022,6 +5248,10 @@ fn turn_in_progress(app: &TuiApp) -> bool {
                 .task_state
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.status == squeezy_core::TaskStateStatus::Running))
+}
+
+fn should_advance_animation_tick(app: &TuiApp) -> bool {
+    app.focused || turn_in_progress(app)
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
@@ -5285,16 +5515,78 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     frame.render_widget(paragraph, area);
 }
 
+const TRANSCRIPT_OVERLAY_SCROLL_BOTTOM: usize = usize::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptOverlayMode {
+    NativeSelection,
+    ScrollbarDrag,
+}
+
+impl TranscriptOverlayMode {
+    fn mouse_capture(self) -> bool {
+        matches!(self, Self::ScrollbarDrag)
+    }
+}
+
 /// State for the full-screen transcript overlay (Ctrl+T). All transcript
 /// entries are rendered in their fully-expanded form regardless of each
 /// entry's collapsed flag; the user scrolls with PgUp/PgDn/arrows.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranscriptOverlayState {
-    pub(crate) scroll: u16,
+    pub(crate) scroll: usize,
+    pub(crate) mode: TranscriptOverlayMode,
+}
+
+impl Default for TranscriptOverlayState {
+    fn default() -> Self {
+        Self {
+            scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+            mode: TranscriptOverlayMode::NativeSelection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptOverlayRenderKey {
+    width: u16,
+    transcript_len: usize,
+    transcript_revision_hash: u64,
+    selected_entry: Option<usize>,
+    pending_hash: u64,
+    show_reasoning_usage: bool,
+    coalesce_tool_runs: bool,
+    animation_tick: u64,
+    palette_generation: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptOverlayRenderCache {
+    key: Option<TranscriptOverlayRenderKey>,
+    rows: Vec<Line<'static>>,
 }
 
 /// Render the full-screen transcript overlay. Replaces the normal
 /// transcript + prompt layout while `app.transcript_overlay` is `Some`.
+fn render_transcript_overlay_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let (overlay_area, status_area) = transcript_overlay_content_and_status_areas(area);
+    if overlay_area.height > 0 {
+        render_transcript_overlay(frame, overlay_area, app);
+    }
+    if status_area.height > 0 {
+        render_status(frame, status_area, app);
+    }
+    render_toast_overlay(frame, area, app);
+}
+
+fn transcript_overlay_content_and_status_areas(area: Rect) -> (Rect, Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
 fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let state = match app.transcript_overlay {
         Some(state) => state,
@@ -5323,21 +5615,132 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 height: 0,
             },
         ));
-    let lines = transcript_lines_for_overlay(app, Some(text_area.width));
-    let line_count = lines.len();
-    let scroll = transcript_overlay_scrollbar_geometry(line_count, text_area.height, state.scroll)
-        .map(|geometry| state.scroll.min(geometry.max_scroll))
-        .unwrap_or(0);
-    let paragraph = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, text_area);
-    if scrollbar_area.width > 0
-        && let Some(geometry) =
-            transcript_overlay_scrollbar_geometry(line_count, scrollbar_area.height, scroll)
-    {
-        render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+    with_transcript_overlay_rows(app, text_area.width, |rows| {
+        let row_count = rows.len();
+        let scroll =
+            resolved_transcript_overlay_scroll_for_state(state, row_count, text_area.height);
+        render_transcript_overlay_rows(frame, text_area, rows, scroll);
+        if scrollbar_area.width > 0
+            && let Some(geometry) =
+                transcript_overlay_scrollbar_geometry(row_count, scrollbar_area.height, scroll)
+        {
+            app.transcript_overlay_scrollbar_cache
+                .set(Some(TranscriptOverlayScrollbarCache {
+                    scrollbar_area,
+                    geometry,
+                }));
+            render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+        } else {
+            app.transcript_overlay_scrollbar_cache.set(None);
+        }
+    });
+}
+
+#[cfg(test)]
+fn transcript_overlay_rows_for_render(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    with_transcript_overlay_rows(app, width, |rows| rows.to_vec())
+}
+
+fn with_transcript_overlay_rows<R>(
+    app: &TuiApp,
+    width: u16,
+    f: impl FnOnce(&[Line<'static>]) -> R,
+) -> R {
+    let width = width.max(1);
+    let key = transcript_overlay_render_key(app, width);
+    let mut cache = app.transcript_overlay_render_cache.borrow_mut();
+    if cache.key != Some(key) {
+        let logical_lines = transcript_lines_for_overlay(app, Some(width));
+        cache.rows = wrap_transcript_overlay_rows(&logical_lines, width);
+        cache.key = Some(key);
     }
+    f(&cache.rows)
+}
+
+fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
+    let mut transcript_hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in &app.transcript {
+        entry.id.hash(&mut transcript_hasher);
+        entry.revision.hash(&mut transcript_hasher);
+    }
+
+    let mut pending_hasher = std::collections::hash_map::DefaultHasher::new();
+    app.pending_reasoning.hash(&mut pending_hasher);
+    if !app.pending_assistant.trim_is_empty() {
+        app.pending_assistant.text().hash(&mut pending_hasher);
+    }
+
+    TranscriptOverlayRenderKey {
+        width,
+        transcript_len: app.transcript.len(),
+        transcript_revision_hash: transcript_hasher.finish(),
+        selected_entry: app.selected_entry,
+        pending_hash: pending_hasher.finish(),
+        show_reasoning_usage: app.show_reasoning_usage,
+        coalesce_tool_runs: app.coalesce_tool_runs,
+        animation_tick: app.animation_tick,
+        palette_generation: render::palette::palette_generation(),
+    }
+}
+
+fn wrap_transcript_overlay_rows(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut rows = Vec::new();
+    for line in lines {
+        wrap_transcript_overlay_line(line, width, &mut rows);
+    }
+    rows
+}
+
+fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
+    let mut row_spans: Vec<Span<'static>> = Vec::new();
+    let mut row_width = 0usize;
+    let mut saw_content = false;
+
+    for span in &line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            if row_width >= width {
+                if !chunk.is_empty() {
+                    row_spans.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                rows.push(Line::from(std::mem::take(&mut row_spans)));
+                row_width = 0;
+            }
+            chunk.push(ch);
+            row_width += 1;
+            saw_content = true;
+        }
+        if !chunk.is_empty() {
+            row_spans.push(Span::styled(chunk, style));
+        }
+    }
+
+    if saw_content {
+        rows.push(Line::from(row_spans));
+    } else {
+        rows.push(Line::from(""));
+    }
+}
+
+fn render_transcript_overlay_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[Line<'static>],
+    scroll: usize,
+) {
+    frame.render_widget(ratatui::widgets::Clear, area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let visible_rows = rows
+        .iter()
+        .skip(scroll)
+        .take(usize::from(area.height))
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible_rows), area);
 }
 
 fn transcript_overlay_inner(area: Rect) -> Rect {
@@ -5370,27 +5773,48 @@ fn transcript_overlay_text_and_scrollbar_areas(inner: Rect) -> Option<(Rect, Rec
 struct TranscriptScrollbarGeometry {
     thumb_top: u16,
     thumb_height: u16,
-    max_scroll: u16,
+    max_scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptOverlayScrollbarCache {
+    scrollbar_area: Rect,
+    geometry: TranscriptScrollbarGeometry,
+}
+
+fn transcript_overlay_max_scroll_for_content(content_len: usize, viewport_height: u16) -> usize {
+    content_len.saturating_sub(usize::from(viewport_height))
+}
+
+fn resolved_transcript_overlay_scroll_for_state(
+    state: TranscriptOverlayState,
+    content_len: usize,
+    viewport_height: u16,
+) -> usize {
+    let max_scroll = transcript_overlay_max_scroll_for_content(content_len, viewport_height);
+    if state.scroll == TRANSCRIPT_OVERLAY_SCROLL_BOTTOM {
+        max_scroll
+    } else {
+        state.scroll.min(max_scroll)
+    }
 }
 
 fn transcript_overlay_scrollbar_geometry(
     content_len: usize,
     viewport_height: u16,
-    scroll: u16,
+    scroll: usize,
 ) -> Option<TranscriptScrollbarGeometry> {
     let track_height = usize::from(viewport_height);
     if track_height == 0 || content_len <= track_height {
         return None;
     }
-    let max_scroll = content_len
-        .saturating_sub(track_height)
-        .min(usize::from(u16::MAX));
+    let max_scroll = content_len.saturating_sub(track_height);
     if max_scroll == 0 {
         return None;
     }
     let thumb_height = ((track_height * track_height) / content_len).clamp(1, track_height);
     let travel = track_height.saturating_sub(thumb_height);
-    let scroll = usize::from(scroll).min(max_scroll);
+    let scroll = scroll.min(max_scroll);
     let thumb_top = if travel == 0 {
         0
     } else {
@@ -5399,10 +5823,11 @@ fn transcript_overlay_scrollbar_geometry(
     Some(TranscriptScrollbarGeometry {
         thumb_top: thumb_top as u16,
         thumb_height: thumb_height as u16,
-        max_scroll: max_scroll as u16,
+        max_scroll,
     })
 }
 
+#[cfg(test)]
 fn transcript_overlay_scroll_for_scrollbar_row(
     row: u16,
     scrollbar_area: Rect,
@@ -5420,7 +5845,25 @@ fn transcript_overlay_scroll_for_scrollbar_row(
     }
     let centered = usize::from(local_row).saturating_sub(thumb_height / 2);
     let position = centered.min(travel);
-    Some(((position * usize::from(geometry.max_scroll)) / travel) as u16)
+    Some(((position * geometry.max_scroll) / travel).min(usize::from(u16::MAX)) as u16)
+}
+
+fn transcript_overlay_scroll_for_cached_scrollbar_row(
+    row: u16,
+    cache: TranscriptOverlayScrollbarCache,
+) -> usize {
+    let local_row = row
+        .saturating_sub(cache.scrollbar_area.y)
+        .min(cache.scrollbar_area.height.saturating_sub(1));
+    let track_height = usize::from(cache.scrollbar_area.height);
+    let thumb_height = usize::from(cache.geometry.thumb_height);
+    let travel = track_height.saturating_sub(thumb_height);
+    if travel == 0 {
+        return 0;
+    }
+    let centered = usize::from(local_row).saturating_sub(thumb_height / 2);
+    let position = centered.min(travel);
+    (position * cache.geometry.max_scroll) / travel
 }
 
 fn render_transcript_overlay_scrollbar(
@@ -5448,9 +5891,9 @@ fn render_transcript_overlay_scrollbar(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Build the per-entry line list for the overlay: every entry is forced
-/// to its expanded form. Skips the pending-assistant tail since the
-/// overlay is a snapshot of committed transcript content.
+/// Build the per-entry line list for the overlay: every committed entry is
+/// forced to its expanded form, and the live assistant tail is appended so
+/// opening Ctrl-T mid-turn does not look frozen.
 fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
     // The overlay is the "Ctrl-T for full transcript" escape hatch — body
     // content blocks (e.g. read_tool_output payloads, shell stdout/stderr)
@@ -5489,6 +5932,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                     app.selected_entry == Some(index),
                     overlay_verbosity,
                     width,
+                    ToolCardSurface::Plain,
                 ));
                 continue;
             }
@@ -5505,6 +5949,13 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             true,
         ));
     }
+    let pending = pending_assistant_lines(app);
+    if !pending.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(pending);
+    }
     lines
 }
 
@@ -5520,9 +5971,14 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::Message(item) => {
             format_message_entry_with_width(item, false, selected, outcome, width, show_reasoning)
         }
-        TranscriptEntryKind::ToolResult(tool) => {
-            format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
-        }
+        TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
+            tool,
+            false,
+            selected,
+            tool_output_verbosity,
+            width,
+            ToolCardSurface::Plain,
+        ),
         TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
@@ -5701,6 +6157,7 @@ fn transcript_lines_for_render(
                     app.selected_entry == Some(index),
                     app.tool_output_verbosity,
                     width,
+                    ToolCardSurface::Tinted,
                 ));
                 continue;
             }
@@ -5975,6 +6432,7 @@ fn format_transcript_entry_with_width(
             selected,
             tool_output_verbosity,
             width,
+            ToolCardSurface::Tinted,
         ),
         TranscriptEntryKind::Log(entry_log) => {
             format_log_entry(entry_log, entry.collapsed, selected)
@@ -7077,6 +7535,7 @@ fn format_tool_result_entry(
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
     width: Option<u16>,
+    card_surface: ToolCardSurface,
 ) -> Vec<Line<'static>> {
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
@@ -7087,7 +7546,30 @@ fn format_tool_result_entry(
     } else {
         expanded_tool_detail_lines(tool, tool_output_verbosity)
     };
-    wrap_tool_card(header, body)
+    render_tool_card(header, body, card_surface)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCardSurface {
+    Tinted,
+    Plain,
+}
+
+fn render_tool_card(
+    header: Line<'static>,
+    body: Vec<Line<'static>>,
+    surface: ToolCardSurface,
+) -> Vec<Line<'static>> {
+    match surface {
+        ToolCardSurface::Tinted => wrap_tool_card(header, body),
+        ToolCardSurface::Plain => stack_tool_card(header, body),
+    }
+}
+
+fn stack_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut lines = vec![header];
+    lines.extend(body);
+    lines
 }
 
 /// Visually group an action header with its detail rows by tinting both
@@ -7128,6 +7610,7 @@ fn format_grouped_tool_result_entry(
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
     width: Option<u16>,
+    card_surface: ToolCardSurface,
 ) -> Vec<Line<'static>> {
     debug_assert!(members.len() >= 2, "grouped card needs at least 2 members");
     let lead = members[0];
@@ -7165,10 +7648,11 @@ fn format_grouped_tool_result_entry(
                 false,
                 tool_output_verbosity,
                 width,
+                card_surface,
             ));
         }
     }
-    wrap_tool_card(header, body)
+    render_tool_card(header, body, card_surface)
 }
 
 /// Verb that titles a grouped run — `"Read"`, `"Searched"`, etc. Falls
@@ -7341,8 +7825,8 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         ])];
     }
     if entry.kind == LogKind::Warn {
-        // `⚠ message` rendering for turn-end signals so the user can spot
-        // a cancel/fail at a glance. Newlines are flattened to spaces so
+        // `⚠ message` rendering for warnings so the user can spot
+        // config issues and turn failures at a glance. Newlines are flattened to spaces so
         // the whole error reads as one bullet, and the transcript
         // paragraph's `Wrap { trim: false }` line-wraps anything long —
         // errors from providers can be hundreds of characters and need to
@@ -11056,20 +11540,69 @@ fn compose_status_overview_with_detail(
 ) -> Line<'static> {
     let right = mode_status_text(app);
     let right_width = right.chars().count();
+    let gap_width = usize::from(width).saturating_sub(right_width).min(1);
+    let detail_limit = usize::from(width).saturating_sub(right_width + gap_width);
+    truncate_line_to_width(&mut detail, detail_limit);
     let detail_width: usize = detail
         .spans
         .iter()
         .map(|span| span.content.chars().count())
         .sum();
-    let padding_width = (width as usize)
-        .saturating_sub(detail_width.saturating_add(right_width))
-        .max(1);
-    detail.spans.push(Span::raw(" ".repeat(padding_width)));
+    let padding_width = usize::from(width).saturating_sub(detail_width + right_width);
+    if padding_width > 0 {
+        detail.spans.push(Span::raw(" ".repeat(padding_width)));
+    }
     detail.spans.push(Span::styled(
         right,
         Style::default().fg(mode_status_color(app.mode)),
     ));
     detail
+}
+
+fn truncate_line_to_width(line: &mut Line<'static>, width: usize) {
+    let current_width: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    if current_width <= width {
+        return;
+    }
+    if width == 0 {
+        line.spans.clear();
+        return;
+    }
+    let marker = if width <= 3 {
+        ".".repeat(width)
+    } else {
+        "...".to_string()
+    };
+    let content_width = width.saturating_sub(marker.chars().count());
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    for span in std::mem::take(&mut line.spans) {
+        if used >= content_width {
+            break;
+        }
+        let span_width = span.content.chars().count();
+        if used + span_width <= content_width {
+            used += span_width;
+            spans.push(span);
+            continue;
+        }
+        let take = content_width - used;
+        if take > 0 {
+            let text = span.content.chars().take(take).collect::<String>();
+            spans.push(Span::styled(text, span.style));
+        }
+        break;
+    }
+    let marker_style = spans
+        .last()
+        .map(|span: &Span<'static>| span.style)
+        .unwrap_or_default();
+    spans.push(Span::styled(marker, marker_style));
+    line.spans = spans;
 }
 
 fn detail_was_present(app: &TuiApp) -> bool {
@@ -11143,6 +11676,14 @@ fn format_status_hints(app: &TuiApp) -> String {
 }
 
 fn format_status_hint_base(app: &TuiApp) -> String {
+    if let Some(overlay) = app.transcript_overlay.as_ref() {
+        return if overlay.mode.mouse_capture() {
+            "PgUp/PgDn/Wheel scroll · M native selection · drag right gutter scroll · Shift-drag select · Esc close"
+                .to_string()
+        } else {
+            "PgUp/PgDn/Wheel scroll · M scrollbar drag · native select/copy · Esc close".to_string()
+        };
+    }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -11215,8 +11756,6 @@ fn format_status_hint_base(app: &TuiApp) -> String {
 /// `active_tool`, and double-rendering them would make every
 /// tool-call event flicker the hint row.
 const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
-    "expanded ",
-    "collapsed ",
     "mode switched ",
     "already in ",
     "stay in ",
@@ -11226,14 +11765,11 @@ const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
     "Ctrl+X…",
     "transcript overlay",
     "task panel ",
-    "/expand",
-    "/collapse",
     "/statusline cancelled",
     "no recent session",
     "session quick-switch",
     "resume failed",
     "restored last prompt",
-    "nothing expandable",
     "select a transcript entry",
 ];
 
@@ -11714,6 +12250,9 @@ pub(crate) struct TuiApp {
     /// a scroll offset. Acts as the escape hatch from the aggressive
     /// default truncation.
     pub(crate) transcript_overlay: Option<TranscriptOverlayState>,
+    pub(crate) transcript_overlay_scrollbar_cache:
+        std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
+    pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
     pub(crate) alternate_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
@@ -11991,6 +12530,13 @@ fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResol
     }
 }
 
+fn format_config_warning(warning: &ConfigWarning) -> String {
+    format!(
+        "ignored unknown setting {} in {}",
+        warning.field, warning.source
+    )
+}
+
 impl TuiApp {
     /// Clear the click-target registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
@@ -12084,7 +12630,7 @@ impl TuiApp {
         let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
         let keymap = build_keymap_resolver(&config.tui.keymap);
-        Self {
+        let mut app = Self {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
@@ -12131,6 +12677,10 @@ impl TuiApp {
             overlay_next_id: 0,
             overlay_active_id: None,
             transcript_overlay: None,
+            transcript_overlay_scrollbar_cache: std::cell::Cell::new(None),
+            transcript_overlay_render_cache: std::cell::RefCell::new(
+                TranscriptOverlayRenderCache::default(),
+            ),
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
@@ -12217,7 +12767,11 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(Vec::new()),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             settings_path_override: None,
+        };
+        for warning in &config.config_warnings {
+            app.push_warn(format_config_warning(warning));
         }
+        app
     }
 
     /// Mirror every config-derived field the status line and header
@@ -12366,15 +12920,12 @@ impl TuiApp {
     /// content is still moving (working spinner, title spinner, etc.).
     /// When neither is true the main loop skips `draw_app` entirely.
     ///
-    /// Returns `false` whenever the host terminal reports the window
-    /// is unfocused — paired with the animation-tick gate in the main
-    /// loop this stops the spinner from repainting in the background,
-    /// which is the primary battery sink on idle laptops. State
-    /// mutations (e.g. agent events arriving while we are unfocused)
-    /// still flip `needs_redraw` and force a draw, so we never miss a
-    /// material update.
+    /// Returns `false` for unfocused idle animation, but keeps active turns
+    /// moving. That preserves the first-prompt spinner during transient focus
+    /// changes without repainting purely decorative idle motion in the
+    /// background.
     pub(crate) fn has_active_animation(&self) -> bool {
-        if !self.focused {
+        if !self.focused && !turn_in_progress(self) {
             return false;
         }
         matches!(self.turn_visual, TurnVisualState::Running)
@@ -12449,7 +13000,7 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
-    /// Push a turn-ending warning log (⚠ prefix). Suppresses the push when
+    /// Push a warning log (⚠ prefix). Suppresses the push when
     /// the most recent transcript entry is already a `⚠ Cancelled` / `⚠ Denied`
     /// tool card — the card already communicates the turn-end at a glance,
     /// and a trailing `⚠ turn cancelled` line is just noise. Returns whether
@@ -12706,38 +13257,6 @@ impl TranscriptEntry {
         }
     }
 
-    fn matches_category(&self, category: TranscriptCategory) -> bool {
-        match category {
-            TranscriptCategory::All => true,
-            TranscriptCategory::Tools => matches!(self.kind, TranscriptEntryKind::ToolResult(_)),
-            TranscriptCategory::Logs => match &self.kind {
-                TranscriptEntryKind::Log(_) => true,
-                TranscriptEntryKind::Message(item) => item.role == Role::System,
-                TranscriptEntryKind::PlanCard(_) => true,
-                TranscriptEntryKind::SlashEcho(_) => true,
-                _ => false,
-            },
-            TranscriptCategory::Diffs => match &self.kind {
-                TranscriptEntryKind::ToolResult(tool) => tool.result.tool_name.contains("diff"),
-                TranscriptEntryKind::Diff(_) => true,
-                _ => false,
-            },
-            TranscriptCategory::Receipts => match &self.kind {
-                TranscriptEntryKind::ToolResult(tool) => {
-                    !tool.result.receipt.output_sha256.is_empty()
-                }
-                _ => false,
-            },
-            TranscriptCategory::Assistant => match &self.kind {
-                TranscriptEntryKind::Message(item) => item.role == Role::Assistant,
-                _ => false,
-            },
-            TranscriptCategory::Reasoning => {
-                matches!(self.kind, TranscriptEntryKind::Reasoning(_))
-            }
-        }
-    }
-
     fn plain_text_lines(&self) -> Vec<String> {
         match &self.kind {
             TranscriptEntryKind::Message(item) => {
@@ -12971,22 +13490,6 @@ fn tool_retry_key(tool: &ToolTranscript) -> Option<String> {
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptCategory {
-    All,
-    Tools,
-    Logs,
-    Diffs,
-    Receipts,
-    Assistant,
-    /// Streamed model reasoning blocks (greyed-out chevrons in the
-    /// transcript). The most common Ctrl+E target — exposing it as a
-    /// dedicated `/expand reasoning` lets users on terminals where
-    /// Ctrl+E / Alt+E never reach the application still drive the
-    /// expansion surface from a keystroke they control.
-    Reasoning,
-}
-
 /// Mid-turn cost/token snapshot surfaced in the status bar so the user
 /// can watch a turn's spend grow without log spam in the transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13128,10 +13631,17 @@ struct TerminalGuard {
     /// `mode == AlternateScreen` (that mode is already fullscreen —
     /// no swap needed).
     overlay_screen_active: bool,
-    /// Whether the user opted into mouse capture. The transcript overlay
-    /// keeps this off by default so ordinary text selection still works;
-    /// when capture is enabled, its right-side scrollbar also receives
-    /// click/drag events.
+    /// True after we have applied the transcript overlay's mouse policy
+    /// to the terminal. Needed because the overlay temporarily overrides
+    /// the main screen's opt-in mouse capture even in alternate-screen mode.
+    overlay_mouse_override_active: bool,
+    /// Whether the overlay currently has drag capture enabled for its
+    /// right-side scrollbar. When false, native terminal selection/copy is
+    /// left available inside the overlay.
+    overlay_mouse_capture: bool,
+    /// Whether the user opted into mouse capture for the main screen.
+    /// The transcript overlay disables mouse reporting so normal text
+    /// selection/copy works there, then restores this setting when it closes.
     mouse_capture: bool,
     exit_hint: Option<String>,
     startup_flushed: bool,
@@ -13239,6 +13749,8 @@ impl TerminalGuard {
             overlay_terminal: None,
             mode,
             overlay_screen_active: false,
+            overlay_mouse_override_active: false,
+            overlay_mouse_capture: false,
             mouse_capture,
             exit_hint: None,
             startup_flushed: false,
@@ -13295,6 +13807,7 @@ impl TerminalGuard {
     }
 
     fn draw_app(&mut self, app: &mut TuiApp) -> Result<()> {
+        let overlay_frame = app.transcript_overlay.is_some() || self.overlay_screen_active;
         if app.pending_resize {
             app.pending_resize = false;
             self.wipe_inline_viewport_for_resize()?;
@@ -13306,6 +13819,11 @@ impl TerminalGuard {
         // fullscreen there). Must run BEFORE we borrow the terminal
         // for the draw, because it swaps `self.terminal`.
         self.sync_overlay_screen(app.transcript_overlay.is_some())?;
+        self.sync_overlay_mouse_mode(
+            app.transcript_overlay
+                .as_ref()
+                .map(|state| state.mode.mouse_capture()),
+        )?;
         // After the swap, decide which render path to take. Inline
         // mode + no overlay = `render_inline` (small viewport painted
         // over scrollback). Alt-screen mode OR overlay-screen swap =
@@ -13316,7 +13834,7 @@ impl TerminalGuard {
         if !use_fullscreen_render {
             self.flush_history(app)?;
         }
-        let synchronized = self.synchronized_output;
+        let synchronized = self.synchronized_output && !overlay_frame;
         let terminal = self.term();
         // DEC 2026 Begin Synchronized Update bracket. Writing it through
         // the backend buffer puts it ahead of the cell-diff bytes that
@@ -13324,16 +13842,20 @@ impl TerminalGuard {
         // buffering at parse time and commit the whole frame when they
         // see the matching End Synchronized Update written below.
         // Unsupported terminals silently ignore both sequences.
-        if synchronized {
-            let _ = terminal
+        let begin_outcome = if synchronized {
+            terminal
                 .backend_mut()
-                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes());
-        }
+                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())
+        } else {
+            Ok(())
+        };
         // `terminal.draw` returns a value that borrows the terminal,
         // which would block the post-draw `backend_mut` reborrow below.
         // Collapse to `Result<(), io::Error>` immediately so the borrow
         // ends before we reach for the backend again.
-        let draw_outcome: io::Result<()> = if use_fullscreen_render {
+        let draw_outcome: io::Result<()> = if let Err(err) = begin_outcome {
+            Err(err)
+        } else if use_fullscreen_render {
             terminal.draw(|frame| render(frame, app)).map(|_| ())
         } else {
             terminal.draw(|frame| render_inline(frame, app)).map(|_| ())
@@ -13342,12 +13864,18 @@ impl TerminalGuard {
         // not stay parked in a buffered-update state — the spec lets a
         // capable terminal time the bracket out on its own, but closing
         // it promptly keeps the visible frame in sync with our state.
-        if synchronized {
+        let end_outcome = if synchronized {
             let backend = terminal.backend_mut();
-            let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
-            let _ = backend.flush();
+            backend
+                .write_all(END_SYNCHRONIZED_UPDATE.as_bytes())
+                .and_then(|()| backend.flush())
+        } else {
+            Ok(())
+        };
+        match draw_outcome.and(end_outcome) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(SqueezyError::Terminal(err.to_string())),
         }
-        draw_outcome.map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     /// Reconcile the alt-screen-for-overlay swap state with the
@@ -13375,6 +13903,40 @@ impl TerminalGuard {
             (false, true) => self.enter_overlay_screen(),
             (true, false) => self.leave_overlay_screen(),
             _ => Ok(()),
+        }
+    }
+
+    fn sync_overlay_mouse_mode(&mut self, overlay_mouse_capture: Option<bool>) -> Result<()> {
+        match overlay_mouse_capture {
+            Some(scrollbar_drag) => {
+                if self.overlay_mouse_override_active
+                    && self.overlay_mouse_capture == scrollbar_drag
+                {
+                    return Ok(());
+                }
+                let terminal = self.term();
+                set_transcript_overlay_mouse_mode(terminal.backend_mut(), scrollbar_drag, false)
+                    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                self.overlay_mouse_override_active = true;
+                self.overlay_mouse_capture = scrollbar_drag;
+                Ok(())
+            }
+            None => {
+                if !self.overlay_mouse_override_active {
+                    return Ok(());
+                }
+                let restore_main_mouse_capture = self.mouse_capture;
+                let terminal = self.term();
+                set_transcript_overlay_mouse_mode(
+                    terminal.backend_mut(),
+                    false,
+                    restore_main_mouse_capture,
+                )
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                self.overlay_mouse_override_active = false;
+                self.overlay_mouse_capture = false;
+                Ok(())
+            }
         }
     }
 
@@ -13430,6 +13992,8 @@ impl TerminalGuard {
             leave_transcript_overlay_screen(overlay.backend_mut(), self.mouse_capture)
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
+        self.overlay_mouse_override_active = false;
+        self.overlay_mouse_capture = false;
         // The terminal emulator has restored the main buffer. The
         // pre-overlay inline TUI viewport content (input row,
         // status, hint) is still sitting in the bottom rows where
@@ -13535,6 +14099,8 @@ impl Drop for TerminalGuard {
         {
             let _ = leave_transcript_overlay_screen(overlay.backend_mut(), false);
             self.overlay_screen_active = false;
+            self.overlay_mouse_override_active = false;
+            self.overlay_mouse_capture = false;
         }
         // Drop the overlay terminal explicitly so its writer
         // releases stdout before the primary terminal does its
@@ -13628,6 +14194,7 @@ fn inline_history_lines_for_flush(
                     false,
                     app.tool_output_verbosity,
                     Some(width),
+                    ToolCardSurface::Tinted,
                 ));
                 continue;
             }

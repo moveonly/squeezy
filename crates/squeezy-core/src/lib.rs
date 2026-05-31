@@ -420,6 +420,14 @@ pub struct AppConfig {
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub hardening: HardeningConfig,
     pub config_sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_warnings: Vec<ConfigWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigWarning {
+    pub source: String,
+    pub field: String,
 }
 
 impl AppConfig {
@@ -446,17 +454,22 @@ impl AppConfig {
     }
 
     pub fn from_settings_path_and_env(path: PathBuf) -> Result<Self> {
-        let (settings, sources) = SettingsFile::load_optional_source(&path, "settings")?;
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, None, |name| {
-            env::var(name).ok()
-        })
+        let (settings, sources, warnings) = SettingsFile::load_optional_source(&path, "settings")?;
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
+            settings,
+            sources,
+            warnings,
+            None,
+            |name| env::var(name).ok(),
+        )
     }
 
     pub fn from_settings_path_and_env_with_provider(path: PathBuf, provider: &str) -> Result<Self> {
-        let (settings, sources) = SettingsFile::load_optional_source(&path, "settings")?;
-        Self::try_from_settings_and_env_vars_with_sources(
+        let (settings, sources, warnings) = SettingsFile::load_optional_source(&path, "settings")?;
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
             settings,
             sources,
+            warnings,
             Some(provider),
             |name| env::var(name).ok(),
         )
@@ -507,7 +520,23 @@ impl AppConfig {
 
     fn try_from_settings_and_env_vars_with_sources(
         settings: SettingsFile,
+        sources: Vec<String>,
+        cli_provider: Option<&str>,
+        var: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
+            settings,
+            sources,
+            Vec::new(),
+            cli_provider,
+            var,
+        )
+    }
+
+    fn try_from_settings_and_env_vars_with_sources_and_warnings(
+        settings: SettingsFile,
         mut sources: Vec<String>,
+        config_warnings: Vec<ConfigWarning>,
         cli_provider: Option<&str>,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
@@ -950,6 +979,7 @@ impl AppConfig {
             mcp_servers,
             hardening: HardeningConfig::from_settings(settings.hardening.unwrap_or_default()),
             config_sources: sources,
+            config_warnings,
         })
     }
 
@@ -957,14 +987,18 @@ impl AppConfig {
         provider: Option<&str>,
         profile: Option<&str>,
     ) -> Result<Self> {
-        let (mut settings, mut sources) = load_default_settings_sources()?;
+        let (mut settings, mut sources, warnings) = load_default_settings_sources()?;
         if let Some(name) = profile {
             settings.apply_profile(name)?;
             sources.push(format!("profile:{name}"));
         }
-        Self::try_from_settings_and_env_vars_with_sources(settings, sources, provider, |name| {
-            env::var(name).ok()
-        })
+        Self::try_from_settings_and_env_vars_with_sources_and_warnings(
+            settings,
+            sources,
+            warnings,
+            provider,
+            |name| env::var(name).ok(),
+        )
     }
 
     fn built_in_defaults() -> Self {
@@ -2398,31 +2432,24 @@ impl SettingsFile {
         Ok(Self::load_optional_source(path, "settings")?.0)
     }
 
-    fn load_optional_source(path: &Path, label: &str) -> Result<(Self, Vec<String>)> {
+    fn load_optional_source(
+        path: &Path,
+        label: &str,
+    ) -> Result<(Self, Vec<String>, Vec<ConfigWarning>)> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Self::default(), vec!["defaults".to_string()]));
+                return Ok((Self::default(), vec!["defaults".to_string()], Vec::new()));
             }
             Err(error) => return Err(error.into()),
         };
-        let settings = Self::from_toml_str(&text, &format!("{label}:{}", path.display()))?;
+        let source = format!("{label}:{}", path.display());
+        let settings = Self::from_toml_str(&text, &source)?;
         let unknowns = take_unknown_fields();
-        if !unknowns.is_empty()
-            && let Err(error) = strip_unknown_fields_from_file(path, &unknowns)
-        {
-            tracing::warn!(
-                path = %path.display(),
-                ?error,
-                "failed to strip unknown fields from settings.toml"
-            );
-        }
         Ok((
             settings,
-            vec![
-                "defaults".to_string(),
-                format!("{label}:{}", path.display()),
-            ],
+            vec!["defaults".to_string(), source.clone()],
+            config_warnings_from_unknown_fields(&source, unknowns),
         ))
     }
 
@@ -7930,7 +7957,7 @@ pub fn project_settings_template() -> &'static str {
 "#
 }
 
-fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>)> {
+fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_path = find_project_settings_path(&cwd);
@@ -8077,9 +8104,10 @@ fn load_settings_from_paths(
     user_path: Option<&Path>,
     project_path: Option<&Path>,
     repo_path: Option<&Path>,
-) -> Result<(SettingsFile, Vec<String>)> {
+) -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let mut settings = SettingsFile::default();
     let mut sources = vec!["defaults".to_string()];
+    let mut warnings = Vec::new();
     for (path, label) in [
         (user_path, "user"),
         (project_path, "project"),
@@ -8089,24 +8117,14 @@ fn load_settings_from_paths(
         if !path.is_file() {
             continue;
         }
-        let parsed = SettingsFile::from_toml_str(
-            &fs::read_to_string(path)?,
-            &format!("{label}:{}", path.display()),
-        )?;
+        let source = format!("{label}:{}", path.display());
+        let parsed = SettingsFile::from_toml_str(&fs::read_to_string(path)?, &source)?;
         let unknowns = take_unknown_fields();
-        if !unknowns.is_empty()
-            && let Err(error) = strip_unknown_fields_from_file(path, &unknowns)
-        {
-            tracing::warn!(
-                path = %path.display(),
-                ?error,
-                "failed to strip unknown fields from settings.toml"
-            );
-        }
         settings.merge(parsed);
-        sources.push(format!("{label}:{}", path.display()));
+        sources.push(source.clone());
+        warnings.extend(config_warnings_from_unknown_fields(&source, unknowns));
     }
-    Ok((settings, sources))
+    Ok((settings, sources, warnings))
 }
 
 fn provider_setting(
@@ -8742,8 +8760,8 @@ fn parse_profiles_map(
 thread_local! {
     /// Dotted paths of unknown fields seen during the most recent
     /// `SettingsFile::from_toml_str` call. The file loader clears this
-    /// before parsing and drains it afterwards to rewrite the source
-    /// without the dead keys.
+    /// before parsing and drains it afterwards so the app can warn the
+    /// user without rejecting or rewriting the settings file.
     static UNKNOWN_FIELDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -8755,8 +8773,8 @@ fn reject_unknown_keys(
 ) -> Result<()> {
     // Pre-1.0 the schema is still moving; silently ignoring renamed or
     // removed fields lets users keep their old settings.toml around while
-    // we iterate. The loader uses `UNKNOWN_FIELDS` to rewrite the source
-    // file without the dead keys after each load.
+    // we iterate. The loader records `UNKNOWN_FIELDS` so startup can show
+    // a warning in the transcript.
     for key in table.keys() {
         if !allowed.iter().any(|allowed| key == allowed) {
             let field_path = field(path, key);
@@ -8771,47 +8789,14 @@ fn take_unknown_fields() -> Vec<String> {
     UNKNOWN_FIELDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
-fn strip_unknown_fields_from_file(path: &Path, dotted_paths: &[String]) -> std::io::Result<()> {
-    let text = fs::read_to_string(path)?;
-    let mut doc: toml_edit::DocumentMut = match text.parse() {
-        Ok(doc) => doc,
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                ?error,
-                "could not re-parse settings.toml for cleanup; leaving file untouched"
-            );
-            return Ok(());
-        }
-    };
-    let mut changed = false;
-    for dotted in dotted_paths {
-        if remove_dotted_path(doc.as_table_mut(), dotted) {
-            changed = true;
-        }
-    }
-    if changed {
-        fs::write(path, doc.to_string())?;
-    }
-    Ok(())
-}
-
-fn remove_dotted_path(root: &mut toml_edit::Table, dotted: &str) -> bool {
-    let mut parts = dotted.split('.').collect::<Vec<_>>();
-    let Some(last) = parts.pop() else {
-        return false;
-    };
-    let mut current: &mut toml_edit::Table = root;
-    for segment in &parts {
-        let next = current
-            .get_mut(segment)
-            .and_then(|item| item.as_table_mut());
-        match next {
-            Some(table) => current = table,
-            None => return false,
-        }
-    }
-    current.remove(last).is_some()
+fn config_warnings_from_unknown_fields(source: &str, fields: Vec<String>) -> Vec<ConfigWarning> {
+    fields
+        .into_iter()
+        .map(|field| ConfigWarning {
+            source: source.to_string(),
+            field,
+        })
+        .collect()
 }
 
 fn optional_table<'a>(

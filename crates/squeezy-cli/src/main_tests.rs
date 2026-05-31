@@ -28,6 +28,29 @@ selection_version = 1
 }
 
 #[test]
+fn model_selection_state_treats_provider_and_model_as_configured_without_version() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let state = model_selection_state(&settings);
+
+    assert!(
+        state.configured(),
+        "explicit provider/model should skip first-run setup"
+    );
+    assert!(
+        !state.complete(),
+        "selection_version remains a migration marker, not a startup blocker"
+    );
+}
+
+#[test]
 fn save_startup_model_selection_preserves_existing_settings() {
     let root = temp_dir("model-selection");
     let path = root.join("settings.toml");

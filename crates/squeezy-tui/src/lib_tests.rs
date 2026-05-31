@@ -38,6 +38,40 @@ fn app_starts_ready_with_empty_transcript() {
 }
 
 #[test]
+fn app_starts_with_unknown_config_warnings_in_transcript() {
+    let mut config = test_config(SessionMode::Build);
+    config.config_warnings = vec![squeezy_core::ConfigWarning {
+        source: "user:/tmp/settings.toml".to_string(),
+        field: "permissions.custom.legacy".to_string(),
+    }];
+
+    let app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    assert_eq!(app.transcript.len(), 1);
+    let entry = app.transcript.first().expect("startup warning");
+    let log = match &entry.kind {
+        TranscriptEntryKind::Log(log) => log,
+        _ => panic!("expected startup warning log"),
+    };
+    assert_eq!(log.kind, LogKind::Warn);
+    assert_eq!(
+        log.message,
+        "ignored unknown setting permissions.custom.legacy in user:/tmp/settings.toml"
+    );
+    let rendered = lines_to_plain_text(&format_log_entry(log, false, false));
+    assert!(
+        rendered.contains("⚠ ignored unknown setting permissions.custom.legacy"),
+        "warning must render with the standard warning sign: {rendered}"
+    );
+}
+
+#[test]
 fn app_does_not_seed_onboarding_summary_into_fresh_transcript() {
     let config = test_config(SessionMode::Build);
     let app = TuiApp::new_with_clipboard(
@@ -780,8 +814,13 @@ async fn wheel_scroll_works_in_inline_mode() {
 #[tokio::test]
 async fn wheel_scroll_targets_transcript_overlay_when_open() {
     let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
 
     handle_mouse(
         &mut app,
@@ -1778,7 +1817,8 @@ async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
     ));
     std::fs::create_dir_all(&tmpdir).expect("mkdir");
     let settings_path = tmpdir.join("settings.toml");
-    let _guard = ScopedSettingsPath::new(settings_path);
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
     set_input(&mut app, "/statusline".to_string());
     handle_key(
         &mut app,
@@ -1833,7 +1873,9 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let dir = temp_workspace("statusline_save");
-    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+    let settings_path = dir.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
     set_input(&mut app, "/statusline".to_string());
     handle_key(
         &mut app,
@@ -3505,11 +3547,9 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
         "middle of the body must be elided: {collapsed}"
     );
 
-    // `/expand all` is the slash-command path for users who want the
-    // expanded view inline (works in alt-screen; in inline mode the
-    // most recent turn's entries flip but already-flushed ones stay
-    // in scrollback — a limitation the overlay sidesteps entirely).
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    // Force the expanded inline variant directly so this test still
+    // covers the card body rendering. The user-facing full view is Ctrl-T.
+    set_all_transcript_collapsed(&mut app, false);
 
     assert!(!app.transcript[0].collapsed);
     let expanded = render_to_string(&app, 100, 40);
@@ -3533,19 +3573,6 @@ fn failed_tool_result_starts_expanded_so_error_is_visible() {
     );
 }
 
-#[test]
-fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
-    assert!(matches!(
-        parse_transcript_category("reasoning"),
-        Some(TranscriptCategory::Reasoning)
-    ));
-    assert!(matches!(
-        parse_transcript_category("thinking"),
-        Some(TranscriptCategory::Reasoning)
-    ));
-    assert!(parse_transcript_category("rambling").is_none());
-}
-
 #[tokio::test]
 async fn typing_after_selection_returns_focus_to_prompt_editing() {
     let mut agent = test_agent(SessionMode::Build);
@@ -3567,33 +3594,16 @@ async fn typing_after_selection_returns_focus_to_prompt_editing() {
 }
 
 #[tokio::test]
-async fn slash_collapse_and_expand_apply_to_tool_entries() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/expand tools").await);
-    assert!(!app.transcript[0].collapsed);
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/collapse tools").await);
-    assert!(app.transcript[0].collapsed);
-}
-
-#[tokio::test]
-async fn bare_slash_expand_opens_full_transcript_overlay() {
+async fn removed_slash_expand_no_longer_opens_full_transcript_overlay() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
     app.transcript[0].collapsed = true;
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/expand").await);
+    assert!(!handle_slash_command(&mut app, &mut agent, "/expand").await);
 
-    assert!(app.transcript_overlay.is_some());
-    assert_eq!(app.status, "full transcript open");
-    assert!(
-        app.transcript[0].collapsed,
-        "bare /expand should not pretend it can rewrite inline scrollback"
-    );
+    assert!(app.transcript_overlay.is_none());
+    assert!(app.transcript[0].collapsed);
 }
 
 #[test]
@@ -3669,7 +3679,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    set_all_transcript_collapsed(&mut app, false);
 
     let output = render_to_string(&app, 140, 18);
 
@@ -4007,7 +4017,7 @@ fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
             arguments: serde_json::json!({}),
         }),
     );
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    set_all_transcript_collapsed(&mut app, false);
 
     let output = render_to_string(&app, 120, 16);
 
@@ -4046,7 +4056,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
             arguments: serde_json::json!({}),
         }),
     );
-    set_transcript_collapsed(&mut app, TranscriptCategory::All, false);
+    set_all_transcript_collapsed(&mut app, false);
 
     let lines = format_transcript_entry_with_width(
         &app.transcript[0],
@@ -5289,6 +5299,47 @@ fn transcript_overlay_screen_keeps_native_selection_available() {
         !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
         "full transcript must leave native terminal text selection available"
     );
+    assert!(
+        !ansi.contains(ENABLE_MOUSE_DRAG_CAPTURE),
+        "full transcript must not capture drag events by default"
+    );
+}
+
+#[test]
+fn transcript_overlay_mouse_mode_enables_scrollbar_drag_reporting() {
+    let mut bytes = Vec::new();
+    set_transcript_overlay_mouse_mode(&mut bytes, true, false)
+        .expect("enable transcript overlay mouse mode");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        ansi.starts_with(DISABLE_MOUSE_MODES),
+        "must reset stale mouse modes before enabling drag reporting"
+    );
+    assert!(
+        ansi.contains(ENABLE_MOUSE_DRAG_CAPTURE),
+        "scrollbar mode must enable button-drag reporting"
+    );
+    assert!(
+        ansi.contains("\x1b[?1002h"),
+        "scrollbar mode must report drag events, not just clicks"
+    );
+}
+
+#[test]
+fn transcript_overlay_mouse_mode_can_restore_main_click_capture() {
+    let mut bytes = Vec::new();
+    set_transcript_overlay_mouse_mode(&mut bytes, false, true).expect("restore main mouse capture");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        ansi.starts_with(DISABLE_MOUSE_MODES),
+        "must leave overlay drag mode before restoring main mouse capture"
+    );
+    assert!(
+        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "main click capture should be restored when it was enabled before the overlay"
+    );
 }
 
 #[test]
@@ -5386,6 +5437,31 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
 
     let output = render_to_string(&app, 100, 12);
     assert!(output.contains("●  ship it┃"), "{output}");
+}
+
+#[test]
+fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.cancel = Some(CancellationToken::new());
+    app.turn_visual = TurnVisualState::Running;
+    app.animation_tick_rate = Duration::from_millis(100);
+    app.input.clear();
+    app.pending_assistant.clear();
+    app.transcript.clear();
+
+    app.animation_tick = 0;
+    let first = render_to_string(&app, 100, 12);
+    app.animation_tick = 4;
+    let second = render_to_string(&app, 100, 12);
+
+    assert!(first.contains("●  ┃"), "{first}");
+    assert!(second.contains("◕  ┃"), "{second}");
+    assert_ne!(
+        first, second,
+        "first-turn spinner frame should repaint before any assistant delta"
+    );
 }
 
 #[test]
@@ -9602,6 +9678,15 @@ async fn ctrl_t_opens_and_closes_transcript_overlay() {
         app.transcript_overlay.is_some(),
         "Ctrl-T should open the overlay"
     );
+    let overlay = app.transcript_overlay.expect("overlay");
+    assert_eq!(
+        overlay.scroll, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        "Ctrl-T should open anchored to the bottom/live end"
+    );
+    assert!(
+        !overlay.mode.mouse_capture(),
+        "Ctrl-T should preserve native text selection by default"
+    );
 
     handle_key(
         &mut app,
@@ -9613,6 +9698,557 @@ async fn ctrl_t_opens_and_closes_transcript_overlay() {
     assert!(
         app.transcript_overlay.is_none(),
         "Esc should close the overlay"
+    );
+}
+
+#[tokio::test]
+async fn esc_closes_transcript_overlay_without_interrupting_active_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    app.turn_rx = Some(rx);
+    app.cancel = Some(cancel.clone());
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes overlay");
+
+    assert!(!quit);
+    assert!(app.transcript_overlay.is_none());
+    assert!(app.turn_rx.is_some(), "active turn should keep running");
+    assert!(!cancel.is_cancelled(), "Esc should close overlay first");
+}
+
+#[tokio::test]
+async fn transcript_overlay_m_toggles_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("open overlay");
+    let native_hint = format_status_hints(&app);
+    assert!(
+        native_hint.contains("native select/copy"),
+        "overlay should start in native selection mode: {native_hint}"
+    );
+    assert!(
+        native_hint.contains("M scrollbar drag"),
+        "overlay should expose the scrollbar-drag toggle: {native_hint}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("toggle overlay mouse mode");
+    let overlay = app.transcript_overlay.expect("overlay");
+    assert!(
+        overlay.mode.mouse_capture(),
+        "M should enable app-handled right scrollbar dragging"
+    );
+    let drag_hint = format_status_hints(&app);
+    assert!(
+        drag_hint.contains("drag right gutter scroll"),
+        "drag mode should describe the active scrollbar behavior: {drag_hint}"
+    );
+    assert!(
+        drag_hint.contains("Shift-drag select"),
+        "drag mode should preserve the terminal selection escape hatch: {drag_hint}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("toggle overlay mouse mode off");
+    assert!(
+        !app.transcript_overlay
+            .expect("overlay")
+            .mode
+            .mouse_capture(),
+        "second M should restore native selection mode"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_ctrl_m_does_not_toggle_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-m while overlay is open");
+
+    assert!(
+        !app.transcript_overlay
+            .expect("overlay")
+            .mode
+            .mouse_capture(),
+        "Ctrl-M must not arm terminal mouse-drag reporting"
+    );
+}
+
+#[test]
+fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    let changed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        !changed,
+        "mouse release alone should not redraw the overlay"
+    );
+    assert!(
+        app.transcript_overlay
+            .expect("overlay")
+            .mode
+            .mouse_capture(),
+        "explicit scrollbar drag mode must remain armed until the user toggles it off"
+    );
+}
+
+#[test]
+fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+    let events = vec![
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    ];
+
+    let coalesced = coalesce_input_events_for_dispatch(&app, events);
+
+    assert_eq!(
+        coalesced.len(),
+        2,
+        "drag floods should collapse to the latest drag plus the following key"
+    );
+    match coalesced[0] {
+        Event::Mouse(mouse) => {
+            assert_eq!(mouse.row, 12);
+            assert!(matches!(
+                mouse.kind,
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            ));
+        }
+        ref other => panic!("expected coalesced drag first, got {other:?}"),
+    }
+    assert!(
+        matches!(coalesced[1], Event::Key(key) if key.code == KeyCode::Esc),
+        "keyboard event must remain immediately reachable after the coalesced drag"
+    );
+}
+
+#[test]
+fn input_batch_prioritizes_key_before_transcript_drag_flood() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+    let mut events = vec![
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    ];
+
+    let priority = take_priority_key_event_for_dispatch(&app, &mut events);
+
+    assert!(
+        matches!(priority, Some(Event::Key(key)) if key.code == KeyCode::Esc),
+        "keys must be handled before drag repaint work while scrollbar capture is active"
+    );
+    assert_eq!(
+        events.len(),
+        2,
+        "mouse events stay available for later coalescing after the key"
+    );
+}
+
+#[test]
+fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(input_events_per_poll_limit(&app), MAX_INPUT_EVENTS_PER_POLL);
+
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    assert_eq!(
+        input_events_per_poll_limit(&app),
+        MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL,
+        "scrollbar drag mode should drain deep mouse floods before repainting"
+    );
+}
+
+#[test]
+fn input_batch_does_not_coalesce_drags_outside_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+    let events = vec![
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }),
+    ];
+
+    let coalesced = coalesce_input_events_for_dispatch(&app, events);
+
+    assert_eq!(
+        coalesced.len(),
+        2,
+        "native-selection mode should not rewrite mouse event batches"
+    );
+}
+
+#[test]
+fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+    app.transcript_overlay_scrollbar_cache
+        .set(Some(TranscriptOverlayScrollbarCache {
+            scrollbar_area: Rect {
+                x: 79,
+                y: 1,
+                width: 1,
+                height: 10,
+            },
+            geometry: TranscriptScrollbarGeometry {
+                thumb_top: 0,
+                thumb_height: 2,
+                max_scroll: 100,
+            },
+        }));
+
+    let changed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        changed,
+        "dragging the cached scrollbar should update scroll"
+    );
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        "drag mapping should use cached max-scroll without relayouting transcript lines"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("scroll back in overlay");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+    )
+    .await
+    .expect("jump to overlay end");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc after end");
+
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc should still close Ctrl-T after scrolling back to the end"
+    );
+
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-c after end");
+
+    assert!(!quit, "first Ctrl-C should arm exit confirm, not exit");
+    assert!(
+        app.exit_confirm_armed,
+        "Ctrl-C should still reach the exit-confirm path after overlay end"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_owns_page_keys_before_global_keymap() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_scroll_from_bottom = 12;
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        mode: TranscriptOverlayMode::NativeSelection,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page down while overlay is open");
+
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        10,
+        "PageDown should scroll the Ctrl-T transcript overlay"
+    );
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 12,
+        "PageDown must not scroll the underlying transcript while Ctrl-T is open"
+    );
+}
+
+#[tokio::test]
+async fn transcript_overlay_swallows_ctrl_x_queue_chord() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.prompt_queue.push_back("queued".to_string());
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-x while overlay is open");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("q while overlay is open");
+
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "Ctrl-X Q must not open the queue overlay behind Ctrl-T"
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Ctrl-T overlay should keep owning the key path"
+    );
+}
+
+#[tokio::test]
+async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert!(app.turn_rx.is_none(), "turn should finish");
+    let overlay = app.transcript_overlay.expect("overlay should remain open");
+    assert!(
+        overlay.mode.mouse_capture(),
+        "turn completion must preserve explicit scrollbar drag mode"
+    );
+}
+
+#[tokio::test]
+async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc should be handled");
+
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc should close Ctrl-T after turn completion"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_drag_mode() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
+        mode: TranscriptOverlayMode::ScrollbarDrag,
+    });
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-c should be handled");
+
+    assert!(!quit, "first Ctrl-C should arm exit confirm, not exit");
+    assert!(
+        app.exit_confirm_armed,
+        "Ctrl-C should still reach the global exit-confirm path"
     );
 }
 
@@ -9658,6 +10294,101 @@ fn transcript_overlay_renders_entries_uncollapsed() {
 }
 
 #[test]
+fn transcript_overlay_includes_pending_assistant_mid_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("tell me a story"));
+    app.pending_reasoning = "planning the next line".to_string();
+    app.pending_assistant.push_delta("Once the lantern woke,");
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(
+        rendered.contains("planning the next line"),
+        "overlay should show live reasoning while the turn streams: {rendered}"
+    );
+    assert!(
+        rendered.contains("Once the lantern woke,"),
+        "overlay should show live assistant text while the turn streams: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_cache_invalidates_for_pending_stream_changes() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("tell me a story"));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.pending_assistant.push_delta("first live tail");
+
+    let first = lines_to_plain_text(&transcript_overlay_rows_for_render(&app, 80));
+    assert!(first.contains("first live tail"), "{first}");
+
+    app.pending_assistant.clear();
+    app.pending_assistant.push_delta("second live tail");
+
+    let second = lines_to_plain_text(&transcript_overlay_rows_for_render(&app, 80));
+    assert!(second.contains("second live tail"), "{second}");
+    assert!(
+        !second.contains("first live tail"),
+        "cached overlay rows must not hold stale live output: {second}"
+    );
+}
+
+#[test]
+fn transcript_overlay_cache_invalidates_for_width_changes() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+    ));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let narrow = transcript_overlay_rows_for_render(&app, 12).len();
+    let wide = transcript_overlay_rows_for_render(&app, 80).len();
+
+    assert!(
+        narrow > wide,
+        "narrow overlay rows should wrap into more visible rows: narrow={narrow}, wide={wide}"
+    );
+}
+
+#[test]
+fn transcript_overlay_repaint_clears_stale_characters() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.push_transcript_item(TranscriptItem::assistant(
+        "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    ));
+
+    let backend = TestBackend::new(64, 12);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render(frame, &app))
+        .expect("first draw");
+
+    app.transcript.clear();
+    app.push_transcript_item(TranscriptItem::assistant("ok"));
+    terminal
+        .draw(|frame| render(frame, &app))
+        .expect("second draw");
+
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..12 {
+        for x in 0..64 {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+
+    assert!(output.contains("ok"), "{output}");
+    assert!(
+        !output.contains("ZZZZ"),
+        "shorter overlay rows must clear stale characters from the prior frame: {output}"
+    );
+}
+
+#[test]
 fn transcript_overlay_renders_right_scrollbar_for_overflow() {
     let mut app = test_app(SessionMode::Build);
     for index in 0..40 {
@@ -9674,6 +10405,38 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
     assert!(
         output.contains('░'),
         "overflowing transcript overlay should render a scrollbar track: {output}"
+    );
+}
+
+#[test]
+fn transcript_overlay_keeps_status_footer_visible() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 120, 18);
+
+    assert!(
+        output.contains("Transcript"),
+        "overlay frame missing: {output}"
+    );
+    assert!(
+        output.contains("Build mode (Shift+Tab to cycle)"),
+        "overlay should keep the mode/status row visible: {output}"
+    );
+    assert!(
+        output.contains("PgUp/PgDn/Wheel scroll"),
+        "overlay should keep the transcript hint row visible: {output}"
+    );
+    assert!(
+        output.contains("M scrollbar drag"),
+        "overlay should expose the scrollbar-drag toggle: {output}"
+    );
+    assert!(
+        output.contains("native select/copy"),
+        "overlay should default to native text selection: {output}"
     );
 }
 
@@ -9697,6 +10460,61 @@ fn transcript_overlay_scrollbar_click_maps_to_scroll_offset() {
     assert!(
         transcript_overlay_scroll_for_scrollbar_row(6, scrollbar_area, 100).expect("middle row")
             > 0
+    );
+}
+
+#[test]
+fn transcript_overlay_tool_cards_are_expanded_and_plain() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..30)
+        .map(|i| format!("line-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_len = body.len();
+    let call = ToolCall {
+        call_id: "read-1".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::json!({"path": "src/lib.rs"}),
+    };
+    let result = ToolResult {
+        call_id: "read-1".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        content: serde_json::json!({
+            "path": "src/lib.rs",
+            "bytes_returned": body_len,
+            "total_bytes": body_len,
+            "ranges": [{"start": 1, "end": 30}],
+            "content": body,
+        }),
+        cost_hint: ToolCostHint {
+            output_bytes: body_len as u64,
+            ..ToolCostHint::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: "abcdef1234567890".to_string(),
+            content_sha256: Some("0123456789abcdef".to_string()),
+        },
+        spill_model_output: None,
+    };
+    app.push_tool_result_with_call(result, Some(call));
+
+    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(
+        rendered.contains("line-14"),
+        "overlay transcript must include uncapped output: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Ctrl-T for full transcript"),
+        "{rendered}"
+    );
+    assert!(
+        lines.iter().all(|line| {
+            line.style.bg.is_none() && line.spans.iter().all(|span| span.style.bg.is_none())
+        }),
+        "overlay transcript should not carry card background tints: {lines:?}"
     );
 }
 
@@ -9928,14 +10746,14 @@ fn note_turn_started_marks_dirty_and_animation_active() {
 }
 
 #[test]
-fn focus_lost_freezes_animation_tick_and_active_animation_predicate() {
-    // The main loop drives `animation_tick` from a focused/unfocused
-    // gate (`if app.focused { app.animation_tick = … }`) and
-    // short-circuits `has_active_animation()` while the host terminal
-    // is unfocused. This test pins both halves of the contract.
+fn focus_lost_keeps_active_turn_spinner_animating_but_freezes_idle_motion() {
+    // The main loop freezes idle background motion while unfocused, but an
+    // in-flight turn must keep ticking so the first-prompt spinner does not
+    // park on one frame if the terminal reports a transient focus loss.
     let mut app = test_app(SessionMode::Build);
-    // Simulate a turn in flight: spinner + working title would
-    // normally keep the loop redrawing every iteration.
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.cancel = Some(CancellationToken::new());
     app.turn_visual = TurnVisualState::Running;
     app.terminal_title_state = TerminalTitleState::Working;
     assert!(
@@ -9943,42 +10761,43 @@ fn focus_lost_freezes_animation_tick_and_active_animation_predicate() {
         "focused running turn must advertise an active animation"
     );
 
-    // FocusLost arrived. The animation gate clamps every motion
-    // signal so the main loop stops repainting and stops ticking
-    // the spinner driver until focus returns.
+    // FocusLost arrived during an active turn. The turn remains the driver, so
+    // the spinner and title animation keep advancing.
     app.focused = false;
     assert!(
-        !app.has_active_animation(),
-        "unfocused TUI must not advertise any active animation, even mid-turn"
+        app.has_active_animation(),
+        "unfocused active turn must still advertise an active animation"
     );
 
-    // Drive the loop body's animation-tick gate directly: the
-    // counter MUST NOT advance while unfocused, even across many
-    // iterations.
     let baseline = app.animation_tick;
     for _ in 0..32 {
-        if app.focused {
+        if should_advance_animation_tick(&app) {
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
     }
     assert_eq!(
-        app.animation_tick, baseline,
-        "no animation tick may fire while focus is lost"
+        app.animation_tick,
+        baseline + 32,
+        "active turn should keep the animation tick alive while unfocused"
     );
 
-    // FocusGained restores both signals.
-    app.focused = true;
+    let mut idle = test_app(SessionMode::Build);
+    idle.focused = false;
+    idle.turn_visual = TurnVisualState::Running;
+    idle.terminal_title_state = TerminalTitleState::Working;
     assert!(
-        app.has_active_animation(),
-        "refocus must re-arm the active-animation predicate"
+        !idle.has_active_animation(),
+        "unfocused idle UI should not keep background animation alive"
     );
-    if app.focused {
-        app.animation_tick = app.animation_tick.wrapping_add(1);
+    let idle_baseline = idle.animation_tick;
+    for _ in 0..32 {
+        if should_advance_animation_tick(&idle) {
+            idle.animation_tick = idle.animation_tick.wrapping_add(1);
+        }
     }
     assert_eq!(
-        app.animation_tick,
-        baseline + 1,
-        "tick driver must resume incrementing once focus returns"
+        idle.animation_tick, idle_baseline,
+        "idle animation tick should stay frozen while unfocused"
     );
 }
 
@@ -10017,8 +10836,48 @@ fn status_line_unset_uses_builtin_colored_detail_items() {
     );
     assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
     assert!(
-        !row2.contains("openai:"),
-        "row 2 should not include the detail line: {row2}"
+        !row1.contains("dir "),
+        "default detail row should replace the legacy dir/git prefix: {row1}"
+    );
+    assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
+}
+
+#[test]
+fn status_line_empty_list_disables_detail_items() {
+    let mut app = test_app(SessionMode::Build);
+    app.status_line_items = Some(Vec::new());
+
+    let lines = format_status_lines(&app, 120);
+    assert_eq!(lines.len(), 2);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row1.contains("dir "),
+        "row 1 should fall back to legacy overview: {row1}"
+    );
+    assert!(
+        !row1.contains("scripted:gpt-test"),
+        "empty list should disable detail items: {row1}"
+    );
+    assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
+}
+
+#[test]
+fn status_line_default_detail_truncates_before_mode_label() {
+    let mut app = test_app(SessionMode::Build);
+    app.directory =
+        "/very/long/workspace/path/that/should/not/push/the/mode/label/off/screen".to_string();
+
+    let lines = format_status_lines(&app, 80);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+
+    assert!(
+        row1.contains("..."),
+        "long default detail row should be truncated: {row1}"
+    );
+    assert!(
+        row1.contains("Build mode (Shift+Tab to cycle)"),
+        "mode label must remain visible: {row1}"
     );
     let provider_span = lines[0]
         .spans

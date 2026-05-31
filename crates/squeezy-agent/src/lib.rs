@@ -2837,8 +2837,6 @@ impl Agent {
             | DispatchCommand::Model
             | DispatchCommand::Plans { .. }
             | DispatchCommand::Copy { .. }
-            | DispatchCommand::Collapse { .. }
-            | DispatchCommand::Expand { .. }
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }

@@ -1,8 +1,8 @@
 //! Status-bar items, accent grouping, and styled-line renderer.
 //!
-//! Each item is an opt-in segment a user can enable through `/statusline`.
-//! Items are grouped into [`StatusLineAccent`] families so the configured
-//! list paints with a consistent color vocabulary across enabled items.
+//! Each item is a segment in the built-in or user-configured status line.
+//! Items are grouped into [`StatusLineAccent`] families so the rendered list
+//! paints with a consistent color vocabulary across enabled items.
 //!
 //! The legacy `render_status_details` plain-text path is kept for tests and
 //! for the historical verbose detail line that fires when no
