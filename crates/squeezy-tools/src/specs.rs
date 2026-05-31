@@ -367,7 +367,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
             "properties": {
                 "query": {"type": "string", "description": "Optional text to match against indexed declaration names and signatures. Omit it when using filters for counts."},
                 "kind": {"type": "string", "description": "Optional symbol kind such as callable, function, method, struct, module, trait, class."},
-                "path": {"type": "string", "description": "Optional workspace-relative path suffix filter."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter. Multi-segment values (e.g. `gson/src/main/java`) match by strict directory prefix; single tokens (e.g. `squeezy_graph`) fall back to fuzzy segment matching."},
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
                 "attribute": {"type": "string"},

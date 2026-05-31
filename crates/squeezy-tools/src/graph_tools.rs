@@ -2010,17 +2010,53 @@ fn read_slice_byte_window(
     Ok((offset, limit, None))
 }
 
+/// Targeted total span (in lines) the read_slice line-range mode auto-widens
+/// toward when the caller passes a tight window. Picked to comfortably contain
+/// a typical Rust `impl Trait for Foo { fn name() … }` block (~10 lines) plus
+/// enough surrounding context that a single fetch covers the enclosing
+/// function/impl in most languages — without forcing a second read when the
+/// model only knew the method's body span.
+const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 80;
+/// Threshold below which a caller-supplied line range is treated as "too
+/// tight" and gets auto-widened up to `READ_SLICE_AUTO_WIDEN_TARGET_LINES`.
+/// Ranges already at or above this size are left exactly as the caller asked.
+const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 60;
+
 fn line_window(
     text: &str,
     args: &ReadSliceArgs,
 ) -> std::result::Result<(usize, usize, SourceSpan), String> {
     let total_lines = text.lines().count().max(1) as u32;
     let context = args.context_lines.unwrap_or(0);
-    let start_line = args.start_line.unwrap_or(1).max(1).saturating_sub(context);
-    let start_line = start_line.max(1);
-    let end_line = args
+    let raw_start = args.start_line.unwrap_or(1).max(1);
+    let raw_end = args
         .end_line
         .unwrap_or(args.start_line.unwrap_or(total_lines))
+        .max(raw_start);
+    // Auto-widen tight caller-supplied windows so the enclosing
+    // function/impl block fits in one fetch. Honored only when `start_line`
+    // (and optionally `end_line`) drove the call — symbol_id / byte modes
+    // never reach this helper, and explicit `context_lines` still adds on top
+    // of the widened range.
+    let (auto_pad_above, auto_pad_below) = if args.start_line.is_some() {
+        let requested = raw_end.saturating_sub(raw_start).saturating_add(1);
+        if requested < READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES {
+            let extra = READ_SLICE_AUTO_WIDEN_TARGET_LINES.saturating_sub(requested);
+            let above = extra / 2;
+            let below = extra - above;
+            (above, below)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    let start_line = raw_start
+        .saturating_sub(auto_pad_above)
+        .saturating_sub(context)
+        .max(1);
+    let end_line = raw_end
+        .saturating_add(auto_pad_below)
         .saturating_add(context)
         .min(total_lines)
         .max(start_line);
@@ -3388,5 +3424,94 @@ impl ToolRegistry {
         payload.insert("available".to_string(), json!(true));
         payload.insert("files".to_string(), json!(files));
         Value::Object(payload)
+    }
+}
+
+#[cfg(test)]
+mod line_window_auto_widen_tests {
+    use super::{
+        READ_SLICE_AUTO_WIDEN_TARGET_LINES, READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES, ReadSliceArgs,
+        line_window,
+    };
+
+    fn args(start_line: u32, end_line: u32) -> ReadSliceArgs {
+        let raw = serde_json::json!({
+            "path": "ignored",
+            "start_line": start_line,
+            "end_line": end_line,
+        });
+        serde_json::from_value(raw).expect("ReadSliceArgs")
+    }
+
+    fn text_with(lines: u32) -> String {
+        (1..=lines)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tight_window_auto_widens_toward_target() {
+        // The realworld pattern: model picked a 21-line window (470..=490) around
+        // a 3-line method body — auto-widen pushes it toward
+        // ~READ_SLICE_AUTO_WIDEN_TARGET_LINES so the enclosing impl block fits.
+        let text = text_with(1000);
+        let (_, _, span) = line_window(&text, &args(470, 490)).expect("line_window");
+        let actual_lines = span.end.line.saturating_sub(span.start.line) + 1;
+        assert!(
+            actual_lines >= READ_SLICE_AUTO_WIDEN_TARGET_LINES - 1,
+            "expected widened to ~{}, got {actual_lines}",
+            READ_SLICE_AUTO_WIDEN_TARGET_LINES
+        );
+        assert!(
+            span.start.line < 470,
+            "expected start line padded above 470, got {}",
+            span.start.line + 1
+        );
+        assert!(
+            span.end.line > 490,
+            "expected end line padded below 490, got {}",
+            span.end.line + 1
+        );
+    }
+
+    #[test]
+    fn wide_window_is_left_alone() {
+        // Caller already asked for >= READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES,
+        // so honor the request exactly. SourcePoint::line is 0-based here.
+        let text = text_with(1000);
+        let start = 100;
+        let end = start + READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES; // 60-line span
+        let (_, _, span) = line_window(&text, &args(start, end)).expect("line_window");
+        assert_eq!(span.start.line, start - 1);
+        assert_eq!(span.end.line, end - 1);
+    }
+
+    #[test]
+    fn single_line_request_expands_to_target_window() {
+        // Common shape: model picks a single line because the packet said
+        // start.line=476 and it forgot to read body_span.end.line.
+        let text = text_with(1000);
+        let (_, _, span) = line_window(&text, &args(476, 476)).expect("line_window");
+        let actual_lines = span.end.line.saturating_sub(span.start.line) + 1;
+        assert!(
+            actual_lines >= READ_SLICE_AUTO_WIDEN_TARGET_LINES - 1,
+            "expected widened to ~{}, got {actual_lines}",
+            READ_SLICE_AUTO_WIDEN_TARGET_LINES
+        );
+    }
+
+    #[test]
+    fn auto_widen_respects_file_bounds() {
+        // Asking near the top of a small file must not panic, and must clamp
+        // start_line at 1 without overshooting end_line past file length.
+        let text = text_with(20);
+        let (_, _, span) = line_window(&text, &args(2, 5)).expect("line_window");
+        assert_eq!(span.start.line, 0, "start_line clamped to 1");
+        assert!(
+            span.end.line <= 19,
+            "end_line clamped to file length, got {}",
+            span.end.line + 1
+        );
     }
 }
