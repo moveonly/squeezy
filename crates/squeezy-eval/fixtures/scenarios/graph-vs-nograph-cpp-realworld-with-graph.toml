@@ -1,0 +1,85 @@
+id = "graph-vs-nograph-cpp-realworld-with-graph"
+title = "spdlog sink_it_ override audit — with graph (openai mini)"
+description = """
+Cross-language A/B (C++). Realistic, multi-step audit: enumerate every
+concrete sink in `include/spdlog/sinks/` that overrides the pure-virtual
+`sink_it_(const log_msg&)` declared on `base_sink<Mutex>`, then for each
+classify whether the override body invokes `formatter_->format(msg, …)`
+(the call inherited from `base_sink<Mutex>::formatter_`). The override
+set spans 22 classes across 21 headers — including two pairs split
+between `.h` declarations and `-inl.h` definitions
+(`basic_file_sink`, `rotating_file_sink`) and two classes in the same
+file (`qt_sink`, `qt_color_sink`) — so a faithful answer requires a
+hierarchy walk plus per-override body inspection, not just a grep over
+function signatures.
+"""
+
+[workspace.github]
+repo = "gabime/spdlog"
+sha = "d5275e3343c4dca4feb9fa772199181509f2a657"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 64
+
+[[steps]]
+kind = "prompt"
+text = """
+List every concrete C++ class declared under `include/spdlog/sinks/`
+that overrides the pure-virtual method
+`void sink_it_(const details::log_msg&)` inherited from
+`spdlog::sinks::base_sink<Mutex>` (declared in
+`include/spdlog/sinks/base_sink.h:41`).
+
+Inclusion rules:
+- The override must appear on a class declared in a header under
+  `include/spdlog/sinks/`. Classes that override `sink_it_` via a base
+  template they themselves derive from (e.g. `dup_filter_sink`
+  derives from `dist_sink<Mutex>`) count if they textually override
+  `sink_it_` again; do not list inherited but un-overridden cases.
+- For classes whose override is declared in a `*.h` and inline-defined
+  in the matching `*-inl.h` (e.g. `basic_file_sink`, `rotating_file_sink`),
+  read the body from the `-inl.h` file.
+- Exclude `base_sink` itself (the pure-virtual declaration).
+- Exclude anything outside `include/spdlog/sinks/` (tests, examples,
+  bench, .cpp build sources).
+- A file may contain more than one such class (e.g. `qt_sinks.h`).
+
+For each override give exactly four fields, tab-separated, one row per
+override, no header row:
+- `file`: path relative to the repo root, of the `*.h` where the
+  `void sink_it_(...) override` token appears (NOT the `-inl.h`).
+- `line`: 1-based line number of that `override` declaration in `file`.
+- `class`: the unqualified class name owning the override.
+- `formats_msg`: `yes` if the override body contains a textual call to
+  `formatter_->format(msg, ...)` (i.e. it invokes
+  `base_sink<Mutex>::formatter_->format(msg, formatted)` or the same
+  call via a `using`/unqualified spelling), `no` otherwise. A `yes`
+  answer applies even when the call is gated by a runtime flag (e.g.
+  `if (enable_formatting_)`); the question is purely whether the call
+  is present in the body. For overrides that delegate entirely to a
+  sibling override (`dup_filter_sink::sink_it_` calls
+  `dist_sink<Mutex>::sink_it_`), classify by the *delegating*
+  override's own body.
+
+Output the rows in ascending order by `file` then `line`. No prose, no
+header line, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 600
+max_input_tokens = 200000
+
+[triage]
+enabled = false
