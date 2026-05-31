@@ -55,6 +55,32 @@ fn empty_registry_dispatches_to_no_handlers() {
 }
 
 #[test]
+fn dispatch_no_collect_invokes_handlers_without_returning_results() {
+    struct CountingHandler {
+        calls: std::sync::Arc<std::sync::Mutex<u32>>,
+    }
+
+    impl HookHandler for CountingHandler {
+        fn handle(&self, _ctx: &HookContext) -> HookResult {
+            *self.calls.lock().unwrap() += 1;
+            HookResult::deny("ignored at observation-only sites")
+        }
+    }
+
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(CountingHandler {
+        calls: calls.clone(),
+    }));
+
+    registry.dispatch_no_collect(HookPayload::PreTurn {
+        turn_id: "0".to_string(),
+    });
+
+    assert_eq!(*calls.lock().unwrap(), 1);
+}
+
+#[test]
 fn handlers_can_propose_mutations_visible_to_callers() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(MutatingHandler {

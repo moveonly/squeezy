@@ -330,6 +330,23 @@ impl HookRegistry {
             .map(|handler| handler.handle(ctx))
             .collect()
     }
+
+    /// Fan out `payload` to every handler without retaining replies.
+    ///
+    /// Use this for observation-only sites that only need handler side
+    /// effects; decision points should continue using [`HookRegistry::dispatch`].
+    pub fn dispatch_no_collect(&self, payload: HookPayload) {
+        let ctx = HookContext::new(payload);
+        self.dispatch_context_no_collect(&ctx);
+    }
+
+    /// Like [`HookRegistry::dispatch_no_collect`] but accepts a pre-built
+    /// context.
+    pub fn dispatch_context_no_collect(&self, ctx: &HookContext) {
+        for handler in &self.handlers {
+            let _ = handler.handle(ctx);
+        }
+    }
 }
 
 impl std::fmt::Debug for HookRegistry {
@@ -640,7 +657,7 @@ impl AgentHook for LegacyHookForwarder {
             if self.registry.is_empty() {
                 return;
             }
-            let _ = self.registry.dispatch(HookPayload::PreTurn {
+            self.registry.dispatch_no_collect(HookPayload::PreTurn {
                 turn_id: req.turn_id.clone(),
             });
         })
@@ -673,7 +690,7 @@ impl AgentHook for LegacyHookForwarder {
             if self.registry.is_empty() {
                 return;
             }
-            let _ = self.registry.dispatch(HookPayload::PostToolUse {
+            self.registry.dispatch_no_collect(HookPayload::PostToolUse {
                 turn_id: result.turn_id.clone(),
                 tool_name: result.tool_name.clone(),
                 call_id: result.call_id.clone(),
