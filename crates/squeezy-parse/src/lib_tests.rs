@@ -1288,6 +1288,27 @@ fn parser_reports_changed_ranges_for_cached_file() {
 }
 
 #[test]
+fn input_edit_reports_multiline_points() {
+    let old = "fn one() {\n    alpha();\n}\n";
+    let new = "fn one() {\n    beta();\n    gamma();\n}\n";
+
+    let edit = input_edit(old, new);
+
+    assert_eq!(
+        edit.start_position,
+        slow_point_for_byte(old, edit.start_byte)
+    );
+    assert_eq!(
+        edit.old_end_position,
+        slow_point_for_byte(old, edit.old_end_byte)
+    );
+    assert_eq!(
+        edit.new_end_position,
+        slow_point_for_byte(new, edit.new_end_byte)
+    );
+}
+
+#[test]
 fn unsupported_language_returns_structured_result() {
     let mut parser = LanguageParser::new().unwrap();
     let mut record = record("README.md", "# docs\n");
@@ -2904,6 +2925,20 @@ fn tsx_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Tsx;
     record
+}
+
+fn slow_point_for_byte(source: &str, byte: usize) -> Point {
+    let mut row = 0;
+    let mut column = 0;
+    for current in source.as_bytes().iter().take(byte) {
+        if *current == b'\n' {
+            row += 1;
+            column = 0;
+        } else {
+            column += 1;
+        }
+    }
+    Point { row, column }
 }
 
 fn ts_record(relative_path: &str, source: &str) -> FileRecord {

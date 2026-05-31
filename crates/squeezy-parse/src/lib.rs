@@ -217,7 +217,7 @@ pub struct ParseSummary {
     pub changed_ranges: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CachedParsedFile {
     hash: ContentHash,
     language: LanguageKind,
@@ -234,7 +234,7 @@ pub struct LanguageParser {
 /// Rust-only name. New code should prefer [`LanguageParser`].
 pub type RustParser = LanguageParser;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ParseJob {
     index: usize,
     record: FileRecord,
@@ -305,8 +305,10 @@ impl LanguageParser {
         let chunk_size = jobs.len().div_ceil(worker_count);
         let mut outputs = std::thread::scope(|scope| {
             let mut handles = Vec::new();
-            for chunk in jobs.chunks(chunk_size) {
-                let chunk = chunk.to_vec();
+            let mut remaining_jobs = jobs;
+            while !remaining_jobs.is_empty() {
+                let split_at = remaining_jobs.len().saturating_sub(chunk_size);
+                let chunk = remaining_jobs.split_off(split_at);
                 handles.push(scope.spawn(move || parse_job_chunk(chunk)));
             }
 
@@ -371,9 +373,20 @@ impl LanguageParser {
             ));
         }
 
-        let old = self.cache.remove(&record.id);
-        let (tree, changed_ranges) = match old.filter(|cached| cached.language == record.language) {
-            Some(mut cached) if cached.hash != record.hash => {
+        if let Some(cached) = self.cache.get(&record.id) {
+            if cached.language == record.language && cached.hash == record.hash {
+                let mut parsed = extract_language(record.clone(), &source, &cached.tree);
+                parsed.changed_ranges = Vec::new();
+                return Ok(parsed);
+            }
+        }
+
+        let old = self
+            .cache
+            .remove(&record.id)
+            .filter(|cached| cached.language == record.language);
+        let (tree, changed_ranges) = match old {
+            Some(mut cached) => {
                 let edit = input_edit(&cached.source, &source);
                 cached.tree.edit(&edit);
                 let parser = self.parser_for_language(record.language)?;
@@ -392,12 +405,6 @@ impl LanguageParser {
                     changed_ranges.push(span_from_edit(&edit));
                 }
                 (new_tree, changed_ranges)
-            }
-            Some(cached) => {
-                self.cache.insert(record.id.clone(), cached.clone());
-                let mut parsed = extract_language(record.clone(), &source, &cached.tree);
-                parsed.changed_ranges = Vec::new();
-                return Ok(parsed);
             }
             None => {
                 let parser = self.parser_for_language(record.language)?;
@@ -1050,8 +1057,7 @@ fn last_path_segment(path: &str) -> String {
 }
 
 fn named_child_count(node: Node<'_>) -> usize {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).count()
+    node.named_child_count()
 }
 
 fn node_text<'source>(
@@ -1110,14 +1116,15 @@ fn input_edit(old: &str, new: &str) -> InputEdit {
     let suffix = common_suffix(&old_bytes[prefix..], &new_bytes[prefix..]);
     let old_end_byte = old_bytes.len() - suffix;
     let new_end_byte = new_bytes.len() - suffix;
+    let start_position = point_for_byte(old, prefix);
 
     InputEdit {
         start_byte: prefix,
         old_end_byte,
         new_end_byte,
-        start_position: point_for_byte(old, prefix),
-        old_end_position: point_for_byte(old, old_end_byte),
-        new_end_position: point_for_byte(new, new_end_byte),
+        start_position,
+        old_end_position: point_after_bytes(old_bytes, prefix, old_end_byte, start_position),
+        new_end_position: point_after_bytes(new_bytes, prefix, new_end_byte, start_position),
     }
 }
 
@@ -1148,6 +1155,19 @@ fn point_for_byte(source: &str, byte: usize) -> Point {
         }
     }
     Point { row, column }
+}
+
+fn point_after_bytes(source: &[u8], start_byte: usize, end_byte: usize, start: Point) -> Point {
+    let mut point = start;
+    for current in &source[start_byte..end_byte] {
+        if *current == b'\n' {
+            point.row += 1;
+            point.column = 0;
+        } else {
+            point.column += 1;
+        }
+    }
+    point
 }
 
 pub fn edge_kind_for_call(call: ParsedCallKind) -> EdgeKind {
