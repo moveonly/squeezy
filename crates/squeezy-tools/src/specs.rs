@@ -495,8 +495,8 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
         description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. \
-            When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), prefer `symbol_id=<id>` with `span_kind=body` over a hand-picked line range \
-            — the tool returns the exact body in one call without padding guesswork. \
+            When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), prefer `symbol_id=<id>` with `span_kind=body` over a hand-picked line range — the tool returns the exact body in one call without padding guesswork. \
+            For exhaustive per-member work (every method on a class, every variant of an enum, every field of a struct), call `hierarchy(symbol_id=<container>)` first to enumerate the member list, then `read_slice` per member or once on the container body — a single class-body slice does not enumerate members and cross-checking against the hierarchy list before answering prevents under-coverage. \
             For line-range mode, the window auto-expands so callers don't need to micro-pad: ranges under ~60 lines are widened symmetrically toward ~80 lines so the enclosing function/impl block is usually included. \
             If you need more, ask for it explicitly via wider `start_line`/`end_line` or `context_lines`.".to_string(),
         capability: PermissionCapability::Read,
