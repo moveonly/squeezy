@@ -1,11 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ignore::WalkBuilder;
 
 use crate::driver::EvalError;
 use crate::scenario::WorkspaceSpec;
+
+/// Monotonic per-process counter appended to scratch directory names so
+/// concurrent provisions never collide on the same path even when the
+/// wall clock or pid alone would not separate them.
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A workspace resolved to a real directory on disk.
 pub struct ProvisionedWorkspace {
@@ -97,23 +103,16 @@ pub fn provision(
         WorkspaceSpec::Github { github } => {
             fs::create_dir_all(scratch_root)
                 .map_err(|err| EvalError::Io(format!("create_dir_all {scratch_root:?}: {err}")))?;
-            let slug = sanitize(&github.repo);
-            let target = scratch_root.join(format!(
-                "{}-{}",
-                slug,
-                &github.sha[..short_sha_len(&github.sha)]
-            ));
-            if !target.exists() {
-                let url = format!("https://github.com/{}.git", github.repo);
-                run_git(&[
-                    "clone",
-                    "--no-checkout",
-                    &url,
-                    target.to_string_lossy().as_ref(),
-                ])?;
-                run_git_in(&target, &["fetch", "--depth", "1", "origin", &github.sha])?;
-                run_git_in(&target, &["checkout", &github.sha])?;
-            }
+            let target = github_scratch_dir(scratch_root, &github.repo, &github.sha);
+            let url = format!("https://github.com/{}.git", github.repo);
+            run_git(&[
+                "clone",
+                "--no-checkout",
+                &url,
+                target.to_string_lossy().as_ref(),
+            ])?;
+            run_git_in(&target, &["fetch", "--depth", "1", "origin", &github.sha])?;
+            run_git_in(&target, &["checkout", &github.sha])?;
             Ok(ProvisionedWorkspace {
                 path: target.clone(),
                 source: WorkspaceSource::Github {
@@ -226,6 +225,31 @@ fn copy_tree_ignore_respecting(source: &Path, target: &Path) -> Result<(), EvalE
     Ok(())
 }
 
+/// Compose the per-run scratch directory for a GitHub workspace. The
+/// path embeds the repo slug + short SHA for human readability plus a
+/// pid + nanosecond timestamp + monotonic counter so concurrent eval
+/// runs targeting the same repo+SHA never share a directory. Sharing
+/// is unsafe because [`WorkspaceCleanup::Directory::drop`] rmrf's the
+/// path, which would yank the workspace out from under any concurrent
+/// run still reading files there.
+fn github_scratch_dir(scratch_root: &Path, repo: &str, sha: &str) -> PathBuf {
+    let slug = sanitize(repo);
+    let short_sha = &sha[..short_sha_len(sha)];
+    let ns_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    scratch_root.join(format!(
+        "{}-{}-{}-{}-{}",
+        slug,
+        short_sha,
+        std::process::id(),
+        ns_ts,
+        seq,
+    ))
+}
+
 fn sanitize(repo: &str) -> String {
     repo.chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -271,3 +295,7 @@ fn run_git_in(dir: &Path, args: &[&str]) -> Result<(), EvalError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "workspace_tests.rs"]
+mod tests;
