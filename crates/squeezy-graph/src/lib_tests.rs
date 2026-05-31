@@ -7280,6 +7280,79 @@ void start() {
 }
 
 #[test]
+fn graph_records_csharp_internal_class_inheritance_edge() {
+    // Mirrors Newtonsoft.Json's `TraceJsonReader` shape (an `internal
+    // class : JsonReader`) so a regression that strips `base:` from
+    // non-public C# class declarations would break the inheritance
+    // edge that `decl_search(attribute="base:JsonReader")` and
+    // `hierarchy` rely on.
+    let mut parser = LanguageParser::new().unwrap();
+    let reader = csharp_record(
+        "src/JsonReader.cs",
+        r#"
+namespace App;
+
+public abstract class JsonReader
+{
+    public virtual bool Read() { return false; }
+}
+"#,
+    );
+    let trace = csharp_record(
+        "src/TraceJsonReader.cs",
+        r#"
+namespace App;
+
+internal class TraceJsonReader : JsonReader, IJsonLineInfo
+{
+    public override bool Read() { return true; }
+}
+"#,
+    );
+    let parsed = [reader, trace]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let trace_class = graph
+        .find_symbol_by_name("TraceJsonReader")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("TraceJsonReader class symbol");
+    assert!(
+        trace_class
+            .attributes
+            .iter()
+            .any(|attr| attr == "base:JsonReader"),
+        "internal class TraceJsonReader : JsonReader should carry base:JsonReader, got {:?}",
+        trace_class.attributes,
+    );
+    let reader_class = graph
+        .find_symbol_by_name("JsonReader")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("JsonReader class symbol");
+    let extends_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| {
+            edge.from == trace_class.id
+                && edge.kind == EdgeKind::Extends
+                && edge.target_text == "JsonReader"
+        })
+        .expect("TraceJsonReader -> JsonReader Extends edge");
+    assert_eq!(
+        extends_edge.to.as_ref(),
+        Some(&reader_class.id),
+        "cross-file `internal class : JsonReader` should bind to the JsonReader class symbol",
+    );
+}
+
+#[test]
 fn dart_import_show_decomposes_into_named_imports() {
     let mut parser = LanguageParser::new().unwrap();
     let main = dart_record(

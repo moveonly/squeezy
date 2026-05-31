@@ -464,6 +464,49 @@ public class Dog : Animal, IComparable<Dog>
 }
 
 #[test]
+fn csharp_parser_emits_base_attributes_for_internal_protected_and_private_classes() {
+    // Newtonsoft.Json's `TraceJsonReader` is declared as
+    // `internal class TraceJsonReader : JsonReader, IJsonLineInfo` —
+    // sitting under a `#region` license header and a braced
+    // namespace, with `#if`/`#endif`-guarded members inside the class.
+    // The C# extractor must emit `base:JsonReader` for every
+    // visibility (public, internal, protected, private,
+    // protected-internal, and the implicit-internal no-modifier form),
+    // otherwise `decl_search(attribute="base:JsonReader")` and the
+    // `Extends` edge derived from it miss every concrete override
+    // beneath them.
+    let source = "\u{feff}#region License\n// header\n#endregion\n\nnamespace Newtonsoft.Json.Serialization\n{\n    internal class TraceJsonReader : JsonReader, IJsonLineInfo\n    {\n        public override bool Read() { return true; }\n\n#if HAVE_DATE_TIME_OFFSET\n        public override DateTimeOffset? ReadAsDateTimeOffset() { return null; }\n#endif\n    }\n\n    class ImplicitInternal : JsonReader { }\n\n    public class Outer\n    {\n        protected class Nested : JsonReader { }\n        private class Hidden : JsonReader { }\n        protected internal class Mixed : JsonReader { }\n    }\n}\n";
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record(
+        "Src/Newtonsoft.Json/Serialization/TraceJsonReader.cs",
+        source,
+    );
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    for name in [
+        "TraceJsonReader",
+        "ImplicitInternal",
+        "Nested",
+        "Hidden",
+        "Mixed",
+    ] {
+        let symbol = parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("{name} symbol missing from parse"));
+        assert!(
+            symbol
+                .attributes
+                .iter()
+                .any(|attr| attr == "base:JsonReader"),
+            "{name} should emit `base:JsonReader` regardless of visibility, got {:?}",
+            symbol.attributes,
+        );
+    }
+}
+
+#[test]
 fn csharp_parser_records_route_attributes_for_aspnet_controllers() {
     let source = r#"
 using Microsoft.AspNetCore.Mvc;
