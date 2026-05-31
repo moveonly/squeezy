@@ -28,7 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
-    anthropic_betas::bedrock_extra_body_betas, cache_policy::should_apply_caching,
+    anthropic_betas::bedrock_extra_body_betas,
+    cache_policy::{DYNAMIC_TOOL_NAME_PREFIX, should_apply_caching},
     retry::idle_timeout,
 };
 
@@ -654,8 +655,12 @@ pub(crate) fn tool_configuration(
             })?;
         tools.push(Tool::ToolSpec(tool_spec));
     }
-    if prompt_caching {
-        tools.push(Tool::CachePoint(cache_point_block()?));
+    if prompt_caching
+        && let Some(idx) = specs
+            .iter()
+            .rposition(|spec| !spec.name.starts_with(DYNAMIC_TOOL_NAME_PREFIX))
+    {
+        tools.insert(idx + 1, Tool::CachePoint(cache_point_block()?));
     }
     let config = ToolConfiguration::builder()
         .set_tools(Some(tools))

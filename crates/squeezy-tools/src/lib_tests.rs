@@ -1298,6 +1298,50 @@ async fn read_file_returns_image_payload_when_file_is_png() {
 }
 
 #[tokio::test]
+async fn read_file_rejects_image_exceeding_size_cap() {
+    use crate::file_ops::MAX_IMAGE_BYTES;
+    let root = temp_workspace("read_file_image_too_large");
+    let size: usize = 6 * 1024 * 1024;
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    bytes.resize(size, 0u8);
+    fs::write(root.join("huge.png"), &bytes).expect("write png");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "read_huge_image".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "huge.png"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["image"], true);
+    assert_eq!(result.content["mime_type"], "image/png");
+    assert_eq!(result.content["total_bytes"], size as u64);
+    assert_eq!(result.content["max_image_bytes"], MAX_IMAGE_BYTES);
+    assert_eq!(result.content["path"], "huge.png");
+    let err_msg = result.content["error"].as_str().expect("error string");
+    assert!(err_msg.contains("huge.png"), "error msg: {err_msg}");
+    assert!(err_msg.contains(&size.to_string()), "error msg: {err_msg}",);
+    assert!(
+        err_msg.contains(&MAX_IMAGE_BYTES.to_string()),
+        "error msg: {err_msg}",
+    );
+    assert!(
+        result.content.get("data_base64").is_none(),
+        "rejected image must not include base64: {:?}",
+        result.content,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn read_file_returns_dedup_stub_when_unchanged_since_last_receipt() {
     let root = temp_workspace("read_file_dedup_unchanged");
     // Use a multi-KB body so the audit's "stub output < full output / 10"

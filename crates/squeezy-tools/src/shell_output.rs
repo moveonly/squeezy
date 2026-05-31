@@ -125,7 +125,7 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
             // JSON stream. Preserve those signal lines so shaped output still
             // surfaces test failures.
             if libtest_signal_line(line) {
-                plain_lines.push(trim_shaped_block(line.trim_end(), 4_000));
+                plain_lines.push(trim_shaped_block(line.trim_end(), 8_000));
             }
             continue;
         };
@@ -148,7 +148,7 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
                     .or_else(|| message.get("message").and_then(Value::as_str))
                     .unwrap_or("");
                 if !text.trim().is_empty() {
-                    kept.push(trim_shaped_block(text, 4_000));
+                    kept.push(trim_shaped_block(text, 8_000));
                 }
             }
             Some("build-finished") => {
@@ -169,7 +169,7 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
                 .or_else(|| value.get("message").and_then(Value::as_str))
                 .unwrap_or("");
             if !text.trim().is_empty() {
-                kept.push(trim_shaped_block(text, 4_000));
+                kept.push(trim_shaped_block(text, 8_000));
             }
         }
     }
@@ -248,7 +248,7 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
             last_summary = Some(value.clone());
         }
         if line_has_signal(event) || line_has_signal(status) || value_contains_signal(&value) {
-            kept.push(trim_shaped_block(&value.to_string(), 4_000));
+            kept.push(trim_shaped_block(&value.to_string(), 8_000));
         }
     }
     if parsed == 0 {
@@ -261,7 +261,7 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
         ));
     }
     if let Some(summary) = last_summary {
-        summary_parts.push(trim_shaped_block(&summary.to_string(), 4_000));
+        summary_parts.push(trim_shaped_block(&summary.to_string(), 8_000));
     }
     kept.insert(0, summary_parts.join(" "));
     Some((join_shaped_lines(kept), String::new()))
@@ -326,7 +326,7 @@ fn json_test_summary(value: &Value, family: &str) -> String {
 fn collect_json_signal_lines(value: &Value, path: &str, kept: &mut Vec<String>) {
     match value {
         Value::String(text) if line_has_signal(text) => {
-            kept.push(trim_shaped_block(&format!("{path}: {text}"), 4_000));
+            kept.push(trim_shaped_block(&format!("{path}: {text}"), 8_000));
         }
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
@@ -337,7 +337,7 @@ fn collect_json_signal_lines(value: &Value, path: &str, kept: &mut Vec<String>) 
             for (key, value) in entries {
                 let next = format!("{path}.{key}");
                 if line_has_signal(key) && value.is_string() {
-                    kept.push(trim_shaped_block(&format!("{next}: {value}"), 4_000));
+                    kept.push(trim_shaped_block(&format!("{next}: {value}"), 8_000));
                 }
                 collect_json_signal_lines(value, &next, kept);
             }
@@ -381,8 +381,8 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
         }
         return out;
     }
-    const HEAD_BUDGET: usize = 20;
-    const TAIL_BUDGET: usize = 20;
+    const HEAD_BUDGET: usize = 50;
+    const TAIL_BUDGET: usize = 50;
     let mut head: Vec<String> = Vec::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(TAIL_BUDGET);
     let mut signal_lines: Vec<String> = Vec::new();

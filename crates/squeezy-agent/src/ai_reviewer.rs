@@ -24,7 +24,7 @@ fn default_policy() -> &'static str {
 /// sees the user's original intent even when the request lands many turns
 /// downstream.
 const RECENT_WINDOW_ITEMS: usize = 8;
-const MAX_USER_TOKENS: usize = 800;
+const MAX_USER_TOKENS: usize = 2_000;
 const MAX_OTHER_TOKENS: usize = 400;
 const SUMMARY_TOKEN_RESERVE: usize = 200;
 const CHARS_PER_TOKEN: usize = 4;
