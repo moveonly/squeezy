@@ -577,19 +577,42 @@ fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
     }
 }
 
-pub(crate) fn graph_unavailable_result(call: &ToolCall) -> ToolResult {
+pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) -> ToolResult {
     // `fallback.suggested_tools` is intentionally absent — the reason code is
     // enough for the model to pick a non-graph retry path on its own.
+    //
+    // `still_indexing` distinguishes the transient cold-start window (the
+    // background `GraphManager::open_with_store` task is still running and
+    // the wait condvar timed out) from a workspace where the open completed
+    // with `None` (structurally unavailable). The transient case carries a
+    // `retryable: true` hint so the model knows the same call will succeed
+    // shortly — without it, a cold-open that overran the wait stranded the
+    // model on a single `graph_unavailable` reading and it fell back to
+    // grep instead of retrying.
+    let (status, reason, retryable) = if still_indexing {
+        (
+            "graph_indexing",
+            "semantic graph is still being indexed; retry this tool call",
+            true,
+        )
+    } else {
+        (
+            "graph_unavailable",
+            "semantic graph is unavailable for this workspace",
+            false,
+        )
+    };
     make_result(
         call,
         ToolStatus::Success,
         json!({
             "tool": call.name,
             "graph_available": false,
-            "reason": "semantic graph is unavailable for this workspace",
+            "reason": reason,
             "packets": [],
             "fallback": {
-                "status": "graph_unavailable",
+                "status": status,
+                "retryable": retryable,
             }
         }),
         ToolCostHint::default(),
@@ -2088,7 +2111,7 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -2102,7 +2125,7 @@ impl ToolRegistry {
             }
         };
         let Some(manager) = graph.as_mut() else {
-            return graph_unavailable_result(call);
+            return graph_unavailable_result(call, !graph_ready);
         };
         let refresh = match manager.refresh_before_query() {
             Ok(report) => report,
@@ -3307,13 +3330,27 @@ impl ToolRegistry {
         max_symbols_per_file: usize,
         max_references: usize,
     ) -> Value {
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),
         };
         let Some(manager) = graph.as_mut() else {
-            return json!({"available": false, "reason": "semantic graph is unavailable for this workspace"});
+            return if !graph_ready {
+                json!({
+                    "available": false,
+                    "status": "graph_indexing",
+                    "retryable": true,
+                    "reason": "semantic graph is still being indexed",
+                })
+            } else {
+                json!({
+                    "available": false,
+                    "status": "graph_unavailable",
+                    "retryable": false,
+                    "reason": "semantic graph is unavailable for this workspace",
+                })
+            };
         };
         let refresh = manager.refresh_before_query().ok();
         annotate_graph(manager, snapshot);

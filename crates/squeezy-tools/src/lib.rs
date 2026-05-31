@@ -2877,7 +2877,7 @@ impl ToolRegistry {
             captured_unix_millis: unix_millis(),
         };
 
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let report = {
             let mut graph = match self.graph.lock() {
                 Ok(graph) => graph,
@@ -2892,7 +2892,7 @@ impl ToolRegistry {
                 }
             };
             let Some(manager) = graph.as_mut() else {
-                return graph_unavailable_result(call);
+                return graph_unavailable_result(call, !graph_ready);
             };
             if let Err(err) = manager.refresh_before_query() {
                 return tool_error(call, err);
