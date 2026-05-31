@@ -5435,8 +5435,8 @@ impl TurnRuntime {
             // sticky window suppress routing on the next user prompt.
             // The decision is one-way — once the turn escalates it
             // never falls back to the cheap tier within this turn.
-            if on_cheap_turn {
-                if let Some(reason) = escalation_state.maybe_trigger(
+            if on_cheap_turn
+                && let Some(reason) = escalation_state.maybe_trigger(
                     broker.metrics.tool_calls,
                     broker.metrics.tool_errors,
                     broker.metrics.budget_denials,
@@ -5444,39 +5444,39 @@ impl TurnRuntime {
                     on_cheap_turn,
                     &self.config.routing,
                     self.config.max_tool_calls_per_turn,
-                ) {
-                    let from_model = current_model.to_string();
-                    current_model = parent_model.clone();
-                    on_cheap_turn = false;
-                    broker.metrics.escalated_to_parent = true;
-                    let sticky_remaining = {
-                        let mut state = self.routing_state.lock().expect("routing state lock");
-                        state
-                            .sticky
-                            .engage(self.config.routing.escalation_sticky_turns);
-                        state.sticky.remaining_turns
-                    };
-                    // Mirror the engaged window into `ConversationState`
-                    // so the next `to_resume_state()` call — which
-                    // happens at every turn boundary via
-                    // `persist_turn_accounting` — persists it without
-                    // any extra plumbing.
-                    self.conversation_state
-                        .lock()
-                        .await
-                        .set_routing_sticky_remaining_turns(sticky_remaining);
-                    self.telemetry
-                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
-                    let _ = self
-                        .tx
-                        .send(AgentEvent::TurnRouted {
-                            turn_id: self.turn_id,
-                            from: from_model,
-                            to: parent_model_str.clone(),
-                            reason: format!("escalated_{}", reason.as_str()),
-                        })
-                        .await;
-                }
+                )
+            {
+                let from_model = current_model.to_string();
+                current_model = parent_model.clone();
+                on_cheap_turn = false;
+                broker.metrics.escalated_to_parent = true;
+                let sticky_remaining = {
+                    let mut state = self.routing_state.lock().expect("routing state lock");
+                    state
+                        .sticky
+                        .engage(self.config.routing.escalation_sticky_turns);
+                    state.sticky.remaining_turns
+                };
+                // Mirror the engaged window into `ConversationState`
+                // so the next `to_resume_state()` call — which
+                // happens at every turn boundary via
+                // `persist_turn_accounting` — persists it without
+                // any extra plumbing.
+                self.conversation_state
+                    .lock()
+                    .await
+                    .set_routing_sticky_remaining_turns(sticky_remaining);
+                self.telemetry
+                    .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                let _ = self
+                    .tx
+                    .send(AgentEvent::TurnRouted {
+                        turn_id: self.turn_id,
+                        from: from_model,
+                        to: parent_model_str.clone(),
+                        reason: format!("escalated_{}", reason.as_str()),
+                    })
+                    .await;
             }
             let request = LlmRequest {
                 model: current_model.clone(),

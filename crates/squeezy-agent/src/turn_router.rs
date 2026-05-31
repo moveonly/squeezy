@@ -607,6 +607,15 @@ pub(crate) struct EscalationState {
 }
 
 impl EscalationState {
+    /// The detector intentionally takes seven orthogonal signals
+    /// (three counters, the latest assistant text, the on-cheap-turn
+    /// gate, the routing config, and the parent's tool budget) so the
+    /// caller does not have to construct a transient struct just to
+    /// poll for escalation on every round and every text delta. The
+    /// clippy `too_many_arguments` lint flags the 8 args; we allow it
+    /// here rather than introduce a wrapper type that would obscure
+    /// the call-site contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn maybe_trigger(
         &mut self,
         tool_calls: u64,
