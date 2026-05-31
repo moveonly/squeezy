@@ -2143,6 +2143,59 @@ async fn slash_plans_list_renders_persisted_plans() {
 }
 
 #[tokio::test]
+async fn slash_plans_list_empty_renders_guidance() {
+    let root = temp_workspace("slash_plans_list_empty");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans list".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "no plans persisted in this session");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(
+        rendered.contains("No plans saved in this session yet"),
+        "empty /plans list should explain itself: {rendered}"
+    );
+    assert!(
+        rendered.contains("Plan mode"),
+        "empty /plans list should tell users how plans are created: {rendered}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn slash_plans_show_without_id_renders_usage_guidance() {
+    let root = temp_workspace("slash_plans_show_no_id");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+
+    set_input(&mut app, "/plans show".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.status, "usage: /plans <subcommand> <id-or-prefix>");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("Missing plan id"), "{rendered}");
+    assert!(rendered.contains("/plans show <id>"), "{rendered}");
+    assert!(rendered.contains("Run `/plans`"), "{rendered}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn slash_plans_delete_requires_explicit_yes() {
     let root = temp_workspace("slash_plans_delete_confirm");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
@@ -2392,6 +2445,15 @@ async fn slash_plans_show_unknown_id_sets_status() {
         app.status.starts_with("no plan matches"),
         "got status: {}",
         app.status
+    );
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(
+        rendered.contains("No plan matches `plan-does-not-exist`"),
+        "missing plan should be transcript-visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("no saved plans"),
+        "missing plan in an empty session should explain why: {rendered}"
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -2966,7 +3028,7 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
 
-    let suggestions = input::slash_suggestions(&app.input);
+    let suggestions = input::slash_suggestions_for_app(&app);
     let names = suggestions
         .iter()
         .map(|command| command.name)
@@ -3054,6 +3116,37 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         suggestions.len() - 1,
         "Up from 0 should wrap to last"
     );
+}
+
+#[test]
+fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/".to_string());
+    let names = input::slash_suggestions_for_app(&app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            !names.contains(&checkpoint_command),
+            "{checkpoint_command} should not be suggested while checkpointing is disabled"
+        );
+    }
+
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut enabled_app = test_app_with_config(&config, SessionMode::Build);
+    set_input(&mut enabled_app, "/".to_string());
+    let names = input::slash_suggestions_for_app(&enabled_app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should be suggested while checkpointing is enabled"
+        );
+    }
 }
 
 #[test]
@@ -3177,11 +3270,12 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/cost").await);
 
-    let output = last_message_content(&app).expect("cost output");
+    let raw = last_message_content(&app).expect("cost output");
+    let output = strip_ansi_escape_sequences(raw);
     assert_eq!(app.status, "cost snapshot");
     assert!(output.contains("Cost accounting"), "{output}");
     assert!(
-        output.contains("provider=scripted model=gpt-5.5"),
+        output.contains("provider  scripted") && output.contains("model gpt-5.5"),
         "{output}"
     );
     assert!(
@@ -3195,7 +3289,7 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
     assert!(!output.contains("receipts stub_hits="), "{output}");
     assert!(!output.contains("spills writes="), "{output}");
     assert!(!output.contains("\nio bytes_read="), "{output}");
-    assert!(!output.contains("\nredactions="), "{output}");
+    assert!(!output.contains("redactions="), "{output}");
     assert!(app.jobs.is_empty());
 }
 
@@ -3309,7 +3403,11 @@ fn format_cost_command_renders_active_buckets() {
         full_history_request: estimate,
     };
 
-    let output = commands::format_cost_command(&snapshot);
+    let raw = commands::format_cost_command(&snapshot);
+    // The styled output embeds ANSI escapes around individual values
+    // (theme-aware colors). Assertions check semantic substrings after
+    // stripping the escapes so future palette tweaks don't churn tests.
+    let output = strip_ansi_escape_sequences(&raw);
     assert!(output.contains("estimated_usd=$0.415300"), "{output}");
     assert!(output.contains("provider_tokens input=1200"), "{output}");
     assert!(
@@ -3321,6 +3419,12 @@ fn format_cost_command_renders_active_buckets() {
     assert!(output.contains("spills writes=1"), "{output}");
     assert!(output.contains("io bytes_read=12345"), "{output}");
     assert!(output.contains("redactions=2"), "{output}");
+    // The styled output should actually contain ANSI escapes — confirms
+    // the formatter is using `commands_style`.
+    assert!(
+        raw.contains('\x1b'),
+        "cost output should embed ANSI escapes: {raw:?}"
+    );
 }
 
 #[tokio::test]
@@ -3341,7 +3445,8 @@ async fn slash_context_reports_known_model_budget_percentages() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
 
-    let output = last_message_content(&app).expect("context output");
+    let raw = last_message_content(&app).expect("context output");
+    let output = strip_ansi_escape_sequences(raw);
     assert_eq!(app.status, "context snapshot");
     // Post-squeezy-rw0i the /context output leads with consumed +
     // remaining against the model's context window, followed by a
@@ -3352,7 +3457,7 @@ async fn slash_context_reports_known_model_budget_percentages() {
         output.contains("consumed:") && output.contains("remaining:"),
         "{output}"
     );
-    assert!(output.contains("400000"), "{output}");
+    assert!(output.contains("400,000"), "{output}");
     assert!(output.contains('%'), "{output}");
     assert!(app.jobs.is_empty());
 }
@@ -3367,13 +3472,13 @@ async fn slash_context_uses_registry_fallback_for_unknown_models() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
 
-    let output = last_message_content(&app).expect("context output");
-    // Fallback window is 272_000; max_output reserve 64_000. The new
-    // /context layout exposes both via the consumed/remaining header
-    // and the max_output_reserve line.
-    assert!(output.contains("272000"), "{output}");
+    let raw = last_message_content(&app).expect("context output");
+    let output = strip_ansi_escape_sequences(raw);
+    // Fallback window is 272_000; max_output reserve 64_000. Numbers are
+    // rendered with grouped thousands so the user can scan them at a glance.
+    assert!(output.contains("272,000"), "{output}");
     assert!(
-        output.contains("max_output_reserve: 64000 tokens"),
+        output.contains("max_output_reserve: 64,000 tokens"),
         "{output}"
     );
     assert!(output.contains("Consumption by source"), "{output}");
@@ -3492,6 +3597,19 @@ async fn slash_attach_inserts_visible_file_token() {
     assert!(prepared.model_input.contains("2026-05-24 ERROR failed"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attachments_empty_renders_guidance() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attachments").await);
+
+    assert_eq!(app.status, "no attached context");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("No attached context yet"), "{rendered}");
+    assert!(rendered.contains("/attach <path>"), "{rendered}");
 }
 
 #[tokio::test]
@@ -5807,91 +5925,57 @@ fn failed_assistant_marker_uses_error_color() {
 }
 
 #[test]
-fn accounting_block_colors_labels_values_and_dollar_amounts() {
-    let content = "Cost accounting\n\
-session=abc\n\
-provider=openai model=gpt-5.5 mode=build\n\
-estimated_usd=$0.415300 (estimated from provider-reported usage and local pricing metadata)\n\
-provider_tokens input=1200 output=340 reasoning=- cached_input=0 cache_write_input=-\n\
-tools calls=4 successes=3 errors=1 denials=0 cancellations=0 budget_denials=0\n\
-accuracy=provider token counters are provider-reported when available.";
+fn ansi_system_entry_parses_escapes_into_styled_spans() {
+    // System messages whose content carries ANSI escape sequences flow
+    // through `format_ansi_system_entry`, which parses each escape into
+    // a styled ratatui span. This is how `/cost` and `/context` render
+    // with bold colored headers and per-value accents. Plain-text system
+    // messages should keep their original single-style rendering — see
+    // `accounting_block_dispatch_skips_unrelated_system_messages` below.
+    let accent_rgb = match crate::render::theme::accent() {
+        ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+        other => panic!("expected accent to resolve to Color::Rgb in tests, got {other:?}"),
+    };
+    let bold_accent_header = format!(
+        "\x1b[1m\x1b[38;2;{};{};{}mCost accounting\x1b[0m",
+        accent_rgb.0, accent_rgb.1, accent_rgb.2,
+    );
+    let value_in_accent = format!(
+        "\x1b[38;2;{};{};{}m1200\x1b[0m",
+        accent_rgb.0, accent_rgb.1, accent_rgb.2,
+    );
+    let content = format!("{bold_accent_header}\n  input={value_in_accent}");
     let item = TranscriptItem::system(content);
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
-    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert!(lines.len() >= 2, "{lines:?}");
 
-    let span_for = |line: &Line<'static>, text: &str| -> Style {
-        line.spans
-            .iter()
-            .find(|span| span.content.as_ref() == text)
-            .unwrap_or_else(|| panic!("missing span {text:?} in {line:?}"))
-            .style
-    };
-
-    // Header still renders the `• Noted` chrome plus the bolded
-    // "Cost accounting" body, in crate::render::theme::secondary().
-    let header_style = span_for(&lines[0], "Cost accounting");
-    assert_eq!(header_style.fg, Some(crate::render::theme::secondary()));
-    assert!(header_style.add_modifier.contains(Modifier::BOLD));
-
-    // `session=` is the dim label, `abc` is the bright value.
-    let session_line = &lines[1];
+    // First line: the role chrome (`• Noted`) prefix plus the parsed
+    // header span, which should be bold + accent colored.
+    let header_span = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Cost accounting")
+        .unwrap_or_else(|| panic!("expected `Cost accounting` span in {:?}", lines[0]));
     assert_eq!(
-        span_for(session_line, "session=").fg,
-        Some(crate::render::theme::quiet())
+        header_span.style.fg,
+        Some(crate::render::theme::accent()),
+        "header should be accent colored: {:?}",
+        header_span.style
     );
-    assert_eq!(span_for(session_line, "abc").fg, None);
-
-    // The dollar amount pops in crate::render::theme::accent(); the trailing parenthetical fades.
-    let usd_line = &lines[3];
-    assert_eq!(
-        span_for(usd_line, "estimated_usd=").fg,
-        Some(crate::render::theme::quiet())
-    );
-    assert_eq!(
-        span_for(usd_line, "$0.415300").fg,
-        Some(crate::render::theme::accent())
-    );
-    assert_eq!(
-        span_for(usd_line, "(estimated").fg,
-        Some(crate::render::theme::quiet())
-    );
-
-    // Zero / dash values fade so real numbers carry the eye.
-    let tokens_line = &lines[4];
-    assert_eq!(
-        span_for(tokens_line, "provider_tokens").fg,
-        Some(crate::render::theme::secondary())
-    );
-    assert_eq!(span_for(tokens_line, "1200").fg, None);
-    assert_eq!(
-        span_for(tokens_line, "-").fg,
-        Some(crate::render::theme::quiet())
-    );
-    assert_eq!(
-        span_for(tokens_line, "0").fg,
-        Some(crate::render::theme::quiet())
-    );
-
-    // The leading group word on tool rows is crate::render::theme::secondary().
-    let tools_line = &lines[5];
-    assert_eq!(
-        span_for(tools_line, "tools").fg,
-        Some(crate::render::theme::secondary())
-    );
-    assert_eq!(span_for(tools_line, "4").fg, None);
-
-    // The accuracy epilogue is wholly dimmed.
-    let accuracy_line = &lines[6];
     assert!(
-        accuracy_line
-            .spans
-            .iter()
-            .all(|span| span.style.fg.is_none()
-                || span.style.fg == Some(crate::render::theme::quiet())
-                || span.content.as_ref().chars().all(char::is_whitespace)),
-        "{accuracy_line:?}"
+        header_span.style.add_modifier.contains(Modifier::BOLD),
+        "header should be bold: {:?}",
+        header_span.style
     );
+
+    // Second line: continuation indent + plain prefix + accented value.
+    let value_span = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "1200")
+        .unwrap_or_else(|| panic!("expected `1200` span in {:?}", lines[1]));
+    assert_eq!(value_span.style.fg, Some(crate::render::theme::accent()));
 }
 
 #[test]
@@ -6836,28 +6920,6 @@ async fn ctrl_y_copies_last_assistant_message() {
 }
 
 #[tokio::test]
-async fn slash_copy_transcript_copies_plain_text_transcript() {
-    let mut agent = test_agent(SessionMode::Build);
-    let writes = Arc::new(StdMutex::new(Vec::new()));
-    let mut app = test_app_with_clipboard(
-        SessionMode::Build,
-        Box::new(RecordingClipboard {
-            writes: writes.clone(),
-            error: None,
-        }),
-    );
-    app.push_transcript_item(TranscriptItem::user("hello"));
-    app.push_transcript_item(TranscriptItem::assistant("answer"));
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/copy transcript").await);
-    assert_eq!(
-        writes.lock().unwrap().as_slice(),
-        ["user: hello\nassistant: answer"]
-    );
-    assert!(app.status.contains("copied transcript"), "{}", app.status);
-}
-
-#[tokio::test]
 async fn slash_pin_pins_and_unpins_transcript_context() {
     let root = temp_workspace("pin_context");
     let config = test_config_with_root(SessionMode::Build, root.clone());
@@ -6882,6 +6944,19 @@ async fn slash_pin_pins_and_unpins_transcript_context() {
     assert_eq!(app.status, format!("unpinned {pin_id}"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_pins_empty_renders_guidance() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/pins").await);
+
+    assert_eq!(app.status, "no pinned context");
+    let rendered = last_message_content(&app).expect("system guidance");
+    assert!(rendered.contains("No pinned context yet"), "{rendered}");
+    assert!(rendered.contains("/pin selected"), "{rendered}");
 }
 
 #[tokio::test]
@@ -7200,7 +7275,9 @@ fn base64_encoder_supports_osc52_payloads() {
 
 #[tokio::test]
 async fn successful_edit_turn_pushes_diff_undo_hint() {
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
 
@@ -7242,6 +7319,47 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
     assert!(
         !app.last_turn_had_edits,
         "flag must reset after the hint fires"
+    );
+}
+
+#[tokio::test]
+async fn successful_edit_turn_hides_undo_hint_when_checkpointing_disabled() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("apply_patch", "patched ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("/diff") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    let hint = hint.expect("successful edit turn must push a /diff hint");
+    assert!(
+        !hint.contains("/undo"),
+        "checkpointing disabled should hide /undo hint: {hint}"
     );
 }
 
@@ -7343,7 +7461,9 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
 
 #[tokio::test]
 async fn failed_edit_turn_error_status_mentions_undo() {
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
 

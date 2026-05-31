@@ -71,9 +71,6 @@ pub enum DispatchCommand {
         path: String,
     },
     Attachments,
-    Copy {
-        target: Option<String>,
-    },
     Compact {
         undo: bool,
     },
@@ -184,7 +181,6 @@ impl DispatchCommand {
             Self::Reviewer => "/reviewer",
             Self::Attach { .. } => "/attach",
             Self::Attachments => "/attachments",
-            Self::Copy { .. } => "/copy",
             Self::Compact { .. } => "/compact",
             Self::Diff => "/diff",
             Self::Tasks => "/tasks",
@@ -274,22 +270,6 @@ impl DispatchCommand {
                 }
             }
             "/attachments" => Self::Attachments,
-            "/copy" => {
-                // The pre-refactor handler only inspected the first
-                // token: `None` copies the last assistant message,
-                // `Some("transcript")` copies the transcript, any
-                // other first token sets the usage status. Extra
-                // trailing tokens are ignored to preserve that
-                // behaviour exactly.
-                let target = rest.split_whitespace().next().map(str::to_string);
-                if matches!(target.as_deref(), Some(value) if value != "transcript") {
-                    return Err(DispatchCommandParseError::Usage {
-                        command: head.to_string(),
-                        hint: "usage: /copy [transcript]".to_string(),
-                    });
-                }
-                Self::Copy { target }
-            }
             "/compact" => {
                 let mut tokens = rest.split_whitespace();
                 let undo = matches!(

@@ -106,31 +106,14 @@ fn parse_attach_requires_path() {
 }
 
 #[test]
-fn parse_attachments_and_copy() {
+fn parse_attachments() {
     assert_eq!(parse("/attachments").unwrap(), DispatchCommand::Attachments);
-    assert_eq!(
-        parse("/copy").unwrap(),
-        DispatchCommand::Copy { target: None }
-    );
-    assert_eq!(
-        parse("/copy transcript").unwrap(),
-        DispatchCommand::Copy {
-            target: Some("transcript".to_string())
-        }
-    );
-    // The pre-refactor handler ignored trailing tokens after the
-    // first; preserve that so `/copy transcript anything` still
-    // copies the transcript instead of surfacing a usage error.
-    assert_eq!(
-        parse("/copy transcript please").unwrap(),
-        DispatchCommand::Copy {
-            target: Some("transcript".to_string())
-        }
-    );
-    // Anything other than `transcript` is a usage error to match the
-    // pre-refactor TUI handler exactly.
-    let err = parse("/copy nonsense").unwrap_err();
-    assert!(matches!(err, DispatchCommandParseError::Usage { .. }));
+}
+
+#[test]
+fn parse_copy_is_not_a_builtin_slash_command() {
+    let err = parse("/copy").unwrap_err();
+    assert!(matches!(err, DispatchCommandParseError::Unknown { .. }));
 }
 
 #[test]

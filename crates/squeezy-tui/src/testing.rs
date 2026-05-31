@@ -264,7 +264,7 @@ impl TuiHarness {
     /// composer would take. This is the only way to exercise
     /// `DispatchOutcome::TuiOnly` commands (`/config`, `/model`,
     /// `/permissions`, `/effort`, `/verbosity`, `/tool-verbosity`,
-    /// `/theme`, `/statusline`, `/keymap`, `/copy`, `/help`, etc.)
+    /// `/theme`, `/statusline`, `/keymap`, `/help`, etc.)
     /// from an eval driver — those commands
     /// short-circuit `Agent::dispatch_command_raw` and never reach the
     /// TUI.

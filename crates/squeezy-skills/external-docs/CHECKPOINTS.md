@@ -22,7 +22,7 @@ Use `checkpoint_list` to list recent checkpoints. The response includes `journal
 
 Use `checkpoint_show` with a `checkpoint_id` to inspect one checkpoint, including file paths, status, hashes, patch text for text files, binary markers, skipped files, and coverage warnings.
 
-In the TUI:
+When checkpointing is enabled, the TUI also surfaces checkpoint commands:
 
 - `/checkpoints` lists checkpoints.
 - `/checkpoint <checkpoint_id>` shows one checkpoint.

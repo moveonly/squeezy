@@ -63,6 +63,7 @@ use tokio_util::sync::CancellationToken;
 
 mod approval;
 mod commands;
+mod commands_style;
 mod config_screen;
 mod events;
 mod fuzzy;
@@ -2438,7 +2439,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
-            copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+            copy_last_assistant_to_clipboard(app);
             true
         }
         keymap::Action::RestoreCancelledPrompt => {
@@ -2704,9 +2705,7 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/help" => {
-            false
-        }
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/help" => false,
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -2730,7 +2729,7 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
         // Required-arg failures preserve the pre-refactor `usage:`
         // strings so the visible affordance is unchanged.
         Err(DispatchCommandParseError::Usage { hint, .. }) => {
-            app.status = hint;
+            set_status_with_notice(app, hint.clone(), hint);
             return true;
         }
     };
@@ -2755,6 +2754,17 @@ pub(crate) async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, in
 
     apply_dispatch_command(app, agent, cmd).await;
     true
+}
+
+fn set_status_notice(app: &mut TuiApp, message: impl Into<String>) {
+    let message = message.into();
+    app.status = message.clone();
+    app.push_transcript_item(TranscriptItem::system(message));
+}
+
+fn set_status_with_notice(app: &mut TuiApp, status: impl Into<String>, notice: impl Into<String>) {
+    app.status = status.into();
+    app.push_transcript_item(TranscriptItem::system(notice.into()));
 }
 
 async fn handle_inline_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
@@ -2816,7 +2826,7 @@ fn handle_inline_attach_command(
     command_end: usize,
 ) -> bool {
     let Some((path, path_end)) = inline_attach_path(input, command_end) else {
-        app.status = "usage: /attach <path>".to_string();
+        set_status_notice(app, "usage: /attach <path>");
         return true;
     };
     let original_input = app.input.clone();
@@ -3001,7 +3011,11 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Attachments => {
             app.attachments = agent.context_attachments_snapshot().await;
             if app.attachments.is_empty() {
-                app.status = "no attached context".to_string();
+                set_status_with_notice(
+                    app,
+                    "no attached context",
+                    "No attached context yet. Use `/attach <path>` to add a file or directory token to your next prompt.",
+                );
             } else {
                 app.status = format!("{} attached context item(s)", app.attachments.len());
                 app.push_transcript_item(TranscriptItem::system(format_attachment_list(
@@ -3013,8 +3027,17 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             Ok(attachment) => {
                 app.attachments = agent.context_attachments_snapshot().await;
                 app.status = format!("detached {}", attachment.id);
+                app.push_log(format!("detached context attachment {}", attachment.id));
             }
-            Err(error) => app.status = format!("detach failed: {error}"),
+            Err(error) => {
+                set_status_with_notice(
+                    app,
+                    format!("detach failed: {error}"),
+                    format!(
+                        "Detach failed: {error}\nRun `/attachments` to see current attachment ids."
+                    ),
+                );
+            }
         },
         DispatchCommand::Compact { undo } => {
             if undo {
@@ -3032,9 +3055,15 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         ));
                     }
                     Ok(None) => {
-                        app.status = "no compaction checkpoint to undo".to_string();
+                        set_status_with_notice(
+                            app,
+                            "no compaction checkpoint to undo",
+                            "No context compaction checkpoint is available to undo.",
+                        );
                     }
-                    Err(error) => app.status = format!("compact undo failed: {error}"),
+                    Err(error) => {
+                        set_status_notice(app, format!("compact undo failed: {error}"));
+                    }
                 }
             } else {
                 match agent.compact_context_manual().await {
@@ -3058,16 +3087,26 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         )));
                     }
                     Ok(None) => {
-                        app.status = "nothing to compact yet".to_string();
+                        set_status_with_notice(
+                            app,
+                            "nothing to compact yet",
+                            "Nothing to compact yet; the current context is still below the compaction threshold.",
+                        );
                     }
-                    Err(error) => app.status = format!("compact failed: {error}"),
+                    Err(error) => {
+                        set_status_notice(app, format!("compact failed: {error}"));
+                    }
                 }
             }
         }
         DispatchCommand::Pins => {
             app.context_compaction = agent.context_compaction_snapshot().await;
             if app.context_compaction.pinned.is_empty() {
-                app.status = "no pinned context".to_string();
+                set_status_with_notice(
+                    app,
+                    "no pinned context",
+                    "No pinned context yet. Use `/pin selected` or `/pin last` to keep an important transcript item through compaction.",
+                );
             } else {
                 app.status = format!(
                     "{} pinned context item(s)",
@@ -3086,15 +3125,22 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         Ok(pin) => {
                             app.context_compaction = agent.context_compaction_snapshot().await;
                             app.status = format!("pinned {}", pin.id);
+                            app.push_log(format!("pinned context {}", pin.id));
                         }
-                        Err(error) => app.status = format!("pin failed: {error}"),
+                        Err(error) => {
+                            set_status_notice(app, format!("pin failed: {error}"));
+                        }
                     }
                 }
                 PinSourceResult::NoEntry => {
-                    app.status = "no transcript entry to pin".to_string();
+                    set_status_with_notice(
+                        app,
+                        "no transcript entry to pin",
+                        "No transcript entry is available to pin yet. Select a transcript row first, or run `/pin last` after there is something in the transcript.",
+                    );
                 }
                 PinSourceResult::UnknownTarget => {
-                    app.status = "usage: /pin selected|last".to_string();
+                    set_status_notice(app, "usage: /pin selected|last");
                 }
             }
         }
@@ -3102,8 +3148,15 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             Ok(pin) => {
                 app.context_compaction = agent.context_compaction_snapshot().await;
                 app.status = format!("unpinned {}", pin.id);
+                app.push_log(format!("unpinned context {}", pin.id));
             }
-            Err(error) => app.status = format!("unpin failed: {error}"),
+            Err(error) => {
+                set_status_with_notice(
+                    app,
+                    format!("unpin failed: {error}"),
+                    format!("Unpin failed: {error}\nRun `/pins` to see current pin ids."),
+                );
+            }
         },
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Cheap => {
@@ -3137,13 +3190,23 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         }
         DispatchCommand::Theme { theme: Some(theme) } => {
             let Some(parsed) = squeezy_core::normalize_tui_theme_name(&theme) else {
-                app.status = format!("unknown theme {theme:?}; expected a theme slug",);
+                set_status_with_notice(
+                    app,
+                    format!("unknown theme {theme:?}; expected a theme slug"),
+                    format!(
+                        "Unknown theme {theme:?}. Run `/theme` to open theme settings, or use one of: {}.",
+                        render::theme::available_theme_names(&agent.config_snapshot()).join(", ")
+                    ),
+                );
                 return;
             };
             if !render::theme::theme_exists(&agent.config_snapshot(), &parsed) {
-                app.status = format!(
-                    "unknown theme {theme:?}; available: {}",
-                    render::theme::available_theme_names(&agent.config_snapshot()).join(", ")
+                let available =
+                    render::theme::available_theme_names(&agent.config_snapshot()).join(", ");
+                set_status_with_notice(
+                    app,
+                    format!("unknown theme {theme:?}; available: {available}"),
+                    format!("Unknown theme {theme:?}. Available themes: {available}."),
                 );
                 return;
             }
@@ -3166,7 +3229,11 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Tasks => {
             sync_jobs_from_agent(app, agent);
             let body = format_tasks_list(app, agent);
-            app.status = format!("{} tasks", app.jobs.len());
+            app.status = if app.jobs.is_empty() {
+                "no background tasks".to_string()
+            } else {
+                format!("{} tasks", app.jobs.len())
+            };
             app.push_transcript_item(TranscriptItem::system(body));
         }
         DispatchCommand::Task { id } => {
@@ -3178,7 +3245,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Sessions => match agent.list_sessions(&SessionQuery::default()) {
             Ok(sessions) => {
                 app.status = format!("{} sessions", sessions.len());
-                app.push_transcript_item(TranscriptItem::system(
+                let body = if sessions.is_empty() {
+                    "No saved sessions found yet.".to_string()
+                } else {
                     sessions
                         .into_iter()
                         .take(10)
@@ -3195,10 +3264,11 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                             )
                         })
                         .collect::<Vec<_>>()
-                        .join("\n"),
-                ));
+                        .join("\n")
+                };
+                app.push_transcript_item(TranscriptItem::system(body));
             }
-            Err(error) => app.status = format!("session list failed: {error}"),
+            Err(error) => set_status_notice(app, format!("session list failed: {error}")),
         },
         DispatchCommand::Session { id } => match agent.show_session(&id) {
             Ok(record) => {
@@ -3218,7 +3288,15 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                     record.metadata.first_user_task.unwrap_or_default()
                 )));
             }
-            Err(error) => app.status = format!("session show failed: {error}"),
+            Err(error) => {
+                set_status_with_notice(
+                    app,
+                    format!("session show failed: {error}"),
+                    format!(
+                        "Session lookup failed: {error}\nRun `/sessions` to see recent session ids."
+                    ),
+                );
+            }
         },
         DispatchCommand::SessionRename { name } => {
             let parameter = if name.trim().is_empty() {
@@ -3243,7 +3321,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         )));
                     }
                 },
-                Err(error) => app.status = format!("rename failed: {error}"),
+                Err(error) => set_status_notice(app, format!("rename failed: {error}")),
             }
         }
         DispatchCommand::SessionLabel { name } => match agent.add_session_label(name.clone()) {
@@ -3260,10 +3338,10 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         metadata.session_id
                     )));
                 } else {
-                    app.status = format!("label #{name} already on session");
+                    set_status_notice(app, format!("label #{name} already on session"));
                 }
             }
-            Err(error) => app.status = format!("label failed: {error}"),
+            Err(error) => set_status_notice(app, format!("label failed: {error}")),
         },
         DispatchCommand::Fork => match agent.fork_current().await {
             Ok(new_id) => {
@@ -3278,12 +3356,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Resume { id } => switch_to_session(app, agent, &id).await,
         DispatchCommand::SessionExport { id } => match agent.export_session(&id) {
             Ok(value) => {
-                app.status = format!(
-                    "session export {} bytes",
-                    serde_json::to_string(&value).map_or(0, |text| text.len())
-                );
+                let bytes = serde_json::to_string(&value).map_or(0, |text| text.len());
+                app.status = format!("session export {} bytes", bytes);
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "Session export for `{id}` is ready ({bytes} bytes)."
+                )));
             }
-            Err(error) => app.status = format!("session export failed: {error}"),
+            Err(error) => set_status_notice(app, format!("session export failed: {error}")),
         },
         DispatchCommand::SessionExportHtml { id, path } => {
             let target = path
@@ -3304,8 +3383,15 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }) {
                 Ok(len) => {
                     app.status = format!("wrote {} ({} bytes)", target.display(), len);
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "Wrote session export HTML to {} ({} bytes).",
+                        target.display(),
+                        len
+                    )));
                 }
-                Err(error) => app.status = format!("session export html failed: {error}"),
+                Err(error) => {
+                    set_status_notice(app, format!("session export html failed: {error}"))
+                }
             }
         }
         DispatchCommand::SessionCleanup { args } => {
@@ -3330,18 +3416,15 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                         report.archived.len(),
                         report.removed.len()
                     );
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "Session cleanup complete: archived {} session(s), removed {} session(s).",
+                        report.archived.len(),
+                        report.removed.len()
+                    )));
                 }
-                Err(error) => app.status = format!("session cleanup failed: {error}"),
+                Err(error) => set_status_notice(app, format!("session cleanup failed: {error}")),
             }
         }
-        DispatchCommand::Copy { target } => match target.as_deref() {
-            None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
-            Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
-            // `DispatchCommand::parse` already rejects other values
-            // with `Usage`, but keep the arm for forward compatibility
-            // — a future variant of `/copy` would land here.
-            Some(_) => app.status = "usage: /copy [transcript]".to_string(),
-        },
         DispatchCommand::Checkpoints => {
             start_local_checkpoint_job(app, agent, "checkpoint_list", serde_json::json!({}))
         }
@@ -3365,7 +3448,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
 
 fn apply_task_detail(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
     let Some(id) = parse_job_id(raw_id) else {
-        app.status = "task id must be a number".to_string();
+        set_status_notice(app, "task id must be a number");
         return;
     };
     sync_jobs_from_agent(app, agent);
@@ -3379,20 +3462,31 @@ fn apply_task_detail(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
             app.status = format!("task {} {}", job.id, job.status.as_str());
             app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
         }
-        None => app.status = format!("task {id} not found"),
+        None => set_status_with_notice(
+            app,
+            format!("task {id} not found"),
+            format!("Task {id} was not found. Run `/tasks` to list background tasks."),
+        ),
     }
 }
 
 fn apply_task_cancel(app: &mut TuiApp, agent: &Agent, raw_id: &str) {
     let Some(id) = parse_job_id(raw_id) else {
-        app.status = "task id must be a number".to_string();
+        set_status_notice(app, "task id must be a number");
         return;
     };
     if agent.cancel_job(id) {
         app.status = format!("cancelling task {id}");
+        app.push_log(format!("cancelling task {id}"));
         sync_jobs_from_agent(app, agent);
     } else {
-        app.status = format!("task {id} not active");
+        set_status_with_notice(
+            app,
+            format!("task {id} not active"),
+            format!(
+                "Task {id} is not active or does not exist. Run `/tasks` to list background tasks."
+            ),
+        );
     }
 }
 
@@ -3409,6 +3503,7 @@ fn start_local_checkpoint_job(
     });
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
+    app.push_log(format!("started job {} {}", job.id, job.title));
 }
 
 /// Dispatch for `/plans [list|show|delete|set-active|open] [<id>]`.
@@ -3472,13 +3567,35 @@ fn plans_usage() -> String {
 /// caller can early-out. On success returns the canonical plan id.
 fn plans_resolve(app: &mut TuiApp, sid: &str, raw: Option<&str>) -> Option<String> {
     let Some(needle) = raw else {
-        app.status = "usage: /plans <subcommand> <id-or-prefix>".to_string();
+        set_status_with_notice(
+            app,
+            "usage: /plans <subcommand> <id-or-prefix>",
+            format!(
+                "Missing plan id.\n{}\n\nRun `/plans` to list saved plans in this session.",
+                plans_usage()
+            ),
+        );
         return None;
     };
     match proposed_plan::resolve_plan_prefix(&app.workspace_root, sid, needle) {
         Ok(plan_id) => Some(plan_id),
         Err(proposed_plan::PlanLookupError::NotFound) => {
-            app.status = format!("no plan matches `{needle}` in this session");
+            let entries = proposed_plan::list_plans(&app.workspace_root, sid);
+            let notice = if entries.is_empty() {
+                format!(
+                    "No plan matches `{needle}` because this session has no saved plans yet.\n\
+                     Plans are saved when Plan mode produces a completed `<proposed_plan>` block."
+                )
+            } else {
+                format!(
+                    "No plan matches `{needle}` in this session.\nRun `/plans` to list available plan ids."
+                )
+            };
+            set_status_with_notice(
+                app,
+                format!("no plan matches `{needle}` in this session"),
+                notice,
+            );
             None
         }
         Err(proposed_plan::PlanLookupError::Ambiguous(matches)) => {
@@ -3500,7 +3617,11 @@ fn plans_resolve(app: &mut TuiApp, sid: &str, raw: Option<&str>) -> Option<Strin
 fn render_plans_list(app: &mut TuiApp, sid: &str) {
     let entries = proposed_plan::list_plans(&app.workspace_root, sid);
     if entries.is_empty() {
-        app.status = "no plans persisted in this session".to_string();
+        set_status_with_notice(
+            app,
+            "no plans persisted in this session",
+            "No plans saved in this session yet.\nPlans are saved when Plan mode produces a completed `<proposed_plan>` block.",
+        );
         return;
     }
     app.status = format!("{} plan(s) in this session", entries.len());
@@ -3569,7 +3690,7 @@ fn plans_show(app: &mut TuiApp, sid: &str, plan_id: &str) {
                 body.trim_end()
             )));
         }
-        Err(err) => app.status = format!("plans show failed: {err}"),
+        Err(err) => set_status_notice(app, format!("plans show failed: {err}")),
     }
 }
 
@@ -3597,7 +3718,7 @@ fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) 
             app.status = format!("deleted plan {plan_id}");
             app.push_log(format!("plan {plan_id} deleted ({})", compact_path(&path)));
         }
-        Err(err) => app.status = format!("plans delete failed: {err}"),
+        Err(err) => set_status_notice(app, format!("plans delete failed: {err}")),
     }
 }
 
@@ -3608,7 +3729,7 @@ fn plans_set_active(app: &mut TuiApp, sid: &str, plan_id: &str) {
             app.status = format!("active plan → {plan_id}");
             app.push_log(format!("set active plan: {plan_id}"));
         }
-        Err(err) => app.status = format!("plans set-active failed: {err}"),
+        Err(err) => set_status_notice(app, format!("plans set-active failed: {err}")),
     }
 }
 
@@ -3656,7 +3777,11 @@ async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             discard_pending_feedback(app);
         }
         "" => {
-            app.status = "usage: /feedback <what happened>".to_string();
+            set_status_with_notice(
+                app,
+                "usage: /feedback <what happened>",
+                "Usage: `/feedback <what happened>` previews maintainer feedback before sending.",
+            );
         }
         message => match agent.prepare_feedback(message) {
             Ok(feedback) => {
@@ -3671,14 +3796,18 @@ async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                 app.status = "feedback ready: Enter send · Esc discard".to_string();
                 app.push_transcript_item(TranscriptItem::system(preview));
             }
-            Err(error) => app.status = format!("feedback preview failed: {error}"),
+            Err(error) => set_status_notice(app, format!("feedback preview failed: {error}")),
         },
     }
 }
 
 async fn submit_pending_feedback(app: &mut TuiApp, agent: &Agent) {
     let Some(feedback) = app.pending_feedback.take() else {
-        app.status = "no feedback pending".to_string();
+        set_status_with_notice(
+            app,
+            "no feedback pending",
+            "No feedback preview is pending. Run `/feedback <what happened>` first.",
+        );
         return;
     };
     match agent.submit_feedback(&feedback).await {
@@ -3691,7 +3820,7 @@ async fn submit_pending_feedback(app: &mut TuiApp, agent: &Agent) {
         }
         Err(error) => {
             app.pending_feedback = Some(feedback);
-            app.status = format!("feedback send failed: {error}");
+            set_status_notice(app, format!("feedback send failed: {error}"));
         }
     }
 }
@@ -3705,7 +3834,11 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     match rest {
         "send" => {
             let Some(report) = app.pending_report.take() else {
-                app.status = "no report pending".to_string();
+                set_status_with_notice(
+                    app,
+                    "no report pending",
+                    "No bug report preview is pending. Run `/report` first.",
+                );
                 return;
             };
             match agent.submit_bug_report(&report).await {
@@ -3718,7 +3851,7 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                 }
                 Err(error) => {
                     app.pending_report = Some(report);
-                    app.status = format!("report send failed: {error}");
+                    set_status_notice(app, format!("report send failed: {error}"));
                 }
             }
         }
@@ -3731,7 +3864,7 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                 match commands::parse_report_preview_args(agent, rest) {
                     Ok(value) => value,
                     Err(error) => {
-                        app.status = error;
+                        set_status_notice(app, error);
                         return;
                     }
                 };
@@ -3747,7 +3880,7 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                     app.status = "report preview ready".to_string();
                     app.push_transcript_item(TranscriptItem::system(preview));
                 }
-                Err(error) => app.status = format!("report preview failed: {error}"),
+                Err(error) => set_status_notice(app, format!("report preview failed: {error}")),
             }
         }
     }
@@ -3911,24 +4044,14 @@ fn sanitize_inline(text: &str) -> String {
     text.replace(['\n', '\r'], " ")
 }
 
-fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
-    let Some(text) = clipboard_text(app, target) else {
-        app.status = match target {
-            ClipboardTarget::LastAssistant => "nothing to copy yet".to_string(),
-            ClipboardTarget::Transcript => "transcript is empty".to_string(),
-        };
+fn copy_last_assistant_to_clipboard(app: &mut TuiApp) {
+    let Some(text) = last_assistant_clipboard_text(app) else {
+        app.status = "nothing to copy yet".to_string();
         return;
     };
     match app.clipboard.copy_text(&text) {
         Ok(()) => {
-            app.status = match target {
-                ClipboardTarget::LastAssistant => {
-                    format!("copied assistant message ({} chars)", text.chars().count())
-                }
-                ClipboardTarget::Transcript => {
-                    format!("copied transcript ({} chars)", text.chars().count())
-                }
-            };
+            app.status = format!("copied assistant message ({} chars)", text.chars().count());
         }
         Err(error) => {
             app.status = format!("copy failed: {error}");
@@ -3936,37 +4059,14 @@ fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
     }
 }
 
-fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
-    match target {
-        ClipboardTarget::LastAssistant => {
-            if !app.pending_assistant.trim_is_empty() {
-                return Some(app.pending_assistant.text());
-            }
-            app.transcript
-                .iter()
-                .rev()
-                .find_map(TranscriptEntry::assistant_content)
-        }
-        ClipboardTarget::Transcript => {
-            let text = transcript_plain_text(app);
-            if text.trim().is_empty() {
-                None
-            } else {
-                Some(text)
-            }
-        }
+fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
+    if !app.pending_assistant.trim_is_empty() {
+        return Some(app.pending_assistant.text());
     }
-}
-
-fn transcript_plain_text(app: &TuiApp) -> String {
-    let mut lines = Vec::new();
-    for item in &app.transcript {
-        lines.extend(item.plain_text_lines());
-    }
-    if !app.pending_assistant.is_empty() {
-        lines.push(format!("assistant: {}", app.pending_assistant.text()));
-    }
-    lines.join("\n")
+    app.transcript
+        .iter()
+        .rev()
+        .find_map(TranscriptEntry::assistant_content)
 }
 
 fn parse_response_verbosity(value: &str) -> Option<ResponseVerbosity> {
@@ -4010,8 +4110,10 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
         other => match squeezy_core::ReasoningEffort::parse(other) {
             Some(effort) => Some(effort),
             None => {
-                app.status =
-                    format!("unknown effort {raw:?}; expected low, medium, high, xhigh, or auto");
+                set_status_notice(
+                    app,
+                    format!("unknown effort {raw:?}; expected low, medium, high, xhigh, or auto"),
+                );
                 return;
             }
         },
@@ -4062,7 +4164,10 @@ fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
         "on" | "enable" | "enabled" | "true" | "1" => false,
         "off" | "disable" | "disabled" | "false" | "0" => true,
         _ => {
-            app.status = format!("unknown router state {raw:?}; expected on or off");
+            set_status_notice(
+                app,
+                format!("unknown router state {raw:?}; expected on or off"),
+            );
             return;
         }
     };
@@ -4090,8 +4195,10 @@ fn handle_slash_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Option<&st
         return;
     };
     let Some(verbosity) = parse_response_verbosity(raw) else {
-        app.status =
-            format!("unknown response verbosity {raw:?}; expected concise, normal, or verbose");
+        set_status_notice(
+            app,
+            format!("unknown response verbosity {raw:?}; expected concise, normal, or verbose"),
+        );
         return;
     };
     app.response_verbosity = verbosity;
@@ -4115,8 +4222,10 @@ fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Optio
         return;
     };
     let Some(verbosity) = parse_tool_output_verbosity(raw) else {
-        app.status =
-            format!("unknown tool output verbosity {raw:?}; expected compact, normal, or verbose");
+        set_status_notice(
+            app,
+            format!("unknown tool output verbosity {raw:?}; expected compact, normal, or verbose"),
+        );
         return;
     };
     app.tool_output_verbosity = verbosity;
@@ -7534,7 +7643,14 @@ fn format_message_entry_with_width(
     }
     if item.role == Role::System
         && !failed
-        && let Some(lines) = format_accounting_block_entry(selected, &item.content)
+        && let Some(lines) = format_ansi_system_entry(
+            selected,
+            "• ",
+            label_color,
+            action,
+            action_color,
+            &item.content,
+        )
     {
         return lines;
     }
@@ -7549,109 +7665,40 @@ fn format_message_entry_with_width(
     )
 }
 
-/// Render the `/cost` and `/context` outputs with per-token coloring:
-/// group words pop in `crate::render::theme::secondary()`, `key=` labels dim to `crate::render::theme::quiet()`, dollar values
-/// pop in `crate::render::theme::accent()`, and zero/dash/unknown values fade to `crate::render::theme::quiet()` so the
-/// real numbers carry the eye. Returns `None` for any system message that
-/// is not an accounting block — the caller falls through to the default
-/// single-style renderer.
-fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Line<'static>>> {
-    let mut iter = content.lines();
-    let header = iter.next()?;
-    if header != "Cost accounting" && header != "Context window" {
+/// Render system messages whose content embeds ANSI escape sequences
+/// (currently emitted by `/context` and `/cost` via `commands_style`).
+/// Plain-text system messages fall through to the default single-style
+/// renderer so the dozens of other `TranscriptItem::system` callers stay
+/// byte-identical.
+fn format_ansi_system_entry(
+    selected: bool,
+    label: &'static str,
+    label_color: Color,
+    action: &'static str,
+    action_color: Color,
+    content: &str,
+) -> Option<Vec<Line<'static>>> {
+    if !content.contains('\x1b') {
         return None;
     }
-    let header_span = Span::styled(
-        header.to_string(),
-        Style::default()
-            .fg(crate::render::theme::secondary())
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut lines = Vec::with_capacity(content.lines().count());
-    lines.push(action_line_spans(
+    let parsed = crate::render::ansi::ansi_to_text(content);
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(parsed.lines.len().max(1));
+    let mut iter = parsed.lines.into_iter();
+    let first = iter.next().unwrap_or_else(|| Line::from(""));
+    out.push(action_line_spans(
         selected,
-        "• ",
-        crate::render::theme::secondary(),
-        "Noted",
-        crate::render::theme::secondary(),
-        vec![header_span],
+        label,
+        label_color,
+        action,
+        action_color,
+        first.spans,
     ));
-    for body in iter {
+    for line in iter {
         let mut spans = vec![Span::raw("  ")];
-        spans.extend(accounting_body_spans(body));
-        lines.push(Line::from(spans));
+        spans.extend(line.spans);
+        out.push(Line::from(spans));
     }
-    Some(lines)
-}
-
-fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
-    // Sentences without any `key=value` token are dimmed wholesale (the
-    // accuracy epilogue, the `provider_stored_context=...` narrative line).
-    if !line.contains('=') || line.starts_with("accuracy=") {
-        return vec![Span::styled(
-            line.to_string(),
-            Style::default().fg(crate::render::theme::quiet()),
-        )];
-    }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut first_token = true;
-    for token in line.split_inclusive(' ') {
-        let (text, trailing) = if let Some(stripped) = token.strip_suffix(' ') {
-            (stripped, " ")
-        } else {
-            (token, "")
-        };
-        if let Some(eq_idx) = text.find('=') {
-            let (key, rest) = text.split_at(eq_idx);
-            let value = &rest[1..];
-            spans.push(Span::styled(
-                format!("{key}="),
-                Style::default().fg(crate::render::theme::quiet()),
-            ));
-            spans.push(Span::styled(
-                value.to_string(),
-                accounting_value_style(value),
-            ));
-        } else {
-            // A bare word — the leading group label (`tools`,
-            // `subagents`, `transmitted_request`, …) or a trailing
-            // parenthetical like `(estimated from ...)`.
-            let style = if first_token {
-                Style::default().fg(crate::render::theme::secondary())
-            } else {
-                Style::default().fg(crate::render::theme::quiet())
-            };
-            spans.push(Span::styled(text.to_string(), style));
-        }
-        if !trailing.is_empty() {
-            spans.push(Span::raw(trailing));
-        }
-        first_token = false;
-    }
-    spans
-}
-
-fn accounting_value_style(value: &str) -> Style {
-    if value.is_empty() {
-        return Style::default().fg(crate::render::theme::quiet());
-    }
-    if value.starts_with('$') {
-        return Style::default().fg(crate::render::theme::accent());
-    }
-    // Values that signal absence/zero fade so the eye lands on the real
-    // numbers. Percent strings like `0.00%` count as zero too.
-    let is_zero_percent = value
-        .strip_suffix('%')
-        .and_then(|prefix| prefix.parse::<f64>().ok())
-        .is_some_and(|value| value == 0.0);
-    if matches!(
-        value,
-        "-" | "0" | "unknown" | "inactive" | "absent" | "false"
-    ) || is_zero_percent
-    {
-        return Style::default().fg(crate::render::theme::quiet());
-    }
-    Style::default()
+    Some(out)
 }
 
 fn format_user_prompt_entry(
@@ -11552,7 +11599,7 @@ fn composer_bubble_lines(
 }
 
 fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let suggestions = input::slash_suggestions_at(&app.input, app.input_cursor);
+    let suggestions = input::slash_suggestions_for_app(app);
     let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index);
     let command_width = visible
         .iter()
@@ -12368,12 +12415,6 @@ fn role_label(role: &Role) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ClipboardTarget {
-    LastAssistant,
-    Transcript,
-}
-
 pub(crate) trait Clipboard: Send {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String>;
 }
@@ -12767,6 +12808,7 @@ pub(crate) struct TuiApp {
     /// nudge can fire again on the next approach to the threshold.
     pub(crate) context_compaction_nudge_shown: bool,
     pub(crate) context_estimate: ContextEstimate,
+    pub(crate) checkpoints_enabled: bool,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) selected_entry: Option<usize>,
     pub(crate) next_entry_id: u64,
@@ -12898,7 +12940,8 @@ pub(crate) struct TuiApp {
     pub(crate) cancelled_prompt: Option<String>,
     /// True when the in-flight turn has already produced a successful
     /// edit-capable tool call (apply_patch / write_file). Used to surface
-    /// `/diff` and `/undo` hints at end-of-turn (success or failure).
+    /// `/diff` and, when checkpointing is enabled, `/undo` hints at
+    /// end-of-turn (success or failure).
     pub(crate) last_turn_had_edits: bool,
     pub(crate) mcp_elicitation_selection_index: usize,
     pub(crate) pending_feedback: Option<PreparedFeedback>,
@@ -13205,6 +13248,7 @@ impl TuiApp {
             context_compaction_threshold: config.context_compaction.estimated_tokens,
             context_compaction_nudge_shown: false,
             context_estimate: ContextEstimate::default(),
+            checkpoints_enabled: config.checkpoints_enabled,
             transcript,
             selected_entry: None,
             next_entry_id,
@@ -13318,6 +13362,7 @@ impl TuiApp {
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
         self.context_compaction_threshold = config.context_compaction.estimated_tokens;
+        self.checkpoints_enabled = config.checkpoints_enabled;
         self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
         self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
         self.status_line_use_colors = config.tui.status_line_use_colors;
@@ -13778,36 +13823,6 @@ impl TranscriptEntry {
             // collapsed shape, and Ctrl-E still toggles it either way.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
-        }
-    }
-
-    fn plain_text_lines(&self) -> Vec<String> {
-        match &self.kind {
-            TranscriptEntryKind::Message(item) => {
-                vec![format!("{}: {}", role_label(&item.role), item.content)]
-            }
-            TranscriptEntryKind::ToolResult(tool) => {
-                vec![format!("tool result: {}", tool_result_summary(tool))]
-            }
-            TranscriptEntryKind::Log(entry) => vec![format!("log: {}", entry.message)],
-            TranscriptEntryKind::PlanCard(data) => {
-                let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
-                vec![format!("plan {}\n{body}", data.plan_id)]
-            }
-            TranscriptEntryKind::Diff(data) => {
-                vec![format!("diff ({})\n{}", data.summary, data.plain)]
-            }
-            TranscriptEntryKind::Reasoning(snapshot) => {
-                vec![format!("reasoning: {}", snapshot.display_text)]
-            }
-            TranscriptEntryKind::SlashEcho(data) => {
-                let body = if data.args.is_empty() {
-                    data.cmd.clone()
-                } else {
-                    format!("{} {}", data.cmd, data.args)
-                };
-                vec![format!("slash: {body}")]
-            }
         }
     }
 
