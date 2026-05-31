@@ -177,7 +177,6 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<path>",
         &[PermissionCapability::Read],
     ),
-    slash("/copy", "copy last answer or transcript"),
     // `/compact` triggers a summarisation turn against the model.
     SlashCommand {
         name: "/compact",
@@ -343,6 +342,14 @@ impl SlashCommand {
 
     pub(crate) fn supports_inline_use(&self) -> bool {
         matches!(self.name, "/attach" | "/help" | "/plan" | "/build")
+    }
+
+    pub(crate) fn visible_with_checkpoints(&self, checkpoints_enabled: bool) -> bool {
+        checkpoints_enabled
+            || !matches!(
+                self.name,
+                "/checkpoints" | "/checkpoint" | "/undo" | "/revert-turn"
+            )
     }
 
     /// Short label used in the slash menu badge, e.g. `net`, `read`, `edit`.
@@ -903,6 +910,13 @@ pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashComma
     scored.into_iter().map(|(cmd, _)| cmd).collect()
 }
 
+pub(crate) fn slash_suggestions_for_app(app: &TuiApp) -> Vec<SlashCommand> {
+    slash_suggestions_at(&app.input, app.input_cursor)
+        .into_iter()
+        .filter(|command| command.visible_with_checkpoints(app.checkpoints_enabled))
+        .collect()
+}
+
 fn slash_completion_context(input: &str, cursor: usize) -> Option<SlashCompletionContext> {
     let cursor = text_cursor(input, cursor);
     let (start, end) = token_bounds_at_cursor(input, cursor);
@@ -984,7 +998,7 @@ fn slash_command_occurrences(input: &str) -> Vec<SlashCommandOccurrence> {
 }
 
 pub(crate) fn clamp_slash_menu_index(app: &mut TuiApp) {
-    let count = slash_suggestions_at(&app.input, app.input_cursor).len();
+    let count = slash_suggestions_for_app(app).len();
     if count == 0 {
         app.slash_menu_index = 0;
     } else if app.slash_menu_index >= count {
@@ -993,7 +1007,7 @@ pub(crate) fn clamp_slash_menu_index(app: &mut TuiApp) {
 }
 
 pub(crate) fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) -> bool {
-    let count = slash_suggestions_at(&app.input, app.input_cursor).len();
+    let count = slash_suggestions_for_app(app).len();
     if count == 0 {
         return false;
     }
@@ -1014,7 +1028,7 @@ pub(crate) fn complete_selected_slash_command(app: &mut TuiApp) -> bool {
     let Some(context) = slash_completion_context(&app.input, app.input_cursor) else {
         return false;
     };
-    let suggestions = slash_suggestions_at(&app.input, app.input_cursor);
+    let suggestions = slash_suggestions_for_app(app);
     if suggestions.is_empty() {
         return false;
     }

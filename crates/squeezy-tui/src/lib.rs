@@ -2439,7 +2439,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
-            copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+            copy_last_assistant_to_clipboard(app);
             true
         }
         keymap::Action::RestoreCancelledPrompt => {
@@ -2705,9 +2705,7 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/copy" | "/help" => {
-            false
-        }
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/help" => false,
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -3335,14 +3333,6 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 Err(error) => app.status = format!("session cleanup failed: {error}"),
             }
         }
-        DispatchCommand::Copy { target } => match target.as_deref() {
-            None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
-            Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
-            // `DispatchCommand::parse` already rejects other values
-            // with `Usage`, but keep the arm for forward compatibility
-            // — a future variant of `/copy` would land here.
-            Some(_) => app.status = "usage: /copy [transcript]".to_string(),
-        },
         DispatchCommand::Checkpoints => {
             start_local_checkpoint_job(app, agent, "checkpoint_list", serde_json::json!({}))
         }
@@ -3912,24 +3902,14 @@ fn sanitize_inline(text: &str) -> String {
     text.replace(['\n', '\r'], " ")
 }
 
-fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
-    let Some(text) = clipboard_text(app, target) else {
-        app.status = match target {
-            ClipboardTarget::LastAssistant => "nothing to copy yet".to_string(),
-            ClipboardTarget::Transcript => "transcript is empty".to_string(),
-        };
+fn copy_last_assistant_to_clipboard(app: &mut TuiApp) {
+    let Some(text) = last_assistant_clipboard_text(app) else {
+        app.status = "nothing to copy yet".to_string();
         return;
     };
     match app.clipboard.copy_text(&text) {
         Ok(()) => {
-            app.status = match target {
-                ClipboardTarget::LastAssistant => {
-                    format!("copied assistant message ({} chars)", text.chars().count())
-                }
-                ClipboardTarget::Transcript => {
-                    format!("copied transcript ({} chars)", text.chars().count())
-                }
-            };
+            app.status = format!("copied assistant message ({} chars)", text.chars().count());
         }
         Err(error) => {
             app.status = format!("copy failed: {error}");
@@ -3937,37 +3917,14 @@ fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
     }
 }
 
-fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
-    match target {
-        ClipboardTarget::LastAssistant => {
-            if !app.pending_assistant.trim_is_empty() {
-                return Some(app.pending_assistant.text());
-            }
-            app.transcript
-                .iter()
-                .rev()
-                .find_map(TranscriptEntry::assistant_content)
-        }
-        ClipboardTarget::Transcript => {
-            let text = transcript_plain_text(app);
-            if text.trim().is_empty() {
-                None
-            } else {
-                Some(text)
-            }
-        }
+fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
+    if !app.pending_assistant.trim_is_empty() {
+        return Some(app.pending_assistant.text());
     }
-}
-
-fn transcript_plain_text(app: &TuiApp) -> String {
-    let mut lines = Vec::new();
-    for item in &app.transcript {
-        lines.extend(item.plain_text_lines());
-    }
-    if !app.pending_assistant.is_empty() {
-        lines.push(format!("assistant: {}", app.pending_assistant.text()));
-    }
-    lines.join("\n")
+    app.transcript
+        .iter()
+        .rev()
+        .find_map(TranscriptEntry::assistant_content)
 }
 
 fn parse_response_verbosity(value: &str) -> Option<ResponseVerbosity> {
@@ -11491,7 +11448,7 @@ fn composer_bubble_lines(
 }
 
 fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let suggestions = input::slash_suggestions_at(&app.input, app.input_cursor);
+    let suggestions = input::slash_suggestions_for_app(app);
     let visible = visible_slash_suggestions(&suggestions, app.slash_menu_index);
     let command_width = visible
         .iter()
@@ -12307,12 +12264,6 @@ fn role_label(role: &Role) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ClipboardTarget {
-    LastAssistant,
-    Transcript,
-}
-
 pub(crate) trait Clipboard: Send {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String>;
 }
@@ -12706,6 +12657,7 @@ pub(crate) struct TuiApp {
     /// nudge can fire again on the next approach to the threshold.
     pub(crate) context_compaction_nudge_shown: bool,
     pub(crate) context_estimate: ContextEstimate,
+    pub(crate) checkpoints_enabled: bool,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) selected_entry: Option<usize>,
     pub(crate) next_entry_id: u64,
@@ -12837,7 +12789,8 @@ pub(crate) struct TuiApp {
     pub(crate) cancelled_prompt: Option<String>,
     /// True when the in-flight turn has already produced a successful
     /// edit-capable tool call (apply_patch / write_file). Used to surface
-    /// `/diff` and `/undo` hints at end-of-turn (success or failure).
+    /// `/diff` and, when checkpointing is enabled, `/undo` hints at
+    /// end-of-turn (success or failure).
     pub(crate) last_turn_had_edits: bool,
     pub(crate) mcp_elicitation_selection_index: usize,
     pub(crate) pending_feedback: Option<PreparedFeedback>,
@@ -13144,6 +13097,7 @@ impl TuiApp {
             context_compaction_threshold: config.context_compaction.estimated_tokens,
             context_compaction_nudge_shown: false,
             context_estimate: ContextEstimate::default(),
+            checkpoints_enabled: config.checkpoints_enabled,
             transcript,
             selected_entry: None,
             next_entry_id,
@@ -13257,6 +13211,7 @@ impl TuiApp {
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
         self.context_compaction_threshold = config.context_compaction.estimated_tokens;
+        self.checkpoints_enabled = config.checkpoints_enabled;
         self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
         self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
         self.status_line_use_colors = config.tui.status_line_use_colors;
@@ -13717,36 +13672,6 @@ impl TranscriptEntry {
             // collapsed shape, and Ctrl-E still toggles it either way.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
-        }
-    }
-
-    fn plain_text_lines(&self) -> Vec<String> {
-        match &self.kind {
-            TranscriptEntryKind::Message(item) => {
-                vec![format!("{}: {}", role_label(&item.role), item.content)]
-            }
-            TranscriptEntryKind::ToolResult(tool) => {
-                vec![format!("tool result: {}", tool_result_summary(tool))]
-            }
-            TranscriptEntryKind::Log(entry) => vec![format!("log: {}", entry.message)],
-            TranscriptEntryKind::PlanCard(data) => {
-                let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
-                vec![format!("plan {}\n{body}", data.plan_id)]
-            }
-            TranscriptEntryKind::Diff(data) => {
-                vec![format!("diff ({})\n{}", data.summary, data.plain)]
-            }
-            TranscriptEntryKind::Reasoning(snapshot) => {
-                vec![format!("reasoning: {}", snapshot.display_text)]
-            }
-            TranscriptEntryKind::SlashEcho(data) => {
-                let body = if data.args.is_empty() {
-                    data.cmd.clone()
-                } else {
-                    format!("{} {}", data.cmd, data.args)
-                };
-                vec![format!("slash: {body}")]
-            }
         }
     }
 

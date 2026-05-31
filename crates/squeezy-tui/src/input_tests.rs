@@ -130,7 +130,6 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
         "/pins",
         "/pin",
         "/unpin",
-        "/copy",
         "/plan",
         "/build",
     ] {
@@ -146,6 +145,43 @@ fn purely_informational_slash_commands_declare_no_capabilities() {
 fn legacy_attachment_commands_are_hidden_from_slash_menu() {
     assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/attachments"));
     assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/detach"));
+}
+
+#[test]
+fn copy_is_hidden_from_slash_menu() {
+    assert!(!SLASH_COMMANDS.iter().any(|cmd| cmd.name == "/copy"));
+}
+
+#[test]
+fn checkpoint_commands_hide_when_checkpointing_is_disabled() {
+    let names = slash_suggestions("/")
+        .into_iter()
+        .filter(|cmd| cmd.visible_with_checkpoints(false))
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            !names.contains(&checkpoint_command),
+            "{checkpoint_command} should be hidden when checkpointing is disabled"
+        );
+    }
+}
+
+#[test]
+fn checkpoint_commands_show_when_checkpointing_is_enabled() {
+    let names = slash_suggestions("/")
+        .into_iter()
+        .filter(|cmd| cmd.visible_with_checkpoints(true))
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should be visible when checkpointing is enabled"
+        );
+    }
 }
 
 #[test]
@@ -202,20 +238,20 @@ fn slash_suggestions_match_substring_not_just_prefix() {
 
 #[test]
 fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
-    // `/co` should list prefix matches (`/config`, `/cost`, `/copy`,
-    // `/compact`, `/context`) before subsequence-only hits.
+    // `/co` should list prefix matches (`/config`, `/cost`, `/compact`,
+    // `/context`) before subsequence-only hits.
     // `/options` is a hidden compatibility alias, so it must not duplicate
     // the visible settings command in the menu.
     let names = slash_suggestions("/co")
         .into_iter()
         .map(|cmd| cmd.name)
         .collect::<Vec<_>>();
-    let first_five: Vec<&str> = names.iter().take(5).copied().collect();
-    let mut expected = vec!["/compact", "/config", "/context", "/copy", "/cost"];
+    let first_four: Vec<&str> = names.iter().take(4).copied().collect();
+    let mut expected = vec!["/compact", "/config", "/context", "/cost"];
     expected.sort();
-    let mut got = first_five.clone();
+    let mut got = first_four.clone();
     got.sort();
-    assert_eq!(got, expected, "first five should be /co* prefix hits");
+    assert_eq!(got, expected, "first four should be /co* prefix hits");
     assert!(
         !names.contains(&"/options"),
         "/options should not be suggested alongside /config"

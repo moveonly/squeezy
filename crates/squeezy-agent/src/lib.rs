@@ -2879,8 +2879,8 @@ impl Agent {
             }
             // `/fork`, `/resume`, `/session-export-html`, `/session-cleanup`,
             // `/pin`, `/checkpoint*`, `/revert-turn` require &mut
-            // self or interact with TUI-owned state (clipboard, transcript
-            // selection, vcs background job). The TUI keeps running those
+            // self or interact with TUI-owned state (transcript selection,
+            // vcs background job). The TUI keeps running those
             // through its existing helpers; the agent dispatch records the
             // typed entry point via `TuiOnly` so RPC drivers still see the
             // command they invoked.
@@ -2896,7 +2896,6 @@ impl Agent {
             | DispatchCommand::Config { .. }
             | DispatchCommand::Model
             | DispatchCommand::Plans { .. }
-            | DispatchCommand::Copy { .. }
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }

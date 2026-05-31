@@ -335,10 +335,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_estimate = context_estimate;
                     app.cancelled_prompt = None;
                     if app.last_turn_had_edits {
-                        app.push_status(
-                            "turn complete · /diff to inspect changes · /undo to revert this turn"
-                                .to_string(),
-                        );
+                        app.push_status(format!("turn complete · {}", edit_recovery_hint(app)));
                         app.last_turn_had_edits = false;
                     }
                     maybe_push_context_compaction_nudge(app);
@@ -409,15 +406,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::Cancelled { .. } => {
                     let mut message = "cancelled; edit prompt or retry".to_string();
                     if app.last_turn_had_edits {
-                        message.push_str(" · /undo to revert this turn's edits");
+                        append_edit_recovery_hint(&mut message, app);
                     }
                     app.status = message;
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_warn("turn cancelled".to_string());
                     if app.last_turn_had_edits {
-                        app.push_log(
-                            "/diff to inspect changes · /undo to revert this turn".to_string(),
-                        );
+                        app.push_log(edit_recovery_hint(app).to_string());
                         app.last_turn_had_edits = false;
                     }
                     app.pending_assistant.clear();
@@ -442,7 +437,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::Failed { error, .. } => {
                     let mut status = format_error_status(&error);
                     if app.last_turn_had_edits {
-                        status.push_str(" · /undo to revert this turn's edits");
+                        append_edit_recovery_hint(&mut status, app);
                     }
                     app.status = status;
                     app.turn_visual = TurnVisualState::Failed;
@@ -634,6 +629,19 @@ pub(crate) fn drain_plan_housekeeping(app: &mut TuiApp) {
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
     }
+}
+
+fn edit_recovery_hint(app: &TuiApp) -> &'static str {
+    if app.checkpoints_enabled {
+        "/diff to inspect changes · /undo to revert this turn"
+    } else {
+        "/diff to inspect changes"
+    }
+}
+
+fn append_edit_recovery_hint(message: &mut String, app: &TuiApp) {
+    message.push_str(" · ");
+    message.push_str(edit_recovery_hint(app));
 }
 
 pub(crate) fn apply_job_update(app: &mut TuiApp, job: JobSnapshot) {

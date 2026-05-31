@@ -2966,7 +2966,7 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
 
-    let suggestions = input::slash_suggestions(&app.input);
+    let suggestions = input::slash_suggestions_for_app(&app);
     let names = suggestions
         .iter()
         .map(|command| command.name)
@@ -3054,6 +3054,37 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         suggestions.len() - 1,
         "Up from 0 should wrap to last"
     );
+}
+
+#[test]
+fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/".to_string());
+    let names = input::slash_suggestions_for_app(&app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            !names.contains(&checkpoint_command),
+            "{checkpoint_command} should not be suggested while checkpointing is disabled"
+        );
+    }
+
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut enabled_app = test_app_with_config(&config, SessionMode::Build);
+    set_input(&mut enabled_app, "/".to_string());
+    let names = input::slash_suggestions_for_app(&enabled_app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        assert!(
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should be suggested while checkpointing is enabled"
+        );
+    }
 }
 
 #[test]
@@ -6814,28 +6845,6 @@ async fn ctrl_y_copies_last_assistant_message() {
 }
 
 #[tokio::test]
-async fn slash_copy_transcript_copies_plain_text_transcript() {
-    let mut agent = test_agent(SessionMode::Build);
-    let writes = Arc::new(StdMutex::new(Vec::new()));
-    let mut app = test_app_with_clipboard(
-        SessionMode::Build,
-        Box::new(RecordingClipboard {
-            writes: writes.clone(),
-            error: None,
-        }),
-    );
-    app.push_transcript_item(TranscriptItem::user("hello"));
-    app.push_transcript_item(TranscriptItem::assistant("answer"));
-
-    assert!(handle_slash_command(&mut app, &mut agent, "/copy transcript").await);
-    assert_eq!(
-        writes.lock().unwrap().as_slice(),
-        ["user: hello\nassistant: answer"]
-    );
-    assert!(app.status.contains("copied transcript"), "{}", app.status);
-}
-
-#[tokio::test]
 async fn slash_pin_pins_and_unpins_transcript_context() {
     let root = temp_workspace("pin_context");
     let config = test_config_with_root(SessionMode::Build, root.clone());
@@ -7178,7 +7187,9 @@ fn base64_encoder_supports_osc52_payloads() {
 
 #[tokio::test]
 async fn successful_edit_turn_pushes_diff_undo_hint() {
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
 
@@ -7220,6 +7231,47 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
     assert!(
         !app.last_turn_had_edits,
         "flag must reset after the hint fires"
+    );
+}
+
+#[tokio::test]
+async fn successful_edit_turn_hides_undo_hint_when_checkpointing_disabled() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("apply_patch", "patched ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("/diff") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    let hint = hint.expect("successful edit turn must push a /diff hint");
+    assert!(
+        !hint.contains("/undo"),
+        "checkpointing disabled should hide /undo hint: {hint}"
     );
 }
 
@@ -7321,7 +7373,9 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
 
 #[tokio::test]
 async fn failed_edit_turn_error_status_mentions_undo() {
-    let mut app = test_app(SessionMode::Build);
+    let mut config = test_config(SessionMode::Build);
+    config.checkpoints_enabled = true;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
 
