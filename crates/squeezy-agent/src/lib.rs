@@ -7381,7 +7381,44 @@ async fn run_subagent_dispatch(
     // stream, nested tool calls, and any sub-subagents — a real
     // cancellation tree instead of a flat sibling list under the turn.
     let child_context = context.with_cancel(child_cancel.clone());
-    let execution = run_subagent(&child_context, kind, request).await;
+    // Emit `ToolProgress` heartbeats from the parent's perspective while
+    // the subagent body runs. The subagent's first model round (just
+    // reasoning, no tool calls yet) is otherwise invisible to the
+    // parent's per-event timeout: `run_subagent`'s drain task only
+    // forwards inner `ToolProgress` events, which fire only once the
+    // subagent itself launches a tool. On a no-graph variant where the
+    // subagent's allowed-tool set is whittled down to glob/grep/read_file
+    // and the model spends >60s reasoning about how to substitute for
+    // the missing graph tools, the eval driver's 60s `event_timeout`
+    // expires and the whole turn is abandoned with $0 cost. Tick at the
+    // same `TOOL_PROGRESS_INTERVAL` as a regular tool call so consumers
+    // see the explore call behaving like any other long-running tool.
+    let subagent_started = Instant::now();
+    let progress_call_id = call.call_id.clone();
+    let progress_tool_name = call.name.clone();
+    let progress_tx = context.tx.clone();
+    let progress_turn_id = context.turn_id;
+    let subagent_future = run_subagent(&child_context, kind, request);
+    tokio::pin!(subagent_future);
+    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+    // `interval` fires immediately on first poll; skip that tick so the
+    // heartbeat only fires once the subagent has actually been running.
+    progress_ticker.tick().await;
+    let execution = loop {
+        tokio::select! {
+            execution = &mut subagent_future => break execution,
+            _ = progress_ticker.tick() => {
+                let _ = progress_tx
+                    .send(AgentEvent::ToolProgress {
+                        turn_id: progress_turn_id,
+                        call_id: progress_call_id.clone(),
+                        tool_name: progress_tool_name.clone(),
+                        elapsed_ms: subagent_started.elapsed().as_millis() as u64,
+                    })
+                    .await;
+            }
+        }
+    };
     drop(lease);
     if let Some(registry) = context.hooks.as_ref() {
         dispatch_subagent_stop(

@@ -8158,6 +8158,195 @@ async fn switch_session_allow_hook_proceeds_to_resume_current() {
     );
 }
 
+// Verifies that a long-running subagent body emits `AgentEvent::ToolProgress`
+// heartbeats on the parent's event channel even before the subagent fires
+// its first inner tool call.
+//
+// Regression for the no-graph `explore` deadlock: when `excluded_tools`
+// strips the subagent's graph-tool whitelist down to glob/grep/read_file,
+// the subagent's first model round can spend tens of seconds reasoning
+// about how to substitute for the missing tools. The drain task in
+// `run_subagent` only forwards `ToolProgress` events from inside the
+// subagent (and those only fire while an inner tool is running), so the
+// parent's per-event timeout (60s in the eval driver) would expire with
+// nothing but a `SubagentStarted` line in the trace, abandoning the turn
+// with $0 cost. The fix wraps the `run_subagent` await in a per-tick
+// progress emitter on the parent's `tx`, mirroring the per-tool ticker
+// used elsewhere, so the explore call looks like any other long-running
+// tool from the parent's perspective.
+#[tokio::test]
+async fn explore_subagent_emits_tool_progress_heartbeats_during_slow_first_round() {
+    use std::task::{Context as TaskContext, Poll};
+
+    // Custom stream that returns `Pending` until the configured delay
+    // elapses, then yields its queued events one by one.
+    struct DelayedStream {
+        delay: Option<Pin<Box<tokio::time::Sleep>>>,
+        events: VecDeque<Result<LlmEvent>>,
+    }
+
+    impl Stream for DelayedStream {
+        type Item = Result<LlmEvent>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(sleep) = self.delay.as_mut() {
+                match sleep.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(()) => {
+                        self.delay = None;
+                    }
+                }
+            }
+            match self.events.pop_front() {
+                Some(event) => Poll::Ready(Some(event)),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    struct DelayedSubagentProvider {
+        responses: Mutex<VecDeque<(Duration, Vec<Result<LlmEvent>>)>>,
+    }
+
+    impl LlmProvider for DelayedSubagentProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+            let (delay, events) = self
+                .responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .unwrap_or((Duration::from_millis(0), Vec::new()));
+            let sleep = if delay.is_zero() {
+                None
+            } else {
+                Some(Box::pin(tokio::time::sleep(delay)))
+            };
+            Box::pin(DelayedStream {
+                delay: sleep,
+                events: events.into(),
+            })
+        }
+    }
+
+    // Parent round 1: model immediately calls `explore`.
+    // Subagent round 1: sleeps ~1.6s before yielding any event, then
+    // returns a one-line text answer. The sleep is long enough to cross
+    // the 1s `TOOL_PROGRESS_INTERVAL` so we observe at least one
+    // heartbeat tick from the parent-side progress emitter.
+    // Parent round 2: closes the turn.
+    let responses = VecDeque::from(vec![
+        (
+            Duration::from_millis(0),
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_explore_heartbeat".to_string(),
+                    name: "explore".to_string(),
+                    arguments: json!({"prompt": "investigate slow subagent heartbeat path"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_heartbeat_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ),
+        (
+            Duration::from_millis(1600),
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ok".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_sub_heartbeat_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ),
+        (
+            Duration::from_millis(0),
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_heartbeat_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ),
+    ]);
+    let provider = Arc::new(DelayedSubagentProvider {
+        responses: Mutex::new(responses),
+    });
+
+    let root = temp_workspace("explore_subagent_heartbeat");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn(
+        "trigger an explore subagent".to_string(),
+        CancellationToken::new(),
+    );
+    let mut subagent_started = false;
+    let mut subagent_completed = false;
+    let mut explore_progress_count: u32 = 0;
+    while let Some(event) = rx.recv().await {
+        match &event {
+            AgentEvent::SubagentStarted { agent, .. } if agent == "explore" => {
+                subagent_started = true;
+            }
+            AgentEvent::ToolProgress {
+                tool_name, call_id, ..
+            } if tool_name == "explore" && call_id == "call_explore_heartbeat" => {
+                // Only count heartbeats that fire after the SubagentStarted
+                // line so we are measuring the parent-side ticker, not a
+                // pre-start emission.
+                if subagent_started {
+                    explore_progress_count += 1;
+                }
+            }
+            AgentEvent::SubagentCompleted { agent, .. } if agent == "explore" => {
+                subagent_completed = true;
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        subagent_started,
+        "explore subagent must have emitted SubagentStarted"
+    );
+    assert!(
+        subagent_completed,
+        "explore subagent must have emitted SubagentCompleted"
+    );
+    assert!(
+        explore_progress_count >= 1,
+        "parent must receive at least one ToolProgress heartbeat \
+         tagged with tool_name=explore between SubagentStarted and \
+         SubagentCompleted so the eval driver's 60s event_timeout \
+         does not abandon a subagent whose first model round is \
+         silent; got {explore_progress_count}",
+    );
+}
+
 #[tokio::test]
 async fn switch_session_deny_hook_aborts_before_resume_current() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
