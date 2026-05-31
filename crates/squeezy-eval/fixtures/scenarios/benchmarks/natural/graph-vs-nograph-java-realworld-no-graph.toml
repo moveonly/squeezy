@@ -1,14 +1,15 @@
 id = "graph-vs-nograph-java-realworld-no-graph"
-title = "google/gson TypeAdapter<T> override audit — no graph (openai mini)"
+title = "google/gson TypeAdapter<T> subclass + first construction site — no graph (openai mini)"
 description = """
 No-graph half of the real-world Java audit A/B. Same prompt and model
 as `graph-vs-nograph-java-realworld-with-graph.toml` but the entire
 semantic graph tool family is excluded. The model has to fall back to
-`grep` / `glob` / `read_file` to (a) enumerate direct subclasses,
-filtering anonymous + Javadoc + indirect (`SerializationDelegatingTypeAdapter`)
-candidates by hand, and then (b) read each candidate to classify
-nested vs top-level, abstract vs concrete, and check for `read` /
-`write` overrides.
+`grep` / `glob` / `read_file` to (a) enumerate direct `TypeAdapter`
+subclasses, filtering anonymous + Javadoc + indirect
+(`SerializationDelegatingTypeAdapter`) candidates by hand, and then
+(b) per class, grep for `new <Class>(` across the whole subtree to
+find the first cross-file construction site — many adapters are
+declared in one file and instantiated in a different factory file.
 """
 
 [workspace.github]
@@ -52,7 +53,9 @@ kind = "prompt"
 text = """
 Audit every named (non-anonymous) Java class declared under
 `gson/src/main/java/` that **directly extends
-`com.google.gson.TypeAdapter<T>`** (for any concrete or bounded `T`).
+`com.google.gson.TypeAdapter<T>`** (for any concrete or bounded `T`),
+and pair each with the first production call site that constructs
+an instance.
 
 Scope:
 - ONLY look at paths under `gson/src/main/java/`. Skip `proto/`,
@@ -70,23 +73,22 @@ Exclude:
   intermediate base (e.g. classes that extend
   `SerializationDelegatingTypeAdapter<T>` rather than `TypeAdapter<T>`
   directly).
-- Occurrences inside Javadoc `/** ... */` block comments (these are
-  documentation examples, not real declarations).
+- Occurrences inside Javadoc `/** ... */` block comments or `//`
+  line comments (these are documentation, not real declarations).
 
-For each direct subclass give exactly seven fields, one per line:
-- `file`: path relative to repo root
+For each direct subclass give exactly five fields, one per line:
+- `file`: path of the class declaration, relative to repo root
 - `line`: 1-based line number where the class declaration starts
 - `class`: simple class name (no generics, no package)
-- `nested`: `yes` if the class is declared inside another type,
-  `no` if it's the file's top-level class
-- `abstract_class`: `yes` if the class declaration includes the
-  `abstract` modifier, `no` otherwise
-- `read_overridden`: `yes` if the class declares an override of
-  `read(JsonReader)` (a method whose first parameter type is
-  `JsonReader`), `no` otherwise
-- `write_overridden`: `yes` if the class declares an override of
-  `write(JsonWriter, T)` (a method whose first parameter type is
-  `JsonWriter`), `no` otherwise
+- `new_site_file`: path of the FIRST production source line that
+  constructs an instance via `new <ClassName>(` — search across
+  every `.java` file under `gson/src/main/java/` (NOT only the
+  declaring file), pick the lexicographically earliest path and
+  then the lowest line number in that path; ignore lines inside
+  `/** ... */` Javadoc or `//` line comments; report `none` if the
+  class is abstract or otherwise never constructed by name.
+- `new_site_line`: 1-based line number of that construction call
+  site, or `none` if `new_site_file` is `none`.
 
 Output as a compact plain-text list. No prose, no extra commentary.
 """
