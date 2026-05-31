@@ -464,7 +464,7 @@ async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
         let mut queue = state.queue.lock().await;
         queue.events.push(event);
         if queue.events.len() >= MAX_BATCH_EVENTS {
-            let events = std::mem::take(&mut queue.events);
+            let events = drain_event_buffer(&mut queue.events);
             queue.flush_scheduled = false;
             TelemetryAction::Flush(events)
         } else if !queue.flush_scheduled {
@@ -500,7 +500,13 @@ enum TelemetryAction {
 async fn drain_queued_events(state: &TelemetryState) -> Vec<TelemetryEvent> {
     let mut queue = state.queue.lock().await;
     queue.flush_scheduled = false;
-    std::mem::take(&mut queue.events)
+    drain_event_buffer(&mut queue.events)
+}
+
+fn drain_event_buffer(events: &mut Vec<TelemetryEvent>) -> Vec<TelemetryEvent> {
+    let mut drained = Vec::with_capacity(MAX_BATCH_EVENTS);
+    std::mem::swap(events, &mut drained);
+    drained
 }
 
 async fn send_batch(
