@@ -240,6 +240,74 @@ fn tool_configuration_returns_none_when_empty() {
 }
 
 #[test]
+fn tool_configuration_cache_point_skips_mcp_prefixed_tools() {
+    let specs: Vec<Arc<LlmToolSpec>> = vec![
+        LlmToolSpec {
+            name: "search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+        LlmToolSpec {
+            name: "mcp__example".to_string(),
+            description: "Dynamic MCP tool".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+    ];
+    let config = tool_configuration(&specs, true)
+        .expect("ok")
+        .expect("present");
+    let tools = config.tools();
+    assert_eq!(tools.len(), 3, "two specs plus cache point");
+    assert!(matches!(
+        &tools[0],
+        aws_sdk_bedrockruntime::types::Tool::ToolSpec(spec) if spec.name() == "search"
+    ));
+    let aws_sdk_bedrockruntime::types::Tool::CachePoint(cache_point) = &tools[1] else {
+        panic!(
+            "expected CachePoint between stable tool and mcp__ tool, got {:?}",
+            tools[1]
+        );
+    };
+    assert_eq!(*cache_point.r#type(), CachePointType::Default);
+    assert!(matches!(
+        &tools[2],
+        aws_sdk_bedrockruntime::types::Tool::ToolSpec(spec) if spec.name() == "mcp__example"
+    ));
+
+    let all_mcp: Vec<Arc<LlmToolSpec>> = vec![
+        LlmToolSpec {
+            name: "mcp__one".to_string(),
+            description: "MCP one".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+        LlmToolSpec {
+            name: "mcp__two".to_string(),
+            description: "MCP two".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+    ];
+    let config = tool_configuration(&all_mcp, true)
+        .expect("ok")
+        .expect("present");
+    let tools = config.tools();
+    assert_eq!(tools.len(), 2, "all-mcp list yields no cache point");
+    for tool in tools {
+        assert!(
+            !matches!(tool, aws_sdk_bedrockruntime::types::Tool::CachePoint(_)),
+            "no CachePoint should be emitted when every tool is mcp__-prefixed"
+        );
+    }
+}
+
+#[test]
 fn json_to_document_preserves_numeric_kinds() {
     let document = json_to_document(&json!({
         "u": 42,
