@@ -833,6 +833,29 @@ fn common_vcs_markers_are_indexing_signals() {
 }
 
 #[test]
+fn ancestor_vcs_scan_stops_at_cached_home_boundary() {
+    let parent = temp_root("ancestor_vcs_scan_stops_at_cached_home_boundary");
+    let home = parent.join("home");
+    let project = home.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(parent.join(".git")).unwrap();
+
+    let home = fs::canonicalize(home).unwrap();
+    let project = fs::canonicalize(project).unwrap();
+    let context = IndexingDecisionContext {
+        canonical_home: Some(home),
+    };
+
+    assert_eq!(vcs_marker_signal(&project, &context), None);
+
+    fs::create_dir_all(project.join(".git")).unwrap();
+    assert_eq!(
+        vcs_marker_signal(&project, &context),
+        Some("VCS marker .git at workspace root".to_string())
+    );
+}
+
+#[test]
 fn git_worktree_file_is_an_indexing_signal() {
     let root = temp_root("git_worktree_file_is_an_indexing_signal");
     fs::write(

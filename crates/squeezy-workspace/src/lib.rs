@@ -282,6 +282,28 @@ pub struct IndexingDecision {
 }
 
 #[derive(Debug, Clone)]
+struct IndexingDecisionContext {
+    canonical_home: Option<PathBuf>,
+}
+
+impl IndexingDecisionContext {
+    fn from_env() -> Self {
+        Self {
+            canonical_home: env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|home| fs::canonicalize(home).ok()),
+        }
+    }
+
+    fn is_home_dir(&self, root: &Path) -> bool {
+        self.canonical_home
+            .as_deref()
+            .map(|home| home == root)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkspaceCrawler {
     options: CrawlOptions,
     compiled_policy: Arc<CompiledIndexingPolicy>,
@@ -674,8 +696,9 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 
     let mut positive_signals = Vec::new();
     let mut negative_signals = Vec::new();
+    let context = IndexingDecisionContext::from_env();
 
-    if is_home_dir(root) {
+    if context.is_home_dir(root) {
         negative_signals.push("workspace root is the user's home directory".to_string());
     }
     if is_protected_root(root) {
@@ -684,7 +707,7 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 
     let mut has_strong_positive = false;
 
-    if let Some(marker) = vcs_marker_signal(root) {
+    if let Some(marker) = vcs_marker_signal(root, &context) {
         has_strong_positive = true;
         positive_signals.push(marker);
     }
@@ -733,14 +756,6 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
     }
 }
 
-fn is_home_dir(root: &Path) -> bool {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| fs::canonicalize(home).ok())
-        .map(|home| home == root)
-        .unwrap_or(false)
-}
-
 fn is_protected_root(root: &Path) -> bool {
     const PROTECTED: &[&str] = &[
         "/",
@@ -772,9 +787,9 @@ fn is_personal_folder(root: &Path) -> bool {
     )
 }
 
-fn vcs_marker_signal(root: &Path) -> Option<String> {
+fn vcs_marker_signal(root: &Path, context: &IndexingDecisionContext) -> Option<String> {
     for (index, ancestor) in root.ancestors().enumerate() {
-        if index > 0 && (is_home_dir(ancestor) || is_protected_root(ancestor)) {
+        if index > 0 && (context.is_home_dir(ancestor) || is_protected_root(ancestor)) {
             break;
         }
         if let Some(marker) = vcs_marker_at(ancestor) {
