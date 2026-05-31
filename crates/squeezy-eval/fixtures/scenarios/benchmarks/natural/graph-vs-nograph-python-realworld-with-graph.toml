@@ -1,25 +1,21 @@
 id = "graph-vs-nograph-python-realworld-with-graph"
-title = "psf/requests Session intra-class call graph — with graph (openai mini)"
+title = "psf/requests cross-tree subclass surface — with graph (openai mini)"
 description = """
 Realistic Python A/B half. Pinned `psf/requests` SHA. Models the user
-request "I want to factor out the Session intra-class call graph so I
-can reason about which methods are safe to override without breaking
-sibling methods. For every public method on `Session` (and its parent
-`SessionRedirectMixin`), tell me which OTHER methods on the same
-hierarchy it calls via `self.<method>(...)`. The set of methods is
-defined by the class hierarchy, so I need the graph closed over both
-classes; then per-method body inspection to enumerate intra-hierarchy
-self-calls."
+request: "I want a structural inventory of every class in the repo
+(src + tests) that directly extends one of the core hierarchy bases
+in `requests`, with the methods each subclass defines. I'm
+refactoring those base classes and want to see at a glance which
+subclasses I'll touch and what surface they add."
 
-The hierarchy has 20 non-dunder methods (7 on `SessionRedirectMixin`,
-13 on `Session`); `request`, `resolve_redirects`, and `send` are the
-hubs of the call graph. Naive shell tools can grep `self.<word>(`
-inside the file, but the model still needs to (a) restrict matches to
-methods defined on the two target classes, (b) attribute each call to
-the enclosing method body (not the surrounding class), and (c) ignore
-self-calls to the same method. Graph + hierarchy + reference_search
-closes the method set and definition_search slices each body cleanly.
-Pair with `graph-vs-nograph-python-realworld-no-graph.toml` and run
+The answer spans 7 files (`src/requests/_types.py`, `adapters.py`,
+`auth.py`, `cookies.py`, `models.py`, `sessions.py`, and
+`tests/test_requests.py`). A naive shell pass has to grep `class\\b`
+across both `src/` and `tests/`, then per match re-read the file to
+enumerate the subclass body. Graph closes it in three steps: enumerate
+the bases via `decl_search`/`hierarchy`, walk each subclass via
+`hierarchy`/`definition_search`, and emit the method list. Pair with
+`graph-vs-nograph-python-realworld-no-graph.toml` and run
 `squeezy-eval diff`.
 """
 
@@ -45,36 +41,42 @@ max_tool_calls_per_turn = 32
 [[steps]]
 kind = "prompt"
 text = """
-I want a per-method intra-hierarchy call graph for the `Session`
-class (and its parent `SessionRedirectMixin`) in
-`src/requests/sessions.py`. Treat the two classes as a single
-hierarchy — `Session(SessionRedirectMixin)` — and let H be the set of
-non-dunder method names defined on either class. (`__init__`,
-`__enter__`, `__exit__`, `__getstate__`, `__setstate__` are dunders
-and MUST be excluded from H. The `send` stub at line 132 on
-`SessionRedirectMixin` is overridden by the real `send` on `Session`
-at line 752 — use the Session body when analyzing `send`.)
+Let B be the set of base-class names:
 
-For EACH method name in H, inspect the body of the most-specific
-definition in the hierarchy and list every OTHER name in H that the
-body calls via a `self.<name>(...)` expression. Rules:
-- Only count direct `self.<name>(...)` calls. Do not count
-  `super().<name>(...)`, `cls.<name>(...)`, or calls through any
-  other object.
-- Do not count a method calling ITSELF (recursive self-calls are
-  ignored).
-- Do not count names that are NOT in H (e.g. `self.mount` IS in H,
-  but `self.cookies.update(...)` is NOT — `update` is not in H).
-- Deduplicate: each callee appears at most once per caller.
-- Callees within a single line are sorted alphabetically.
+  BaseAdapter, Session, SessionRedirectMixin, AuthBase, HTTPBasicAuth,
+  RequestEncodingMixin, RequestHooksMixin, PreparedRequest, CookieJar
 
-Output one line per method in H, sorted alphabetically by method
-name, in this EXACT format:
+Scan every `*.py` file under `src/requests/` AND under `tests/` (any
+depth). For every class declaration `class C(...):` whose
+IMMEDIATE/DIRECT base list (as written at the `class` line — do NOT
+walk transitive ancestors) names at least one element of B (matched
+by the last name segment — `cookielib.CookieJar` matches `CookieJar`,
+`requests.Session` matches `Session`), emit one line:
 
-  <method_name>: <comma-separated alphabetically-sorted callees, or `(none)`>
+  <relative_path>::<C>: <comma-separated alphabetically-sorted
+  non-dunder method names defined directly on C, or `(none)`>
 
-No prose, no extra commentary, no headers. Include methods whose
-bodies make no intra-hierarchy self-calls — show them with `(none)`.
+Rules:
+- Use repo-relative paths (e.g. `src/requests/sessions.py`,
+  `tests/test_requests.py`). No leading `./`.
+- Non-dunder means the method name does NOT both start and end with
+  `__` (so `__init__`, `__repr__`, `__call__` are excluded;
+  `_find`, `_build_raw` are INCLUDED).
+- Only direct `def` children of the class body count. Methods nested
+  inside an `if TYPE_CHECKING:` block or inside another function do
+  NOT count.
+- Include subclasses that appear inside a function body or a
+  `TYPE_CHECKING` block IF the class line's base list matches B —
+  e.g. `src/requests/_types.py::_ValidatedRequest` (under
+  `if TYPE_CHECKING:`) extends `PreparedRequest` and must be
+  included with `(none)` since it has no `def`s.
+- If a subclass defines no qualifying methods, output `(none)`.
+- One line per (path, class) pair. Sort lines alphabetically by the
+  full `<path>::<class>` key.
+
+Output only the lines (no prose, no headers, no commentary, no code
+fences). Do not echo class declarations or method bodies — emit only
+the `<path>::<C>: <methods>` format.
 """
 
 [expect]

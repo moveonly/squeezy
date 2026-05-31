@@ -1,12 +1,12 @@
 id = "graph-vs-nograph-python-realworld-no-graph"
-title = "psf/requests Session intra-class call graph — no graph (openai mini)"
+title = "psf/requests cross-tree subclass surface — no graph (openai mini)"
 description = """
 No-graph half of the realistic Python A/B. Same prompt and pinned SHA
 as the with-graph half; graph tools excluded and the graph-first
-exploration planner disabled. The model must close the method set
-over the Session/SessionRedirectMixin hierarchy AND attribute each
-intra-hierarchy self-call to the correct enclosing method body using
-only `grep` / `glob` / `read_file`.
+exploration planner disabled. The model must enumerate every direct
+subclass of the listed hierarchy bases across `src/requests/` AND
+`tests/` and list each subclass's directly-defined non-dunder method
+surface using only `grep` / `glob` / `read_file`.
 """
 
 [workspace.github]
@@ -48,36 +48,42 @@ SQUEEZY_EXPLORATION_COMPILER = "0"
 [[steps]]
 kind = "prompt"
 text = """
-I want a per-method intra-hierarchy call graph for the `Session`
-class (and its parent `SessionRedirectMixin`) in
-`src/requests/sessions.py`. Treat the two classes as a single
-hierarchy — `Session(SessionRedirectMixin)` — and let H be the set of
-non-dunder method names defined on either class. (`__init__`,
-`__enter__`, `__exit__`, `__getstate__`, `__setstate__` are dunders
-and MUST be excluded from H. The `send` stub at line 132 on
-`SessionRedirectMixin` is overridden by the real `send` on `Session`
-at line 752 — use the Session body when analyzing `send`.)
+Let B be the set of base-class names:
 
-For EACH method name in H, inspect the body of the most-specific
-definition in the hierarchy and list every OTHER name in H that the
-body calls via a `self.<name>(...)` expression. Rules:
-- Only count direct `self.<name>(...)` calls. Do not count
-  `super().<name>(...)`, `cls.<name>(...)`, or calls through any
-  other object.
-- Do not count a method calling ITSELF (recursive self-calls are
-  ignored).
-- Do not count names that are NOT in H (e.g. `self.mount` IS in H,
-  but `self.cookies.update(...)` is NOT — `update` is not in H).
-- Deduplicate: each callee appears at most once per caller.
-- Callees within a single line are sorted alphabetically.
+  BaseAdapter, Session, SessionRedirectMixin, AuthBase, HTTPBasicAuth,
+  RequestEncodingMixin, RequestHooksMixin, PreparedRequest, CookieJar
 
-Output one line per method in H, sorted alphabetically by method
-name, in this EXACT format:
+Scan every `*.py` file under `src/requests/` AND under `tests/` (any
+depth). For every class declaration `class C(...):` whose
+IMMEDIATE/DIRECT base list (as written at the `class` line — do NOT
+walk transitive ancestors) names at least one element of B (matched
+by the last name segment — `cookielib.CookieJar` matches `CookieJar`,
+`requests.Session` matches `Session`), emit one line:
 
-  <method_name>: <comma-separated alphabetically-sorted callees, or `(none)`>
+  <relative_path>::<C>: <comma-separated alphabetically-sorted
+  non-dunder method names defined directly on C, or `(none)`>
 
-No prose, no extra commentary, no headers. Include methods whose
-bodies make no intra-hierarchy self-calls — show them with `(none)`.
+Rules:
+- Use repo-relative paths (e.g. `src/requests/sessions.py`,
+  `tests/test_requests.py`). No leading `./`.
+- Non-dunder means the method name does NOT both start and end with
+  `__` (so `__init__`, `__repr__`, `__call__` are excluded;
+  `_find`, `_build_raw` are INCLUDED).
+- Only direct `def` children of the class body count. Methods nested
+  inside an `if TYPE_CHECKING:` block or inside another function do
+  NOT count.
+- Include subclasses that appear inside a function body or a
+  `TYPE_CHECKING` block IF the class line's base list matches B —
+  e.g. `src/requests/_types.py::_ValidatedRequest` (under
+  `if TYPE_CHECKING:`) extends `PreparedRequest` and must be
+  included with `(none)` since it has no `def`s.
+- If a subclass defines no qualifying methods, output `(none)`.
+- One line per (path, class) pair. Sort lines alphabetically by the
+  full `<path>::<class>` key.
+
+Output only the lines (no prose, no headers, no commentary, no code
+fences). Do not echo class declarations or method bodies — emit only
+the `<path>::<C>: <methods>` format.
 """
 
 [expect]
