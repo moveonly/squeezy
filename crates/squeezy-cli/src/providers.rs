@@ -10,12 +10,12 @@ use std::env;
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use squeezy_core::{
     DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_BEDROCK_REGION, DEFAULT_GOOGLE_BASE_URL,
     DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL, OpenAiCompatiblePreset, Result, SqueezyError,
 };
-use squeezy_llm::models_for_provider;
+use squeezy_llm::{ModelInfo, models_for_provider};
 
 #[derive(Debug, Subcommand)]
 pub enum ProvidersCommand {
@@ -125,18 +125,8 @@ fn handle_info(
         .into_iter()
         .find(|entry| entry.name == canonical)
         .expect("canonical name resolved from same registry");
-    let models: Vec<_> = models_for_provider(canonical)
-        .map(|model| {
-            json!({
-                "id": model.id,
-                "profile": format!("{:?}", model.profile),
-                "tool_calling": model.capabilities.tool_calling,
-                "context_window": model.limits.map(|l| l.context_window_tokens),
-                "lifecycle": model.lifecycle.as_str(),
-            })
-        })
-        .collect();
     if args.json {
+        let models: Vec<_> = models_for_provider(canonical).map(model_json).collect();
         let body = json!({
             "name": entry.name,
             "display_name": entry.display_name,
@@ -162,19 +152,30 @@ fn handle_info(
         if entry.configured { "yes" } else { "no" }
     );
     println!("  models      {}", entry.model_count);
-    for model in &models {
+    for model in models_for_provider(canonical) {
         println!(
             "    {} (profile={}, tools={}, ctx={})",
-            model["id"].as_str().unwrap_or("?"),
-            model["profile"].as_str().unwrap_or("?"),
-            model["tool_calling"].as_bool().unwrap_or(false),
-            model["context_window"]
-                .as_u64()
+            model.id,
+            format!("{:?}", model.profile),
+            model.capabilities.tool_calling,
+            model
+                .limits
+                .map(|limits| limits.context_window_tokens)
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "?".into()),
         );
     }
     Ok(())
+}
+
+fn model_json(model: &ModelInfo) -> Value {
+    json!({
+        "id": model.id,
+        "profile": format!("{:?}", model.profile),
+        "tool_calling": model.capabilities.tool_calling,
+        "context_window": model.limits.map(|l| l.context_window_tokens),
+        "lifecycle": model.lifecycle.as_str(),
+    })
 }
 
 fn non_empty(value: &str) -> &str {
