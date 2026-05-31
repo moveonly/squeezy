@@ -227,6 +227,29 @@ pub const DEFAULT_PROVIDER_POOL_MAX_IDLE_PER_HOST: u32 = u32::MAX;
 /// for hours by claiming a multi-day cooldown.
 pub const DEFAULT_PROVIDER_MAX_RETRY_DELAY_MS: u64 = 60_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
+// Per-turn model routing ("cheap-model fast path") defaults. The router
+// inspects the user prompt before each turn's first LLM request; on a
+// match it dispatches that turn to the provider's small-fast tier
+// (`small_fast_model_for_provider`). The mid-turn escalation detector
+// hands the same turn back to the parent model when the cheap model
+// stalls. See `crates/squeezy-agent/src/turn_router.rs` for the
+// classifier and the escalation signals; see chapter 11 of the
+// cost-saving docs for the rationale.
+pub const DEFAULT_ROUTING_AUTO_CHEAP: bool = true;
+pub const DEFAULT_ROUTING_AUTO_CHEAP_LLM_JUDGE: bool = true;
+pub const DEFAULT_ROUTING_CHEAP_ESCALATION_ERROR_THRESHOLD: u8 = 2;
+pub const DEFAULT_ROUTING_ESCALATION_STICKY_TURNS: u8 = 3;
+pub const DEFAULT_ROUTING_BYPASS_FOR_IMAGES: bool = true;
+/// Char-budget gate for the heuristic prefilter. Prompts longer than
+/// this skip the slam-dunk path and fall through to the borderline
+/// judge (or `Parent`). Sized at ~400 tokens of English at 5 chars/tok.
+pub const DEFAULT_ROUTING_HEURISTIC_MAX_CHARS: u32 = 2_000;
+/// Char-budget gate for the LLM judge. Prompts longer than this skip the
+/// judge call and route to `Parent` directly — long prompts almost
+/// always carry the kind of nuance the cheap tier struggles with, and a
+/// long judge call would erode the savings the router is trying to
+/// produce. Sized at ~1500 tokens of English.
+pub const DEFAULT_ROUTING_JUDGE_MAX_CHARS: u32 = 6_000;
 // Per-subagent-invocation budgets, sized so they never bind in
 // realistic use; the subagent's natural exit is the model emitting a
 // final answer with no tool calls.
@@ -408,6 +431,7 @@ pub struct AppConfig {
     pub max_search_files_per_turn: u64,
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: u8,
+    pub routing: RoutingConfig,
     pub telemetry: TelemetryConfig,
     pub feedback: FeedbackConfig,
     pub redaction: RedactionConfig,
@@ -857,6 +881,10 @@ impl AppConfig {
             .filter(|value| (1..=100).contains(value))
             .or(budgets.cost_warn_percent)
             .unwrap_or(DEFAULT_COST_WARN_PERCENT);
+        let routing = RoutingConfig::from_settings_and_env(
+            settings.routing.unwrap_or_default(),
+            &mut get_var,
+        );
         let telemetry = TelemetryConfig::from_settings_and_env(
             settings.telemetry.unwrap_or_default(),
             &mut get_var,
@@ -967,6 +995,7 @@ impl AppConfig {
             max_search_files_per_turn,
             max_session_cost_usd_micros,
             cost_warn_percent,
+            routing,
             telemetry,
             feedback,
             redaction,
@@ -1263,6 +1292,43 @@ impl AppConfig {
         output.push_str(&format!(
             "cost_warn_percent = {}\n\n",
             self.cost_warn_percent
+        ));
+
+        output.push_str("[routing]\n");
+        output.push_str(&format!("auto_cheap = {}\n", self.routing.auto_cheap));
+        output.push_str(&format!(
+            "auto_cheap_llm_judge = {}\n",
+            self.routing.auto_cheap_llm_judge
+        ));
+        if self.routing.cheap_escalation_tool_calls == 0 {
+            output.push_str(
+                "# cheap_escalation_tool_calls = 0  # derives at runtime as max_tool_calls_per_turn / 4\n",
+            );
+        } else {
+            output.push_str(&format!(
+                "cheap_escalation_tool_calls = {}\n",
+                self.routing.cheap_escalation_tool_calls
+            ));
+        }
+        output.push_str(&format!(
+            "cheap_escalation_error_threshold = {}\n",
+            self.routing.cheap_escalation_error_threshold
+        ));
+        output.push_str(&format!(
+            "escalation_sticky_turns = {}\n",
+            self.routing.escalation_sticky_turns
+        ));
+        output.push_str(&format!(
+            "bypass_for_images = {}\n",
+            self.routing.bypass_for_images
+        ));
+        output.push_str(&format!(
+            "heuristic_max_chars = {}\n",
+            self.routing.heuristic_max_chars
+        ));
+        output.push_str(&format!(
+            "judge_max_chars = {}\n\n",
+            self.routing.judge_max_chars
         ));
 
         output.push_str("[permissions]\n");
@@ -2407,6 +2473,7 @@ pub struct SettingsFile {
     pub context: Option<ContextCompactionSettings>,
     pub subagents: Option<SubagentSettings>,
     pub budgets: Option<BudgetSettings>,
+    pub routing: Option<RoutingSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
     pub feedback: Option<FeedbackSettings>,
@@ -2476,6 +2543,7 @@ impl SettingsFile {
                 "context",
                 "subagents",
                 "budgets",
+                "routing",
                 "permissions",
                 "telemetry",
                 "feedback",
@@ -2524,6 +2592,9 @@ impl SettingsFile {
             .transpose()?;
         settings.budgets = optional_table(table, "budgets", source)?
             .map(|table| BudgetSettings::from_table(table, source, "budgets"))
+            .transpose()?;
+        settings.routing = optional_table(table, "routing", source)?
+            .map(|table| RoutingSettings::from_table(table, source, "routing"))
             .transpose()?;
         settings.permissions = optional_table(table, "permissions", source)?
             .map(|table| PermissionSettings::from_table(table, source, "permissions"))
@@ -2605,6 +2676,7 @@ impl SettingsFile {
         );
         merge_option(&mut self.subagents, next.subagents, SubagentSettings::merge);
         merge_option(&mut self.budgets, next.budgets, BudgetSettings::merge);
+        merge_option(&mut self.routing, next.routing, RoutingSettings::merge);
         merge_option(
             &mut self.permissions,
             next.permissions,
@@ -3186,6 +3258,193 @@ impl BudgetSettings {
             next.max_session_cost_usd_micros,
         );
         replace_if_some(&mut self.cost_warn_percent, next.cost_warn_percent);
+    }
+}
+
+/// Per-turn model routing config. Resolved from `[routing]` in TOML and
+/// the matching `SQUEEZY_ROUTING_*` env vars; the agent crate's
+/// `turn_router` module reads these knobs to decide whether to dispatch
+/// the current turn on the cheap tier and when to hand back to the
+/// parent model after a false positive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    pub auto_cheap: bool,
+    pub auto_cheap_llm_judge: bool,
+    /// Hard ceiling on tool calls a cheap-routed turn may issue before
+    /// the escalation detector hands back to the parent model. `0`
+    /// (default) means "derive at runtime as `max_tool_calls_per_turn /
+    /// 4`". Resolves via `RoutingConfig::resolved_cheap_escalation_tool_calls`.
+    pub cheap_escalation_tool_calls: u64,
+    pub cheap_escalation_error_threshold: u8,
+    pub escalation_sticky_turns: u8,
+    pub bypass_for_images: bool,
+    pub heuristic_max_chars: u32,
+    pub judge_max_chars: u32,
+}
+
+impl RoutingConfig {
+    fn from_settings_and_env(
+        settings: RoutingSettings,
+        get_var: &mut impl FnMut(&str) -> Option<String>,
+    ) -> Self {
+        Self {
+            auto_cheap: get_var("SQUEEZY_ROUTING_AUTO_CHEAP")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.auto_cheap.unwrap_or(DEFAULT_ROUTING_AUTO_CHEAP)),
+            auto_cheap_llm_judge: get_var("SQUEEZY_ROUTING_AUTO_CHEAP_LLM_JUDGE")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(
+                    settings
+                        .auto_cheap_llm_judge
+                        .unwrap_or(DEFAULT_ROUTING_AUTO_CHEAP_LLM_JUDGE),
+                ),
+            cheap_escalation_tool_calls: parse_u64(
+                get_var("SQUEEZY_ROUTING_CHEAP_ESCALATION_TOOL_CALLS"),
+                settings.cheap_escalation_tool_calls.unwrap_or(0),
+            ),
+            cheap_escalation_error_threshold: get_var(
+                "SQUEEZY_ROUTING_CHEAP_ESCALATION_ERROR_THRESHOLD",
+            )
+            .as_deref()
+            .and_then(|raw| raw.parse::<u8>().ok())
+            .or(settings.cheap_escalation_error_threshold)
+            .unwrap_or(DEFAULT_ROUTING_CHEAP_ESCALATION_ERROR_THRESHOLD),
+            escalation_sticky_turns: get_var("SQUEEZY_ROUTING_ESCALATION_STICKY_TURNS")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u8>().ok())
+                .or(settings.escalation_sticky_turns)
+                .unwrap_or(DEFAULT_ROUTING_ESCALATION_STICKY_TURNS),
+            bypass_for_images: get_var("SQUEEZY_ROUTING_BYPASS_FOR_IMAGES")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(
+                    settings
+                        .bypass_for_images
+                        .unwrap_or(DEFAULT_ROUTING_BYPASS_FOR_IMAGES),
+                ),
+            heuristic_max_chars: get_var("SQUEEZY_ROUTING_HEURISTIC_MAX_CHARS")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .or(settings.heuristic_max_chars)
+                .unwrap_or(DEFAULT_ROUTING_HEURISTIC_MAX_CHARS),
+            judge_max_chars: get_var("SQUEEZY_ROUTING_JUDGE_MAX_CHARS")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .or(settings.judge_max_chars)
+                .unwrap_or(DEFAULT_ROUTING_JUDGE_MAX_CHARS),
+        }
+    }
+
+    /// Resolves the in-turn escalation ceiling for tool calls. When the
+    /// user leaves `cheap_escalation_tool_calls` at the `0` sentinel we
+    /// derive a value from the parent's `max_tool_calls_per_turn` rather
+    /// than hard-coding a number, so the threshold scales with the
+    /// user's existing budget choices.
+    pub fn resolved_cheap_escalation_tool_calls(&self, max_tool_calls_per_turn: u64) -> u64 {
+        if self.cheap_escalation_tool_calls > 0 {
+            self.cheap_escalation_tool_calls
+        } else {
+            (max_tool_calls_per_turn / 4).max(1)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RoutingSettings {
+    pub auto_cheap: Option<bool>,
+    pub auto_cheap_llm_judge: Option<bool>,
+    pub cheap_escalation_tool_calls: Option<u64>,
+    pub cheap_escalation_error_threshold: Option<u8>,
+    pub escalation_sticky_turns: Option<u8>,
+    pub bypass_for_images: Option<bool>,
+    pub heuristic_max_chars: Option<u32>,
+    pub judge_max_chars: Option<u32>,
+}
+
+impl RoutingSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "auto_cheap",
+                "auto_cheap_llm_judge",
+                "cheap_escalation_tool_calls",
+                "cheap_escalation_error_threshold",
+                "escalation_sticky_turns",
+                "bypass_for_images",
+                "heuristic_max_chars",
+                "judge_max_chars",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            auto_cheap: bool_value(table, "auto_cheap", source, &field(path, "auto_cheap"))?,
+            auto_cheap_llm_judge: bool_value(
+                table,
+                "auto_cheap_llm_judge",
+                source,
+                &field(path, "auto_cheap_llm_judge"),
+            )?,
+            cheap_escalation_tool_calls: u64_value(
+                table,
+                "cheap_escalation_tool_calls",
+                source,
+                &field(path, "cheap_escalation_tool_calls"),
+            )?,
+            cheap_escalation_error_threshold: u8_value(
+                table,
+                "cheap_escalation_error_threshold",
+                source,
+                &field(path, "cheap_escalation_error_threshold"),
+            )?,
+            escalation_sticky_turns: u8_value(
+                table,
+                "escalation_sticky_turns",
+                source,
+                &field(path, "escalation_sticky_turns"),
+            )?,
+            bypass_for_images: bool_value(
+                table,
+                "bypass_for_images",
+                source,
+                &field(path, "bypass_for_images"),
+            )?,
+            heuristic_max_chars: u32_value(
+                table,
+                "heuristic_max_chars",
+                source,
+                &field(path, "heuristic_max_chars"),
+            )?,
+            judge_max_chars: u32_value(
+                table,
+                "judge_max_chars",
+                source,
+                &field(path, "judge_max_chars"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.auto_cheap, next.auto_cheap);
+        replace_if_some(&mut self.auto_cheap_llm_judge, next.auto_cheap_llm_judge);
+        replace_if_some(
+            &mut self.cheap_escalation_tool_calls,
+            next.cheap_escalation_tool_calls,
+        );
+        replace_if_some(
+            &mut self.cheap_escalation_error_threshold,
+            next.cheap_escalation_error_threshold,
+        );
+        replace_if_some(
+            &mut self.escalation_sticky_turns,
+            next.escalation_sticky_turns,
+        );
+        replace_if_some(&mut self.bypass_for_images, next.bypass_for_images);
+        replace_if_some(&mut self.heuristic_max_chars, next.heuristic_max_chars);
+        replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
     }
 }
 
@@ -10526,6 +10785,22 @@ pub struct SessionMetrics {
     pub subagent_provider: CostSnapshot,
     #[serde(default)]
     pub subagent_by_kind: SubagentKindMetrics,
+    /// Cumulative USD micros spent on cheap-tier routing-judge calls
+    /// across the session.
+    #[serde(default)]
+    pub routing_judge_usd_micros: u64,
+    /// Number of turns dispatched to the cheap tier instead of the
+    /// parent model.
+    #[serde(default)]
+    pub routed_to_cheap_turns: u64,
+    /// Number of cheap-routed turns that escalated back to the parent
+    /// model mid-turn.
+    #[serde(default)]
+    pub escalated_to_parent_turns: u64,
+    /// Cumulative estimated savings versus running the same turns on
+    /// the parent model.
+    #[serde(default)]
+    pub routing_estimated_savings_usd_micros: u64,
 }
 
 impl SessionMetrics {
@@ -10559,6 +10834,18 @@ impl SessionMetrics {
         merge_cost_snapshot(&mut self.provider, &turn.provider);
         merge_cost_snapshot(&mut self.subagent_provider, &turn.subagent_provider);
         self.subagent_by_kind.merge(&turn.subagent_by_kind);
+        self.routing_judge_usd_micros = self
+            .routing_judge_usd_micros
+            .saturating_add(turn.routing_judge_usd_micros);
+        if turn.routed_to_cheap {
+            self.routed_to_cheap_turns = self.routed_to_cheap_turns.saturating_add(1);
+        }
+        if turn.escalated_to_parent {
+            self.escalated_to_parent_turns = self.escalated_to_parent_turns.saturating_add(1);
+        }
+        self.routing_estimated_savings_usd_micros = self
+            .routing_estimated_savings_usd_micros
+            .saturating_add(turn.routing_estimated_savings_usd_micros);
     }
 }
 
@@ -10593,6 +10880,26 @@ pub struct TurnMetrics {
     pub subagent_provider: CostSnapshot,
     #[serde(default)]
     pub subagent_by_kind: SubagentKindMetrics,
+    /// USD micros spent on the borderline-classification call
+    /// dispatched by the cheap-model fast path. Zero on turns where the
+    /// heuristic fired (no judge call) or routing was disabled.
+    #[serde(default)]
+    pub routing_judge_usd_micros: u64,
+    /// True when the turn's first LLM round dispatched on the cheap
+    /// tier rather than the user's configured parent model.
+    #[serde(default)]
+    pub routed_to_cheap: bool,
+    /// True when a cheap-routed turn ran into an escalation signal and
+    /// switched back to the parent model mid-turn.
+    #[serde(default)]
+    pub escalated_to_parent: bool,
+    /// Estimated savings versus running the same turn on the parent
+    /// model — computed by re-pricing the provider-reported token
+    /// counts at the parent's per-Mtok rate and subtracting the actual
+    /// cheap-tier bill. Zero when the turn was not routed or when the
+    /// model registry has no pricing for either side.
+    #[serde(default)]
+    pub routing_estimated_savings_usd_micros: u64,
 }
 
 impl TurnMetrics {

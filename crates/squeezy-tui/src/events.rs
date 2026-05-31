@@ -462,6 +462,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.auto_drain_queue = !app.prompt_queue.is_empty();
                     break;
                 }
+                AgentEvent::TurnRouted {
+                    from, to, reason, ..
+                } => {
+                    let notice = format!("↪ routed `{from}` → `{to}` ({reason})");
+                    app.push_transcript_item(TranscriptItem::system(notice));
+                }
             }
         }
         if keep_rx {

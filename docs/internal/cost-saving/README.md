@@ -16,6 +16,7 @@ Each chapter sits beside this index as a numbered file:
 | [08](08-sub-agent-isolation.md) | Sub-agent context isolation | Conversation shape | `crates/squeezy-agent/src/subagent_catalog.rs`, runner code in `squeezy-agent/src/lib.rs` |
 | [09](09-verbosity-controls.md) | User-controllable verbosity | Output shape | `crates/squeezy-core/src/lib.rs:6469+`, TUI handlers |
 | [10](10-token-accounting.md) | Token accounting & `/context` telemetry | Observability | `crates/squeezy-core/src/lib.rs:9805+`, per-provider extractors, `crates/squeezy-agent/src/lib.rs:510+` |
+| [11](11-cheap-model-fast-path.md) | Cheap-model fast path (per-turn routing) | Request | `crates/squeezy-agent/src/turn_router.rs`, `crates/squeezy-core/src/lib.rs` (`RoutingConfig`) |
 
 ---
 
@@ -37,6 +38,7 @@ Squeezy's architecture is a set of orthogonal mechanisms, each targeting one or 
 │ Request layer (per-API-call cost)                           │
 │   Ch.01  Provider prompt caching (Anthropic, OpenAI, ...)   │
 │   Ch.10  Token accounting (observability for every mech.)   │
+│   Ch.11  Cheap-model fast path (per-turn routing)           │
 ├─────────────────────────────────────────────────────────────┤
 │ Prompt-assembly layer (what goes into "system" + tools)     │
 │   Ch.06  Lazy tool schemas + lazy skill bodies              │
@@ -101,6 +103,10 @@ Three orthogonal axes. `ResponseVerbosity { Concise | Normal | Verbose }` swaps 
 
 `CostSnapshot { input_tokens, output_tokens, reasoning_output_tokens, cached_input_tokens, cache_write_input_tokens, estimated_usd_micros }` is the universal currency. Each provider's usage block is normalised back into it — Anthropic and Bedrock fold cache-read and cache-write back into the total `input_tokens`, OpenAI exposes `input_tokens_details.cached_tokens` only (no cache-write field), Google reports `cachedContentTokenCount`. `SessionAccountingSnapshot` and `ConversationShape` break the wire down by user/assistant text, function-call bytes, tool-output bytes, reasoning bytes, image bytes — that breakdown is what `/context` shows and what compaction triggers read from.
 
+### 11 — Cheap-model fast path (per-turn routing)
+
+Each user turn is classified before its first LLM round. A strict heuristic prefilter (single sentence, ≤ 15 words, tight imperative whitelist, no compound connectors, no ambiguity markers) admits the most obvious slam-dunks (`run cargo test`, `checkout main`, `grep TODO src/lib.rs`) and dispatches them on the provider's own small-fast tier — Anthropic Haiku, OpenAI Nano / Mini, Gemini Flash Lite, the cheap Bedrock variant — via `small_fast_model_for_provider`. Anything the heuristic does not catch within `judge_max_chars` defers to a one-shot JSON-constrained LLM judge that runs on the same cheap tier and casts a `cheap`/`parent` vote. The cheap-routed turn is monitored mid-flight: tool-call ceiling (`max_tool_calls_per_turn / 4`), `tool_errors + budget_denials ≥ 2`, or a low-confidence assistant-text phrase ("i'm not sure", "this is complex", …) trips a same-turn handoff back to the parent model via `current_model` swap, plus an escalation-sticky window that forces the next 3 user prompts to skip the router. Image input always routes parent. `/cheap`, `/parent`, and `/router off|on` slash commands give the user manual control through `Agent::request_routing_force_*` and `Agent::set_routing_session_disabled`.
+
 ## Cross-cutting design principles
 
 Reading the chapters in order, the same handful of principles recur:
@@ -117,7 +123,6 @@ Reading the chapters in order, the same handful of principles recur:
 
 The architecture leaves natural extension points where future work could squeeze out more savings:
 
-- **Cheap-model fast path.** Automatically route trivial subtasks (file-edit classification, tool-result rewriting, summary cleanup) to a smaller model like Haiku while the user's headline model handles the main reasoning. Today every turn uses the user-configured model.
 - **Dense / embedding-augmented code search.** Supplement the lexical BM25 + trigram + tier ladder with semantic embeddings so `verify_token` matches "auth checking" queries. Would feed `definition_search` and `symbol_context`.
 - **Grandchild sub-agents under governance.** Sub-agents cannot spawn more sub-agents today (`roles_tests.rs:42`). A budget-gated relaxation would enable deeper exploration trees without unbounded cost.
 - **Mid-stream cancellation at tool-call boundaries.** The Anthropic streamer already parses `tool_use` events as they arrive; cancelling the rest of the stream once a tool call is committed would shave output tokens on long reasoning passes.

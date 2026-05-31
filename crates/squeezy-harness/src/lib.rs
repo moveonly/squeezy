@@ -676,7 +676,8 @@ async fn run_agent_with_config(
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ReasoningSegment { .. }
-            | AgentEvent::ShellSandboxBestEffortFallback { .. } => {}
+            | AgentEvent::ShellSandboxBestEffortFallback { .. }
+            | AgentEvent::TurnRouted { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);

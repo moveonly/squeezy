@@ -74,6 +74,7 @@ mod permission_persist;
 mod plan_mode;
 mod roles;
 pub mod subagent_catalog;
+mod turn_router;
 
 pub use dispatch::{
     DispatchCommand, DispatchCommandKind, DispatchCommandParseError, DispatchOutcome,
@@ -1206,6 +1207,12 @@ pub struct Agent {
     /// fire-and-forget lifetime of these tasks. New tasks may still be
     /// registered after a shutdown completes; the JoinSet is reusable.
     background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
+    /// Cross-turn state for the per-turn model router. Tracks the
+    /// escalation-sticky window and any pending `/cheap` / `/parent` /
+    /// `/router` user override. Shared with each `TurnRuntime` via
+    /// `Arc<StdMutex<_>>` so the streaming loop can engage the sticky
+    /// window after an escalation and the next `start_turn` picks it up.
+    routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -1618,12 +1625,41 @@ impl Agent {
             pending_swap: None,
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
+            routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
         }
     }
 
     /// Borrow the current effective config.
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// Force the next turn onto the provider's small-fast cheap tier
+    /// even when the heuristic would not have fired and the LLM judge
+    /// would have voted parent. Used by the `/cheap` slash command.
+    /// One-shot — consumed by the next `start_turn`.
+    pub fn request_routing_force_cheap(&self) {
+        let mut state = self.routing_state.lock().expect("routing state lock");
+        state.pending_override.force_cheap = true;
+        state.pending_override.force_parent = false;
+    }
+
+    /// Force the next turn onto the user's configured parent model,
+    /// bypassing the router entirely. Used by the `/parent` slash
+    /// command. One-shot — consumed by the next `start_turn`.
+    pub fn request_routing_force_parent(&self) {
+        let mut state = self.routing_state.lock().expect("routing state lock");
+        state.pending_override.force_parent = true;
+        state.pending_override.force_cheap = false;
+    }
+
+    /// Toggle the master routing switch for the rest of the session.
+    /// When `disabled` is `true`, the per-turn router never picks the
+    /// cheap tier implicitly; explicit `/cheap` still works. Used by
+    /// `/router off|on`.
+    pub fn set_routing_session_disabled(&self, disabled: bool) {
+        let mut state = self.routing_state.lock().expect("routing state lock");
+        state.pending_override.session_disabled = disabled;
     }
 
     /// Test-only handle to the subagent registry so callers can
@@ -3345,6 +3381,7 @@ impl Agent {
         let subagents = self.subagents.clone();
         let hooks = self.hooks.clone();
         let background_tasks = self.background_tasks.clone();
+        let routing_state = self.routing_state.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -3498,6 +3535,7 @@ impl Agent {
                     hooks,
                     display_input: redacted_display_input,
                     transient_input_items,
+                    routing_state,
                 }
                 .run(task_title.clone())
                 .await;
@@ -4388,6 +4426,7 @@ struct TurnRuntime {
     hooks: Option<Arc<HookRegistry>>,
     display_input: String,
     transient_input_items: Vec<LlmInputItem>,
+    routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
 }
 
 impl TurnRuntime {
@@ -5195,6 +5234,63 @@ impl TurnRuntime {
         // one retry per turn to prevent infinite loops if the model
         // ignores the nudge.
         let mut replan_retry_used = false;
+        // Per-turn model routing decision. The classifier runs once at
+        // the top of the turn; `current_model` is what each round
+        // dispatches on. On mid-turn escalation it is overwritten with
+        // the parent model for the rest of the turn — the conversation
+        // state survives because `replace_provider` is not needed for
+        // a within-provider swap on the wire.
+        let parent_model_str = self.config.model.clone();
+        let parent_model: Arc<str> = Arc::from(parent_model_str.clone());
+        let routing_override = {
+            let mut state = self.routing_state.lock().expect("routing state lock");
+            let snapshot = state.pending_override;
+            // Force-cheap / force-parent are one-shot per turn; clear them
+            // so the next prompt routes on its own merits.
+            state.pending_override.force_cheap = false;
+            state.pending_override.force_parent = false;
+            snapshot
+        };
+        let sticky_active = self
+            .routing_state
+            .lock()
+            .expect("routing state lock")
+            .sticky
+            .tick();
+        let decision = turn_router::classify_turn(
+            turn_router::ClassifyTurnInputs {
+                user_input: &task_title,
+                provider: &self.provider,
+                provider_name: self.provider.name(),
+                parent_model: &parent_model_str,
+                config: &self.config,
+                has_image_input: !image_items.is_empty(),
+                overrides: routing_override,
+                sticky: sticky_active,
+            },
+            self.cancel.clone(),
+        )
+        .await;
+        let mut current_model: Arc<str> = match &decision {
+            turn_router::TurnRoutingDecision::Cheap { model, .. } => model.clone(),
+            turn_router::TurnRoutingDecision::Parent => parent_model.clone(),
+        };
+        let mut on_cheap_turn = decision.is_cheap();
+        if on_cheap_turn {
+            broker.metrics.routed_to_cheap = true;
+            if let Some(reason_label) = decision.reason_label() {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::TurnRouted {
+                        turn_id: self.turn_id,
+                        from: parent_model_str.clone(),
+                        to: current_model.to_string(),
+                        reason: reason_label.to_string(),
+                    })
+                    .await;
+            }
+        }
+        let mut escalation_state = turn_router::EscalationState::default();
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -5274,8 +5370,45 @@ impl TurnRuntime {
                 .as_ref()
                 .expect("instructions cache populated above")
                 .clone();
+            // Mid-turn escalation: if the cheap-routed turn has tripped
+            // any signal we tracked over the previous round, swap to
+            // the parent model from this round onward and let the
+            // sticky window suppress routing on the next user prompt.
+            // The decision is one-way — once the turn escalates it
+            // never falls back to the cheap tier within this turn.
+            if on_cheap_turn {
+                if let Some(reason) = escalation_state.maybe_trigger(
+                    broker.metrics.tool_calls,
+                    broker.metrics.tool_errors,
+                    broker.metrics.budget_denials,
+                    &assistant_message,
+                    on_cheap_turn,
+                    &self.config.routing,
+                    self.config.max_tool_calls_per_turn,
+                ) {
+                    let from_model = current_model.to_string();
+                    current_model = parent_model.clone();
+                    on_cheap_turn = false;
+                    broker.metrics.escalated_to_parent = true;
+                    {
+                        let mut state = self.routing_state.lock().expect("routing state lock");
+                        state
+                            .sticky
+                            .engage(self.config.routing.escalation_sticky_turns);
+                    }
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::TurnRouted {
+                            turn_id: self.turn_id,
+                            from: from_model,
+                            to: parent_model_str.clone(),
+                            reason: format!("escalated_{}", reason.as_str()),
+                        })
+                        .await;
+                }
+            }
             let request = LlmRequest {
-                model: Arc::from(self.config.model.as_str()),
+                model: current_model.clone(),
                 instructions: Arc::from(cached_instructions),
                 input: Arc::from(next_input.as_slice()),
                 max_output_tokens: self.config.max_output_tokens,
@@ -8627,7 +8760,7 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
 /// (`qwen3-coder`) is the only model a local Ollama install is guaranteed
 /// to have, so it is returned verbatim rather than pretending a separate
 /// cheap tier exists.
-fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
+pub(crate) fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
     if let Some(model) = config.small_fast_model.clone() {
         return Some(model);
     }
@@ -12943,6 +13076,21 @@ pub enum AgentEvent {
     Failed {
         turn_id: TurnId,
         error: SqueezyError,
+    },
+    /// Emitted whenever the per-turn router swaps the model on the wire
+    /// away from the user's configured parent model. Fires twice on an
+    /// escalated turn: once at the start when the cheap tier is
+    /// selected, and once mid-turn when the cheap model handed back to
+    /// the parent. `from` is the model the agent would otherwise have
+    /// used; `to` is the model the next round will dispatch on; `reason`
+    /// is a short stable token (`heuristic_slam_dunk_<rule>`,
+    /// `llm_judge`, `user_explicit`, `escalated_<signal>`) so TUI and
+    /// eval consumers can match on it without parsing prose.
+    TurnRouted {
+        turn_id: TurnId,
+        from: String,
+        to: String,
+        reason: String,
     },
 }
 

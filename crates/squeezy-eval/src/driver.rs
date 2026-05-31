@@ -2505,6 +2505,7 @@ impl Driver {
                     completed = true;
                     break;
                 }
+                AgentEvent::TurnRouted { .. } => {}
             }
             if should_break_on_text {
                 cancel.cancel();

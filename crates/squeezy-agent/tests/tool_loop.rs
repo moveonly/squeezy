@@ -3721,14 +3721,21 @@ fn tool_names(request: &LlmRequest) -> Vec<&str> {
 }
 
 fn config_for(root: PathBuf) -> AppConfig {
-    AppConfig {
+    let mut config = AppConfig {
         workspace_root: root,
         permissions: PermissionPolicy {
             edit: PermissionMode::Allow,
             ..Default::default()
         },
         ..Default::default()
-    }
+    };
+    // Scripted-provider integration tests assume one LLM call per round
+    // (their `responses` queue is sized exactly for the round it
+    // expects). Turn the router off so the borderline judge call does
+    // not pop a queued response that the round expected to see. Tests
+    // that want to exercise the router opt back in explicitly.
+    config.routing.auto_cheap = false;
+    config
 }
 
 fn temp_workspace(name: &str) -> PathBuf {
