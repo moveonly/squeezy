@@ -1,0 +1,128 @@
+id = "graph-vs-nograph-php-realworld-with-graph"
+title = "laravel Eloquent Relation concern + existence-query audit — with graph (openai mini)"
+description = """
+Cross-language A/B (PHP), real-world variant. Asks the model to audit
+every concrete (non-abstract) `Relation` subclass declared directly
+under `src/Illuminate/Database/Eloquent/Relations/` (not the
+`Concerns/` subdirectory, not abstracts like `Relation`,
+`HasOneOrMany`, `HasOneOrManyThrough`, `MorphOneOrMany`) and report
+two facts per row:
+
+1. Which traits from the
+   `Illuminate\\Database\\Eloquent\\Relations\\Concerns\\*`
+   namespace this class declaration directly inserts via its own
+   `use TraitName, ...;` clause(s) inside the class body — NOT
+   inherited through the parent chain (e.g. `MorphMany` inherits
+   `InteractsWithDictionary` and `SupportsInverseRelations`
+   transitively through `MorphOneOrMany` → `HasOneOrMany`, but
+   declares no `use` clause of its own, so its row reads `none`).
+2. Whether the class body directly declares a method named exactly
+   `getRelationExistenceQuery` (the contract entry point used by
+   `Builder::whereHas`); the related sibling methods
+   `getRelationExistenceQueryForSelfRelation`,
+   `getRelationExistenceQueryForSelfJoin`, and
+   `getRelationExistenceQueryForThroughSelfRelation` do NOT count.
+
+The expected answer has exactly 12 rows. Each row exercises three
+distinct lookups: (a) class declaration site within
+`Relations/` filtered to concrete classes, (b) `use Trait` resolution
+restricted to the seven `Concerns\\*` traits and constrained to the
+class's own body (no inheritance), (c) presence of a precisely-named
+method declaration in the class body. The semantic graph answers (a)
+via `decl_search`, (b) via `read_slice` on each class header, and (c)
+via `decl_search` for the method scoped to each subclass; the
+no-graph half has to glob, read every Relations file, and disambiguate
+the exact `getRelationExistenceQuery` token from its three sibling
+`*ForSelfRelation` / `*ForSelfJoin` / `*ForThroughSelfRelation`
+overloads.
+
+Pair with `graph-vs-nograph-php-realworld-no-graph.toml` and
+`squeezy-eval diff` to compare cost and accuracy.
+"""
+
+[workspace.github]
+repo = "laravel/framework"
+sha = "c32ead90e14dfe04e98dc0639d3377b2605914dd"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+
+[[steps]]
+kind = "prompt"
+text = """
+Audit every concrete (non-abstract) class declared directly under
+`src/Illuminate/Database/Eloquent/Relations/` in this repo. Each
+qualifying class is the single `class <Name> extends ...` declaration
+in a top-level `*.php` file under that directory.
+
+Scope:
+- ONLY look at `src/Illuminate/Database/Eloquent/Relations/*.php`
+  (the top-level files in that directory).
+- SKIP the `src/Illuminate/Database/Eloquent/Relations/Concerns/`
+  subdirectory entirely — those are the source traits, not relation
+  classes.
+- SKIP anything under `tests/`, `workbench/`, `bin/`, or files
+  whose basename ends in `Test.php`.
+
+Exclude these abstract base classes (they are declared `abstract
+class`):
+- `Relation`
+- `HasOneOrMany`
+- `HasOneOrManyThrough`
+- `MorphOneOrMany`
+
+For each remaining concrete class, give exactly four fields, one row
+per class, no header row, fields separated by ` | ` (space-pipe-space):
+
+- `file_line`: the path relative to repo root plus the 1-based line
+  number of the `class <Name>` declaration, joined with `:`
+  (e.g. `src/Illuminate/Database/Eloquent/Relations/HasOne.php:20`).
+- `class`: the unqualified class name (e.g. `HasOne`).
+- `concerns`: comma-separated, ALPHABETIZED list of trait names from
+  the `Illuminate\\Database\\Eloquent\\Relations\\Concerns\\*`
+  namespace that THIS class declaration directly inserts via its
+  own `use TraitName, ...;` clause(s) inside the class body. Only
+  these seven traits count:
+  - `AsPivot`
+  - `CanBeOneOfMany`
+  - `ComparesRelatedModels`
+  - `InteractsWithDictionary`
+  - `InteractsWithPivotTable`
+  - `SupportsDefaultModels`
+  - `SupportsInverseRelations`
+  Traits inherited from a parent class (e.g. `HasMany` inherits
+  `InteractsWithDictionary` through `HasOneOrMany`'s own `use`
+  clause) DO NOT count — only direct `use` clauses in the class
+  body itself. If none of the seven traits is directly inserted,
+  write the literal word `none`.
+- `overrides_existence`: `yes` if the class body directly declares
+  a method whose name is EXACTLY `getRelationExistenceQuery` (any
+  visibility / signature); `no` otherwise. Sibling methods named
+  `getRelationExistenceQueryForSelfRelation`,
+  `getRelationExistenceQueryForSelfJoin`, or
+  `getRelationExistenceQueryForThroughSelfRelation` DO NOT count
+  as overrides of `getRelationExistenceQuery`.
+
+Order rows ascending by `file_line` (i.e. alphabetical by file
+basename). Output a compact plain-text list — no prose, no header,
+no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 540
+max_input_tokens = 250000
+
+[triage]
+enabled = false
