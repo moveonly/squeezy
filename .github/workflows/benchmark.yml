@@ -83,9 +83,140 @@ jobs:
       - name: Check language coverage docs
         run: python3 benchmarks/scripts/check_languages_doc.py
 
+  changes:
+    name: Detect changed language paths
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      java: ${{ steps.filter.outputs.java }}
+      go: ${{ steps.filter.outputs.go }}
+      c-family: ${{ steps.filter.outputs['c-family'] }}
+      csharp: ${{ steps.filter.outputs.csharp }}
+      js-ts: ${{ steps.filter.outputs['js-ts'] }}
+      kotlin: ${{ steps.filter.outputs.kotlin }}
+      swift: ${{ steps.filter.outputs.swift }}
+      ruby: ${{ steps.filter.outputs.ruby }}
+      php: ${{ steps.filter.outputs.php }}
+      scala: ${{ steps.filter.outputs.scala }}
+      dart: ${{ steps.filter.outputs.dart }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        with:
+          filters: |
+            shared:
+              - ".github/actions/setup-bench/**"
+              - ".github/workflows/benchmark.yml"
+              - ".github/workflows/benchmark-lang.yml"
+              - "benchmarks/corpus.json"
+              - "benchmarks/scripts/**"
+              - "benchmarks/squeezy-graph-bench/**"
+              - "benchmarks/specs/empty-queries.json"
+              - "crates/squeezy-core/**"
+              - "crates/squeezy-workspace/**"
+              - "crates/squeezy-graph/Cargo.toml"
+              - "crates/squeezy-graph/src/lib.rs"
+              - "crates/squeezy-graph/src/cross_file/**"
+              - "crates/squeezy-parse/Cargo.toml"
+              - "crates/squeezy-parse/src/lib.rs"
+              - "Cargo.toml"
+              - "Cargo.lock"
+            rust:
+              - "crates/squeezy-graph/src/languages/rust*.rs"
+              - "crates/squeezy-parse/src/languages/rust*.rs"
+              - "benchmarks/fixtures/rust/**"
+              - "benchmarks/specs/smoke-queries.json"
+            python:
+              - "crates/squeezy-graph/src/languages/python*.rs"
+              - "crates/squeezy-parse/src/languages/python*.rs"
+              - "benchmarks/fixtures/python/**"
+              - "benchmarks/specs/python-*.json"
+            java:
+              - "crates/squeezy-graph/src/languages/java*.rs"
+              - "crates/squeezy-parse/src/languages/java*.rs"
+              - "benchmarks/fixtures/java/**"
+              - "benchmarks/specs/java-*.json"
+            go:
+              - "crates/squeezy-graph/src/languages/go*.rs"
+              - "crates/squeezy-parse/src/languages/go*.rs"
+              - "benchmarks/fixtures/go/**"
+              - "benchmarks/specs/go-*.json"
+            c-family:
+              - "crates/squeezy-graph/src/languages/c_family*.rs"
+              - "crates/squeezy-parse/src/languages/c_family*.rs"
+              - "benchmarks/fixtures/c/**"
+              - "benchmarks/fixtures/cpp/**"
+              - "benchmarks/specs/c-*.json"
+              - "benchmarks/specs/cpp-*.json"
+            csharp:
+              - "crates/squeezy-graph/src/languages/csharp*.rs"
+              - "crates/squeezy-parse/src/languages/csharp*.rs"
+              - "benchmarks/fixtures/csharp/**"
+              - "benchmarks/specs/csharp-*.json"
+              - "benchmarks/oracle/csharp/**"
+            js-ts:
+              - "crates/squeezy-graph/src/languages/js_ts*.rs"
+              - "crates/squeezy-parse/src/languages/js_ts*.rs"
+              - "benchmarks/fixtures/js-ts/**"
+              - "benchmarks/specs/js-ts-*.json"
+            kotlin:
+              - "crates/squeezy-graph/src/languages/kotlin*.rs"
+              - "crates/squeezy-parse/src/languages/kotlin*.rs"
+              - "benchmarks/fixtures/kotlin/**"
+              - "benchmarks/specs/kotlin-*.json"
+              - "benchmarks/oracle/kotlin/**"
+            swift:
+              - "crates/squeezy-graph/src/languages/swift*.rs"
+              - "crates/squeezy-parse/src/languages/swift*.rs"
+              - "benchmarks/fixtures/swift/**"
+              - "benchmarks/specs/swift-*.json"
+              - "benchmarks/baselines/swift.json"
+              - "benchmarks/heuristic-history/swift.jsonl"
+            ruby:
+              - "crates/squeezy-graph/src/languages/ruby*.rs"
+              - "crates/squeezy-parse/src/languages/ruby*.rs"
+              - "benchmarks/fixtures/ruby/**"
+              - "benchmarks/specs/ruby-*.json"
+              - "benchmarks/baselines/ruby.json"
+              - "benchmarks/heuristic-history/ruby.jsonl"
+            php:
+              - "crates/squeezy-graph/src/languages/php*.rs"
+              - "crates/squeezy-parse/src/languages/php*.rs"
+              - "benchmarks/fixtures/php/**"
+              - "benchmarks/specs/php-*.json"
+              - "benchmarks/oracle-helpers/php-oracle/**"
+            scala:
+              - "crates/squeezy-graph/src/languages/scala*.rs"
+              - "crates/squeezy-parse/src/languages/scala*.rs"
+              - "benchmarks/fixtures/scala/**"
+              - "benchmarks/specs/scala-*.json"
+              - "benchmarks/oracle/scala/**"
+              - "benchmarks/baselines/scala.json"
+              - "benchmarks/heuristic-history/scala.jsonl"
+            dart:
+              - "crates/squeezy-graph/src/languages/dart*.rs"
+              - "crates/squeezy-parse/src/languages/dart*.rs"
+              - "benchmarks/fixtures/dart/**"
+              - "benchmarks/specs/dart-*.json"
+              - "benchmarks/oracle-helpers/dart-oracle/**"
+              - "benchmarks/baselines/dart.json"
+              - "benchmarks/heuristic-history/dart.jsonl"
+
   rust-semantic-graph:
     name: Rust semantic graph
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'rust' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'rust' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.rust == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: rust
@@ -95,7 +226,12 @@ jobs:
 
   python-semantic-graph-smoke:
     name: Python semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'python' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'python' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.python == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: python
@@ -105,7 +241,12 @@ jobs:
 
   java-semantic-graph-smoke:
     name: Java semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'java' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'java' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.java == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: java
@@ -115,7 +256,12 @@ jobs:
 
   go-semantic-graph-smoke:
     name: Go semantic graph
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'go' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'go' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.go == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: go
@@ -125,7 +271,12 @@ jobs:
 
   c-family-semantic-graph:
     name: C/C++ semantic graph
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'c-family' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'c-family' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs['c-family'] == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: c-family
@@ -135,7 +286,12 @@ jobs:
 
   csharp-semantic-graph:
     name: C# semantic graph
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'csharp' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'csharp' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.csharp == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: csharp
@@ -145,7 +301,12 @@ jobs:
 
   js-ts-semantic-graph-smoke:
     name: JS/TS semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'js-ts' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'js-ts' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs['js-ts'] == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: js-ts
@@ -160,7 +321,12 @@ jobs:
   # repo's convention for newly-added languages.
   kotlin-semantic-graph-smoke:
     name: Kotlin semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'kotlin' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'kotlin' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.kotlin == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: kotlin
@@ -170,7 +336,12 @@ jobs:
 
   swift-semantic-graph-smoke:
     name: Swift semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'swift' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'swift' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.swift == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: swift
@@ -180,7 +351,12 @@ jobs:
 
   ruby-semantic-graph-smoke:
     name: Ruby semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'ruby' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'ruby' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.ruby == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: ruby
@@ -190,7 +366,12 @@ jobs:
 
   php-semantic-graph-smoke:
     name: PHP semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'php' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'php' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.php == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: php
@@ -200,7 +381,12 @@ jobs:
 
   scala-semantic-graph-smoke:
     name: Scala semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'scala' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'scala' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.scala == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: scala
@@ -210,7 +396,12 @@ jobs:
 
   dart-semantic-graph-smoke:
     name: Dart semantic graph smoke
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'dart' || inputs.language == 'all' }}
+    needs: changes
+    if: >-
+      !cancelled()
+      && ((github.event_name == 'workflow_dispatch' && (inputs.language == 'dart' || inputs.language == 'all'))
+        || github.event_name == 'push'
+        || (github.event_name == 'pull_request' && (needs.changes.outputs.shared == 'true' || needs.changes.outputs.dart == 'true')))
     uses: ./.github/workflows/benchmark-lang.yml
     with:
       language: dart
