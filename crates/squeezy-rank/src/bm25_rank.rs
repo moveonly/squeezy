@@ -5,7 +5,10 @@
 //! tokens. Pure in-tree implementation — no upstream `bm25` crate so
 //! we avoid the unmaintained `fxhash` advisory it pulls in.
 
-use std::collections::HashMap;
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
 /// BM25 saturation parameter. 1.2 is the standard textbook value and
 /// matches what the `bm25` crate uses internally.
@@ -22,6 +25,12 @@ pub struct BM25Doc<'a> {
     pub attributes: &'a str,
 }
 
+#[derive(Debug)]
+struct BM25DocStats<'query> {
+    token_count: usize,
+    term_frequency: HashMap<&'query str, u32>,
+}
+
 /// Rerank `docs` against `query`, returning up to `top_n` `(index, score)`
 /// pairs sorted best-first (higher BM25 score wins).
 pub fn bm25_rerank(docs: &[BM25Doc<'_>], query: &str, top_n: usize) -> Vec<(usize, f32)> {
@@ -33,43 +42,40 @@ pub fn bm25_rerank(docs: &[BM25Doc<'_>], query: &str, top_n: usize) -> Vec<(usiz
         return Vec::new();
     }
 
-    let doc_tokens: Vec<Vec<String>> = docs.iter().map(|doc| tokenize_doc(*doc)).collect();
+    let query_terms: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+    let mut df: HashMap<&str, u32> = HashMap::with_capacity(query_terms.len());
+    let mut total_doc_len = 0usize;
+    let doc_stats: Vec<BM25DocStats<'_>> = docs
+        .iter()
+        .map(|doc| {
+            let stats = collect_doc_stats(*doc, &query_terms, &mut df);
+            total_doc_len += stats.token_count;
+            stats
+        })
+        .collect();
 
-    let n = doc_tokens.len() as f32;
+    let n = doc_stats.len() as f32;
     let avgdl = if n == 0.0 {
         0.0
     } else {
-        doc_tokens.iter().map(|d| d.len() as f32).sum::<f32>() / n
+        total_doc_len as f32 / n
     };
 
-    // doc-frequency: how many docs contain each query token at least once
-    let mut df: HashMap<&str, u32> = HashMap::new();
-    for term in &query_tokens {
-        let count = doc_tokens
-            .iter()
-            .filter(|tokens| tokens.iter().any(|t| t == term))
-            .count() as u32;
-        df.insert(term.as_str(), count);
-    }
-
-    let mut scored: Vec<(usize, f32)> = doc_tokens
+    let mut scored: Vec<(usize, f32)> = doc_stats
         .iter()
         .enumerate()
-        .map(|(idx, tokens)| {
-            let dl = tokens.len() as f32;
+        .map(|(idx, stats)| {
+            let dl = stats.token_count as f32;
             let length_norm = if avgdl > 0.0 { dl / avgdl } else { 1.0 };
-            let mut tf: HashMap<&str, u32> = HashMap::new();
-            for token in tokens {
-                *tf.entry(token.as_str()).or_insert(0) += 1;
-            }
             let score: f32 = query_tokens
                 .iter()
                 .map(|term| {
-                    let term_tf = tf.get(term.as_str()).copied().unwrap_or(0) as f32;
+                    let term = term.as_str();
+                    let term_tf = stats.term_frequency.get(term).copied().unwrap_or(0) as f32;
                     if term_tf == 0.0 {
                         return 0.0;
                     }
-                    let n_qi = df.get(term.as_str()).copied().unwrap_or(0) as f32;
+                    let n_qi = df.get(term).copied().unwrap_or(0) as f32;
                     let idf = ((n - n_qi + 0.5) / (n_qi + 0.5) + 1.0).ln();
                     idf * (term_tf * (K1 + 1.0)) / (term_tf + K1 * (1.0 - B + B * length_norm))
                 })
@@ -79,9 +85,46 @@ pub fn bm25_rerank(docs: &[BM25Doc<'_>], query: &str, top_n: usize) -> Vec<(usiz
         .filter(|(_, score)| *score > 0.0)
         .collect();
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(top_n);
+    sort_top_scores(&mut scored, top_n);
     scored
+}
+
+fn sort_top_scores(scored: &mut Vec<(usize, f32)>, top_n: usize) {
+    if scored.len() > top_n {
+        scored.select_nth_unstable_by(top_n, compare_bm25_scores);
+        scored.truncate(top_n);
+    }
+    scored.sort_by(compare_bm25_scores);
+}
+
+fn compare_bm25_scores(a: &(usize, f32), b: &(usize, f32)) -> Ordering {
+    b.1.partial_cmp(&a.1)
+        .unwrap_or(Ordering::Equal)
+        .then(a.0.cmp(&b.0))
+}
+
+fn collect_doc_stats<'query>(
+    doc: BM25Doc<'_>,
+    query_terms: &HashSet<&'query str>,
+    df: &mut HashMap<&'query str, u32>,
+) -> BM25DocStats<'query> {
+    let mut stats = BM25DocStats {
+        token_count: 0,
+        term_frequency: HashMap::new(),
+    };
+    let mut seen_terms = HashSet::new();
+
+    for_each_doc_token(doc, |token| {
+        stats.token_count += 1;
+        if let Some(&term) = query_terms.get(token) {
+            *stats.term_frequency.entry(term).or_insert(0) += 1;
+            if seen_terms.insert(term) {
+                *df.entry(term).or_insert(0) += 1;
+            }
+        }
+    });
+
+    stats
 }
 
 /// Split on whitespace and identifier separators (`_`, `-`, `/`, `.`,
@@ -96,15 +139,12 @@ fn tokenize(input: &str) -> Vec<String> {
     tokens
 }
 
-fn tokenize_doc(doc: BM25Doc<'_>) -> Vec<String> {
-    let mut tokens = Vec::new();
+fn for_each_doc_token(doc: BM25Doc<'_>, mut visit: impl FnMut(&str)) {
     let mut current = String::new();
-    let mut visit = |token: &str| tokens.push(token.to_owned());
     for part in [doc.signature, doc.docs, doc.attributes] {
         tokenize_part(part, &mut current, &mut visit);
         flush_token(&mut current, &mut visit);
     }
-    tokens
 }
 
 fn tokenize_part(input: &str, current: &mut String, visit: &mut impl FnMut(&str)) {
