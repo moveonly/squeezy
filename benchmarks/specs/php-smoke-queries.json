@@ -48,10 +48,10 @@
     {
       "id": "php-call-chain",
       "kind": "call_chain",
-      "from": "Repository::fetch",
-      "to": "Service::run",
+      "from": "run",
+      "to": "log",
       "expected_contains": [
-        "Repository::fetch -> Service::run"
+        "run -> log"
       ]
     },
     {
@@ -75,8 +75,9 @@
       "id": "php-body-search",
       "kind": "body_search",
       "text": "log",
+      "owner_kind": "Method",
       "expected_contains": [
-        "Method:log"
+        "log:'log: '"
       ]
     },
     {
