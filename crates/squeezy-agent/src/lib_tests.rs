@@ -5354,6 +5354,62 @@ async fn subagent_concurrency_cap_emits_rejected_event() {
 }
 
 #[tokio::test]
+async fn subagent_max_concurrent_override_is_honored_by_executor() {
+    const OVERRIDE_CAP: usize = 6;
+    assert_ne!(OVERRIDE_CAP, SUBAGENT_MAX_CONCURRENT);
+
+    let provider = Arc::new(OneDelegateProvider::new());
+    let config = AppConfig {
+        subagents: SubagentConfig {
+            max_concurrent: OVERRIDE_CAP,
+            ..SubagentConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let registry = agent.subagent_registry_for_test();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..OVERRIDE_CAP {
+        leases.push(
+            registry
+                .start(
+                    roles::SubagentRole::Explorer,
+                    cancel.child_token(),
+                    OVERRIDE_CAP,
+                    format!("pre-saturate {slot}"),
+                )
+                .expect("under-cap start"),
+        );
+    }
+
+    let mut rx = agent.start_turn("delegate now".to_string(), cancel.clone());
+    let mut rejection: Option<(SubagentRejectionReason, usize, usize)> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentRejected {
+                reason,
+                limit,
+                active,
+                ..
+            } => {
+                rejection = Some((reason, limit, active));
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    drop(leases);
+
+    let (reason, limit, active) =
+        rejection.expect("expected a SubagentRejected event when the cap is full");
+    assert_eq!(reason, SubagentRejectionReason::ConcurrencyCap);
+    assert_eq!(limit, OVERRIDE_CAP);
+    assert_eq!(active, OVERRIDE_CAP);
+}
+
+#[tokio::test]
 async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_times_out() {
     use squeezy_core::Redactor;
     use std::sync::Arc;
@@ -8191,4 +8247,38 @@ async fn switch_session_deny_hook_aborts_before_resume_current() {
         initial_session_id,
         "deny must leave the in-process session id untouched",
     );
+}
+
+#[test]
+fn attachment_shape_excludes_removed_stored_bytes() {
+    fn make(id: &str, status: ContextAttachmentStatus, bytes: usize) -> ContextAttachment {
+        ContextAttachment {
+            id: id.to_string(),
+            source: ContextAttachmentSource::Paste,
+            kind: ContextAttachmentKind::Text,
+            status,
+            label: id.to_string(),
+            path: None,
+            original_sha256: String::new(),
+            redacted_sha256: None,
+            original_bytes: bytes,
+            stored_bytes: bytes,
+            preview_bytes: 0,
+            redactions: 0,
+            preview: String::new(),
+            truncated: false,
+            image_media_type: None,
+            image_data_base64: None,
+        }
+    }
+
+    let attachments = vec![
+        make("a", ContextAttachmentStatus::Attached, 1000),
+        make("b", ContextAttachmentStatus::Removed, 500),
+    ];
+    let shape = attachment_shape(&attachments);
+    assert_eq!(shape.stored_bytes, 1000);
+    assert_eq!(shape.active, 1);
+    assert_eq!(shape.removed, 1);
+    assert_eq!(shape.total, 2);
 }

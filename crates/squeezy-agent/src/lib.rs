@@ -126,7 +126,7 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// budget. Eight steps is enough to thread a non-trivial multi-stage
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
-const DELEGATE_CHAIN_MAX_STEPS: usize = 8;
+const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -142,7 +142,8 @@ const SUBAGENT_JSON_TAIL_INSTRUCTION: &str = "Output contract: end your final as
 /// parent Agent. The registry rejects further `start()` calls until an
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
 /// predictable rather than letting a model spawn an unbounded swarm.
-const SUBAGENT_MAX_CONCURRENT: usize = 4;
+#[allow(dead_code)]
+const SUBAGENT_MAX_CONCURRENT: usize = squeezy_core::DEFAULT_SUBAGENT_MAX_CONCURRENT;
 // Compaction summary truncation budget — survivor policy chunk for the
 // SUMMARY_BLOCK family. Sister budgets live in `context_compaction.rs`;
 // this one stays here because it is *also* used by
@@ -7291,7 +7292,7 @@ async fn run_subagent_dispatch(
     let lease = match context.subagents.start(
         kind.role().unwrap_or(SubagentRole::Explorer),
         child_cancel.clone(),
-        SUBAGENT_MAX_CONCURRENT,
+        context.config.subagents.max_concurrent.max(1),
         format!("{} starting", kind.as_str()),
     ) {
         Ok(lease) => lease,
@@ -9492,7 +9493,7 @@ async fn flush_delegate_batch(
             .await;
     }
 
-    let cap = SUBAGENT_MAX_CONCURRENT.max(1);
+    let cap = context.config.subagents.max_concurrent.max(1);
     let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
@@ -11676,10 +11677,12 @@ fn attachment_shape(attachments: &[ContextAttachment]) -> AttachmentShape {
         ..AttachmentShape::default()
     };
     for attachment in attachments {
-        shape.stored_bytes += attachment.stored_bytes;
         shape.redactions += attachment.redactions;
         match attachment.status {
-            ContextAttachmentStatus::Attached => shape.active += 1,
+            ContextAttachmentStatus::Attached => {
+                shape.active += 1;
+                shape.stored_bytes += attachment.stored_bytes;
+            }
             ContextAttachmentStatus::Removed => shape.removed += 1,
             ContextAttachmentStatus::Unsupported => shape.unsupported += 1,
         }

@@ -46,7 +46,7 @@ use crate::{
 
 pub(crate) const DEFAULT_PATCH_MAX_SYMBOLS: usize = 8;
 pub(crate) const DEFAULT_PATCH_MAX_RELATED: usize = 12;
-pub(crate) const MAX_PATCH_BLOCKS: usize = 32;
+pub(crate) const MAX_PATCH_BLOCKS: usize = 64;
 pub(crate) const PATCH_SNIPPET_MAX_CHARS: usize = 2_000;
 
 pub(crate) const PATCH_PLAN_TTL: Duration = Duration::from_secs(30 * 60);

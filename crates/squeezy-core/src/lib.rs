@@ -196,7 +196,7 @@ pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
-pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 16;
 // Per-turn aggregate budgets across every tool the agent runs in a
 // single turn. These defaults are sized so they never bind in realistic
 // use; users who want strict cost caps can set tighter values in
@@ -233,6 +233,11 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
+/// Maximum number of subagents that may be active at once for a single
+/// parent Agent. The registry rejects further `start()` calls until an
+/// in-flight subagent finishes (lease drops). Keeps fanout flat and
+/// predictable rather than letting a model spawn an unbounded swarm.
+pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: usize = 20;
 // Emergency belt on subagent model rounds. Plan/Delegate/Review
 // subagents run full agent work, sized to match what real long-running
 // agent sessions reach in practice. The cost broker, cancellation
@@ -246,7 +251,7 @@ pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 1_000;
 // median Explore/Plan/Review run while still guaranteeing the parent's turn
 // loop reclaims control on the order of minutes. Set to `0` in TOML or
 // `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0` to disable.
-pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 300;
+pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 900;
 // Generous default sized for Plan/Delegate/Review summaries under a
 // reasoning model: thinking tokens burn first, then the actual summary.
 // 64K leaves room for both across every model we ship a preset for. The
@@ -278,7 +283,7 @@ pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
 /// default so an idle workspace keeps roughly 60 days of recoverable
 /// history (30 live + 30 archived) without manual intervention.
 pub const DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS: u64 = 30;
-pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
+pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 131_072;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 // Absolute fallback for the per-turn compaction trigger when
@@ -289,16 +294,16 @@ pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
 // unknown-model case.
 pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 60_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
-pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
+pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 10;
 pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
-pub const DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES: usize = 16_384;
-pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 8_192;
+pub const DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES: usize = 32_768;
+pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 16_384;
 /// Trigger mid-turn compaction once the provider-reported total token usage
 /// reaches this fraction of `model_context_window` (out of 100).
 pub const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT: u8 = 80;
 /// Max output tokens to request when the model-assisted compaction strategy
 /// is active.
-pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS: u32 = 500;
+pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS: u32 = 1_500;
 /// Timeout for a single model-assisted compaction round-trip. On expiry the
 /// pipeline falls back to the extractive summary.
 pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS: u64 = 30;
@@ -1160,6 +1165,10 @@ impl AppConfig {
         if let Some(model) = &self.subagents.explore_model {
             output.push_str(&format!("explore_model = {}\n", toml_string(model)));
         }
+        output.push_str(&format!(
+            "max_concurrent = {}\n",
+            self.subagents.max_concurrent
+        ));
         output.push_str(&format!(
             "max_tool_calls_per_call = {}\n",
             self.subagents.max_tool_calls_per_call
@@ -3740,6 +3749,7 @@ pub struct SubagentSettings {
     pub enabled: Option<bool>,
     pub explore_enabled: Option<bool>,
     pub explore_model: Option<String>,
+    pub max_concurrent: Option<usize>,
     pub max_tool_calls_per_call: Option<u64>,
     pub max_tool_bytes_read_per_call: Option<u64>,
     pub max_search_files_per_call: Option<u64>,
@@ -3757,6 +3767,7 @@ impl SubagentSettings {
                 "enabled",
                 "explore_enabled",
                 "explore_model",
+                "max_concurrent",
                 "max_tool_calls_per_call",
                 "max_tool_bytes_read_per_call",
                 "max_search_files_per_call",
@@ -3781,6 +3792,12 @@ impl SubagentSettings {
                 "explore_model",
                 source,
                 &field(path, "explore_model"),
+            )?,
+            max_concurrent: usize_value(
+                table,
+                "max_concurrent",
+                source,
+                &field(path, "max_concurrent"),
             )?,
             max_tool_calls_per_call: u64_value(
                 table,
@@ -3831,6 +3848,7 @@ impl SubagentSettings {
         replace_if_some(&mut self.enabled, next.enabled);
         replace_if_some(&mut self.explore_enabled, next.explore_enabled);
         replace_if_some(&mut self.explore_model, next.explore_model);
+        replace_if_some(&mut self.max_concurrent, next.max_concurrent);
         replace_if_some(
             &mut self.max_tool_calls_per_call,
             next.max_tool_calls_per_call,
@@ -3855,6 +3873,7 @@ pub struct SubagentConfig {
     pub enabled: bool,
     pub explore_enabled: bool,
     pub explore_model: Option<String>,
+    pub max_concurrent: usize,
     pub max_tool_calls_per_call: u64,
     pub max_tool_bytes_read_per_call: u64,
     pub max_search_files_per_call: u64,
@@ -3889,6 +3908,15 @@ impl SubagentConfig {
             explore_model: get_var("SQUEEZY_EXPLORE_MODEL")
                 .or(settings.explore_model)
                 .filter(|value| !value.trim().is_empty()),
+            max_concurrent: {
+                let raw = parse_usize(
+                    get_var("SQUEEZY_SUBAGENT_MAX_CONCURRENT"),
+                    settings
+                        .max_concurrent
+                        .unwrap_or(DEFAULT_SUBAGENT_MAX_CONCURRENT),
+                );
+                raw.max(1)
+            },
             max_tool_calls_per_call: parse_u64(
                 get_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL"),
                 settings
@@ -3939,6 +3967,7 @@ impl Default for SubagentConfig {
             enabled: true,
             explore_enabled: true,
             explore_model: None,
+            max_concurrent: DEFAULT_SUBAGENT_MAX_CONCURRENT,
             max_tool_calls_per_call: DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
             max_tool_bytes_read_per_call: DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
             max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
@@ -7582,6 +7611,7 @@ pub fn user_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
+# max_concurrent = 4           # maximum parallel subagents per parent agent
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
@@ -7798,6 +7828,7 @@ pub fn project_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
+# max_concurrent = 4           # maximum parallel subagents per parent agent
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000

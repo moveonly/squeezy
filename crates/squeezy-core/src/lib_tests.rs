@@ -139,7 +139,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert!(config.hardening.deny_debug_attach);
     assert!(!config.store_responses);
     assert!(config.exploration_compiler);
-    assert_eq!(config.max_parallel_tools, 8);
+    assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
     assert_eq!(
