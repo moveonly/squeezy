@@ -10165,9 +10165,9 @@ async fn run_one_tool(
         // Graph cold-start: when the tool registry returns the
         // `fallback.status = "graph_indexing"` sentinel introduced in
         // `fddd56e7`, retry once after a short wait. The underlying
-        // dispatcher already waits up to `GRAPH_READY_WAIT` (30s) on
-        // the first attempt; this retry covers the narrow window where
-        // the indexer finishes a fraction of a second after that wait
+        // dispatcher already waits up to `GRAPH_READY_WAIT` on the
+        // first attempt; this retry covers the narrow window where the
+        // indexer finishes a fraction of a second after that wait
         // closed. The cap of one retry keeps the agent from looping
         // when the indexer is genuinely backlogged — the second result,
         // whatever it is, is surfaced to the model as-is.
@@ -10258,7 +10258,7 @@ const TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 /// Wait between the first attempt and a single transparent retry when a
 /// graph tool returns `fallback.status = "graph_indexing"`. The
 /// underlying tool registry already burns up to `GRAPH_READY_WAIT`
-/// (30s) waiting for the cold-start indexer; this short follow-up sleep
+/// waiting for the cold-start indexer; this short follow-up sleep
 /// covers the common case where the indexer finishes a fraction of a
 /// second after the first attempt's wait window closes. Total agent-
 /// side wait per call is bounded by one sleep here.

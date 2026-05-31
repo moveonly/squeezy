@@ -159,11 +159,15 @@ pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// Upper bound a graph tool waits for the deferred
 /// `GraphManager::open_with_store` background task to finish before it
-/// falls back to `graph_unavailable_result`. Generous enough to cover
-/// cold crawls of large repos; capped so a pathological hang (e.g.
-/// fsync stall on a misconfigured filesystem) can't strand the model
-/// indefinitely.
-pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(30);
+/// falls back to `graph_unavailable_result`. Tuned to be short enough
+/// that a slow cold-open on a large monorepo (akka/akka, ~4.7k files)
+/// doesn't strand every graph tool call behind a multi-second wait —
+/// once the bg task finishes the condvar fires and subsequent calls
+/// return instantly, so the model only pays this wait on the very first
+/// graph tool of a session. Most projects open in well under this
+/// window; slow-opening ones surface `graph_indexing` quickly and the
+/// model falls back to grep without burning a wall-time budget waiting.
+pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
 pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 50;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
