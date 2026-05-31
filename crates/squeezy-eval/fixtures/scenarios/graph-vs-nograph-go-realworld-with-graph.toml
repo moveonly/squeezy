@@ -1,18 +1,29 @@
 id = "graph-vs-nograph-go-realworld-with-graph"
-title = "spf13/cobra *Command setter audit — with graph (openai mini)"
+title = "spf13/cobra cross-package *Command method audit — with graph (openai mini)"
 description = """
-Realistic Go A/B half. Audits every method on `*Command` in
-`spf13/cobra` whose name starts with `Set` (the setter surface a
-config-builder migration would have to cover). Ground truth is 17
-methods, all defined in `command.go`. The task is multi-step:
-  1. enumerate every `Set*` method on `*Command`
-  2. read each body
-  3. classify whether the body mutates ONLY fields of the receiver
-     `c`, or whether it also touches another `*Command` instance
-     (via `c.Root()`, `c.helpCommand`, child commands in a loop, etc.)
-Graph tooling can resolve the receiver type and batch the bodies;
-grep alone has to filter out non-`*Command` `Set*` methods on
-helpers like `FlagSet` and read each body manually.
+Realistic Go A/B half. Enumerates every exported method on
+`*cobra.Command` that is invoked from the cross-package `doc/`
+directory in `spf13/cobra`. For each method the model must report
+the cobra-root file + line where the method is defined plus the
+sorted set of `doc/*.go` files that call it. Ground truth is 14
+methods, all defined in `command.go`, spanning 5 caller files
+(`doc/man_docs.go`, `doc/md_docs.go`, `doc/rest_docs.go`,
+`doc/util.go`, `doc/yaml_docs.go`).
+
+The task is intentionally multi-step + cross-package:
+  1. enumerate every method call on a `*cobra.Command` receiver
+     under `doc/` — the receivers vary (`cmd`, `c`, `child`,
+     `parent`, `command`, indexed `s[i]`)
+  2. resolve each method to its definition in the cobra root
+     package (need to filter out methods that are on other
+     receiver types like `*pflag.FlagSet`)
+  3. record the per-method set of `doc/` files that call it
+Graph tooling can answer per-method via `reference_search` and
+read the definition with `decl_search`. Grep alone has to (a)
+enumerate distinct method names from `doc/` lexically, (b) decide
+which receivers are `*cobra.Command` (which is not visible from a
+single grep line), and (c) re-grep each method individually to
+collect caller files.
 """
 
 [workspace.github]
@@ -37,33 +48,40 @@ max_tool_calls_per_turn = 48
 [[steps]]
 kind = "prompt"
 text = """
-Audit every method defined on the receiver type `*Command` in the
-`spf13/cobra` repo whose name starts with `Set` (capital S followed
-by an uppercase letter). Include every such method, including the
-one marked Deprecated.
+Audit every distinct exported method on the receiver type
+`*cobra.Command` that is invoked anywhere in the cross-package
+`doc/` directory of the `spf13/cobra` repo. An exported method
+starts with an uppercase letter; the method is on `*cobra.Command`
+when its receiver value is itself a `*cobra.Command` — this
+includes obvious receivers (`cmd *cobra.Command`, `command
+*cobra.Command`), traversal variables (`c` inside a `VisitParents`
+callback or `for _, c := range cmd.Commands()`), `child` from a
+range over `children := cmd.Commands()`, the result of
+`cmd.Parent()`, and the indexed `s[i]` / `s[j]` where `s` is a
+`[]*cobra.Command` slice.
 
 Exclude:
-  - Methods on any other receiver type (e.g. `*FlagSet`,
-    `*Group`, etc.).
-  - Files ending in `_test.go`.
+  - Methods on any other receiver type (e.g. `*pflag.FlagSet`,
+    package-level helpers like `cobra.WriteStringAndCheck`, std-lib
+    methods like `strings.ReplaceAll`, `fmt.Fprintf`).
+  - Anything inside a file ending in `_test.go`.
   - Doc comments and `//` lines.
+  - Package-level functions on `cobra` (only methods on the
+    `*Command` receiver count).
 
-For each method give exactly four fields, one per line per method,
+For each method emit exactly four fields, one per line per method,
 separated by a blank line between methods:
-  - `name`: method name (e.g. `SetContext`)
-  - `file`: path relative to repo root
-  - `line`: 1-based line number of the `func` keyword in the
+  - `name`: the method name (e.g. `CommandPath`)
+  - `def_file`: path relative to repo root of the file that
+    contains the `func (... *Command) <name>(...)` declaration
+  - `def_line`: 1-based line number of the `func` keyword in that
     declaration
-  - `scope`: one of
-      * `self`   — body writes ONLY to fields of the receiver `c`
-      * `other`  — body writes to a field of a different `*Command`
-                   instance reached via `c.Root()`, `c.helpCommand`,
-                   iteration over `c.commands`, or any other
-                   non-self path. A recursive call to the same
-                   setter on a different `*Command` also counts as
-                   `other`.
+  - `caller_files`: comma-separated, sorted list of `doc/` files
+    that contain at least one call to this method (e.g.
+    `doc/man_docs.go,doc/md_docs.go,doc/rest_docs.go,doc/yaml_docs.go`)
 
-Output as a compact plain-text list. No prose, no extra commentary.
+Sort the method blocks alphabetically by `name`. Output as a
+compact plain-text list. No prose, no extra commentary.
 """
 
 [expect]

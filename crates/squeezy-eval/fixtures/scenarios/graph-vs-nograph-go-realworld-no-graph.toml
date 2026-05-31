@@ -1,11 +1,15 @@
 id = "graph-vs-nograph-go-realworld-no-graph"
-title = "spf13/cobra *Command setter audit — no graph (openai mini)"
+title = "spf13/cobra cross-package *Command method audit — no graph (openai mini)"
 description = """
 No-graph half of the realistic Go A/B. Same prompt and model as
 `graph-vs-nograph-go-realworld-with-graph.toml` but with the entire
 semantic graph tool family excluded. The model must rely on `grep`,
-`glob`, and `read_file` to enumerate setters, filter out non-Command
-matches, and read each body to classify `self` vs `other`.
+`glob`, and `read_file` to (a) enumerate distinct exported method
+names called in `doc/`, (b) confirm each receiver is
+`*cobra.Command` (and not `*pflag.FlagSet`, `cobra` package-level,
+or a stdlib type), (c) locate each method's definition in the
+cobra root package, and (d) collect the per-method caller-file
+set. With no graph, each of these is a separate lexical sweep.
 """
 
 [workspace.github]
@@ -47,33 +51,40 @@ SQUEEZY_EXPLORATION_COMPILER = "0"
 [[steps]]
 kind = "prompt"
 text = """
-Audit every method defined on the receiver type `*Command` in the
-`spf13/cobra` repo whose name starts with `Set` (capital S followed
-by an uppercase letter). Include every such method, including the
-one marked Deprecated.
+Audit every distinct exported method on the receiver type
+`*cobra.Command` that is invoked anywhere in the cross-package
+`doc/` directory of the `spf13/cobra` repo. An exported method
+starts with an uppercase letter; the method is on `*cobra.Command`
+when its receiver value is itself a `*cobra.Command` — this
+includes obvious receivers (`cmd *cobra.Command`, `command
+*cobra.Command`), traversal variables (`c` inside a `VisitParents`
+callback or `for _, c := range cmd.Commands()`), `child` from a
+range over `children := cmd.Commands()`, the result of
+`cmd.Parent()`, and the indexed `s[i]` / `s[j]` where `s` is a
+`[]*cobra.Command` slice.
 
 Exclude:
-  - Methods on any other receiver type (e.g. `*FlagSet`,
-    `*Group`, etc.).
-  - Files ending in `_test.go`.
+  - Methods on any other receiver type (e.g. `*pflag.FlagSet`,
+    package-level helpers like `cobra.WriteStringAndCheck`, std-lib
+    methods like `strings.ReplaceAll`, `fmt.Fprintf`).
+  - Anything inside a file ending in `_test.go`.
   - Doc comments and `//` lines.
+  - Package-level functions on `cobra` (only methods on the
+    `*Command` receiver count).
 
-For each method give exactly four fields, one per line per method,
+For each method emit exactly four fields, one per line per method,
 separated by a blank line between methods:
-  - `name`: method name (e.g. `SetContext`)
-  - `file`: path relative to repo root
-  - `line`: 1-based line number of the `func` keyword in the
+  - `name`: the method name (e.g. `CommandPath`)
+  - `def_file`: path relative to repo root of the file that
+    contains the `func (... *Command) <name>(...)` declaration
+  - `def_line`: 1-based line number of the `func` keyword in that
     declaration
-  - `scope`: one of
-      * `self`   — body writes ONLY to fields of the receiver `c`
-      * `other`  — body writes to a field of a different `*Command`
-                   instance reached via `c.Root()`, `c.helpCommand`,
-                   iteration over `c.commands`, or any other
-                   non-self path. A recursive call to the same
-                   setter on a different `*Command` also counts as
-                   `other`.
+  - `caller_files`: comma-separated, sorted list of `doc/` files
+    that contain at least one call to this method (e.g.
+    `doc/man_docs.go,doc/md_docs.go,doc/rest_docs.go,doc/yaml_docs.go`)
 
-Output as a compact plain-text list. No prose, no extra commentary.
+Sort the method blocks alphabetically by `name`. Output as a
+compact plain-text list. No prose, no extra commentary.
 """
 
 [expect]
