@@ -33,20 +33,7 @@ pub fn bm25_rerank(docs: &[BM25Doc<'_>], query: &str, top_n: usize) -> Vec<(usiz
         return Vec::new();
     }
 
-    let doc_tokens: Vec<Vec<String>> = docs
-        .iter()
-        .map(|doc| {
-            let mut combined = String::with_capacity(
-                doc.signature.len() + doc.docs.len() + doc.attributes.len() + 2,
-            );
-            combined.push_str(doc.signature);
-            combined.push(' ');
-            combined.push_str(doc.docs);
-            combined.push(' ');
-            combined.push_str(doc.attributes);
-            tokenize(&combined)
-        })
-        .collect();
+    let doc_tokens: Vec<Vec<String>> = docs.iter().map(|doc| tokenize_doc(*doc)).collect();
 
     let n = doc_tokens.len() as f32;
     let avgdl = if n == 0.0 {
@@ -103,6 +90,24 @@ pub fn bm25_rerank(docs: &[BM25Doc<'_>], query: &str, top_n: usize) -> Vec<(usiz
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut visit = |token: &str| tokens.push(token.to_owned());
+    tokenize_part(input, &mut current, &mut visit);
+    flush_token(&mut current, &mut visit);
+    tokens
+}
+
+fn tokenize_doc(doc: BM25Doc<'_>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut visit = |token: &str| tokens.push(token.to_owned());
+    for part in [doc.signature, doc.docs, doc.attributes] {
+        tokenize_part(part, &mut current, &mut visit);
+        flush_token(&mut current, &mut visit);
+    }
+    tokens
+}
+
+fn tokenize_part(input: &str, current: &mut String, visit: &mut impl FnMut(&str)) {
     for ch in input.chars() {
         let is_sep = ch.is_whitespace()
             || matches!(
@@ -140,17 +145,18 @@ fn tokenize(input: &str) -> Vec<String> {
                     | '\\'
             );
         if is_sep {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
+            flush_token(current, visit);
             continue;
         }
         current.extend(ch.to_lowercase());
     }
+}
+
+fn flush_token(current: &mut String, visit: &mut impl FnMut(&str)) {
     if !current.is_empty() {
-        tokens.push(current);
+        visit(current);
+        current.clear();
     }
-    tokens
 }
 
 #[cfg(test)]
