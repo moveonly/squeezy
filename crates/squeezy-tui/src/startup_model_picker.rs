@@ -1,8 +1,7 @@
-//! Startup model/provider picker.
+//! Startup setup picker.
 //!
-//! This is the first-run setup sibling of the resume picker. It deliberately
-//! uses ratatui instead of stdio prompts so interactive startup stays inside
-//! one visual surface.
+//! First-run setup deliberately stays inside the TUI surface: theme is
+//! selected first and applied before provider/model pages render.
 
 use std::{io, path::Path};
 
@@ -11,11 +10,14 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use squeezy_core::ReasoningEffort;
+use squeezy_core::{
+    AppConfig, ReasoningEffort,
+    settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
+};
 
 use crate::render::theme;
 
@@ -27,9 +29,43 @@ const REASONING_EFFORTS: [ReasoningEffort; 4] = [
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupThemeChoice {
+    pub name: String,
+    pub label: String,
+    pub action: StartupThemeAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupThemeAction {
+    Select,
+    ConfigureInConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupModelPickerProvider {
     pub label: String,
+    pub credential: StartupProviderCredential,
     pub models: Vec<StartupModelPickerModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupProviderCredential {
+    Configured,
+    NeedsConfig { env_var: String },
+    NotRequired,
+}
+
+impl StartupProviderCredential {
+    fn needs_config(&self) -> bool {
+        matches!(self, Self::NeedsConfig { .. })
+    }
+
+    fn env_var(&self) -> Option<&str> {
+        match self {
+            Self::NeedsConfig { env_var } => Some(env_var),
+            Self::Configured | Self::NotRequired => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,40 +76,103 @@ pub struct StartupModelPickerModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupModelPickerSelection {
+    pub theme: String,
     pub provider_index: usize,
     pub model_index: usize,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub open_theme_config: bool,
+    pub open_model_config: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupModelPickerResult {
+    Selected(StartupModelPickerSelection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerStep {
+    Theme,
     Provider,
+    Key,
     Model,
     Reasoning,
 }
 
+impl PickerStep {
+    const fn prompt(self) -> &'static str {
+        match self {
+            Self::Theme => "Choose a theme",
+            Self::Provider => "Choose a provider",
+            Self::Key => "Add provider key",
+            Self::Model => "Choose a model",
+            Self::Reasoning => "Choose reasoning effort",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupModelPickerState {
+    themes: Vec<StartupThemeChoice>,
     choices: Vec<StartupModelPickerProvider>,
+    initial_theme: String,
+    trailing_question_count: usize,
     step: PickerStep,
+    theme_cursor: usize,
     provider_cursor: usize,
+    key_cursor: usize,
     model_cursor: usize,
     effort_cursor: usize,
 }
 
 impl StartupModelPickerState {
-    fn new(choices: Vec<StartupModelPickerProvider>) -> Self {
+    fn new(
+        themes: Vec<StartupThemeChoice>,
+        choices: Vec<StartupModelPickerProvider>,
+        initial_theme: &str,
+        trailing_question_count: usize,
+    ) -> Self {
+        let theme_cursor = themes
+            .iter()
+            .position(|choice| choice.name == initial_theme)
+            .unwrap_or(0);
         Self {
+            themes,
             choices,
-            step: PickerStep::Provider,
+            initial_theme: initial_theme.to_string(),
+            trailing_question_count,
+            step: PickerStep::Theme,
+            theme_cursor,
             provider_cursor: 0,
+            key_cursor: 0,
             model_cursor: 0,
             effort_cursor: 1,
         }
     }
 
+    fn theme(&self) -> Option<&StartupThemeChoice> {
+        self.themes.get(self.theme_cursor)
+    }
+
+    fn theme_action(&self) -> StartupThemeAction {
+        self.theme()
+            .map(|theme| theme.action)
+            .unwrap_or(StartupThemeAction::Select)
+    }
+
+    fn selected_theme_name(&self) -> Option<&str> {
+        self.theme().and_then(|theme| match theme.action {
+            StartupThemeAction::Select => Some(theme.name.as_str()),
+            StartupThemeAction::ConfigureInConfig => None,
+        })
+    }
+
     fn provider(&self) -> Option<&StartupModelPickerProvider> {
         self.choices.get(self.provider_cursor)
+    }
+
+    fn provider_needs_key_config(&self) -> bool {
+        self.provider()
+            .is_some_and(|provider| provider.credential.needs_config())
     }
 
     fn selected_model(&self) -> Option<&StartupModelPickerModel> {
@@ -86,9 +185,32 @@ impl StartupModelPickerState {
             .is_some_and(|model| model.reasoning_effort)
     }
 
+    fn visible_steps(&self) -> Vec<PickerStep> {
+        let mut steps = vec![PickerStep::Theme, PickerStep::Provider];
+        if self.provider_needs_key_config() {
+            steps.push(PickerStep::Key);
+        }
+        steps.push(PickerStep::Model);
+        if self.selected_model_requires_reasoning() {
+            steps.push(PickerStep::Reasoning);
+        }
+        steps
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        let steps = self.visible_steps();
+        let index = steps
+            .iter()
+            .position(|step| *step == self.step)
+            .unwrap_or(0);
+        (index + 1, steps.len() + self.trailing_question_count)
+    }
+
     fn move_cursor(&mut self, delta: isize) {
         let len = match self.step {
+            PickerStep::Theme => self.themes.len(),
             PickerStep::Provider => self.choices.len(),
+            PickerStep::Key => key_options(self).len(),
             PickerStep::Model => self
                 .provider()
                 .map(|provider| provider.models.len())
@@ -99,7 +221,9 @@ impl StartupModelPickerState {
             return;
         }
         let cursor = match self.step {
+            PickerStep::Theme => &mut self.theme_cursor,
             PickerStep::Provider => &mut self.provider_cursor,
+            PickerStep::Key => &mut self.key_cursor,
             PickerStep::Model => &mut self.model_cursor,
             PickerStep::Reasoning => &mut self.effort_cursor,
         };
@@ -107,20 +231,41 @@ impl StartupModelPickerState {
         *cursor = ((*cursor as isize + delta).rem_euclid(len)) as usize;
         if self.step == PickerStep::Provider {
             self.model_cursor = 0;
+            self.key_cursor = 0;
         }
     }
 
     fn go_left(&mut self) {
         self.step = match self.step {
-            PickerStep::Provider => PickerStep::Provider,
+            PickerStep::Theme => PickerStep::Theme,
+            PickerStep::Provider => PickerStep::Theme,
+            PickerStep::Key => PickerStep::Provider,
+            PickerStep::Model if self.provider_needs_key_config() => PickerStep::Key,
             PickerStep::Model => PickerStep::Provider,
             PickerStep::Reasoning => PickerStep::Model,
         };
     }
 
-    fn go_right_or_finish(&mut self) -> Option<StartupModelPickerSelection> {
+    fn go_right_or_finish(&mut self) -> Option<PickerOutcome> {
         match self.step {
+            PickerStep::Theme => {
+                if self.theme_action() == StartupThemeAction::ConfigureInConfig {
+                    self.step = PickerStep::Provider;
+                    return None;
+                }
+                let theme = self.selected_theme_name()?.to_string();
+                self.step = PickerStep::Provider;
+                Some(PickerOutcome::ApplyTheme(theme))
+            }
             PickerStep::Provider => {
+                if self.provider_needs_key_config() {
+                    self.step = PickerStep::Key;
+                    return None;
+                }
+                self.step = PickerStep::Model;
+                None
+            }
+            PickerStep::Key => {
                 self.step = PickerStep::Model;
                 None
             }
@@ -128,17 +273,25 @@ impl StartupModelPickerState {
                 self.step = PickerStep::Reasoning;
                 None
             }
-            PickerStep::Model | PickerStep::Reasoning => Some(self.selection()),
+            PickerStep::Model | PickerStep::Reasoning => {
+                Some(PickerOutcome::Selected(self.selection()))
+            }
         }
     }
 
     fn selection(&self) -> StartupModelPickerSelection {
         StartupModelPickerSelection {
+            theme: self
+                .selected_theme_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| self.initial_theme.clone()),
             provider_index: self.provider_cursor,
             model_index: self.model_cursor,
             reasoning_effort: self
                 .selected_model_requires_reasoning()
                 .then(|| REASONING_EFFORTS[self.effort_cursor]),
+            open_theme_config: self.theme_action() == StartupThemeAction::ConfigureInConfig,
+            open_model_config: self.provider_needs_key_config(),
         }
     }
 
@@ -148,20 +301,26 @@ impl StartupModelPickerState {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Up, _) => {
+                let preview = self.step == PickerStep::Theme;
                 self.move_cursor(-1);
-                None
+                preview
+                    .then(|| self.selected_theme_name().map(str::to_string))
+                    .flatten()
+                    .map(PickerOutcome::PreviewTheme)
             }
             (KeyCode::Down, _) => {
+                let preview = self.step == PickerStep::Theme;
                 self.move_cursor(1);
-                None
+                preview
+                    .then(|| self.selected_theme_name().map(str::to_string))
+                    .flatten()
+                    .map(PickerOutcome::PreviewTheme)
             }
             (KeyCode::Left, _) => {
                 self.go_left();
                 None
             }
-            (KeyCode::Right, _) | (KeyCode::Enter, _) => {
-                self.go_right_or_finish().map(PickerOutcome::Selected)
-            }
+            (KeyCode::Right, _) | (KeyCode::Enter, _) => self.go_right_or_finish(),
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => {
                 Some(PickerOutcome::Quit)
             }
@@ -173,24 +332,43 @@ impl StartupModelPickerState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PickerOutcome {
+    PreviewTheme(String),
+    ApplyTheme(String),
     Selected(StartupModelPickerSelection),
     Quit,
 }
 
 pub(crate) fn run_picker<W: io::Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
+    config: &AppConfig,
     settings_path: &Path,
+    themes: Vec<StartupThemeChoice>,
     choices: Vec<StartupModelPickerProvider>,
-) -> io::Result<Option<StartupModelPickerSelection>> {
-    let mut state = StartupModelPickerState::new(choices);
-    if state.choices.is_empty() {
+    trailing_question_count: usize,
+) -> io::Result<Option<StartupModelPickerResult>> {
+    let mut state =
+        StartupModelPickerState::new(themes, choices, &config.tui.theme, trailing_question_count);
+    if state.themes.is_empty() || state.choices.is_empty() {
         return Ok(None);
     }
     loop {
         terminal.draw(|frame| render_picker(frame, &state, settings_path))?;
         match event::read()? {
             Event::Key(key) => match state.dispatch(key) {
-                Some(PickerOutcome::Selected(selection)) => return Ok(Some(selection)),
+                Some(PickerOutcome::PreviewTheme(theme)) => {
+                    let mut next = config.clone();
+                    next.tui.theme = theme;
+                    crate::apply_theme_overrides(&next);
+                }
+                Some(PickerOutcome::ApplyTheme(theme)) => {
+                    persist_theme(settings_path, &theme)?;
+                    let mut next = config.clone();
+                    next.tui.theme = theme;
+                    crate::apply_theme_overrides(&next);
+                }
+                Some(PickerOutcome::Selected(selection)) => {
+                    return Ok(Some(StartupModelPickerResult::Selected(selection)));
+                }
                 Some(PickerOutcome::Quit) => return Ok(None),
                 None => {}
             },
@@ -198,6 +376,18 @@ pub(crate) fn run_picker<W: io::Write>(
             _ => continue,
         }
     }
+}
+
+fn persist_theme(settings_path: &Path, theme: &str) -> io::Result<()> {
+    apply_edits(
+        &SettingsScope::user(settings_path),
+        &[SettingsEdit {
+            path: &["tui", "theme"],
+            op: EditOp::SetString(theme.to_string()),
+        }],
+    )
+    .map(|_| ())
+    .map_err(|err| io::Error::other(err.to_string()))
 }
 
 fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState, path: &Path) {
@@ -214,7 +404,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", Style::default().fg(theme::quiet())),
-        Span::styled("setup defaults", Style::default().fg(Color::White)),
+        Span::styled("first run setup", Style::default().fg(theme::foreground())),
         Span::raw(" "),
     ]);
     let block = Block::default()
@@ -231,14 +421,14 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState
         .margin(1)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(2),
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(inner);
 
-    frame.render_widget(Paragraph::new(render_step_line(state)), layout[0]);
+    frame.render_widget(Paragraph::new(render_question_line(state)), layout[0]);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("save ", Style::default().fg(theme::quiet())),
@@ -246,47 +436,46 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState
                 path.display().to_string(),
                 Style::default().fg(theme::path_hint()),
             ),
-            Span::styled(" · env var names only", Style::default().fg(theme::quiet())),
-        ])),
+        ]))
+        .wrap(Wrap { trim: false }),
         layout[1],
     );
-    frame.render_widget(Paragraph::new(render_selection_summary(state)), layout[2]);
     frame.render_widget(
-        Paragraph::new(render_choice_rows(state, usize::from(layout[3].height))),
+        Paragraph::new(render_selection_summary(state)).wrap(Wrap { trim: false }),
+        layout[2],
+    );
+    frame.render_widget(
+        Paragraph::new(render_choice_rows(state, usize::from(layout[3].height)))
+            .wrap(Wrap { trim: false }),
         layout[3],
     );
-    frame.render_widget(Paragraph::new(render_footer(state)), layout[4]);
+    frame.render_widget(
+        Paragraph::new(render_footer(state)).wrap(Wrap { trim: false }),
+        layout[4],
+    );
 }
 
-fn render_step_line(state: &StartupModelPickerState) -> Line<'static> {
-    let provider_active = state.step == PickerStep::Provider;
-    let model_active = state.step == PickerStep::Model;
-    let reasoning_active = state.step == PickerStep::Reasoning;
+fn render_question_line(state: &StartupModelPickerState) -> Line<'static> {
+    let (current, total) = state.progress();
     Line::from(vec![
-        step_span("1 provider", provider_active),
-        Span::styled("  ", Style::default()),
-        step_span("2 model", model_active),
-        Span::styled("  ", Style::default()),
-        step_span("3 reasoning", reasoning_active),
-        Span::styled("  ", Style::default()),
-        Span::styled("then resume", Style::default().fg(theme::quiet())),
-    ])
-}
-
-fn step_span(label: &'static str, active: bool) -> Span<'static> {
-    if active {
         Span::styled(
-            format!("▸ {label}"),
+            format!("Question {current}/{total} "),
             Style::default()
                 .fg(theme::secondary())
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(format!("  {label}"), Style::default().fg(theme::quiet()))
-    }
+        ),
+        Span::styled(
+            state.step.prompt(),
+            Style::default().fg(theme::foreground()),
+        ),
+    ])
 }
 
 fn render_selection_summary(state: &StartupModelPickerState) -> Line<'static> {
+    let theme_name = state
+        .selected_theme_name()
+        .or_else(|| state.theme().map(|theme| theme.label.as_str()))
+        .unwrap_or("default");
     let provider = state
         .provider()
         .map(|provider| provider.label.as_str())
@@ -295,21 +484,49 @@ fn render_selection_summary(state: &StartupModelPickerState) -> Line<'static> {
         .selected_model()
         .map(|model| model.label.as_str())
         .unwrap_or("not selected");
-    Line::from(vec![
-        Span::styled("provider ", Style::default().fg(theme::quiet())),
-        Span::styled(truncate(provider, 34), Style::default().fg(Color::White)),
-        Span::styled("  model ", Style::default().fg(theme::quiet())),
-        Span::styled(truncate(model, 44), Style::default().fg(Color::White)),
-    ])
+    let mut spans = vec![
+        Span::styled("theme ", Style::default().fg(theme::quiet())),
+        Span::styled(
+            theme_name.to_string(),
+            Style::default().fg(theme::foreground()),
+        ),
+    ];
+    if !matches!(state.step, PickerStep::Theme) {
+        spans.push(Span::styled(
+            "  provider ",
+            Style::default().fg(theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            provider.to_string(),
+            Style::default().fg(theme::foreground()),
+        ));
+    }
+    if matches!(state.step, PickerStep::Model | PickerStep::Reasoning) {
+        spans.push(Span::styled(
+            "  model ",
+            Style::default().fg(theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            model.to_string(),
+            Style::default().fg(theme::foreground()),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_choice_rows(state: &StartupModelPickerState, height: usize) -> Vec<Line<'static>> {
     let labels = match state.step {
+        PickerStep::Theme => state
+            .themes
+            .iter()
+            .map(|choice| choice.label.clone())
+            .collect::<Vec<_>>(),
         PickerStep::Provider => state
             .choices
             .iter()
             .map(|choice| choice.label.clone())
             .collect::<Vec<_>>(),
+        PickerStep::Key => key_options(state),
         PickerStep::Model => state
             .provider()
             .map(|provider| {
@@ -326,28 +543,38 @@ fn render_choice_rows(state: &StartupModelPickerState, height: usize) -> Vec<Lin
             .collect::<Vec<_>>(),
     };
     let cursor = match state.step {
+        PickerStep::Theme => state.theme_cursor,
         PickerStep::Provider => state.provider_cursor,
+        PickerStep::Key => state.key_cursor,
         PickerStep::Model => state.model_cursor,
         PickerStep::Reasoning => state.effort_cursor,
     };
-    let (start, end) = visible_window(labels.len(), cursor, height.max(1));
+    let (start, end, show_above, show_below) = visible_window(labels.len(), cursor, height.max(1));
     let mut rows = Vec::with_capacity(height);
-    if start > 0 {
+    if show_above {
         rows.push(Line::from(Span::styled(
-            "  ...",
+            "  ↑ more",
             Style::default().fg(theme::quiet()),
         )));
     }
     for (index, label) in labels.iter().enumerate().take(end).skip(start) {
         rows.push(render_choice_row(label, index == cursor));
     }
-    if end < labels.len() {
+    if show_below {
         rows.push(Line::from(Span::styled(
-            "  ...",
+            "  ↓ more",
             Style::default().fg(theme::quiet()),
         )));
     }
     rows
+}
+
+fn key_options(state: &StartupModelPickerState) -> Vec<String> {
+    let env = state
+        .provider()
+        .and_then(|provider| provider.credential.env_var())
+        .unwrap_or("provider API key");
+    vec![format!("Configure {env} later in /config")]
 }
 
 fn render_choice_row(label: &str, active: bool) -> Line<'static> {
@@ -359,19 +586,25 @@ fn render_choice_row(label: &str, active: bool) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        (theme::quiet(), Style::default().fg(Color::White))
+        (theme::quiet(), Style::default().fg(theme::foreground()))
     };
     let prefix = if active { "▸ " } else { "  " };
     Line::from(vec![
         Span::styled(prefix, Style::default().fg(prefix_color)),
-        Span::styled(truncate(label, 96), style),
+        Span::styled(label.to_string(), style),
     ])
 }
 
 fn render_footer(state: &StartupModelPickerState) -> Line<'static> {
     let enter_label = match state.step {
+        PickerStep::Theme if state.theme_action() == StartupThemeAction::ConfigureInConfig => {
+            "continue"
+        }
+        PickerStep::Theme => "apply",
+        PickerStep::Provider if state.provider_needs_key_config() => "key",
         PickerStep::Provider => "model",
-        PickerStep::Model if state.selected_model_requires_reasoning() => "reasoning",
+        PickerStep::Key => "continue",
+        PickerStep::Model if state.selected_model_requires_reasoning() => "effort",
         PickerStep::Model | PickerStep::Reasoning => "confirm",
     };
     Line::from(vec![
@@ -389,17 +622,46 @@ fn render_footer(state: &StartupModelPickerState) -> Line<'static> {
     ])
 }
 
-fn visible_window(total: usize, cursor: usize, height: usize) -> (usize, usize) {
-    if total <= height {
-        return (0, total);
+fn visible_window(total: usize, cursor: usize, height: usize) -> (usize, usize, bool, bool) {
+    if total == 0 || height == 0 {
+        return (0, 0, false, false);
     }
-    let half = height / 2;
-    let start = cursor.saturating_sub(half).min(total - height);
-    (start, start + height)
+    let cursor = cursor.min(total - 1);
+    if total <= height {
+        return (0, total, false, false);
+    }
+    if height == 1 {
+        return (cursor, cursor + 1, false, false);
+    }
+    if height == 2 {
+        return match (cursor > 0, cursor + 1 < total) {
+            (true, _) => (cursor, cursor + 1, true, false),
+            (false, true) => (cursor, cursor + 1, false, true),
+            (false, false) => (cursor, cursor + 1, false, false),
+        };
+    }
+
+    let mut show_above = false;
+    let mut show_below = false;
+    loop {
+        let reserved = usize::from(show_above) + usize::from(show_below);
+        let item_capacity = height.saturating_sub(reserved).max(1);
+        let start = cursor
+            .saturating_sub(item_capacity / 2)
+            .min(total - item_capacity);
+        let end = (start + item_capacity).min(total);
+        let next_show_above = start > 0;
+        let next_show_below = end < total;
+        if next_show_above == show_above && next_show_below == show_below {
+            return (start, end, show_above, show_below);
+        }
+        show_above = next_show_above;
+        show_below = next_show_below;
+    }
 }
 
 fn centered_area(full: Rect) -> Rect {
-    let max_width = 96u16;
+    let max_width = 98u16;
     let max_height = 20u16;
     let width = full.width.min(max_width);
     let height = full.height.min(max_height);
@@ -411,15 +673,6 @@ fn centered_area(full: Rect) -> Rect {
         width,
         height,
     }
-}
-
-fn truncate(input: &str, limit: usize) -> String {
-    if input.chars().count() <= limit {
-        return input.to_string();
-    }
-    let mut out: String = input.chars().take(limit.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

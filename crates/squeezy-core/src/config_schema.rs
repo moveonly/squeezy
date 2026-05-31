@@ -23,9 +23,9 @@ use crate::{
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
     DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_THEME_NAME,
     DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode,
-    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity,
-    ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen, TuiSynchronizedOutput,
-    normalize_tui_theme_name,
+    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, SessionResumePicker,
+    StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    TuiSynchronizedOutput, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -377,6 +377,7 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
 pub const PROFILE_OPTIONS: &[&str] = &["cheap", "balanced", "strong"];
 pub const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh"];
 pub const SESSION_MODE_OPTIONS: &[&str] = &["build", "plan"];
+pub const SESSION_RESUME_PICKER_OPTIONS: &[&str] = &["ask", "never"];
 pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
@@ -1029,6 +1030,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Enum("build"),
                 help: "Build mode runs tools freely; Plan mode is read-only and emits a structured plan.",
                 env_override: Some("SQUEEZY_SESSION_MODE"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "resume_picker",
+                toml_path: &["session", "resume_picker"],
+                kind: FieldKind::Enum {
+                    options: SESSION_RESUME_PICKER_OPTIONS,
+                },
+                tier: ApplyTier::Restart,
+                get: get_session_resume_picker,
+                set: set_session_resume_picker,
+                default_display: "ask",
+                default: || FieldValue::Enum("ask"),
+                help: "Ask to resume a recent session at startup, or always start fresh.",
+                env_override: None,
                 secret: false,
             },
             FieldMeta {
@@ -2221,6 +2237,18 @@ fn set_session_mode(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'stat
         _ => return Err("session_mode expects enum"),
     };
     cfg.session_mode = SessionMode::parse(s).ok_or("invalid session_mode")?;
+    Ok(())
+}
+
+fn get_session_resume_picker(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.session_resume_picker.as_str())
+}
+fn set_session_resume_picker(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("resume_picker expects enum"),
+    };
+    cfg.session_resume_picker = SessionResumePicker::parse(s).ok_or("invalid resume_picker")?;
     Ok(())
 }
 

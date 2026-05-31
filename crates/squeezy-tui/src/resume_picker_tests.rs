@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::{Terminal, backend::TestBackend};
 use squeezy_store::{EventBranchTip, SessionMetadata, SessionStatus};
 
 use super::*;
@@ -117,6 +118,23 @@ fn cwd() -> PathBuf {
     PathBuf::from("/work/repo")
 }
 
+fn render_state_to_text(state: &ResumePickerState, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_picker(frame, state))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
 #[test]
 fn picker_opens_with_start_fresh_selected() {
     let state = ResumePickerState::new(vec![summary("first"), summary("second")], cwd());
@@ -130,7 +148,9 @@ fn picker_enter_on_start_fresh_starts_fresh() {
     let mut state = ResumePickerState::new(vec![summary("first")], cwd());
     assert_eq!(
         state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::StartFresh)
+        Some(ResumeChoice::StartFresh {
+            suppress: ResumePickerSuppress::default(),
+        })
     );
 }
 
@@ -156,7 +176,9 @@ fn picker_esc_starts_fresh() {
     state.dispatch(press(KeyCode::Down)); // cursor on candidate
     assert_eq!(
         state.dispatch(press(KeyCode::Esc)),
-        Some(ResumeChoice::StartFresh)
+        Some(ResumeChoice::StartFresh {
+            suppress: ResumePickerSuppress::default(),
+        })
     );
 }
 
@@ -171,15 +193,53 @@ fn picker_q_quits() {
 
 #[test]
 fn picker_arrow_wraps_through_start_fresh_at_top() {
-    // [start_fresh, candidate] — 2 rows total.
+    // [start_fresh, candidate, project checkbox, user checkbox] — 4 rows total.
     let mut state = ResumePickerState::new(vec![summary("only")], cwd());
     assert_eq!(state.cursor, 0); // opens on start_fresh
     state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 1); // candidate
     state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 2); // project checkbox
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 3); // user checkbox
+    state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 0); // wraps back to start_fresh
     state.dispatch(press(KeyCode::Up));
-    assert_eq!(state.cursor, 1); // wraps up to last row (candidate)
+    assert_eq!(state.cursor, 3); // wraps up to last row (user checkbox)
+}
+
+#[test]
+fn user_never_ask_checkbox_implies_project_checkbox() {
+    let mut state = ResumePickerState::new(vec![summary("only")], cwd());
+    state.cursor = state.user_checkbox_index();
+
+    state.dispatch(press(KeyCode::Char(' ')));
+
+    assert!(state.never_user);
+    assert!(state.never_project);
+    state.cursor = state.start_fresh_index();
+    assert_eq!(
+        state.dispatch(press(KeyCode::Enter)),
+        Some(ResumeChoice::StartFresh {
+            suppress: ResumePickerSuppress {
+                project: true,
+                user: true,
+            },
+        })
+    );
+}
+
+#[test]
+fn clearing_project_checkbox_also_clears_user_checkbox() {
+    let mut state = ResumePickerState::new(vec![summary("only")], cwd());
+    state.cursor = state.user_checkbox_index();
+    state.dispatch(press(KeyCode::Char(' ')));
+    state.cursor = state.project_checkbox_index();
+
+    state.dispatch(press(KeyCode::Char(' ')));
+
+    assert!(!state.never_project);
+    assert!(!state.never_user);
 }
 
 #[test]
@@ -194,7 +254,7 @@ fn turn_indicator_renders_singular_and_plural_correctly() {
 }
 
 #[test]
-fn session_summary_label_truncates_long_prompts() {
+fn session_summary_label_keeps_long_prompts_for_wrapping() {
     let summary = SessionSummary {
         session_id: "x".to_string(),
         started_at_ms: 0,
@@ -208,8 +268,8 @@ fn session_summary_label_truncates_long_prompts() {
         branches: Vec::new(),
     };
     let label = summary.label();
-    assert!(label.chars().count() <= 80, "label too long: {label}");
-    assert!(label.ends_with('…'), "expected ellipsis: {label}");
+    assert_eq!(label.chars().count(), 200);
+    assert!(!label.contains('…'), "label should wrap instead: {label}");
 }
 
 #[test]
@@ -439,4 +499,30 @@ fn picker_expands_branches_after_tab_toggle() {
     state.dispatch(press(KeyCode::Down));
     let choice = state.dispatch(press(KeyCode::Enter));
     assert!(matches!(choice, Some(ResumeChoice::CrossProject { .. })));
+}
+
+#[test]
+fn setup_resume_picker_left_goes_back_to_setup() {
+    let mut state =
+        ResumePickerState::with_setup_progress(vec![summary("first")], cwd(), Some((5, 5)));
+
+    assert_eq!(
+        state.dispatch(press(KeyCode::Left)),
+        Some(ResumeChoice::Back)
+    );
+}
+
+#[test]
+fn setup_resume_picker_uses_setup_chrome_and_full_footer() {
+    let state = ResumePickerState::with_setup_progress(vec![summary("first")], cwd(), Some((5, 5)));
+
+    let rendered = render_state_to_text(&state, 86, 22);
+
+    assert!(rendered.contains("first run setup"), "{rendered}");
+    assert!(
+        rendered.contains("Question 5/5 Resume a session"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("← back"), "{rendered}");
+    assert!(rendered.contains("Q quit"), "{rendered}");
 }

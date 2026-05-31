@@ -386,6 +386,8 @@ pub struct AppConfig {
     pub workspace_root: PathBuf,
     pub permissions: PermissionPolicy,
     pub session_mode: SessionMode,
+    #[serde(default)]
+    pub session_resume_picker: SessionResumePicker,
     pub session_logs: SessionLogConfig,
     pub context_compaction: ContextCompactionConfig,
     pub subagents: SubagentConfig,
@@ -913,6 +915,7 @@ impl AppConfig {
             .map(parse_enabled_bool)
             .unwrap_or(tool_settings.checkpoints_enabled.unwrap_or(false));
         let tools = ToolSchemaConfig::from_settings(tool_settings)?;
+        let session_resume_picker = session_settings.resume_picker.unwrap_or_default();
         let session_logs = SessionLogConfig::from_settings(&session_settings);
         let context_compaction = ContextCompactionConfig::from_settings_and_env(
             settings.context.unwrap_or_default(),
@@ -947,6 +950,7 @@ impl AppConfig {
             workspace_root,
             permissions,
             session_mode,
+            session_resume_picker,
             session_logs,
             context_compaction,
             subagents,
@@ -1093,6 +1097,10 @@ impl AppConfig {
         output.push_str(&format!(
             "mode = {}\n",
             toml_string(self.session_mode.as_str())
+        ));
+        output.push_str(&format!(
+            "resume_picker = {}\n",
+            toml_string(self.session_resume_picker.as_str())
         ));
         if let Some(log_dir) = &self.session_logs.log_dir {
             output.push_str(&format!(
@@ -3418,9 +3426,35 @@ impl SessionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionResumePicker {
+    #[default]
+    Ask,
+    Never,
+}
+
+impl SessionResumePicker {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" | "always" | "on" | "true" => Some(Self::Ask),
+            "never" | "off" | "false" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Never => "never",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SessionSettings {
     pub mode: Option<SessionMode>,
+    pub resume_picker: Option<SessionResumePicker>,
     pub log_dir: Option<PathBuf>,
     pub log_retention_days: Option<u64>,
     pub log_retention_archive_days: Option<u64>,
@@ -3434,6 +3468,7 @@ impl SessionSettings {
             table,
             &[
                 "mode",
+                "resume_picker",
                 "log_dir",
                 "log_retention_days",
                 "log_retention_archive_days",
@@ -3458,6 +3493,12 @@ impl SessionSettings {
         };
         Ok(Self {
             mode,
+            resume_picker: session_resume_picker_value(
+                table,
+                "resume_picker",
+                source,
+                &field(path, "resume_picker"),
+            )?,
             log_dir: path_value(table, "log_dir", source, &field(path, "log_dir"))?,
             log_retention_days: u64_value(
                 table,
@@ -3488,6 +3529,7 @@ impl SessionSettings {
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.mode, next.mode);
+        replace_if_some(&mut self.resume_picker, next.resume_picker);
         replace_if_some(&mut self.log_dir, next.log_dir);
         replace_if_some(&mut self.log_retention_days, next.log_retention_days);
         replace_if_some(
@@ -5749,6 +5791,18 @@ fn parse_session_mode_value(value: &str, source: &str, path: &str) -> Result<Ses
     })
 }
 
+fn parse_session_resume_picker_value(
+    value: &str,
+    source: &str,
+    path: &str,
+) -> Result<SessionResumePicker> {
+    SessionResumePicker::parse(value).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid resume picker value {value:?}; expected ask or never"
+        ))
+    })
+}
+
 fn parse_bool(value: Option<String>, default: bool) -> bool {
     value.as_deref().map_or(default, parse_enabled_bool)
 }
@@ -7611,6 +7665,7 @@ pub fn user_settings_template() -> &'static str {
 
 [session]
 # mode = "build"              # build | plan
+# resume_picker = "ask"       # ask | never
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
 # log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
@@ -7828,6 +7883,7 @@ pub fn project_settings_template() -> &'static str {
 
 [session]
 # mode = "build"              # build | plan
+# resume_picker = "ask"       # ask | never
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
 # log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
@@ -8902,6 +8958,21 @@ fn string_value(
             resolve_shell_escape(raw, source, path).map(Some)
         }
     }
+}
+
+fn session_resume_picker_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<SessionResumePicker>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| type_error(source, path, "string"))?;
+    parse_session_resume_picker_value(value, source, path).map(Some)
 }
 
 fn bool_value(
