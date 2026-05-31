@@ -3654,6 +3654,74 @@ fn shell_tool_rows_show_command_and_highlight_output() {
 }
 
 #[test]
+fn failed_rustfmt_output_uses_diff_background_not_colored_text() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "cargo fmt --check",
+        "workdir": ".",
+        "exit_code": 1,
+        "stdout": concat!(
+            "Diff in /tmp/project/src/lib.rs:1:\n",
+            "fn demo() {\n",
+            "\u{1b}[31m-    old_call();\u{1b}(B\u{1b}[m\n",
+            "\u{1b}[32m+    new_call();\u{1b}(B\u{1b}[m\n",
+        ),
+        "stderr": "",
+    });
+    app.push_tool_result(result);
+
+    let lines = format_transcript_entry_with_width(
+        &app.transcript[0],
+        false,
+        ToolOutputVerbosity::Normal,
+        MessageOutcome::Normal,
+        Some(140),
+        true,
+    );
+    let rendered = lines_to_plain_text(&lines);
+    assert!(
+        rendered.contains("Diff in /tmp/project/src/lib.rs:1:"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("(B+"), "{rendered}");
+    assert!(!rendered.contains("(B-"), "{rendered}");
+
+    let add_line = lines
+        .iter()
+        .find(|line| rendered_line_text(line).contains("+    new_call();"))
+        .expect("add line");
+    assert!(
+        add_line.style.bg.is_some(),
+        "add line should carry a row background: {add_line:?}"
+    );
+    let add_sign = add_line
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "+")
+        .expect("add sign");
+    assert_eq!(add_sign.style.fg, None);
+    assert!(add_sign.style.bg.is_some());
+
+    let del_line = lines
+        .iter()
+        .find(|line| rendered_line_text(line).contains("-    old_call();"))
+        .expect("delete line");
+    assert!(
+        del_line.style.bg.is_some(),
+        "delete line should carry a row background: {del_line:?}"
+    );
+    let del_sign = del_line
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "-")
+        .expect("delete sign");
+    assert_eq!(del_sign.style.fg, None);
+    assert!(del_sign.style.bg.is_some());
+}
+
+#[test]
 fn read_only_shell_rows_render_codex_style_output_block() {
     let mut app = test_app(SessionMode::Build);
     let call = ToolCall {
@@ -4028,13 +4096,13 @@ fn edit_row_uses_apply_patch_unified_diff_when_checkpoint_is_absent() {
 }
 
 #[test]
-fn write_file_edit_row_uses_call_content_when_result_has_only_path() {
+fn write_file_new_file_preview_uses_call_content() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("write_file", "");
     result.call_id = "write-1".to_string();
     result.content = serde_json::json!({
         "path": "src/process_info.rs",
-        "before_sha256": "before",
+        "before_sha256": null,
         "after_sha256": "after",
         "bytes_written": 25,
         "noop": false
@@ -4065,6 +4133,51 @@ fn write_file_edit_row_uses_call_content_when_result_has_only_path() {
     assert!(
         !output.contains("\"bytes_written\""),
         "renderer should show the write preview, not raw JSON: {output}"
+    );
+}
+
+#[test]
+fn write_file_existing_file_without_diff_does_not_show_fake_all_add() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("write_file", "");
+    result.call_id = "write-1".to_string();
+    result.content = serde_json::json!({
+        "path": "src/cli/commands/init.rs",
+        "before_sha256": "before",
+        "after_sha256": "after",
+        "bytes_written": 2048,
+        "noop": false
+    });
+    app.push_tool_result_with_call(
+        result,
+        Some(ToolCall {
+            call_id: "write-1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/cli/commands/init.rs",
+                "content": "line\n".repeat(200)
+            }),
+        }),
+    );
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("✔ Edited src/cli/commands/init.rs"),
+        "{output}"
+    );
+    assert!(output.contains("file src/cli/commands/init.rs"), "{output}");
+    assert!(
+        !output.contains("+200 -0"),
+        "existing-file write_file without an actual diff must not look like a full-file add: {output}"
+    );
+    assert!(
+        !output.contains("+line"),
+        "existing-file write_file without an actual diff must not render the replacement body as a fake add diff: {output}"
+    );
+    assert!(
+        !output.contains("\"bytes_written\""),
+        "renderer should not fall back to raw JSON: {output}"
     );
 }
 
@@ -7892,12 +8005,17 @@ fn render_inline_to_string(app: &TuiApp, width: u16, height: u16) -> String {
 fn lines_to_plain_text(lines: &[Line<'_>]) -> String {
     let mut output = String::new();
     for line in lines {
-        for span in &line.spans {
-            output.push_str(&span.content);
-        }
+        output.push_str(&rendered_line_text(line));
         output.push('\n');
     }
     output
+}
+
+fn rendered_line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }
 
 fn rendered_word_styles(app: &TuiApp, word: &str) -> Vec<(Color, Color, Modifier)> {

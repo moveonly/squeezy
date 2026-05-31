@@ -113,8 +113,8 @@ use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverit
 #[cfg(test)]
 use render::palette::WORKING_SHIMMER_HIGHLIGHT;
 use render::palette::{
-    self, AMBER, BANG_RED, DIFF_ADD_FG, DIFF_DEL_FG, ERROR_RED, GOLD, MODE_BUILD_GREEN,
-    MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN, blend_color,
+    self, AMBER, BANG_RED, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET,
+    SUCCESS_GREEN, blend_color,
 };
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
@@ -176,9 +176,7 @@ fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
         return false;
     }
     let stdout = tool.result.content["stdout"].as_str().unwrap_or("");
-    stdout
-        .lines()
-        .any(|line| line.starts_with("@@ -") && line.contains(" @@"))
+    shell_text_looks_like_diff(stdout)
 }
 
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
@@ -7943,6 +7941,20 @@ fn edit_file_from_write_call(tool: &ToolTranscript) -> Option<EditChangedFile> {
     let call = tool.call.as_ref()?;
     let path =
         string_arg(&tool.result.content, "path").or_else(|| string_arg(&call.arguments, "path"))?;
+    if !tool
+        .result
+        .content
+        .get("before_sha256")
+        .is_some_and(|value| value.is_null())
+    {
+        return Some(EditChangedFile {
+            path,
+            additions: 0,
+            deletions: 0,
+            patch: None,
+            patch_truncated: false,
+        });
+    }
     let content = call.arguments.get("content")?.as_str()?;
     let patch = render_write_file_preview_diff(&path, content)?;
     let additions = patch
@@ -8525,9 +8537,7 @@ fn shell_output_block_lines(
         .unwrap_or_else(|| tool.result.tool_name.clone());
     let workdir = string_arg(&tool.result.content, "workdir").unwrap_or_else(|| ".".to_string());
     let limit = preview_limit.unwrap_or(usize::MAX);
-    let is_diff = output
-        .lines()
-        .any(|line| line.starts_with("@@ -") && line.contains(" @@"));
+    let is_diff = shell_text_looks_like_diff(&output);
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
     lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
         if line.truncated_marker {
@@ -8565,6 +8575,30 @@ fn shell_output_line(content: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+fn shell_text_looks_like_diff(content: &str) -> bool {
+    let mut saw_rustfmt_header = false;
+    let mut saw_change = false;
+    for line in content.lines() {
+        let stripped = strip_ansi_escape_sequences(line);
+        let trimmed = stripped.trim_start();
+        if trimmed.starts_with("@@ -") && trimmed.contains(" @@") {
+            return true;
+        }
+        if trimmed.starts_with("Diff in ") {
+            saw_rustfmt_header = true;
+        }
+        if is_diff_change_line(trimmed) {
+            saw_change = true;
+        }
+    }
+    saw_rustfmt_header && saw_change
+}
+
+fn is_diff_change_line(trimmed: &str) -> bool {
+    (trimmed.starts_with('+') && !trimmed.starts_with("+++"))
+        || (trimmed.starts_with('-') && !trimmed.starts_with("---"))
+}
+
 /// Diff-aware variant of [`shell_output_line`]. Lines that begin with `+`
 /// or `-` (but NOT `+++` / `---` file headers) get a tinted background to
 /// mirror the inline-diff styling reviewers expect from GitHub / Claude
@@ -8572,7 +8606,24 @@ fn shell_output_line(content: &str) -> Line<'static> {
 /// finds the section breaks; everything else falls through to the default
 /// styled output.
 fn shell_output_diff_line(content: &str) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    diff_output_line(content, vec![Span::raw("  ")])
+}
+
+fn detail_output_diff_line(content: &str) -> Line<'static> {
+    diff_output_line(
+        content,
+        vec![
+            Span::raw("  "),
+            Span::styled(
+                "│ ",
+                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+            ),
+        ],
+    )
+}
+
+fn diff_output_line(content: &str, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    let content = strip_ansi_escape_sequences(content);
     let trimmed = content.trim_start_matches(' ');
     let leading_ws = &content[..content.len() - trimmed.len()];
     if !leading_ws.is_empty() {
@@ -8581,30 +8632,20 @@ fn shell_output_diff_line(content: &str) -> Line<'static> {
     let style = if trimmed.starts_with("+++") || trimmed.starts_with("---") {
         Style::default().fg(palette::muted_fg())
     } else if let Some(rest) = trimmed.strip_prefix('+') {
-        let mut style = Style::default();
-        let bg = palette::surface_bg(DIFF_ADD_FG);
-        if let Some(bg) = bg {
-            style = style.bg(bg);
-        }
+        let bg = render::diff::diff_add_bg();
+        let style = Style::default().bg(bg);
         spans.push(Span::styled("+".to_string(), style));
         spans.push(Span::styled(rest.to_string(), style));
         let mut line = Line::from(spans);
-        if let Some(bg) = bg {
-            line = line.style(Style::default().bg(bg));
-        }
+        line = line.style(Style::default().bg(bg));
         return line;
     } else if let Some(rest) = trimmed.strip_prefix('-') {
-        let mut style = Style::default();
-        let bg = palette::surface_bg(DIFF_DEL_FG);
-        if let Some(bg) = bg {
-            style = style.bg(bg);
-        }
+        let bg = render::diff::diff_del_bg();
+        let style = Style::default().bg(bg);
         spans.push(Span::styled("-".to_string(), style));
         spans.push(Span::styled(rest.to_string(), style));
         let mut line = Line::from(spans);
-        if let Some(bg) = bg {
-            line = line.style(Style::default().bg(bg));
-        }
+        line = line.style(Style::default().bg(bg));
         return line;
     } else if trimmed.starts_with("@@") {
         Style::default()
@@ -8616,6 +8657,31 @@ fn shell_output_diff_line(content: &str) -> Line<'static> {
     };
     spans.push(Span::styled(trimmed.to_string(), style));
     Line::from(spans)
+}
+
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
+                let _ = chars.next();
+            }
+            Some(_) | None => {}
+        }
+    }
+    output
 }
 
 fn expanded_decl_search_detail_lines(
@@ -9290,10 +9356,13 @@ fn output_block_lines(
     }
     let limit = usize::MAX;
     let lines = head_tail_lines(content, limit);
+    let is_diff = shell_text_looks_like_diff(content);
     let mut rendered = vec![detail_line(false, QUIET, label)];
     rendered.extend(lines.into_iter().map(|line| {
         if line.truncated_marker {
             detail_line(false, QUIET, line.text)
+        } else if is_diff {
+            detail_output_diff_line(&line.text)
         } else {
             detail_spans_line(styled_output_spans(&line.text))
         }
