@@ -649,18 +649,51 @@ fn request_body_emits_image_in_native_images_array() {
 
     let body = OllamaProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");
-    // system + user text + user image
-    assert_eq!(messages.len(), 3);
-    // Native Ollama puts images on the message itself, not in a content
-    // block array.
-    let image_msg = &messages[2];
-    assert_eq!(image_msg["role"], "user");
-    assert_eq!(image_msg["content"], "");
-    let images = image_msg["images"].as_array().expect("images array");
+    // system + user(text + image) — image attaches to the preceding
+    // user-text turn so vision models pair them as the same prompt.
+    assert_eq!(messages.len(), 2);
+    let prompt_msg = &messages[1];
+    assert_eq!(prompt_msg["role"], "user");
+    assert_eq!(prompt_msg["content"], "what is this?");
+    let images = prompt_msg["images"].as_array().expect("images array");
     assert_eq!(images.len(), 1);
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(images[0].as_str().expect("base64 string"))
         .expect("valid base64");
     assert_eq!(decoded.as_slice(), bytes.as_ref());
+}
+
+#[test]
+fn request_body_image_first_falls_back_to_standalone_user_message() {
+    // When there is no preceding user-text message to attach the image
+    // to, the helper still emits a standalone image-only user turn so
+    // bare-image inputs round-trip.
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G']);
+    let request = LlmRequest {
+        model: "llava".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes,
+        }]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = OllamaProvider::request_body(&request);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "");
+    assert!(messages[0]["images"].is_array());
 }

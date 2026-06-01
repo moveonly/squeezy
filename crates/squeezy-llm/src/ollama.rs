@@ -516,18 +516,47 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
             }
             // Ollama's native chat API puts images on the message itself
             // (`{"role": "user", "content": "...", "images": ["<b64>"]}`)
-            // instead of a content-block array; emit a standalone user
-            // message with an empty `content` string so vision-capable
-            // local models (llava, llama3.2-vision) see the bytes.
+            // instead of a content-block array. When the previous message
+            // is a user-text turn (the usual "what is this?" prompt),
+            // attach the image to *that* message — vision models pair the
+            // image with the most recent user text and an empty-content
+            // image-only turn after the text turn changes the semantics.
+            // Fall back to a standalone image-only user message when
+            // there is no preceding user-text message to attach to.
             LlmInputItem::Image {
                 media_type: _,
                 bytes,
             } => {
-                messages.push(json!({
-                    "role": "user",
-                    "content": "",
-                    "images": [BASE64_STANDARD.encode(bytes.as_ref())],
-                }));
+                let encoded = BASE64_STANDARD.encode(bytes.as_ref());
+                let attached = messages.last_mut().is_some_and(|last| {
+                    if last.get("role").and_then(Value::as_str) != Some("user") {
+                        return false;
+                    }
+                    let has_text = last
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty());
+                    if !has_text {
+                        return false;
+                    }
+                    let images = last
+                        .as_object_mut()
+                        .expect("messages built as json objects above")
+                        .entry("images".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Value::Array(arr) = images {
+                        arr.push(Value::String(encoded.clone()));
+                        return true;
+                    }
+                    false
+                });
+                if !attached {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": "",
+                        "images": [encoded],
+                    }));
+                }
             }
             // Ollama has no signed reasoning replay format. Skip on replay.
             LlmInputItem::Reasoning(_) => {}
