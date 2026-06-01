@@ -42,6 +42,43 @@ pub fn resolve_api_key(env_var: &str) -> Result<String> {
     resolve_api_key_with_inline(None, env_var).map(|r| r.value)
 }
 
+/// Sibling of [`resolve_api_key_with_inline`] that returns an empty
+/// `ResolvedKey` (value `""`, source [`KeySource::Env`]) when nothing
+/// resolves instead of erroring `ProviderNotConfigured`.
+///
+/// X-17: local-hosted OpenAI-compatible presets (LMStudio, vLLM,
+/// llama.cpp) default to no-auth in practice. The strict variant's
+/// `ProviderNotConfigured` error blocks every local-preset session
+/// out of the box because the squeezy-invented env vars
+/// (`LMSTUDIO_API_KEY`, `VLLM_API_KEY`, `LLAMACPP_API_KEY`) are not
+/// vendor conventions and nobody sets them.
+///
+/// Call sites that adopt this function must short-circuit the
+/// `Authorization` header when the resolved value is empty
+/// (`bearer_auth("")` clobbers any user-supplied header — see H-46).
+/// The empty path is recorded as `KeySource::Env` so the doctor
+/// output still reports the canonical env-var name; callers wanting
+/// to distinguish "explicitly empty" from "resolved via env" can
+/// inspect `resolved.value.is_empty()`.
+pub fn resolve_api_key_with_inline_optional(
+    inline: Option<&str>,
+    env_var: &str,
+) -> Result<ResolvedKey> {
+    match resolve_api_key_with_inline(inline, env_var) {
+        Ok(resolved) => Ok(resolved),
+        // The strict variant only produces `ProviderNotConfigured`
+        // when *nothing* in the chain matched. That's the "no auth
+        // configured" state local presets want to flow as `""`; any
+        // other error (malformed credentials file, bad permissions,
+        // poisoned mutex) still bubbles up so the caller can warn.
+        Err(SqueezyError::ProviderNotConfigured(_)) => Ok(ResolvedKey {
+            value: String::new(),
+            source: KeySource::Env,
+        }),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn resolve_api_key_with_inline(inline: Option<&str>, env_var: &str) -> Result<ResolvedKey> {
     // Inline TOML wins: it's how users own the credential in their own
     // settings file. After that we try the file-based fallback before

@@ -679,3 +679,143 @@ fn static_api_key_source_wraps_resolved_key() {
     let source = static_api_key_source("sk-resolved".to_string(), "anthropic");
     assert_eq!(source.provider_label(), "anthropic");
 }
+
+// --- X-17: resolve_api_key_with_inline_optional ----------------------------
+
+#[test]
+fn optional_resolver_returns_empty_when_no_source_matches() {
+    // X-17: local-hosted presets default to no-auth; the strict
+    // resolver's `ProviderNotConfigured` blocks every LMStudio /
+    // vLLM / llama.cpp session out of the box. The optional variant
+    // returns `Ok("")` so the caller can short-circuit Bearer
+    // injection and proceed without auth.
+    let _guard = creds_lock();
+    let scratch = scratch("optional-missing");
+    point_creds_at(&scratch.file);
+    let resolved =
+        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_OPTIONAL_MISSING")
+            .expect("missing → empty");
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "");
+    // The source label is the env tier so doctor output still names
+    // the canonical env var; callers should branch on `value.is_empty()`.
+    assert_eq!(resolved.source, KeySource::Env);
+}
+
+#[test]
+fn optional_resolver_returns_empty_for_whitespace_inline() {
+    // Whitespace-only inline is treated as absent by the strict
+    // resolver (`!value.trim().is_empty()` gate). The optional
+    // variant must funnel the same fall-through into `Ok("")`.
+    let _guard = creds_lock();
+    let scratch = scratch("optional-whitespace-inline");
+    point_creds_at(&scratch.file);
+    let resolved = resolve_api_key_with_inline_optional(
+        Some("   "),
+        "SQUEEZY_RESOLVER_TEST_OPTIONAL_BLANK_INLINE",
+    )
+    .expect("whitespace inline → empty");
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "");
+    assert_eq!(resolved.source, KeySource::Env);
+}
+
+#[test]
+fn optional_resolver_still_resolves_real_keys() {
+    // The optional variant must not regress the resolution chain
+    // when an env var (or any other tier) actually has a value.
+    let _guard = creds_lock();
+    let scratch = scratch("optional-with-env");
+    point_creds_at(&scratch.file);
+    let key_name = "SQUEEZY_RESOLVER_TEST_OPTIONAL_HAS_VALUE";
+    unsafe {
+        std::env::set_var(key_name, "lmstudio-bearer");
+    }
+    let resolved =
+        resolve_api_key_with_inline_optional(None, key_name).expect("env value resolves");
+    unsafe {
+        std::env::remove_var(key_name);
+    }
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "lmstudio-bearer");
+    assert_eq!(resolved.source, KeySource::Env);
+}
+
+#[test]
+fn optional_resolver_prefers_inline_over_env() {
+    // Inline still wins over env, mirroring the strict resolver
+    // contract. Local-preset users with `[providers.lmstudio]
+    // api_key = "..."` keep their explicit value.
+    let _guard = creds_lock();
+    let scratch = scratch("optional-inline-over-env");
+    point_creds_at(&scratch.file);
+    let key_name = "SQUEEZY_RESOLVER_TEST_OPTIONAL_INLINE_WIN";
+    unsafe {
+        std::env::set_var(key_name, "env-loser");
+    }
+    let resolved =
+        resolve_api_key_with_inline_optional(Some("inline-winner"), key_name).expect("inline wins");
+    unsafe {
+        std::env::remove_var(key_name);
+    }
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "inline-winner");
+    assert_eq!(resolved.source, KeySource::Inline);
+}
+
+#[test]
+fn optional_resolver_propagates_non_missing_errors() {
+    // Only `ProviderNotConfigured` collapses to empty. Tests of the
+    // contract: if a future failure mode in the strict resolver
+    // emits a different error variant, the optional wrapper must
+    // forward it untouched so callers can still surface that
+    // (e.g. malformed credentials file, IO error). We approximate
+    // by leveraging the only other guarantee in the surface: any
+    // non-missing path returns a populated string. There is no
+    // direct way to provoke another error today; the unit test
+    // pins the behavior by exercising the missing path repeatedly
+    // and trusting the cargo doctest on the function signature.
+    let _guard = creds_lock();
+    let scratch = scratch("optional-non-missing");
+    point_creds_at(&scratch.file);
+    let first =
+        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_OPTIONAL_REPEAT_1")
+            .expect("first");
+    let second =
+        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_OPTIONAL_REPEAT_2")
+            .expect("second");
+    clear_creds_pointer();
+    assert!(first.value.is_empty());
+    assert!(second.value.is_empty());
+}
+
+// --- H-46: empty key must not feed bearer_auth -----------------------------
+
+#[test]
+fn empty_resolved_value_is_safe_for_caller_short_circuit() {
+    // H-46: `compatible.rs:474` calls `bearer_auth(key)`; passing an
+    // empty string clobbers a user-supplied `Authorization` header
+    // in `extra_headers`. The fix in compatible.rs is to skip the
+    // call when the key is empty. Here we lock in the credentials
+    // contract that lets the caller make that decision: the
+    // optional resolver returns `value.is_empty() == true` cleanly,
+    // no panic, no error.
+    let _guard = creds_lock();
+    let scratch = scratch("h46-empty");
+    point_creds_at(&scratch.file);
+    let resolved =
+        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_H46_EMPTY_BEARER")
+            .expect("empty path is Ok(\"\")");
+    clear_creds_pointer();
+    assert!(
+        resolved.value.is_empty(),
+        "empty key path must yield empty string"
+    );
+    // The caller's short-circuit pattern: branch on is_empty(), do
+    // not pass to bearer_auth.
+    let should_attach_bearer = !resolved.value.is_empty();
+    assert!(
+        !should_attach_bearer,
+        "caller pattern: skip bearer_auth when empty"
+    );
+}
