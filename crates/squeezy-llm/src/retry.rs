@@ -387,6 +387,11 @@ impl StreamSkipState {
             LlmEvent::ServerModel(_) => self.emitted_server_model = true,
             LlmEvent::Completed { .. } | LlmEvent::Cancelled | LlmEvent::ContextOverflow { .. } => {
             }
+            // `LlmEvent` is `#[non_exhaustive]`; additive variants
+            // (incremental tool-args, refusal/citation deltas) don't
+            // change retry skip accounting until the canonical
+            // materialized event lands, so we no-op here.
+            _ => {}
         }
     }
 }
@@ -479,6 +484,12 @@ impl SkipCursor {
                     Some(LlmEvent::ServerModel(model))
                 }
             }
+            // `LlmEvent` is `#[non_exhaustive]`; additive variants
+            // (incremental tool-args, refusal/citation deltas) pass
+            // through unchanged because the retry layer doesn't track
+            // them yet. Downstream consumers wildcard-skip on the same
+            // grounds.
+            other => Some(other),
         }
     }
 }

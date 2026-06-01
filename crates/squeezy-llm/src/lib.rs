@@ -771,6 +771,20 @@ pub enum LlmEvent {
     },
     ReasoningDone(ReasoningPayload),
     ToolCall(LlmToolCall),
+    /// Incremental tool-arguments delta. Some providers stream tool
+    /// arguments token-by-token before the full call materializes:
+    /// OpenAI Responses' `response.function_call_arguments.delta`
+    /// (H-07) and Anthropic-style incremental tool-args. Emitted
+    /// additively while the call buffers; downstream consumers may
+    /// display a progressive "calling tool …" hint or ignore it. The
+    /// canonical `ToolCall` event still fires once the full call is
+    /// known, so consumers that only care about the materialized call
+    /// can wildcard-skip this variant.
+    ToolCallDelta {
+        call_id: String,
+        name: String,
+        arguments_chunk: String,
+    },
     /// Triple-path overflow detector classified this turn's terminal
     /// shape as a context-window overflow. See
     /// [`crate::overflow::classify_terminal`] for the three shapes the
