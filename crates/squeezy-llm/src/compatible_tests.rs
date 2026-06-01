@@ -1355,3 +1355,61 @@ fn remote_preset_still_requires_api_key() {
         "missing key must map to ProviderNotConfigured, got: {error:?}"
     );
 }
+
+#[test]
+fn lmstudio_empty_api_key_omits_authorization_header() {
+    // H-46 regression: the X-17 `bearer_auth(key)` guard in
+    // `stream_response` must keep the `Authorization` header off the
+    // wire when the resolved key is empty. `local_preset_builds_…`
+    // above proves construction succeeds; this test pins the
+    // post-construction request shape so a future refactor that drops
+    // the `if !key.is_empty()` gate would also drop a malformed
+    // `Authorization: Bearer ` (empty token) on whichever local server
+    // happens to be listening — and would panic inside reqwest before
+    // that, since `bearer_auth("")` is a known bad input.
+    //
+    // The deliberately-unset env var keeps the test deterministic on a
+    // developer's machine that may already have `LMSTUDIO_API_KEY`
+    // exported.
+    let env_var = "SQUEEZY_H46_DEFINITELY_NOT_SET_LMSTUDIO";
+    unsafe {
+        std::env::remove_var(env_var);
+    }
+    let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::LMStudio,
+        api_key_env: env_var.to_string(),
+        api_key: None,
+        base_url: "http://127.0.0.1:1234/v1".to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
+    })
+    .expect("LM Studio provider must build with no key configured");
+
+    // The empty resolved key path: no Authorization header anywhere.
+    let unauthed = provider.build_chat_request_for_test("");
+    assert!(
+        !unauthed
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION),
+        "empty resolved key must not stamp an Authorization header; \
+         got headers: {:?}",
+        unauthed.headers(),
+    );
+
+    // Positive control: a non-empty key still attaches `Bearer <key>`.
+    // Without this assertion a buggy implementation that *always*
+    // skipped `bearer_auth` would pass the negative case silently.
+    let authed = provider.build_chat_request_for_test("sk-local-test");
+    let value = authed
+        .headers()
+        .get(reqwest::header::AUTHORIZATION)
+        .expect("non-empty key must produce an Authorization header")
+        .to_str()
+        .expect("Bearer header value is ASCII");
+    assert_eq!(value, "Bearer sk-local-test");
+}

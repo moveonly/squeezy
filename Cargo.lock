@@ -2901,6 +2901,7 @@ name = "squeezy-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "http 1.4.0",
  "libc",
  "regex",
  "serde",

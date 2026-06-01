@@ -4120,6 +4120,338 @@ fn inline_api_key_is_redacted_on_serde_serialize() {
 }
 
 #[test]
+fn extra_headers_values_are_redacted_on_serde_serialize() {
+    // M-63: the Custom-preset workaround for non-Bearer auth is to
+    // smuggle the secret through `[providers.<section>.headers]`
+    // (LiteLLM `x-litellm-key`, PortKey `x-portkey-api-key`, vLLM
+    // bearer, corporate `x-api-key` / `api-key`). Without redaction
+    // those values flow verbatim through any code path that calls
+    // serde Serialize on a `ProviderSettings`, so a panic envelope or
+    // bug-report dump leaks the user's credential. Pin the contract:
+    // the *key* of each header stays visible (so an operator can see
+    // which slots are wired) and the *value* is masked to
+    // `"<redacted>"`. Cover three common shapes — an OpenRouter
+    // attribution header (not actually secret but treated uniformly),
+    // a LiteLLM virtual-key header, and a PortKey virtual-key header.
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        "x-litellm-key".to_string(),
+        "lk-litellm-do-not-leak".to_string(),
+    );
+    headers.insert(
+        "x-portkey-api-key".to_string(),
+        "pk-portkey-do-not-leak".to_string(),
+    );
+    headers.insert(
+        "HTTP-Referer".to_string(),
+        "https://example.com".to_string(),
+    );
+    let settings = ProviderSettings {
+        api_key_env: Some("OPENAI_API_KEY".to_string()),
+        headers: Some(headers),
+        ..ProviderSettings::default()
+    };
+    let emitted = toml::to_string(&settings).expect("serialize");
+    for plaintext in [
+        "lk-litellm-do-not-leak",
+        "pk-portkey-do-not-leak",
+        "https://example.com",
+    ] {
+        assert!(
+            !emitted.contains(plaintext),
+            "serialize must not leak header value {plaintext:?}; got: {emitted}",
+        );
+    }
+    // Header *names* stay visible so operators can audit which slots
+    // are wired. Without this assertion a future regression that
+    // dropped the whole `headers` table on serialize would slip past.
+    for header_name in ["x-litellm-key", "x-portkey-api-key", "HTTP-Referer"] {
+        assert!(
+            emitted.contains(header_name),
+            "serialize must keep header name {header_name:?} visible; got: {emitted}",
+        );
+    }
+    assert!(
+        emitted.contains("<redacted>"),
+        "serialize must emit the redaction marker; got: {emitted}"
+    );
+}
+
+#[test]
+fn extra_headers_none_serializes_without_a_headers_table() {
+    // M-63 must preserve the `None` distinction: a provider with no
+    // `[providers.<section>.headers]` block should serialize without
+    // any `headers` key at all, so the round-trip back through TOML
+    // keeps the unset state. (`toml::to_string` skips `Option::None`
+    // fields by default, and the redactor must not accidentally upgrade
+    // them to `Some(empty_map)`.)
+    let settings = ProviderSettings {
+        api_key_env: Some("OPENAI_API_KEY".to_string()),
+        headers: None,
+        ..ProviderSettings::default()
+    };
+    let emitted = toml::to_string(&settings).expect("serialize");
+    assert!(
+        !emitted.contains("headers"),
+        "None headers must not emit a [headers] table; got: {emitted}"
+    );
+}
+
+#[test]
+fn custom_preset_emits_allow_list_warning_at_config_load() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    // M-64 contract: when the `Custom` OpenAI-compatible preset is
+    // configured we emit exactly one `WARN` on
+    // `squeezy_core::config` carrying the resolved `base_url`. The
+    // warning is intentionally non-blocking — an operator who imports
+    // a project-local `./squeezy.toml` from an untrusted source needs
+    // to *see* the destination of every Bearer-token-carrying request
+    // before traffic flows. Curated presets (OpenAI proper, Anthropic,
+    // Cloudflare AI Gateway, …) all run against published default
+    // base_urls so the same warning would be noise; only Custom takes
+    // a fully user-controlled URL and bypasses every other check.
+    #[derive(Default, Clone)]
+    struct Capturing {
+        events: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    struct MsgVisitor<'a>(&'a mut String);
+    impl Visit for MsgVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
+        }
+    }
+    impl Subscriber for Capturing {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= &Level::WARN
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let target = event.metadata().target().to_string();
+            let mut message = String::new();
+            event.record(&mut MsgVisitor(&mut message));
+            self.events
+                .lock()
+                .expect("events lock poisoned")
+                .push((target, message));
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    let subscriber = Capturing::default();
+    let toml = r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "https://internal.example.com/v1"
+api_key_env = "FAKE_KEY"
+"#;
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    let _config = tracing::subscriber::with_default(subscriber.clone(), || {
+        AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+            (name == "FAKE_KEY").then(|| "k".to_string())
+        })
+    })
+    .expect("Custom preset must build with explicit base_url + api_key_env");
+
+    let captured: Vec<(String, String)> =
+        std::mem::take(&mut *subscriber.events.lock().expect("events lock poisoned"));
+    let matches: Vec<_> = captured
+        .iter()
+        .filter(|(target, message)| {
+            target == "squeezy_core::config" && message.contains("Custom preset bypasses")
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one Custom-preset allow-list warning on \
+         squeezy_core::config; captured: {captured:?}"
+    );
+    let (_, message) = matches[0];
+    assert!(
+        message.contains("https://internal.example.com/v1"),
+        "warning must name the resolved base_url; got: {message}"
+    );
+}
+
+#[test]
+fn extra_headers_reject_crlf_at_config_load() {
+    // M-65: a header value containing CR/LF is request-smuggling
+    // shrapnel — http::HeaderValue refuses anything outside
+    // [0x20..0x7E] ∪ {0x09} at request-construction time, but the
+    // failure mode there is a deferred reqwest builder error with no
+    // field name, surfacing mid-stream as a confusing "invalid HTTP
+    // header value". Pin the contract that config-load catches the
+    // offending TOML path up-front and surfaces a usable hint. Cover
+    // the canonical request-smuggling shape (`\r\n` + spliced Host
+    // header) and the lone-`\n` flavor that bypasses sloppy CR/LF
+    // string-search filters.
+    for (literal, label) in [
+        (r#""value\r\nHost: attacker.example""#, "x-evil-crlf"),
+        (r#""value\nX-Smuggled: true""#, "x-evil-lf"),
+        (r#""value\rsplit""#, "x-evil-cr"),
+    ] {
+        let toml = format!(
+            r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "https://api.example.com/v1"
+api_key_env = "FAKE_KEY"
+
+[providers.openai_compatible.headers]
+"{label}" = {literal}
+"#
+        );
+        // ProviderSettings::from_table runs as part of from_toml_str, so
+        // the CR/LF rejection surfaces here — it would otherwise be a
+        // deferred reqwest builder error at request time with no field
+        // name. Pin both the field path and the CR/LF hint so a future
+        // refactor that moved this check elsewhere or stripped the hint
+        // would fail the assertion.
+        let err = SettingsFile::from_toml_str(&toml, "test").unwrap_err();
+        assert!(
+            matches!(err, SqueezyError::Config(_)),
+            "{label}: CR/LF rejection must surface as SqueezyError::Config, got: {err:?}",
+        );
+        let message = err.to_string();
+        let expected_path = format!("providers.openai_compatible.headers.{label}");
+        assert!(
+            message.contains(&expected_path),
+            "{label}: error must name the offending TOML path {expected_path:?}; got: {message}",
+        );
+        assert!(
+            message.contains("CR/LF") || message.contains("control characters"),
+            "{label}: error must hint at the CR/LF restriction; got: {message}",
+        );
+    }
+}
+
+#[test]
+fn extra_headers_accept_visible_ascii_at_config_load() {
+    // Counterpart to `extra_headers_reject_crlf_at_config_load`: the
+    // common-case `HTTP-Referer` / `X-Title` / `cf-aig-authorization`
+    // shapes used in actual production deployments must still parse
+    // cleanly. Without this assertion a regression that tightened the
+    // filter too aggressively (e.g. rejecting whitespace, parens, or
+    // forward slashes) would shut out the OpenRouter attribution and
+    // Cloudflare AI Gateway dual-auth setups documented in the README.
+    let toml = r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "https://api.example.com/v1"
+api_key_env = "FAKE_KEY"
+
+[providers.openai_compatible.headers]
+HTTP-Referer = "https://github.com/esqueezy/squeezy"
+X-Title = "Squeezy (1.2.3)"
+cf-aig-authorization = "Bearer sk-test-1234"
+"#;
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+        (name == "FAKE_KEY").then(|| "k".to_string())
+    })
+    .expect("standard ASCII header values must round-trip cleanly");
+}
+
+#[test]
+fn non_custom_preset_does_not_emit_allow_list_warning() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    // Counterpart to `custom_preset_emits_allow_list_warning_at_config_load`:
+    // a curated preset (OpenRouter here — it has a published default
+    // base_url) must NOT emit the Custom-preset bypass warning. Without
+    // this control a future regression that fired the warning for
+    // every OpenAI-compatible preset would slip past the positive
+    // assertion above.
+    #[derive(Default, Clone)]
+    struct Capturing {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+    struct MsgVisitor<'a>(&'a mut String);
+    impl Visit for MsgVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
+        }
+    }
+    impl Subscriber for Capturing {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= &Level::WARN && metadata.target() == "squeezy_core::config"
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut message = String::new();
+            event.record(&mut MsgVisitor(&mut message));
+            self.events
+                .lock()
+                .expect("events lock poisoned")
+                .push(message);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    let subscriber = Capturing::default();
+    let toml = r#"
+[model]
+provider = "openrouter"
+
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+"#;
+    let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
+    let _config = tracing::subscriber::with_default(subscriber.clone(), || {
+        AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+            (name == "OPENROUTER_API_KEY").then(|| "k".to_string())
+        })
+    })
+    .expect("OpenRouter preset must build");
+
+    let captured: Vec<String> =
+        std::mem::take(&mut *subscriber.events.lock().expect("events lock poisoned"));
+    for message in &captured {
+        assert!(
+            !message.contains("Custom preset bypasses"),
+            "non-Custom preset must not emit the allow-list warning; got: {message}",
+        );
+    }
+}
+
+#[test]
 fn local_inline_api_key_overrides_user_inline_api_key() {
     let mut user = ProviderSettings {
         api_key: Some("from-user".to_string()),

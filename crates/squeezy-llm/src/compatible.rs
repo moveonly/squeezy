@@ -120,6 +120,31 @@ impl OpenAiCompatibleProvider {
         &self.base_url
     }
 
+    /// Test-only mirror of the bearer/header attachment block inside
+    /// [`Self::stream_response`]. Given a resolved key string (which may
+    /// be empty for unauthenticated local presets — see X-17 / H-46),
+    /// stamp the same headers a live request would carry, then return a
+    /// built `reqwest::Request` callers can inspect without standing up
+    /// a mock server. The conditional `bearer_auth` gate is what H-46
+    /// pins: when `key` is empty the `Authorization` header must be
+    /// absent so `bearer_auth("")` never panics inside reqwest and an
+    /// LM Studio / vLLM / llama.cpp deployment with no token is not
+    /// served a malformed `Authorization: Bearer ` blank.
+    #[cfg(test)]
+    pub(crate) fn build_chat_request_for_test(&self, key: &str) -> reqwest::Request {
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut builder = self.client.post(&url);
+        if !key.is_empty() {
+            builder = builder.bearer_auth(key);
+        }
+        for (header_key, header_value) in &self.extra_headers {
+            builder = builder.header(header_key.as_str(), header_value.as_str());
+        }
+        builder
+            .build()
+            .expect("compatible request must build with valid headers")
+    }
+
     /// Construct the provider against an already-built credential
     /// source. The GitHub Copilot OAuth provider uses this path so a
     /// rotating Bearer token can flow through the Chat-Completions
