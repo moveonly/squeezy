@@ -93,7 +93,7 @@ pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 // per-project + per-region, so users must set `vertex_project` and
 // `vertex_location` (or override `base_url` directly).
 pub const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
-pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-2.5-pro";
+pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-3.1-pro-preview";
 // OpenAI-compatible single-vendor (light preset tier — no curated models, no dedicated costly test).
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-2512";
