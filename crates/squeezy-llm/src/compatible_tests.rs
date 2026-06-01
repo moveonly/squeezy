@@ -327,6 +327,46 @@ fn finish_stop_with_content_does_not_emit_notice() {
 }
 
 #[test]
+fn finish_content_filter_emits_notice_and_drains_reasoning() {
+    // The content-filter exit path (`finish_reason="content_filter"`) lands
+    // when an upstream guardrail rejects the in-flight assistant output.
+    // The parser must (1) flush any reasoning streamed up to the block
+    // into a `ReasoningDone` so the partial thinking persists, and (2)
+    // inject a visible `TextDelta` so the user sees *why* the turn
+    // truncated instead of a silent empty assistant message — local
+    // self-hosted servers behind a moderation reverse-proxy hit this
+    // path most often.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":"weighing options"}}]}"#,
+        &mut state,
+    )
+    .expect("reasoning delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+        &mut state,
+    )
+    .expect("content_filter");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::ReasoningDone(_))),
+        "expected ReasoningDone to flush thinking before the filter exit notice: {events:?}"
+    );
+    let notice = events
+        .iter()
+        .find_map(|e| match e {
+            LlmEvent::TextDelta(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("content filter notice");
+    assert!(
+        notice.contains("content_filter"),
+        "notice must call out the filter exit: {notice}"
+    );
+}
+
+#[test]
 fn finish_length_emits_truncation_notice_and_drains_reasoning() {
     let mut state = StreamState::default();
     parse_chat_event(
