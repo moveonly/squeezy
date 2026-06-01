@@ -1613,72 +1613,99 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         OpenAiConfig, ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
-    cfg.provider = match s {
-        "openai" => ProviderConfig::OpenAi(OpenAiConfig {
-            api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
-            api_key: None,
-            base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
-            transport,
-        }),
-        "openai-codex" | "openai_codex" | "chatgpt" => {
+    let (provider, default_model) = match s {
+        "openai" => (
+            ProviderConfig::OpenAi(OpenAiConfig {
+                api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
+                api_key: None,
+                base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+                transport,
+            }),
+            DEFAULT_OPENAI_MODEL,
+        ),
+        "openai-codex" | "openai_codex" | "chatgpt" => (
             ProviderConfig::OpenAiCodex(OpenAiCodexConfig {
                 base_url: DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
                 originator: DEFAULT_OPENAI_CODEX_ORIGINATOR.to_string(),
                 transport,
-            })
-        }
-        "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
-            api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
-            api_key: None,
-            base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
-            transport,
-        }),
-        "google" => ProviderConfig::Google(GoogleConfig {
-            api_key_env: "SQUEEZY_GOOGLE_KEY".to_string(),
-            api_key: None,
-            base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
-            transport,
-        }),
-        "azure_openai" => ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
-            api_key_env: "SQUEEZY_AZURE_OPENAI_KEY".to_string(),
-            api_key: None,
-            base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
-            api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
-            deployment_name_map: BTreeMap::new(),
-            transport,
-        }),
-        "bedrock" => ProviderConfig::Bedrock(BedrockConfig {
-            region: DEFAULT_BEDROCK_REGION.to_string(),
-            base_url: None,
-            bearer_token: None,
-            request_metadata: BTreeMap::new(),
-            transport,
-        }),
-        "ollama" => ProviderConfig::Ollama(OllamaConfig {
-            base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
-            route_style: Default::default(),
-            transport,
-        }),
-        "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
-            script: None,
-            name: None,
-            transport,
-        }),
+            }),
+            DEFAULT_OPENAI_CODEX_MODEL,
+        ),
+        "anthropic" => (
+            ProviderConfig::Anthropic(AnthropicConfig {
+                api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
+                api_key: None,
+                base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+                transport,
+            }),
+            DEFAULT_ANTHROPIC_MODEL,
+        ),
+        "google" => (
+            ProviderConfig::Google(GoogleConfig {
+                api_key_env: "SQUEEZY_GOOGLE_KEY".to_string(),
+                api_key: None,
+                base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
+                transport,
+            }),
+            DEFAULT_GOOGLE_MODEL,
+        ),
+        "azure_openai" => (
+            ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
+                api_key_env: "SQUEEZY_AZURE_OPENAI_KEY".to_string(),
+                api_key: None,
+                base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
+                api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
+                deployment_name_map: BTreeMap::new(),
+                transport,
+            }),
+            DEFAULT_AZURE_OPENAI_MODEL,
+        ),
+        "bedrock" => (
+            ProviderConfig::Bedrock(BedrockConfig {
+                region: DEFAULT_BEDROCK_REGION.to_string(),
+                base_url: None,
+                bearer_token: None,
+                request_metadata: BTreeMap::new(),
+                transport,
+            }),
+            DEFAULT_BEDROCK_MODEL,
+        ),
+        "ollama" => (
+            ProviderConfig::Ollama(OllamaConfig {
+                base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+                route_style: Default::default(),
+                transport,
+            }),
+            DEFAULT_OLLAMA_MODEL,
+        ),
+        "faux" | "mock" => (
+            ProviderConfig::Faux(FauxConfig {
+                script: None,
+                name: None,
+                transport,
+            }),
+            crate::DEFAULT_FAUX_MODEL,
+        ),
         other => {
             let preset = OpenAiCompatiblePreset::parse(other).ok_or("unknown provider")?;
-            ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
-                preset,
-                api_key_env: preset.default_api_key_env().to_string(),
-                api_key: None,
-                base_url: preset.default_base_url().to_string(),
-                extra_headers: BTreeMap::new(),
-                transport,
-                account_id: None,
-                gateway_id: None,
-            })
+            let default_model = preset.default_model();
+            (
+                ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
+                    preset,
+                    api_key_env: preset.default_api_key_env().to_string(),
+                    api_key: None,
+                    base_url: preset.default_base_url().to_string(),
+                    extra_headers: BTreeMap::new(),
+                    transport,
+                    account_id: None,
+                    gateway_id: None,
+                }),
+                default_model,
+            )
         }
     };
-    cfg.model = default_model_for(s).to_string();
+    cfg.provider = provider;
+    cfg.model = default_model.to_string();
     Ok(())
 }
 
@@ -2682,10 +2709,10 @@ fn set_redaction_custom_patterns(
     };
     // Validate each pattern compiles; let RedactionConfig::validate gate.
     let next = crate::RedactionConfig {
-        custom_patterns: items.clone(),
+        custom_patterns: items,
     };
     next.validate().map_err(|_| "invalid regex pattern")?;
-    cfg.redaction.custom_patterns = items;
+    cfg.redaction = next;
     Ok(())
 }
 
@@ -2753,9 +2780,12 @@ fn get_websearch_provider(cfg: &AppConfig) -> FieldValue {
 fn set_websearch_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
     match value {
         FieldValue::String(s) => {
-            let trimmed = s.trim().to_ascii_lowercase();
-            if trimmed == "exa" || trimmed == "parallel" {
-                cfg.websearch_provider = trimmed;
+            let trimmed = s.trim();
+            if trimmed.eq_ignore_ascii_case("exa") {
+                cfg.websearch_provider = "exa".to_string();
+                Ok(())
+            } else if trimmed.eq_ignore_ascii_case("parallel") {
+                cfg.websearch_provider = "parallel".to_string();
                 Ok(())
             } else {
                 Err("websearch_provider must be \"exa\" or \"parallel\"")
@@ -2773,10 +2803,10 @@ pub fn section(id: SectionId) -> Option<&'static ConfigSectionMeta> {
 /// Parse a section slug to its `SectionId` (case-insensitive). Useful for
 /// `/config <section>` arguments.
 pub fn section_from_slug(slug: &str) -> Option<SectionId> {
-    let lower = slug.trim().to_ascii_lowercase();
+    let slug = slug.trim();
     CONFIG_SECTIONS
         .iter()
-        .find(|s| s.id.slug() == lower)
+        .find(|s| s.id.slug().eq_ignore_ascii_case(slug))
         .map(|s| s.id)
 }
 
