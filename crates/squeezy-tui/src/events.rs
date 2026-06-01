@@ -222,7 +222,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format!("{agent} subagent running");
                     app.note_subagent_started(id, agent.clone(), prompt.clone());
-                    app.push_log(format!("{agent} subagent started: {prompt}"));
+                    app.push_log(format!(
+                        "{agent} subagent started: {}",
+                        compact_text(&prompt, 180)
+                    ));
                 }
                 AgentEvent::SubagentActivity {
                     id, agent, message, ..

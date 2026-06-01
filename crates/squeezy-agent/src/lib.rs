@@ -7676,17 +7676,15 @@ async fn run_subagent_dispatch(
         }
     };
 
-    let started_prompt = context
-        .redactor
-        .redact(&compact_text(&request.prompt, 240))
-        .text;
+    let started_prompt = context.redactor.redact(&request.prompt).text;
+    let started_prompt_preview = compact_text(&started_prompt, 240);
     let subagent_id = lease.id;
     log_session_event(
         context.session_log.as_ref(),
         &context.redactor,
         "subagent_started",
         Some(context.turn_id),
-        Some(format!("{}: {started_prompt}", kind.as_str())),
+        Some(format!("{}: {started_prompt_preview}", kind.as_str())),
         json!({
             "agent": kind.as_str(),
             "scope": request.scope,
@@ -7759,7 +7757,7 @@ async fn run_subagent_dispatch(
                     turn_id: context.turn_id,
                     id: subagent_id,
                     agent: kind.as_str().to_string(),
-                    summary: compact_text(&execution.summary, 320),
+                    summary: execution.summary.clone(),
                     metrics: execution.metrics.clone(),
                 })
                 .await;
@@ -7787,7 +7785,7 @@ async fn run_subagent_dispatch(
                     turn_id: context.turn_id,
                     id: subagent_id,
                     agent: kind.as_str().to_string(),
-                    error: compact_text(&error, 320),
+                    error,
                     metrics: execution.metrics.clone(),
                 })
                 .await;
