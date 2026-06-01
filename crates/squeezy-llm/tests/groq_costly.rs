@@ -33,6 +33,7 @@ async fn groq_chat_completions_streaming_costly() -> Result<()> {
         gateway_id: None,
         deployment_id: None,
         cf_ai_gateway: None,
+        use_oauth: false,
     })?;
     let model = env::var(MODEL_ENV)
         .or_else(|_| env::var("SQUEEZY_COSTLY_MODEL"))

@@ -2730,6 +2730,100 @@ fn vertex_preset_templates_base_url_from_project_and_location() {
 }
 
 #[test]
+fn vertex_preset_opts_into_oauth_when_setting_set() {
+    // The new `use_oauth = true` TOML setting flips the config flag
+    // so the LLM client can construct a refreshing `VertexOAuthSource`
+    // instead of snapshotting `VERTEX_ACCESS_TOKEN` at startup.
+    // squeezy-core only surfaces the intent; the OAuth implementation
+    // lives in squeezy-llm to keep the core layer transport-agnostic.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            vertex_location: Some("us-central1".to_string()),
+            use_oauth: Some(true),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |_| None)
+        .expect("vertex config builds with oauth opt-in");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert!(compatible.use_oauth);
+}
+
+#[test]
+fn vertex_preset_infers_oauth_from_application_credentials_env() {
+    // When the operator has `GOOGLE_APPLICATION_CREDENTIALS` pointed at
+    // a service-account JSON and has NOT pasted a static
+    // `VERTEX_ACCESS_TOKEN`, infer that they want OAuth. This matches
+    // gcloud / opencode behavior and removes the per-session token
+    // refresh chore from the user's workflow.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some("/path/to/sa.json".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds with ADC env");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert!(
+        compatible.use_oauth,
+        "ADC-style env without a static token must imply OAuth intent",
+    );
+}
+
+#[test]
+fn vertex_preset_static_token_disables_oauth_inference() {
+    // The inference path defers to the user's choice: a static
+    // `VERTEX_ACCESS_TOKEN` means they're managing refresh themselves
+    // (e.g. a sidecar that rewrites the env every 50 minutes), so
+    // we keep the legacy static-snapshot behavior.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some("/path/to/sa.json".to_string()),
+            "VERTEX_ACCESS_TOKEN" => Some("ya29.live".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds with both ADC env and static token");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert!(!compatible.use_oauth);
+}
+
+#[test]
 fn vertex_preset_rejects_missing_project() {
     let settings = SettingsFile::default();
     let error = AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |_| None)

@@ -1683,6 +1683,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 gateway_id: None,
                 deployment_id: None,
                 cf_ai_gateway: None,
+                use_oauth: false,
             })
         }
     };

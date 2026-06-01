@@ -2030,6 +2030,16 @@ pub struct OpenAiCompatibleConfig {
     /// existing precedence for `cf-aig-authorization`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cf_ai_gateway: Option<CloudflareAiGatewayConfig>,
+    /// Vertex AI: opt in to a refreshing OAuth source instead of the
+    /// static `VERTEX_ACCESS_TOKEN` snapshot. The LLM client decides
+    /// how to source tokens (squeezy-core does not depend on
+    /// `squeezy-llm`'s oauth module); it can construct
+    /// `VertexOAuthSource` from `GOOGLE_APPLICATION_CREDENTIALS` or
+    /// `gcloud auth application-default print-access-token`. Default
+    /// is `false`, preserving the historical static-snapshot
+    /// behavior.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub use_oauth: bool,
 }
 
 /// Typed `cf-aig-*` knob surface for the Cloudflare AI Gateway preset.
@@ -3030,6 +3040,10 @@ pub struct ProviderSettings {
     /// block entirely, so the higher-precedence layer's value (if any)
     /// remains in effect during merge.
     pub cf_ai_gateway: Option<CloudflareAiGatewayConfig>,
+    /// Vertex-only: opt in to OAuth-sourced bearer tokens. Tri-state
+    /// (`None` to preserve the higher-precedence layer during merge,
+    /// `Some(false)` to explicitly disable, `Some(true)` to enable).
+    pub use_oauth: Option<bool>,
 }
 
 impl ProviderSettings {
@@ -3062,6 +3076,7 @@ impl ProviderSettings {
                 "service_tier",
                 "deployment_id",
                 "cf_ai_gateway",
+                "use_oauth",
             ],
             source,
             path,
@@ -3276,6 +3291,7 @@ impl ProviderSettings {
                 &field(path, "deployment_id"),
             )?,
             cf_ai_gateway,
+            use_oauth: bool_value(table, "use_oauth", source, &field(path, "use_oauth"))?,
         })
     }
 
@@ -3306,6 +3322,7 @@ impl ProviderSettings {
         replace_if_some(&mut self.service_tier, next.service_tier);
         replace_if_some(&mut self.deployment_id, next.deployment_id);
         replace_if_some(&mut self.cf_ai_gateway, next.cf_ai_gateway);
+        replace_if_some(&mut self.use_oauth, next.use_oauth);
     }
 }
 
@@ -8872,6 +8889,7 @@ fn provider_setting_bool_any(
         };
         let value = match key {
             "use_entra_id" => settings.use_entra_id,
+            "use_oauth" => settings.use_oauth,
             _ => None,
         };
         if value.is_some() {
@@ -9111,6 +9129,30 @@ fn build_openai_compatible_config(
     } else {
         None
     };
+    // Vertex OAuth opt-in: explicit `use_oauth = true` in TOML wins;
+    // otherwise infer from the environment — when `VERTEX_USE_OAUTH=1`
+    // is set, or when the user supplied
+    // `GOOGLE_APPLICATION_CREDENTIALS` (an ADC-style refresher) but no
+    // static `VERTEX_ACCESS_TOKEN`. The LLM client is responsible for
+    // actually wiring a `VertexOAuthSource` — squeezy-core only
+    // surfaces the intent.
+    let use_oauth = if matches!(preset, OpenAiCompatiblePreset::Vertex) {
+        if let Some(value) =
+            provider_setting_bool_any(providers, &[section, "vertex_ai"], "use_oauth")
+        {
+            value
+        } else if let Some(flag) = get_var("VERTEX_USE_OAUTH") {
+            matches!(
+                flag.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        } else {
+            get_var("GOOGLE_APPLICATION_CREDENTIALS").is_some()
+                && get_var("VERTEX_ACCESS_TOKEN").is_none()
+        }
+    } else {
+        false
+    };
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,
@@ -9122,6 +9164,7 @@ fn build_openai_compatible_config(
         gateway_id,
         deployment_id,
         cf_ai_gateway,
+        use_oauth,
     }))
 }
 
