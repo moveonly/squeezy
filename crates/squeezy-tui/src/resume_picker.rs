@@ -290,8 +290,9 @@ pub(crate) fn merge_candidates_for_picker(
     global: &[GlobalSessionIndexEntry],
     now_ms: u64,
 ) -> Vec<SessionSummary> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<SessionSummary> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<SessionSummary> =
+        Vec::with_capacity((local.len() + global.len()).min(MAX_PICKER_ENTRIES));
     for meta in local {
         if !meta.resume_available {
             continue;
@@ -299,7 +300,7 @@ pub(crate) fn merge_candidates_for_picker(
         if now_ms.saturating_sub(meta.started_at_ms) > RECENT_WINDOW_MS {
             continue;
         }
-        if !seen.insert(meta.session_id.clone()) {
+        if !seen.insert(meta.session_id.as_str()) {
             continue;
         }
         out.push(SessionSummary::from_metadata(meta));
@@ -311,7 +312,7 @@ pub(crate) fn merge_candidates_for_picker(
         if now_ms.saturating_sub(entry.started_at_ms) > RECENT_WINDOW_MS {
             continue;
         }
-        if !seen.insert(entry.session_id.clone()) {
+        if !seen.insert(entry.session_id.as_str()) {
             continue;
         }
         out.push(SessionSummary::from_global_index_entry(entry));
@@ -691,7 +692,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     };
     let intro = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!("{}", state.candidates.len()),
+            state.candidates.len().to_string(),
             Style::default()
                 .fg(crate::render::theme::accent())
                 .add_modifier(Modifier::BOLD),
@@ -736,7 +737,8 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     } else {
         "all projects"
     };
-    let mut footer_lines = vec![Line::from(vec![
+    let mut footer_lines = Vec::with_capacity(2);
+    footer_lines.push(Line::from(vec![
         Span::styled(
             "↑/↓ ",
             Style::default().fg(crate::render::theme::secondary()),
@@ -758,8 +760,8 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             "toggle  ",
             Style::default().fg(crate::render::theme::quiet()),
         ),
-    ])];
-    let mut second_line = Vec::new();
+    ]));
+    let mut second_line = Vec::with_capacity(if state.can_go_back() { 8 } else { 6 });
     if state.can_go_back() {
         second_line.push(Span::styled(
             "← ",
@@ -838,21 +840,30 @@ fn render_candidate_row(
         }
         None => (summary.label(), None),
     };
-    let mut spans = vec![
-        Span::styled(prefix, Style::default().fg(prefix_color)),
-        Span::styled(format_started_at(summary.started_at_ms), timestamp_style),
-        Span::styled("  ", Style::default()),
-        Span::styled(format!("{:>10}", summary.turn_indicator()), timestamp_style),
-        Span::styled("  ", Style::default()),
-        Span::styled(label, label_style),
-    ];
+    let label_hint = summary.label_hint();
+    let mut spans = Vec::with_capacity(
+        6 + usize::from(branch_marker.is_some())
+            + if label_hint.is_empty() { 0 } else { 2 }
+            + if cross_project { 3 } else { 0 },
+    );
+    spans.push(Span::styled(prefix, Style::default().fg(prefix_color)));
+    spans.push(Span::styled(
+        format_started_at(summary.started_at_ms),
+        timestamp_style,
+    ));
+    spans.push(Span::styled("  ", Style::default()));
+    spans.push(Span::styled(
+        format!("{:>10}", summary.turn_indicator()),
+        timestamp_style,
+    ));
+    spans.push(Span::styled("  ", Style::default()));
+    spans.push(Span::styled(label, label_style));
     if let Some(marker) = branch_marker {
         spans.push(Span::styled(
             marker,
             Style::default().fg(crate::render::theme::magenta()),
         ));
     }
-    let label_hint = summary.label_hint();
     if !label_hint.is_empty() {
         spans.push(Span::styled("  ", Style::default()));
         spans.push(Span::styled(

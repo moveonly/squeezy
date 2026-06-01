@@ -83,12 +83,13 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     /// the tier file actually exists on disk. The dot mirrors the
     /// `[file present]` / `[no file]` indicator on the Reset section
     /// so the user can tell at a glance which tabs are doing work.
-    fn tab(
+    fn push_tab(
+        spans: &mut Vec<Span<'static>>,
         label: &'static str,
         subtitle: String,
         active: bool,
         exists: bool,
-    ) -> Vec<Span<'static>> {
+    ) {
         // The active tab is identified by the amber dot alone — we used to
         // also stamp an extra "▸ " in front of the label, but the ▸
         // separators between tabs already make that look like "▸ ▸ Repo"
@@ -117,15 +118,13 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         } else {
             format!(" {subtitle}")
         };
-        vec![
-            Span::styled(label, label_style),
-            Span::raw(" "),
-            Span::styled(dot, dot_style),
-            Span::styled(
-                subtitle_text,
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-        ]
+        spans.push(Span::styled(label, label_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(dot, dot_style));
+        spans.push(Span::styled(
+            subtitle_text,
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
     }
     let user_exists = std::fs::metadata(&state.sources.user_path_default).is_ok();
     let repo_exists = std::fs::metadata(&state.sources.project_path_default).is_ok();
@@ -154,7 +153,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     let (user_sub, repo_sub, local_sub) =
         budget_subtitles(&user_full, &repo_full, &local_full, budget_for_paths);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(22);
     spans.push(Span::styled(
         "  Config  ",
         Style::default()
@@ -165,12 +164,13 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         " │ ",
         Style::default().fg(crate::render::theme::quiet()),
     ));
-    spans.extend(tab(
+    push_tab(
+        &mut spans,
         "User",
         user_sub,
         state.scope == ConfigScope::User,
         user_exists,
-    ));
+    );
     spans.push(Span::styled(
         " ▸ ",
         Style::default().fg(crate::render::theme::blue()),
@@ -180,24 +180,26 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     } else if repo_exists {
         format!("{repo_sub} (committed)")
     } else {
-        repo_sub.clone()
+        repo_sub
     };
-    spans.extend(tab(
+    push_tab(
+        &mut spans,
         "Repo",
         repo_subtitle,
         state.scope == ConfigScope::Repo,
         repo_exists,
-    ));
+    );
     spans.push(Span::styled(
         " ▸ ",
         Style::default().fg(crate::render::theme::blue()),
     ));
-    spans.extend(tab(
+    push_tab(
+        &mut spans,
         "Local",
         local_sub,
         state.scope == ConfigScope::Local,
         local_exists,
-    ));
+    );
     if state.dirty {
         spans.push(Span::styled(
             "    (changes applied)",
@@ -380,7 +382,15 @@ fn render_theme_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     let section = state.current_section();
     let active_theme = state.effective.tui.theme.clone();
     let active_snapshot = crate::render::theme::resolve_theme(&state.effective, &active_theme);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let theme_names = crate::render::theme::available_theme_names(&state.effective);
+    let token_rows = crate::render::theme::token_rows();
+    let total_rows = theme_names.len() + 1 + token_rows.len();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(
+        total_rows
+            .min(area.height as usize)
+            .saturating_add(usize::from(state.theme_editor.is_some()) * 4)
+            .saturating_add(8),
+    );
     lines.push(Line::from(vec![
         Span::styled(
             section.label,
@@ -408,19 +418,14 @@ fn render_theme_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     ]));
     lines.push(Line::raw(""));
 
-    let total_rows = state.row_count();
     let editing = state.theme_editor.is_some();
-    let (rows, hidden_above, hidden_below) = if editing {
-        (vec![state.field_index], 0, 0)
+    let (row_start, row_end, hidden_above, hidden_below) = if editing {
+        (state.field_index, state.field_index + 1, 0, 0)
     } else {
         let detail_rows = 4usize + usize::from(state.theme_editor.is_some()) * 4;
         let row_area = (area.height as usize).saturating_sub(detail_rows);
         let (start, end) = field_row_window(total_rows, state.field_index, row_area);
-        (
-            (start..end).collect(),
-            start,
-            total_rows.saturating_sub(end),
-        )
+        (start, end, start, total_rows.saturating_sub(end))
     };
 
     if hidden_above > 0 {
@@ -430,7 +435,7 @@ fn render_theme_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
         )));
     }
 
-    for row in rows {
+    for row in row_start..row_end {
         let focused = row == state.field_index;
         let prefix = if focused { "› " } else { "  " };
         let prefix_style = Style::default().fg(if focused {
@@ -438,7 +443,17 @@ fn render_theme_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
         } else {
             crate::render::theme::quiet()
         });
-        match state.theme_row_at(row) {
+        let theme_row = if row < theme_names.len() {
+            Some(ThemeRow::Theme(theme_names[row].clone()))
+        } else if row == theme_names.len() {
+            Some(ThemeRow::New)
+        } else {
+            token_rows
+                .get(row.saturating_sub(theme_names.len() + 1))
+                .copied()
+                .map(ThemeRow::Color)
+        };
+        match theme_row {
             Some(ThemeRow::Theme(name)) => {
                 let snapshot = crate::render::theme::resolve_theme(&state.effective, &name);
                 let accent = snapshot

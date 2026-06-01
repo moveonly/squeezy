@@ -317,7 +317,7 @@ pub(crate) fn render_status_detail_line(
     items: &[StatusLineItem],
     use_theme_colors: bool,
 ) -> Option<Line<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len().saturating_mul(2));
     for item in items {
         let Some(text) = resolve_status_item(app, *item) else {
             continue;
@@ -359,25 +359,29 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             if frag.is_empty() {
                 Some(compact_text(&app.model, 40))
             } else {
-                Some(compact_text(&format!("{}{}", app.model, frag), 48))
+                let mut text = String::with_capacity(app.model.len() + frag.len());
+                text.push_str(&app.model);
+                text.push_str(&frag);
+                Some(compact_text(&text, 48))
             }
         }
-        StatusLineItem::ProviderAndModel => Some(compact_text(
-            &format!("{}:{}", app.provider_name, app.model),
-            54,
-        )),
+        StatusLineItem::ProviderAndModel => {
+            let mut text = String::with_capacity(app.provider_name.len() + 1 + app.model.len());
+            text.push_str(&app.provider_name);
+            text.push(':');
+            text.push_str(&app.model);
+            Some(compact_text(&text, 54))
+        }
         StatusLineItem::ReasoningEffort => app
             .reasoning_effort
             .map(|effort| format!("effort {}", effort.as_str())),
         StatusLineItem::CurrentDir => Some(compact_text(&app.directory, 48)),
-        StatusLineItem::ProjectName => {
-            let name = app
-                .workspace_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string);
-            name.filter(|n| !n.is_empty())
-        }
+        StatusLineItem::ProjectName => app
+            .workspace_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string),
         StatusLineItem::Languages => {
             let summary = app.language_summary.trim();
             if summary.is_empty() || summary == "none" {
@@ -389,8 +393,8 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
         StatusLineItem::GitBranch => app
             .repo
             .branch
-            .clone()
-            .map(|b| compact_text(&b, 32))
+            .as_deref()
+            .map(|b| compact_text(b, 32))
             .or_else(|| {
                 if app.repo.available {
                     Some("detached".to_string())
@@ -540,8 +544,14 @@ pub(crate) fn render_status_details(app: &TuiApp) -> String {
         segments::cached_tokens(app),
         segments::cache_write_tokens(app),
     ];
-    let pieces: Vec<String> = segments.into_iter().flatten().collect();
-    pieces.join("  ")
+    let mut output = String::new();
+    for segment in segments.into_iter().flatten() {
+        if !output.is_empty() {
+            output.push_str("  ");
+        }
+        output.push_str(&segment);
+    }
+    output
 }
 
 /// Render the `cost ...` segment with optional cap and percent.
@@ -632,12 +642,11 @@ pub(crate) mod segments {
     }
 
     pub(crate) fn budget(app: &TuiApp) -> Option<String> {
-        let label = if app.metrics.budget_denials == 0 {
-            "ok".to_string()
+        if app.metrics.budget_denials == 0 {
+            Some("budget ok".to_string())
         } else {
-            format!("denied:{}", app.metrics.budget_denials)
-        };
-        Some(format!("budget {label}"))
+            Some(format!("budget denied:{}", app.metrics.budget_denials))
+        }
     }
 
     pub(crate) fn config(app: &TuiApp) -> Option<String> {
