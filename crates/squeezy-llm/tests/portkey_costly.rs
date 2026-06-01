@@ -46,6 +46,7 @@ async fn portkey_chat_completions_streaming_costly() -> Result<()> {
         transport: ProviderTransportConfig::default(),
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
     })?;
     let output = common::run_echo_smoke(provider, &model, PRESET.display_name()).await?;
     assert!(

@@ -2010,6 +2010,17 @@ pub struct OpenAiCompatibleConfig {
     /// for the Workers AI preset and every non-Cloudflare preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_id: Option<String>,
+    /// Baseten dedicated-deployment id. When set together with a
+    /// `base_url` that carries `{deployment_id}` (or the per-deployment
+    /// shape `https://model-{deployment_id}.api.baseten.co/environments/production/sync/v1`),
+    /// the LLM client substitutes the placeholder before requests fire.
+    /// Lets users pin SLA-bound or bring-your-own-checkpoint models
+    /// without downgrading to the `Custom` preset and losing
+    /// `BASETEN_API_KEY` autoload, the `baseten` provider label, and
+    /// the `baseten` model-alias namespace. `None` keeps the existing
+    /// shared-endpoint contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
 }
 
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
@@ -2943,6 +2954,10 @@ pub struct ProviderSettings {
     /// `default`, `auto`, `scale`). Pass-through string so new tiers
     /// land without a client release. Ignored by every other provider.
     pub service_tier: Option<String>,
+    /// Baseten-only: dedicated-deployment id used to substitute
+    /// `{deployment_id}` in the resolved `base_url`. Ignored by every
+    /// other preset.
+    pub deployment_id: Option<String>,
 }
 
 impl ProviderSettings {
@@ -2973,6 +2988,7 @@ impl ProviderSettings {
                 "organization",
                 "project",
                 "service_tier",
+                "deployment_id",
             ],
             source,
             path,
@@ -3096,6 +3112,12 @@ impl ProviderSettings {
                 source,
                 &field(path, "service_tier"),
             )?,
+            deployment_id: string_value(
+                table,
+                "deployment_id",
+                source,
+                &field(path, "deployment_id"),
+            )?,
         })
     }
 
@@ -3124,6 +3146,7 @@ impl ProviderSettings {
         replace_if_some(&mut self.organization, next.organization);
         replace_if_some(&mut self.project, next.project);
         replace_if_some(&mut self.service_tier, next.service_tier);
+        replace_if_some(&mut self.deployment_id, next.deployment_id);
     }
 }
 
@@ -8641,6 +8664,7 @@ fn provider_setting(
         "organization" => settings.organization.as_ref(),
         "project" => settings.project.as_ref(),
         "service_tier" => settings.service_tier.as_ref(),
+        "deployment_id" => settings.deployment_id.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -8902,6 +8926,21 @@ fn build_openai_compatible_config(
     }
     let transport = provider_transport_settings(providers, &[section]);
     let api_key = provider_setting(providers, section, "api_key");
+    // Baseten dedicated deployments live behind per-deployment hosts
+    // (`https://model-{deployment_id}.api.baseten.co/...`). The
+    // placeholder substitution lives in the LLM client; here we just
+    // collect the id so the runtime path has it. Reading from BOTH
+    // `BASETEN_DEPLOYMENT_ID` env and TOML lets repo configs name a
+    // sane default while operators per-shell override the deployment
+    // they're testing.
+    let deployment_id = if matches!(preset, OpenAiCompatiblePreset::Baseten) {
+        get_var("BASETEN_DEPLOYMENT_ID")
+            .or_else(|| provider_setting(providers, section, "deployment_id"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,
@@ -8911,6 +8950,7 @@ fn build_openai_compatible_config(
         transport,
         account_id,
         gateway_id,
+        deployment_id,
     }))
 }
 

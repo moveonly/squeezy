@@ -2741,6 +2741,97 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
+fn baseten_preset_carries_deployment_id_for_per_deployment_url() {
+    // Baseten dedicated deployments live behind per-deployment hosts
+    // (`https://model-{deployment_id}.api.baseten.co/...`). The
+    // placeholder substitution lives in the LLM client; the config
+    // builder's job is to surface the id without making users
+    // downgrade to the `Custom` preset (which would lose
+    // `BASETEN_API_KEY` autoload + the `baseten` registry label).
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "baseten".to_string(),
+        ProviderSettings {
+            deployment_id: Some("4qj0wr".to_string()),
+            base_url: Some(
+                "https://model-{deployment_id}.api.baseten.co/environments/production/sync/v1"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("baseten"), |name| match name {
+            "BASETEN_API_KEY" => Some("baseten-key".to_string()),
+            _ => None,
+        })
+        .expect("baseten config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("baseten must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.preset, OpenAiCompatiblePreset::Baseten);
+    assert_eq!(compatible.deployment_id.as_deref(), Some("4qj0wr"));
+    assert!(
+        compatible.base_url.contains("{deployment_id}"),
+        "config layer keeps the placeholder template; substitution lives in the LLM client",
+    );
+}
+
+#[test]
+fn baseten_env_override_beats_toml_deployment_id() {
+    // `BASETEN_DEPLOYMENT_ID` lets operators pivot between deployments
+    // per-shell without editing committed config — common when shipping
+    // a release-candidate alongside a baseline.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "baseten".to_string(),
+        ProviderSettings {
+            deployment_id: Some("from-toml".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("baseten"), |name| match name {
+            "BASETEN_API_KEY" => Some("baseten-key".to_string()),
+            "BASETEN_DEPLOYMENT_ID" => Some("from-env".to_string()),
+            _ => None,
+        })
+        .expect("baseten config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("baseten must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.deployment_id.as_deref(), Some("from-env"));
+}
+
+#[test]
+fn non_baseten_presets_ignore_deployment_id_env() {
+    // The env-var read is preset-scoped: a stray `BASETEN_DEPLOYMENT_ID`
+    // in a shell that's also running an OpenRouter session must not
+    // leak into the OpenRouter config.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openrouter".to_string()),
+        "OPENROUTER_API_KEY" => Some("or-key".to_string()),
+        "BASETEN_DEPLOYMENT_ID" => Some("stray".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("openrouter must map to OpenAiCompatible");
+    };
+    assert!(
+        compatible.deployment_id.is_none(),
+        "the env-var read must be preset-scoped to Baseten",
+    );
+}
+
+#[test]
 fn cloudflare_workers_ai_preset_carries_account_id_and_placeholder_template() {
     // The Workers AI preset keeps the `{account_id}` placeholder in the
     // resolved `base_url` and flows `cloudflare_account_id` through as a

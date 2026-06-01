@@ -1681,6 +1681,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 transport,
                 account_id: None,
                 gateway_id: None,
+                deployment_id: None,
             })
         }
     };

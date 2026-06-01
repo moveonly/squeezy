@@ -30,6 +30,7 @@ async fn vercel_ai_gateway_chat_completions_streaming_costly() -> Result<()> {
         transport: ProviderTransportConfig::default(),
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
     })?;
     let model = env::var(MODEL_ENV)
         .or_else(|_| env::var("SQUEEZY_COSTLY_MODEL"))
