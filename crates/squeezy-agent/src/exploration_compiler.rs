@@ -84,6 +84,26 @@ impl ExplorationTurnState {
 }
 
 pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
+    let plan = compile_exploration_plan_inner(input)?;
+    // File-named tasks (prompt mentions ≥2 explicit source file paths)
+    // are a poor fit for speculative graph plumbing: the model can read
+    // the named files directly. Suppressing the planner here saves the
+    // tool round + tokens its result would have added. RepoMap and
+    // RouteDiscovery are exempt — both genuinely need a wide-tree view
+    // regardless of whether the prompt happens to cite a file path.
+    if matches!(
+        plan.intent,
+        ExplorationIntent::RepoMap | ExplorationIntent::RouteDiscovery
+    ) {
+        return Some(plan);
+    }
+    if explicit_file_path_count(input) >= 2 {
+        return None;
+    }
+    Some(plan)
+}
+
+fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
     let lowered = input.to_ascii_lowercase();
     let extracted = extract_symbol_query(input);
     let query = extracted.as_ref().map(|q| q.value.clone());
@@ -345,6 +365,53 @@ fn method_listing_intent(input: &str) -> bool {
         || input.contains("members on")
         || input.contains("api of")
         || input.contains("api for")
+}
+
+/// Cheap heuristic: count substrings in `input` that look like a source
+/// file path (e.g. `Sources/Vapor/Routing/RoutesBuilder+Method.swift`,
+/// `crates/squeezy-tools/src/file_ops.rs`). A prompt that names ≥2 such
+/// paths is almost always doing a targeted multi-file read where
+/// speculative graph queries are dead overhead. Avoids a regex
+/// dependency: walks the bytes, finds `.<ext>` tokens whose preceding
+/// run is path-shaped, dedupes by case-insensitive value.
+fn explicit_file_path_count(input: &str) -> usize {
+    const EXTS: &[&str] = &[
+        "rs", "go", "py", "java", "cs", "js", "ts", "tsx", "jsx", "swift", "kt", "scala", "php",
+        "rb", "c", "cpp", "h", "hpp", "dart",
+    ];
+    let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, _) in input.match_indices('.') {
+        let after = &input[idx + 1..];
+        let ext_end = after
+            .find(|ch: char| !ch.is_ascii_alphanumeric())
+            .unwrap_or(after.len());
+        let ext = &after[..ext_end];
+        if ext.is_empty() || !EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+            continue;
+        }
+        // Walk backwards from `.` to find the run of path-shaped chars.
+        let before = &input[..idx];
+        let start = before
+            .rfind(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '+' | '.'))
+            })
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let path = &input[start..idx + 1 + ext_end];
+        // Must contain at least one `/` to count as a path (not bare filename
+        // commentary like "fix.rs is a file"). Two file paths in a directory
+        // section like `{widgets,material,cupertino}/...` will naturally pass
+        // this check because the realistic prompts always include the parent
+        // package or `src/` prefix.
+        if !path.contains('/') {
+            continue;
+        }
+        found.insert(path.to_ascii_lowercase());
+        if found.len() >= 2 {
+            return found.len();
+        }
+    }
+    found.len()
 }
 
 fn hierarchy_intent(input: &str) -> bool {

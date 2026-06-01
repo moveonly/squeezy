@@ -275,3 +275,74 @@ fn planner_calls_use_the_shared_graph_max_results_constant() {
         }
     }
 }
+
+#[test]
+fn hierarchy_intent_compiles_to_hierarchy_call() {
+    let plan =
+        compile_exploration_plan("Find every subclass of WidgetsBindingObserver").expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+    assert_eq!(plan.query.as_deref(), Some("WidgetsBindingObserver"));
+    assert_eq!(
+        plan.calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hierarchy"],
+        "subclass query should issue a single hierarchy call",
+    );
+    assert!(plan.guard_raw_reads);
+}
+
+#[test]
+fn subclasses_phrasing_also_compiles_to_hierarchy() {
+    let plan =
+        compile_exploration_plan("List every subclass of WidgetsBindingObserver").expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+}
+
+#[test]
+fn file_named_prompt_suppresses_speculative_planner() {
+    // Prompts that name ≥2 explicit source file paths are doing a
+    // targeted multi-file read where speculative graph plumbing is dead
+    // overhead — the model can read the named files directly. The gate
+    // returns None instead of a plan so the planner doesn't burn tool
+    // rounds + tokens on results the model never branches on.
+    //
+    // Use a hierarchy-intent prompt so the inner planner would otherwise
+    // return Some(Hierarchy); the gate is what suppresses it. Avoid
+    // route/repo-map keywords ("flow", "reach", "architecture") so the
+    // exempt branches don't accidentally win.
+    let prompt = "Find every subclass of MyTrait declared in \
+        src/lib.rs and src/main.rs";
+    assert!(
+        compile_exploration_plan(prompt).is_none(),
+        "≥2 file paths should suppress speculative planner",
+    );
+}
+
+#[test]
+fn repo_map_and_route_intents_are_exempt_from_file_path_gate() {
+    // Even with explicit file paths in the prompt, RepoMap and
+    // RouteDiscovery genuinely need a wide-tree view. Gate must not
+    // suppress them.
+    let route = compile_exploration_plan(
+        "Trace the flow from RequestHandler::dispatch through src/server.rs and src/router.rs",
+    )
+    .expect("route plan");
+    assert_eq!(route.intent, ExplorationIntent::RouteDiscovery);
+
+    let repo_map = compile_exploration_plan(
+        "Show me the repo map even though I'm touching src/lib.rs and src/main.rs",
+    )
+    .expect("repo_map plan");
+    assert_eq!(repo_map.intent, ExplorationIntent::RepoMap);
+}
+
+#[test]
+fn single_file_path_does_not_trigger_gate() {
+    // Threshold is ≥2 paths. A single file mention is typical of
+    // definition / methods queries that still benefit from the planner.
+    let plan =
+        compile_exploration_plan("list methods on Widget defined in src/lib.rs").expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::MethodListing);
+}
