@@ -8989,13 +8989,70 @@ fn is_loopback_host(host: &str) -> bool {
     false
 }
 
+/// Secondary env-var names accepted as fallbacks when the preset's
+/// canonical `default_api_key_env` is empty. Lets squeezy honor the
+/// out-of-band conventions mainstream platforms inject (Vercel
+/// runtimes always have `VERCEL_OIDC_TOKEN`; older Cloudflare and
+/// DeepInfra docs reference alternate names). Returning `&'static
+/// [&'static str]` keeps the lookup zero-allocation. The list is the
+/// preset metadata's "alias chain" — the canonical env wins when set,
+/// the first non-empty alias takes over when not. Ordering matters:
+/// list the alias that the platform's tooling actually injects first.
+fn preset_api_key_env_aliases(preset: OpenAiCompatiblePreset) -> &'static [&'static str] {
+    match preset {
+        // Vercel functions auto-inject `VERCEL_OIDC_TOKEN` (12h TTL) so
+        // a session inside a Vercel runtime authenticates against
+        // AI Gateway without a manually-pasted key. Production docs:
+        // /docs/ai-gateway/authentication-and-byok/oidc.
+        OpenAiCompatiblePreset::Vercel => &["VERCEL_OIDC_TOKEN"],
+        // Cloudflare's API token historically shipped under
+        // `CLOUDFLARE_API_TOKEN` (their dashboard) and
+        // `CLOUDFLARE_API_KEY` (Workers AI docs). Honor both so
+        // operators who already set one don't have to mirror it.
+        OpenAiCompatiblePreset::CloudflareWorkersAi
+        | OpenAiCompatiblePreset::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
+        // DeepInfra's CLI ships `DEEPINFRA_TOKEN`; the docs call it
+        // `DEEPINFRA_API_KEY`.
+        OpenAiCompatiblePreset::DeepInfra => &["DEEPINFRA_TOKEN"],
+        _ => &[],
+    }
+}
+
 fn build_openai_compatible_config(
     preset: OpenAiCompatiblePreset,
     providers: &BTreeMap<String, ProviderSettings>,
     get_var: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<ProviderConfig> {
     let section = preset.as_str();
+    // Some presets ship secondary env-var names that mainstream tooling
+    // honors out-of-band (Vercel injects `VERCEL_OIDC_TOKEN` into
+    // every function runtime; Cloudflare's API token historically
+    // shipped as both `CLOUDFLARE_API_KEY` and `CLOUDFLARE_API_TOKEN`;
+    // DeepInfra docs reference both `DEEPINFRA_API_KEY` and
+    // `DEEPINFRA_TOKEN`). When the user hasn't explicitly named an
+    // `api_key_env` AND the preset's default env is empty in this
+    // process, fall back to the first non-empty alias so an
+    // out-of-the-box session works without per-shell env juggling.
     let api_key_env = provider_setting(providers, section, "api_key_env")
+        .or_else(|| {
+            let candidate = preset.default_api_key_env();
+            if !candidate.is_empty()
+                && get_var(candidate)
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                preset_api_key_env_aliases(preset)
+                    .iter()
+                    .find(|alias| {
+                        get_var(alias)
+                            .map(|value| !value.trim().is_empty())
+                            .unwrap_or(false)
+                    })
+                    .map(|alias| (*alias).to_string())
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             let candidate = preset.default_api_key_env();
             if candidate.is_empty() {

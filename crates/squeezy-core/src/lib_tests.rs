@@ -2835,6 +2835,72 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
+fn vercel_preset_falls_back_to_oidc_token_env() {
+    // Vercel runtimes inject `VERCEL_OIDC_TOKEN` (12h TTL) into every
+    // function deployment. When the user has not pasted an
+    // `AI_GATEWAY_API_KEY`, fall back to the OIDC token so a squeezy
+    // session inside a Vercel function authenticates against AI Gateway
+    // without per-deploy env juggling.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("vercel".to_string()),
+        "VERCEL_OIDC_TOKEN" => Some("eyJ.fake.oidc".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vercel must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.api_key_env, "VERCEL_OIDC_TOKEN",
+        "missing AI_GATEWAY_API_KEY must fall back to VERCEL_OIDC_TOKEN",
+    );
+}
+
+#[test]
+fn vercel_preset_canonical_env_wins_over_oidc_alias() {
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("vercel".to_string()),
+        "AI_GATEWAY_API_KEY" => Some("user-set".to_string()),
+        "VERCEL_OIDC_TOKEN" => Some("eyJ.fake.oidc".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vercel must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.api_key_env, "AI_GATEWAY_API_KEY");
+}
+
+#[test]
+fn cloudflare_presets_honor_api_token_alias() {
+    // Cloudflare's dashboard names the credential `CLOUDFLARE_API_TOKEN`
+    // while squeezy historically reads `CLOUDFLARE_API_KEY`. Honor the
+    // dashboard name as a fallback so operators don't have to rename a
+    // CI secret on the way in.
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("cloudflare_workers_ai".to_string()),
+        "CLOUDFLARE_ACCOUNT_ID" => Some("acct-abc".to_string()),
+        "CLOUDFLARE_API_TOKEN" => Some("token-value".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("workers AI must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_TOKEN");
+}
+
+#[test]
+fn deepinfra_preset_honors_token_alias() {
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("deepinfra".to_string()),
+        "DEEPINFRA_TOKEN" => Some("token-value".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("deepinfra must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.api_key_env, "DEEPINFRA_TOKEN");
+}
+
+#[test]
 fn baseten_preset_carries_deployment_id_for_per_deployment_url() {
     // Baseten dedicated deployments live behind per-deployment hosts
     // (`https://model-{deployment_id}.api.baseten.co/...`). The
