@@ -856,8 +856,8 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         (Some(0), HistoryDirection::Previous) => Some(0),
         (Some(index), HistoryDirection::Previous) => Some(index - 1),
         (Some(index), HistoryDirection::Next) if index >= last => {
-            set_input(app, app.input_history_draft.clone());
-            app.input_history_draft.clear();
+            let draft = std::mem::take(&mut app.input_history_draft);
+            set_input(app, draft);
             app.input_history_index = None;
             app.slash_menu_index = 0;
             return;
