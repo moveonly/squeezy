@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use super::{XaiRoute, classify_route, is_responses_capable};
-use crate::{LlmProvider, LlmRequest, XaiProvider};
+use crate::{LlmEvent, LlmProvider, LlmRequest, XaiProvider};
 
 #[test]
 fn xai_uses_responses_api_for_grok_3_and_newer() {
@@ -130,11 +130,19 @@ const CHAT_SSE_BODY: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-/// Records the first request path the loopback server sees so the
-/// dispatcher tests can assert which endpoint each request hit.
+/// Captured request line plus headers from a single dispatcher request.
+#[derive(Debug, Default, Clone)]
+struct CapturedRequest {
+    path: String,
+    headers: BTreeMap<String, String>,
+}
+
+/// Records every request the loopback server sees so the dispatcher and
+/// SSE-replay tests can assert which endpoint the dispatcher chose, and
+/// which headers (if any) the sub-provider forwarded.
 #[derive(Default)]
 struct DispatcherRecorder {
-    paths: tokio::sync::Mutex<Vec<String>>,
+    captured: tokio::sync::Mutex<Vec<CapturedRequest>>,
     requests: AtomicUsize,
 }
 
@@ -143,20 +151,44 @@ impl DispatcherRecorder {
         Arc::new(Self::default())
     }
 
-    async fn record(&self, path: String) {
+    async fn record(&self, captured: CapturedRequest) {
         self.requests.fetch_add(1, Ordering::SeqCst);
-        self.paths.lock().await.push(path);
+        self.captured.lock().await.push(captured);
+    }
+
+    async fn first(&self) -> Option<CapturedRequest> {
+        self.captured.lock().await.first().cloned()
     }
 
     async fn first_path(&self) -> Option<String> {
-        self.paths.lock().await.first().cloned()
+        self.first().await.map(|c| c.path)
+    }
+}
+
+/// Selects which SSE body the loopback server returns for each route.
+#[derive(Clone)]
+struct RouteBodies {
+    responses: &'static str,
+    chat: &'static str,
+}
+
+impl RouteBodies {
+    const fn defaults() -> Self {
+        Self {
+            responses: RESPONSES_SSE_BODY,
+            chat: CHAT_SSE_BODY,
+        }
     }
 }
 
 /// Spin a loopback TCP server that replies to every POST with an SSE
 /// body chosen by inspecting the request path. The recorder captures
-/// the path so the test can assert which endpoint the dispatcher chose.
-async fn spawn_xai_dispatcher_server(recorder: Arc<DispatcherRecorder>) -> SocketAddr {
+/// the path AND headers so tests can assert which endpoint the
+/// dispatcher chose and whether per-route headers reached the wire.
+async fn spawn_xai_dispatcher_server(
+    recorder: Arc<DispatcherRecorder>,
+    bodies: RouteBodies,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
@@ -166,6 +198,7 @@ async fn spawn_xai_dispatcher_server(recorder: Arc<DispatcherRecorder>) -> Socke
                 Err(_) => return,
             };
             let recorder = recorder.clone();
+            let bodies = bodies.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::with_capacity(8192);
                 let mut tmp = [0u8; 4096];
@@ -182,17 +215,32 @@ async fn spawn_xai_dispatcher_server(recorder: Arc<DispatcherRecorder>) -> Socke
                     }
                 }
                 let head = String::from_utf8_lossy(&buf);
-                let request_line = head.lines().next().unwrap_or("").to_string();
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or("").to_string();
                 let path = request_line
                     .split_whitespace()
                     .nth(1)
                     .unwrap_or("")
                     .to_string();
-                recorder.record(path.clone()).await;
+                let mut headers = BTreeMap::new();
+                for line in lines {
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+                    }
+                }
+                recorder
+                    .record(CapturedRequest {
+                        path: path.clone(),
+                        headers,
+                    })
+                    .await;
                 let body = if path.ends_with("/responses") {
-                    RESPONSES_SSE_BODY
+                    bodies.responses
                 } else {
-                    CHAT_SSE_BODY
+                    bodies.chat
                 };
                 let bytes = body.as_bytes();
                 let headers = format!(
@@ -254,7 +302,7 @@ async fn xai_dispatcher_routes_grok_4_3_to_responses_h21() {
     // that drop grok-4.3 from the Responses branch would silently
     // pass before this test landed.
     let recorder = DispatcherRecorder::new();
-    let addr = spawn_xai_dispatcher_server(recorder.clone()).await;
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), RouteBodies::defaults()).await;
     let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
         .expect("XaiProvider builds against mock server");
 
@@ -275,7 +323,7 @@ async fn xai_dispatcher_routes_grok_2_to_chat_completions_h21() {
     // that flipped `classify_route`'s fallback to Responses would 404
     // every grok-2 request and only surface in production.
     let recorder = DispatcherRecorder::new();
-    let addr = spawn_xai_dispatcher_server(recorder.clone()).await;
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), RouteBodies::defaults()).await;
     let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
         .expect("XaiProvider builds against mock server");
 
@@ -290,6 +338,245 @@ async fn xai_dispatcher_routes_grok_2_to_chat_completions_h21() {
         path, "/v1/chat/completions",
         "grok-2 must reach /v1/chat/completions"
     );
+}
+
+/// SSE that exercises the Responses parser end-to-end:
+/// `response.output_text.delta` carries text, the terminal
+/// `response.completed` event reports both reasoning_tokens and a
+/// cached_tokens hit. The replay verifies the dispatcher surfaces the
+/// model's full cost picture (text + reasoning + cache hit) instead of
+/// dropping the reasoning/cache columns silently.
+const RESPONSES_REASONING_SSE_BODY: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_xai_m30\",\"model\":\"grok-4.3\"}}\n\n",
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\" xai\"}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_xai_m30\",\"model\":\"grok-4.3\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":5},\"total_tokens\":15}}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Chat-completions SSE with text deltas and a `usage` block that
+/// reports `prompt_tokens_details.cached_tokens` plus
+/// `completion_tokens_details.reasoning_tokens`. The replay locks in
+/// the canonical xAI Chat shape so a regression in the cost parser
+/// (e.g. moving the cached-tokens lookup) surfaces immediately. M-31
+/// (top-level `cached_tokens` fallback) lives in `compatible.rs` and
+/// stays out of this commit.
+const CHAT_REASONING_SSE_BODY: &str = concat!(
+    "data: {\"id\":\"chatcmpl_xai_m30\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+    "data: {\"id\":\"chatcmpl_xai_m30\",\"choices\":[{\"delta\":{\"content\":\" grok\"}}]}\n\n",
+    "data: {\"id\":\"chatcmpl_xai_m30\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":3},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+#[tokio::test]
+async fn xai_responses_sse_replay_surfaces_text_and_reasoning_cost_m30() {
+    // M-30: replay the Responses SSE through `XaiProvider` and verify
+    // (a) text deltas arrive in order, (b) `LlmEvent::Completed` lands
+    // exactly once, (c) `cost.cached_input_tokens` and
+    // `cost.reasoning_output_tokens` survive parsing. Without this
+    // test, a regression that dropped either column would silently
+    // zero out xAI's reasoning telemetry.
+    let recorder = DispatcherRecorder::new();
+    let bodies = RouteBodies {
+        responses: RESPONSES_REASONING_SSE_BODY,
+        chat: CHAT_SSE_BODY,
+    };
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), bodies).await;
+    let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
+        .expect("XaiProvider builds against mock server");
+
+    let stream = provider.stream_response(dispatcher_request("grok-4.3"), CancellationToken::new());
+    let events: Vec<LlmEvent> =
+        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("Responses SSE must complete within timeout")
+            .into_iter()
+            .map(|res| res.expect("Responses SSE must not error"))
+            .collect();
+
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::TextDelta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hello xai");
+
+    let Some(LlmEvent::Completed { cost, .. }) = events
+        .iter()
+        .find(|event| matches!(event, LlmEvent::Completed { .. }))
+    else {
+        panic!("expected LlmEvent::Completed in Responses replay");
+    };
+    assert_eq!(cost.input_tokens, Some(12));
+    assert_eq!(cost.output_tokens, Some(3));
+    assert_eq!(
+        cost.cached_input_tokens,
+        Some(4),
+        "Responses path must surface input_tokens_details.cached_tokens"
+    );
+    assert_eq!(
+        cost.reasoning_output_tokens,
+        Some(5),
+        "Responses path must surface output_tokens_details.reasoning_tokens"
+    );
+    assert_eq!(
+        recorder.first_path().await.as_deref(),
+        Some("/v1/responses"),
+        "Responses replay must reach the Responses route"
+    );
+}
+
+#[tokio::test]
+async fn xai_chat_sse_replay_surfaces_text_and_reasoning_cost_m30() {
+    // M-30: replay the Chat Completions SSE through `XaiProvider` so
+    // grok-2-style requests retain their reasoning + cached-token
+    // telemetry. The fixture mirrors xAI's documented usage shape; a
+    // regression in `parse_chat_usage` that lost the
+    // `prompt_tokens_details.cached_tokens` lookup would fail this test
+    // immediately.
+    let recorder = DispatcherRecorder::new();
+    let bodies = RouteBodies {
+        responses: RESPONSES_SSE_BODY,
+        chat: CHAT_REASONING_SSE_BODY,
+    };
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), bodies).await;
+    let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
+        .expect("XaiProvider builds against mock server");
+
+    let stream = provider.stream_response(dispatcher_request("grok-2"), CancellationToken::new());
+    let events: Vec<LlmEvent> =
+        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("Chat SSE must complete within timeout")
+            .into_iter()
+            .map(|res| res.expect("Chat SSE must not error"))
+            .collect();
+
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::TextDelta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hi grok");
+
+    let Some(LlmEvent::Completed { cost, .. }) = events
+        .iter()
+        .find(|event| matches!(event, LlmEvent::Completed { .. }))
+    else {
+        panic!("expected LlmEvent::Completed in Chat replay");
+    };
+    assert_eq!(cost.input_tokens, Some(9));
+    assert_eq!(cost.output_tokens, Some(2));
+    assert_eq!(
+        cost.cached_input_tokens,
+        Some(3),
+        "Chat path must surface prompt_tokens_details.cached_tokens"
+    );
+    assert_eq!(
+        cost.reasoning_output_tokens,
+        Some(7),
+        "Chat path must surface completion_tokens_details.reasoning_tokens"
+    );
+    assert_eq!(
+        recorder.first_path().await.as_deref(),
+        Some("/v1/chat/completions"),
+        "Chat replay must reach the Chat Completions route"
+    );
+}
+
+#[tokio::test]
+async fn xai_chat_route_includes_extra_headers_responses_route_drops_them_m30() {
+    // M-30: lock in the documented H-22 asymmetry. User-supplied
+    // headers (telemetry / proxy attribution) reach the Chat route via
+    // `OpenAiCompatibleProvider`, but `from_xai_config` intentionally
+    // drops them on the Responses route. Once `openai.rs` honours
+    // `extra_headers` on both routes (H-22), this test flips its
+    // Responses-side expectation and the assertion becomes a guard
+    // against regressing the fix.
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "helicone-property-tag".to_string(),
+        "squeezy-xai-m30".to_string(),
+    );
+
+    // One mock server serves both routes; the SSE bodies are
+    // route-specific so the parser terminates cleanly.
+    let recorder = DispatcherRecorder::new();
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), RouteBodies::defaults()).await;
+    let mut config = dispatcher_xai_config_with_extra_headers(extra);
+    config.base_url = format!("http://{addr}/v1");
+
+    let provider = XaiProvider::from_config(&config)
+        .expect("XaiProvider builds with extra_headers across both routes");
+
+    let stream_chat =
+        provider.stream_response(dispatcher_request("grok-2"), CancellationToken::new());
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream_chat.collect::<Vec<_>>())
+        .await
+        .expect("chat-route replay must complete");
+
+    let stream_responses =
+        provider.stream_response(dispatcher_request("grok-4.3"), CancellationToken::new());
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream_responses.collect::<Vec<_>>())
+        .await
+        .expect("responses-route replay must complete");
+
+    let captured = recorder.captured.lock().await.clone();
+    assert_eq!(
+        captured.len(),
+        2,
+        "expected one chat request and one responses request"
+    );
+    let chat = captured
+        .iter()
+        .find(|req| req.path == "/v1/chat/completions")
+        .expect("chat route captured");
+    let responses = captured
+        .iter()
+        .find(|req| req.path == "/v1/responses")
+        .expect("responses route captured");
+
+    assert_eq!(
+        chat.headers
+            .get("helicone-property-tag")
+            .map(String::as_str),
+        Some("squeezy-xai-m30"),
+        "Chat route must forward extra_headers"
+    );
+    assert!(
+        !responses.headers.contains_key("helicone-property-tag"),
+        "Responses route intentionally drops extra_headers (H-22 lives in openai.rs)"
+    );
+}
+
+fn dispatcher_xai_config_with_extra_headers(
+    extra_headers: BTreeMap<String, String>,
+) -> OpenAiCompatibleConfig {
+    OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::XAi,
+        api_key_env: "XAI_API_KEY".to_string(),
+        api_key: Some("test-key".to_string()),
+        // Caller overrides this with the actual loopback address before
+        // building the provider.
+        base_url: "http://127.0.0.1:0/v1".to_string(),
+        extra_headers,
+        transport: ProviderTransportConfig {
+            request_max_retries: 0,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: 5_000,
+            ..ProviderTransportConfig::default()
+        },
+        account_id: None,
+        gateway_id: None,
+    }
 }
 
 #[test]
