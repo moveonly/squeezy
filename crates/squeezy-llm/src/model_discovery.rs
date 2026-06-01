@@ -206,7 +206,11 @@ pub fn parse_catalog(value: &Value) -> Vec<DiscoveredModel> {
     let Some(data) = value.get("data").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
-    data.iter().filter_map(parse_entry).collect()
+    let mut models = Vec::with_capacity(data.len());
+    for entry in data.iter().filter_map(parse_entry) {
+        models.push(entry);
+    }
+    models
 }
 
 fn parse_entry(value: &Value) -> Option<DiscoveredModel> {
