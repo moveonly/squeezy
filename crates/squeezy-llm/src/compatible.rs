@@ -129,6 +129,36 @@ impl OpenAiCompatibleProvider {
         //      Cloudflare key for backwards compatibility with
         //      Workers AI-only gateways that were intentionally wired
         //      up under the old (broken) scheme.
+        // H-59: PortKey's canonical auth path uses the
+        // `x-portkey-api-key` header rather than
+        // `Authorization: Bearer`. The Bearer slot is then free to
+        // carry the upstream provider's credential (BYO-key mode).
+        // The opt-in is a magic `use_x_portkey_api_key = "true"`
+        // entry in the user's `[providers.portkey.headers]` table.
+        // Lift the resolved api_key into `x-portkey-api-key` and
+        // strip both the magic flag and the original Bearer path
+        // (the bearer_auth call in `stream_response` will suppress
+        // itself when it sees `x-portkey-api-key` set; see the
+        // P12 sibling for the symmetric `Authorization` handling).
+        let portkey_canonical_auth = config.preset == OpenAiCompatiblePreset::PortKey
+            && headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("use_x_portkey_api_key") && v == "true");
+        if portkey_canonical_auth {
+            // Strip the magic flag — it is not a wire header.
+            headers.retain(|key, _| !key.eq_ignore_ascii_case("use_x_portkey_api_key"));
+            // Lift the resolved Cloudflare-flavored key into the
+            // `x-portkey-api-key` slot, leaving the Bearer slot
+            // for whatever the user supplies on the upstream
+            // request. User-supplied `x-portkey-api-key`
+            // overrides win.
+            let has_canonical = headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("x-portkey-api-key"));
+            if !has_canonical && !api_key.is_empty() {
+                headers.insert("x-portkey-api-key".to_string(), api_key.clone());
+            }
+        }
         // H-40: when the CF AI Gateway preset migrates to the new
         // REST URL shape, gateway selection moves from the URL
         // path to a `cf-aig-gateway-id` header. Emit it here when
@@ -645,6 +675,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
             matches!(preset, OpenAiCompatiblePreset::LlamaCpp) && !request.tools.is_empty();
         let body = Self::request_body_for_preset(&request, preset);
         let provider_label = self.preset.display_name();
+        // H-59: when the user opted into the PortKey canonical
+        // `x-portkey-api-key` auth path (via the magic flag in
+        // extra_headers, lifted in `from_config`), suppress the
+        // Bearer header so the wire carries the PortKey key in
+        // the header slot only. The Bearer slot is freed for
+        // BYO-upstream-key flows.
+        let suppress_bearer = extra_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-portkey-api-key"));
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -653,14 +692,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 &cancel,
                 |key| {
                     let mut builder = client.post(&url);
-                    // X-17: skip `bearer_auth(key)` entirely when the
-                    // resolved key is empty. Local presets (LM Studio,
-                    // vLLM, llama.cpp) run unauthenticated by default
-                    // and reqwest panics on `bearer_auth("")`. Remote
-                    // presets always have a non-empty key here because
-                    // their construction path runs through the strict
-                    // resolver above.
-                    if !key.is_empty() {
+                    // X-17: skip `bearer_auth(key)` when the resolved
+                    // key is empty (local LM Studio / vLLM / llama.cpp
+                    // unauthenticated presets — reqwest panics on
+                    // `bearer_auth("")`).
+                    // H-59: also skip when the PortKey canonical-auth
+                    // path opted into `x-portkey-api-key`, so the
+                    // Bearer slot stays free for a BYO upstream key.
+                    if !key.is_empty() && !suppress_bearer {
                         builder = builder.bearer_auth(key);
                     }
                     for (header_key, header_value) in &extra_headers {

@@ -2409,6 +2409,81 @@ async fn cloudflare_ai_gateway_falls_back_to_resolved_key_when_no_upstream_confi
     );
 }
 
+#[tokio::test]
+async fn portkey_canonical_auth_lifts_key_into_x_portkey_api_key_header() {
+    // H-59: when the user sets `use_x_portkey_api_key = "true"`
+    // in [providers.portkey.headers], the PortKey key flows in
+    // the `x-portkey-api-key` header (PortKey's canonical form)
+    // and the Bearer slot is freed for BYO-upstream-key flows.
+    let mut extras = BTreeMap::new();
+    extras.insert("use_x_portkey_api_key".to_string(), "true".to_string());
+    let portkey = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::PortKey,
+        api_key_env: "PORTKEY_API_KEY".to_string(),
+        api_key: Some("pk-test".to_string()),
+        base_url: "https://api.portkey.ai/v1".to_string(),
+        extra_headers: extras,
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+    })
+    .expect("provider builds");
+    let canonical = portkey
+        .extra_headers()
+        .iter()
+        .find_map(|(k, v)| {
+            k.eq_ignore_ascii_case("x-portkey-api-key")
+                .then(|| v.clone())
+        })
+        .expect("x-portkey-api-key must be present");
+    assert_eq!(canonical, "pk-test");
+    // The magic flag must be stripped — it is not a wire
+    // header.
+    assert!(
+        !portkey
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("use_x_portkey_api_key")),
+        "magic opt-in flag must be stripped from wire headers"
+    );
+    // The bearer slot still resolves to the same key — the
+    // stream_response loop is the place that suppresses the
+    // Authorization header on the wire.
+    let bearer = portkey
+        .api_key_source()
+        .current_key()
+        .await
+        .expect("bearer");
+    assert_eq!(bearer, "pk-test");
+}
+
+#[test]
+fn portkey_canonical_auth_opt_in_does_not_clobber_user_supplied_header() {
+    // When the user already set `x-portkey-api-key` explicitly,
+    // honour their value rather than overwriting it with the
+    // resolved key — BYO-key flows often want to forward a
+    // virtual key here.
+    let mut extras = BTreeMap::new();
+    extras.insert("use_x_portkey_api_key".to_string(), "true".to_string());
+    extras.insert("x-portkey-api-key".to_string(), "manual-vk".to_string());
+    let portkey = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::PortKey,
+        api_key_env: "PORTKEY_API_KEY".to_string(),
+        api_key: Some("pk-test".to_string()),
+        base_url: "https://api.portkey.ai/v1".to_string(),
+        extra_headers: extras,
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+    })
+    .expect("provider builds");
+    let canonical = portkey
+        .extra_headers()
+        .get("x-portkey-api-key")
+        .expect("x-portkey-api-key present");
+    assert_eq!(canonical, "manual-vk", "user override must win");
+}
+
 #[test]
 fn cloudflare_ai_gateway_emits_cf_aig_gateway_id_header() {
     // H-40: gateway selection moves from URL segment to the
