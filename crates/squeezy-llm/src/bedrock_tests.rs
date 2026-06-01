@@ -16,7 +16,7 @@ use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStream
 use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
-    BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
+    BedrockProvider, BedrockStreamState, BreakpointBudget, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
     bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
     compute_thinking_extra_fields, conversation_messages, current_bearer_token,
@@ -1179,7 +1179,7 @@ fn tool_configuration_forwards_tool_choice() {
 
 #[test]
 fn bedrock_document_block_round_trips_pdf_bytes() {
-    use aws_sdk_bedrockruntime::types::{DocumentFormat, DocumentSource};
+    use aws_sdk_bedrockruntime::types::DocumentFormat;
     let bytes: Arc<[u8]> = Arc::from(b"%PDF-1.4 fake".to_vec());
     let block = bedrock_document_block("application/pdf", "report.pdf", &bytes)
         .expect("pdf must round-trip");
@@ -1385,5 +1385,90 @@ fn handle_bedrock_event_replaces_signature_deltas() {
         Some("authoritative-signature"),
         "second Signature delta must replace, not concat: got {:?}",
         block.signature,
+    );
+}
+
+/// M-18: the 4-slot allocator hands out four markers in
+/// invalidation-priority order (tools -> system -> messages) and
+/// then drops+warns on every subsequent consumer. The cap matches
+/// Bedrock's documented limit so a future per-skill policy that
+/// emits a 5th breakpoint degrades to a warning instead of a
+/// `ValidationException` on every turn.
+#[test]
+fn breakpoint_budget_caps_at_four_and_warns_on_overflow() {
+    let mut budget = BreakpointBudget::new();
+    assert!(budget.consume("tools"));
+    assert!(budget.consume("system"));
+    assert!(budget.consume("messages"));
+    // A fourth slot is still available so a future caller marker
+    // (skill layer, per-message breakpoint) lands inside the cap.
+    assert!(budget.consume("future-marker"));
+    // Cap reached; any further consumer is dropped.
+    assert!(!budget.consume("overflow-1"));
+    assert!(!budget.consume("overflow-2"));
+    assert_eq!(budget.dropped, 2);
+}
+
+/// M-18 regression guard: the auto policy emits exactly three
+/// markers today (tools tail / system tail / latest user block).
+/// The combined system_blocks + conversation_messages +
+/// tool_configuration helpers must still stamp all three when the
+/// budget allows.
+#[test]
+fn auto_caching_emits_three_breakpoints_within_budget() {
+    let specs: Vec<Arc<LlmToolSpec>> = vec![
+        LlmToolSpec {
+            name: "search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+    ];
+    // System breakpoint.
+    let system = system_blocks("be helpful", CacheRetention::Short).expect("system");
+    let system_cache_points = system
+        .iter()
+        .filter(|b| matches!(b, SystemContentBlock::CachePoint(_)))
+        .count();
+    assert_eq!(
+        system_cache_points, 1,
+        "system tail must carry exactly one cachePoint when retention is enabled",
+    );
+    // Last-user breakpoint.
+    let messages = conversation_messages(
+        &[
+            LlmInputItem::UserText("first".to_string()),
+            LlmInputItem::AssistantText("ack".to_string()),
+            LlmInputItem::UserText("second".to_string()),
+        ],
+        CacheRetention::Short,
+    )
+    .expect("messages");
+    let message_cache_points: usize = messages
+        .iter()
+        .map(|m| {
+            m.content()
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::CachePoint(_)))
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        message_cache_points, 1,
+        "exactly one cachePoint must land on the last user message",
+    );
+    // Tools tail breakpoint.
+    let tools = tool_configuration(&specs, CacheRetention::Short, None)
+        .expect("ok")
+        .expect("present");
+    let tool_cache_points = tools
+        .tools()
+        .iter()
+        .filter(|t| matches!(t, aws_sdk_bedrockruntime::types::Tool::CachePoint(_)))
+        .count();
+    assert_eq!(
+        tool_cache_points, 1,
+        "tools tail must carry exactly one cachePoint when retention is enabled",
     );
 }

@@ -175,6 +175,60 @@ pub(crate) fn build_bedrock_client(
     Ok(BedrockClient::new(shared))
 }
 
+/// Bedrock accepts at most four `cachePoint` markers per Converse
+/// request across `tools`, `system`, and `messages`. The hard cap is
+/// documented at
+/// <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>;
+/// a 5th breakpoint triggers a `ValidationException` that takes the
+/// whole turn down non-retryably.
+///
+/// `BreakpointBudget` mirrors anthropic.rs's `BreakpointBudget`
+/// (mirror of opencode's `Bedrock.Cache.Breakpoints` slot allocator)
+/// so the lowering layer can decide which sections receive a marker
+/// in invalidation-priority order (tools change least frequently,
+/// system next, messages most often — longer-TTL must precede
+/// shorter-TTL on Bedrock). When the budget is exhausted the
+/// allocator drops the next request and emits a single `tracing::warn!`
+/// per dropped marker so a future per-skill policy that overflows
+/// the cap surfaces in logs instead of failing every request.
+#[derive(Debug)]
+struct BreakpointBudget {
+    remaining: usize,
+    dropped: usize,
+}
+
+impl BreakpointBudget {
+    /// Bedrock's hard cap on `cachePoint` markers per Converse request.
+    const CAP: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            remaining: Self::CAP,
+            dropped: 0,
+        }
+    }
+
+    /// Try to consume one slot for the named section. Returns `true`
+    /// when the marker should be emitted, `false` when the budget is
+    /// exhausted (and warns once per dropped marker so operators see
+    /// when a per-skill policy outgrew Bedrock's 4-breakpoint cap).
+    fn consume(&mut self, section: &'static str) -> bool {
+        if self.remaining == 0 {
+            self.dropped = self.dropped.saturating_add(1);
+            tracing::warn!(
+                provider = "bedrock",
+                section,
+                cap = Self::CAP,
+                dropped = self.dropped,
+                "bedrock cachePoint breakpoint dropped: per-request cap exceeded",
+            );
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 impl LlmProvider for BedrockProvider {
     fn name(&self) -> &'static str {
         "bedrock"
@@ -251,8 +305,41 @@ fn bedrock_stream_attempt(
         } else {
             CacheRetention::None
         };
+        // Bedrock's hard cap is 4 `cachePoint` blocks per request,
+        // ordered tools -> system -> messages (longer-TTL must
+        // precede shorter-TTL). The auto policy currently emits
+        // 3 markers (tools tail, system tail, latest user block),
+        // so the cap is not exceeded yet — but a future per-skill
+        // policy that adds a 5th breakpoint would hard-fail every
+        // request with a `ValidationException`. Mirror opencode's
+        // `Bedrock.Cache.Breakpoints` allocator: consume in
+        // invalidation-priority order (least-volatile first) and
+        // drop+warn on overflow rather than 4xx-ing the turn.
+        let mut budget = BreakpointBudget::new();
+        let emit_tools_cache = retention != CacheRetention::None
+            && !request.tools.is_empty()
+            && budget.consume("tools");
+        let emit_system_cache = retention != CacheRetention::None
+            && !request.instructions.trim().is_empty()
+            && budget.consume("system");
+        let emit_messages_cache = retention != CacheRetention::None && budget.consume("messages");
+        let tools_retention = if emit_tools_cache {
+            retention
+        } else {
+            CacheRetention::None
+        };
+        let system_retention = if emit_system_cache {
+            retention
+        } else {
+            CacheRetention::None
+        };
+        let messages_retention = if emit_messages_cache {
+            retention
+        } else {
+            CacheRetention::None
+        };
         let mut builder = client.converse_stream().model_id(&model);
-        for block in system_blocks(&request.instructions, retention)? {
+        for block in system_blocks(&request.instructions, system_retention)? {
             builder = builder.system(block);
         }
         // Canonicalize cross-provider tool-call ids and
@@ -265,12 +352,14 @@ fn bedrock_stream_attempt(
         // produce ids Bedrock either rejects on shape or fails
         // to match.
         let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
-        for message in conversation_messages(&normalized_input, retention)? {
+        for message in conversation_messages(&normalized_input, messages_retention)? {
             builder = builder.messages(message);
         }
-        if let Some(config) =
-            tool_configuration(&request.tools, retention, request.tool_choice.as_deref())?
-        {
+        if let Some(config) = tool_configuration(
+            &request.tools,
+            tools_retention,
+            request.tool_choice.as_deref(),
+        )? {
             builder = builder.tool_config(config);
         }
         if let Some(inference) = inference_configuration(&request) {
