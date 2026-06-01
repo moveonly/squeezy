@@ -415,3 +415,71 @@ fn auth_list_args_default_json_false() {
     let args = AuthListArgs::default();
     assert!(!args.json);
 }
+
+#[test]
+fn deepinfra_provider_is_registered_with_canonical_token_env() {
+    // H-48: DeepInfra's vendor docs name `DEEPINFRA_TOKEN` as the
+    // canonical env var; the Vercel-AI-SDK convention uses
+    // `DEEPINFRA_API_KEY`. The CLI must honor the canonical name as
+    // primary and the SDK name as fallback so users following
+    // either doc set find their key resolves.
+    use super::KNOWN_PROVIDERS;
+    let deepinfra = KNOWN_PROVIDERS
+        .iter()
+        .find(|p| p.section == "deepinfra")
+        .copied()
+        .expect("deepinfra must be in the known-provider table");
+    assert_eq!(deepinfra.cli, "deepinfra");
+    assert_eq!(deepinfra.env, "DEEPINFRA_TOKEN");
+    assert_eq!(deepinfra.fallback_env, Some("DEEPINFRA_API_KEY"));
+}
+
+#[test]
+fn deepinfra_status_row_reports_token_env_when_set() {
+    // The status table must surface `DEEPINFRA_TOKEN (set)` so a
+    // user copying DeepInfra's curl quickstart can confirm Squeezy
+    // sees the right env var. We exercise compute_status_row
+    // directly rather than the printer; the JSON form is asserted
+    // by the iterator test above.
+    use super::{KNOWN_PROVIDERS, compute_status_row};
+    let deepinfra = KNOWN_PROVIDERS
+        .iter()
+        .find(|p| p.section == "deepinfra")
+        .copied()
+        .expect("deepinfra known");
+    let sources = synthetic_sources(None, None, None);
+    let env = env_from(&[("DEEPINFRA_TOKEN", "fake-deepinfra-token")]);
+    let row = compute_status_row(deepinfra, &sources, &env);
+    assert_eq!(row.effective_source(), "env");
+    assert!(row.env_set);
+    assert_eq!(row.env_var, "DEEPINFRA_TOKEN");
+}
+
+#[test]
+fn deepinfra_status_row_falls_back_to_api_key_env() {
+    // Users coming from Vercel-AI-SDK use DEEPINFRA_API_KEY. The
+    // fallback path must still report the row as configured.
+    use super::{KNOWN_PROVIDERS, compute_status_row};
+    let deepinfra = KNOWN_PROVIDERS
+        .iter()
+        .find(|p| p.section == "deepinfra")
+        .copied()
+        .expect("deepinfra known");
+    let sources = synthetic_sources(None, None, None);
+    let env = env_from(&[("DEEPINFRA_API_KEY", "fake-from-vercel-sdk-name")]);
+    let row = compute_status_row(deepinfra, &sources, &env);
+    assert_eq!(row.effective_source(), "env (fallback)");
+    assert!(row.fallback_env_set);
+    assert!(!row.env_set);
+}
+
+#[test]
+fn auth_set_resolves_deepinfra_to_canonical_section_name() {
+    // The CLI accepts `squeezy auth set deepinfra ...`; the
+    // provider_section_for mapping must round-trip the id to its
+    // TOML section so the inline-set helper writes under
+    // [providers.deepinfra].
+    use super::provider_section_for;
+    let section = provider_section_for("deepinfra").expect("known");
+    assert_eq!(section, "deepinfra");
+}
