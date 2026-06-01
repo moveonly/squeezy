@@ -56,6 +56,7 @@ impl PreparedQuery {
 /// chars of `query` are not, in order, a subsequence of the lowercased
 /// chars of `candidate`. Higher is better. An empty query returns
 /// `Some(0)`.
+#[allow(dead_code)]
 pub fn score(candidate: &str, query: &str) -> Option<i32> {
     let query = PreparedQuery::new(query);
     score_prepared(candidate, &query)
