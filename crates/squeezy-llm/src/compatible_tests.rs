@@ -554,6 +554,61 @@ fn parse_chat_event_handles_done_sentinel() {
 }
 
 #[test]
+fn finish_reason_stop_followed_by_trailing_usage_chunk_captures_cost() {
+    // C-10: Groq, OpenRouter-via-Groq, and native OpenAI ship the
+    // final `usage` envelope in a chunk *after* the one carrying
+    // `finish_reason: "stop"` and before the terminal `[DONE]`. If
+    // the stop handler latches `completed_emitted = true`, the outer
+    // stream loop short-circuits and the trailing usage payload is
+    // discarded — cost gets reported as zero. Pin the wire order
+    // here so a future refactor that accidentally re-flips the flag
+    // is caught by CI instead of by a silent billing regression.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"id":"resp_g","choices":[{"delta":{"content":"hello"}}]}"#,
+        &mut state,
+    )
+    .expect("content delta");
+    // Chunk #2 carries the terminal finish_reason but no usage.
+    let stop_events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        &mut state,
+    )
+    .expect("stop");
+    assert!(
+        !state.completed_emitted,
+        "stop arm must not flip completed_emitted — trailing usage chunks must still parse: {stop_events:?}"
+    );
+    assert_eq!(state.cost.input_tokens, None);
+    assert_eq!(state.cost.output_tokens, None);
+    // Chunk #3 carries usage but `choices: []`.
+    parse_chat_event(
+        r#"{"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45}}"#,
+        &mut state,
+    )
+    .expect("usage chunk after finish_reason: stop must still parse");
+    assert_eq!(
+        state.cost.input_tokens,
+        Some(123),
+        "trailing usage chunk must update state.cost"
+    );
+    assert_eq!(state.cost.output_tokens, Some(45));
+    // Chunk #4: `[DONE]` finally emits Completed with the captured
+    // cost.
+    let done_events = parse_chat_event("[DONE]", &mut state).expect("done");
+    let LlmEvent::Completed { cost, .. } = done_events
+        .iter()
+        .find(|e| matches!(e, LlmEvent::Completed { .. }))
+        .expect("Completed event")
+    else {
+        unreachable!()
+    };
+    assert_eq!(cost.input_tokens, Some(123));
+    assert_eq!(cost.output_tokens, Some(45));
+    assert!(state.completed_emitted, "[DONE] must latch completion");
+}
+
+#[test]
 fn parse_chat_event_propagates_stream_error() {
     let mut state = StreamState::default();
     let err = parse_chat_event(

@@ -1215,6 +1215,20 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                     }
                     "stop" => {
                         events.extend(state.drain_tool_calls()?);
+                        // INVARIANT (C-10): do NOT flip
+                        // `state.completed_emitted` inside this arm.
+                        // Groq + OpenRouter-via-Groq + native OpenAI
+                        // ship a trailing usage chunk *after* the
+                        // `finish_reason: stop` chunk and before the
+                        // terminal `[DONE]`. The outer loop short-
+                        // circuits as soon as `completed_emitted`
+                        // flips, so latching it here would discard the
+                        // usage chunk and report zero cost. The
+                        // terminal `Completed` event is emitted from
+                        // the `[DONE]` arm only — see
+                        // `parse_chat_event` at the top of this
+                        // function.
+                        //
                         // Reasoning-mode models (Qwen3, DeepSeek-R1 via
                         // aggregator, etc.) sometimes emit only reasoning
                         // and finish cleanly with `stop` — no content, no
