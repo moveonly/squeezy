@@ -102,7 +102,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": true
+      "prompt_caching": true,
+      "thinking_budget_min": 1024,
+      "thinking_budget_max": 60000
     },
     "pricing": {
       "input_usd_micros_per_mtok": 15000000,
@@ -132,7 +134,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": true
+      "prompt_caching": true,
+      "thinking_budget_min": 1024,
+      "thinking_budget_max": 60000
     },
     "pricing": {
       "input_usd_micros_per_mtok": 3000000,
@@ -162,7 +166,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": true
+      "prompt_caching": true,
+      "thinking_budget_min": 1024,
+      "thinking_budget_max": 60000
     },
     "pricing": {
       "input_usd_micros_per_mtok": 1000000,
@@ -192,7 +198,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": false,
+      "thinking_budget_min": 128,
+      "thinking_budget_max": 32768
     },
     "pricing": {
       "input_usd_micros_per_mtok": 1250000,
@@ -222,7 +230,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": false,
+      "thinking_budget_min": 0,
+      "thinking_budget_max": 24576
     },
     "pricing": {
       "input_usd_micros_per_mtok": 300000,
@@ -252,7 +262,9 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": false,
+      "thinking_budget_min": 0,
+      "thinking_budget_max": 24576
     },
     "pricing": {
       "input_usd_micros_per_mtok": 100000,
@@ -943,7 +955,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": false,
+      "thinking_budget_min": 0,
+      "thinking_budget_max": 32768
     },
     "pricing": {
       "input_usd_micros_per_mtok": 1250000,
