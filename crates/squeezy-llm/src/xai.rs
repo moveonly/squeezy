@@ -14,6 +14,12 @@
 //! The provider holds one client per route and dispatches per-request based
 //! on [`classify_route`]; per-startup dispatch would lock a session to a
 //! single wire even when the user switches Grok generations mid-run.
+//!
+//! H-22 (extra_headers asymmetry): the Responses route currently drops
+//! `OpenAiCompatibleConfig::extra_headers` in `openai.rs::from_xai_config`
+//! while the Chat route honours them. Fixing the asymmetry lives in
+//! `openai.rs` (Phase 4B owns that file) and is intentionally not patched
+//! here. Coordinate with that phase before declaring the audit closed.
 
 use squeezy_core::{OpenAiCompatibleConfig, OpenAiCompatiblePreset, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
@@ -42,6 +48,32 @@ impl LlmProvider for XaiProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        // H-23: xAI Live Search.
+        //
+        // Once [`LlmRequest::hosted_tools`] (Phase 1) lands in this
+        // branch, the dispatcher forwards the `LlmHostedTool::WebSearch`
+        // entries through to whichever sub-provider handles the
+        // selected route:
+        //   * Responses path appends `{ "type": "web_search", "filters": … }`
+        //     as a hosted tool entry alongside any caller-supplied
+        //     function tools.
+        //   * Chat path merges the same intent into a top-level
+        //     `search_parameters: { mode: "auto", … }` field on the
+        //     request body.
+        //
+        // The actual body lowering must land in `openai.rs`
+        // (Responses) and `compatible.rs` (Chat); xAI's own dispatcher
+        // is responsible only for forwarding the field unchanged when
+        // it is present on `request`. Coordination: this TODO is
+        // intentional so Phase 4B (openai.rs) and the cross-cutting
+        // compatible.rs change land in lock-step with the field
+        // appearing on `LlmRequest`. Citation parsing on the chat
+        // path is tracked separately in M-31.
+        //
+        // Until Phase 1's `hosted_tools` slot ships, requests cannot
+        // carry the Live Search intent at all. The forwarding still
+        // happens because we hand the *full* `LlmRequest` to the
+        // sub-provider; no per-field copy is needed here.
         match classify_route(&request.model) {
             XaiRoute::Responses => self.responses.stream_response(request, cancel),
             XaiRoute::Chat => self.chat.stream_response(request, cancel),
