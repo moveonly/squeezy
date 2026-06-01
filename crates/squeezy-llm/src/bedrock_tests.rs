@@ -17,11 +17,11 @@ use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
     BedrockProvider, BedrockStreamState, bedrock_request_metadata_map, build_bedrock_client,
-    conversation_messages, handle_bedrock_event, json_to_document, system_blocks,
-    tool_configuration,
+    conversation_messages, handle_bedrock_event, inference_configuration, json_to_document,
+    system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
-use crate::{LlmInputItem, LlmToolSpec};
+use crate::{LlmInputItem, LlmRequest, LlmToolSpec};
 
 #[test]
 fn system_blocks_skip_blank_instructions() {
@@ -479,6 +479,72 @@ fn config_request_metadata_appears_on_converse_stream_input() {
     assert!(
         bedrock_request_metadata_map(&BTreeMap::new()).is_none(),
         "empty config tags must skip the field entirely so unconfigured callers don't ship an empty object"
+    );
+}
+
+#[test]
+fn inference_configuration_skipped_when_all_defaults() {
+    // No sampling knobs set => omit the field entirely. The Converse
+    // API treats absent and empty equivalently but skipping it keeps
+    // the wire payload minimal and makes the "all defaults" case
+    // observable in request logs.
+    let request = LlmRequest::default();
+    assert!(
+        inference_configuration(&request).is_none(),
+        "default request must not ship an InferenceConfiguration",
+    );
+}
+
+#[test]
+fn inference_configuration_maps_max_tokens_temperature_top_p_stop() {
+    // max_output_tokens, temperature, top_p, and stop must all round-
+    // trip from LlmRequest into the SDK builder so the Converse API
+    // sees the caller's bounded reply window, deterministic sampling,
+    // and explicit halt strings instead of the model's vendor defaults.
+    let request = LlmRequest {
+        max_output_tokens: Some(4096),
+        temperature: Some(0.0),
+        top_p: Some(0.85),
+        stop: vec!["END".to_string(), "STOP".to_string()],
+        ..LlmRequest::default()
+    };
+
+    let inference = inference_configuration(&request).expect("expected configuration");
+    let input = ConverseStreamInputBuilder::default()
+        .model_id("test-model")
+        .inference_config(inference)
+        .build()
+        .expect("ConverseStreamInputBuilder::build is infallible for valid inputs");
+    let echoed = input
+        .inference_config()
+        .expect("inference_config must round-trip");
+    assert_eq!(echoed.max_tokens(), Some(4096));
+    assert_eq!(echoed.temperature(), Some(0.0));
+    assert_eq!(echoed.top_p(), Some(0.85));
+    assert_eq!(echoed.stop_sequences(), &["END", "STOP"]);
+}
+
+#[test]
+fn inference_configuration_clamps_max_tokens_overflow() {
+    // u32::MAX exceeds i32::MAX; the helper must clamp rather than
+    // wrap or panic so a configuration mistake doesn't take the
+    // request down on the i32 boundary.
+    let request = LlmRequest {
+        max_output_tokens: Some(u32::MAX),
+        ..LlmRequest::default()
+    };
+    let inference = inference_configuration(&request).expect("expected configuration");
+    let input = ConverseStreamInputBuilder::default()
+        .model_id("test-model")
+        .inference_config(inference)
+        .build()
+        .expect("build");
+    assert_eq!(
+        input
+            .inference_config()
+            .expect("inference_config must round-trip")
+            .max_tokens(),
+        Some(i32::MAX),
     );
 }
 

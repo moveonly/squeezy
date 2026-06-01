@@ -13,9 +13,9 @@ use aws_sdk_bedrockruntime::{
     primitives::event_stream::EventReceiver,
     types::{
         CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
-        ConversationRole, ImageBlock, ImageFormat, ImageSource, Message, ReasoningContentBlock,
-        ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock, Tool,
-        ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+        ConversationRole, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
+        ReasoningContentBlock, ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock,
+        Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
         ToolSpecification, ToolUseBlock,
     },
 };
@@ -159,6 +159,9 @@ impl LlmProvider for BedrockProvider {
             }
             if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {
                 builder = builder.tool_config(config);
+            }
+            if let Some(inference) = inference_configuration(&request) {
+                builder = builder.inference_config(inference);
             }
             let mut extra_fields: std::collections::HashMap<String, Document> =
                 std::collections::HashMap::new();
@@ -682,6 +685,43 @@ pub(crate) fn tool_configuration(
             SqueezyError::ProviderRequest(format!("failed to build Bedrock toolConfig: {err}"))
         })?;
     Ok(Some(config))
+}
+
+/// Lower the cross-provider sampling knobs on [`LlmRequest`] into a
+/// Bedrock `InferenceConfiguration`. Returns `None` when none of the
+/// fields are set so callers omit the field entirely instead of
+/// shipping an empty object — the Converse API treats absent and empty
+/// equivalently, but skipping it keeps the wire payload minimal and
+/// makes the "all defaults" case observable in request logs.
+///
+/// `max_output_tokens`, `temperature`, `top_p`, and `stop` all map
+/// 1:1 to the SDK fields. Token counts are clamped to `i32::MAX`
+/// because the SDK uses a signed 32-bit field where the cross-provider
+/// surface is `u32`.
+pub(crate) fn inference_configuration(request: &LlmRequest) -> Option<InferenceConfiguration> {
+    if request.max_output_tokens.is_none()
+        && request.temperature.is_none()
+        && request.top_p.is_none()
+        && request.stop.is_empty()
+    {
+        return None;
+    }
+    let mut builder = InferenceConfiguration::builder();
+    if let Some(max) = request.max_output_tokens {
+        builder = builder.max_tokens(i32::try_from(max).unwrap_or(i32::MAX));
+    }
+    if let Some(temp) = request.temperature {
+        builder = builder.temperature(temp);
+    }
+    if let Some(top_p) = request.top_p {
+        builder = builder.top_p(top_p);
+    }
+    if !request.stop.is_empty() {
+        for stop in &request.stop {
+            builder = builder.stop_sequences(stop.clone());
+        }
+    }
+    Some(builder.build())
 }
 
 /// Build a Bedrock `ImageBlock` from an `LlmInputItem::Image` payload.
