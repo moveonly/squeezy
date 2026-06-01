@@ -337,6 +337,144 @@ fn transcript_overlay_uses_active_subagent_conversation() {
 }
 
 #[tokio::test]
+async fn focused_pane_esc_closes_pane_without_cancelling_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(5, "delegate".to_string(), "Inspect src".to_string());
+    let cancel = CancellationToken::new();
+    app.cancel = Some(cancel.clone()); // a turn is in flight
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert!(app.subagent_pane.focused);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(!app.subagent_pane.focused, "Esc should close the focused pane");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
+    assert!(
+        !cancel.is_cancelled(),
+        "Esc inside the pane must not cancel the running turn"
+    );
+}
+
+#[tokio::test]
+async fn typing_releases_focused_pane_to_the_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(8, "delegate".to_string(), "Inspect src".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert!(app.subagent_pane.focused);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type char");
+    assert!(
+        !app.subagent_pane.focused,
+        "typing should release pane focus so the prompt is never trapped"
+    );
+    assert!(
+        app.input.contains('h'),
+        "the character should reach the composer: {:?}",
+        app.input
+    );
+}
+
+#[tokio::test]
+async fn delete_clears_finished_subagents_and_keeps_running_ones() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string()); // still running
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("clear finished");
+
+    assert_eq!(app.subagent_pane.records.len(), 1);
+    assert_eq!(app.subagent_pane.records[0].id, 2);
+    assert_eq!(app.status, "cleared finished subagents");
+}
+
+#[test]
+fn prune_caps_retained_subagent_records() {
+    let mut app = test_app(SessionMode::Build);
+    for id in 0..40u64 {
+        app.note_subagent_started(id, "delegate".to_string(), format!("task {id}"));
+        app.note_subagent_completed(
+            id,
+            "delegate".to_string(),
+            "done".to_string(),
+            TurnMetrics::default(),
+        );
+    }
+    assert!(
+        app.subagent_pane.records.len() <= 32,
+        "records should be capped, got {}",
+        app.subagent_pane.records.len()
+    );
+    assert!(
+        app.subagent_pane.records.iter().any(|r| r.id == 39),
+        "the newest subagent must be retained"
+    );
+}
+
+#[test]
+fn subagent_activity_transcript_stays_bounded() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(4, "delegate".to_string(), "seed".to_string());
+    for i in 0..1000 {
+        app.note_subagent_activity(4, "delegate".to_string(), format!("running tool {i}"));
+    }
+    let record = &app.subagent_pane.records[0];
+    assert!(
+        record.transcript.len() <= 256,
+        "per-subagent transcript should be bounded, got {}",
+        record.transcript.len()
+    );
+    // The most recent activity must survive the trimming.
+    assert_eq!(record.latest, compact_text("running tool 999", 120));
+}
+
+#[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

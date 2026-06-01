@@ -1795,7 +1795,17 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             app.status = "main conversation selected".to_string();
             true
         }
-        _ if app.subagent_pane.focused => true,
+        KeyCode::Delete | KeyCode::Backspace if app.subagent_pane.focused => {
+            app.clear_finished_subagents();
+            true
+        }
+        // Any other key releases pane focus and falls through to its normal
+        // handler (the composer, slash commands, …) so the prompt is never
+        // trapped behind the pane.
+        _ if app.subagent_pane.focused => {
+            app.subagent_pane.focused = false;
+            false
+        }
         _ => false,
     }
 }
@@ -2063,7 +2073,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // Enter-time pre-intercept used to live here, but it silently dropped
     // any input with a trailing space (e.g. `/plan `).
 
-    if key.code == KeyCode::Esc && request_turn_interrupt(app) {
+    // A focused subagent pane owns Esc (to close itself); don't let Esc
+    // cancel an in-flight turn out from under the user while they're
+    // navigating the pane.
+    if key.code == KeyCode::Esc
+        && !app.subagent_pane.focused
+        && request_turn_interrupt(app)
+    {
         return Ok(false);
     }
 
@@ -12274,10 +12290,13 @@ fn subagent_record_row(
         ),
         _ => detail,
     };
+    // Disambiguate same-kind rows during parallel fanout (e.g. three
+    // "delegate" subagents) with their row ordinal.
+    let label = format!("{} #{row}", record.agent);
     subagent_pane_row(
         glyph,
         glyph_style,
-        &record.agent,
+        &label,
         Style::default().fg(crate::render::theme::foreground()),
         &detail,
         width,
@@ -12505,7 +12524,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         };
     }
     if app.subagent_pane.focused {
-        return "Up/Down select subagent · Enter view · Esc main".to_string();
+        return "Up/Down select · Enter view · Del clear done · type/Esc back to prompt".to_string();
     }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
@@ -12596,6 +12615,7 @@ const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
     "subagent pane ",
     "main conversation selected",
     "subagent conversation selected",
+    "cleared finished subagents",
     "task panel ",
     "/statusline cancelled",
     "no recent session",
@@ -14013,6 +14033,7 @@ impl TuiApp {
                 transcript,
             });
         }
+        self.prune_subagent_records();
         self.clamp_subagent_selection();
     }
 
@@ -14033,6 +14054,14 @@ impl TuiApp {
             record.agent = agent;
             record.latest = compact_text(&message, 120);
             record.transcript.push(entry);
+            // Keep the seed prompt + "started" log (the first two entries);
+            // drop the oldest activity beyond the cap so a long-running
+            // subagent's stored transcript stays bounded.
+            const MAX_SUBAGENT_TRANSCRIPT: usize = 256;
+            if record.transcript.len() > MAX_SUBAGENT_TRANSCRIPT {
+                let overflow = record.transcript.len() - MAX_SUBAGENT_TRANSCRIPT;
+                record.transcript.drain(2..2 + overflow);
+            }
         }
     }
 
@@ -14093,6 +14122,49 @@ impl TuiApp {
         {
             self.subagent_pane.active = ConversationSource::Main;
         }
+    }
+
+    /// Bound the retained subagent records so a long session can't grow the
+    /// pane (and its cloned transcripts) without limit. Oldest *finished*
+    /// records are dropped first; the actively-viewed record and any still-
+    /// running subagents are always kept.
+    fn prune_subagent_records(&mut self) {
+        const MAX_SUBAGENT_RECORDS: usize = 32;
+        while self.subagent_pane.records.len() > MAX_SUBAGENT_RECORDS {
+            let active_id = match self.subagent_pane.active {
+                ConversationSource::Subagent(id) => Some(id),
+                ConversationSource::Main => None,
+            };
+            let Some(pos) = self.subagent_pane.records.iter().position(|record| {
+                !matches!(record.lifecycle, SubagentLifecycle::Running)
+                    && Some(record.id) != active_id
+            }) else {
+                break;
+            };
+            self.subagent_pane.records.remove(pos);
+        }
+    }
+
+    /// Drop every completed/failed subagent row, leaving only those still
+    /// running. When nothing remains the pane disappears and focus returns
+    /// to the main conversation. Bound to Del/Backspace while the pane is
+    /// focused.
+    pub(crate) fn clear_finished_subagents(&mut self) {
+        self.subagent_pane
+            .records
+            .retain(|record| matches!(record.lifecycle, SubagentLifecycle::Running));
+        if self.subagent_pane.records.is_empty() {
+            self.subagent_pane.focused = false;
+            self.subagent_pane.active = ConversationSource::Main;
+            self.subagent_pane.selected = 0;
+        } else {
+            self.subagent_pane.selected = self
+                .subagent_pane
+                .selected
+                .min(self.subagent_pane.records.len());
+        }
+        self.clamp_subagent_selection();
+        self.status = "cleared finished subagents".to_string();
     }
 
     pub(crate) fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
