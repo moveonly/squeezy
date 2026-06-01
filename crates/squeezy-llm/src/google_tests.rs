@@ -576,6 +576,50 @@ fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
 }
 
 #[test]
+fn token_split_pins_visible_vs_thoughts() {
+    // Pins the convention: output_tokens = candidatesTokenCount
+    // (visible), reasoning_output_tokens = thoughtsTokenCount; they
+    // are exclusive and a billed-output cost reporter must sum them.
+    let mut cost = CostSnapshot::default();
+    let mut last_finish_reason: Option<String> = None;
+    let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
+    let mut tool_call_counter: usize = 0;
+    let mut response_id_slot: Option<String> = None;
+    parse_google_event(
+        r#"{
+          "candidates":[{"content":{"parts":[{"text":"final"}]}}],
+          "usageMetadata":{
+            "promptTokenCount":100,
+            "candidatesTokenCount":40,
+            "thoughtsTokenCount":250
+          }
+        }"#,
+        &mut cost,
+        &mut last_finish_reason,
+        &mut reasoning_buf,
+        &mut server_model_slot,
+        &mut tool_call_counter,
+        &mut response_id_slot,
+    )
+    .expect("valid event");
+    assert_eq!(cost.input_tokens, Some(100));
+    assert_eq!(
+        cost.output_tokens,
+        Some(40),
+        "output_tokens must equal candidatesTokenCount (visible only)"
+    );
+    assert_eq!(
+        cost.reasoning_output_tokens,
+        Some(250),
+        "reasoning_output_tokens must equal thoughtsTokenCount"
+    );
+    // A billed-output reporter sums the two.
+    let billed = cost.output_tokens.unwrap() + cost.reasoning_output_tokens.unwrap();
+    assert_eq!(billed, 290, "billed output = visible + thoughts");
+}
+
+#[test]
 fn parser_surfaces_prompt_feedback_block_reason_as_error() {
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;

@@ -638,6 +638,19 @@ fn parse_google_event(
         *response_id_slot = Some(rid.to_string());
     }
     if let Some(usage) = value.get("usageMetadata") {
+        // Token convention (X-11 / M-12). Gemini splits output across
+        // two fields:
+        // - `candidatesTokenCount` — *visible* output tokens (the
+        //   model's text + tool-call args).
+        // - `thoughtsTokenCount` — reasoning tokens consumed for
+        //   the thinking pass (separate column on the bill).
+        //
+        // The two sums are EXCLUSIVE: visible output excludes
+        // thoughts. Squeezy mirrors that split on CostSnapshot:
+        // `output_tokens = candidatesTokenCount` (visible) and
+        // `reasoning_output_tokens = thoughtsTokenCount`. Cost
+        // reporters that want a single billed-output number sum the
+        // two; tests below pin this invariant.
         cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
         cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
         cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
