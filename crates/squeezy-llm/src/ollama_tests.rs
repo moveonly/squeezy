@@ -228,6 +228,59 @@ fn pull_parser_rejects_invalid_json() {
 }
 
 #[test]
+fn host_root_normalizes_all_input_shapes() {
+    assert_eq!(
+        ollama_host_root("http://localhost:11434"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/api"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/api/"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/v1"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/v1/"),
+        "http://localhost:11434"
+    );
+}
+
+#[test]
+fn api_endpoint_url_always_includes_api_segment() {
+    for base in [
+        "http://localhost:11434",
+        "http://localhost:11434/",
+        "http://localhost:11434/api",
+        "http://localhost:11434/api/",
+        "http://localhost:11434/v1",
+        "http://localhost:11434/v1/",
+    ] {
+        for endpoint in ["chat", "show", "pull", "tags"] {
+            assert_eq!(
+                api_endpoint_url(base, endpoint),
+                format!("http://localhost:11434/api/{endpoint}"),
+                "base={base} endpoint={endpoint}",
+            );
+            assert_eq!(
+                api_endpoint_url(base, &format!("/{endpoint}")),
+                format!("http://localhost:11434/api/{endpoint}"),
+                "leading-slash endpoint, base={base}",
+            );
+        }
+    }
+}
+
+#[test]
 fn openai_compat_base_url_swaps_api_for_v1() {
     assert_eq!(
         openai_compat_base_url("http://localhost:11434/api"),

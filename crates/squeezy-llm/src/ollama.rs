@@ -19,6 +19,13 @@ use crate::{
     transport::shared_client,
 };
 
+// TODO(audit C-06): `DEFAULT_OLLAMA_BASE_URL` in `squeezy-core` still bakes in
+// the `/api` suffix and the config layer reads `OLLAMA_BASE_URL` without
+// falling back to the canonical `OLLAMA_HOST` env var. The URL helpers below
+// (`api_endpoint_url`, `ollama_host_root`) absorb any base shape so users who
+// set `OLLAMA_HOST=http://host:11434` still reach the right endpoint; the
+// core-side constant and env-fallback fixes ship in Phase 4FH alongside the
+// `OllamaConfig` field additions.
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
     client: reqwest::Client,
@@ -90,7 +97,7 @@ pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<
         .timeout(Duration::from_millis(250))
         .build()
         .ok()?;
-    let url = format!("{}/show", base_url.trim_end_matches('/'));
+    let url = api_endpoint_url(base_url, "show");
     let value: Value = client
         .post(url)
         .json(&json!({ "model": model }))
@@ -111,7 +118,7 @@ pub async fn fetch_ollama_model_names(base_url: &str) -> Vec<String> {
         Ok(client) => client,
         Err(_) => return Vec::new(),
     };
-    let url = format!("{}/tags", base_url.trim_end_matches('/'));
+    let url = api_endpoint_url(base_url, "tags");
     let value: Value = match client.get(url).send().await {
         Ok(response) => match response.json().await {
             Ok(value) => value,
@@ -182,6 +189,33 @@ pub(crate) fn openai_compat_base_url(base_url: &str) -> String {
     format!("{trimmed}/v1")
 }
 
+/// Strip any trailing `/api`, `/v1`, or trailing slash from an Ollama base URL
+/// so the bare host root (`http://host:port`) is left. Users follow Ollama's
+/// upstream convention and set `OLLAMA_HOST=http://host:port`; squeezy's
+/// default bakes `/api` into the configured base. Helpers route every native
+/// endpoint through `api_endpoint_url` so the host root is always recovered
+/// before the per-endpoint path (`/api/chat`, `/api/show`, ...) is appended.
+pub(crate) fn ollama_host_root(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if let Some(root) = trimmed.strip_suffix("/api") {
+        return root.trim_end_matches('/').to_string();
+    }
+    if let Some(root) = trimmed.strip_suffix("/v1") {
+        return root.trim_end_matches('/').to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Build a fully-qualified native Ollama endpoint URL given any user-supplied
+/// base shape and a bare endpoint name (e.g. `"chat"`, `"show"`, `"pull"`,
+/// `"tags"`). Always emits `<host_root>/api/<endpoint>` regardless of whether
+/// the caller's base URL ended in `/api`, `/v1`, a trailing slash, or nothing.
+pub(crate) fn api_endpoint_url(base_url: &str, endpoint: &str) -> String {
+    let host = ollama_host_root(base_url);
+    let path = endpoint.trim_start_matches('/');
+    format!("{host}/api/{path}")
+}
+
 impl LlmProvider for OllamaProvider {
     fn name(&self) -> &'static str {
         "ollama"
@@ -195,7 +229,7 @@ impl LlmProvider for OllamaProvider {
             return compat.stream_response(request, cancel);
         }
         let client = self.client.clone();
-        let url = format!("{}/chat", self.base_url);
+        let url = api_endpoint_url(&self.base_url, "chat");
         let body = Self::request_body(&request);
         let transport = self.transport;
 
@@ -452,11 +486,14 @@ pub type PullStream = Pin<Box<dyn Stream<Item = Result<PullEvent>> + Send>>;
 /// (`{"error": "..."}` payloads) are surfaced as `Err(ProviderStream(_))`
 /// and end the stream. Cancelling `cancel` shuts the stream down cleanly.
 ///
-/// `base_url` should be the Ollama server root including `/api` — the same
-/// shape `OllamaConfig.base_url` carries (`http://localhost:11434/api`).
+/// `base_url` may be any common shape — `http://host:11434`,
+/// `http://host:11434/`, `http://host:11434/api`, or `http://host:11434/v1`.
+/// [`api_endpoint_url`] normalizes to the canonical host root before joining
+/// `/api/pull`, so users who follow Ollama's upstream `OLLAMA_HOST` env var
+/// (no `/api` suffix) reach the right endpoint instead of silently 404-ing.
 pub fn pull_model(base_url: &str, model: &str, cancel: CancellationToken) -> PullStream {
     let client = reqwest::Client::new();
-    let url = format!("{}/pull", base_url.trim_end_matches('/'));
+    let url = api_endpoint_url(base_url, "pull");
     let body = json!({ "model": model, "stream": true });
 
     Box::pin(try_stream! {
