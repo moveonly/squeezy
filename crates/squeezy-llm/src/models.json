@@ -1376,6 +1376,126 @@
     "metadata_source": "https://deepinfra.com/pricing"
   },
   {
+    "provider": "baseten",
+    "id": "moonshotai/kimi-k2.6-instruct",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": 60000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "baseten",
+    "id": "deepseek-ai/DeepSeek-V4-Pro",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1740000,
+      "output_usd_micros_per_mtok": 3480000,
+      "cache_read_usd_micros_per_mtok": 14500,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "baseten",
+    "id": "zai-org/GLM-5.1",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 500000,
+      "output_usd_micros_per_mtok": 1500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "baseten",
+    "id": "nvidia/Nemotron-Super-120B-A12B",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1500000,
+      "output_usd_micros_per_mtok": 4500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
     "provider": "vertex",
     "id": "google/gemini-3.1-pro-preview",
     "profile": "strong",
