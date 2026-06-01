@@ -25,6 +25,9 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         api_key: None,
         base_url: env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string()),
+        organization: None,
+        project: None,
+        service_tier: None,
         transport: ProviderTransportConfig::default(),
     })?;
     let request = LlmRequest {

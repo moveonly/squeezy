@@ -2435,6 +2435,69 @@ fn openrouter_provider_resolves_to_compatible_variant_with_preset_defaults() {
 }
 
 #[test]
+fn openai_carries_org_project_and_service_tier_from_env() {
+    // Env vars beat TOML on these knobs so a per-shell override of
+    // `OPENAI_PROJECT_ID` (e.g. `direnv`) doesn't get masked by a
+    // checked-in repo `[providers.openai]` block. The provider then
+    // emits `OpenAI-Organization` / `OpenAI-Project` headers and a
+    // `service_tier` body field so spend attribution and tier
+    // selection both land correctly without forking the provider.
+    let openai = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        "OPENAI_ORG_ID" => Some("org-PAYG".to_string()),
+        "OPENAI_PROJECT_ID" => Some("proj_abc".to_string()),
+        "OPENAI_SERVICE_TIER" => Some("flex".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAi(config) = &openai.provider else {
+        panic!("expected openai");
+    };
+    assert_eq!(config.organization.as_deref(), Some("org-PAYG"));
+    assert_eq!(config.project.as_deref(), Some("proj_abc"));
+    assert_eq!(config.service_tier.as_deref(), Some("flex"));
+}
+
+#[test]
+fn openai_falls_back_to_toml_for_org_project_service_tier() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "openai".to_string(),
+        ProviderSettings {
+            organization: Some("org-fromtoml".to_string()),
+            project: Some("proj_fromtoml".to_string()),
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(settings, Some("openai"), |_| None)
+        .expect("openai config builds");
+    let ProviderConfig::OpenAi(openai) = &config.provider else {
+        panic!("expected openai");
+    };
+    assert_eq!(openai.organization.as_deref(), Some("org-fromtoml"));
+    assert_eq!(openai.project.as_deref(), Some("proj_fromtoml"));
+    assert_eq!(openai.service_tier.as_deref(), Some("priority"));
+}
+
+#[test]
+fn openai_org_project_service_tier_default_to_none() {
+    let openai = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        _ => None,
+    });
+    let ProviderConfig::OpenAi(config) = &openai.provider else {
+        panic!("expected openai");
+    };
+    assert!(config.organization.is_none());
+    assert!(config.project.is_none());
+    assert!(config.service_tier.is_none());
+}
+
+#[test]
 fn azure_openai_carries_extra_headers_from_settings() {
     // Operators wire `Apim-Subscription-Key` (and Entra ID `Authorization`
     // overrides) through the standard `[providers.azure_openai.headers]`

@@ -1071,6 +1071,9 @@ fn api_key_row_reports_env_var_presence() {
             api_key_env: custom_env.to_string(),
             api_key: None,
             base_url: squeezy_core::DEFAULT_OPENAI_BASE_URL.to_string(),
+            organization: None,
+            project: None,
+            service_tier: None,
             transport: Default::default(),
         }),
         ..AppConfig::default()

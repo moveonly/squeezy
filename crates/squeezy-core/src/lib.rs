@@ -695,6 +695,24 @@ impl AppConfig {
                 base_url: get_var("OPENAI_BASE_URL")
                     .or_else(|| provider_setting(&providers, "openai", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+                // OPENAI_ORG_ID is the canonical env name in OpenAI's own
+                // SDKs; OPENAI_ORGANIZATION is the long-form alias they
+                // accept too. Honor both so users porting from other
+                // tooling don't get surprised.
+                organization: get_var("OPENAI_ORG_ID")
+                    .or_else(|| get_var("OPENAI_ORGANIZATION"))
+                    .or_else(|| provider_setting(&providers, "openai", "organization"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                project: get_var("OPENAI_PROJECT_ID")
+                    .or_else(|| get_var("OPENAI_PROJECT"))
+                    .or_else(|| provider_setting(&providers, "openai", "project"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                service_tier: get_var("OPENAI_SERVICE_TIER")
+                    .or_else(|| provider_setting(&providers, "openai", "service_tier"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
                 transport: provider_transport_settings(&providers, &["openai"]),
             }),
             "openai-codex" | "openai_codex" | "chatgpt" => {
@@ -2243,6 +2261,24 @@ pub struct OpenAiConfig {
     #[serde(serialize_with = "redact_secret_opt")]
     pub api_key: Option<String>,
     pub base_url: String,
+    /// Pay-As-You-Go org slug forwarded as the `OpenAI-Organization`
+    /// header so spend attributes against the right billing org when
+    /// the API key has access to multiple. `None` keeps the legacy
+    /// behavior of letting OpenAI pick the user's default org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Project id forwarded as `OpenAI-Project` so multi-project orgs
+    /// attribute usage to the right project rather than the org's
+    /// fallback project. Reads `OPENAI_PROJECT_ID` env / `project` TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Service tier forwarded as the `service_tier` body field on
+    /// `/responses` and chat-completions calls. Accepts `"auto"`,
+    /// `"default"`, `"flex"`, `"priority"`, and `"scale"`; the
+    /// provider passes the string through so newly-added tiers do
+    /// not require a client release. `None` lets OpenAI pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -2881,6 +2917,16 @@ pub struct ProviderSettings {
     /// `api-key` header. Tri-state (`None`) so the higher-precedence
     /// layer can leave the value untouched during settings merge.
     pub use_entra_id: Option<bool>,
+    /// OpenAI-only: PayG org slug forwarded as `OpenAI-Organization`.
+    /// Ignored by every other provider.
+    pub organization: Option<String>,
+    /// OpenAI-only: project id forwarded as `OpenAI-Project`. Ignored by
+    /// every other provider.
+    pub project: Option<String>,
+    /// OpenAI-only: `service_tier` body field (`flex`, `priority`,
+    /// `default`, `auto`, `scale`). Pass-through string so new tiers
+    /// land without a client release. Ignored by every other provider.
+    pub service_tier: Option<String>,
 }
 
 impl ProviderSettings {
@@ -2908,6 +2954,9 @@ impl ProviderSettings {
                 "route_style",
                 "script",
                 "use_entra_id",
+                "organization",
+                "project",
+                "service_tier",
             ],
             source,
             path,
@@ -3018,6 +3067,19 @@ impl ProviderSettings {
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
             script: string_value(table, "script", source, &field(path, "script"))?,
             use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
+            organization: string_value(
+                table,
+                "organization",
+                source,
+                &field(path, "organization"),
+            )?,
+            project: string_value(table, "project", source, &field(path, "project"))?,
+            service_tier: string_value(
+                table,
+                "service_tier",
+                source,
+                &field(path, "service_tier"),
+            )?,
         })
     }
 
@@ -3043,6 +3105,9 @@ impl ProviderSettings {
         replace_if_some(&mut self.route_style, next.route_style);
         replace_if_some(&mut self.script, next.script);
         replace_if_some(&mut self.use_entra_id, next.use_entra_id);
+        replace_if_some(&mut self.organization, next.organization);
+        replace_if_some(&mut self.project, next.project);
+        replace_if_some(&mut self.service_tier, next.service_tier);
     }
 }
 
@@ -8557,6 +8622,9 @@ fn provider_setting(
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         "script" => settings.script.as_ref(),
+        "organization" => settings.organization.as_ref(),
+        "project" => settings.project.as_ref(),
+        "service_tier" => settings.service_tier.as_ref(),
         _ => None,
     }?;
     Some(value.clone())

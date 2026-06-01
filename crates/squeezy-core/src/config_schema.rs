@@ -1618,6 +1618,9 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
             api_key: None,
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+            organization: None,
+            project: None,
+            service_tier: None,
             transport,
         }),
         "openai-codex" | "openai_codex" | "chatgpt" => {
