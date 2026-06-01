@@ -520,7 +520,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                          x-portkey-provider). Set one of those and retry."
                     }
                 } else {
-                    ""
+                    local_jit_load_hint(preset, status, &message)
                 };
                 Err(SqueezyError::ProviderRequest(format!(
                     "{provider_label} {status}: {message}{hint}"
@@ -977,6 +977,49 @@ fn collect_delta_text(value: Option<&Value>) -> String {
             out
         }
         _ => String::new(),
+    }
+}
+
+/// Append a JIT-load hint to a 400 error body from a local OpenAI-compatible
+/// server (LM Studio, vLLM, llama.cpp). All three return `400 Bad Request`
+/// with a message containing "not loaded" / "model not loaded" / "no models
+/// loaded" when the user pointed `model = "<id>"` at a checkpoint the server
+/// hasn't loaded into memory yet. Returns an inline hint string the caller
+/// concatenates onto the surfaced error message; returns `""` when the
+/// preset / status / message combination does not match. The hint points
+/// the user at the provider-appropriate fix (`lms load`, `vllm serve`,
+/// `llama-server -m`) instead of the bare upstream complaint.
+fn local_jit_load_hint(
+    preset: OpenAiCompatiblePreset,
+    status: StatusCode,
+    message: &str,
+) -> &'static str {
+    if status != StatusCode::BAD_REQUEST {
+        return "";
+    }
+    let lower = message.to_ascii_lowercase();
+    if !(lower.contains("not loaded")
+        || lower.contains("no models loaded")
+        || lower.contains("model is not loaded"))
+    {
+        return "";
+    }
+    match preset {
+        OpenAiCompatiblePreset::LMStudio => {
+            " — hint: LM Studio rejected the request because the requested model is not loaded. \
+             Open the LM Studio app, switch to the Developer tab, and load the checkpoint, or run \
+             `lms load <model>` from the LM Studio CLI before retrying."
+        }
+        OpenAiCompatiblePreset::VLlm => {
+            " — hint: the vLLM server is running but the requested model is not loaded. \
+             Restart `vllm serve` with `--model <id>` pointing at the checkpoint you want to call, \
+             or pick a model id that matches what the server already advertises via `GET /v1/models`."
+        }
+        OpenAiCompatiblePreset::LlamaCpp => {
+            " — hint: llama.cpp server has no model loaded. Start it with `llama-server -m <path>` \
+             pointing at the GGUF file you want to serve, then retry."
+        }
+        _ => "",
     }
 }
 

@@ -505,6 +505,97 @@ fn parse_chat_event_propagates_stream_error() {
 }
 
 #[test]
+fn local_jit_load_hint_attaches_for_lmstudio_400_not_loaded() {
+    // LM Studio returns `400 Bad Request` with an upstream message that
+    // contains "not loaded" when the user pointed `model = "<id>"` at a
+    // checkpoint the server hasn't loaded into memory. The hint must
+    // point at the LM Studio-specific fix (`lms load <model>`) so the
+    // user does not have to guess which CLI to reach for.
+    let hint = local_jit_load_hint(
+        OpenAiCompatiblePreset::LMStudio,
+        StatusCode::BAD_REQUEST,
+        "Model 'qwen3-32b' is not loaded",
+    );
+    assert!(
+        hint.contains("lms load"),
+        "LM Studio hint must surface the `lms load` CLI guidance: {hint}"
+    );
+}
+
+#[test]
+fn local_jit_load_hint_attaches_for_vllm_400_no_models_loaded() {
+    // vLLM surfaces "no models loaded" / "model not loaded" on a 400
+    // when the served checkpoint id does not match what `vllm serve`
+    // was launched with. The hint points at the `--model` startup flag.
+    let hint = local_jit_load_hint(
+        OpenAiCompatiblePreset::VLlm,
+        StatusCode::BAD_REQUEST,
+        "no models loaded; check --model startup flag",
+    );
+    assert!(
+        hint.contains("vllm serve"),
+        "vLLM hint must reference `vllm serve`: {hint}"
+    );
+}
+
+#[test]
+fn local_jit_load_hint_attaches_for_llamacpp_400_not_loaded() {
+    // llama.cpp's HTTP server returns 400 with "model is not loaded"
+    // when launched without `-m <path>`. Surface the `llama-server -m`
+    // fix so the user does not have to chase the upstream README.
+    let hint = local_jit_load_hint(
+        OpenAiCompatiblePreset::LlamaCpp,
+        StatusCode::BAD_REQUEST,
+        "model is not loaded",
+    );
+    assert!(
+        hint.contains("llama-server -m"),
+        "llama.cpp hint must reference the `llama-server -m` invocation: {hint}"
+    );
+}
+
+#[test]
+fn local_jit_load_hint_returns_empty_for_non_400_or_unrelated_body() {
+    // 401 / 500 / etc must not get the JIT-load hint — those are auth /
+    // upstream-crash failures, not "checkpoint missing" failures.
+    assert_eq!(
+        local_jit_load_hint(
+            OpenAiCompatiblePreset::LMStudio,
+            StatusCode::UNAUTHORIZED,
+            "Model 'qwen3-32b' is not loaded",
+        ),
+        ""
+    );
+    // 400 without the "not loaded" sentinel must also leave the hint
+    // empty so unrelated bad-request errors (malformed prompt, oversized
+    // input) surface without misleading guidance attached.
+    assert_eq!(
+        local_jit_load_hint(
+            OpenAiCompatiblePreset::LMStudio,
+            StatusCode::BAD_REQUEST,
+            "prompt too long",
+        ),
+        ""
+    );
+}
+
+#[test]
+fn local_jit_load_hint_returns_empty_for_remote_presets() {
+    // Only the three local presets get the hint — adding it to
+    // OpenRouter / Vercel / etc. would mislead users when the upstream
+    // (aggregator) returns 400 for an unrelated reason.
+    for preset in [
+        OpenAiCompatiblePreset::OpenRouter,
+        OpenAiCompatiblePreset::Vercel,
+        OpenAiCompatiblePreset::Groq,
+        OpenAiCompatiblePreset::PortKey,
+    ] {
+        let hint = local_jit_load_hint(preset, StatusCode::BAD_REQUEST, "model is not loaded");
+        assert_eq!(hint, "", "preset {preset:?} must not get the JIT-load hint");
+    }
+}
+
+#[test]
 fn format_chat_error_handles_partial_envelopes() {
     let only_message: Value = serde_json::from_str(r#"{"error":{"message":"boom"}}"#).unwrap();
     assert_eq!(format_chat_error(&only_message, "fallback"), "boom");
