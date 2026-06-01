@@ -657,6 +657,23 @@ pub struct LlmToolSpec {
     pub strict: bool,
 }
 
+/// Citation reference carried inside [`LlmEvent::Citation`]. Mirrors
+/// the shape OpenAI Responses annotations and xAI Live Search emit:
+/// a URL plus optional title and inclusive byte offsets into the
+/// running text buffer. Every field is optional because providers
+/// disagree on which dimensions they surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CitationSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_index: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmToolCall {
     pub call_id: String,
@@ -794,6 +811,16 @@ pub enum LlmEvent {
     /// wildcard-skip this variant.
     Refusal {
         content: String,
+    },
+    /// Source citation attached to a span of streamed text. OpenAI
+    /// Responses emits `annotations` blocks pointing at retrieval
+    /// matches; xAI Live Search (H-23) similarly streams citations
+    /// alongside text. `text_index` is the byte offset into the
+    /// running text buffer the citation refers to; the agent /
+    /// transcript records the source for later display.
+    Citation {
+        text_index: u32,
+        source: CitationSource,
     },
     /// Triple-path overflow detector classified this turn's terminal
     /// shape as a context-window overflow. See
