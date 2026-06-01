@@ -819,3 +819,35 @@ fn empty_resolved_value_is_safe_for_caller_short_circuit() {
         "caller pattern: skip bearer_auth when empty"
     );
 }
+
+#[tokio::test]
+async fn empty_static_api_key_source_does_not_panic() {
+    // H-46: when compatible.rs adopts resolve_api_key_with_inline_optional
+    // it will sometimes hand the resulting empty string to
+    // static_api_key_source. The trait surface must keep working —
+    // current_key() returns "" cleanly so the caller can decide
+    // whether to skip bearer_auth.
+    let source = static_api_key_source(String::new(), "lmstudio");
+    let key = source.current_key().await.expect("empty key resolves");
+    assert!(key.is_empty(), "empty key must propagate as empty string");
+    // invalidate is a no-op for StaticApiKey; verify it doesn't
+    // panic on the empty path either.
+    source.invalidate().await.expect("invalidate is infallible");
+    let after = source.current_key().await.expect("post-invalidate");
+    assert!(after.is_empty(), "still empty after invalidate");
+}
+
+#[test]
+fn empty_resolved_key_round_trips_through_static_api_key() {
+    // H-46 contract: the empty key path must survive every
+    // conversion between ResolvedKey, String, and StaticApiKey
+    // without panicking. Caller patterns wrap the resolved value in
+    // static_api_key_source unconditionally, so this rules out the
+    // string-handling layer panicking on "".
+    let resolved = ResolvedKey {
+        value: String::new(),
+        source: KeySource::Env,
+    };
+    let source = static_api_key_source(resolved.value.clone(), "vllm");
+    assert_eq!(source.provider_label(), "vllm");
+}
