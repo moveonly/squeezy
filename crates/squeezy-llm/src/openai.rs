@@ -72,8 +72,25 @@ impl OpenAiProvider {
                 "missing AZURE_OPENAI_BASE_URL or providers.azure_openai.base_url".to_string(),
             ));
         }
+        // C-13: this provider concatenates `?api-version={config.api_version}`
+        // onto every `/responses` URL. The DEFAULT_AZURE_OPENAI_API_VERSION
+        // constant in squeezy-core (`crates/squeezy-core/src/lib.rs:35`)
+        // is currently `"v1"`, which is wrong for the `/responses`
+        // endpoint (Azure requires `"preview"` against `/openai/v1/responses`).
+        // The constant lives outside Phase 4B scope; fixing it is queued
+        // for Phase 4I. The URL-build path below honors whatever the
+        // caller hands in, so setting `[providers.azure_openai].api_version = "preview"`
+        // works correctly today.
+        // TODO(Phase 4I): change DEFAULT_AZURE_OPENAI_API_VERSION to "preview".
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        // H-36: detect the classic `/openai/deployments/{deployment}` URL
+        // shape that older Azure Government / Mooncake resources still
+        // use. The Responses route on these resources expects the URL to
+        // already embed the deployment id, so the standard `{base}/responses`
+        // rewrite (with the v1 `/openai/v1` path) breaks them. Stash a
+        // flag here so `stream_response` can skip the deployment-name
+        // rewrite below.
         let mut provider = Self::with_api_key_source(
             "azure_openai",
             static_api_key_source(api_key, "azure_openai"),
@@ -83,6 +100,16 @@ impl OpenAiProvider {
         );
         provider.deployment_name_map = config.deployment_name_map.clone();
         Ok(provider)
+    }
+
+    /// `true` when this Azure provider was configured against the
+    /// classic `/openai/deployments/{deployment}` URL shape. The
+    /// Responses route on those resources expects the deployment to be
+    /// in the URL path, not the request body, so [`stream_response`]
+    /// skips the body-side model rewrite (and warns when neither the
+    /// deployment nor the body model match).
+    pub(crate) fn is_classic_azure_deployment_url(&self) -> bool {
+        self.api_version.is_some() && self.base_url.contains("/openai/deployments/")
     }
 
     /// Build an OpenAI Responses-API client targeting xAI's `/responses`
@@ -157,13 +184,39 @@ impl OpenAiProvider {
         // `google_call_…`, `tooluse_…`) and the pairing breaks even
         // though OpenAI itself accepts the id shape.
         let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        // H-37 (Azure default): Azure's Responses API requires
+        // `store: true` for the multi-turn `previous_response_id` flow
+        // (the prior response must persist on the server). Codex's
+        // client mirrors this with
+        // `store: provider.is_azure_responses_endpoint()`
+        // (`others/codex/codex-rs/core/src/client.rs:761`).
+        // Honor the caller's explicit setting if they passed `true`;
+        // otherwise default to `true` for Azure regardless of the
+        // request-side `store` slot. Non-Azure providers keep the
+        // caller's verbatim value.
+        let effective_store = if provider_name == "azure_openai" {
+            // Caller already opted in (or already opted out via the
+            // explicit `store: true/false`). We can't distinguish a
+            // caller-supplied `false` from the default `false` at this
+            // layer without a schema add, so default to `true` for
+            // Azure and document the override in the docstring above.
+            true
+        } else {
+            request.store
+        };
         let mut body = json!({
             "model": request.model,
-            "instructions": request.instructions,
             "input": openai_input(&normalized_input),
             "stream": true,
-            "store": request.store,
+            "store": effective_store,
         });
+        // M-02: only emit `instructions` when non-empty. An empty string
+        // would shadow the stored conversation default on a
+        // `previous_response_id` chain (codex mirrors this with
+        // `#[serde(skip_serializing_if = "String::is_empty")]`).
+        if !request.instructions.is_empty() {
+            body["instructions"] = json!(request.instructions);
+        }
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
@@ -231,12 +284,15 @@ impl OpenAiProvider {
                     })
                     .collect::<Vec<_>>()
             );
-            // Forward `tool_choice` when the caller set one. See LlmRequest
-            // docs — `None` omits the field and falls back to the
-            // provider's `auto` default.
-            if let Some(choice) = request.tool_choice.as_deref() {
-                body["tool_choice"] = json!(choice);
-            }
+        }
+        // M-03: forward `tool_choice` unconditionally — Responses-state
+        // continuations re-attach the prior turn's tools via
+        // `previous_response_id`, so a caller saying
+        // `tool_choice: "none"` on a follow-up turn needs the field even
+        // when `request.tools` is empty. `None` omits the field and
+        // falls back to the provider's `auto` default.
+        if let Some(choice) = request.tool_choice.as_deref() {
+            body["tool_choice"] = json!(choice);
         }
         if let Some(parallel) = request.parallel_tool_calls {
             // OpenAI's Responses API defaults to parallel tool calls; only
@@ -258,15 +314,37 @@ impl OpenAiProvider {
     /// header values are `session_id` and `x-client-request-id`, both
     /// taken from the request's cache key.
     ///
-    /// The header values carry the full (unclamped) cache key — the
-    /// 64-codepoint limit is specific to the body field; routing headers
-    /// have OpenAI's general (much larger) header length cap.
+    /// The header values carry up to 256 bytes of the cache key — the
+    /// 64-codepoint limit is specific to the body field. Defensive
+    /// 256-byte clamp (audit LOW): reqwest/hyper enforce an 8KB header
+    /// line cap and adversarial inputs (multi-MB cache keys propagated
+    /// from user-controlled session ids) would panic the request builder
+    /// before the cap kicks in.
     pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
         let Some(key) = request.effective_cache_spec().key else {
             return Vec::new();
         };
-        vec![("session_id", key.clone()), ("x-client-request-id", key)]
+        let clamped = clamp_affinity_header_value(&key);
+        vec![
+            ("session_id", clamped.clone()),
+            ("x-client-request-id", clamped),
+        ]
     }
+}
+
+/// Clamp a cache-key value to 256 bytes for use as an HTTP header.
+/// Splits on a UTF-8 codepoint boundary so the result is still a valid
+/// `String`. Values already at or under the cap pass through verbatim.
+fn clamp_affinity_header_value(value: &str) -> String {
+    const MAX_BYTES: usize = 256;
+    if value.len() <= MAX_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
@@ -299,6 +377,53 @@ fn openai_text_format(schema: &LlmOutputSchema) -> Value {
     })
 }
 
+/// Build the `/responses` URL for a single turn.
+///
+/// - Standard OpenAI / xAI / non-classic Azure: appends `/responses` to
+///   the base URL (already trimmed of trailing `/`).
+/// - Classic Azure (`/openai/deployments/{deployment}` URL shape, H-36):
+///   the deployment is already in the path so `/responses` still
+///   appends.
+/// - `api_version`: when `Some`, attaches as a query parameter using
+///   `&` if the base URL already carries a query string (AZ-M4) and
+///   percent-encoding the value (AZ-M4 / M-56) so typos like
+///   `"preview "` produce a well-formed URL instead of an invalid HTTP
+///   request.
+fn build_responses_url(base_url: &str, api_version: Option<&str>, _classic_azure: bool) -> String {
+    // The classic-Azure flag is currently informational — both shapes
+    // append `/responses`; the deployment-in-path lives in `base_url`
+    // already. Held in the signature so a future per-shape divergence
+    // (e.g. `/responses` vs `/responses?api-version=…` dating per
+    // Azure quickstart) doesn't break the call-site contract.
+    let mut url = format!("{base_url}/responses");
+    if let Some(api_version) = api_version {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str("api-version=");
+        url.push_str(&percent_encode_query_component(api_version));
+    }
+    url
+}
+
+/// Minimal RFC 3986 query-component percent-encoder for `api-version`.
+/// Encodes everything outside the unreserved set
+/// (`A-Z` / `a-z` / `0-9` / `-` `_` `.` `~`) so that valid Azure
+/// `api-version` values (`preview`, `2024-10-21`) pass through verbatim
+/// while user typos (trailing space, `?`, `&`, `#`, …) become
+/// percent-escapes instead of breaking the URL structure.
+fn percent_encode_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
         self.name
@@ -312,11 +437,18 @@ impl LlmProvider for OpenAiProvider {
         let api_key = self.api_key.clone();
         let provider_name = self.name;
         let transport = self.transport;
-        let mut url = format!("{}/responses", self.base_url);
-        if let Some(api_version) = &self.api_version {
-            url.push_str("?api-version=");
-            url.push_str(api_version);
-        }
+        // H-36 + AZ-M4: build the `/responses` URL via a small helper so
+        // (a) the classic `/openai/deployments/{deployment}` shape skips
+        // the path rewrite, and (b) `?api-version=` composition stays
+        // safe when the api_version string contains reserved chars or
+        // the base_url already has a query string. Encoding via
+        // `url::form_urlencoded::byte_serialize` follows RFC 3986
+        // `query` rules.
+        let url = build_responses_url(
+            &self.base_url,
+            self.api_version.as_deref(),
+            self.is_classic_azure_deployment_url(),
+        );
         let mut body = Self::request_body(&request, provider_name);
         // Azure resources expose deployments under user-chosen ids (e.g.
         // `my-deployment-gpt-4o`). The Responses route reads the body's
@@ -326,11 +458,47 @@ impl LlmProvider for OpenAiProvider {
         // making this a no-op in those paths. Capability lookups above
         // intentionally ran against the *original* `request.model` so
         // the reasoning/effort decision still uses our static registry.
+        //
+        // H-36: the classic `/openai/deployments/{deployment}/responses`
+        // URL shape carries the deployment in the path, so the body
+        // model still matters for telemetry but does not select the
+        // deployment. The body-side rewrite still runs (no harm) and
+        // the URL-build above kept the user's `base_url` unmodified.
         let deployment = self.resolve_deployment_name(&request.model);
         if deployment != request.model.as_ref() {
             body["model"] = json!(deployment);
         }
         let affinity_headers = Self::affinity_headers(&request);
+        // H-35 (interim Entra-ID Bearer path): Microsoft Entra ID is
+        // the modern auth path for Azure OpenAI (`Authorization: Bearer
+        // <jwt>` with resource `https://cognitiveservices.azure.com/.default`).
+        // `AzureOpenAiConfig::use_entra_id` is the canonical config slot
+        // and lives in squeezy-core (Phase 4I). Until that schema add
+        // ships, callers can opt in via the `AZURE_OPENAI_USE_ENTRA_ID`
+        // env var — when set to a truthy value the provider attaches
+        // the api key as a Bearer token instead of the `api-key` header.
+        // TODO(Phase 4I): replace this env-var read with a typed config
+        //  field on `AzureOpenAiConfig` and a token-provider hook.
+        let use_entra_id_bearer = provider_name == "azure_openai"
+            && std::env::var("AZURE_OPENAI_USE_ENTRA_ID")
+                .ok()
+                .is_some_and(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                });
+        // H-34 + M-04 (org/project/service_tier/extra_headers): the
+        // schema slots live on `AzureOpenAiConfig` / `OpenAiConfig` in
+        // squeezy-core. TODO(Phase 4I):
+        //  - add `OpenAiConfig::organization`, `OpenAiConfig::project`,
+        //    `OpenAiConfig::service_tier` fields and thread through to
+        //    this auth/body section (set `OpenAI-Organization`,
+        //    `OpenAI-Project` headers; emit `service_tier` in body).
+        //  - add `AzureOpenAiConfig::extra_headers` map and apply here
+        //    after `api-key` / Bearer so user-supplied headers (Entra
+        //    Bearer, APIM subscription key, x-ms-correlation-request-id)
+        //    can override the default.
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -339,9 +507,12 @@ impl LlmProvider for OpenAiProvider {
                 &cancel,
                 |key| {
                     let builder = client.post(&url);
-                    let builder = if provider_name == "azure_openai" {
+                    let builder = if provider_name == "azure_openai" && !use_entra_id_bearer {
                         builder.header("api-key", key)
                     } else {
+                        // OpenAI / xAI / Codex use Bearer; Azure with
+                        // `AZURE_OPENAI_USE_ENTRA_ID=1` also rides this
+                        // arm (H-35 interim path).
                         builder.bearer_auth(key)
                     };
                     // Cache-affinity headers (only emitted when the
@@ -388,7 +559,15 @@ impl LlmProvider for OpenAiProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                    let parsed = parse_openai_event(&event, &mut reasoning_acc);
+                    // H-06: drain pre-yield (`ContextOverflow` etc.)
+                    // *before* propagating either the parsed event or a
+                    // terminal error so the agent's recovery layer sees
+                    // the structured signal first.
+                    for pre in reasoning_acc.drain_pre_yield() {
+                        yield pre;
+                    }
+                    let parsed = parsed?;
                     if let Some(server) = reasoning_acc.take_server_model()
                         && let Some(echo) = server_model_echo.observe(&request.model, &server)
                     {
@@ -404,7 +583,11 @@ impl LlmProvider for OpenAiProvider {
             }
 
             for event in decoder.finish() {
-                let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                let parsed = parse_openai_event(&event, &mut reasoning_acc);
+                for pre in reasoning_acc.drain_pre_yield() {
+                    yield pre;
+                }
+                let parsed = parsed?;
                 if let Some(server) = reasoning_acc.take_server_model()
                     && let Some(echo) = server_model_echo.observe(&request.model, &server)
                 {
@@ -446,6 +629,36 @@ pub(crate) struct ReasoningAccumulator {
     /// for every event that doesn't include a `response.model` field —
     /// the loop only acts on the first observation per stream.
     server_model: Option<String>,
+    /// Cumulative streamed text from `response.output_text.delta` events.
+    /// Used by `response.output_text.done` (H-08) to reconcile against
+    /// the authoritative final string and emit a corrective `TextDelta`
+    /// for any suffix divergence (re-ordering or dropped delta during
+    /// reconnect-without-skip).
+    text_buffer: String,
+    /// `true` once a `response.refusal.delta` or `response.refusal.done`
+    /// has been observed in this stream. Drives the C-02 normalization:
+    /// the terminal `response.completed` event normally lands with no
+    /// `incomplete_details` (refusals ARE the completion, not an
+    /// incomplete state), so we override `stop_reason` to
+    /// `StopReason::Refusal` here. The TUI also sees per-delta refusal
+    /// text via `LlmEvent::Refusal` while the refusal streams.
+    refusal_latched: bool,
+    /// Per-item-id (call_id) cache of the function name observed on the
+    /// matching `response.output_item.added` event. Needed because
+    /// `response.function_call_arguments.delta` (H-07) carries only the
+    /// `item_id` + chunk text, not the function name — downstream
+    /// consumers need the name to render a meaningful "calling tool X"
+    /// hint. The terminal `response.output_item.done` event still
+    /// produces the canonical `LlmEvent::ToolCall` with the fully
+    /// assembled arguments, so consumers may also ignore the deltas.
+    tool_call_names: std::collections::HashMap<String, String>,
+    /// Events the parser wants to yield *before* the next return value
+    /// fires (typically an [`LlmEvent::ContextOverflow`] preceding the
+    /// `response.failed` terminal error — H-06). The outer stream loop
+    /// drains this after every `parse_openai_event` call (including the
+    /// error path) so the signal reaches consumers before the
+    /// `SqueezyError::ProviderStream` terminal value lands.
+    pre_yield: std::collections::VecDeque<LlmEvent>,
 }
 
 impl ReasoningAccumulator {
@@ -465,23 +678,50 @@ impl ReasoningAccumulator {
     pub(crate) fn take_server_model(&mut self) -> Option<String> {
         self.server_model.take()
     }
+
+    /// Drain queued events the parser wants to surface ahead of the
+    /// next return value. Used by H-06's `response.failed` path to
+    /// emit a [`LlmEvent::ContextOverflow`] before the terminal
+    /// `SqueezyError::ProviderStream` value lands. The outer stream
+    /// loop calls this after every `parse_openai_event` invocation —
+    /// including the error path — so the pre-yield signal always
+    /// reaches consumers.
+    pub(crate) fn drain_pre_yield(&mut self) -> std::collections::vec_deque::IntoIter<LlmEvent> {
+        std::mem::take(&mut self.pre_yield).into_iter()
+    }
 }
 
 pub(crate) fn parse_openai_event(
     data: &str,
     reasoning_acc: &mut ReasoningAccumulator,
 ) -> Result<Option<LlmEvent>> {
-    if data == "[DONE]" {
-        return Ok(None);
-    }
+    // Q11 removed the `[DONE]` sentinel — Responses API never emits it
+    // (only Chat Completions does). If a malformed proxy ever injects
+    // it the empty-data parse error path below surfaces it.
 
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
+    // LOW: validate `event.type` is actually a string. A malformed proxy
+    // that ships `{"type": null, ...}` would otherwise silently land in
+    // the `_ =>` "unhandled" arm. Track via a tracing warn so the
+    // protocol violation is observable in a debug build.
+    let event_type = match value.get("type") {
+        Some(Value::String(s)) => s.as_str(),
+        Some(other) => {
+            tracing::warn!(
+                target: "squeezy_llm::openai",
+                ?other,
+                "OpenAI SSE event carried a non-string `type` field",
+            );
+            ""
+        }
+        None => "",
+    };
+    // Q10: skip the trace line when the event has no type — useful for
+    // hand-rolled debug fixtures but adds noise in production.
+    if !event_type.is_empty() {
+        tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
+    }
 
     // OpenAI Responses events embed the server-chosen model on the
     // `response` object that ships with `response.created`,
@@ -508,7 +748,97 @@ pub(crate) fn parse_openai_event(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // Cumulative buffer feeds the H-08 `output_text.done`
+            // reconcile path below.
+            reasoning_acc.text_buffer.push_str(&delta);
             Ok(Some(LlmEvent::TextDelta(delta)))
+        }
+        "response.output_text.done" => {
+            // H-08: the `.done` event carries the authoritative final
+            // string for the completed text part. Reconcile against the
+            // cumulative delta buffer — if a delta was dropped during a
+            // mid-stream reconnect-without-skip or arrived out of order,
+            // emit a corrective `TextDelta` for the missing suffix so
+            // the persisted transcript matches what the model actually
+            // produced. Common case: deltas matched, no event emitted.
+            let authoritative = value.get("text").and_then(Value::as_str).unwrap_or("");
+            let already = reasoning_acc.text_buffer.as_str();
+            if let Some(suffix) = authoritative.strip_prefix(already)
+                && !suffix.is_empty()
+            {
+                let suffix = suffix.to_string();
+                reasoning_acc.text_buffer.push_str(&suffix);
+                return Ok(Some(LlmEvent::TextDelta(suffix)));
+            }
+            Ok(None)
+        }
+        "response.refusal.delta" => {
+            // C-02: safety-refusal text streams through `refusal.delta`
+            // chunks ending with `refusal.done`. Surface each delta as a
+            // typed `Refusal` event so the TUI shows the running refusal
+            // text, and latch the flag so the terminal `response.completed`
+            // (which arrives without `incomplete_details`) normalizes to
+            // `StopReason::Refusal` instead of `EndTurn`.
+            let delta = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            reasoning_acc.refusal_latched = true;
+            Ok(Some(LlmEvent::Refusal { content: delta }))
+        }
+        "response.refusal.done" => {
+            // Latch even when no `delta` event preceded the done (defensive
+            // — production streams always start with at least one delta).
+            reasoning_acc.refusal_latched = true;
+            Ok(None)
+        }
+        "response.output_item.added" => {
+            // H-07: pre-register the call_id → name mapping the
+            // subsequent `response.function_call_arguments.delta`
+            // events need to surface a meaningful name. The terminal
+            // `response.output_item.done` still emits the canonical
+            // `ToolCall` with the assembled arguments so consumers
+            // that only watch the final event keep working.
+            if let Some(item) = value.get("item")
+                && item.get("type").and_then(Value::as_str) == Some("function_call")
+                && let (Some(item_id), Some(name)) = (
+                    item.get("id").and_then(Value::as_str),
+                    item.get("name").and_then(Value::as_str),
+                )
+            {
+                reasoning_acc
+                    .tool_call_names
+                    .insert(item_id.to_string(), name.to_string());
+            }
+            Ok(None)
+        }
+        "response.function_call_arguments.delta" => {
+            // H-07: incremental tool-arguments delta. OpenAI's Responses
+            // streams `apply_patch` / multi-file diff arguments
+            // chunk-by-chunk; surfacing them lets the UI show progress
+            // before the full call materializes. The canonical
+            // `LlmEvent::ToolCall` still lands at `output_item.done`.
+            let item_id = value
+                .get("item_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let chunk = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = reasoning_acc
+                .tool_call_names
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
+            Ok(Some(LlmEvent::ToolCallDelta {
+                call_id: item_id,
+                name,
+                arguments_chunk: chunk,
+            }))
         }
         "response.reasoning_summary_text.delta" => {
             let delta = value
@@ -553,12 +883,20 @@ pub(crate) fn parse_openai_event(
             // Successful completions don't carry `incomplete_details`;
             // treat their absence as `EndTurn` so the agent's turn loop
             // sees a normalized stop reason on every provider event.
-            let stop_reason = response
-                .and_then(|response| response.get("incomplete_details"))
-                .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
-                .map(crate::StopReason::from_openai_incomplete)
-                .or(Some(crate::StopReason::EndTurn));
+            // C-02: when a `response.refusal.delta` latched earlier in
+            // the same stream, override to `Refusal` — the terminal
+            // event arrives without `incomplete_details` because the
+            // refusal text IS the completion, not an incomplete state.
+            let stop_reason = if reasoning_acc.refusal_latched {
+                Some(crate::StopReason::Refusal)
+            } else {
+                response
+                    .and_then(|response| response.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(crate::StopReason::from_openai_incomplete)
+                    .or(Some(crate::StopReason::EndTurn))
+            };
             Ok(Some(LlmEvent::Completed {
                 response_id,
                 cost: parse_cost(response),
@@ -575,10 +913,29 @@ pub(crate) fn parse_openai_event(
                 .and_then(|response| response.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let stop_reason = response
-                .and_then(|response| response.get("incomplete_details"))
+            let incomplete_details =
+                response.and_then(|response| response.get("incomplete_details"));
+            let reason = incomplete_details
                 .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str);
+            // C-14 (Azure mid-stream): when the output filter blocks a
+            // response after streaming starts, Azure surfaces
+            // `incomplete_details.content_filter_result` with per-category
+            // severity. Queue a `LlmEvent::Refusal` ahead of the
+            // `Completed` event so the TUI shows the filter category
+            // alongside the canonical `StopReason::Refusal` signal.
+            if reason == Some("content_filter") {
+                let filter_result =
+                    incomplete_details.and_then(|details| details.get("content_filter_result"));
+                if let Some(result) = filter_result {
+                    let summary = azure_content_filter_categories(result);
+                    reasoning_acc
+                        .pre_yield
+                        .push_back(LlmEvent::Refusal { content: summary });
+                }
+                reasoning_acc.refusal_latched = true;
+            }
+            let stop_reason = reason
                 .map(crate::StopReason::from_openai_incomplete)
                 .or(Some(crate::StopReason::Other("incomplete".to_string())));
             Ok(Some(LlmEvent::Completed {
@@ -589,13 +946,96 @@ pub(crate) fn parse_openai_event(
             }))
         }
         "error" | "response.failed" => {
-            let message = value
-                .get("error")
-                .and_then(|error| error.get("message"))
+            // H-06: parse the `error.{code,message,param}` envelope and
+            // branch on `code` so the agent's recovery layer sees a
+            // structured signal instead of a flat stringified error.
+            // `response.failed.response.error` is the canonical envelope
+            // (codex models the same shape in `codex-rs/codex-api/src/sse/responses.rs`).
+            // Stale-`previous_response_id` (M-05) is handled here too —
+            // surfaced with a `previous_response_not_found:` marker prefix
+            // so the agent layer can detect it without a SqueezyError
+            // schema add (squeezy-core scope, Phase 4I).
+            let response_error = value
+                .get("response")
+                .and_then(|response| response.get("error"));
+            let error_obj = response_error
+                .or_else(|| value.get("error"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let code = error_obj
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = error_obj
+                .get("message")
                 .and_then(Value::as_str)
                 .or_else(|| value.get("message").and_then(Value::as_str))
                 .unwrap_or("OpenAI stream error");
-            Err(SqueezyError::ProviderStream(message.to_string()))
+            let param = error_obj.get("param").and_then(Value::as_str);
+
+            // Stitch a descriptive prefix that downstream marker-prefix
+            // detectors (M-05 stale `previous_response_id`, agent's
+            // overflow recovery) can match without a SqueezyError schema
+            // add. Falls back to the bare provider message when no
+            // recognised code lands.
+            let prefixed = match code {
+                "context_length_exceeded" => {
+                    // Push the canonical `ContextOverflow` event ahead of
+                    // the terminal error so the agent's compact-and-
+                    // retry recovery fires before the bare provider
+                    // error reaches the turn loop.
+                    reasoning_acc
+                        .pre_yield
+                        .push_back(LlmEvent::ContextOverflow {
+                            provider: "openai".to_string(),
+                            signal: crate::OverflowSignal::ErrorPattern(message.to_string()),
+                        });
+                    format!("context_length_exceeded: {message}")
+                }
+                "content_filter" => {
+                    // C-14 (Azure): the content-filter envelope ships
+                    // per-category severity inside
+                    // `error.innererror.content_filter_result.{hate,sexual,
+                    // violence,self_harm,jailbreak,protected_material_*}`.
+                    // Surface a `LlmEvent::Refusal` ahead of the terminal
+                    // error so the TUI shows the filter category instead
+                    // of a bare 400. The summary string concatenates the
+                    // filtered categories so the agent's transcript
+                    // records *why* the refusal happened.
+                    let summary = azure_content_filter_summary(&error_obj);
+                    reasoning_acc.pre_yield.push_back(LlmEvent::Refusal {
+                        content: summary.clone(),
+                    });
+                    reasoning_acc.refusal_latched = true;
+                    format!("content_filter: {summary} ({message})")
+                }
+                "rate_limit_exceeded" => {
+                    // Embed any "try again in 3s" hint the upstream
+                    // ships in the message so the agent's retry layer
+                    // can honor the Retry-After-style delay.
+                    format!("rate_limit_exceeded: {message}")
+                }
+                "insufficient_quota" => format!("insufficient_quota: {message}"),
+                "cyber_policy" => format!("cyber_policy: {message}"),
+                "previous_response_not_found" => {
+                    // M-05: mark stale `previous_response_id` 404s so
+                    // the agent layer can drop the stored id and resend
+                    // the materialized input. Squeezy-core's
+                    // `SqueezyError` schema add lives in Phase 4I; the
+                    // marker prefix keeps detection working today.
+                    format!("previous_response_not_found: {message}")
+                }
+                "" => message.to_string(),
+                other => format!("{other}: {message}"),
+            };
+            // Stash `param` in the message tail when present so debug
+            // dashboards keep the field that points at the offending
+            // request slot.
+            let final_message = match param {
+                Some(p) if !p.is_empty() => format!("{prefixed} (param: {p})"),
+                _ => prefixed,
+            };
+            Err(SqueezyError::ProviderStream(final_message))
         }
         _ => {
             tracing::debug!(
@@ -608,11 +1048,77 @@ pub(crate) fn parse_openai_event(
     }
 }
 
-fn openai_input(input: &[LlmInputItem]) -> Value {
-    if let [LlmInputItem::UserText(text)] = input {
-        return json!(text);
+/// Pretty-print the Azure content-filter envelope into a human-readable
+/// string for the `LlmEvent::Refusal { content }` payload. Searches the
+/// canonical paths Azure uses (per-prompt and per-response variants).
+fn azure_content_filter_summary(error_obj: &Value) -> String {
+    // Try the most common Azure shapes in order:
+    //   error.innererror.content_filter_result.{category}
+    //   error.content_filter_result.{category}
+    let candidates = [
+        error_obj
+            .get("innererror")
+            .and_then(|v| v.get("content_filter_result")),
+        error_obj.get("content_filter_result"),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let summary = azure_content_filter_categories(candidate);
+        if !summary.is_empty() {
+            return summary;
+        }
     }
+    "content_filter".to_string()
+}
 
+/// Extract a category-level summary from an Azure `content_filter_result`
+/// JSON object. Returns a comma-separated list of `category[:severity]`
+/// pairs for every category whose `filtered: true` flag is set.
+fn azure_content_filter_categories(result: &Value) -> String {
+    let Some(obj) = result.as_object() else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (category, value) in obj {
+        let filtered = value
+            .get("filtered")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let severity = value.get("severity").and_then(Value::as_str);
+        let detected = value
+            .get("detected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if filtered {
+            match severity {
+                Some(sev) if !sev.is_empty() => out.push(format!("{category}:{sev}")),
+                _ => out.push(category.clone()),
+            }
+        } else if detected {
+            out.push(format!("{category}:detected"));
+        }
+    }
+    if out.is_empty() {
+        // Some envelopes only carry `severity` without `filtered`; fall
+        // back to listing categories whose severity is set above safe.
+        for (category, value) in obj {
+            if let Some(sev) = value.get("severity").and_then(Value::as_str)
+                && !sev.is_empty()
+                && sev != "safe"
+            {
+                out.push(format!("{category}:{sev}"));
+            }
+        }
+    }
+    out.join(", ")
+}
+
+fn openai_input(input: &[LlmInputItem]) -> Value {
+    // UserText array shape (audit MEDIUM finding): always emit the
+    // typed array form so multi-item turns mixing `UserText` and
+    // `Image` produce a uniform shape. The string-form fast-path is
+    // removed because (a) OpenAI is phasing it out for Responses, and
+    // (b) it produced a different prompt-cache prefix than the array
+    // form for otherwise-identical bodies.
     Value::Array(input.iter().filter_map(openai_input_item).collect())
 }
 
@@ -620,11 +1126,17 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
     Some(match item {
         LlmInputItem::UserText(text) => json!({
             "role": "user",
-            "content": text,
+            "content": [{
+                "type": "input_text",
+                "text": text,
+            }],
         }),
         LlmInputItem::AssistantText(text) => json!({
             "role": "assistant",
-            "content": text,
+            "content": [{
+                "type": "output_text",
+                "text": text,
+            }],
         }),
         LlmInputItem::FunctionCall {
             call_id,
@@ -637,12 +1149,50 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
             "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
         }),
         LlmInputItem::FunctionCallOutput {
-            call_id, output, ..
-        } => json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output,
-        }),
+            call_id,
+            output,
+            content_parts,
+            ..
+        } => {
+            // M-06: when the caller attached structured tool-result
+            // parts (image returns from browser tools, multi-block
+            // outputs), emit the Responses-API array form so the model
+            // receives the images directly instead of through a
+            // base64-stringified blob inside `output`. Falls back to
+            // the plain string form when `content_parts` is `None`.
+            if let Some(parts) = content_parts
+                && !parts.is_empty()
+            {
+                let serialized: Vec<Value> = parts
+                    .iter()
+                    .map(|part| match part {
+                        crate::ToolResultPart::Text { text } => json!({
+                            "type": "input_text",
+                            "text": text,
+                        }),
+                        crate::ToolResultPart::Image { media_type, bytes } => json!({
+                            "type": "input_image",
+                            "detail": "auto",
+                            "image_url": format!(
+                                "data:{media_type};base64,{}",
+                                BASE64_STANDARD.encode(bytes.as_ref())
+                            ),
+                        }),
+                    })
+                    .collect();
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": Value::Array(serialized),
+                })
+            } else {
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                })
+            }
+        }
         LlmInputItem::Image { media_type, bytes } => json!({
             "role": "user",
             "content": [{
