@@ -12287,6 +12287,10 @@ fn subagent_record_row(
         ),
         _ => detail,
     };
+    // Lead with the lifecycle word so the state survives a monochrome
+    // terminal and the selected-row glyph (which is always ⏺) can't mask a
+    // failed/running/capped subagent.
+    let detail = format!("{} · {}", record.lifecycle.label(), detail);
     // Disambiguate same-kind rows during parallel fanout (e.g. three
     // "delegate" subagents) with their row ordinal.
     let label = format!("{} #{row}", record.agent);
@@ -13068,6 +13072,9 @@ enum SubagentLifecycle {
     Running,
     Completed,
     Failed,
+    /// Refused before a lease was acquired (e.g. the concurrency cap was
+    /// hit). Has no real subagent id and never produces further events.
+    Rejected,
 }
 
 impl SubagentLifecycle {
@@ -13077,6 +13084,7 @@ impl SubagentLifecycle {
             (false, Self::Running) => "◐",
             (false, Self::Completed) => "●",
             (false, Self::Failed) => "◯",
+            (false, Self::Rejected) => "⊘",
         }
     }
 
@@ -13085,6 +13093,7 @@ impl SubagentLifecycle {
             Self::Running => "running",
             Self::Completed => "done",
             Self::Failed => "failed",
+            Self::Rejected => "capped",
         }
     }
 
@@ -13093,6 +13102,7 @@ impl SubagentLifecycle {
             Self::Running => crate::render::theme::accent(),
             Self::Completed => crate::render::theme::green(),
             Self::Failed => crate::render::theme::red(),
+            Self::Rejected => crate::render::theme::quiet(),
         }
     }
 }
@@ -13114,6 +13124,10 @@ pub(crate) struct SubagentPaneState {
     selected: usize,
     active: ConversationSource,
     records: Vec<SubagentRecord>,
+    /// Source of ids for rejected subagents, which never acquire a real
+    /// lease id. Drawn from the top of the u64 range downward so they can
+    /// never collide with the session's low, increasing lease ids.
+    next_synthetic_id: SubagentId,
 }
 
 impl Default for SubagentPaneState {
@@ -13123,6 +13137,7 @@ impl Default for SubagentPaneState {
             selected: 0,
             active: ConversationSource::Main,
             records: Vec::new(),
+            next_synthetic_id: u64::MAX,
         }
     }
 }
@@ -14106,6 +14121,41 @@ impl TuiApp {
             record.metrics = Some(metrics);
             record.transcript.push(entry);
         }
+    }
+
+    /// Record a subagent that was refused before it ever ran (e.g. the
+    /// concurrency cap was hit). Rejections carry no lease id, so they get a
+    /// synthetic one and a single-line transcript explaining the cap; the
+    /// row is otherwise a normal (finished) pane entry that Del can clear.
+    pub(crate) fn note_subagent_rejected(
+        &mut self,
+        agent: String,
+        reason: String,
+        limit: usize,
+        active: usize,
+    ) {
+        let id = self.subagent_pane.next_synthetic_id;
+        self.subagent_pane.next_synthetic_id =
+            self.subagent_pane.next_synthetic_id.saturating_sub(1);
+        let detail = format!("{reason} ({active}/{limit} already running)");
+        let entry_id = self.next_id();
+        let transcript = vec![TranscriptEntry::log_with_kind(
+            entry_id,
+            format!("{agent} subagent capped: {detail}"),
+            LogKind::Warn,
+            self.transcript_default,
+        )];
+        self.subagent_pane.records.push(SubagentRecord {
+            id,
+            agent,
+            prompt: detail.clone(),
+            lifecycle: SubagentLifecycle::Rejected,
+            latest: compact_text(&detail, 120),
+            metrics: None,
+            transcript,
+        });
+        self.prune_subagent_records();
+        self.clamp_subagent_selection();
     }
 
     fn clamp_subagent_selection(&mut self) {

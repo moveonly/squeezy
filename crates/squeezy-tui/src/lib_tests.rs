@@ -477,6 +477,54 @@ fn subagent_activity_transcript_stays_bounded() {
     assert_eq!(record.latest, compact_text("running tool 999", 120));
 }
 
+#[test]
+fn rejected_subagent_appears_in_pane_and_is_clearable() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "real one".to_string());
+    app.note_subagent_rejected("delegate".to_string(), "concurrency cap".to_string(), 3, 3);
+
+    assert_eq!(app.subagent_pane.records.len(), 2);
+    let rejected = app
+        .subagent_pane
+        .records
+        .iter()
+        .find(|r| matches!(r.lifecycle, SubagentLifecycle::Rejected))
+        .expect("rejected record present");
+    // Synthetic id must not collide with the real lease id (1).
+    assert_ne!(rejected.id, 1);
+    assert!(
+        rejected.latest.contains("concurrency cap"),
+        "{}",
+        rejected.latest
+    );
+
+    // The pane renders the capped row with its state word.
+    let output = render_to_string(&app, 120, 18);
+    assert!(output.contains("capped"), "{output}");
+
+    // A rejection is "finished", so Del clears it but keeps the running one.
+    app.clear_finished_subagents();
+    assert_eq!(app.subagent_pane.records.len(), 1);
+    assert_eq!(app.subagent_pane.records[0].id, 1);
+}
+
+#[test]
+fn subagent_row_shows_lifecycle_word_for_accessibility() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(2, "explore".to_string(), "look".to_string());
+    app.note_subagent_failed(
+        2,
+        "explore".to_string(),
+        "boom".to_string(),
+        TurnMetrics::default(),
+    );
+    // Even with the row selected (glyph forced to ⏺), the failed state is
+    // still conveyed as text.
+    app.subagent_pane.selected = 1;
+    let output = render_to_string(&app, 120, 18);
+    assert!(output.contains("failed"), "{output}");
+}
+
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);
