@@ -468,6 +468,117 @@ fn parse_chat_event_ignores_unknown_delta_shapes_without_panic() {
 }
 
 #[test]
+fn request_body_pins_n_to_one() {
+    // H-24: pin n: 1 explicitly so an upstream server that
+    // defaults to n > 1 (rare but legal under Chat Completions)
+    // cannot silently double-bill. The streamed parser only honors
+    // choices[0]; any additional choices and their tool calls
+    // would be dropped.
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert_eq!(body["n"], 1, "n must always be pinned to 1 in the body");
+}
+
+#[test]
+fn parse_chat_event_partitions_tool_calls_across_distinct_choices() {
+    // H-24: two choices each populating `index = 0` for their own
+    // tool call must NOT collapse into a single accumulator. The
+    // tool_calls map is keyed on (choice_index, tool_index) so
+    // both calls survive the drain.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[
+            {"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"grep","arguments":"{\"x\":1}"}}]}},
+            {"index":1,"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"name":"read","arguments":"{\"y\":2}"}}]}}
+        ]}"#,
+        &mut state,
+    )
+    .expect("delta with two choices");
+    let events = parse_chat_event(
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        &mut state,
+    )
+    .expect("finish");
+    let tool_calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            LlmEvent::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_calls.len(),
+        2,
+        "both choices' tool calls must survive partition: {tool_calls:?}"
+    );
+    let names: Vec<_> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"grep"));
+    assert!(names.contains(&"read"));
+    let call_ids: Vec<_> = tool_calls.iter().map(|c| c.call_id.as_str()).collect();
+    assert!(call_ids.contains(&"call_a"));
+    assert!(call_ids.contains(&"call_b"));
+}
+
+#[test]
+fn parse_chat_event_treats_missing_tool_index_as_continuation_of_active_index() {
+    // H-24: when an aggregator (Anthropic-via-OpenRouter relaying
+    // content_block_delta, some PortKey upstreams) drops the
+    // `index` field on a continuation delta, the field MUST be
+    // treated as a continuation of the most-recent active index
+    // on the same choice — NOT silently rewritten to `0`. The old
+    // `unwrap_or(0)` collapsed parallel call 1's args into call 0.
+    let mut state = StreamState::default();
+    // Open two parallel tool calls (index 0 and 1) on the same choice.
+    parse_chat_event(
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"grep","arguments":"{\"x"}},
+            {"index":1,"id":"call_b","function":{"name":"read","arguments":"{\"y"}}
+        ]}}]}"#,
+        &mut state,
+    )
+    .expect("two parallel calls");
+    // Continuation delta omits `index`. The previous code path
+    // would route to index 0; the H-24 fix routes to the highest
+    // active index (1).
+    parse_chat_event(
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\":2}"}}]}}]}"#,
+        &mut state,
+    )
+    .expect("missing-index continuation");
+    let events = parse_chat_event(
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        &mut state,
+    )
+    .expect("finish");
+    let tool_calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            LlmEvent::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_calls.len(), 2);
+    let grep = tool_calls
+        .iter()
+        .find(|c| c.name == "grep")
+        .expect("call 0 still present");
+    // call 0's args were never closed; the parser marks them
+    // INVALID_TOOL_ARGUMENTS.
+    assert_eq!(
+        grep.arguments[crate::INVALID_TOOL_ARGUMENTS_KEY],
+        Value::Bool(true),
+        "call 0 should NOT have received call 1's continuation"
+    );
+    let read = tool_calls
+        .iter()
+        .find(|c| c.name == "read")
+        .expect("call 1 still present");
+    assert_eq!(
+        read.arguments["y"], 2,
+        "missing-index continuation must route to the highest active index"
+    );
+}
+
+#[test]
 fn parse_chat_event_accumulates_tool_call_across_deltas() {
     let mut state = StreamState::default();
     parse_chat_event(

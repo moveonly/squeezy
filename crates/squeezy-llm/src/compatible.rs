@@ -313,6 +313,13 @@ impl OpenAiCompatibleProvider {
             "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true },
+            // H-24: pin `n: 1` so an upstream default of `n: 2` (rare
+            // but legal under Chat Completions) cannot silently double-
+            // bill. The streamed parser only honours `choices[0]`; any
+            // additional choices would be dropped, including their
+            // tool calls. Emitting the field explicitly guarantees the
+            // server-side count matches what we read.
+            "n": 1,
         });
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -962,7 +969,23 @@ fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, St
 struct StreamState {
     response_id: Option<String>,
     cost: CostSnapshot,
-    tool_calls: BTreeMap<usize, PartialToolCall>,
+    /// Tool-call accumulator partitioned by `(choice_index,
+    /// tool_index)`. H-24: aggregators that relay multi-choice
+    /// streams (rare today since we pin `n: 1` but legal under
+    /// Chat Completions) and providers that occasionally omit the
+    /// `index` field on continuation deltas (some Anthropic-via-
+    /// aggregator relays of `content_block_delta`) would otherwise
+    /// collapse the second call's args into the first. The
+    /// `(choice_index, tool_index)` key separates choices and the
+    /// `latest_tool_index_per_choice` map covers the missing-index
+    /// case by treating it as a continuation of the most recent
+    /// active index on that choice.
+    tool_calls: BTreeMap<(usize, usize), PartialToolCall>,
+    /// Tracks the highest-seen `tool_calls[].index` value per
+    /// choice so a continuation delta whose `index` field is
+    /// missing routes to the matching accumulator instead of
+    /// silently appending to `index=0`.
+    latest_tool_index_per_choice: BTreeMap<usize, usize>,
     completed_emitted: bool,
     /// Captured OpenAI chat-completions `finish_reason` from the last
     /// streamed choice, so the agent's turn loop sees a normalized
@@ -1012,8 +1035,38 @@ struct PartialToolCall {
 }
 
 impl StreamState {
-    fn accumulate_tool_call(&mut self, index: usize, delta: &Value) {
-        let entry = self.tool_calls.entry(index).or_default();
+    /// Accumulate a streamed `tool_calls[]` delta from `choice_index`
+    /// into the per-`(choice, tool)` partition.
+    ///
+    /// `tool_index` is `None` when the upstream omitted the `index`
+    /// field on a continuation delta — Anthropic-via-aggregator
+    /// relays of `content_block_delta` and some PortKey upstreams
+    /// drop the field after the first chunk. H-24: route those to
+    /// the most-recently-seen active index on the same choice
+    /// instead of silently defaulting to `0`, which would
+    /// concatenate a second parallel call's arguments into the
+    /// first call's accumulator.
+    fn accumulate_tool_call(
+        &mut self,
+        choice_index: usize,
+        tool_index: Option<usize>,
+        delta: &Value,
+    ) {
+        let resolved_tool_index = match tool_index {
+            Some(idx) => {
+                self.latest_tool_index_per_choice
+                    .entry(choice_index)
+                    .and_modify(|current| *current = (*current).max(idx))
+                    .or_insert(idx);
+                idx
+            }
+            None => *self
+                .latest_tool_index_per_choice
+                .get(&choice_index)
+                .unwrap_or(&0),
+        };
+        let key = (choice_index, resolved_tool_index);
+        let entry = self.tool_calls.entry(key).or_default();
         if let Some(id) = delta.get("id").and_then(Value::as_str) {
             entry.call_id = Some(id.to_string());
         }
@@ -1037,7 +1090,8 @@ impl StreamState {
     fn drain_tool_calls(&mut self) -> Result<Vec<LlmEvent>> {
         let mut events = Vec::new();
         let drained = std::mem::take(&mut self.tool_calls);
-        for (index, partial) in drained {
+        self.latest_tool_index_per_choice.clear();
+        for ((_choice_index, index), partial) in drained {
             let call_id = partial.call_id.unwrap_or_else(|| format!("call_{index}"));
             // Skip incomplete tool calls (no function.name accumulated)
             // instead of erroring the whole stream. PortKey / OpenRouter /
@@ -1302,6 +1356,13 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     let choices = value.get("choices").and_then(Value::as_array);
     if let Some(choices) = choices {
         for choice in choices {
+            // H-24: chat-completions choices carry an `index` field
+            // when `n > 1`. We pin `n: 1` in `request_body` so this
+            // is normally `0`, but multi-choice traffic surfaces
+            // through aggregator routes that mirror the upstream
+            // verbatim. Track the choice index so the tool-call
+            // accumulator partitions correctly across choices.
+            let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if let Some(delta) = choice.get("delta") {
                 let reasoning = collect_delta_text(delta.get("reasoning_content"))
                     + &collect_delta_text(delta.get("reasoning"));
@@ -1319,9 +1380,16 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tool_call in tool_calls {
-                        let index =
-                            tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        state.accumulate_tool_call(index, tool_call);
+                        // Missing `index` on a continuation delta
+                        // routes to the most-recent active index on
+                        // this choice (H-24). `None` is *not*
+                        // collapsed to `0` here — accumulate_tool_call
+                        // decides the right slot.
+                        let tool_index = tool_call
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize);
+                        state.accumulate_tool_call(choice_index, tool_index, tool_call);
                     }
                 }
             }
