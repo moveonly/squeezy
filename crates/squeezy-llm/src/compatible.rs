@@ -23,6 +23,8 @@ use squeezy_core::{
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
@@ -343,10 +345,20 @@ impl OpenAiCompatibleProvider {
             // unknown body fields, so emitting it unconditionally costs
             // nothing and recovers cached-input billing for OpenAI-via-
             // OpenRouter traffic that the Anthropic-only `cache_control`
-            // path above does not cover. Clamp to the 64-codepoint limit
-            // OpenAI silently enforces (long keys are dropped server-side
-            // with no error, eating every cache hit).
-            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+            // path above does not cover.
+            //
+            // H-33: callers that derive the affinity key from a full
+            // path hash (or similar) hit the 64-codepoint limit
+            // OpenAI silently enforces. Truncation collides those
+            // keys (`abc/path/very/long/one` and
+            // `abc/path/very/long/two` clamp to the same prefix),
+            // mixing the cache across distinct sessions. Hash long
+            // keys via SHA-256 → first 32 hex chars instead;
+            // collision risk is negligible and the cache stays
+            // partitioned by the caller's intent. Short keys round-
+            // trip unchanged so existing callers keep their human-
+            // readable identifiers.
+            body["prompt_cache_key"] = json!(stable_prompt_cache_key(key));
         }
         if cache_retention == CacheRetention::Long {
             // Mirror the OpenAI native provider's extended-retention opt-in
@@ -1343,6 +1355,27 @@ fn local_jit_load_hint(
         }
         _ => "",
     }
+}
+
+/// H-33: derive a stable, collision-safe `prompt_cache_key` that
+/// respects OpenAI's silent 64-codepoint limit. Short keys (≤64
+/// chars) round-trip verbatim so existing callers keep their
+/// human-readable identifiers (and the test fixtures continue to
+/// match exact strings). Long keys hash via SHA-256 → first 32 hex
+/// chars (well under the 64 limit, collision rate is 2^-128). The
+/// existing `clamp_prompt_cache_key` helper still backs the
+/// final truncation so the OpenAI native provider and this
+/// adapter agree on the codepoint cap.
+fn stable_prompt_cache_key(key: &str) -> String {
+    if key.chars().count() <= 64 {
+        return clamp_prompt_cache_key(key).to_string();
+    }
+    let digest = Sha256::digest(key.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}")).expect("hex write");
+    }
+    hex
 }
 
 /// H-27: classify an inline mid-stream `{"error":...}` envelope as

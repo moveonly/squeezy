@@ -1326,20 +1326,45 @@ fn request_body_omits_prompt_cache_retention_for_short_retention_legacy_cache_ke
 }
 
 #[test]
-fn request_body_clamps_prompt_cache_key_for_openai_aggregator_route() {
-    // F11: aggregator routes that forward `prompt_cache_key` verbatim to
-    // OpenAI must also clamp to the 64-codepoint limit so the
-    // OpenRouter → OpenAI hop does not silently drop the field.
+fn request_body_hashes_long_prompt_cache_key_for_openai_aggregator_route() {
+    // H-33: callers that derive `cache_key` from a full path hash
+    // (or any other source that can exceed 64 chars) used to be
+    // silently truncated to a common prefix, mixing caches across
+    // distinct sessions. Long keys now hash via SHA-256 → 32 hex
+    // chars so the partition stays per-session.
     let mut request = sample_request();
     request.model = "openai/gpt-5.5".to_string().into();
-    let long_key: String = "a".repeat(100);
-    request.cache_key = Some(long_key);
-    let body = OpenAiCompatibleProvider::request_body(&request);
-    let emitted = body["prompt_cache_key"]
+    let long_key_a = format!("{}-a", "a".repeat(100));
+    let long_key_b = format!("{}-b", "a".repeat(100));
+    request.cache_key = Some(long_key_a.clone());
+    let body_a = OpenAiCompatibleProvider::request_body(&request);
+    let emitted_a = body_a["prompt_cache_key"]
         .as_str()
-        .expect("prompt_cache_key must be emitted");
-    assert_eq!(emitted.chars().count(), 64);
-    assert_eq!(emitted, "a".repeat(64));
+        .expect("prompt_cache_key must be emitted")
+        .to_string();
+    assert_eq!(emitted_a.len(), 32, "hashed key must be 32 hex chars");
+    assert!(
+        emitted_a.chars().all(|c| c.is_ascii_hexdigit()),
+        "hashed key must be ascii hex: {emitted_a}"
+    );
+    request.cache_key = Some(long_key_b);
+    let body_b = OpenAiCompatibleProvider::request_body(&request);
+    let emitted_b = body_b["prompt_cache_key"].as_str().expect("emitted");
+    assert_ne!(
+        emitted_a, emitted_b,
+        "two distinct long keys (same first 64 chars) MUST hash to different values; old truncate-only behavior collided them"
+    );
+}
+
+#[test]
+fn request_body_keeps_short_prompt_cache_key_verbatim() {
+    // Short keys (≤64 chars) round-trip unchanged so existing
+    // callers keep their human-readable identifiers.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
 }
 
 #[test]
