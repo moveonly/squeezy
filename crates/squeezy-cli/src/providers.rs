@@ -154,9 +154,9 @@ fn handle_info(
     println!("  models      {}", entry.model_count);
     for model in models_for_provider(canonical) {
         println!(
-            "    {} (profile={}, tools={}, ctx={})",
+            "    {} (profile={:?}, tools={}, ctx={})",
             model.id,
-            format!("{:?}", model.profile),
+            model.profile,
             model.capabilities.tool_calling,
             model
                 .limits
@@ -197,19 +197,18 @@ fn canonicalize_provider_name(value: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn registry_entries(env_lookup: &dyn Fn(&str) -> Option<String>) -> Vec<ProviderEntry> {
-    let mut entries: Vec<ProviderEntry> = BASE_PROVIDERS
-        .iter()
-        .map(|entry| ProviderEntry {
-            name: entry.name,
-            display_name: entry.display_name,
-            base_url: entry.base_url,
-            api_key_env: entry.api_key_env,
-            configured: env_set(env_lookup, entry.api_key_env),
-            full_tier: true,
-            model_count: models_for_provider(entry.name).count(),
-        })
-        .collect();
-    for preset in OpenAiCompatiblePreset::all() {
+    let presets = OpenAiCompatiblePreset::all();
+    let mut entries = Vec::with_capacity(BASE_PROVIDERS.len() + presets.len());
+    entries.extend(BASE_PROVIDERS.iter().map(|entry| ProviderEntry {
+        name: entry.name,
+        display_name: entry.display_name,
+        base_url: entry.base_url,
+        api_key_env: entry.api_key_env,
+        configured: env_set(env_lookup, entry.api_key_env),
+        full_tier: true,
+        model_count: models_for_provider(entry.name).count(),
+    }));
+    for preset in presets {
         entries.push(ProviderEntry {
             name: preset.as_str(),
             display_name: preset.display_name(),

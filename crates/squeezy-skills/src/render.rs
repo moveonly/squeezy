@@ -38,7 +38,7 @@ pub fn render_active_skills(
         return None;
     }
 
-    let mut blocks = Vec::new();
+    let mut blocks = Vec::with_capacity(skills.len());
     for skill in skills {
         let body_chars = char_count(&skill.body);
         if body_chars > body_cap_chars {
@@ -208,7 +208,8 @@ pub fn render_skill_preamble(
     });
 
     let header = "Available Squeezy skills. Use `load_skill` when a task benefits from one of these local instruction sets.";
-    let mut lines = vec![header.to_string()];
+    let mut lines = Vec::with_capacity(sorted.len() + 1);
+    lines.push(header.to_string());
     let mut omitted = 0usize;
     for summary in &sorted {
         let line = format!(

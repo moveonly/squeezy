@@ -4,7 +4,6 @@
 //! `--no-triage`, and exits non-zero when any scenario violates the
 //! requested `fail_on` policy.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,19 +35,20 @@ pub struct FailOn {
 
 impl FailOn {
     pub fn parse(spec: &str) -> Self {
-        let parts: BTreeSet<String> = spec
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Self {
-            findings: parts.contains("findings"),
-            // Expectations are a subset of auto-findings (rules whose
-            // ids start with `expect_`); treat the keyword as opt-in
-            // separately from the broader `findings` bucket.
-            expectations: parts.contains("expectations"),
-            errors: parts.contains("errors"),
+        let mut fail_on = Self::default();
+        for part in spec.split(',').map(str::trim) {
+            if part.eq_ignore_ascii_case("findings") {
+                fail_on.findings = true;
+            } else if part.eq_ignore_ascii_case("expectations") {
+                // Expectations are a subset of auto-findings (rules whose
+                // ids start with `expect_`); treat the keyword as opt-in
+                // separately from the broader `findings` bucket.
+                fail_on.expectations = true;
+            } else if part.eq_ignore_ascii_case("errors") {
+                fail_on.errors = true;
+            }
         }
+        fail_on
     }
 }
 

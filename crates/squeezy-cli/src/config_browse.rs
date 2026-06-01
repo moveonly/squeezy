@@ -13,7 +13,7 @@
 //! match what the rest of the agent sees — no parallel discovery code
 //! to drift out of sync.
 
-use std::env;
+use std::{env, fmt::Write as _};
 
 use serde_json::{Value, json};
 use squeezy_core::{AppConfig, Result, SqueezyError};
@@ -146,7 +146,7 @@ fn template_json(template: &PromptTemplate) -> Value {
 }
 
 fn render_skills_section(out: &mut String, skills: &[SkillSummary]) {
-    out.push_str(&format!("SKILLS ({})\n", skills.len()));
+    let _ = writeln!(out, "SKILLS ({})", skills.len());
     if skills.is_empty() {
         out.push_str("  (none discovered)\n");
         return;
@@ -155,24 +155,26 @@ fn render_skills_section(out: &mut String, skills: &[SkillSummary]) {
     let src_width = max_width(skills.iter().map(|s| s.source.as_str()));
     for skill in skills {
         let state = if skill.disabled { " (disabled)" } else { "" };
-        out.push_str(&format!(
-            "  {name:<name_w$}  {src:<src_w$}  {desc}{state}\n",
+        let _ = writeln!(
+            out,
+            "  {name:<name_w$}  {src:<src_w$}  {desc}{state}",
             name = skill.name,
             src = skill.source.as_str(),
             desc = skill.description,
             name_w = name_width,
             src_w = src_width,
-        ));
+        );
     }
 }
 
 fn render_providers_section(out: &mut String, providers: &[ProviderEntry]) {
     let configured = providers.iter().filter(|p| p.configured).count();
-    out.push_str(&format!(
-        "PROVIDERS ({} known, {} configured)\n",
+    let _ = writeln!(
+        out,
+        "PROVIDERS ({} known, {} configured)",
         providers.len(),
         configured
-    ));
+    );
     if providers.is_empty() {
         out.push_str("  (none registered)\n");
         return;
@@ -191,8 +193,9 @@ fn render_providers_section(out: &mut String, providers: &[ProviderEntry]) {
         } else {
             provider.api_key_env
         };
-        out.push_str(&format!(
-            "  {name:<name_w$}  {env:<env_w$}  {state:<10}  {models} model(s)\n",
+        let _ = writeln!(
+            out,
+            "  {name:<name_w$}  {env:<env_w$}  {state:<10}  {models} model(s)",
             name = provider.name,
             env = env_label,
             state = if provider.configured {
@@ -203,39 +206,41 @@ fn render_providers_section(out: &mut String, providers: &[ProviderEntry]) {
             models = provider.model_count,
             name_w = name_width,
             env_w = env_width,
-        ));
+        );
     }
 }
 
 fn render_sessions_section(out: &mut String, sessions: &[SessionMetadata]) {
-    out.push_str(&format!("SESSIONS ({})\n", sessions.len()));
+    let _ = writeln!(out, "SESSIONS ({})", sessions.len());
     if sessions.is_empty() {
         out.push_str("  (no sessions recorded)\n");
         return;
     }
-    let preview: Vec<&SessionMetadata> = sessions.iter().take(SESSION_PREVIEW_LIMIT).collect();
+    let preview = &sessions[..sessions.len().min(SESSION_PREVIEW_LIMIT)];
     let id_width = max_width(preview.iter().map(|s| s.session_id.as_str()));
     let status_width = max_width(preview.iter().map(|s| s.status.as_str()));
-    for session in &preview {
-        out.push_str(&format!(
-            "  {id:<id_w$}  {status:<status_w$}  {label}\n",
+    for session in preview {
+        let _ = writeln!(
+            out,
+            "  {id:<id_w$}  {status:<status_w$}  {label}",
             id = session.session_id,
             status = session.status.as_str(),
             label = session_label(session),
             id_w = id_width,
             status_w = status_width,
-        ));
+        );
     }
     if sessions.len() > SESSION_PREVIEW_LIMIT {
-        out.push_str(&format!(
-            "  … {} more (run `squeezy sessions list`)\n",
+        let _ = writeln!(
+            out,
+            "  … {} more (run `squeezy sessions list`)",
             sessions.len() - SESSION_PREVIEW_LIMIT,
-        ));
+        );
     }
 }
 
 fn render_templates_section(out: &mut String, templates: &[PromptTemplate]) {
-    out.push_str(&format!("PROMPT TEMPLATES ({})\n", templates.len()));
+    let _ = writeln!(out, "PROMPT TEMPLATES ({})", templates.len());
     if templates.is_empty() {
         out.push_str("  (none discovered)\n");
         return;
@@ -248,29 +253,36 @@ fn render_templates_section(out: &mut String, templates: &[PromptTemplate]) {
         .unwrap_or(0);
     let source_width = max_width(templates.iter().map(|t| t.source.as_str()));
     for template in templates {
-        let hint = template
-            .argument_hint
-            .as_deref()
-            .map(|h| format!(" {h}"))
-            .unwrap_or_default();
-        let slashed = format!("/{}", template.name);
-        out.push_str(&format!(
-            "  {name:<name_w$}  {src:<src_w$}  {desc}{hint}\n",
-            name = slashed,
-            src = template.source.as_str(),
-            desc = template.description,
-            name_w = name_width,
-            src_w = source_width,
-        ));
+        if let Some(hint) = template.argument_hint.as_deref() {
+            let _ = writeln!(
+                out,
+                "  /{name:<name_w$}  {src:<src_w$}  {desc} {hint}",
+                name = template.name,
+                src = template.source.as_str(),
+                desc = template.description,
+                name_w = name_width - 1,
+                src_w = source_width,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  /{name:<name_w$}  {src:<src_w$}  {desc}",
+                name = template.name,
+                src = template.source.as_str(),
+                desc = template.description,
+                name_w = name_width - 1,
+                src_w = source_width,
+            );
+        }
     }
 }
 
 fn session_label(session: &SessionMetadata) -> String {
     session
         .display_name
-        .clone()
-        .or_else(|| session.first_user_task.clone())
-        .or_else(|| session.latest_summary.clone())
+        .as_deref()
+        .or(session.first_user_task.as_deref())
+        .or(session.latest_summary.as_deref())
         .unwrap_or_default()
         .replace('\n', " ")
 }
