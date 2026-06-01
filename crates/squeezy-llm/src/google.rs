@@ -15,7 +15,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
-    retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
     transport::shared_client,
 };
@@ -251,85 +251,98 @@ impl LlmProvider for GoogleProvider {
         // Google's documented `x-goog-api-key` header instead.
         let url = google_stream_url(&self.base_url, &request.model);
         let api_key = self.api_key.clone();
-        let body = Self::request_body(&request);
         let transport = self.transport;
+        let request_for_attempts = request.clone();
+        let attempt_cancel = cancel.clone();
+        let make_attempt = move || -> LlmStream {
+            google_stream_attempt(
+                client.clone(),
+                api_key.clone(),
+                url.clone(),
+                request_for_attempts.clone(),
+                transport,
+                attempt_cancel.clone(),
+            )
+        };
+        // Mirror Anthropic — wrap in with_stream_retry so transient
+        // mid-stream truncation (RST, idle timeout on a long thinking
+        // turn, partial frame) triggers a bounded reconnect that
+        // dedupes already-yielded events via StreamSkipState instead
+        // of losing the entire turn.
+        with_stream_retry(
+            "google",
+            RetryPolicy::provider_stream(transport),
+            cancel,
+            make_attempt,
+        )
+    }
+}
 
-        Box::pin(try_stream! {
-            let response = send_with_auth_retry(
-                &api_key,
-                RetryPolicy::provider_requests(transport),
-                &cancel,
-                |key| {
-                    client
-                        .post(&url)
-                        .header("x-goog-api-key", key)
-                        .json(&body)
-                },
-            ).await?;
-            let status = response.status();
-            let response = if status == StatusCode::OK {
-                response
-            } else {
-                let message = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "failed to read error response".to_string());
-                Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
-                unreachable!("provider error returned above");
-            };
+fn google_stream_attempt(
+    client: reqwest::Client,
+    api_key: Arc<dyn ApiKeySource>,
+    url: String,
+    request: LlmRequest,
+    transport: ProviderTransportConfig,
+    cancel: CancellationToken,
+) -> LlmStream {
+    let body = GoogleProvider::request_body(&request);
+    Box::pin(try_stream! {
+        let response = send_with_auth_retry(
+            &api_key,
+            RetryPolicy::provider_requests(transport),
+            &cancel,
+            |key| {
+                client
+                    .post(&url)
+                    .header("x-goog-api-key", key)
+                    .json(&body)
+            },
+        ).await?;
+        let status = response.status();
+        let response = if status == StatusCode::OK {
+            response
+        } else {
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read error response".to_string());
+            Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
+            unreachable!("provider error returned above");
+        };
 
-            yield LlmEvent::Started;
-            let mut decoder = SseDecoder::default();
-            let mut last_cost = CostSnapshot::default();
-            let mut last_finish_reason: Option<String> = None;
-            let mut server_model_slot: Option<String> = None;
-            let mut server_model_echo = crate::ServerModelEcho::default();
-            let mut saw_any = false;
-            let mut reasoning_buf = GoogleReasoningBuffer::default();
-            // Per-stream tool-call counter. Gemini doesn't issue tool-call
-            // ids on the wire — we synthesize one. Two streamed events
-            // each carrying `functionCall` at `parts[0]` previously
-            // collided on `google_call_0` because the counter was the
-            // part index within a *single* SSE event. The replay
-            // canonicalizer then collapsed both calls and the second
-            // FunctionCallOutput overrode the first. Lift the counter
-            // to a per-stream usize so parallel calls keep distinct ids.
-            let mut tool_call_counter: usize = 0;
-            let mut bytes = response.bytes_stream();
-            loop {
-                let polled = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        yield LlmEvent::Cancelled;
-                        return;
-                    }
-                    next = timeout(idle_timeout(transport), bytes.next()) => next,
-                };
-                let next = polled.map_err(|_| {
-                    SqueezyError::ProviderStream("Google stream idle timeout".to_string())
-                })?;
-                let Some(chunk) = next else { break; };
-                let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
-                for event in decoder.push(&chunk) {
-                    saw_any = true;
-                    let parsed = parse_google_event(
-                        &event,
-                        &mut last_cost,
-                        &mut last_finish_reason,
-                        &mut reasoning_buf,
-                        &mut server_model_slot,
-                        &mut tool_call_counter,
-                    )?;
-                    if let Some(server) = server_model_slot.take()
-                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
-                    {
-                        yield echo;
-                    }
-                    for llm_event in parsed {
-                        yield llm_event;
-                    }
+        yield LlmEvent::Started;
+        let mut decoder = SseDecoder::default();
+        let mut last_cost = CostSnapshot::default();
+        let mut last_finish_reason: Option<String> = None;
+        let mut server_model_slot: Option<String> = None;
+        let mut server_model_echo = crate::ServerModelEcho::default();
+        let mut saw_any = false;
+        let mut reasoning_buf = GoogleReasoningBuffer::default();
+        // Per-stream tool-call counter. Gemini doesn't issue tool-call
+        // ids on the wire — we synthesize one. Two streamed events
+        // each carrying `functionCall` at `parts[0]` previously
+        // collided on `google_call_0` because the counter was the
+        // part index within a *single* SSE event. The replay
+        // canonicalizer then collapsed both calls and the second
+        // FunctionCallOutput overrode the first. Lift the counter
+        // to a per-stream usize so parallel calls keep distinct ids.
+        let mut tool_call_counter: usize = 0;
+        let mut bytes = response.bytes_stream();
+        loop {
+            let polled = tokio::select! {
+                _ = cancel.cancelled() => {
+                    yield LlmEvent::Cancelled;
+                    return;
                 }
-            }
-            for event in decoder.finish() {
+                next = timeout(idle_timeout(transport), bytes.next()) => next,
+            };
+            let next = polled.map_err(|_| {
+                SqueezyError::ProviderStream("Google stream idle timeout".to_string())
+            })?;
+            let Some(chunk) = next else { break; };
+            let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
+            for event in decoder.push(&chunk) {
                 saw_any = true;
                 let parsed = parse_google_event(
                     &event,
@@ -348,22 +361,41 @@ impl LlmProvider for GoogleProvider {
                     yield llm_event;
                 }
             }
-            if !saw_any {
-                Err(SqueezyError::ProviderStream("Google stream ended without events".to_string()))?;
+        }
+        for event in decoder.finish() {
+            saw_any = true;
+            let parsed = parse_google_event(
+                &event,
+                &mut last_cost,
+                &mut last_finish_reason,
+                &mut reasoning_buf,
+                &mut server_model_slot,
+                &mut tool_call_counter,
+            )?;
+            if let Some(server) = server_model_slot.take()
+                && let Some(echo) = server_model_echo.observe(&request.model, &server)
+            {
+                yield echo;
             }
-            if let Some(payload) = reasoning_buf.flush() {
-                yield LlmEvent::ReasoningDone(payload);
+            for llm_event in parsed {
+                yield llm_event;
             }
-            yield LlmEvent::Completed {
-                response_id: None,
-                cost: last_cost,
-                stop_reason: last_finish_reason
-                    .as_deref()
-                    .map(crate::StopReason::from_google),
-                reasoning_only_stop: false,
-            };
-        })
-    }
+        }
+        if !saw_any {
+            Err(SqueezyError::ProviderStream("Google stream ended without events".to_string()))?;
+        }
+        if let Some(payload) = reasoning_buf.flush() {
+            yield LlmEvent::ReasoningDone(payload);
+        }
+        yield LlmEvent::Completed {
+            response_id: None,
+            cost: last_cost,
+            stop_reason: last_finish_reason
+                .as_deref()
+                .map(crate::StopReason::from_google),
+            reasoning_only_stop: false,
+        };
+    })
 }
 
 pub(crate) fn google_stream_url(base_url: &str, model: &str) -> String {
