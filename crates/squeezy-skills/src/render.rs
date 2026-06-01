@@ -304,16 +304,15 @@ pub fn render_active_skills_with_metrics(
         };
         let mut inserted = false;
         for (candidate, candidate_is_stub) in candidates {
-            let mut attempt = fitted.clone();
-            attempt.push(candidate.clone());
-            if let Some(rendered) = wrap_blocks(&attempt)
+            fitted.push(candidate);
+            if let Some(rendered) = wrap_blocks(&fitted)
                 && char_count(&rendered) <= budget_chars
             {
-                fitted = attempt;
                 included_is_stub.push(candidate_is_stub);
                 inserted = true;
                 break;
             }
+            fitted.pop();
         }
         if !inserted {
             metrics.dropped += 1;
