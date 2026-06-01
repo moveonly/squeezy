@@ -50,7 +50,6 @@ mod contribution;
 mod credentials;
 mod faux;
 mod google;
-mod lmstudio;
 pub mod model_discovery;
 pub mod models_dev;
 pub mod oauth;
@@ -85,9 +84,6 @@ pub use credentials::{
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
-pub use lmstudio::{
-    DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
-};
 pub use model_discovery::{
     CONSERVATIVE_FALLBACK_CAPABILITIES, CapabilitySource, ResolvedCapabilities,
     resolve_capabilities, resolve_capabilities_with,
