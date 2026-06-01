@@ -106,6 +106,63 @@ impl OpenAiCompatibleProvider {
         for (key, value) in &config.extra_headers {
             headers.insert(key.clone(), value.clone());
         }
+        // C-11: Cloudflare AI Gateway dual-auth inversion. The /compat
+        // (and the new REST) endpoint expects the *upstream provider's*
+        // key in `Authorization: Bearer` (so OpenAI/Anthropic/etc. see a
+        // valid key from their own envelope) and the Cloudflare gateway
+        // token in `cf-aig-authorization`. squeezy-core resolves
+        // `CLOUDFLARE_API_KEY` into `config.api_key{_env}` and lets
+        // `CF_AIG_TOKEN` populate `cf-aig-authorization` via
+        // `extra_headers`. Without the swap below the upstream sees the
+        // Cloudflare key (401) and the gateway sees either no key or the
+        // Cloudflare key in both slots. opencode's `cloudflare.ts:42-51`
+        // models the correct split; we mirror it here.
+        //
+        // Source-of-truth for the upstream key (in priority order):
+        //   1. `CF_UPSTREAM_KEY` env var (operator opt-in)
+        //   2. `extra_headers["upstream-api-key"]` (TOML escape hatch
+        //      for callers that prefer not to set the env)
+        //   3. fallthrough: leave the Bearer slot pointing at the
+        //      Cloudflare key for backwards compatibility with
+        //      Workers AI-only gateways that were intentionally wired
+        //      up under the old (broken) scheme.
+        let api_key = if config.preset == OpenAiCompatiblePreset::CloudflareAiGateway {
+            let upstream_key = std::env::var("CF_UPSTREAM_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    headers.iter().find_map(|(key, value)| {
+                        key.eq_ignore_ascii_case("upstream-api-key")
+                            .then(|| value.clone())
+                    })
+                });
+            // Strip the `upstream-api-key` TOML escape hatch once we've
+            // lifted it into the Bearer slot — it is not a real wire
+            // header and would otherwise be sent verbatim.
+            headers.retain(|key, _| !key.eq_ignore_ascii_case("upstream-api-key"));
+            // Lift the Cloudflare gateway token into
+            // `cf-aig-authorization` when the user has not already set
+            // it via TOML / `CF_AIG_TOKEN` (squeezy-core handles the env
+            // → header lift). User-supplied headers win to preserve
+            // manual overrides; the empty-key case is left to the
+            // upstream to reject.
+            let has_aig_header = headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("cf-aig-authorization"));
+            if !has_aig_header && !api_key.is_empty() {
+                headers.insert(
+                    "cf-aig-authorization".to_string(),
+                    format!("Bearer {api_key}"),
+                );
+            }
+            match upstream_key {
+                Some(key) => key,
+                None => api_key,
+            }
+        } else {
+            api_key
+        };
         Ok(Self::with_api_key_source(
             config.preset,
             static_api_key_source(api_key, config.preset.as_str()),
@@ -143,6 +200,11 @@ impl OpenAiCompatibleProvider {
         builder
             .build()
             .expect("compatible request must build with valid headers")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn api_key_source(&self) -> Arc<dyn ApiKeySource> {
+        self.api_key.clone()
     }
 
     /// Construct the provider against an already-built credential

@@ -5,7 +5,19 @@ use squeezy_core::{
     DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL, DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL,
     OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Serialize tests that mutate process-wide env vars. The
+/// Cloudflare AI Gateway dual-auth path peeks at `CF_UPSTREAM_KEY`
+/// and Rust's test runner runs cases in parallel by default, so
+/// without this lock two cases racing on the same env var would
+/// silently observe each other's writes.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn sample_request() -> LlmRequest {
     LlmRequest {
@@ -1467,4 +1479,255 @@ fn lmstudio_empty_api_key_omits_authorization_header() {
         .to_str()
         .expect("Bearer header value is ASCII");
     assert_eq!(value, "Bearer sk-local-test");
+}
+
+/// Build a Cloudflare AI Gateway provider under a serialized env
+/// snapshot, restore the prior env, and return the built provider
+/// for sync inspection. Keeps the env lock from spanning any
+/// `.await` (clippy `await_holding_lock`).
+fn build_with_cf_upstream(
+    upstream: Option<&str>,
+    config: OpenAiCompatibleConfig,
+) -> Result<OpenAiCompatibleProvider> {
+    let _guard = env_lock();
+    let prior = std::env::var("CF_UPSTREAM_KEY").ok();
+    unsafe {
+        match upstream {
+            Some(value) => std::env::set_var("CF_UPSTREAM_KEY", value),
+            None => std::env::remove_var("CF_UPSTREAM_KEY"),
+        }
+    }
+    let provider = OpenAiCompatibleProvider::from_config(&config);
+    unsafe {
+        match prior.as_deref() {
+            Some(value) => std::env::set_var("CF_UPSTREAM_KEY", value),
+            None => std::env::remove_var("CF_UPSTREAM_KEY"),
+        }
+    }
+    provider
+}
+
+#[tokio::test]
+async fn cloudflare_ai_gateway_swaps_upstream_key_into_bearer_slot() {
+    // C-11: When the user has set `CF_UPSTREAM_KEY` the constructed
+    // provider must carry that as its Bearer credential, and the
+    // resolved `CLOUDFLARE_API_KEY` (which squeezy-core feeds via
+    // `api_key` / `api_key_env`) lifts into `cf-aig-authorization`.
+    // Otherwise the `/compat` endpoint sees the Cloudflare key in
+    // both slots and the upstream (OpenAI / Anthropic / Groq) 401s.
+    let gateway = build_with_cf_upstream(
+        Some("upstream-openai-key"),
+        OpenAiCompatibleConfig {
+            preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+            api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+            api_key: Some("cf-token".to_string()),
+            base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+            extra_headers: BTreeMap::new(),
+            transport: ProviderTransportConfig::default(),
+            account_id: Some("acct".to_string()),
+            gateway_id: Some("gw".to_string()),
+            deployment_id: None,
+            cf_ai_gateway: None,
+            use_oauth: false,
+        },
+    )
+    .expect("AI Gateway provider builds");
+    let bearer = gateway
+        .api_key_source()
+        .current_key()
+        .await
+        .expect("bearer key resolves");
+    assert_eq!(
+        bearer, "upstream-openai-key",
+        "Bearer slot must carry the UPSTREAM provider's key when CF_UPSTREAM_KEY is set"
+    );
+    let aig = gateway
+        .extra_headers()
+        .iter()
+        .find_map(|(k, v)| {
+            k.eq_ignore_ascii_case("cf-aig-authorization")
+                .then(|| v.clone())
+        })
+        .expect("cf-aig-authorization must be populated from the resolved Cloudflare key");
+    assert_eq!(
+        aig, "Bearer cf-token",
+        "cf-aig-authorization must carry the Cloudflare-token Bearer"
+    );
+}
+
+#[tokio::test]
+async fn cloudflare_ai_gateway_lifts_upstream_api_key_from_extra_headers_fallback() {
+    // The `upstream-api-key` extra-header is the TOML escape hatch
+    // for callers that prefer not to set `CF_UPSTREAM_KEY` in the
+    // shell. It must be lifted into the Bearer slot and stripped
+    // from the outgoing wire headers (it isn't a real HTTP header).
+    let mut extras = BTreeMap::new();
+    extras.insert(
+        "upstream-api-key".to_string(),
+        "anthropic-upstream".to_string(),
+    );
+    let gateway = build_with_cf_upstream(
+        None,
+        OpenAiCompatibleConfig {
+            preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+            api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+            api_key: Some("cf-token".to_string()),
+            base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+            extra_headers: extras,
+            transport: ProviderTransportConfig::default(),
+            account_id: Some("acct".to_string()),
+            gateway_id: Some("gw".to_string()),
+            deployment_id: None,
+            cf_ai_gateway: None,
+            use_oauth: false,
+        },
+    )
+    .expect("AI Gateway provider builds");
+    let bearer = gateway
+        .api_key_source()
+        .current_key()
+        .await
+        .expect("bearer key resolves");
+    assert_eq!(
+        bearer, "anthropic-upstream",
+        "Bearer slot must carry the upstream-api-key extra header when env is unset"
+    );
+    assert!(
+        !gateway
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("upstream-api-key")),
+        "upstream-api-key escape hatch must be stripped from wire headers after lifting"
+    );
+    let aig = gateway
+        .extra_headers()
+        .iter()
+        .find_map(|(k, v)| {
+            k.eq_ignore_ascii_case("cf-aig-authorization")
+                .then(|| v.clone())
+        })
+        .expect("cf-aig-authorization must still populate from the Cloudflare key");
+    assert_eq!(aig, "Bearer cf-token");
+}
+
+#[tokio::test]
+async fn cloudflare_ai_gateway_preserves_user_cf_aig_authorization_override() {
+    // Manual override path: when the user has explicitly set
+    // `cf-aig-authorization` via TOML, the swap must not overwrite
+    // it. The Bearer slot still receives the upstream key.
+    let mut extras = BTreeMap::new();
+    extras.insert(
+        "cf-aig-authorization".to_string(),
+        "Bearer manual-override".to_string(),
+    );
+    let gateway = build_with_cf_upstream(
+        Some("upstream"),
+        OpenAiCompatibleConfig {
+            preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+            api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+            api_key: Some("cf-token".to_string()),
+            base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+            extra_headers: extras,
+            transport: ProviderTransportConfig::default(),
+            account_id: Some("acct".to_string()),
+            gateway_id: Some("gw".to_string()),
+            deployment_id: None,
+            cf_ai_gateway: None,
+            use_oauth: false,
+        },
+    )
+    .expect("AI Gateway provider builds");
+    let aig = gateway
+        .extra_headers()
+        .iter()
+        .find_map(|(k, v)| {
+            k.eq_ignore_ascii_case("cf-aig-authorization")
+                .then(|| v.clone())
+        })
+        .expect("cf-aig-authorization must be present");
+    assert_eq!(
+        aig, "Bearer manual-override",
+        "user-supplied cf-aig-authorization must win over the auto-lift"
+    );
+    let bearer = gateway
+        .api_key_source()
+        .current_key()
+        .await
+        .expect("bearer");
+    assert_eq!(bearer, "upstream");
+}
+
+#[tokio::test]
+async fn cloudflare_ai_gateway_falls_back_to_resolved_key_when_no_upstream_configured() {
+    // Backwards-compat path: when neither `CF_UPSTREAM_KEY` nor
+    // `upstream-api-key` is configured, leave the Bearer slot
+    // pointing at the resolved Cloudflare key. Workers-AI-only
+    // gateways that were intentionally wired against the old
+    // (broken) scheme keep working until the user migrates.
+    let gateway = build_with_cf_upstream(
+        None,
+        OpenAiCompatibleConfig {
+            preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+            api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+            api_key: Some("cf-token".to_string()),
+            base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+            extra_headers: BTreeMap::new(),
+            transport: ProviderTransportConfig::default(),
+            account_id: Some("acct".to_string()),
+            gateway_id: Some("gw".to_string()),
+            deployment_id: None,
+            cf_ai_gateway: None,
+            use_oauth: false,
+        },
+    )
+    .expect("AI Gateway provider builds");
+    let bearer = gateway
+        .api_key_source()
+        .current_key()
+        .await
+        .expect("bearer");
+    assert_eq!(
+        bearer, "cf-token",
+        "fallback path must keep the Cloudflare key in the Bearer slot for legacy gateways"
+    );
+}
+
+#[tokio::test]
+async fn workers_ai_preset_does_not_apply_dual_auth_swap() {
+    // The dual-auth swap is gated on the AI Gateway preset only.
+    // The Workers AI preset routes directly to Cloudflare's edge
+    // and uses the Cloudflare key as the standard Bearer — no
+    // gateway-token slot exists for it. Make sure setting
+    // `CF_UPSTREAM_KEY` doesn't accidentally hijack the
+    // Workers AI key.
+    let workers = build_with_cf_upstream(
+        Some("unrelated"),
+        OpenAiCompatibleConfig {
+            preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+            api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+            api_key: Some("cf-token".to_string()),
+            base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+            extra_headers: BTreeMap::new(),
+            transport: ProviderTransportConfig::default(),
+            account_id: Some("acct".to_string()),
+            gateway_id: None,
+            deployment_id: None,
+            cf_ai_gateway: None,
+            use_oauth: false,
+        },
+    )
+    .expect("Workers AI provider builds");
+    let bearer = workers
+        .api_key_source()
+        .current_key()
+        .await
+        .expect("bearer");
+    assert_eq!(
+        bearer, "cf-token",
+        "Workers AI preset must not pick up CF_UPSTREAM_KEY"
+    );
+    assert!(
+        workers.extra_headers().is_empty(),
+        "Workers AI preset must not auto-emit a cf-aig-authorization header"
+    );
 }
