@@ -34,7 +34,8 @@ pub fn compute_affected(
     propagating: &HashSet<FileId>,
     removed_files: &HashSet<FileId>,
 ) -> HashSet<FileId> {
-    let mut affected: HashSet<FileId> = changed.iter().cloned().collect();
+    let mut affected: HashSet<FileId> = HashSet::with_capacity(changed.len() + removed_files.len());
+    affected.extend(changed.iter().cloned());
     affected.extend(removed_files.iter().cloned());
 
     let mut frontier: Vec<FileId> = propagating
@@ -42,12 +43,11 @@ pub fn compute_affected(
         .chain(removed_files.iter())
         .cloned()
         .collect();
-    let mut visited: HashSet<FileId> = HashSet::new();
+    let mut visited: HashSet<FileId> = HashSet::with_capacity(frontier.len());
     while let Some(file) = frontier.pop() {
         if !visited.insert(file.clone()) {
             continue;
         }
-        affected.insert(file.clone());
         if let Some(importers) = importers_by_file.get(&file) {
             for importer in importers {
                 if !visited.contains(importer) {
@@ -55,6 +55,7 @@ pub fn compute_affected(
                 }
             }
         }
+        affected.insert(file);
     }
     affected
 }
