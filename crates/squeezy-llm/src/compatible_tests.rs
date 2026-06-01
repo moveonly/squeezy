@@ -327,6 +327,46 @@ fn finish_stop_with_content_does_not_emit_notice() {
 }
 
 #[test]
+fn finish_content_filter_emits_notice_and_drains_reasoning() {
+    // The content-filter exit path (`finish_reason="content_filter"`) lands
+    // when an upstream guardrail rejects the in-flight assistant output.
+    // The parser must (1) flush any reasoning streamed up to the block
+    // into a `ReasoningDone` so the partial thinking persists, and (2)
+    // inject a visible `TextDelta` so the user sees *why* the turn
+    // truncated instead of a silent empty assistant message — local
+    // self-hosted servers behind a moderation reverse-proxy hit this
+    // path most often.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":"weighing options"}}]}"#,
+        &mut state,
+    )
+    .expect("reasoning delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+        &mut state,
+    )
+    .expect("content_filter");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::ReasoningDone(_))),
+        "expected ReasoningDone to flush thinking before the filter exit notice: {events:?}"
+    );
+    let notice = events
+        .iter()
+        .find_map(|e| match e {
+            LlmEvent::TextDelta(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("content filter notice");
+    assert!(
+        notice.contains("content_filter"),
+        "notice must call out the filter exit: {notice}"
+    );
+}
+
+#[test]
 fn finish_length_emits_truncation_notice_and_drains_reasoning() {
     let mut state = StreamState::default();
     parse_chat_event(
@@ -352,6 +392,35 @@ fn finish_length_emits_truncation_notice_and_drains_reasoning() {
         })
         .expect("truncation notice");
     assert!(notice.contains("max_output_tokens"), "notice: {notice}");
+}
+
+#[test]
+fn drain_tool_calls_emits_null_arguments_when_function_args_empty() {
+    // M-29: when the model commits to a zero-arg tool call the upstream
+    // streams `function.arguments` as an empty string. The drain must
+    // surface that as `Value::Null` so the tool dispatch layer can
+    // disambiguate "no arguments" from "arguments was the empty object".
+    // The legacy behavior fabricated `{}` and stripped the distinction.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"now"}}]}}]}"#,
+        &mut state,
+    )
+    .expect("zero-arg tool call delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        &mut state,
+    )
+    .expect("finish");
+    let LlmEvent::ToolCall(call) = &events[0] else {
+        panic!("expected ToolCall, got {events:?}");
+    };
+    assert_eq!(call.name, "now");
+    assert_eq!(
+        call.arguments,
+        Value::Null,
+        "empty function.arguments must surface as Value::Null, not {{}}"
+    );
 }
 
 #[test]
@@ -502,6 +571,97 @@ fn parse_chat_event_propagates_stream_error() {
         message.contains("code=rate_limit_exceeded"),
         "must surface error.code: {message}"
     );
+}
+
+#[test]
+fn local_jit_load_hint_attaches_for_lmstudio_400_not_loaded() {
+    // LM Studio returns `400 Bad Request` with an upstream message that
+    // contains "not loaded" when the user pointed `model = "<id>"` at a
+    // checkpoint the server hasn't loaded into memory. The hint must
+    // point at the LM Studio-specific fix (`lms load <model>`) so the
+    // user does not have to guess which CLI to reach for.
+    let hint = local_jit_load_hint(
+        OpenAiCompatiblePreset::LMStudio,
+        StatusCode::BAD_REQUEST,
+        "Model 'qwen3-32b' is not loaded",
+    );
+    assert!(
+        hint.contains("lms load"),
+        "LM Studio hint must surface the `lms load` CLI guidance: {hint}"
+    );
+}
+
+#[test]
+fn local_jit_load_hint_attaches_for_vllm_400_no_models_loaded() {
+    // vLLM surfaces "no models loaded" / "model not loaded" on a 400
+    // when the served checkpoint id does not match what `vllm serve`
+    // was launched with. The hint points at the `--model` startup flag.
+    let hint = local_jit_load_hint(
+        OpenAiCompatiblePreset::VLlm,
+        StatusCode::BAD_REQUEST,
+        "no models loaded; check --model startup flag",
+    );
+    assert!(
+        hint.contains("vllm serve"),
+        "vLLM hint must reference `vllm serve`: {hint}"
+    );
+}
+
+#[test]
+fn local_jit_load_hint_attaches_for_llamacpp_400_not_loaded() {
+    // llama.cpp's HTTP server returns 400 with "model is not loaded"
+    // when launched without `-m <path>`. Surface the `llama-server -m`
+    // fix so the user does not have to chase the upstream README.
+    let hint = local_jit_load_hint(
+        OpenAiCompatiblePreset::LlamaCpp,
+        StatusCode::BAD_REQUEST,
+        "model is not loaded",
+    );
+    assert!(
+        hint.contains("llama-server -m"),
+        "llama.cpp hint must reference the `llama-server -m` invocation: {hint}"
+    );
+}
+
+#[test]
+fn local_jit_load_hint_returns_empty_for_non_400_or_unrelated_body() {
+    // 401 / 500 / etc must not get the JIT-load hint — those are auth /
+    // upstream-crash failures, not "checkpoint missing" failures.
+    assert_eq!(
+        local_jit_load_hint(
+            OpenAiCompatiblePreset::LMStudio,
+            StatusCode::UNAUTHORIZED,
+            "Model 'qwen3-32b' is not loaded",
+        ),
+        ""
+    );
+    // 400 without the "not loaded" sentinel must also leave the hint
+    // empty so unrelated bad-request errors (malformed prompt, oversized
+    // input) surface without misleading guidance attached.
+    assert_eq!(
+        local_jit_load_hint(
+            OpenAiCompatiblePreset::LMStudio,
+            StatusCode::BAD_REQUEST,
+            "prompt too long",
+        ),
+        ""
+    );
+}
+
+#[test]
+fn local_jit_load_hint_returns_empty_for_remote_presets() {
+    // Only the three local presets get the hint — adding it to
+    // OpenRouter / Vercel / etc. would mislead users when the upstream
+    // (aggregator) returns 400 for an unrelated reason.
+    for preset in [
+        OpenAiCompatiblePreset::OpenRouter,
+        OpenAiCompatiblePreset::Vercel,
+        OpenAiCompatiblePreset::Groq,
+        OpenAiCompatiblePreset::PortKey,
+    ] {
+        let hint = local_jit_load_hint(preset, StatusCode::BAD_REQUEST, "model is not loaded");
+        assert_eq!(hint, "", "preset {preset:?} must not get the JIT-load hint");
+    }
 }
 
 #[test]
@@ -1099,5 +1259,99 @@ fn cloudflare_workers_ai_missing_account_id_fails_with_clear_error() {
     assert!(
         whitespace_error.to_string().contains("{account_id}"),
         "whitespace error must also name the placeholder: {whitespace_error}"
+    );
+}
+
+#[test]
+fn is_local_preset_classifies_lmstudio_vllm_llamacpp_as_local() {
+    // X-17 hinges on this classifier: the three local-hosted presets
+    // tolerate an empty resolved API key. Anything that drifts into or
+    // out of this set must show up as a test failure so a future preset
+    // addition cannot silently inherit the no-auth path.
+    assert!(is_local_preset(OpenAiCompatiblePreset::LMStudio));
+    assert!(is_local_preset(OpenAiCompatiblePreset::VLlm));
+    assert!(is_local_preset(OpenAiCompatiblePreset::LlamaCpp));
+    for preset in [
+        OpenAiCompatiblePreset::OpenRouter,
+        OpenAiCompatiblePreset::Vercel,
+        OpenAiCompatiblePreset::PortKey,
+        OpenAiCompatiblePreset::Groq,
+        OpenAiCompatiblePreset::XAi,
+        OpenAiCompatiblePreset::DeepSeek,
+        OpenAiCompatiblePreset::Vertex,
+        OpenAiCompatiblePreset::Mistral,
+        OpenAiCompatiblePreset::Together,
+        OpenAiCompatiblePreset::Fireworks,
+        OpenAiCompatiblePreset::Cerebras,
+        OpenAiCompatiblePreset::DeepInfra,
+        OpenAiCompatiblePreset::Baseten,
+        OpenAiCompatiblePreset::CloudflareWorkersAi,
+        OpenAiCompatiblePreset::CloudflareAiGateway,
+        OpenAiCompatiblePreset::Custom,
+    ] {
+        assert!(
+            !is_local_preset(preset),
+            "preset {preset:?} must not classify as a local self-hosted preset",
+        );
+    }
+}
+
+#[test]
+fn local_preset_builds_without_inline_or_env_api_key() {
+    // X-17: LM Studio / vLLM / llama.cpp run unauthenticated by default.
+    // `from_config` must not error when neither inline nor env carries a
+    // key; instead the resolved key flows as `""` and the stream path
+    // short-circuits the `Authorization: Bearer` header. Construct the
+    // provider with no inline key and a deliberately-not-set env var
+    // name so this regression-tests on a clean process too.
+    let env_var = "SQUEEZY_X17_DEFINITELY_NOT_SET_LMSTUDIO";
+    // Make sure no stale value from a prior test leaks in.
+    unsafe {
+        std::env::remove_var(env_var);
+    }
+    let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::LMStudio,
+        api_key_env: env_var.to_string(),
+        api_key: None,
+        base_url: "http://127.0.0.1:1234/v1".to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
+    })
+    .expect("LM Studio provider must build without an api key configured");
+    assert_eq!(provider.base_url(), "http://127.0.0.1:1234/v1");
+}
+
+#[test]
+fn remote_preset_still_requires_api_key() {
+    // Behavior parity guard: removing the X-17 tolerance for any
+    // remote preset would surface as the strict resolver failure here.
+    // Pick Groq because its env-var name is unambiguously vendor-owned
+    // and unlikely to collide with anything in the developer's shell.
+    let env_var = "SQUEEZY_X17_DEFINITELY_NOT_SET_GROQ";
+    unsafe {
+        std::env::remove_var(env_var);
+    }
+    let error = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::Groq,
+        api_key_env: env_var.to_string(),
+        api_key: None,
+        base_url: "https://api.groq.com/openai/v1".to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
+    })
+    .expect_err("remote preset without api key must still fail");
+    assert!(
+        matches!(error, SqueezyError::ProviderNotConfigured(_)),
+        "missing key must map to ProviderNotConfigured, got: {error:?}"
     );
 }
