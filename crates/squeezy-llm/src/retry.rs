@@ -619,11 +619,25 @@ where
     Box::pin(stream)
 }
 
+/// Decides whether `with_stream_retry` should reconnect on `err`.
+///
+/// Provider stream/request errors are the only transport-level shapes
+/// the harness knows how to replay, but Anthropic's error normaliser
+/// (and any future provider that opts into the same contract) prefixes
+/// terminal errors with [`crate::anthropic_error::NON_RETRYABLE_MARKER`]
+/// — typically `invalid_request_error`, `authentication_error`, or
+/// `permission_error` responses where retrying the identical request
+/// just burns the rest of the attempt budget on a guaranteed failure.
+///
+/// Strip-and-check the marker before classifying so a marked
+/// `ProviderRequest`/`ProviderStream` returns `false` and short-circuits
+/// the reconnect loop straight to the caller.
 fn is_retryable_stream_error(err: &SqueezyError) -> bool {
-    matches!(
-        err,
-        SqueezyError::ProviderStream(_) | SqueezyError::ProviderRequest(_)
-    )
+    let message = match err {
+        SqueezyError::ProviderStream(msg) | SqueezyError::ProviderRequest(msg) => msg.as_str(),
+        _ => return false,
+    };
+    !message.starts_with(crate::anthropic_error::NON_RETRYABLE_MARKER)
 }
 
 #[cfg(test)]

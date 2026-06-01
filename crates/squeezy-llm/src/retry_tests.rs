@@ -188,6 +188,160 @@ async fn mock_transport_stops_retrying_once_stream_max_retries_is_exhausted() {
     assert!(matches!(err, SqueezyError::ProviderStream(_)));
 }
 
+/// X-18: a mid-stream error already classified as terminal by the
+/// Anthropic error normaliser (or any provider that opts into the
+/// `[non-retryable]` marker contract) must short-circuit the reconnect
+/// loop. The factory must run exactly once and the marked error must
+/// bubble up untouched so the upstream prose reaches the caller.
+#[tokio::test]
+async fn non_retryable_marker_short_circuits_stream_retry() {
+    use crate::anthropic_error::NON_RETRYABLE_MARKER;
+
+    let policy = RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+    let marked = format!(
+        "{NON_RETRYABLE_MARKER}Anthropic rejected request (invalid_request_error): bad input",
+    );
+    let marked_for_factory = marked.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        *factory_attempts.lock().expect("lock") += 1;
+        let payload = marked_for_factory.clone();
+        let inner = try_stream! {
+            yield LlmEvent::Started;
+            Err::<LlmEvent, SqueezyError>(SqueezyError::ProviderStream(payload))?;
+            unreachable!("error returned above");
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let collected = stream.collect::<Vec<_>>().await;
+    let final_attempts = *attempts.lock().expect("lock");
+    assert_eq!(
+        final_attempts, 1,
+        "non-retryable marker must skip the reconnect loop entirely",
+    );
+
+    let last = collected
+        .last()
+        .expect("at least one yielded result")
+        .as_ref();
+    let err = last.expect_err("final yield must be the terminal error");
+    match err {
+        SqueezyError::ProviderStream(message) => {
+            assert!(
+                message.starts_with(NON_RETRYABLE_MARKER),
+                "marked message must propagate verbatim to the caller (saw: {message:?})",
+            );
+            assert!(
+                message.contains("invalid_request_error"),
+                "upstream prose must survive the short-circuit",
+            );
+        }
+        other => panic!("expected ProviderStream, saw {other:?}"),
+    }
+}
+
+/// Sanity-check the marker contract on `ProviderRequest` errors too:
+/// providers like Anthropic format their pre-stream HTTP errors with
+/// the same prefix, so the stream-retry classifier must respect it for
+/// both variants.
+#[tokio::test]
+async fn non_retryable_marker_short_circuits_on_provider_request_variant() {
+    use crate::anthropic_error::NON_RETRYABLE_MARKER;
+
+    let policy = RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+    let marked = format!(
+        "{NON_RETRYABLE_MARKER}Anthropic rejected request (authentication_error): invalid key",
+    );
+    let marked_for_factory = marked.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        *factory_attempts.lock().expect("lock") += 1;
+        let payload = marked_for_factory.clone();
+        let inner = try_stream! {
+            if false {
+                yield LlmEvent::Started;
+            }
+            Err(SqueezyError::ProviderRequest(payload))?;
+            unreachable!("error returned above");
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let collected = stream.collect::<Vec<_>>().await;
+    let final_attempts = *attempts.lock().expect("lock");
+    assert_eq!(
+        final_attempts, 1,
+        "marked ProviderRequest must also skip the reconnect loop",
+    );
+
+    let err = collected
+        .last()
+        .expect("at least one yielded result")
+        .as_ref()
+        .expect_err("final yield must be the terminal error");
+    assert!(matches!(err, SqueezyError::ProviderRequest(_)));
+}
+
+/// Plain (unmarked) `ProviderStream` errors must still retry so the
+/// fix does not widen the non-retryable window beyond the marker
+/// contract. Pairs with the two short-circuit tests above.
+#[tokio::test]
+async fn unmarked_provider_stream_error_still_retries() {
+    let policy = RetryPolicy {
+        max_retries: 1,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        *factory_attempts.lock().expect("lock") += 1;
+        let inner = try_stream! {
+            if false {
+                yield LlmEvent::Started;
+            }
+            Err(SqueezyError::ProviderStream(
+                "connection reset".to_string(),
+            ))?;
+            unreachable!("error returned above");
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let _ = stream.collect::<Vec<_>>().await;
+    let final_attempts = *attempts.lock().expect("lock");
+    assert_eq!(
+        final_attempts, 2,
+        "unmarked transient errors must still trigger the reconnect path",
+    );
+}
+
 #[tokio::test]
 async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
     let policy = RetryPolicy {
