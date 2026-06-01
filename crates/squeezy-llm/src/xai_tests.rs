@@ -306,6 +306,9 @@ fn dispatcher_xai_config(addr: SocketAddr) -> OpenAiCompatibleConfig {
         },
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     }
 }
 
@@ -605,6 +608,9 @@ fn dispatcher_xai_config_with_extra_headers(
         },
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     }
 }
 

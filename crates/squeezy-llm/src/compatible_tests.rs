@@ -2481,6 +2481,9 @@ async fn portkey_canonical_auth_lifts_key_into_x_portkey_api_key_header() {
         transport: ProviderTransportConfig::default(),
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect("provider builds");
     let canonical = portkey
@@ -2530,6 +2533,9 @@ fn portkey_canonical_auth_opt_in_does_not_clobber_user_supplied_header() {
         transport: ProviderTransportConfig::default(),
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect("provider builds");
     let canonical = portkey
@@ -2555,6 +2561,9 @@ fn cloudflare_ai_gateway_emits_cf_aig_gateway_id_header() {
         transport: ProviderTransportConfig::default(),
         account_id: Some("acct".to_string()),
         gateway_id: Some("my-gateway".to_string()),
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect("provider builds");
     let gateway_header = gateway
@@ -2583,6 +2592,9 @@ fn cloudflare_ai_gateway_omits_cf_aig_gateway_id_when_unset() {
         transport: ProviderTransportConfig::default(),
         account_id: Some("acct".to_string()),
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })
     .expect("provider builds without gateway id");
     assert!(

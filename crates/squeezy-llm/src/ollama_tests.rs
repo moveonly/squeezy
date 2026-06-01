@@ -62,6 +62,7 @@ fn request_body_emits_keep_alive_when_set() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
     };
 
     let with_value = OllamaProvider::request_body_with(&request, Some("24h"));
@@ -102,6 +103,7 @@ fn request_body_always_sets_num_ctx_default() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -216,6 +218,7 @@ fn request_body_sets_think_true_for_reasoning_effort() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
     };
     let body = OllamaProvider::request_body(&request);
     assert_eq!(body["think"], true);
@@ -239,6 +242,7 @@ fn request_body_sets_think_string_for_gpt_oss() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
     };
     let body = OllamaProvider::request_body(&request);
     assert_eq!(body["think"], "high");
@@ -262,6 +266,7 @@ fn request_body_skips_think_for_non_reasoning_models() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
     };
     let body = OllamaProvider::request_body(&request);
     assert!(body.get("think").is_none());
@@ -709,6 +714,7 @@ fn request_body_image_first_falls_back_to_standalone_user_message() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
     };
     let body = OllamaProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");

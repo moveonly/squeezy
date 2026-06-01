@@ -1723,6 +1723,9 @@ fn is_classic_azure_deployment_url_detects_old_url_shape() {
         base_url: "https://gov.openai.azure.us/openai/deployments/my-deploy".to_string(),
         api_version: "2024-10-21".to_string(),
         deployment_name_map: std::collections::BTreeMap::new(),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: false,
+        entra_bearer_token: None,
         transport: squeezy_core::ProviderTransportConfig::default(),
     };
     let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
@@ -1737,6 +1740,9 @@ fn is_classic_azure_deployment_url_false_for_v1_url() {
         base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
         api_version: "preview".to_string(),
         deployment_name_map: std::collections::BTreeMap::new(),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: false,
+        entra_bearer_token: None,
         transport: squeezy_core::ProviderTransportConfig::default(),
     };
     let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
