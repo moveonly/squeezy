@@ -197,6 +197,93 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn request_body_sets_think_true_for_reasoning_effort() {
+    let request = LlmRequest {
+        model: "qwen3:8b".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::Medium),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = OllamaProvider::request_body(&request);
+    assert_eq!(body["think"], true);
+}
+
+#[test]
+fn request_body_sets_think_string_for_gpt_oss() {
+    let request = LlmRequest {
+        model: "gpt-oss:20b".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = OllamaProvider::request_body(&request);
+    assert_eq!(body["think"], "high");
+}
+
+#[test]
+fn request_body_skips_think_for_non_reasoning_models() {
+    let request = LlmRequest {
+        model: "llama3.3:70b".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = OllamaProvider::request_body(&request);
+    assert!(body.get("think").is_none());
+}
+
+#[test]
+fn parser_emits_reasoning_delta_from_message_thinking() {
+    let mut server_model_slot: Option<String> = None;
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3:8b","message":{"thinking":"let me ponder","content":""}}"#,
+        &mut server_model_slot,
+    )
+    .expect("thinking chunk parses");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0],
+        LlmEvent::ReasoningDelta {
+            text: "let me ponder".to_string(),
+            kind: crate::ReasoningKind::Text,
+        }
+    );
+}
+
+#[test]
 fn parser_decodes_string_encoded_tool_arguments() {
     let mut server_model_slot: Option<String> = None;
     let events = parse_ollama_line(

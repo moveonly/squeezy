@@ -157,8 +157,56 @@ impl OllamaProvider {
         if let Some(value) = keep_alive {
             body["keep_alive"] = json!(value);
         }
+        // Thinking-model support. Ollama 0.6+ exposes a `think` request
+        // parameter that gates the model's reasoning trace into a separate
+        // `message.thinking` channel for qwen3 / deepseek-r1 / gpt-oss.
+        // Engage it when the caller asked for reasoning explicitly via
+        // `reasoning_effort`, or when the requested model is in the known
+        // thinking-capable allow-list. gpt-oss takes `"low" | "medium" |
+        // "high"`; other models take `true`.
+        if let Some(value) = think_value_for_request(request) {
+            body["think"] = value;
+        }
         body
     }
+}
+
+/// Compute the value to send for `body["think"]` on a native Ollama chat
+/// request. Returns `None` when the request is not asking for reasoning and
+/// the model is not in the thinking-capable allow-list.
+fn think_value_for_request(request: &LlmRequest) -> Option<Value> {
+    let model: &str = &request.model;
+    let is_gpt_oss = is_gpt_oss_model(model);
+    let wants_reasoning =
+        request.reasoning_effort.is_some() || is_thinking_capable_model(model) || is_gpt_oss;
+    if !wants_reasoning {
+        return None;
+    }
+    if is_gpt_oss {
+        // gpt-oss takes the OpenAI-style effort string. Default to "medium"
+        // when the caller did not specify so we still engage thinking.
+        let level = request
+            .reasoning_effort
+            .map(|effort| effort.as_str())
+            .unwrap_or("medium");
+        return Some(Value::String(level.to_string()));
+    }
+    Some(Value::Bool(true))
+}
+
+/// True when the model id matches one of Ollama's documented thinking-capable
+/// families. The match is intentionally a case-insensitive substring check so
+/// tags / quantization suffixes (`qwen3:8b-instruct-q4_0`) still hit.
+fn is_thinking_capable_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("qwen3") || lower.contains("deepseek-r1") || lower.contains("deepseek-v3.1")
+}
+
+/// True when the model id matches the `gpt-oss` family. Split out from
+/// `is_thinking_capable_model` because gpt-oss takes the OpenAI-style
+/// effort string instead of a bare boolean.
+fn is_gpt_oss_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("gpt-oss")
 }
 
 pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<u64> {
@@ -474,6 +522,28 @@ fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Resu
     }
 
     let mut events = Vec::new();
+    // Ollama 0.6+ surfaces reasoning traces on a dedicated `message.thinking`
+    // field when the request set `think: true` (or the gpt-oss effort
+    // string). Emit it on the reasoning channel so the agent's reasoning-only
+    // stop detection and TUI separator can see it instead of bleeding into
+    // TextDelta.
+    //
+    // TODO(audit H-17): there is no `ReasoningPayload::Ollama` variant yet,
+    // so we do not emit a terminal `ReasoningDone` — Ollama also has no
+    // signed replay format that would let us round-trip the trace into a
+    // follow-up turn (see `LlmInputItem::Reasoning(_)` handling above).
+    // Phase 4FH lands the payload variant when it touches the core type.
+    if let Some(thinking) = value
+        .get("message")
+        .and_then(|message| message.get("thinking"))
+        .and_then(Value::as_str)
+        && !thinking.is_empty()
+    {
+        events.push(LlmEvent::ReasoningDelta {
+            text: thinking.to_string(),
+            kind: crate::ReasoningKind::Text,
+        });
+    }
     if let Some(content) = value
         .get("message")
         .and_then(|message| message.get("content"))
