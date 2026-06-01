@@ -104,12 +104,105 @@ impl GoogleProvider {
                     .map(|tool| json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.parameters,
+                        "parameters": sanitize_for_gemini(&tool.parameters),
                     }))
                     .collect::<Vec<_>>()
             }]);
         }
         body
+    }
+}
+
+/// Project a JSON Schema into Gemini's OpenAPI-3.03 subset. Gemini's
+/// `functionDeclarations[].parameters` rejects: `additionalProperties`,
+/// `$ref` / `$defs`, empty `{"type":"object"}` (must have
+/// `properties`), and `type: [..., "null"]` (uses `nullable: true`
+/// instead). Without this pass, schemas that work on Anthropic /
+/// OpenAI return 400 INVALID_ARGUMENT on Gemini.
+///
+/// Mirrors opencode's gemini sanitize pipeline (others/opencode/packages/llm/src/protocols/gemini.ts).
+pub(crate) fn sanitize_for_gemini(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map.iter() {
+                // Drop keys Gemini rejects outright. `$defs` / `$ref`
+                // can't be resolved server-side; `additionalProperties`
+                // and `unevaluatedProperties` aren't in the supported
+                // subset.
+                match key.as_str() {
+                    "$ref"
+                    | "$defs"
+                    | "$schema"
+                    | "$id"
+                    | "$comment"
+                    | "additionalProperties"
+                    | "unevaluatedProperties" => continue,
+                    _ => {}
+                }
+                let sanitized = match key.as_str() {
+                    "properties" => {
+                        if let Some(obj) = value.as_object() {
+                            let mut new_obj = serde_json::Map::new();
+                            for (k, v) in obj.iter() {
+                                new_obj.insert(k.clone(), sanitize_for_gemini(v));
+                            }
+                            Value::Object(new_obj)
+                        } else {
+                            value.clone()
+                        }
+                    }
+                    "items" | "allOf" | "anyOf" | "oneOf" | "prefixItems" => match value {
+                        Value::Array(arr) => {
+                            Value::Array(arr.iter().map(sanitize_for_gemini).collect())
+                        }
+                        other => sanitize_for_gemini(other),
+                    },
+                    "type" => {
+                        if let Value::Array(arr) = value {
+                            // `["string", "null"]` → keep `"string"` and
+                            // set `nullable: true` (Gemini's idiom).
+                            let mut nullable = false;
+                            let mut other: Option<Value> = None;
+                            for elem in arr {
+                                if elem == "null" {
+                                    nullable = true;
+                                } else if other.is_none() {
+                                    other = Some(elem.clone());
+                                }
+                            }
+                            if nullable {
+                                out.insert("nullable".to_string(), Value::Bool(true));
+                            }
+                            if let Some(other) = other {
+                                other
+                            } else {
+                                value.clone()
+                            }
+                        } else {
+                            value.clone()
+                        }
+                    }
+                    _ => value.clone(),
+                };
+                out.insert(key.clone(), sanitized);
+            }
+            // Empty `{"type":"object"}` (no `properties`) is rejected
+            // by Gemini with "should be non-empty for OBJECT type".
+            // Synthesize an empty `properties` map so the wire shape
+            // stays valid.
+            if matches!(out.get("type"), Some(Value::String(t)) if t == "object")
+                && !out.contains_key("properties")
+            {
+                out.insert(
+                    "properties".to_string(),
+                    Value::Object(serde_json::Map::new()),
+                );
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_for_gemini).collect()),
+        other => other.clone(),
     }
 }
 

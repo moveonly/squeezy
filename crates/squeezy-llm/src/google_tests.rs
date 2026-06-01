@@ -193,6 +193,100 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn sanitize_for_gemini_drops_unsupported_keys_and_synthesizes_properties() {
+    let raw = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema",
+        "$ref": "#/definitions/Foo"
+    });
+    let out = sanitize_for_gemini(&raw);
+    assert!(
+        out.get("additionalProperties").is_none(),
+        "additionalProperties must be stripped, got {out}"
+    );
+    assert!(out.get("$schema").is_none(), "$schema must be stripped");
+    assert!(out.get("$ref").is_none(), "$ref must be stripped");
+    // Empty object schema must gain an empty `properties` map so Gemini
+    // doesn't reject "should be non-empty for OBJECT type".
+    assert_eq!(out["type"], "object");
+    assert!(
+        out["properties"].is_object(),
+        "object schema must have properties, got {out}"
+    );
+}
+
+#[test]
+fn sanitize_for_gemini_coerces_nullable_union_to_nullable_flag() {
+    let raw = json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": ["string", "null"]}
+        }
+    });
+    let out = sanitize_for_gemini(&raw);
+    let name = &out["properties"]["name"];
+    assert_eq!(name["type"], "string");
+    assert_eq!(name["nullable"], true);
+}
+
+#[test]
+fn sanitize_for_gemini_recurses_into_nested_properties_and_items() {
+    let raw = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "$ref": "#/x"
+                }
+            }
+        }
+    });
+    let out = sanitize_for_gemini(&raw);
+    let inner = &out["properties"]["items"]["items"];
+    assert!(
+        inner.get("$ref").is_none(),
+        "nested $ref must be stripped, got {inner}"
+    );
+    assert!(
+        inner["properties"].is_object(),
+        "nested object must synthesize properties, got {inner}"
+    );
+}
+
+#[test]
+fn request_body_runs_sanitize_pass_on_tool_parameters() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "read".to_string(),
+                description: "read".to_string(),
+                parameters: json!({"type": "object", "additionalProperties": false}),
+                strict: true,
+            }
+            .into(),
+        ]),
+        ..LlmRequest::default()
+    };
+    let body = GoogleProvider::request_body(&request);
+    let params = &body["tools"][0]["functionDeclarations"][0]["parameters"];
+    assert!(
+        params.get("additionalProperties").is_none(),
+        "request body must strip additionalProperties, got {params}"
+    );
+    assert!(
+        params["properties"].is_object(),
+        "empty object schema must gain a `properties` map"
+    );
+}
+
+#[test]
 fn parallel_tool_calls_across_chunks_get_distinct_ids() {
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;
