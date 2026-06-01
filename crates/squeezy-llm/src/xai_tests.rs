@@ -89,6 +89,35 @@ fn xai_strips_aggregator_namespace_prefix() {
 }
 
 #[test]
+fn xai_strips_multi_segment_aggregator_prefix_low() {
+    // Low/Nit: Vercel AI Gateway, OpenRouter, and PortKey integrations
+    // sometimes layer two or three namespace segments before the
+    // underlying model id. Walk to the trailing segment with
+    // `rsplit_once('/')` so each layer chews cleanly and the route
+    // classifier still sees the Grok slug.
+    assert_eq!(
+        classify_route("vercel/xai/grok-4"),
+        XaiRoute::Responses,
+        "vercel/xai/grok-4 must resolve to grok-4 → Responses"
+    );
+    assert_eq!(
+        classify_route("@openrouter/xai/grok-4.3"),
+        XaiRoute::Responses,
+        "openrouter prefix must not block grok-4.3 → Responses"
+    );
+    assert_eq!(
+        classify_route("portkey/integration/xai/grok-build-0.1"),
+        XaiRoute::Responses,
+        "three-layer portkey prefix must resolve to grok-build → Responses"
+    );
+    assert_eq!(
+        classify_route("portkey/integration/xai/grok-2"),
+        XaiRoute::Chat,
+        "three-layer portkey prefix must still route grok-2 to Chat"
+    );
+}
+
+#[test]
 fn xai_classify_route_covers_new_grok_families_c09() {
     // C-09: explicit allow-list of Grok families xAI ships on Responses
     // as of the May 2026 catalog refresh. The parser must classify each

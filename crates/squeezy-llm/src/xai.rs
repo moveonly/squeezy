@@ -3,13 +3,15 @@
 //!
 //! xAI publishes both an OpenAI-Responses-compatible endpoint
 //! (`POST /v1/responses`) and a Chat-Completions endpoint
-//! (`POST /v1/chat/completions`) on `https://api.x.ai`. Grok 3 and Grok 4
-//! expose their richer feature surface (reasoning summaries, encrypted
-//! reasoning replay, hosted tools) only through Responses; earlier Grok
-//! models (grok-2, grok-beta) predate the Responses launch and answer only
-//! the Chat route. Selecting per request keeps both generations working
-//! through one provider entry by picking the route based on the
-//! requested model id.
+//! (`POST /v1/chat/completions`) on `https://api.x.ai`. As of the May 2026
+//! catalog refresh xAI treats the Responses route as the canonical surface
+//! and rolls every new Grok generation (Grok 4.3, Grok 4.20, Grok Build,
+//! Grok Code) on that wire — reasoning summaries, encrypted reasoning
+//! replay, hosted tools, and Live Search all live on Responses. The Chat
+//! Completions wire is kept as a defensive fallback: every shipping xAI
+//! model still accepts it, and any unknown id (legacy `grok-2`, `grok-1`,
+//! `grok-beta`, or a non-grok string a caller routed through a `base_url`
+//! override) reaches it without a 404.
 //!
 //! The provider holds one client per route and dispatches per-request based
 //! on [`classify_route`]; per-startup dispatch would lock a session to a
@@ -203,11 +205,13 @@ pub(crate) enum XaiRoute {
 /// and the caller surfaces a structured error.
 pub(crate) fn classify_route(model: &str) -> XaiRoute {
     let lower = model.to_ascii_lowercase();
-    // Strip an optional `xai/` aggregator namespace prefix so models
-    // served through an aggregator and routed back into the xAI
-    // dedicated provider (rare but possible via base_url override)
-    // still resolve correctly.
-    let id = lower.split_once('/').map(|(_, id)| id).unwrap_or(&lower);
+    // Walk to the last `/`-delimited segment so multi-layer aggregator
+    // prefixes (`vercel/xai/grok-4`, `@openrouter/xai/grok-4.3`,
+    // `portkey/integration/xai/grok-build-0.1`) all resolve to the
+    // underlying Grok slug. `split_once('/')` would only chew the
+    // first segment and misclassify the tail, so use `rsplit_once`
+    // instead — the trailing segment is always the actual model id.
+    let id = lower.rsplit_once('/').map(|(_, id)| id).unwrap_or(&lower);
     if id.starts_with("grok-imagine") {
         return XaiRoute::ImageNotRouted;
     }
