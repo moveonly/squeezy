@@ -10,6 +10,7 @@ pub(crate) enum ExplorationIntent {
     TestPairing,
     RepoMap,
     MethodListing,
+    Hierarchy,
 }
 
 impl ExplorationIntent {
@@ -22,6 +23,7 @@ impl ExplorationIntent {
             Self::TestPairing => "test_pairing",
             Self::RepoMap => "repo_map",
             Self::MethodListing => "method_listing",
+            Self::Hierarchy => "hierarchy",
         }
     }
 }
@@ -197,6 +199,27 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
         });
     }
 
+    if hierarchy_intent(&lowered)
+        && let Some(query) = symbolic_query.clone()
+    {
+        // A "subclasses of Foo" / "implementors of Trait" question is
+        // exactly what `hierarchy` answers — the model would otherwise
+        // grep for `extends Foo` / `: Foo` / etc. across the tree, which
+        // is both noisier and language-specific. Pre-issuing the graph
+        // call lets the model see the canonical subclass list in one
+        // round and decide whether to drill into individual subclasses.
+        return Some(ExplorationPlan {
+            intent: ExplorationIntent::Hierarchy,
+            query: Some(query.clone()),
+            calls: vec![tool_call(
+                "planner_hierarchy",
+                "hierarchy",
+                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS}),
+            )],
+            guard_raw_reads: true,
+        });
+    }
+
     if method_listing_intent(&lowered)
         && let Some(query) = symbolic_query.clone()
     {
@@ -322,6 +345,26 @@ fn method_listing_intent(input: &str) -> bool {
         || input.contains("members on")
         || input.contains("api of")
         || input.contains("api for")
+}
+
+fn hierarchy_intent(input: &str) -> bool {
+    input.contains("subclass")
+        || input.contains("subclasses")
+        || input.contains("implementors")
+        || input.contains("implementers")
+        || input.contains("implementations of")
+        || input.contains("concrete classes that")
+        || input.contains("classes that extend")
+        || input.contains("classes that implement")
+        || input.contains("classes that mix")
+        || input.contains("class extends")
+        || input.contains("inherit from")
+        || input.contains("inheritors")
+        || input.contains("derived classes")
+        || input.contains("derived types")
+        || input.contains("everything that implements")
+        || input.contains("every implementor")
+        || input.contains("every subclass")
 }
 
 fn test_pairing_intent(input: &str) -> bool {
