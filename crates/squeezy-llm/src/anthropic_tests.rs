@@ -1149,6 +1149,101 @@ fn parser_accumulates_thinking_block_with_signature() {
     }
 }
 
+/// H-02: Anthropic streams a redacted-thinking block's encrypted
+/// payload over `signature_delta` frames (the `content_block_start`
+/// frame's `data` field is empty until those land). Accumulate them
+/// into `block.data` so the multi-turn round-trip ships the full
+/// blob; otherwise Anthropic rejects the continuation with
+/// `invalid_request_error` or silently breaks reasoning continuity.
+#[test]
+fn parser_accumulates_redacted_thinking_data_via_signature_delta() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":""}}"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"REDACTED_"}}"#,
+        &mut state,
+    )
+    .expect("delta-1");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"BLOB"}}"#,
+        &mut state,
+    )
+    .expect("delta-2");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state).expect("stop");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let payload = match events.first() {
+        Some(LlmEvent::ReasoningDone(payload)) => payload.clone(),
+        other => panic!("expected ReasoningDone first, got {other:?}"),
+    };
+    match payload {
+        crate::ReasoningPayload::Anthropic { blocks } => {
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].kind, crate::AnthropicThinkingKind::Redacted);
+            assert_eq!(
+                blocks[0].data.as_deref(),
+                Some("REDACTED_BLOB"),
+                "signature_delta deltas must accumulate into `data` for redacted blocks",
+            );
+            assert!(blocks[0].signature.is_none());
+        }
+        other => panic!("expected Anthropic payload, got {other:?}"),
+    }
+}
+
+/// H-02 replay: when a redacted block's encrypted blob lives in
+/// `block.data`, the wire JSON must emit it under `data`. When it
+/// instead lives in `block.signature` (e.g. a future provider build
+/// that decides to route the field there), the round-trip helper
+/// must still populate `data` so Anthropic accepts the continuation.
+#[test]
+fn anthropic_messages_redacted_thinking_populates_data_from_either_field() {
+    use crate::AnthropicThinkingBlock;
+    // Canonical: `data` populated.
+    let payload = crate::ReasoningPayload::Anthropic {
+        blocks: vec![AnthropicThinkingBlock {
+            kind: crate::AnthropicThinkingKind::Redacted,
+            text: String::new(),
+            signature: None,
+            data: Some("ENCRYPTED".to_string()),
+        }],
+    };
+    let messages = anthropic_messages(
+        &[LlmInputItem::Reasoning(payload)],
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let arr = messages.as_array().expect("array");
+    assert_eq!(arr[0]["content"][0]["type"], "redacted_thinking");
+    assert_eq!(arr[0]["content"][0]["data"], "ENCRYPTED");
+
+    // Fallback: only `signature` populated (e.g. older parser path
+    // where the streamer accumulated into signature). The replay
+    // helper falls back to it so the data field still ships
+    // populated.
+    let payload = crate::ReasoningPayload::Anthropic {
+        blocks: vec![AnthropicThinkingBlock {
+            kind: crate::AnthropicThinkingKind::Redacted,
+            text: String::new(),
+            signature: Some("FALLBACK_ENC".to_string()),
+            data: None,
+        }],
+    };
+    let messages = anthropic_messages(
+        &[LlmInputItem::Reasoning(payload)],
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let arr = messages.as_array().expect("array");
+    assert_eq!(arr[0]["content"][0]["type"], "redacted_thinking");
+    assert_eq!(arr[0]["content"][0]["data"], "FALLBACK_ENC");
+}
+
 #[test]
 fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
     let payload = crate::ReasoningPayload::Anthropic {

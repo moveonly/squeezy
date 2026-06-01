@@ -473,9 +473,23 @@ fn anthropic_messages(
                             obj
                         }
                         AnthropicThinkingKind::Redacted => {
+                            // Anthropic streams the encrypted blob over
+                            // `signature_delta` for redacted blocks, but
+                            // the `content_block_start` frame can also
+                            // populate `data` directly. Round-trip
+                            // whichever field actually got populated so a
+                            // multi-turn continuation never ships an
+                            // empty `data: ""` payload (which Anthropic
+                            // rejects with `invalid_request_error` or
+                            // silently breaks reasoning continuity).
+                            let data = block
+                                .data
+                                .clone()
+                                .or_else(|| block.signature.clone())
+                                .unwrap_or_default();
                             json!({
                                 "type": "redacted_thinking",
-                                "data": block.data.clone().unwrap_or_default(),
+                                "data": data,
                             })
                         }
                     })
@@ -1055,9 +1069,33 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                         .unwrap_or_default()
                         .to_string();
                     if let Some(block) = state.thinking_blocks.get_mut(&index) {
-                        match block.signature.as_mut() {
-                            Some(existing) => existing.push_str(&signature),
-                            None => block.signature = Some(signature),
+                        match block.kind {
+                            // Visible thinking blocks carry a separate
+                            // `signature` field that we round-trip
+                            // alongside the cleartext.
+                            AnthropicThinkingKind::Thinking => match block.signature.as_mut() {
+                                Some(existing) => existing.push_str(&signature),
+                                None => block.signature = Some(signature),
+                            },
+                            // Redacted thinking blocks carry their
+                            // encrypted payload over the `signature_delta`
+                            // wire frame (Anthropic uses the same frame
+                            // for both shapes — for `redacted_thinking`
+                            // there is no cleartext to ship and the
+                            // `data` field on the start frame may be
+                            // empty until the deltas land). Accumulate
+                            // into `block.data` so the replay path can
+                            // emit the full encrypted blob; without
+                            // this, the multi-turn round-trip ships
+                            // `"data": ""` and Anthropic 4xx-s the
+                            // continuation or silently breaks reasoning
+                            // continuity. See `.audit/providers/anthropic.md`
+                            // HIGH #2 and
+                            // <https://platform.claude.com/docs/en/build-with-claude/extended-thinking#multi-turn-conversations-with-thinking>.
+                            AnthropicThinkingKind::Redacted => match block.data.as_mut() {
+                                Some(existing) => existing.push_str(&signature),
+                                None => block.data = Some(signature),
+                            },
                         }
                     }
                     none()
