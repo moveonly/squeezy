@@ -516,6 +516,131 @@
     "metadata_source": "https://openrouter.ai/google/gemini-2.5-pro"
   },
   {
+    "provider": "openrouter",
+    "id": "anthropic/claude-opus-4.7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-opus-4.7"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-sonnet-4.6",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-sonnet-4.6"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-haiku-4.5",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-haiku-4.5"
+  },
+  {
+    "provider": "openrouter",
+    "id": "openai/gpt-5.4-mini",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/openai/gpt-5.4-mini"
+  },
+  {
+    "provider": "openrouter",
+    "id": "openai/gpt-5.4-nano",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/openai/gpt-5.4-nano"
+  },
+  {
     "provider": "vercel",
     "id": "anthropic/claude-opus-4.7",
     "profile": "strong",
