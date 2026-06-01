@@ -27,6 +27,7 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
+    anthropic_error::NON_RETRYABLE_MARKER,
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::{
         ApiKeySource, resolve_api_key_with_inline, resolve_api_key_with_inline_optional,
@@ -1334,6 +1335,88 @@ fn local_jit_load_hint(
     }
 }
 
+/// H-27: classify an inline mid-stream `{"error":...}` envelope as
+/// retryable vs terminal. Retryable shapes (`rate_limit_*`,
+/// `server_error`, `overloaded`, `timeout`, HTTP 408/429/5xx) are
+/// returned as plain `ProviderStream` errors so the existing
+/// transport retry policy can take another swing. Terminal shapes
+/// (auth, invalid request, context overflow, content filter)
+/// surface with the [`NON_RETRYABLE_MARKER`] prefix so the agent
+/// loop drops the turn instead of looping the same broken
+/// request.
+fn is_inline_error_retryable(value: &Value) -> bool {
+    let error = value.get("error");
+    let kind = error
+        .and_then(|err| err.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let code = error
+        .and_then(|err| err.get("code"))
+        .and_then(|c| {
+            c.as_str()
+                .map(str::to_ascii_lowercase)
+                .or_else(|| c.as_i64().map(|n| n.to_string()))
+        })
+        .unwrap_or_default();
+    if let Some(kind) = kind.as_deref() {
+        if kind.contains("rate_limit")
+            || kind.contains("overloaded")
+            || kind.contains("server_error")
+            || kind.contains("api_error")
+            || kind.contains("timeout")
+            || kind.contains("transient")
+            || kind.contains("internal")
+        {
+            return true;
+        }
+        if kind.contains("auth")
+            || kind.contains("permission")
+            || kind.contains("invalid_request")
+            || kind.contains("not_found")
+            || kind.contains("content_filter")
+            || kind.contains("context_length")
+            || kind.contains("quota")
+        {
+            return false;
+        }
+    }
+    // Code-based classification covers providers that only ship a
+    // `code` field (OpenRouter, some PortKey upstreams) without a
+    // `type`. Common retryable codes: `rate_limit_exceeded`,
+    // `service_unavailable`, numeric HTTP statuses 408/429/5xx.
+    if !code.is_empty() {
+        if code.contains("rate_limit")
+            || code.contains("server_error")
+            || code.contains("overloaded")
+            || code.contains("service_unavailable")
+            || code.contains("timeout")
+            || code.contains("transient")
+            || code == "408"
+            || code == "429"
+            || code.starts_with("5")
+        {
+            return true;
+        }
+        if code.contains("invalid")
+            || code.contains("auth")
+            || code.contains("permission")
+            || code.contains("context_length")
+            || code.contains("not_found")
+            || code.contains("insufficient_quota")
+            || code.contains("content_filter")
+        {
+            return false;
+        }
+    }
+    // Default: retryable. The stream-retry policy still bails after
+    // the configured attempt count, so a falsely-retryable
+    // classification can't loop forever. A falsely-terminal
+    // classification, on the other hand, would drop turns on
+    // brand-new error shapes the catalog doesn't yet know about —
+    // worse user experience.
+    true
+}
+
 /// Format a Chat-Completions `{ "error": { message, type, code, … } }` envelope
 /// into a single human-readable string. Surfaces `type` and `code` (Anthropic's
 /// `rate_limit_error`, OpenAI's `invalid_request_error` / `context_length_exceeded`,
@@ -1387,10 +1470,23 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
 
     if value.get("error").is_some() {
-        return Err(SqueezyError::ProviderStream(format_chat_error(
-            &value,
-            "chat completions stream error",
-        )));
+        // H-27: inline mid-stream `error` JSON. Classify so the
+        // outer retry policy can distinguish "retryable transport
+        // hiccup" (rate-limited, 5xx upstream, network blip) from
+        // "request-shape bug / auth fail" (invalid api key, model
+        // gone, schema violation). Retryable shapes stay as
+        // `ProviderStream` (the existing stream-retry policy is
+        // already permissive about that); terminal shapes get the
+        // `[non-retryable]` marker prepended so the agent loop +
+        // TUI mirror the same suppression behavior they apply to
+        // POST-time errors.
+        let formatted = format_chat_error(&value, "chat completions stream error");
+        let message = if is_inline_error_retryable(&value) {
+            formatted
+        } else {
+            format!("{NON_RETRYABLE_MARKER}{formatted}")
+        };
+        return Err(SqueezyError::ProviderStream(message));
     }
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {

@@ -807,6 +807,60 @@ fn parse_chat_event_propagates_stream_error() {
         message.contains("code=rate_limit_exceeded"),
         "must surface error.code: {message}"
     );
+    // H-27: rate_limit_error classifies as retryable; no
+    // [non-retryable] marker.
+    assert!(
+        !message.contains("[non-retryable]"),
+        "retryable rate_limit_error must NOT carry the marker: {message}"
+    );
+}
+
+#[test]
+fn parse_chat_event_marks_inline_terminal_errors_as_non_retryable() {
+    // H-27: invalid_request / auth / context_length / content_filter
+    // are terminal failures; the [non-retryable] marker tells the
+    // agent loop and TUI to drop the turn instead of looping the
+    // same broken request.
+    let cases = &[
+        r#"{"error":{"message":"missing field","type":"invalid_request_error","code":"missing_required_parameter"}}"#,
+        r#"{"error":{"message":"bad key","type":"authentication_error"}}"#,
+        r#"{"error":{"message":"too long","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+        r#"{"error":{"message":"blocked","type":"content_filter"}}"#,
+        r#"{"error":{"message":"no model","code":"model_not_found"}}"#,
+    ];
+    for case in cases {
+        let mut state = StreamState::default();
+        let err = parse_chat_event(case, &mut state).expect_err("must surface error");
+        let message = err.to_string();
+        assert!(
+            message.contains("[non-retryable]"),
+            "terminal error must carry the marker: case={case} message={message}"
+        );
+    }
+}
+
+#[test]
+fn parse_chat_event_leaves_retryable_inline_errors_unmarked() {
+    // Counterpoint to the test above: known retryable shapes
+    // (rate-limit, overload, server error, transient network blips)
+    // stay unmarked so the existing stream-retry policy retries
+    // them naturally.
+    let cases = &[
+        r#"{"error":{"message":"slow down","type":"rate_limit_error"}}"#,
+        r#"{"error":{"message":"upstream overload","type":"overloaded_error"}}"#,
+        r#"{"error":{"message":"5xx","type":"api_error","code":"server_error"}}"#,
+        r#"{"error":{"message":"upstream timeout","code":"timeout"}}"#,
+        r#"{"error":{"message":"unknown shape","code":"new_provider_error"}}"#,
+    ];
+    for case in cases {
+        let mut state = StreamState::default();
+        let err = parse_chat_event(case, &mut state).expect_err("must surface error");
+        let message = err.to_string();
+        assert!(
+            !message.contains("[non-retryable]"),
+            "retryable / unknown error must NOT carry the marker: case={case} message={message}"
+        );
+    }
 }
 
 #[test]
