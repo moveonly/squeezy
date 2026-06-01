@@ -122,7 +122,7 @@ pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL: &str =
     "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL: &str =
-    "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat";
+    "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
