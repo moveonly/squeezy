@@ -200,6 +200,19 @@ impl SqueezyStore {
                 table.remove(key.as_str()).map_err(store_error)?;
             }
         }
+        if !batch.resolver_upserts.is_empty() || !batch.resolver_removals.is_empty() {
+            let mut table = write
+                .open_table(RESOLVER_SNAPSHOT_PER_FILE)
+                .map_err(store_error)?;
+            for (key, value) in &batch.resolver_upserts {
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(store_error)?;
+            }
+            for key in &batch.resolver_removals {
+                table.remove(key.as_str()).map_err(store_error)?;
+            }
+        }
         write.commit().map_err(store_error)
     }
 
@@ -208,14 +221,9 @@ impl SqueezyStore {
     /// stored value so a later open can decide whether the snapshot is
     /// still authoritative.
     pub fn put_resolver_entry<T: Serialize>(&self, file_id: &FileId, entry: &T) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            let mut table = write
-                .open_table(RESOLVER_SNAPSHOT_PER_FILE)
-                .map_err(store_error)?;
-            insert_json(&mut table, file_id.0.as_str(), entry)?;
-        }
-        write.commit().map_err(store_error)
+        let mut batch = GraphWriteBatch::new();
+        batch.upsert_resolver_entry(file_id, entry)?;
+        self.apply_graph_batch(&batch)
     }
 
     pub fn resolver_entry<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
@@ -246,14 +254,9 @@ impl SqueezyStore {
     }
 
     pub fn remove_resolver_entry(&self, file_id: &FileId) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            let mut table = write
-                .open_table(RESOLVER_SNAPSHOT_PER_FILE)
-                .map_err(store_error)?;
-            table.remove(file_id.0.as_str()).map_err(store_error)?;
-        }
-        write.commit().map_err(store_error)
+        let mut batch = GraphWriteBatch::new();
+        batch.remove_resolver_entry(file_id);
+        self.apply_graph_batch(&batch)
     }
 
     pub fn clear_resolver_entries(&self) -> Result<()> {
@@ -365,10 +368,10 @@ impl SqueezyStore {
         };
         let prefix = read_snapshot_key_prefix(path);
         let mut snapshots = Vec::new();
-        for entry in table.iter().map_err(store_error)? {
+        for entry in table.range(prefix.as_str()..).map_err(store_error)? {
             let (key, value) = entry.map_err(store_error)?;
             if !key.value().starts_with(prefix.as_str()) {
-                continue;
+                break;
             }
             let snapshot: StoredReadSnapshot = decode(value.value())?;
             if snapshot.path == path {
@@ -621,6 +624,8 @@ pub struct GraphWriteBatch {
     metadata: Option<GraphStoreMetadata>,
     upserts: Vec<(String, Vec<u8>)>,
     removals: Vec<String>,
+    resolver_upserts: Vec<(String, Vec<u8>)>,
+    resolver_removals: Vec<String>,
 }
 
 impl GraphWriteBatch {
@@ -646,12 +651,33 @@ impl GraphWriteBatch {
         self.removals.push(file_id.0.clone());
     }
 
+    pub fn upsert_resolver_entry<T: Serialize>(
+        &mut self,
+        file_id: &FileId,
+        entry: &T,
+    ) -> Result<()> {
+        let encoded = encode(entry)?;
+        self.resolver_upserts.push((file_id.0.clone(), encoded));
+        Ok(())
+    }
+
+    pub fn remove_resolver_entry(&mut self, file_id: &FileId) {
+        self.resolver_removals.push(file_id.0.clone());
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.metadata.is_none() && self.upserts.is_empty() && self.removals.is_empty()
+        self.metadata.is_none()
+            && self.upserts.is_empty()
+            && self.removals.is_empty()
+            && self.resolver_upserts.is_empty()
+            && self.resolver_removals.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.upserts.len() + self.removals.len()
+        self.upserts.len()
+            + self.removals.len()
+            + self.resolver_upserts.len()
+            + self.resolver_removals.len()
     }
 }
 

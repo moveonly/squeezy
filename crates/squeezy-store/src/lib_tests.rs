@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use serde_json::json;
 use squeezy_core::AppConfig;
+use squeezy_core::FileId;
 
-use crate::{CompactionCheckpoint, SqueezyStore, sessions::ResumeItem};
+use crate::{CompactionCheckpoint, GraphWriteBatch, SqueezyStore, sessions::ResumeItem};
 
 fn temp_root(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -93,4 +95,56 @@ fn compaction_checkpoint_prune_drops_old_only() {
             .is_some(),
         "fresh checkpoint should remain",
     );
+}
+
+#[test]
+fn graph_write_batch_applies_resolver_cache_changes() {
+    let (_root, store) = open_store("resolver-batch");
+    let first = FileId::new("src/first.rs");
+    let second = FileId::new("src/second.rs");
+
+    let mut batch = GraphWriteBatch::new();
+    batch
+        .upsert_resolver_entry(&first, &json!({"exports": ["First"]}))
+        .expect("encode first resolver entry");
+    batch
+        .upsert_resolver_entry(&second, &json!({"exports": ["Second"]}))
+        .expect("encode second resolver entry");
+    assert_eq!(batch.len(), 2);
+    store
+        .apply_graph_batch(&batch)
+        .expect("apply resolver batch");
+
+    let first_entry: serde_json::Value = store
+        .resolver_entry(&first)
+        .expect("load first")
+        .expect("first present");
+    assert_eq!(first_entry["exports"][0], "First");
+    let second_entry: serde_json::Value = store
+        .resolver_entry(&second)
+        .expect("load second")
+        .expect("second present");
+    assert_eq!(second_entry["exports"][0], "Second");
+
+    let mut update = GraphWriteBatch::new();
+    update.remove_resolver_entry(&first);
+    update
+        .upsert_resolver_entry(&second, &json!({"exports": ["SecondV2"]}))
+        .expect("encode updated second resolver entry");
+    store
+        .apply_graph_batch(&update)
+        .expect("apply resolver update");
+
+    assert!(
+        store
+            .resolver_entry::<serde_json::Value>(&first)
+            .expect("load removed first")
+            .is_none(),
+        "resolver removal should be applied in the batch"
+    );
+    let second_entry: serde_json::Value = store
+        .resolver_entry(&second)
+        .expect("load updated second")
+        .expect("second remains");
+    assert_eq!(second_entry["exports"][0], "SecondV2");
 }
