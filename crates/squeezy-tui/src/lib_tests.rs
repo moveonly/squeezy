@@ -298,6 +298,35 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     assert!(!app.subagent_pane.focused);
 }
 
+#[test]
+fn selected_subagent_conversation_preserves_full_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    let prompt_tail = "PROMPT_SENTINEL_VISIBLE_IN_SUBAGENT";
+    let long_prompt = format!(
+        "Modernize src/cli/client.rs. Review the code for outdated patterns, deprecated APIs, \
+         or Rust idioms that could be improved. Suggest and implement modernization improvements. \
+         {} {prompt_tail}",
+        "let-else try-operator iterator-cleanup ".repeat(12)
+    );
+    assert!(
+        long_prompt.chars().count() > 240,
+        "prompt must exceed the old subagent event preview cap"
+    );
+
+    app.note_subagent_started(12, "delegate".to_string(), long_prompt);
+    app.subagent_pane.active = ConversationSource::Subagent(12);
+
+    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(96), false));
+    assert!(
+        subagent_view.contains(prompt_tail),
+        "selected subagent transcript should show the full assignment: {subagent_view}"
+    );
+    assert!(
+        !subagent_view.contains("[truncated]"),
+        "selected subagent transcript should not receive pre-truncated event text: {subagent_view}"
+    );
+}
+
 #[tokio::test]
 async fn config_screen_keeps_subagent_pane_from_owning_arrows() {
     let mut agent = test_agent(SessionMode::Build);
@@ -11605,6 +11634,10 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
 #[test]
 fn status_line_languages_use_squeezy_amber() {
     use crate::status::StatusLineItem;
+    let expected_theme =
+        crate::render::theme::resolve_theme(&squeezy_core::AppConfig::default(), "default");
+    let expected_language_color = expected_theme.color(crate::render::theme::token::PALETTE_ACCENT);
+    let expected_dir_color = expected_theme.color(crate::render::theme::token::PALETTE_GREEN);
     let mut app = test_app(SessionMode::Build);
     app.directory = "~/project".to_string();
     app.language_summary = "Python 10, Rust 247".to_string();
@@ -11625,12 +11658,12 @@ fn status_line_languages_use_squeezy_amber() {
 
     assert_eq!(
         language_span.style.fg,
-        Some(crate::render::theme::accent()),
+        Some(expected_language_color),
         "languages should use Squeezy's darker brand accent"
     );
     assert_eq!(
         dir_span.style.fg,
-        Some(crate::render::theme::green()),
+        Some(expected_dir_color),
         "other path-family status items should keep their existing color"
     );
 }

@@ -4036,6 +4036,107 @@ async fn subagent_request_instructions_omit_agents_md() {
     );
 }
 
+#[tokio::test]
+async fn subagent_lifecycle_events_preserve_full_prompt_and_summary() {
+    let prompt_tail = "PROMPT_SENTINEL_FULL_CONTEXT";
+    let summary_tail = "SUMMARY_SENTINEL_FULL_CONTEXT";
+    let long_prompt = format!(
+        "Modernize src/cli/client.rs. Review the code for outdated patterns, deprecated APIs, \
+         or Rust idioms that could be improved. Suggest and implement modernization improvements \
+         such as using newer Rust features, simplifying error handling, and preserving behavior. \
+         Repeat context: {} {prompt_tail}",
+        "let-else try-operator iterator-cleanup ".repeat(12)
+    );
+    let long_summary = format!(
+        "Completed the modernization review while preserving behavior. Findings and rationale: {} \
+         {summary_tail}",
+        "updated patterns validated tests retained context ".repeat(14)
+    );
+    assert!(
+        long_prompt.chars().count() > 240,
+        "prompt must exceed the old event preview cap"
+    );
+    assert!(
+        long_summary.chars().count() > 320,
+        "summary must exceed the old event preview cap"
+    );
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_full_lifecycle".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": long_prompt}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_full_lifecycle_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(long_summary)),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_full_lifecycle_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("noted".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_full_lifecycle_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn(
+        "delegate long modernization review".to_string(),
+        CancellationToken::new(),
+    );
+    let mut started_prompt = None;
+    let mut completed_summary = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentStarted { prompt, .. } => {
+                started_prompt = Some(prompt);
+            }
+            AgentEvent::SubagentCompleted { summary, .. } => {
+                completed_summary = Some(summary);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+
+    let started_prompt = started_prompt.expect("SubagentStarted prompt");
+    assert!(
+        started_prompt.contains(prompt_tail),
+        "subagent prompt event was truncated before the TUI could show it: {started_prompt}"
+    );
+    assert!(
+        !started_prompt.contains("[truncated]"),
+        "subagent prompt event should carry full local UI text: {started_prompt}"
+    );
+    let completed_summary = completed_summary.expect("SubagentCompleted summary");
+    assert!(
+        completed_summary.contains(summary_tail),
+        "subagent summary event was truncated before the TUI could show it: {completed_summary}"
+    );
+    assert!(
+        !completed_summary.contains("[truncated]"),
+        "subagent summary event should carry full local UI text: {completed_summary}"
+    );
+}
+
 fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
     let mut items = Vec::new();
     for n in 0..16 {
