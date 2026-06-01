@@ -1,3 +1,6 @@
+use std::io;
+
+use serde::Serialize;
 use serde_json::Value;
 use squeezy_core::{AppConfig, CostSnapshot, TurnMetrics};
 use squeezy_llm::{LlmInputItem, LlmRequest, estimate_cost};
@@ -311,20 +314,37 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
             LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => text.len() as u64,
             LlmInputItem::FunctionCallOutput { output, .. } => output.len() as u64,
             LlmInputItem::Image { bytes, .. } => bytes.len() as u64,
-            LlmInputItem::FunctionCall { arguments, .. } => serde_json::to_vec(arguments)
-                .map(|v| v.len() as u64)
-                .unwrap_or(0),
+            LlmInputItem::FunctionCall { arguments, .. } => serialized_json_len(arguments),
             LlmInputItem::Reasoning(payload) => payload.display_text().len() as u64,
         });
     }
     for spec in request.tools.iter() {
-        total = total.saturating_add(
-            serde_json::to_vec(spec)
-                .map(|v| v.len() as u64)
-                .unwrap_or(0),
-        );
+        total = total.saturating_add(serialized_json_len(spec));
     }
     total
+}
+
+#[derive(Debug, Default)]
+struct JsonByteCounter {
+    bytes: u64,
+}
+
+impl io::Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len<T: Serialize>(value: &T) -> u64 {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value)
+        .map(|()| counter.bytes)
+        .unwrap_or(0)
 }
 
 pub(crate) fn format_cap_reached_reason(status: CostCapStatus) -> String {

@@ -21,6 +21,7 @@
 //! additive metadata that future wiring can consume.
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
@@ -309,13 +310,18 @@ pub(crate) struct SubagentFrontmatter {
 pub(crate) fn parse_subagent_file(
     content: &str,
 ) -> std::result::Result<(SubagentFrontmatter, String), String> {
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized: Cow<'_, str> = if content.contains('\r') {
+        Cow::Owned(content.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(content)
+    };
     let mut lines = normalized.lines();
     if lines.next() != Some("---") {
         return Err("missing YAML frontmatter".to_string());
     }
     let mut frontmatter_lines: Vec<&str> = Vec::new();
-    let mut body_lines: Vec<&str> = Vec::new();
+    let mut body = String::new();
+    let mut body_started = false;
     let mut in_frontmatter = true;
     for line in lines {
         if in_frontmatter && line.trim() == "---" {
@@ -325,14 +331,19 @@ pub(crate) fn parse_subagent_file(
         if in_frontmatter {
             frontmatter_lines.push(line);
         } else {
-            body_lines.push(line);
+            if body_started {
+                body.push('\n');
+            } else {
+                body_started = true;
+            }
+            body.push_str(line);
         }
     }
     if in_frontmatter {
         return Err("unterminated YAML frontmatter".to_string());
     }
     let frontmatter = parse_frontmatter_lines(&frontmatter_lines)?;
-    let body = body_lines.join("\n").trim().to_string();
+    let body = body.trim().to_string();
     Ok((frontmatter, body))
 }
 
