@@ -106,7 +106,7 @@ pub const DEFAULT_CEREBRAS_MODEL: &str = "gpt-oss-120b";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
 pub const DEFAULT_BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
-pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_BASETEN_MODEL: &str = "moonshotai/kimi-k2.6-instruct";
 // OpenAI-compatible local self-hosted (light preset tier — loopback default,
 // auth optional, model id depends on whatever the local server has loaded).
 pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
