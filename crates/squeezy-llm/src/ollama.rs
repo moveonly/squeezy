@@ -436,9 +436,20 @@ fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Resu
         }
     }
     if value.get("done").and_then(Value::as_bool) == Some(true) {
-        let stop_reason = value
-            .get("done_reason")
-            .and_then(Value::as_str)
+        let raw_reason = value.get("done_reason").and_then(Value::as_str);
+        // Ollama emits intermediate `{"done":true,"done_reason":"load"}` and
+        // `"unload"` housekeeping frames around model lifecycle events (model
+        // mapped into memory, model evicted under `keep_alive: 0`). Those
+        // frames are not turn terminals — the actual generation chunks
+        // follow. Treat them as no-ops so the stream loop keeps polling for
+        // the real terminal frame instead of closing the turn with zero
+        // tokens. See `crates/squeezy-llm/src/lib.rs:StopReason::from_ollama`
+        // for the normalized mapping of the real terminal reasons (`stop`,
+        // `length`).
+        if matches!(raw_reason, Some("load") | Some("unload")) {
+            return Ok(events);
+        }
+        let stop_reason = raw_reason
             .map(crate::StopReason::from_ollama)
             .or(Some(crate::StopReason::EndTurn));
         events.push(LlmEvent::Completed {

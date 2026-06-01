@@ -127,6 +127,52 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn parser_treats_load_and_unload_done_reasons_as_noop() {
+    // Ollama emits `{"done":true,"done_reason":"load"}` and `"unload"`
+    // housekeeping frames around model lifecycle. They are not turn
+    // terminals; the actual generation chunks follow. The parser must
+    // swallow them so the stream loop keeps polling instead of closing
+    // the turn with zero tokens.
+    for reason in ["load", "unload"] {
+        let mut server_model_slot: Option<String> = None;
+        let line = format!(r#"{{"model":"qwen3:0.6b","done":true,"done_reason":"{reason}"}}"#);
+        let events =
+            parse_ollama_line(&line, &mut server_model_slot).expect("housekeeping frame parses");
+        assert!(
+            events.is_empty(),
+            "expected no events for done_reason={reason}, got {events:?}",
+        );
+    }
+
+    // Following the housekeeping frame, real content chunks must still
+    // surface a TextDelta plus the genuine terminal Completed event.
+    let mut server_model_slot: Option<String> = None;
+    let text_events = parse_ollama_line(
+        r#"{"model":"qwen3:0.6b","message":{"content":"after-load"}}"#,
+        &mut server_model_slot,
+    )
+    .expect("content chunk parses");
+    assert_eq!(text_events.len(), 1);
+    assert_eq!(
+        text_events[0],
+        LlmEvent::TextDelta("after-load".to_string())
+    );
+
+    let terminal_events = parse_ollama_line(
+        r#"{"model":"qwen3:0.6b","done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":4}"#,
+        &mut server_model_slot,
+    )
+    .expect("terminal stop frame parses");
+    assert!(matches!(
+        terminal_events.last(),
+        Some(LlmEvent::Completed {
+            stop_reason: Some(crate::StopReason::EndTurn),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn show_metadata_extracts_context_window_from_model_info() {
     let value = json!({
         "model_info": {
