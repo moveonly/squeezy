@@ -426,7 +426,20 @@ impl LlmProvider for OllamaProvider {
             loop {
                 let polled = tokio::select! {
                     _ = cancel.cancelled() => {
+                        // Mid-stream cancellation skips Ollama's terminal
+                        // `done: true` frame, so the agent loop never sees a
+                        // `Completed` event and accounting under-reports
+                        // usage on every cancelled local turn. Emit a final
+                        // `Completed { stop_reason: None }` after the
+                        // `Cancelled` marker so consumers terminate cleanly
+                        // (mirrors LM Studio's early-termination drain).
                         yield LlmEvent::Cancelled;
+                        yield LlmEvent::Completed {
+                            response_id: None,
+                            cost: CostSnapshot::default(),
+                            stop_reason: None,
+                            reasoning_only_stop: false,
+                        };
                         return;
                     }
                     next = timeout(idle_timeout(transport), bytes.next()) => next,
