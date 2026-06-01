@@ -785,6 +785,16 @@ pub enum LlmEvent {
         name: String,
         arguments_chunk: String,
     },
+    /// OpenAI safety-refusal text delta. The Responses API emits a
+    /// dedicated `response.refusal.delta` stream when the model
+    /// declines to answer; surfacing the running text lets the TUI
+    /// show the refusal verbatim. The terminal `Completed` event
+    /// still carries `stop_reason: Refusal` for the canonical signal.
+    /// Consumers that only care about the canonical event stream can
+    /// wildcard-skip this variant.
+    Refusal {
+        content: String,
+    },
     /// Triple-path overflow detector classified this turn's terminal
     /// shape as a context-window overflow. See
     /// [`crate::overflow::classify_terminal`] for the three shapes the
