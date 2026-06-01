@@ -665,9 +665,31 @@ pub type PullStream = Pin<Box<dyn Stream<Item = Result<PullEvent>> + Send>>;
 /// `/api/pull`, so users who follow Ollama's upstream `OLLAMA_HOST` env var
 /// (no `/api` suffix) reach the right endpoint instead of silently 404-ing.
 pub fn pull_model(base_url: &str, model: &str, cancel: CancellationToken) -> PullStream {
-    let client = reqwest::Client::new();
+    pull_model_with_transport(base_url, model, cancel, ProviderTransportConfig::default())
+}
+
+/// Variant of [`pull_model`] that lets callers pin the transport config used
+/// for the underlying HTTP client + idle-timeout policy. Constructs the
+/// request through the shared connection pool so chat and pull traffic share
+/// TCP/TLS sessions and bounds idle waits — a hung Ollama pull aborts with a
+/// `ProviderStream` timeout instead of pinning the TUI forever.
+///
+/// TODO(audit M-19): de-dupe concurrent identical pulls behind a
+/// `Mutex<HashMap<String, broadcast::Receiver<PullEvent>>>` so two
+/// simultaneous pulls of `qwen3-coder` share one socket and one event
+/// stream. The surface is large enough to deserve its own commit alongside
+/// the TUI progress hookup; punted until the model picker grows a "pull
+/// missing" flow (audit MEDIUM-2).
+pub fn pull_model_with_transport(
+    base_url: &str,
+    model: &str,
+    cancel: CancellationToken,
+    transport: ProviderTransportConfig,
+) -> PullStream {
+    let client = shared_client(&transport);
     let url = api_endpoint_url(base_url, "pull");
     let body = json!({ "model": model, "stream": true });
+    let idle = idle_timeout(transport);
 
     Box::pin(try_stream! {
         let response = tokio::select! {
@@ -693,10 +715,13 @@ pub fn pull_model(base_url: &str, model: &str, cancel: CancellationToken) -> Pul
         let mut decoder = JsonLineDecoder::default();
         let mut bytes = response.bytes_stream();
         loop {
-            let next = tokio::select! {
+            let polled = tokio::select! {
                 _ = cancel.cancelled() => return,
-                next = bytes.next() => next,
+                next = timeout(idle, bytes.next()) => next,
             };
+            let next = polled.map_err(|_| {
+                SqueezyError::ProviderStream("Ollama pull stream idle timeout".to_string())
+            })?;
             let Some(chunk) = next else { break; };
             let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
             for line in decoder.push(&chunk) {
