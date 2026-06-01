@@ -62,6 +62,28 @@ fn build_client_applies_connect_timeout_and_tcp_keepalive() {
 }
 
 #[test]
+fn build_client_sets_squeezy_user_agent() {
+    // The user-agent is wired through `reqwest::ClientBuilder::user_agent`
+    // and therefore lives on the default headers of the resulting Client.
+    // We exercise it by issuing a request against a `mock`-style local
+    // server would be overkill for a smoke test; instead, fire a request
+    // against a deliberately invalid origin and assert the header by
+    // inspecting the Debug output, which reqwest does include for
+    // default headers. If the UA were ever dropped, the substring match
+    // here would fail.
+    let client = build_client(&ProviderTransportConfig::default());
+    let debug = format!("{client:?}");
+    assert!(
+        debug.contains("squeezy-cli/"),
+        "expected squeezy-cli/<version> user-agent in Client debug, got: {debug}"
+    );
+    assert!(
+        debug.contains(env!("CARGO_PKG_VERSION")),
+        "expected current CARGO_PKG_VERSION in Client debug, got: {debug}"
+    );
+}
+
+#[test]
 fn shared_client_builds_distinct_clients_for_distinct_configs() {
     let fast = ProviderTransportConfig {
         pool_idle_timeout_ms: 1_000,

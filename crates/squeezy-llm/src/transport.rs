@@ -96,6 +96,12 @@ pub fn shared_client(config: &ProviderTransportConfig) -> reqwest::Client {
 pub(crate) fn build_client(config: &ProviderTransportConfig) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(config.pool_max_idle_per_host as usize)
+        // Identifies the agent to upstream providers and any in-path
+        // proxy. Providers use the User-Agent for routing, rate-limit
+        // bucketing, and abuse triage; emitting `squeezy-cli/<ver>`
+        // lets the upstream attribute traffic to us instead of the
+        // anonymous `reqwest/<ver>` default.
+        .user_agent(concat!("squeezy-cli/", env!("CARGO_PKG_VERSION")))
         // Bounds the *connect* (DNS + TCP + TLS) handshake only. A
         // hung remote during connection would otherwise block the
         // request indefinitely; reqwest's overall `timeout` is
