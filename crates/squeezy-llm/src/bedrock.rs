@@ -31,7 +31,7 @@ use crate::{
     LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
     anthropic_betas::bedrock_extra_body_betas,
     cache_policy::{DYNAMIC_TOOL_NAME_PREFIX, should_apply_caching},
-    retry::idle_timeout,
+    retry::{RetryPolicy, idle_timeout, with_stream_retry},
 };
 
 /// Anthropic's hard floor for `thinking.budget_tokens` on Bedrock —
@@ -177,150 +177,176 @@ impl LlmProvider for BedrockProvider {
         }
         let provider = self.clone();
         let transport = provider.transport;
-        Box::pin(try_stream! {
-            let client_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                result = provider.client() => result,
-            };
-            let client = client_result?;
-            let requested_model = request.model.to_string();
-            // Newer Anthropic Claude families (Sonnet 4.5 / Opus 4.6 /
-            // Sonnet 4.6) on Bedrock require a cross-region inference
-            // profile and reject the bare `anthropic.claude-*` id with
-            // `ValidationException`. Rewrite to `us./eu./apac./jp.`
-            // based on the configured region; ARNs and ids that already
-            // carry a profile prefix pass through verbatim. The
-            // resolved id is surfaced via `LlmEvent::ServerModel` so
-            // the transcript / cost-attribution layers see the actual
-            // model that produced the turn.
-            let model = apply_inference_profile_prefix(&requested_model, &provider.region);
-            if model != requested_model {
-                tracing::info!(
-                    provider = "bedrock",
-                    requested = %requested_model,
-                    resolved = %model,
-                    "rewrote Bedrock model id to cross-region inference profile"
-                );
-            }
-            let prompt_caching = should_apply_caching("bedrock", &request);
-            // Honor `CacheRetention::Long` end-to-end so Bedrock cache
-            // points carry `ttl: 1h` instead of silently degrading to
-            // the 5-minute default. When caching is disabled at the
-            // policy gate we pass `None` so no breakpoints are emitted.
-            let retention = if prompt_caching {
-                request.effective_cache_spec().retention
-            } else {
-                CacheRetention::None
-            };
-            let mut builder = client.converse_stream().model_id(&model);
-            for block in system_blocks(&request.instructions, retention)? {
-                builder = builder.system(block);
-            }
-            // Canonicalize cross-provider tool-call ids and
-            // synthesize placeholders for orphan tool results before
-            // building Bedrock `toolUse` / `toolResult` blocks.
-            // Bedrock's Converse API enforces the same Anthropic
-            // pairing rules (every `toolResult.toolUseId` must match
-            // a prior `toolUse.toolUseId` in the conversation) so a
-            // mid-session swap from a non-Anthropic provider can
-            // produce ids Bedrock either rejects on shape or fails
-            // to match.
-            let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
-            for message in conversation_messages(&normalized_input, retention)? {
-                builder = builder.messages(message);
-            }
-            if let Some(config) =
-                tool_configuration(&request.tools, retention, request.tool_choice.as_deref())?
-            {
-                builder = builder.tool_config(config);
-            }
-            if let Some(inference) = inference_configuration(&request) {
-                builder = builder.inference_config(inference);
-            }
-            let mut extra_fields: std::collections::HashMap<String, Document> =
-                std::collections::HashMap::new();
-            apply_thinking_extra_fields(&mut extra_fields, &request, &model);
-            let body_betas = bedrock_extra_body_betas(&request.beta_headers);
-            if !body_betas.is_empty() {
-                let beta_array = body_betas
-                    .iter()
-                    .map(|beta| Document::String(beta.as_ref().to_string()))
-                    .collect();
-                extra_fields.insert("anthropic_beta".to_string(), Document::Array(beta_array));
-            }
-            if !extra_fields.is_empty() {
-                builder =
-                    builder.additional_model_request_fields(Document::Object(extra_fields));
-            }
-            if let Some(metadata) = bedrock_request_metadata_map(&provider.request_metadata) {
-                builder = builder.set_request_metadata(Some(metadata));
-            }
-
-            let send_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                result = builder.send() => result,
-            };
-            let response = send_result.map_err(sdk_error_to_squeezy)?;
-
-            yield LlmEvent::Started;
-
-            // Surface the auto-applied inference-profile prefix so the
-            // TUI / transcript / cost-attribution layers see the actual
-            // model that produced the turn. Emitted at most once per
-            // stream — matches the cross-provider [`LlmEvent::ServerModel`]
-            // contract.
-            let mut server_model_echo = crate::ServerModelEcho::default();
-            if let Some(echo) = server_model_echo.observe(&requested_model, &model) {
-                yield echo;
-            }
-
-            let mut stream = response.stream;
-            let mut state = BedrockStreamState::default();
-            loop {
-                let polled = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        yield LlmEvent::Cancelled;
-                        return;
-                    }
-                    next = timeout(idle_timeout(transport), recv_event(&mut stream)) => next,
-                };
-                let event = polled.map_err(|_| {
-                    SqueezyError::ProviderStream("Bedrock stream idle timeout".to_string())
-                })??;
-                let Some(event) = event else { break; };
-                for llm_event in handle_bedrock_event(event, &mut state)? {
-                    yield llm_event;
-                }
-            }
-            if !state.saw_message_stop {
-                Err(SqueezyError::ProviderStream(
-                    "Bedrock stream ended without messageStop".to_string(),
-                ))?;
-            }
-            if !state.saw_metadata {
-                tracing::warn!(
-                    provider = "bedrock",
-                    model = %model,
-                    "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
-                );
-            }
-            if let Some(payload) = state.flush_reasoning() {
-                yield LlmEvent::ReasoningDone(payload);
-            }
-            yield LlmEvent::Completed {
-                response_id: None,
-                cost: state.cost(),
-                stop_reason: state.stop_reason.clone(),
-                reasoning_only_stop: false,
-            };
-        })
+        // Mid-stream `ModelStreamErrorException`, `ThrottlingException`,
+        // and `InternalServerException` are documented as retryable by
+        // AWS. Wrap each attempt in `with_stream_retry` so a transient
+        // hiccup mid-flight reconnects (with a `StreamSkipState` to
+        // suppress the already-yielded prefix) instead of tearing the
+        // whole turn down. The AWS SDK's own retry policy only covers
+        // the initial `send()` — once the event stream is open, only
+        // squeezy's retry harness can recover the connection.
+        let attempt_cancel = cancel.clone();
+        let make_attempt = move || -> LlmStream {
+            bedrock_stream_attempt(provider.clone(), request.clone(), attempt_cancel.clone())
+        };
+        with_stream_retry(
+            "bedrock",
+            RetryPolicy::provider_stream(transport),
+            cancel,
+            make_attempt,
+        )
     }
+}
+
+fn bedrock_stream_attempt(
+    provider: BedrockProvider,
+    request: LlmRequest,
+    cancel: CancellationToken,
+) -> LlmStream {
+    let transport = provider.transport;
+    Box::pin(try_stream! {
+        let client_result = tokio::select! {
+            _ = cancel.cancelled() => {
+                yield LlmEvent::Cancelled;
+                return;
+            }
+            result = provider.client() => result,
+        };
+        let client = client_result?;
+        let requested_model = request.model.to_string();
+        // Newer Anthropic Claude families (Sonnet 4.5 / Opus 4.6 /
+        // Sonnet 4.6) on Bedrock require a cross-region inference
+        // profile and reject the bare `anthropic.claude-*` id with
+        // `ValidationException`. Rewrite to `us./eu./apac./jp.`
+        // based on the configured region; ARNs and ids that already
+        // carry a profile prefix pass through verbatim. The
+        // resolved id is surfaced via `LlmEvent::ServerModel` so
+        // the transcript / cost-attribution layers see the actual
+        // model that produced the turn.
+        let model = apply_inference_profile_prefix(&requested_model, &provider.region);
+        if model != requested_model {
+            tracing::info!(
+                provider = "bedrock",
+                requested = %requested_model,
+                resolved = %model,
+                "rewrote Bedrock model id to cross-region inference profile"
+            );
+        }
+        let prompt_caching = should_apply_caching("bedrock", &request);
+        // Honor `CacheRetention::Long` end-to-end so Bedrock cache
+        // points carry `ttl: 1h` instead of silently degrading to
+        // the 5-minute default. When caching is disabled at the
+        // policy gate we pass `None` so no breakpoints are emitted.
+        let retention = if prompt_caching {
+            request.effective_cache_spec().retention
+        } else {
+            CacheRetention::None
+        };
+        let mut builder = client.converse_stream().model_id(&model);
+        for block in system_blocks(&request.instructions, retention)? {
+            builder = builder.system(block);
+        }
+        // Canonicalize cross-provider tool-call ids and
+        // synthesize placeholders for orphan tool results before
+        // building Bedrock `toolUse` / `toolResult` blocks.
+        // Bedrock's Converse API enforces the same Anthropic
+        // pairing rules (every `toolResult.toolUseId` must match
+        // a prior `toolUse.toolUseId` in the conversation) so a
+        // mid-session swap from a non-Anthropic provider can
+        // produce ids Bedrock either rejects on shape or fails
+        // to match.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        for message in conversation_messages(&normalized_input, retention)? {
+            builder = builder.messages(message);
+        }
+        if let Some(config) =
+            tool_configuration(&request.tools, retention, request.tool_choice.as_deref())?
+        {
+            builder = builder.tool_config(config);
+        }
+        if let Some(inference) = inference_configuration(&request) {
+            builder = builder.inference_config(inference);
+        }
+        let mut extra_fields: std::collections::HashMap<String, Document> =
+            std::collections::HashMap::new();
+        apply_thinking_extra_fields(&mut extra_fields, &request, &model);
+        let body_betas = bedrock_extra_body_betas(&request.beta_headers);
+        if !body_betas.is_empty() {
+            let beta_array = body_betas
+                .iter()
+                .map(|beta| Document::String(beta.as_ref().to_string()))
+                .collect();
+            extra_fields.insert("anthropic_beta".to_string(), Document::Array(beta_array));
+        }
+        if !extra_fields.is_empty() {
+            builder =
+                builder.additional_model_request_fields(Document::Object(extra_fields));
+        }
+        if let Some(metadata) = bedrock_request_metadata_map(&provider.request_metadata) {
+            builder = builder.set_request_metadata(Some(metadata));
+        }
+
+        let send_result = tokio::select! {
+            _ = cancel.cancelled() => {
+                yield LlmEvent::Cancelled;
+                return;
+            }
+            result = builder.send() => result,
+        };
+        let response = send_result.map_err(sdk_error_to_squeezy)?;
+
+        yield LlmEvent::Started;
+
+        // Surface the auto-applied inference-profile prefix so the
+        // TUI / transcript / cost-attribution layers see the actual
+        // model that produced the turn. Emitted at most once per
+        // stream — matches the cross-provider [`LlmEvent::ServerModel`]
+        // contract.
+        let mut server_model_echo = crate::ServerModelEcho::default();
+        if let Some(echo) = server_model_echo.observe(&requested_model, &model) {
+            yield echo;
+        }
+
+        let mut stream = response.stream;
+        let mut state = BedrockStreamState::default();
+        loop {
+            let polled = tokio::select! {
+                _ = cancel.cancelled() => {
+                    yield LlmEvent::Cancelled;
+                    return;
+                }
+                next = timeout(idle_timeout(transport), recv_event(&mut stream)) => next,
+            };
+            let event = polled.map_err(|_| {
+                SqueezyError::ProviderStream("Bedrock stream idle timeout".to_string())
+            })??;
+            let Some(event) = event else { break; };
+            for llm_event in handle_bedrock_event(event, &mut state)? {
+                yield llm_event;
+            }
+        }
+        if !state.saw_message_stop {
+            Err(SqueezyError::ProviderStream(
+                "Bedrock stream ended without messageStop".to_string(),
+            ))?;
+        }
+        if !state.saw_metadata {
+            tracing::warn!(
+                provider = "bedrock",
+                model = %model,
+                "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
+            );
+        }
+        if let Some(payload) = state.flush_reasoning() {
+            yield LlmEvent::ReasoningDone(payload);
+        }
+        yield LlmEvent::Completed {
+            response_id: None,
+            cost: state.cost(),
+            stop_reason: state.stop_reason.clone(),
+            reasoning_only_stop: false,
+        };
+    })
 }
 
 async fn recv_event(
