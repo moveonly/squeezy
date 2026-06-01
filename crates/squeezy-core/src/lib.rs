@@ -2123,9 +2123,24 @@ impl OpenAiCompatiblePreset {
             // upstream bearer when routing through AI Gateway. The optional
             // gateway-level token (`cf-aig-authorization`) is configured
             // separately via `CF_AIG_TOKEN` and injected as an extra header.
+            // Vendor-canonical alias `CLOUDFLARE_API_TOKEN` is exposed via
+            // [`Self::default_api_key_env_aliases`].
             Self::CloudflareWorkersAi => "CLOUDFLARE_API_KEY",
             Self::CloudflareAiGateway => "CLOUDFLARE_API_KEY",
             Self::Custom => "",
+        }
+    }
+
+    /// Vendor-canonical alternate env vars the caller may fall back to when
+    /// the primary [`Self::default_api_key_env`] is unset. The list is in
+    /// preference order (primary first is implied — only aliases are
+    /// returned). Empty for presets with no documented alias.
+    pub const fn default_api_key_env_aliases(self) -> &'static [&'static str] {
+        match self {
+            // Cloudflare's cURL + AI Gateway docs use CLOUDFLARE_API_TOKEN;
+            // only the JS SDK uses CLOUDFLARE_API_KEY. Both are valid.
+            Self::CloudflareWorkersAi | Self::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
+            _ => &[],
         }
     }
 
