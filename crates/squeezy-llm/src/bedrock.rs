@@ -570,19 +570,21 @@ struct BedrockStreamState {
 
 impl BedrockStreamState {
     fn cost(&self) -> CostSnapshot {
-        // Bedrock routes Claude models and inherits Anthropic's
-        // Messages-API convention where `usage.inputTokens` is the
-        // **uncached delta only**. Normalise to the cross-provider
-        // convention shared by OpenAI / Google / Ollama / compatible:
-        // `input_tokens` is the total prompt the model saw, and the
-        // cached share lives in `cached_input_tokens`. See the matching
-        // comment on `AnthropicStreamState::cost()`.
-        let base = self.input_tokens;
-        let cache_read = self.cache_read_input_tokens.unwrap_or(0);
-        let cache_write = self.cache_write_input_tokens.unwrap_or(0);
-        let total_input = base.map(|b| b.saturating_add(cache_read).saturating_add(cache_write));
+        // Bedrock reports inclusive total; we surface as-is.
+        //
+        // The Converse API populates `usage.inputTokens` as the
+        // **total** prompt tokens the model saw, with
+        // `cacheReadInputTokens` and `cacheWriteInputTokens` as
+        // *subsets* of that total (see opencode's
+        // `bedrock-converse.ts:405-418` for the same convention).
+        // The cross-provider `CostSnapshot.input_tokens` field
+        // expects the same inclusive total, so we pass the value
+        // through verbatim. The earlier convention here
+        // double-counted by treating `inputTokens` as Anthropic's
+        // "uncached delta" — for a heavy cache-hit workflow that
+        // inflated reported input-token counts by ~80%.
         CostSnapshot {
-            input_tokens: total_input,
+            input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             reasoning_output_tokens: None,
             cached_input_tokens: self.cache_read_input_tokens,

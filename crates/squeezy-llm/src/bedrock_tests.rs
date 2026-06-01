@@ -471,6 +471,38 @@ fn metadata_event_records_usage_tokens() {
     assert_eq!(state.output_tokens, Some(45));
 }
 
+/// NIT: cost() must surface `input_tokens` as the inclusive total
+/// Bedrock reports — not the sum of the total and its `cache_read`
+/// / `cache_write` subsets. A heavy cache-hit workflow previously
+/// saw ~80% inflation when those subsets were added back into the
+/// total; the fix surfaces the upstream value verbatim and keeps
+/// the cache subset breakdown on the dedicated fields.
+#[test]
+fn cost_surfaces_inclusive_input_tokens_without_double_counting_cache() {
+    let mut state = BedrockStreamState::default();
+    let usage = TokenUsage::builder()
+        .input_tokens(1000)
+        .output_tokens(75)
+        .total_tokens(1075)
+        .cache_read_input_tokens(900)
+        .cache_write_input_tokens(50)
+        .build()
+        .expect("build usage");
+    let metadata = ConverseStreamMetadataEvent::builder().usage(usage).build();
+    handle_bedrock_event(ConverseStreamOutput::Metadata(metadata), &mut state)
+        .expect("handle metadata");
+
+    let cost = state.cost();
+    assert_eq!(
+        cost.input_tokens,
+        Some(1000),
+        "input_tokens must equal Bedrock's inclusive total (1000), not 1000+900+50",
+    );
+    assert_eq!(cost.cached_input_tokens, Some(900));
+    assert_eq!(cost.cache_write_input_tokens, Some(50));
+    assert_eq!(cost.output_tokens, Some(75));
+}
+
 #[test]
 fn message_stop_without_metadata_leaves_usage_unset() {
     let mut state = BedrockStreamState::default();
