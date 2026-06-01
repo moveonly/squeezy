@@ -58,9 +58,9 @@ impl SemanticGraph {
                 .unwrap_or_else(|| file_symbol_id.clone());
             let target_name = import
                 .alias
-                .clone()
-                .unwrap_or_else(|| last_path_segment(&import.path));
-            let mut candidates = self.symbols_by_name_or_scan(&target_name);
+                .as_deref()
+                .unwrap_or_else(|| last_path_segment_str(&import.path));
+            let mut candidates = self.symbols_by_name_or_scan(target_name);
             if self
                 .files
                 .get(&import.file_id)
@@ -183,7 +183,7 @@ impl SemanticGraph {
                 .owner_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let candidates = self.symbols_by_name_or_scan(&last_path_segment(&reference.text));
+            let candidates = self.symbols_by_name_or_scan(last_path_segment_str(&reference.text));
             let (to, confidence) = match candidates.as_slice() {
                 [only] => (Some(only.clone()), Confidence::Heuristic),
                 _ => continue,
@@ -746,8 +746,8 @@ impl SemanticGraph {
         {
             let alias_or_name = import
                 .alias
-                .clone()
-                .unwrap_or_else(|| last_path_segment(&import.path));
+                .as_deref()
+                .unwrap_or_else(|| last_path_segment_str(&import.path));
             if alias_or_name == receiver_segments[0] {
                 let mut import_segments = path_segments(&import.path);
                 import_segments.extend(receiver_segments.iter().skip(1).cloned());
@@ -798,24 +798,19 @@ impl SemanticGraph {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
-        let mut same_file = candidates
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter(|symbol| {
-                symbol.file_id == caller.file_id
-                    && matches!(
-                        symbol.kind,
-                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
-                    )
-            })
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        same_file.sort_by(|left, right| left.0.cmp(&right.0));
-        same_file.dedup();
-        match same_file.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
+        single_unique(
+            candidates
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| {
+                    symbol.file_id == caller.file_id
+                        && matches!(
+                            symbol.kind,
+                            SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                        )
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
     }
 
     pub(crate) fn imported_direct_call(
@@ -828,18 +823,13 @@ impl SemanticGraph {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
-        let mut imported_candidates = candidates
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter(|symbol| self.symbol_is_imported_as(caller, symbol, &call.name))
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        imported_candidates.sort_by(|left, right| left.0.cmp(&right.0));
-        imported_candidates.dedup();
-        match imported_candidates.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
+        single_unique(
+            candidates
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| self.symbol_is_imported_as(caller, symbol, &call.name))
+                .map(|symbol| symbol.id.clone()),
+        )
     }
 
     pub(crate) fn import_alias_direct_call(
@@ -927,7 +917,7 @@ impl SemanticGraph {
                     .alias
                     .as_deref()
                     .map(|alias| alias == name)
-                    .unwrap_or_else(|| last_path_segment(&import.path) == name)
+                    .unwrap_or_else(|| last_path_segment_str(&import.path) == name)
             })
             .any(|import| self.import_matches_symbol(import, symbol))
     }
@@ -941,7 +931,7 @@ impl SemanticGraph {
             return false;
         }
         let Some(file) = self.files.get(&symbol.file_id) else {
-            if last_path_segment(&import.path) != symbol.name {
+            if last_path_segment_str(&import.path) != symbol.name.as_str() {
                 return false;
             }
             return true;
@@ -961,7 +951,7 @@ impl SemanticGraph {
         if file.language == squeezy_core::LanguageKind::Swift {
             return self.swift_import_matches_symbol(import, symbol);
         }
-        if last_path_segment(&import.path) != symbol.name {
+        if last_path_segment_str(&import.path) != symbol.name.as_str() {
             return false;
         }
         if file.language != squeezy_core::LanguageKind::Python

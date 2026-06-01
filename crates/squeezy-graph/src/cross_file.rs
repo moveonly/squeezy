@@ -207,20 +207,26 @@ impl SemanticGraph {
         let mut queue: VecDeque<SymbolId> = VecDeque::new();
         queue.push_back(start.clone());
         while let Some(current) = queue.pop_front() {
-            // Visit edge kinds in the PHP method-resolution order so trait
-            // ancestors land in `order` before the `Extends` parent and
-            // before any `Implements` interface. We pay the small cost of
-            // three filtered passes per node so the per-kind enumeration
-            // order is preserved even when the underlying `self.edges()`
-            // slice is in insertion order.
-            for kind in ANCESTOR_EDGE_KINDS {
-                for edge in self.edges() {
-                    if edge.from != current || edge.kind != kind {
-                        continue;
-                    }
-                    let Some(target) = edge.to.clone() else {
-                        continue;
-                    };
+            // Preserve PHP method-resolution priority without scanning the
+            // full edge list once for every edge kind.
+            let mut by_kind = [Vec::new(), Vec::new(), Vec::new()];
+            for edge in self.edges() {
+                if edge.from != current {
+                    continue;
+                }
+                let Some(kind_index) = ANCESTOR_EDGE_KINDS
+                    .iter()
+                    .position(|kind| *kind == edge.kind)
+                else {
+                    continue;
+                };
+                let Some(target) = &edge.to else {
+                    continue;
+                };
+                by_kind[kind_index].push(target.clone());
+            }
+            for targets in by_kind {
+                for target in targets {
                     if visited.insert(target.clone()) {
                         order.push(target.clone());
                         queue.push_back(target);

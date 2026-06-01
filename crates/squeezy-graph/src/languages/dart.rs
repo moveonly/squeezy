@@ -85,15 +85,14 @@ impl SemanticGraph {
         let (mixins, bases, ifaces, ons) = dart_ancestor_attributes(class);
         // Dart resolution order: mixin chain right-to-left, then superclass,
         // then implements, then `on` constraints.
-        let mut reversed_mixins = mixins.clone();
-        reversed_mixins.reverse();
-        for name in reversed_mixins
-            .into_iter()
-            .chain(bases)
-            .chain(ifaces)
-            .chain(ons)
+        for name in mixins
+            .iter()
+            .rev()
+            .chain(bases.iter())
+            .chain(ifaces.iter())
+            .chain(ons.iter())
         {
-            for candidate_class_id in self.dart_class_symbols_by_name(&name) {
+            for candidate_class_id in self.dart_class_symbols_by_name(name) {
                 if let Some(method) = self.dart_method_on_class(&candidate_class_id, method_name) {
                     return Some(method);
                 }

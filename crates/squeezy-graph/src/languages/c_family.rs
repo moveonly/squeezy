@@ -14,7 +14,7 @@ impl SemanticGraph {
         let include_paths = self
             .imports_for_file(&caller.file_id)
             .filter(|import| import.provenance.reason.contains("include directive"))
-            .map(|import| import.path.clone())
+            .map(|import| import.path.as_str())
             .collect::<Vec<_>>();
         if include_paths.is_empty() {
             return None;
@@ -28,46 +28,37 @@ impl SemanticGraph {
         // jump to. We also let any same-workspace C/C++ symbol resolve so
         // a single-defining function still binds when the include only
         // declares it.
-        let header_matches = candidates
+        let mut header_matches = Vec::new();
+        let mut definitions = Vec::new();
+        for symbol in candidates
             .iter()
             .filter_map(|id| self.symbols.get(id))
             .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method))
-            .filter(|symbol| {
-                self.files
-                    .get(&symbol.file_id)
-                    .map(|file| {
-                        matches!(file.language, LanguageKind::C | LanguageKind::Cpp)
-                            && include_paths.iter().any(|include| {
-                                include_path_matches_file(include, &file.relative_path)
-                            })
-                    })
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
+        {
+            let Some(file) = self.files.get(&symbol.file_id) else {
+                continue;
+            };
+            if !matches!(file.language, LanguageKind::C | LanguageKind::Cpp) {
+                continue;
+            }
+            if include_paths
+                .iter()
+                .any(|include| include_path_matches_file(include, &file.relative_path))
+            {
+                header_matches.push(symbol.id.clone());
+            }
+            if symbol.body_span.is_some()
+                && include_paths
+                    .iter()
+                    .any(|include| file_shares_include_root(include, &file.relative_path))
+            {
+                definitions.push(symbol.id.clone());
+            }
+        }
 
-        let definitions = candidates
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter(|symbol| {
-                matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
-                    && symbol.body_span.is_some()
-            })
-            .filter(|symbol| {
-                self.files
-                    .get(&symbol.file_id)
-                    .map(|file| {
-                        matches!(file.language, LanguageKind::C | LanguageKind::Cpp)
-                            && include_paths.iter().any(|include| {
-                                file_shares_include_root(include, &file.relative_path)
-                            })
-                    })
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-
-        if let Some(only) = single_unique(definitions.iter().map(|symbol| symbol.id.clone())) {
+        if let Some(only) = single_unique(definitions) {
             return Some(only);
         }
-        single_unique(header_matches.iter().map(|symbol| symbol.id.clone()))
+        single_unique(header_matches)
     }
 }

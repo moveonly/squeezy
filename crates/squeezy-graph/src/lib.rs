@@ -495,6 +495,7 @@ impl SemanticGraph {
 
     pub fn from_parsed(files: Vec<ParsedFile>) -> Self {
         let mut graph = Self::empty();
+        graph.reserve_parsed_capacity(&files);
         for file in files {
             graph.insert_parsed_file(file);
         }
@@ -504,6 +505,22 @@ impl SemanticGraph {
         graph.rebuild_semantic_edges();
         graph.rebuild_indexes();
         graph
+    }
+
+    fn reserve_parsed_capacity(&mut self, files: &[ParsedFile]) {
+        let file_count = files.len();
+        let symbol_count = files.iter().map(|file| file.symbols.len()).sum::<usize>();
+        self.files.reserve(file_count);
+        self.symbols.reserve(file_count + symbol_count);
+        self.edges.reserve(symbol_count);
+        self.imports
+            .reserve(files.iter().map(|file| file.imports.len()).sum());
+        self.calls
+            .reserve(files.iter().map(|file| file.calls.len()).sum());
+        self.references
+            .reserve(files.iter().map(|file| file.references.len()).sum());
+        self.body_hits
+            .reserve(files.iter().map(|file| file.body_hits.len()).sum());
     }
 
     pub fn replace_file(&mut self, file: ParsedFile) {
@@ -1001,19 +1018,34 @@ impl SemanticGraph {
     }
 
     fn insert_parsed_file(&mut self, file: ParsedFile) {
-        self.files.insert(file.file.id.clone(), file.file.clone());
-        if let Some(package) = &file.package {
-            self.packages.insert(file.file.id.clone(), package.clone());
+        let ParsedFile {
+            file,
+            package,
+            symbols,
+            imports,
+            calls,
+            references,
+            body_hits,
+            unsupported,
+            ..
+        } = file;
+        let file_id = file.id.clone();
+        let file_symbol = unsupported.is_none().then(|| file_symbol(&file));
+        self.files.insert(file_id.clone(), file);
+        if let Some(package) = package {
+            self.packages.insert(file_id.clone(), package);
         }
-        if file.unsupported.is_some() {
+        if unsupported.is_some() {
             return;
         }
 
-        let file_symbol = file_symbol(&file.file);
+        let Some(file_symbol) = file_symbol else {
+            return;
+        };
         let file_symbol_id = file_symbol.id.clone();
         self.symbols.insert(file_symbol_id.clone(), file_symbol);
 
-        for symbol in file.symbols {
+        for symbol in symbols {
             let symbol = GraphSymbol::from(symbol);
             let parent_id = symbol
                 .parent_id
@@ -1033,10 +1065,10 @@ impl SemanticGraph {
             self.symbols.insert(symbol.id.clone(), symbol);
         }
 
-        self.imports.extend(file.imports.clone());
-        self.calls.extend(file.calls.clone());
-        self.references.extend(file.references.clone());
-        self.body_hits.extend(file.body_hits.clone());
+        self.imports.extend(imports);
+        self.calls.extend(calls);
+        self.references.extend(references);
+        self.body_hits.extend(body_hits);
     }
 
     fn rebuild_java_project_facts(&mut self) {
@@ -1071,6 +1103,7 @@ impl SemanticGraph {
         self.java_project_facts_cache
             .retain(|file_id, _| metadata_ids.contains(file_id));
 
+        let java_path_refs = java_paths.iter().map(String::as_str).collect::<Vec<_>>();
         let mut dedup = BTreeSet::new();
         for (provider, file) in metadata_files {
             let cache_hit = self
@@ -1082,7 +1115,6 @@ impl SemanticGraph {
                 .unwrap_or(false);
 
             if !cache_hit {
-                let java_path_refs = java_paths.iter().map(String::as_str).collect::<Vec<_>>();
                 let source_root_facts = java_source_root_facts(provider, &java_path_refs);
                 let (dependency_values, configured_source_facts) =
                     if let Ok(source) = std::fs::read_to_string(&file.path) {
@@ -1288,6 +1320,7 @@ impl SemanticGraph {
         self.kotlin_project_facts_cache
             .retain(|file_id, _| metadata_ids.contains(file_id));
 
+        let kotlin_path_refs = kotlin_paths.iter().map(String::as_str).collect::<Vec<_>>();
         let mut dedup = BTreeSet::new();
         for (provider, file) in metadata_files {
             let cache_hit = self
@@ -1299,7 +1332,6 @@ impl SemanticGraph {
                 .unwrap_or(false);
 
             if !cache_hit {
-                let kotlin_path_refs = kotlin_paths.iter().map(String::as_str).collect::<Vec<_>>();
                 let source_root_facts = kotlin_source_root_facts(provider, &kotlin_path_refs);
                 let (dependency_values, configured_source_facts) =
                     if let Ok(source) = std::fs::read_to_string(&file.path) {
@@ -1424,6 +1456,14 @@ impl SemanticGraph {
         self.edges_by_to.clear();
         self.rebuild_import_indexes();
 
+        self.symbols_by_name.reserve(self.symbols.len());
+        self.symbol_signature_lower.reserve(self.symbols.len());
+        self.body_hit_text_lower.reserve(self.body_hits.len());
+        self.references_by_text.reserve(self.references.len());
+        self.children_by_parent.reserve(self.symbols.len());
+        self.edges_by_from.reserve(self.edges.len());
+        self.edges_by_to.reserve(self.edges.len());
+
         for symbol in self.symbols.values() {
             self.symbols_by_name
                 .entry(symbol.name.clone())
@@ -1524,6 +1564,10 @@ impl SemanticGraph {
         self.arity_index.clear();
         self.rebuild_import_indexes();
 
+        self.symbols_by_name.reserve(self.symbols.len());
+        self.children_by_parent.reserve(self.symbols.len());
+        self.arity_index.reserve(self.symbols.len());
+
         for symbol in self.symbols.values() {
             self.symbols_by_name
                 .entry(symbol.name.clone())
@@ -1608,19 +1652,20 @@ impl SemanticGraph {
             }
             let target_name = import
                 .alias
-                .clone()
-                .unwrap_or_else(|| last_path_segment(&import.path));
-            for symbol_id in self.symbols_by_name.get(&target_name).into_iter().flatten() {
+                .as_deref()
+                .unwrap_or_else(|| last_path_segment_str(&import.path));
+            let importer_file = import.file_id.clone();
+            for symbol_id in self.symbols_by_name.get(target_name).into_iter().flatten() {
                 let Some(symbol) = self.symbols.get(symbol_id) else {
                     continue;
                 };
-                if symbol.file_id == import.file_id {
+                if symbol.file_id == importer_file {
                     continue;
                 }
                 updates
                     .entry(symbol.file_id.clone())
                     .or_default()
-                    .push(import.file_id.clone());
+                    .push(importer_file.clone());
             }
         }
         for (target, mut importers) in updates {
@@ -1637,6 +1682,8 @@ impl SemanticGraph {
         self.java_package_by_file.clear();
         self.kotlin_package_by_file.clear();
         self.scala_package_by_file.clear();
+        self.imports_by_file.reserve(self.imports.len());
+        self.imports_by_alias_target.reserve(self.imports.len());
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
                 .entry(import.file_id.clone())
@@ -1668,12 +1715,12 @@ impl SemanticGraph {
             if import.alias.is_none() {
                 continue;
             }
-            let leaf = last_path_segment(&import.path);
+            let leaf = last_path_segment_str(&import.path);
             if leaf == "*" || leaf.is_empty() {
                 self.wildcard_aliased_imports.push(index);
             } else {
                 self.imports_by_alias_target
-                    .entry(leaf)
+                    .entry(leaf.to_string())
                     .or_default()
                     .push(index);
             }
@@ -1697,10 +1744,9 @@ impl SemanticGraph {
         match rarest_indexed_trigram(needle, &self.signature_trigram_index) {
             CandidateSet::All => self.symbols.values().collect(),
             CandidateSet::None => Vec::new(),
-            CandidateSet::Indexes(ids) => ids
-                .into_iter()
-                .filter_map(|id| self.symbols.get(&id))
-                .collect(),
+            CandidateSet::Indexes(ids) => {
+                ids.iter().filter_map(|id| self.symbols.get(id)).collect()
+            }
         }
     }
 
@@ -1724,12 +1770,12 @@ impl SemanticGraph {
                 .collect(),
             CandidateSet::None => Vec::new(),
             CandidateSet::Indexes(indexes) => indexes
-                .into_iter()
+                .iter()
                 .filter_map(|index| {
-                    let lower = self.body_hit_text_lower.get(index)?;
+                    let lower = self.body_hit_text_lower.get(*index)?;
                     lower
                         .contains(needle)
-                        .then(|| self.body_hits.get(index))
+                        .then(|| self.body_hits.get(*index))
                         .flatten()
                 })
                 .collect(),
@@ -1737,16 +1783,16 @@ impl SemanticGraph {
     }
 }
 
-enum CandidateSet<T> {
+enum CandidateSet<'a, T> {
     All,
     None,
-    Indexes(Vec<T>),
+    Indexes(&'a [T]),
 }
 
-fn rarest_indexed_trigram<T: Clone>(
+fn rarest_indexed_trigram<'a, T>(
     needle: &str,
-    index: &HashMap<[u8; 3], Vec<T>>,
-) -> CandidateSet<T> {
+    index: &'a HashMap<[u8; 3], Vec<T>>,
+) -> CandidateSet<'a, T> {
     let trigrams = unique_trigrams(needle);
     if trigrams.is_empty() {
         return CandidateSet::All;
@@ -1766,7 +1812,7 @@ fn rarest_indexed_trigram<T: Clone>(
         }
     }
 
-    best.map(|candidates| CandidateSet::Indexes(candidates.clone()))
+    best.map(|candidates| CandidateSet::Indexes(candidates.as_slice()))
         .unwrap_or(CandidateSet::All)
 }
 
@@ -2925,6 +2971,10 @@ fn symbol_is_exported(symbol: &GraphSymbol) -> bool {
 }
 
 fn last_path_segment(path: &str) -> String {
+    last_path_segment_str(path).to_string()
+}
+
+fn last_path_segment_str(path: &str) -> &str {
     // Strip C/C++ pointer-arrow access (`runner->id` → `id`) before the
     // other separators so dotted/scoped reference text from the C-family
     // path collapses to the symbol leaf the same way Rust/Python does.
@@ -2948,11 +2998,10 @@ fn last_path_segment(path: &str) -> String {
         .trim()
         .trim_end_matches('!')
         .trim_end_matches("::*")
-        .to_string()
 }
 
 fn reference_text_matches_symbol(reference: &ParsedReference, symbol: &GraphSymbol) -> bool {
-    reference.text == symbol.name || last_path_segment(&reference.text) == symbol.name
+    reference.text == symbol.name || last_path_segment_str(&reference.text) == symbol.name.as_str()
 }
 
 fn reference_kind_can_bind_symbol(reference: &ParsedReference, symbol: &GraphSymbol) -> bool {
@@ -3027,7 +3076,7 @@ fn constructor_reference_can_bind_symbol(
             reference.kind,
             ReferenceKind::Identifier | ReferenceKind::Path
         )
-        || last_path_segment(&reference.text) != symbol.name
+        || last_path_segment_str(&reference.text) != symbol.name.as_str()
         || matches!(symbol.name.as_str(), "None" | "Some" | "Ok" | "Err")
         || !symbol
             .name
