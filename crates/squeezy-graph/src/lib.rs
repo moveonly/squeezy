@@ -1505,7 +1505,7 @@ impl SemanticGraph {
                 .entry(reference.text.clone())
                 .or_default()
                 .push(index);
-            let leaf = last_path_segment(&reference.text);
+            let leaf = last_path_segment_str(&reference.text);
             // Suffix keys let `reference_candidate_indexes` answer
             // dotted/arrow/scoped lookups in O(matches) instead of scanning
             // every reference. We populate them eagerly here because index
@@ -3200,14 +3200,10 @@ fn receiver_from_dotted_reference(path: &str) -> Option<String> {
 /// the text, if any. Used by index construction to derive dotted/arrow
 /// suffix keys without scanning the reference text repeatedly at query
 /// time.
-fn receiver_split(text: &str, delimiter: char) -> Option<String> {
+fn receiver_split(text: &str, delimiter: char) -> Option<&str> {
     let (_, rest) = text.rsplit_once(delimiter)?;
     let rest = rest.trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_string())
-    }
+    if rest.is_empty() { None } else { Some(rest) }
 }
 
 fn module_path_for_file(path: &str) -> Vec<String> {
