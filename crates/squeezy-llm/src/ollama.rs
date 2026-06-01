@@ -39,6 +39,17 @@ pub struct OllamaProvider {
     base_url: String,
     transport: ProviderTransportConfig,
     compat: Option<LMStudioProvider>,
+    /// Optional `keep_alive` value forwarded to every native chat request.
+    /// Accepts Ollama's documented forms — duration strings (`"5m"`,
+    /// `"24h"`), integer seconds (`"30"`), `"0"` to evict immediately,
+    /// or `"-1"` to keep the model resident forever. Read from
+    /// `OllamaConfig.keep_alive` once Phase 4FH lands the squeezy-core
+    /// field; populated as `None` until then.
+    keep_alive: Option<String>,
+    /// Optional bearer token for Ollama Cloud / reverse-proxy-protected
+    /// self-hosted Ollama. Read from `OllamaConfig.api_key` once Phase
+    /// 4FH lands the squeezy-core field; populated as `None` until then.
+    api_key: Option<String>,
 }
 
 impl OllamaProvider {
@@ -57,10 +68,40 @@ impl OllamaProvider {
             base_url,
             transport: config.transport,
             compat,
+            // TODO(audit H-16): plumb `OllamaConfig.keep_alive` once Phase 4FH
+            // adds the field to squeezy-core. Read path is wired through
+            // `with_keep_alive` and `request_body` today.
+            keep_alive: None,
+            // TODO(audit Low/OAuth): plumb `OllamaConfig.api_key` once Phase
+            // 4FH adds the field to squeezy-core. Read path is wired through
+            // `with_api_key` and the native request layer today.
+            api_key: None,
         }
     }
 
+    /// Override the optional `keep_alive` value used on every native chat
+    /// request. Returns `self` for chaining; intended for use sites that
+    /// construct the provider directly (e.g. tests, future config-bridge
+    /// glue) ahead of the Phase 4FH config field landing.
+    pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
+        self.keep_alive = Some(keep_alive.into());
+        self
+    }
+
+    /// Override the optional bearer token used on every native request
+    /// (e.g. Ollama Cloud, reverse-proxy-protected self-host). Returns
+    /// `self` for chaining; same provisional plumb as `with_keep_alive`.
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        Self::request_body_with(request, None)
+    }
+
+    pub(crate) fn request_body_with(request: &LlmRequest, keep_alive: Option<&str>) -> Value {
         // Canonicalize tool-call ids and synthesize placeholders for
         // orphan tool results before building Ollama's `messages`
         // array. Ollama's native route drops the `call_id` on the
@@ -106,6 +147,15 @@ impl OllamaProvider {
                     }))
                     .collect::<Vec<_>>()
             );
+        }
+        // Pass through configured `keep_alive` so the server retains the
+        // model between turns (or evicts it eagerly). Ollama's default
+        // is 5 minutes; agents idling longer pay the full load tax on
+        // resume. Accepts duration strings (`"5m"`, `"24h"`), integer
+        // seconds (`"30"`), `"0"` for immediate eviction, or `"-1"` to
+        // pin the model indefinitely.
+        if let Some(value) = keep_alive {
+            body["keep_alive"] = json!(value);
         }
         body
     }
@@ -249,12 +299,17 @@ impl LlmProvider for OllamaProvider {
         }
         let client = self.client.clone();
         let url = api_endpoint_url(&self.base_url, "chat");
-        let body = Self::request_body(&request);
+        let body = Self::request_body_with(&request, self.keep_alive.as_deref());
         let transport = self.transport;
+        let api_key = self.api_key.clone();
 
         Box::pin(try_stream! {
             let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-                client.post(&url).json(&body)
+                let mut builder = client.post(&url).json(&body);
+                if let Some(token) = api_key.as_deref() {
+                    builder = builder.bearer_auth(token);
+                }
+                builder
             }).await?;
             let status = response.status();
             let response = if status.is_success() {

@@ -44,6 +44,46 @@ fn request_body_uses_chat_stream_shape() {
 }
 
 #[test]
+fn request_body_emits_keep_alive_when_set() {
+    let request = LlmRequest {
+        model: "qwen3".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let with_value = OllamaProvider::request_body_with(&request, Some("24h"));
+    assert_eq!(with_value["keep_alive"], "24h");
+
+    let without_value = OllamaProvider::request_body_with(&request, None);
+    assert!(without_value.get("keep_alive").is_none());
+}
+
+#[test]
+fn with_keep_alive_sets_field_for_plumbing() {
+    let provider = OllamaProvider::from_config(&squeezy_core::OllamaConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: squeezy_core::OllamaRoute::Native,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    })
+    .with_keep_alive("-1")
+    .with_api_key("secret-token");
+    assert_eq!(provider.keep_alive.as_deref(), Some("-1"));
+    assert_eq!(provider.api_key.as_deref(), Some("secret-token"));
+}
+
+#[test]
 fn request_body_always_sets_num_ctx_default() {
     let request = LlmRequest {
         model: "qwen3".to_string().into(),
