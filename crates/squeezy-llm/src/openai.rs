@@ -184,11 +184,31 @@ impl OpenAiProvider {
         // `google_call_…`, `tooluse_…`) and the pairing breaks even
         // though OpenAI itself accepts the id shape.
         let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        // H-37 (Azure default): Azure's Responses API requires
+        // `store: true` for the multi-turn `previous_response_id` flow
+        // (the prior response must persist on the server). Codex's
+        // client mirrors this with
+        // `store: provider.is_azure_responses_endpoint()`
+        // (`others/codex/codex-rs/core/src/client.rs:761`).
+        // Honor the caller's explicit setting if they passed `true`;
+        // otherwise default to `true` for Azure regardless of the
+        // request-side `store` slot. Non-Azure providers keep the
+        // caller's verbatim value.
+        let effective_store = if provider_name == "azure_openai" {
+            // Caller already opted in (or already opted out via the
+            // explicit `store: true/false`). We can't distinguish a
+            // caller-supplied `false` from the default `false` at this
+            // layer without a schema add, so default to `true` for
+            // Azure and document the override in the docstring above.
+            true
+        } else {
+            request.store
+        };
         let mut body = json!({
             "model": request.model,
             "input": openai_input(&normalized_input),
             "stream": true,
-            "store": request.store,
+            "store": effective_store,
         });
         // M-02: only emit `instructions` when non-empty. An empty string
         // would shadow the stored conversation default on a

@@ -1535,6 +1535,41 @@ fn request_body_falls_back_to_string_output_when_content_parts_unset() {
 }
 
 #[test]
+fn request_body_defaults_store_true_for_azure_provider() {
+    // H-37: Azure Responses requires `store: true` for the multi-turn
+    // `previous_response_id` flow (the prior response must persist on
+    // the server). The OpenAI / xAI / Codex paths still honor the
+    // caller's verbatim `request.store` value.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: Some("resp_prior".to_string()),
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false, // caller default — Azure must still force true
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    let azure_body = OpenAiProvider::request_body(&request, "azure_openai");
+    assert_eq!(azure_body["store"], true, "Azure must default store=true");
+
+    let openai_body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(
+        openai_body["store"], false,
+        "OpenAI must honor caller's request.store verbatim"
+    );
+}
+
+#[test]
 fn build_responses_url_appends_preview_api_version_for_azure() {
     // C-13: caller-supplied `?api-version=preview` MUST land verbatim on
     // the URL. The DEFAULT_AZURE_OPENAI_API_VERSION constant in
