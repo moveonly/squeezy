@@ -2027,7 +2027,7 @@ impl OpenAiCompatiblePreset {
             Self::XAi => "xAI",
             Self::DeepSeek => "DeepSeek",
             Self::Vertex => "Google Vertex AI",
-            Self::Mistral => "Mistral La Plateforme",
+            Self::Mistral => "Mistral AI",
             Self::Together => "Together AI",
             Self::Fireworks => "Fireworks AI",
             Self::Cerebras => "Cerebras",
@@ -2046,11 +2046,14 @@ impl OpenAiCompatiblePreset {
     /// integration test ships in `crates/squeezy-llm/tests/`. Light presets
     /// return `false` and fall back to generic context-window estimates.
     pub const fn is_full_tier(self) -> bool {
+        // PortKey was historically full-tier but has no dedicated costly
+        // integration test and routes via user-defined virtual keys /
+        // integration slugs (see preset-portkey.md PK-3). Treat as a light
+        // preset until a costly test ships.
         matches!(
             self,
             Self::OpenRouter
                 | Self::Vercel
-                | Self::PortKey
                 | Self::Groq
                 | Self::XAi
                 | Self::DeepSeek
