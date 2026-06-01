@@ -2008,6 +2008,50 @@ pub enum ProviderConfig {
     Faux(FauxConfig),
 }
 
+/// OpenAI Chat-Completions–style providers (one struct, many presets).
+///
+/// # Per-preset notes
+///
+/// **Fireworks (M-71)**: Fireworks ships three distinct API surfaces:
+/// 1. `/v1/chat/completions` — the OpenAI-compatible chat shape that
+///    this preset targets, supports the full Fireworks model catalog.
+/// 2. `/v1/responses` — Fireworks' own Responses API with hosted MCP
+///    tool support (not reachable via squeezy's `Fireworks` preset
+///    today; users wanting MCP tools can wire the `Custom` preset to
+///    `/v1/responses` and emit `OpenAI-Beta: responses=v1`).
+/// 3. `/v1/messages` — Anthropic-compatible Messages API surface, used
+///    by Pi for its 13 curated models. Reachable via the `Anthropic`
+///    provider with a custom `base_url`.
+///
+/// **Cerebras (M-58)**: chat-completions v2 (default-switchover
+/// 2026-07-21) tightens schema validation to require
+/// `max_completion_tokens` instead of `max_tokens`. The squeezy-llm
+/// Cerebras path emits the new key on the wire; squeezy-core surfaces
+/// a `ConfigWarning` at build time when `model.max_output_tokens` is
+/// set so operators can plan their cutover.
+///
+/// **Baseten (H-38)**: dedicated deployments live behind
+/// per-deployment hosts (`https://model-{deployment_id}.api.baseten.co/...`).
+/// Setting [`Self::deployment_id`] (or `BASETEN_DEPLOYMENT_ID`)
+/// substitutes the placeholder before the request fires; the
+/// `Baseten` preset still owns the `BASETEN_API_KEY` autoload and
+/// the `baseten` registry namespace.
+///
+/// **Cloudflare AI Gateway (H-41)**: typed `cf-aig-*` knobs ride on
+/// [`Self::cf_ai_gateway`]. User-supplied entries in
+/// [`Self::extra_headers`] always win over the projected
+/// `cf-aig-*` headers, matching the precedence for
+/// `cf-aig-authorization`.
+///
+/// **Vertex (H-28, VX-A/B)**: opt in to OAuth-sourced bearer tokens
+/// via [`Self::use_oauth`] (TOML `use_oauth = true` or implied by
+/// `GOOGLE_APPLICATION_CREDENTIALS` without `VERTEX_ACCESS_TOKEN`).
+/// The `global` location resolves to bare `aiplatform.googleapis.com`,
+/// matching Google's only-via-global Gemini 3 routing.
+///
+/// **Vercel AI Gateway (VL-2)**: `VERCEL_OIDC_TOKEN` (12h TTL,
+/// auto-injected into every Vercel function runtime) flows in as
+/// `api_key_env` when no explicit `AI_GATEWAY_API_KEY` is set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
     pub preset: OpenAiCompatiblePreset,
