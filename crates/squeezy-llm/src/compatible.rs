@@ -636,6 +636,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // where a deployment really does want a config/virtual-key
         // header.
         let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
+        // H-54: llamacpp's chat-completions endpoint requires the
+        // server to have been started with `--jinja` to honour the
+        // tool-call schema. Without the flag the server 500s on
+        // any request that carries `tools: [...]` with no
+        // actionable error text. We attach a hint downstream.
+        let llamacpp_tools_attempt =
+            matches!(preset, OpenAiCompatiblePreset::LlamaCpp) && !request.tools.is_empty();
         let body = Self::request_body_for_preset(&request, preset);
         let provider_label = self.preset.display_name();
 
@@ -703,6 +710,18 @@ impl LlmProvider for OpenAiCompatibleProvider {
                          providers.portkey.headers (x-portkey-config / x-portkey-virtual-key / \
                          x-portkey-provider). Set one of those and retry."
                     }
+                } else if llamacpp_tools_attempt
+                    && status.is_server_error()
+                {
+                    // H-54: llamacpp's chat-completions surface 500s on
+                    // any tool-call request when the server is not
+                    // started with `--jinja`. Surface the actionable
+                    // hint so users don't have to grep upstream logs
+                    // to discover the flag.
+                    " — hint: llama.cpp requires `--jinja` on the server command line \
+                     to honour OpenAI-style `tools` payloads. Restart `llama-server` \
+                     with `--jinja --chat-template-file /path/to/template.jinja` (or \
+                     the bundled `chatml` template) and retry."
                 } else {
                     local_jit_load_hint(preset, status, &message)
                 };
