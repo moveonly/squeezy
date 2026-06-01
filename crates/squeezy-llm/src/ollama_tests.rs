@@ -157,6 +157,41 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn parser_decodes_string_encoded_tool_arguments() {
+    let mut server_model_slot: Option<String> = None;
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":"{\"pattern\":\"needle\"}"}}]}}"#,
+        &mut server_model_slot,
+    )
+    .expect("string arguments parse");
+    assert_eq!(
+        events[0],
+        LlmEvent::ToolCall(LlmToolCall {
+            call_id: "ollama_call_0".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "needle"}),
+        })
+    );
+}
+
+#[test]
+fn parser_marks_invalid_string_encoded_tool_arguments() {
+    let mut server_model_slot: Option<String> = None;
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":"{not-json"}}]}}"#,
+        &mut server_model_slot,
+    )
+    .expect("unparseable string still surfaces a call");
+    let LlmEvent::ToolCall(call) = &events[0] else {
+        panic!("expected ToolCall event, got {events:?}");
+    };
+    let obj = call.arguments.as_object().expect("marker is an object");
+    assert_eq!(obj[crate::INVALID_TOOL_ARGUMENTS_KEY], true);
+    assert_eq!(obj[crate::INVALID_TOOL_ARGUMENTS_RAW_KEY], "{not-json");
+    assert!(obj.contains_key(crate::INVALID_TOOL_ARGUMENTS_ERROR_KEY));
+}
+
+#[test]
 fn parser_treats_load_and_unload_done_reasons_as_noop() {
     // Ollama emits `{"done":true,"done_reason":"load"}` and `"unload"`
     // housekeeping frames around model lifecycle. They are not turn

@@ -443,10 +443,28 @@ fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Resu
                     SqueezyError::ProviderStream("Ollama tool call missing name".to_string())
                 })?
                 .to_string();
-            let arguments = function
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default()));
+            let arguments = match function.get("arguments") {
+                None => Value::Object(Default::default()),
+                // Ollama normally returns `arguments` already parsed as a
+                // JSON object. Smaller / quantized OSS models that learned
+                // OpenAI conventions sometimes emit it as a JSON-encoded
+                // string instead. Parse the string so the tool registry
+                // sees a structured value; on parse failure attach the
+                // shared INVALID_TOOL_ARGUMENTS marker so the agent can
+                // surface a clear error instead of silently mishandling.
+                // Mirrors `lmstudio.rs:drain_tool_calls`.
+                Some(Value::String(raw)) => {
+                    let raw_text = raw.clone();
+                    serde_json::from_str::<Value>(raw).unwrap_or_else(|err| {
+                        json!({
+                            crate::INVALID_TOOL_ARGUMENTS_KEY: true,
+                            crate::INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
+                            crate::INVALID_TOOL_ARGUMENTS_RAW_KEY: raw_text,
+                        })
+                    })
+                }
+                Some(other) => other.clone(),
+            };
             events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id: format!("ollama_call_{index}"),
                 name,
