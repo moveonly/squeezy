@@ -1644,11 +1644,11 @@ fn merge_oauth_beta_header_dedups_case_insensitively() {
     assert_eq!(
         lower_pieces.len(),
         dedup.len(),
-        "merged header must not contain case-variant duplicates: {merged}",
+        "merged header must not contain case-variant duplicates",
     );
     assert!(
         lower_pieces.contains(&"context-1m-2025-08-07".to_string()),
-        "caller-supplied beta must still ride on the wire: {merged}",
+        "caller-supplied beta must still ride on the wire",
     );
 }
 

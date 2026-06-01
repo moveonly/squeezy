@@ -2867,8 +2867,7 @@ fn cerebras_preset_emits_max_completion_tokens_migration_warning() {
             .config_warnings
             .iter()
             .any(|w| w.source == "providers.cerebras" && w.field.contains("max_completion_tokens")),
-        "cerebras + max_output_tokens must surface the v2-cutover warning, got: {:?}",
-        config.config_warnings,
+        "cerebras + max_output_tokens must surface the v2-cutover warning",
     );
 }
 
