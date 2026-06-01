@@ -576,6 +576,23 @@ fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
 }
 
 #[test]
+fn validate_base_url_accepts_versioned_paths() {
+    validate_google_base_url("https://generativelanguage.googleapis.com/v1beta").unwrap();
+    validate_google_base_url("https://generativelanguage.googleapis.com/v1").unwrap();
+    validate_google_base_url("https://example.com/v1alpha").unwrap();
+}
+
+#[test]
+fn validate_base_url_rejects_bare_host() {
+    let err = validate_google_base_url("https://example.com").expect_err("bare host must error");
+    let message = err.to_string();
+    assert!(
+        message.contains("/v* API version"),
+        "error should hint at /v* segment, got `{message}`"
+    );
+}
+
+#[test]
 fn parser_includes_error_status_and_code_in_message() {
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;

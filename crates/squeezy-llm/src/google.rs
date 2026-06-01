@@ -43,10 +43,18 @@ impl GoogleProvider {
     pub fn from_config(config: &GoogleConfig) -> Result<Self> {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        let base_url = config.base_url.trim_end_matches('/').to_string();
+        // Validate that the base URL points at a Gemini API version
+        // path (`/v1`, `/v1beta`, `/v1alpha`, etc.). Pre-fix a base
+        // URL of `https://example.com` silently produced
+        // `https://example.com/models/...:streamGenerateContent` —
+        // wrong URL with no warning. Bare hosts with no version path
+        // are almost always a configuration error.
+        validate_google_base_url(&base_url)?;
         Ok(Self {
             client: shared_client(&config.transport),
             api_key: static_api_key_source(api_key, "google"),
-            base_url: config.base_url.trim_end_matches('/').to_string(),
+            base_url,
             transport: config.transport,
         })
     }
@@ -151,6 +159,24 @@ fn tool_choice_to_gemini_mode(choice: Option<&str>) -> Option<&'static str> {
         "required" => Some("ANY"),
         _ => None,
     }
+}
+
+/// Validate that the Google base URL ends in a `/vN[suffix]` API
+/// version segment. The Gemini wire shape is
+/// `{base}/models/{model}:streamGenerateContent`; bare hosts produce
+/// a syntactically valid but semantically wrong URL.
+pub(crate) fn validate_google_base_url(base_url: &str) -> Result<()> {
+    let segment = base_url.rsplit('/').next().unwrap_or("");
+    let is_versioned = segment.starts_with('v')
+        && segment.len() >= 2
+        && segment[1..2].chars().all(|c| c.is_ascii_digit());
+    if !is_versioned {
+        return Err(SqueezyError::ProviderRequest(format!(
+            "Google base_url `{base_url}` is missing a /v* API version \
+             segment (expected `…/v1`, `…/v1beta`, `…/v1alpha`)."
+        )));
+    }
+    Ok(())
 }
 
 /// Gemini's `:streamGenerateContent` endpoint rejects requests whose
