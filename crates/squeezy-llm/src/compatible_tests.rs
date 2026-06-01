@@ -2269,6 +2269,61 @@ async fn cloudflare_ai_gateway_falls_back_to_resolved_key_when_no_upstream_confi
     );
 }
 
+#[test]
+fn cloudflare_ai_gateway_emits_cf_aig_gateway_id_header() {
+    // H-40: gateway selection moves from URL segment to the
+    // `cf-aig-gateway-id` HEADER under the new REST API. Emit it
+    // whenever the config carries a gateway id so the right
+    // gateway is selected regardless of which URL template the
+    // operator left in place.
+    let gateway = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("cf-token".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct".to_string()),
+        gateway_id: Some("my-gateway".to_string()),
+    })
+    .expect("provider builds");
+    let gateway_header = gateway
+        .extra_headers()
+        .iter()
+        .find_map(|(k, v)| {
+            k.eq_ignore_ascii_case("cf-aig-gateway-id")
+                .then(|| v.clone())
+        })
+        .expect("cf-aig-gateway-id must be emitted");
+    assert_eq!(gateway_header, "my-gateway");
+}
+
+#[test]
+fn cloudflare_ai_gateway_omits_cf_aig_gateway_id_when_unset() {
+    // No gateway id → no header. CF defaults to the account's
+    // `default` gateway.
+    let gateway = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("cf-token".to_string()),
+        // Use a base URL that does NOT contain {gateway_id} so
+        // the construction step doesn't reject the missing id.
+        base_url: "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1".to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct".to_string()),
+        gateway_id: None,
+    })
+    .expect("provider builds without gateway id");
+    assert!(
+        !gateway
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("cf-aig-gateway-id")),
+        "cf-aig-gateway-id must be absent when no gateway id is configured"
+    );
+}
+
 #[tokio::test]
 async fn workers_ai_preset_does_not_apply_dual_auth_swap() {
     // The dual-auth swap is gated on the AI Gateway preset only.

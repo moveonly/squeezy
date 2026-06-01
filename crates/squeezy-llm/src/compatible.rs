@@ -129,6 +129,24 @@ impl OpenAiCompatibleProvider {
         //      Cloudflare key for backwards compatibility with
         //      Workers AI-only gateways that were intentionally wired
         //      up under the old (broken) scheme.
+        // H-40: when the CF AI Gateway preset migrates to the new
+        // REST URL shape, gateway selection moves from the URL
+        // path to a `cf-aig-gateway-id` header. Emit it here when
+        // the config carries a gateway id so the gateway is
+        // selected correctly regardless of which URL template the
+        // user has in place; user-supplied headers still win.
+        if config.preset == OpenAiCompatiblePreset::CloudflareAiGateway
+            && let Some(gateway_id) = config
+                .gateway_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            && !headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("cf-aig-gateway-id"))
+        {
+            headers.insert("cf-aig-gateway-id".to_string(), gateway_id.to_string());
+        }
         let api_key = if config.preset == OpenAiCompatiblePreset::CloudflareAiGateway {
             let upstream_key = std::env::var("CF_UPSTREAM_KEY")
                 .ok()
