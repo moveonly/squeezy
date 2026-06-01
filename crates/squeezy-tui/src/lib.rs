@@ -2076,10 +2076,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // A focused subagent pane owns Esc (to close itself); don't let Esc
     // cancel an in-flight turn out from under the user while they're
     // navigating the pane.
-    if key.code == KeyCode::Esc
-        && !app.subagent_pane.focused
-        && request_turn_interrupt(app)
-    {
+    if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
         return Ok(false);
     }
 
@@ -12524,7 +12521,8 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         };
     }
     if app.subagent_pane.focused {
-        return "Up/Down select · Enter view · Del clear done · type/Esc back to prompt".to_string();
+        return "Up/Down select · Enter view · Del clear done · type/Esc back to prompt"
+            .to_string();
     }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {

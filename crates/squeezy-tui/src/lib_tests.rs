@@ -360,7 +360,10 @@ async fn focused_pane_esc_closes_pane_without_cancelling_turn() {
     )
     .await
     .expect("esc");
-    assert!(!app.subagent_pane.focused, "Esc should close the focused pane");
+    assert!(
+        !app.subagent_pane.focused,
+        "Esc should close the focused pane"
+    );
     assert_eq!(app.subagent_pane.active, ConversationSource::Main);
     assert!(
         !cancel.is_cancelled(),
