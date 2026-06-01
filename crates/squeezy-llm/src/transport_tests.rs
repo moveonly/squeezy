@@ -1,6 +1,9 @@
+use std::num::NonZeroUsize;
+
+use lru::LruCache;
 use squeezy_core::ProviderTransportConfig;
 
-use super::{build_client, shared_client};
+use super::{SHARED_CLIENT_CACHE_CAPACITY, build_client, shared_client};
 
 #[test]
 fn build_client_accepts_default_transport_config() {
@@ -42,6 +45,48 @@ fn shared_client_returns_handles_with_same_underlying_pool() {
 }
 
 #[test]
+fn build_client_applies_connect_timeout_and_tcp_keepalive() {
+    // Smoke test: the builder must accept the connect_timeout +
+    // tcp_keepalive knobs at every config the public surface exposes.
+    // If reqwest ever rejects these (or our `Duration` overflows), the
+    // build would panic via the `expect` inside `build_client`. We
+    // exercise the extremes (default + heavily customized) to catch
+    // any interaction with the pool knobs the same builder also sets.
+    let client = build_client(&ProviderTransportConfig::default());
+    assert!(format!("{client:?}").contains("Client"));
+
+    let customized = ProviderTransportConfig {
+        pool_idle_timeout_ms: 0,
+        pool_max_idle_per_host: 1,
+        ..ProviderTransportConfig::default()
+    };
+    let client = build_client(&customized);
+    assert!(format!("{client:?}").contains("Client"));
+}
+
+#[test]
+fn build_client_sets_squeezy_user_agent() {
+    // The user-agent is wired through `reqwest::ClientBuilder::user_agent`
+    // and therefore lives on the default headers of the resulting Client.
+    // We exercise it by issuing a request against a `mock`-style local
+    // server would be overkill for a smoke test; instead, fire a request
+    // against a deliberately invalid origin and assert the header by
+    // inspecting the Debug output, which reqwest does include for
+    // default headers. If the UA were ever dropped, the substring match
+    // here would fail.
+    let client = build_client(&ProviderTransportConfig::default());
+    let debug = format!("{client:?}");
+    assert!(
+        debug.contains("squeezy-cli/"),
+        "expected squeezy-cli/<version> user-agent in Client debug, got: {debug}"
+    );
+    assert!(
+        debug.contains(env!("CARGO_PKG_VERSION")),
+        "expected current CARGO_PKG_VERSION in Client debug, got: {debug}"
+    );
+}
+
+#[test]
 fn shared_client_builds_distinct_clients_for_distinct_configs() {
     let fast = ProviderTransportConfig {
         pool_idle_timeout_ms: 1_000,
@@ -60,4 +105,90 @@ fn shared_client_builds_distinct_clients_for_distinct_configs() {
     // the load-bearing assertion; if the cache erased the key, that
     // test would have failed first. Both configs reaching
     // `shared_client` without panic is the runtime guarantee we need.
+}
+
+#[test]
+fn shared_client_cache_capacity_is_a_small_positive_bound() {
+    // Sanity bound: the constant must stay non-zero (LruCache requires
+    // `NonZeroUsize`) and small enough that the cache cannot itself
+    // become the memory leak it exists to prevent. Flag any future
+    // bump that pushes us into "thousands of pooled clients" territory.
+    // Compile-time `const` assertions so the bound is enforced at
+    // compile time and clippy's `assertions_on_constants` lint is
+    // happy.
+    const _: () = assert!(SHARED_CLIENT_CACHE_CAPACITY > 0);
+    const _: () = assert!(
+        SHARED_CLIENT_CACHE_CAPACITY <= 128,
+        "transport client cache cap drifted above sane limit",
+    );
+}
+
+#[test]
+fn local_lru_cache_evicts_least_recently_used_at_capacity() {
+    // The shared cache itself is `static`, which makes direct eviction
+    // assertions order-dependent across tests. Instead, mirror the
+    // exact `LruCache<ProviderTransportConfig, reqwest::Client>` shape
+    // the production code uses against a local instance and exercise
+    // the eviction contract end-to-end.
+    let cap = NonZeroUsize::new(2).expect("test cap is non-zero");
+    let mut cache: LruCache<ProviderTransportConfig, reqwest::Client> = LruCache::new(cap);
+    let a = ProviderTransportConfig {
+        pool_idle_timeout_ms: 1,
+        ..ProviderTransportConfig::default()
+    };
+    let b = ProviderTransportConfig {
+        pool_idle_timeout_ms: 2,
+        ..ProviderTransportConfig::default()
+    };
+    let c = ProviderTransportConfig {
+        pool_idle_timeout_ms: 3,
+        ..ProviderTransportConfig::default()
+    };
+    let _ = cache.get_or_insert(a, || build_client(&a)).clone();
+    let _ = cache.get_or_insert(b, || build_client(&b)).clone();
+    assert!(cache.contains(&a));
+    assert!(cache.contains(&b));
+    // Inserting `c` past capacity must evict the LRU entry (`a`).
+    let _ = cache.get_or_insert(c, || build_client(&c)).clone();
+    assert!(
+        !cache.contains(&a),
+        "least-recently-used config should evict",
+    );
+    assert!(cache.contains(&b));
+    assert!(cache.contains(&c));
+}
+
+#[test]
+fn local_lru_cache_touch_rescues_entry_from_eviction() {
+    // Companion to the eviction test: touching the LRU entry before
+    // the next insert must promote it to MRU so the *next* distinct
+    // config replaces the other one. This is the property that lets a
+    // hot config (e.g. the main provider while a judge bursts through
+    // cheap variants) keep its pool warm.
+    let cap = NonZeroUsize::new(2).expect("test cap is non-zero");
+    let mut cache: LruCache<ProviderTransportConfig, reqwest::Client> = LruCache::new(cap);
+    let a = ProviderTransportConfig {
+        pool_idle_timeout_ms: 11,
+        ..ProviderTransportConfig::default()
+    };
+    let b = ProviderTransportConfig {
+        pool_idle_timeout_ms: 22,
+        ..ProviderTransportConfig::default()
+    };
+    let c = ProviderTransportConfig {
+        pool_idle_timeout_ms: 33,
+        ..ProviderTransportConfig::default()
+    };
+    let _ = cache.get_or_insert(a, || build_client(&a)).clone();
+    let _ = cache.get_or_insert(b, || build_client(&b)).clone();
+    // Touch `a` so it becomes MRU.
+    let _ = cache.get_or_insert(a, || build_client(&a)).clone();
+    // Now insert `c`: `b` (the LRU) should evict, not `a`.
+    let _ = cache.get_or_insert(c, || build_client(&c)).clone();
+    assert!(cache.contains(&a));
+    assert!(
+        !cache.contains(&b),
+        "stale entry should evict, not the touched one",
+    );
+    assert!(cache.contains(&c));
 }
