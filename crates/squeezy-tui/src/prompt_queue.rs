@@ -114,14 +114,17 @@ impl PromptQueueState {
 fn preview(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
     const LIMIT: usize = 80;
-    if first.chars().count() <= LIMIT {
+    if first.chars().nth(LIMIT).is_none() {
         first.to_string()
     } else {
         let mut end = LIMIT;
         while !first.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}…", &first[..end])
+        let mut out = String::with_capacity(end + '…'.len_utf8());
+        out.push_str(&first[..end]);
+        out.push('…');
+        out
     }
 }
 
