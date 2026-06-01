@@ -24,7 +24,7 @@
 //! cannot deadlock on each other.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex as StdMutex},
 };
@@ -66,10 +66,16 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
-    let mut keys: BTreeSet<PathBuf> = BTreeSet::new();
-    for path in paths {
-        keys.insert(mutation_key(path.as_ref()));
-    }
+    let mut keys = {
+        let paths = paths.into_iter();
+        let mut keys = Vec::with_capacity(paths.size_hint().0);
+        for path in paths {
+            keys.push(mutation_key(path.as_ref()));
+        }
+        keys
+    };
+    keys.sort_unstable();
+    keys.dedup();
 
     let mut guards = Vec::with_capacity(keys.len());
     for key in keys {
@@ -81,9 +87,12 @@ where
 
 fn acquire_named_lock(key: &Path) -> Arc<Mutex<()>> {
     let mut map = MUTATION_LOCKS.lock().unwrap_or_else(|err| err.into_inner());
-    map.entry(key.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+    if let Some(lock) = map.get(key) {
+        return Arc::clone(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    map.insert(key.to_path_buf(), Arc::clone(&lock));
+    lock
 }
 
 /// Compute the deterministic lock key for a mutation target. See the module
@@ -93,9 +102,10 @@ pub(crate) fn mutation_key(path: &Path) -> PathBuf {
         return canonical;
     }
     if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
-        && let Ok(canonical_parent) = std::fs::canonicalize(parent)
+        && let Ok(mut canonical_parent) = std::fs::canonicalize(parent)
     {
-        return canonical_parent.join(file_name);
+        canonical_parent.push(file_name);
+        return canonical_parent;
     }
     path.to_path_buf()
 }
