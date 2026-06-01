@@ -28,7 +28,10 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
-    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    credentials::{
+        ApiKeySource, resolve_api_key_with_inline, resolve_api_key_with_inline_optional,
+        static_api_key_source,
+    },
     openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
@@ -80,8 +83,23 @@ impl OpenAiCompatibleProvider {
             config.account_id.as_deref(),
             config.gateway_id.as_deref(),
         )?;
-        let api_key =
-            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        // X-17: local-hosted presets (LM Studio, vLLM, llama.cpp) ship
+        // without authentication by default and the squeezy-invented
+        // env-var names (`LMSTUDIO_API_KEY`, etc.) are not vendor
+        // conventions — nobody sets them. Walk the credential chain via
+        // the optional variant so an empty resolution flows as `""`
+        // instead of `ProviderNotConfigured`. The `Authorization: Bearer`
+        // header is short-circuited downstream when the resolved value
+        // is empty so reqwest does not panic on `bearer_auth("")`. Every
+        // other preset stays on the strict variant — Groq/OpenRouter/etc.
+        // without a key is a real misconfiguration and the error tells
+        // the user which env var to set.
+        let api_key = if is_local_preset(config.preset) {
+            resolve_api_key_with_inline_optional(config.api_key.as_deref(), &config.api_key_env)?
+                .value
+        } else {
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value
+        };
         let mut headers = preset_default_headers(config.preset);
         // User-supplied headers override preset defaults so deployments can
         // attach their own HTTP-Referer / X-Title / x-portkey-* values.
@@ -471,7 +489,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 RetryPolicy::provider_requests(transport),
                 &cancel,
                 |key| {
-                    let mut builder = client.post(&url).bearer_auth(key);
+                    let mut builder = client.post(&url);
+                    // X-17: skip `bearer_auth(key)` entirely when the
+                    // resolved key is empty. Local presets (LM Studio,
+                    // vLLM, llama.cpp) run unauthenticated by default
+                    // and reqwest panics on `bearer_auth("")`. Remote
+                    // presets always have a non-empty key here because
+                    // their construction path runs through the strict
+                    // resolver above.
+                    if !key.is_empty() {
+                        builder = builder.bearer_auth(key);
+                    }
                     for (header_key, header_value) in &extra_headers {
                         builder = builder.header(header_key.as_str(), header_value.as_str());
                     }
@@ -989,6 +1017,23 @@ fn collect_delta_text(value: Option<&Value>) -> String {
     }
 }
 
+/// True for the OpenAI-compatible presets that target a server running
+/// on the user's own machine (LM Studio, vLLM, llama.cpp). These presets
+/// (1) run unauthenticated by default, so credential resolution must
+/// tolerate the "no key configured" terminal (see X-17 in
+/// [`OpenAiCompatibleProvider::from_config`]), and (2) JIT-load
+/// checkpoints on demand, so a `400 Bad Request` with a "not loaded"
+/// message wants a provider-specific load-CLI hint
+/// (see [`local_jit_load_hint`]).
+fn is_local_preset(preset: OpenAiCompatiblePreset) -> bool {
+    matches!(
+        preset,
+        OpenAiCompatiblePreset::LMStudio
+            | OpenAiCompatiblePreset::VLlm
+            | OpenAiCompatiblePreset::LlamaCpp
+    )
+}
+
 /// Append a JIT-load hint to a 400 error body from a local OpenAI-compatible
 /// server (LM Studio, vLLM, llama.cpp). All three return `400 Bad Request`
 /// with a message containing "not loaded" / "model not loaded" / "no models
@@ -1003,7 +1048,7 @@ fn local_jit_load_hint(
     status: StatusCode,
     message: &str,
 ) -> &'static str {
-    if status != StatusCode::BAD_REQUEST {
+    if status != StatusCode::BAD_REQUEST || !is_local_preset(preset) {
         return "";
     }
     let lower = message.to_ascii_lowercase();

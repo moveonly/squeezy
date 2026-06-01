@@ -1261,3 +1261,97 @@ fn cloudflare_workers_ai_missing_account_id_fails_with_clear_error() {
         "whitespace error must also name the placeholder: {whitespace_error}"
     );
 }
+
+#[test]
+fn is_local_preset_classifies_lmstudio_vllm_llamacpp_as_local() {
+    // X-17 hinges on this classifier: the three local-hosted presets
+    // tolerate an empty resolved API key. Anything that drifts into or
+    // out of this set must show up as a test failure so a future preset
+    // addition cannot silently inherit the no-auth path.
+    assert!(is_local_preset(OpenAiCompatiblePreset::LMStudio));
+    assert!(is_local_preset(OpenAiCompatiblePreset::VLlm));
+    assert!(is_local_preset(OpenAiCompatiblePreset::LlamaCpp));
+    for preset in [
+        OpenAiCompatiblePreset::OpenRouter,
+        OpenAiCompatiblePreset::Vercel,
+        OpenAiCompatiblePreset::PortKey,
+        OpenAiCompatiblePreset::Groq,
+        OpenAiCompatiblePreset::XAi,
+        OpenAiCompatiblePreset::DeepSeek,
+        OpenAiCompatiblePreset::Vertex,
+        OpenAiCompatiblePreset::Mistral,
+        OpenAiCompatiblePreset::Together,
+        OpenAiCompatiblePreset::Fireworks,
+        OpenAiCompatiblePreset::Cerebras,
+        OpenAiCompatiblePreset::DeepInfra,
+        OpenAiCompatiblePreset::Baseten,
+        OpenAiCompatiblePreset::CloudflareWorkersAi,
+        OpenAiCompatiblePreset::CloudflareAiGateway,
+        OpenAiCompatiblePreset::Custom,
+    ] {
+        assert!(
+            !is_local_preset(preset),
+            "preset {preset:?} must not classify as a local self-hosted preset",
+        );
+    }
+}
+
+#[test]
+fn local_preset_builds_without_inline_or_env_api_key() {
+    // X-17: LM Studio / vLLM / llama.cpp run unauthenticated by default.
+    // `from_config` must not error when neither inline nor env carries a
+    // key; instead the resolved key flows as `""` and the stream path
+    // short-circuits the `Authorization: Bearer` header. Construct the
+    // provider with no inline key and a deliberately-not-set env var
+    // name so this regression-tests on a clean process too.
+    let env_var = "SQUEEZY_X17_DEFINITELY_NOT_SET_LMSTUDIO";
+    // Make sure no stale value from a prior test leaks in.
+    unsafe {
+        std::env::remove_var(env_var);
+    }
+    let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::LMStudio,
+        api_key_env: env_var.to_string(),
+        api_key: None,
+        base_url: "http://127.0.0.1:1234/v1".to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
+    })
+    .expect("LM Studio provider must build without an api key configured");
+    assert_eq!(provider.base_url(), "http://127.0.0.1:1234/v1");
+}
+
+#[test]
+fn remote_preset_still_requires_api_key() {
+    // Behavior parity guard: removing the X-17 tolerance for any
+    // remote preset would surface as the strict resolver failure here.
+    // Pick Groq because its env-var name is unambiguously vendor-owned
+    // and unlikely to collide with anything in the developer's shell.
+    let env_var = "SQUEEZY_X17_DEFINITELY_NOT_SET_GROQ";
+    unsafe {
+        std::env::remove_var(env_var);
+    }
+    let error = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::Groq,
+        api_key_env: env_var.to_string(),
+        api_key: None,
+        base_url: "https://api.groq.com/openai/v1".to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
+    })
+    .expect_err("remote preset without api key must still fail");
+    assert!(
+        matches!(error, SqueezyError::ProviderNotConfigured(_)),
+        "missing key must map to ProviderNotConfigured, got: {error:?}"
+    );
+}
