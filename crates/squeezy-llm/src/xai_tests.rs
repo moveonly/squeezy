@@ -1,4 +1,17 @@
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use squeezy_core::{OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
 use super::{XaiRoute, classify_route, is_responses_capable};
+use crate::{LlmProvider, LlmRequest, XaiProvider};
 
 #[test]
 fn xai_uses_responses_api_for_grok_3_and_newer() {
@@ -98,6 +111,185 @@ fn xai_classify_route_covers_new_grok_families_c09() {
             "{model} must classify as Responses"
         );
     }
+}
+
+/// SSE body the OpenAI Responses parser tolerates: a single
+/// `response.completed` event with usage carries the stream past the
+/// terminator without any deltas. Mirrors the minimum surface the
+/// dispatcher needs to validate which route received the request.
+const RESPONSES_SSE_BODY: &str = concat!(
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_xai_dispatch\",\"model\":\"grok-4.3\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Minimum chat-completions SSE that ends cleanly: one `stop` finish
+/// reason with a `usage` block, no content deltas required.
+const CHAT_SSE_BODY: &str = concat!(
+    "data: {\"id\":\"chatcmpl_xai_dispatch\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Records the first request path the loopback server sees so the
+/// dispatcher tests can assert which endpoint each request hit.
+#[derive(Default)]
+struct DispatcherRecorder {
+    paths: tokio::sync::Mutex<Vec<String>>,
+    requests: AtomicUsize,
+}
+
+impl DispatcherRecorder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    async fn record(&self, path: String) {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.paths.lock().await.push(path);
+    }
+
+    async fn first_path(&self) -> Option<String> {
+        self.paths.lock().await.first().cloned()
+    }
+}
+
+/// Spin a loopback TCP server that replies to every POST with an SSE
+/// body chosen by inspecting the request path. The recorder captures
+/// the path so the test can assert which endpoint the dispatcher chose.
+async fn spawn_xai_dispatcher_server(recorder: Arc<DispatcherRecorder>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(8192);
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match stream.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let request_line = head.lines().next().unwrap_or("").to_string();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                recorder.record(path.clone()).await;
+                let body = if path.ends_with("/responses") {
+                    RESPONSES_SSE_BODY
+                } else {
+                    CHAT_SSE_BODY
+                };
+                let bytes = body.as_bytes();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/event-stream\r\n\
+                     Cache-Control: no-cache\r\n\
+                     Content-Length: {}\r\n\
+                     \r\n",
+                    bytes.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.write_all(bytes).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+fn dispatcher_xai_config(addr: SocketAddr) -> OpenAiCompatibleConfig {
+    OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::XAi,
+        api_key_env: "XAI_API_KEY".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: format!("http://{addr}/v1"),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig {
+            request_max_retries: 0,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: 5_000,
+            ..ProviderTransportConfig::default()
+        },
+        account_id: None,
+        gateway_id: None,
+    }
+}
+
+fn dispatcher_request(model: &str) -> LlmRequest {
+    // `LlmRequest::user_text` keeps the test pinned to the public
+    // constructor — when new optional fields land via the type-system
+    // expansion in Phase 1, they pick up sensible defaults from the
+    // canonical builder rather than needing to be enumerated here.
+    LlmRequest::user_text(
+        model.to_string(),
+        "dispatcher test".to_string(),
+        "ping".to_string(),
+        Some(8),
+    )
+}
+
+#[tokio::test]
+async fn xai_dispatcher_routes_grok_4_3_to_responses_h21() {
+    // H-21: prove the dispatcher hands a Responses-capable Grok 4.3
+    // request to `/v1/responses`. The mock server returns a minimum
+    // SSE body for whichever path it sees, and the recorder asserts
+    // the dispatcher's path choice. Regressions in `classify_route`
+    // that drop grok-4.3 from the Responses branch would silently
+    // pass before this test landed.
+    let recorder = DispatcherRecorder::new();
+    let addr = spawn_xai_dispatcher_server(recorder.clone()).await;
+    let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
+        .expect("XaiProvider builds against mock server");
+
+    let stream = provider.stream_response(dispatcher_request("grok-4.3"), CancellationToken::new());
+    let _events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .expect("dispatcher stream must complete within timeout");
+
+    assert_eq!(recorder.requests.load(Ordering::SeqCst), 1);
+    let path = recorder.first_path().await.expect("recorder captured path");
+    assert_eq!(path, "/v1/responses", "grok-4.3 must reach /v1/responses");
+}
+
+#[tokio::test]
+async fn xai_dispatcher_routes_grok_2_to_chat_completions_h21() {
+    // H-21 companion: legacy grok-2 must keep landing on
+    // `/v1/chat/completions`. Without an explicit assertion, a refactor
+    // that flipped `classify_route`'s fallback to Responses would 404
+    // every grok-2 request and only surface in production.
+    let recorder = DispatcherRecorder::new();
+    let addr = spawn_xai_dispatcher_server(recorder.clone()).await;
+    let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
+        .expect("XaiProvider builds against mock server");
+
+    let stream = provider.stream_response(dispatcher_request("grok-2"), CancellationToken::new());
+    let _events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .expect("dispatcher stream must complete within timeout");
+
+    assert_eq!(recorder.requests.load(Ordering::SeqCst), 1);
+    let path = recorder.first_path().await.expect("recorder captured path");
+    assert_eq!(
+        path, "/v1/chat/completions",
+        "grok-2 must reach /v1/chat/completions"
+    );
 }
 
 #[test]
