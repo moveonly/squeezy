@@ -239,14 +239,32 @@ fn dim(text: String) -> Line<'static> {
 }
 
 fn middle_truncate(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
         return text.to_string();
     }
     let half = max_chars.saturating_sub(3) / 2;
-    let head: String = chars.iter().take(half).collect();
-    let tail: String = chars.iter().skip(chars.len() - half).collect();
-    format!("{head}…{tail}")
+    let head_end = if half == 0 {
+        0
+    } else {
+        text.char_indices()
+            .nth(half)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    };
+    let tail_start = if half == 0 {
+        text.len()
+    } else {
+        text.char_indices()
+            .nth(char_count - half)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    };
+    let mut out = String::with_capacity(head_end + '…'.len_utf8() + text.len() - tail_start);
+    out.push_str(&text[..head_end]);
+    out.push('…');
+    out.push_str(&text[tail_start..]);
+    out
 }
 
 #[cfg(test)]
