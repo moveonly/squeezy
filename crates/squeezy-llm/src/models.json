@@ -1096,6 +1096,36 @@
   },
   {
     "provider": "deepseek",
+    "id": "deepseek-vision-preview",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 280000,
+      "output_usd_micros_per_mtok": 560000,
+      "cache_read_usd_micros_per_mtok": 5600,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  {
+    "provider": "deepseek",
     "id": "deepseek-reasoner-v4",
     "profile": "strong",
     "capabilities": {
@@ -1207,6 +1237,36 @@
     },
     "limits": {
       "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.mistral.ai/api"
+  },
+  {
+    "provider": "mistral",
+    "id": "ministral-3b-2410",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 40000,
+      "output_usd_micros_per_mtok": 40000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
       "max_output_tokens": 32768,
       "effective_context_window_percent": 95
     },
@@ -1516,6 +1576,36 @@
   },
   {
     "provider": "deepinfra",
+    "id": "Qwen/Qwen3-Omni-Instruct",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 800000,
+      "output_usd_micros_per_mtok": 2400000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://deepinfra.com/pricing"
+  },
+  {
+    "provider": "deepinfra",
     "id": "Qwen/Qwen3.6-235B-A22B-Instruct",
     "profile": "balanced",
     "capabilities": {
@@ -1712,6 +1802,36 @@
     "pricing": {
       "input_usd_micros_per_mtok": 500000,
       "output_usd_micros_per_mtok": 4880000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/google/gemma-4-26b-a4b-it",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 290000,
+      "output_usd_micros_per_mtok": 2250000,
       "cache_read_usd_micros_per_mtok": null,
       "cache_write_usd_micros_per_mtok": null
     },
