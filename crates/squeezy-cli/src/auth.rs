@@ -114,6 +114,16 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
         env: "SQUEEZY_CEREBRAS_KEY",
         fallback_env: Some("CEREBRAS_API_KEY"),
     },
+    // DeepInfra documents `DEEPINFRA_TOKEN` as the canonical name in
+    // their CLI / SDK quickstarts. We honor that as the primary env
+    // var; `DEEPINFRA_API_KEY` is kept as the fallback to match
+    // Vercel AI SDK conventions for users coming from that surface.
+    KnownProvider {
+        section: "deepinfra",
+        cli: "deepinfra",
+        env: "DEEPINFRA_TOKEN",
+        fallback_env: Some("DEEPINFRA_API_KEY"),
+    },
     // Local self-hosted OpenAI-compatible servers. They typically run without
     // authentication on a loopback port; the inline-key slot exists so users
     // can stand up a reverse proxy that requires a bearer token.
@@ -760,6 +770,7 @@ fn static_section_name(provider: &str) -> &'static str {
         "together" => "together",
         "fireworks" => "fireworks",
         "cerebras" => "cerebras",
+        "deepinfra" => "deepinfra",
         "lmstudio" => "lmstudio",
         "vllm" => "vllm",
         "llamacpp" => "llamacpp",

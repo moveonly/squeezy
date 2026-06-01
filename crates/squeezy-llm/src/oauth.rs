@@ -23,6 +23,7 @@ pub mod anthropic;
 pub mod github_copilot;
 pub(crate) mod openai_codex;
 mod pkce;
+pub mod vertex;
 
 pub use anthropic::{
     ANTHROPIC_OAUTH_TOKEN_PREFIX, AnthropicLoginConfig, AnthropicOAuthSource, PersistedTokens,
@@ -51,3 +52,4 @@ pub use openai_codex::{
     login_openai_codex_interactive, save_codex_token,
 };
 pub use pkce::{PkceCodes, generate_pkce};
+pub use vertex::{DEFAULT_GCLOUD_COMMAND, GCLOUD_PRINT_TOKEN_ARGS, VertexOAuthSource};
