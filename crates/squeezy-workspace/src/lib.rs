@@ -953,8 +953,13 @@ fn project_marker_exists(
     if marker.contains('/') {
         return root.join(marker).exists();
     }
+    // The read_dir listing is a fast positive shortcut: an exact-case hit
+    // proves existence without a stat. On a miss we must still defer to
+    // `exists()`, which is authoritative and matches the filesystem's own
+    // case semantics (e.g. `cargo.toml` satisfying `Cargo.toml` on
+    // case-insensitive volumes). Using `&&` here would drop such markers.
     root_entry_names
-        .map(|names| names.contains(std::ffi::OsStr::new(marker)) && root.join(marker).exists())
+        .map(|names| names.contains(std::ffi::OsStr::new(marker)) || root.join(marker).exists())
         .unwrap_or_else(|| root.join(marker).exists())
 }
 
