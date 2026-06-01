@@ -395,6 +395,35 @@ fn finish_length_emits_truncation_notice_and_drains_reasoning() {
 }
 
 #[test]
+fn drain_tool_calls_emits_null_arguments_when_function_args_empty() {
+    // M-29: when the model commits to a zero-arg tool call the upstream
+    // streams `function.arguments` as an empty string. The drain must
+    // surface that as `Value::Null` so the tool dispatch layer can
+    // disambiguate "no arguments" from "arguments was the empty object".
+    // The legacy behavior fabricated `{}` and stripped the distinction.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"now"}}]}}]}"#,
+        &mut state,
+    )
+    .expect("zero-arg tool call delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        &mut state,
+    )
+    .expect("finish");
+    let LlmEvent::ToolCall(call) = &events[0] else {
+        panic!("expected ToolCall, got {events:?}");
+    };
+    assert_eq!(call.name, "now");
+    assert_eq!(
+        call.arguments,
+        Value::Null,
+        "empty function.arguments must surface as Value::Null, not {{}}"
+    );
+}
+
+#[test]
 fn drain_tool_calls_skips_incomplete_entries_without_erroring() {
     // PortKey / OpenRouter sometimes ship a tool-call delta whose
     // `function.name` chunk goes missing or whose stream cuts mid-call.

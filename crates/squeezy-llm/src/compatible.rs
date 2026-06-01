@@ -895,18 +895,27 @@ impl StreamState {
                 );
                 continue;
             };
-            let arguments_text = if partial.arguments.is_empty() {
-                "{}".to_string()
+            // M-29: empty `function.arguments` means the model intends a
+            // zero-arg call; emit `Value::Null` instead of fabricating an
+            // empty object. The tool dispatch layer can disambiguate
+            // "model sent no arguments" from "model sent `{}`" and a few
+            // tool implementations (notably ones that gate on
+            // `value.is_null()`) need that signal. The parse-failure
+            // branch still applies to genuinely non-empty malformed JSON
+            // so the existing `INVALID_TOOL_ARGUMENTS_*` markers continue
+            // to flow through.
+            let arguments = if partial.arguments.is_empty() {
+                Value::Null
             } else {
-                partial.arguments
-            };
-            let arguments = serde_json::from_str::<Value>(&arguments_text).unwrap_or_else(|err| {
-                json!({
-                    INVALID_TOOL_ARGUMENTS_KEY: true,
-                    INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
-                    INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
+                let arguments_text = partial.arguments;
+                serde_json::from_str::<Value>(&arguments_text).unwrap_or_else(|err| {
+                    json!({
+                        INVALID_TOOL_ARGUMENTS_KEY: true,
+                        INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
+                        INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
+                    })
                 })
-            });
+            };
             events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id,
                 name,
