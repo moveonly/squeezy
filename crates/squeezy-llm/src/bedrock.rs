@@ -420,7 +420,10 @@ fn bedrock_stream_attempt(
                     yield LlmEvent::Cancelled;
                     return;
                 }
-                next = timeout(idle_timeout(transport), recv_event(&mut stream)) => next,
+                next = timeout(
+                    bedrock_idle_timeout(transport, &request, &model),
+                    recv_event(&mut stream),
+                ) => next,
             };
             let event = polled.map_err(|_| {
                 SqueezyError::ProviderStream("Bedrock stream idle timeout".to_string())
@@ -889,6 +892,53 @@ pub(crate) fn bedrock_effort_label(effort: squeezy_core::ReasoningEffort) -> &'s
         squeezy_core::ReasoningEffort::Medium => "medium",
         squeezy_core::ReasoningEffort::High => "high",
         squeezy_core::ReasoningEffort::XHigh => "max",
+    }
+}
+
+/// Multiplier applied to the base stream idle timeout when the turn
+/// is configured for high-effort reasoning on an adaptive-thinking
+/// Claude family. Adaptive-thinking Claude 4.6+ can spend several
+/// minutes thinking between visible deltas at max effort; the
+/// cross-provider 300-second default is calibrated for steady-state
+/// streaming and trips a false-positive idle timeout on these
+/// configurations. Scale wide enough (2x) to cover documented worst-
+/// case thinking gaps without hiding genuine stalls.
+const BEDROCK_ADAPTIVE_THINKING_IDLE_TIMEOUT_MULTIPLIER: u32 = 2;
+
+/// Compute the per-event idle timeout for a Bedrock stream. Starts
+/// from the cross-provider [`idle_timeout`] base and doubles it when
+/// both:
+/// * the effective reasoning effort (request override OR the model's
+///   `default_reasoning_effort` capability fallback) is `High` or
+///   `XHigh`, and
+/// * the model is in the adaptive-thinking Claude family
+///   ([`crate::anthropic::model_uses_adaptive_thinking`]).
+///
+/// Other configurations keep the steady-state default so a stalled
+/// non-reasoning turn still surfaces as a timeout instead of hanging.
+pub(crate) fn bedrock_idle_timeout(
+    transport: ProviderTransportConfig,
+    request: &LlmRequest,
+    model: &str,
+) -> std::time::Duration {
+    let base = idle_timeout(transport);
+    // `default_reasoning_effort` from the Phase 1 ModelCapabilities
+    // table covers the model-recommended baseline when the caller
+    // left `reasoning_effort` unset. Without that fallback an agent
+    // that always relies on the registry default would never get the
+    // scaled timeout even on adaptive-thinking models that always
+    // think for several minutes at high effort.
+    let effective_effort = request.reasoning_effort.or_else(|| {
+        crate::capabilities_for("bedrock", model).and_then(|caps| caps.default_reasoning_effort)
+    });
+    let is_high_effort = matches!(
+        effective_effort,
+        Some(squeezy_core::ReasoningEffort::High | squeezy_core::ReasoningEffort::XHigh)
+    );
+    if is_high_effort && crate::anthropic::model_uses_adaptive_thinking(model) {
+        base * BEDROCK_ADAPTIVE_THINKING_IDLE_TIMEOUT_MULTIPLIER
+    } else {
+        base
     }
 }
 

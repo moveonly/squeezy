@@ -18,7 +18,7 @@ use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 use super::{
     BedrockProvider, BedrockStreamState, BreakpointBudget, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
-    bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
+    bedrock_idle_timeout, bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
     classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
     current_bearer_token, extract_echoed_model, handle_bedrock_event, hex_decode, hex_encode,
     inference_configuration, json_to_document, region_prefix, sanitize_bedrock_document_name,
@@ -1681,6 +1681,108 @@ fn classify_stream_sdk_error_routes_transient_classes_to_provider_stream() {
             "error must mention the SDK variant {label}: {message}",
         );
     }
+}
+
+/// LOW: adaptive-thinking Claude 4.6+ at high effort can spend
+/// several minutes thinking between visible deltas; the steady-
+/// state 300 s idle timeout used to fire a false-positive timeout
+/// in that configuration. Scale 2x when both the effective
+/// reasoning effort is `High`/`XHigh` and the model is in the
+/// adaptive-thinking family. All other configurations keep the
+/// base default so a genuinely stalled non-reasoning turn still
+/// surfaces as a timeout rather than hanging.
+#[test]
+fn bedrock_idle_timeout_scales_for_adaptive_high_effort() {
+    use squeezy_core::ReasoningEffort;
+    let transport = ProviderTransportConfig::default();
+    let base = bedrock_idle_timeout(
+        transport,
+        &LlmRequest::default(),
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    // Adaptive (claude-sonnet-4-6) + High effort -> 2x base.
+    let adaptive_high = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..LlmRequest::default()
+    };
+    let scaled = bedrock_idle_timeout(
+        transport,
+        &adaptive_high,
+        "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+    );
+    assert_eq!(
+        scaled,
+        base * 2,
+        "adaptive-thinking + High effort must double the base idle timeout",
+    );
+
+    // Adaptive + XHigh effort also scales.
+    let adaptive_xhigh = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::XHigh),
+        ..LlmRequest::default()
+    };
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &adaptive_xhigh,
+            "anthropic.claude-opus-4-6-20251101-v1:0",
+        ),
+        base * 2,
+        "XHigh on adaptive-thinking models also scales",
+    );
+}
+
+#[test]
+fn bedrock_idle_timeout_does_not_scale_for_non_adaptive_or_low_effort() {
+    use squeezy_core::ReasoningEffort;
+    let transport = ProviderTransportConfig::default();
+    let base = bedrock_idle_timeout(
+        transport,
+        &LlmRequest::default(),
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+
+    // High effort on a non-adaptive model (haiku 4.5) keeps base.
+    let pre_4_6_high = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..LlmRequest::default()
+    };
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &pre_4_6_high,
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+        ),
+        base,
+        "pre-4.6 Claude keeps the steady-state timeout even at High effort",
+    );
+
+    // Low effort on adaptive model also keeps base.
+    let adaptive_low = LlmRequest {
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..LlmRequest::default()
+    };
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &adaptive_low,
+            "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        ),
+        base,
+        "Low effort never scales, even on adaptive-thinking models",
+    );
+
+    // Unset reasoning_effort on a model with no `default_reasoning_effort`
+    // registry entry keeps base.
+    assert_eq!(
+        bedrock_idle_timeout(
+            transport,
+            &LlmRequest::default(),
+            "us.anthropic.claude-sonnet-4-6-20251001-v1:0",
+        ),
+        base,
+        "no effort signal at all means no scaling",
+    );
 }
 
 /// LOW: `hex_encode` now uses `write!` into a pre-allocated
