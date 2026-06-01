@@ -913,10 +913,29 @@ pub(crate) fn parse_openai_event(
                 .and_then(|response| response.get("id"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let stop_reason = response
-                .and_then(|response| response.get("incomplete_details"))
+            let incomplete_details =
+                response.and_then(|response| response.get("incomplete_details"));
+            let reason = incomplete_details
                 .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str);
+            // C-14 (Azure mid-stream): when the output filter blocks a
+            // response after streaming starts, Azure surfaces
+            // `incomplete_details.content_filter_result` with per-category
+            // severity. Queue a `LlmEvent::Refusal` ahead of the
+            // `Completed` event so the TUI shows the filter category
+            // alongside the canonical `StopReason::Refusal` signal.
+            if reason == Some("content_filter") {
+                let filter_result =
+                    incomplete_details.and_then(|details| details.get("content_filter_result"));
+                if let Some(result) = filter_result {
+                    let summary = azure_content_filter_categories(result);
+                    reasoning_acc
+                        .pre_yield
+                        .push_back(LlmEvent::Refusal { content: summary });
+                }
+                reasoning_acc.refusal_latched = true;
+            }
+            let stop_reason = reason
                 .map(crate::StopReason::from_openai_incomplete)
                 .or(Some(crate::StopReason::Other("incomplete".to_string())));
             Ok(Some(LlmEvent::Completed {
@@ -973,6 +992,23 @@ pub(crate) fn parse_openai_event(
                         });
                     format!("context_length_exceeded: {message}")
                 }
+                "content_filter" => {
+                    // C-14 (Azure): the content-filter envelope ships
+                    // per-category severity inside
+                    // `error.innererror.content_filter_result.{hate,sexual,
+                    // violence,self_harm,jailbreak,protected_material_*}`.
+                    // Surface a `LlmEvent::Refusal` ahead of the terminal
+                    // error so the TUI shows the filter category instead
+                    // of a bare 400. The summary string concatenates the
+                    // filtered categories so the agent's transcript
+                    // records *why* the refusal happened.
+                    let summary = azure_content_filter_summary(&error_obj);
+                    reasoning_acc.pre_yield.push_back(LlmEvent::Refusal {
+                        content: summary.clone(),
+                    });
+                    reasoning_acc.refusal_latched = true;
+                    format!("content_filter: {summary} ({message})")
+                }
                 "rate_limit_exceeded" => {
                     // Embed any "try again in 3s" hint the upstream
                     // ships in the message so the agent's retry layer
@@ -1010,6 +1046,70 @@ pub(crate) fn parse_openai_event(
             Ok(None)
         }
     }
+}
+
+/// Pretty-print the Azure content-filter envelope into a human-readable
+/// string for the `LlmEvent::Refusal { content }` payload. Searches the
+/// canonical paths Azure uses (per-prompt and per-response variants).
+fn azure_content_filter_summary(error_obj: &Value) -> String {
+    // Try the most common Azure shapes in order:
+    //   error.innererror.content_filter_result.{category}
+    //   error.content_filter_result.{category}
+    let candidates = [
+        error_obj
+            .get("innererror")
+            .and_then(|v| v.get("content_filter_result")),
+        error_obj.get("content_filter_result"),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let summary = azure_content_filter_categories(candidate);
+        if !summary.is_empty() {
+            return summary;
+        }
+    }
+    "content_filter".to_string()
+}
+
+/// Extract a category-level summary from an Azure `content_filter_result`
+/// JSON object. Returns a comma-separated list of `category[:severity]`
+/// pairs for every category whose `filtered: true` flag is set.
+fn azure_content_filter_categories(result: &Value) -> String {
+    let Some(obj) = result.as_object() else {
+        return String::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (category, value) in obj {
+        let filtered = value
+            .get("filtered")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let severity = value.get("severity").and_then(Value::as_str);
+        let detected = value
+            .get("detected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if filtered {
+            match severity {
+                Some(sev) if !sev.is_empty() => out.push(format!("{category}:{sev}")),
+                _ => out.push(category.clone()),
+            }
+        } else if detected {
+            out.push(format!("{category}:detected"));
+        }
+    }
+    if out.is_empty() {
+        // Some envelopes only carry `severity` without `filtered`; fall
+        // back to listing categories whose severity is set above safe.
+        for (category, value) in obj {
+            if let Some(sev) = value.get("severity").and_then(Value::as_str)
+                && !sev.is_empty()
+                && sev != "safe"
+            {
+                out.push(format!("{category}:{sev}"));
+            }
+        }
+    }
+    out.join(", ")
 }
 
 fn openai_input(input: &[LlmInputItem]) -> Value {

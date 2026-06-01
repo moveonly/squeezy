@@ -861,6 +861,93 @@ fn parser_classifies_rate_limit_exceeded_with_prefix() {
 }
 
 #[test]
+fn parser_classifies_azure_content_filter_error_and_queues_refusal_event() {
+    // C-14: Azure prompt-time content_filter envelope. The parser must
+    // queue a `Refusal` event carrying the category/severity summary so
+    // the agent can show the user *why* the refusal happened.
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{
+          "type":"response.failed",
+          "response":{
+            "error":{
+              "code":"content_filter",
+              "message":"The response was filtered due to content policy.",
+              "innererror":{
+                "code":"ResponsibleAIPolicyViolation",
+                "content_filter_result":{
+                  "hate":{"filtered":true,"severity":"high"},
+                  "sexual":{"filtered":false,"severity":"safe"},
+                  "violence":{"filtered":true,"severity":"medium"}
+                }
+              }
+            }
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect_err("content_filter surfaces error");
+    let err_str = err.to_string();
+    assert!(err_str.contains("content_filter"));
+    assert!(err_str.contains("hate:high"));
+    assert!(err_str.contains("violence:medium"));
+
+    let queued: Vec<LlmEvent> = acc.drain_pre_yield().collect();
+    assert_eq!(queued.len(), 1);
+    match &queued[0] {
+        LlmEvent::Refusal { content } => {
+            assert!(content.contains("hate:high"));
+            assert!(content.contains("violence:medium"));
+        }
+        other => panic!("expected Refusal, got {other:?}"),
+    }
+    assert!(acc.refusal_latched);
+}
+
+#[test]
+fn parser_emits_refusal_for_mid_stream_response_incomplete_content_filter() {
+    // C-14 mid-stream: when the *output* filter blocks a response after
+    // streaming starts, Azure ships `response.incomplete` with
+    // `incomplete_details.content_filter_result` carrying per-category
+    // severity. Surface the categories via a `Refusal` event before the
+    // `Completed` event.
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(
+        r#"{
+          "type":"response.incomplete",
+          "response":{
+            "id":"resp_blocked",
+            "incomplete_details":{
+              "reason":"content_filter",
+              "content_filter_result":{
+                "hate":{"filtered":true,"severity":"high"}
+              }
+            }
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect("event ok")
+    .expect("must emit Completed");
+    match event {
+        LlmEvent::Completed { stop_reason, .. } => assert_eq!(
+            stop_reason,
+            Some(crate::StopReason::Refusal),
+            "content_filter reason MUST normalize to Refusal",
+        ),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    let queued: Vec<LlmEvent> = acc.drain_pre_yield().collect();
+    assert_eq!(queued.len(), 1);
+    match &queued[0] {
+        LlmEvent::Refusal { content } => {
+            assert!(content.contains("hate:high"));
+        }
+        other => panic!("expected Refusal, got {other:?}"),
+    }
+}
+
+#[test]
 fn parser_classifies_previous_response_not_found_with_marker_prefix() {
     // M-05: stale `previous_response_id` 404 MUST surface with a
     // `previous_response_not_found:` marker prefix so the agent layer
