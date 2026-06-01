@@ -203,16 +203,20 @@ fn write_messages(
                     continue;
                 }
                 let call_id = output.get("call_id").and_then(Value::as_str);
-                let body = output
-                    .get("output")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| pretty_json(&output));
                 let matched = call_id.and_then(|id| pending_calls.remove(id));
-                if let Some(call) = matched {
-                    write_tool_call(out, &call.tool, &call.arguments, Some(&body))?;
+                if let Some(body) = output.get("output").and_then(Value::as_str) {
+                    if let Some(call) = matched {
+                        write_tool_call(out, &call.tool, &call.arguments, Some(body))?;
+                    } else {
+                        write_tool_result_only(out, call_id, body)?;
+                    }
                 } else {
-                    write_tool_result_only(out, call_id, &body)?;
+                    let body = pretty_json(&output);
+                    if let Some(call) = matched {
+                        write_tool_call(out, &call.tool, &call.arguments, Some(&body))?;
+                    } else {
+                        write_tool_result_only(out, call_id, &body)?;
+                    }
                 }
             }
             SessionEventKind::Reasoning { .. } => {
@@ -448,39 +452,38 @@ impl TextStyle {
             && !self.underline
     }
 
-    fn inline_css(self) -> String {
-        let mut css = String::new();
+    fn push_inline_css(self, out: &mut String) {
+        let start = out.len();
         if let Some(color) = self.fg {
-            push_color_decl(&mut css, "color", color);
+            push_color_decl(out, start, "color", color);
         }
         if let Some(color) = self.bg {
-            push_color_decl(&mut css, "background-color", color);
+            push_color_decl(out, start, "background-color", color);
         }
         if self.bold {
-            push_css_decl(&mut css, "font-weight:bold");
+            push_css_decl(out, start, "font-weight:bold");
         }
         if self.dim {
-            push_css_decl(&mut css, "opacity:0.6");
+            push_css_decl(out, start, "opacity:0.6");
         }
         if self.italic {
-            push_css_decl(&mut css, "font-style:italic");
+            push_css_decl(out, start, "font-style:italic");
         }
         if self.underline {
-            push_css_decl(&mut css, "text-decoration:underline");
+            push_css_decl(out, start, "text-decoration:underline");
         }
-        css
     }
 }
 
-fn push_css_decl(out: &mut String, decl: &str) {
-    if !out.is_empty() {
+fn push_css_decl(out: &mut String, start: usize, decl: &str) {
+    if out.len() > start {
         out.push(';');
     }
     out.push_str(decl);
 }
 
-fn push_color_decl(out: &mut String, property: &str, rgb: u32) {
-    if !out.is_empty() {
+fn push_color_decl(out: &mut String, start: usize, property: &str, rgb: u32) {
+    if out.len() > start {
         out.push(';');
     }
     let _ = write!(
@@ -580,6 +583,11 @@ fn apply_sgr(params: &[u16], style: &mut TextStyle) {
 /// `<span style="…">` so the rendered document needs no class table.
 pub(crate) fn ansi_to_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    push_ansi_html(&mut out, text);
+    out
+}
+
+fn push_ansi_html(out: &mut String, text: &str) {
     let mut style = TextStyle::default();
     let mut in_span = false;
     let bytes = text.as_bytes();
@@ -609,7 +617,7 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
             apply_sgr(&params, &mut style);
             if !style.is_empty() {
                 out.push_str("<span style=\"");
-                out.push_str(&style.inline_css());
+                style.push_inline_css(out);
                 out.push_str("\">");
                 in_span = true;
             }
@@ -620,7 +628,7 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
         // UTF-8 sequence with the index-based byte cursor.
         let remaining = std::str::from_utf8(&bytes[cursor..]).unwrap_or("");
         if let Some(ch) = remaining.chars().next() {
-            push_escaped_char(&mut out, ch);
+            push_escaped_char(out, ch);
             cursor += ch.len_utf8();
         } else {
             cursor += 1;
@@ -629,7 +637,6 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
     if in_span {
         out.push_str("</span>");
     }
-    out
 }
 
 /// Walk `bytes` starting at `start` until we hit the SGR terminator
@@ -659,14 +666,13 @@ fn find_sgr_end(bytes: &[u8], start: usize) -> Option<usize> {
 fn ansi_lines_to_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 64);
     for line in text.split('\n') {
-        let body = ansi_to_html(line);
         out.push_str("<div class=\"ansi-line\">");
-        if body.is_empty() {
+        let body_start = out.len();
+        push_ansi_html(&mut out, line);
+        if out.len() == body_start {
             // Empty line still needs to take up vertical space so the
             // whitespace is faithful — same trick pi uses.
             out.push_str("&nbsp;");
-        } else {
-            out.push_str(&body);
         }
         out.push_str("</div>");
     }
