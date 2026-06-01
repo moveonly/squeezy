@@ -130,10 +130,26 @@ pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-in
 /// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
 /// regional URL that names the project. Returns the resolved base URL for a
 /// `(project, location)` pair, ready for `/chat/completions` to be appended.
+///
+/// The `global` location lives at the bare host `aiplatform.googleapis.com`
+/// (no `{location}-` prefix) because Google does not run a regional Anycast
+/// frontend named `global`. Gemini 3.x is GA only via this location, so a
+/// caller passing `location = "global"` builds the correct host instead of
+/// a `https://global-aiplatform.googleapis.com/...` URL that DNS-fails.
+/// Other locations (regional like `us-central1`, plus the continental
+/// pseudo-regions `us`/`eu`) keep the historical `{location}-aiplatform`
+/// shape so production deployments are unchanged.
 pub fn vertex_base_url(project: &str, location: &str) -> String {
-    format!(
-        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi"
-    )
+    let trimmed = location.trim();
+    if trimmed.eq_ignore_ascii_case("global") {
+        format!(
+            "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi"
+        )
+    } else {
+        format!(
+            "https://{trimmed}-aiplatform.googleapis.com/v1/projects/{project}/locations/{trimmed}/endpoints/openapi"
+        )
+    }
 }
 
 /// Resolve a bare-name model alias (e.g. `opus`, `sonnet`, `haiku`) to the

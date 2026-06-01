@@ -2633,6 +2633,71 @@ fn azure_openai_extra_headers_default_to_empty_map() {
 }
 
 #[test]
+fn vertex_base_url_uses_bare_host_for_global_location() {
+    // Gemini 3.x is GA only via the `global` location, which lives at
+    // bare `aiplatform.googleapis.com` (Google does not run a regional
+    // Anycast frontend named `global`). The historical
+    // `{location}-aiplatform.googleapis.com` shape DNS-fails for
+    // `global`, so the helper must special-case it.
+    assert_eq!(
+        vertex_base_url("my-proj", "global"),
+        "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/endpoints/openapi",
+    );
+    // Casing is normalized so a config that writes `Global` keeps
+    // working.
+    assert_eq!(
+        vertex_base_url("my-proj", "Global"),
+        "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/endpoints/openapi",
+    );
+}
+
+#[test]
+fn vertex_base_url_keeps_regional_shape_for_named_regions() {
+    // Regions (and continental pseudo-regions like `us`/`eu`) keep the
+    // historical `{location}-aiplatform.googleapis.com` host so existing
+    // production deployments are unchanged.
+    assert_eq!(
+        vertex_base_url("my-proj", "us-central1"),
+        "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/endpoints/openapi",
+    );
+    assert_eq!(
+        vertex_base_url("my-proj", "europe-west4"),
+        "https://europe-west4-aiplatform.googleapis.com/v1/projects/my-proj/locations/europe-west4/endpoints/openapi",
+    );
+}
+
+#[test]
+fn vertex_preset_resolves_global_location_to_bare_host() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            vertex_location: Some("global".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "VERTEX_ACCESS_TOKEN" => Some("ya29.fake".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds with global location");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.base_url,
+        "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/endpoints/openapi",
+        "the `global` location must resolve to the bare host, not `https://global-aiplatform.googleapis.com/...`",
+    );
+}
+
+#[test]
 fn vertex_preset_templates_base_url_from_project_and_location() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
