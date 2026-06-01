@@ -53,12 +53,14 @@
 //! continue to be honored in [`crate::bedrock`] via the same
 //! `tokio::time::timeout` pattern other providers use.
 
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use lru::LruCache;
-use squeezy_core::ProviderTransportConfig;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use squeezy_core::{ProviderTransportConfig, is_metadata_or_link_local_ip};
 
 /// Upper bound on the number of distinct [`ProviderTransportConfig`]
 /// values whose [`reqwest::Client`]s are kept warm in the shared cache.
@@ -124,6 +126,18 @@ pub fn shared_client(config: &ProviderTransportConfig) -> reqwest::Client {
 /// (and so the fallback path on a poisoned lock has a single code
 /// path to maintain).
 pub(crate) fn build_client(config: &ProviderTransportConfig) -> reqwest::Client {
+    build_client_with_resolver(config, MetadataBlockingResolver::system())
+}
+
+/// Variant of [`build_client`] that accepts an arbitrary DNS resolver
+/// so unit tests can pin lookups to canned addresses without standing up
+/// a real server. Production callers go through [`build_client`], which
+/// installs the [`MetadataBlockingResolver`] wrapper around the system
+/// resolver.
+pub(crate) fn build_client_with_resolver(
+    config: &ProviderTransportConfig,
+    resolver: MetadataBlockingResolver,
+) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(config.pool_max_idle_per_host as usize)
         // Identifies the agent to upstream providers and any in-path
@@ -132,17 +146,12 @@ pub(crate) fn build_client(config: &ProviderTransportConfig) -> reqwest::Client 
         // lets the upstream attribute traffic to us instead of the
         // anonymous `reqwest/<ver>` default.
         .user_agent(concat!("squeezy-cli/", env!("CARGO_PKG_VERSION")))
-        // Bounds the *connect* (DNS + TCP + TLS) handshake only. A
-        // hung remote during connection would otherwise block the
-        // request indefinitely; reqwest's overall `timeout` is
-        // intentionally unset for streaming bodies, so this is the
-        // only defense against a black-hole connect.
+        // Bounds the *connect* (DNS + TCP + TLS) handshake only.
         .connect_timeout(Duration::from_secs(30))
         // Probes idle sockets so a pool entry silently killed by a
-        // NAT/firewall is detected on the next reuse instead of
-        // surfacing as a stalled request. Independent of
-        // `pool_idle_timeout_ms`, which governs eviction.
-        .tcp_keepalive(Duration::from_secs(60));
+        // NAT/firewall is detected on the next reuse.
+        .tcp_keepalive(Duration::from_secs(60))
+        .dns_resolver(Arc::new(resolver));
     builder = if config.pool_idle_timeout_ms == 0 {
         // `None` keeps idle sockets parked indefinitely — a
         // `pool_idle_timeout_ms = 0` config explicitly disables
@@ -154,6 +163,124 @@ pub(crate) fn build_client(config: &ProviderTransportConfig) -> reqwest::Client 
     builder
         .build()
         .expect("reqwest::Client builder must succeed with default TLS backend")
+}
+
+/// reqwest [`Resolve`] adapter that refuses any DNS lookup resolving to
+/// a cloud-metadata sentinel or IPv4/IPv6 link-local address.
+///
+/// String-level URL allow-listing (see `squeezy_core::check_base_url_scheme`)
+/// is insufficient on its own: an attacker who controls the DNS for a
+/// benign-looking hostname can answer with a TTL=0 record pointing at
+/// `169.254.169.254`. Without a resolver-level guard the validated
+/// hostname slips through at config-load and the first request stream
+/// connects to AWS IMDS over TLS, shipping the user's Bearer token.
+/// Installing this wrapper as the [`reqwest::ClientBuilder::dns_resolver`]
+/// re-checks every resolved `IpAddr` on every refresh of the connection
+/// pool, so DNS rebinding cannot bypass the literal-host filter.
+///
+/// Uses the same `is_metadata_or_link_local_ip` predicate the config
+/// layer applies to literal IPs so the two block-lists cannot drift.
+pub(crate) struct MetadataBlockingResolver {
+    inner: Arc<dyn Resolve>,
+}
+
+impl MetadataBlockingResolver {
+    /// Wrap the platform default (getaddrinfo via `tokio::net::lookup_host`).
+    pub(crate) fn system() -> Self {
+        Self {
+            inner: Arc::new(SystemResolver),
+        }
+    }
+
+    /// Wrap an arbitrary inner resolver. Used by unit tests so a canned
+    /// resolver can simulate DNS rebinding without touching live DNS.
+    #[cfg(test)]
+    pub(crate) fn wrapping(inner: Arc<dyn Resolve>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Resolve for MetadataBlockingResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let inner = self.inner.clone();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = inner.resolve(name).await?;
+            let collected: Vec<SocketAddr> = addrs.collect();
+            for addr in &collected {
+                if is_metadata_or_link_local_ip(&addr.ip()) {
+                    let msg = format!(
+                        "DNS resolution for host {host:?} produced cloud-metadata or \
+                         link-local address {ip}; refusing to connect (possible DNS \
+                         rebinding attempt)",
+                        ip = addr.ip(),
+                    );
+                    return Err(BlockedAddressError(msg).into());
+                }
+            }
+            Ok(Box::new(collected.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Error type emitted when the [`MetadataBlockingResolver`] refuses an
+/// address. Wrapped in [`reqwest::Error`] by the connect path; surfaces
+/// in upstream errors via `BoxError`.
+#[derive(Debug)]
+struct BlockedAddressError(String);
+
+impl std::fmt::Display for BlockedAddressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BlockedAddressError {}
+
+/// Tokio-backed system resolver invoked by [`MetadataBlockingResolver`].
+/// reqwest's bundled `GaiResolver` is `pub(crate)`, so we re-implement the
+/// minimal contract: call `tokio::net::lookup_host` and stream the
+/// results back.
+struct SystemResolver;
+
+impl Resolve for SystemResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Append a sentinel port; reqwest overrides the port using
+            // the URL's authority before connecting, so any non-zero
+            // value works. Using 0 would make `lookup_host` reject the
+            // input outright.
+            let target = format!("{host}:443");
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target)
+                .await
+                .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?
+                .map(|mut sa| {
+                    sa.set_port(0);
+                    sa
+                })
+                .collect();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Test-only [`Resolve`] that returns the configured `IpAddr`s on every
+/// lookup. Used by the DNS-rebinding regression test to swap a benign
+/// address for a metadata-sentinel between calls without touching real
+/// DNS.
+#[cfg(test)]
+pub(crate) struct StaticResolver(pub(crate) std::sync::Mutex<Vec<std::net::IpAddr>>);
+
+#[cfg(test)]
+impl Resolve for StaticResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        let addrs = self.0.lock().expect("static resolver mutex poisoned");
+        let collected: Vec<SocketAddr> = addrs.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
+        Box::pin(std::future::ready(Ok(
+            Box::new(collected.into_iter()) as Addrs
+        )))
+    }
 }
 
 #[cfg(test)]

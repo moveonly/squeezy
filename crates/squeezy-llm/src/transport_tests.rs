@@ -1,9 +1,14 @@
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use squeezy_core::ProviderTransportConfig;
 
-use super::{SHARED_CLIENT_CACHE_CAPACITY, build_client, shared_client};
+use super::{
+    MetadataBlockingResolver, SHARED_CLIENT_CACHE_CAPACITY, StaticResolver, build_client,
+    build_client_with_resolver, shared_client,
+};
 
 #[test]
 fn build_client_accepts_default_transport_config() {
@@ -42,6 +47,63 @@ fn shared_client_returns_handles_with_same_underlying_pool() {
     // without poking at reqwest's private internals — both clones
     // print identical pointer suffixes when they share an `Inner`.
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
+}
+
+/// T-62: simulate a DNS rebinding attack. The static resolver returns a
+/// benign address on the first call and `169.254.169.254` (AWS IMDS)
+/// on the second; the second request must fail with the metadata-block
+/// error rather than connecting. Without the
+/// [`MetadataBlockingResolver`] wrapper a TTL=0 rebind would let
+/// attacker DNS steer the validated hostname at AWS IMDS at request
+/// time.
+#[tokio::test]
+async fn dns_rebinding_resolved_metadata_address_is_refused() {
+    let mailbox: Arc<Mutex<Vec<IpAddr>>> =
+        Arc::new(Mutex::new(vec!["192.0.2.10".parse().unwrap()]));
+    let inner = Arc::new(StaticResolver(Mutex::new(mailbox.lock().unwrap().clone())))
+        as Arc<dyn reqwest::dns::Resolve>;
+    let resolver = MetadataBlockingResolver::wrapping(inner.clone());
+    let client = build_client_with_resolver(&ProviderTransportConfig::default(), resolver);
+
+    // First request: benign address resolves cleanly. The connection
+    // itself will fail (192.0.2.0/24 is RFC 5737 documentation-only)
+    // but the resolver does not refuse it — the error string must come
+    // from the connection layer, not the metadata block-list.
+    let first = client
+        .get("http://target.example.com/v1")
+        .send()
+        .await
+        .expect_err("connection to 192.0.2.10 should fail to connect");
+    let first_msg = format!("{first:?}");
+    assert!(
+        !first_msg.contains("cloud-metadata") && !first_msg.contains("link-local"),
+        "first request must not be refused by the resolver: {first_msg}"
+    );
+
+    // Simulate the rebind: the same hostname now resolves to AWS IMDS.
+    // We rebuild the resolver chain because reqwest caches the resolver
+    // handle; mutate the StaticResolver's address list to model the
+    // mid-stream DNS swap.
+    let imds: IpAddr = "169.254.169.254".parse().unwrap();
+    let rebound_inner =
+        Arc::new(StaticResolver(Mutex::new(vec![imds]))) as Arc<dyn reqwest::dns::Resolve>;
+    let rebound_resolver = MetadataBlockingResolver::wrapping(rebound_inner);
+    let rebound_client =
+        build_client_with_resolver(&ProviderTransportConfig::default(), rebound_resolver);
+    let second = rebound_client
+        .get("http://target.example.com/v1")
+        .send()
+        .await
+        .expect_err("rebind to 169.254.169.254 must be refused");
+    let second_msg = format!("{second:?}");
+    assert!(
+        second_msg.contains("cloud-metadata") || second_msg.contains("link-local"),
+        "rebound request must surface metadata-block error: {second_msg}"
+    );
+    assert!(
+        second_msg.contains("169.254.169.254"),
+        "rebound error must mention the refused IP: {second_msg}"
+    );
 }
 
 #[test]

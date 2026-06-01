@@ -4317,6 +4317,87 @@ base_url = "http://192.168.1.50:8080/v1"
     assert!(error.to_string().contains("https://"));
 }
 
+/// T-61: extending the SSRF block-list past the original http-only filter
+/// to cover IMDS / metadata / link-local hosts regardless of scheme.
+/// `https://169.254.169.254/...` previously sailed straight through into
+/// the Bearer-token request path because the helper only inspected the
+/// http scheme; verify each sentinel host is now refused at config-load
+/// for both http and https.
+#[test]
+fn config_rejects_imds_and_metadata_hosts_regardless_of_scheme() {
+    let cases: &[(&str, &str)] = &[
+        ("https://169.254.169.254/latest/api/token", "169.254"),
+        ("http://169.254.169.254/latest/", "169.254"),
+        // AWS ECS task-IAM endpoint.
+        ("https://169.254.170.2/v2/credentials/", "169.254"),
+        // GCP metadata sentinel hostname.
+        (
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "metadata.google.internal",
+        ),
+        // IPv4 link-local outside the 169.254.169.254 sentinel.
+        ("https://169.254.1.1/v1", "169.254"),
+        // IPv6 link-local (fe80::/10).
+        ("https://[fe80::1]/v1", "fe80::1"),
+        // AWS IPv6 IMDS ULA address.
+        ("https://[fd00:ec2::254]/latest/", "fd00:ec2::254"),
+    ];
+    for (url, host_fragment) in cases {
+        let toml = format!(
+            r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "{url}"
+api_key_env = "FAKE_KEY"
+"#
+        );
+        let settings = SettingsFile::from_toml_str(&toml, "test").expect("settings parse");
+        let error = AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+            (name == "FAKE_KEY").then(|| "k".to_string())
+        })
+        .expect_err(&format!("must reject {url}"));
+        let msg = error.to_string();
+        assert!(
+            msg.contains("cloud-metadata or") || msg.contains("link-local"),
+            "error for {url} must mention metadata/link-local: {msg}"
+        );
+        assert!(
+            msg.contains(host_fragment),
+            "error for {url} must contain host fragment {host_fragment:?}: {msg}"
+        );
+    }
+}
+
+/// Companion to the metadata-host filter: bare loopback configurations
+/// must still be accepted on both `http://` and `https://` so local
+/// `lmstudio`, `ollama`, and `llamacpp` deployments keep working.
+#[test]
+fn config_accepts_loopback_hosts_on_https_too() {
+    for url in [
+        "https://127.0.0.1:11434/api",
+        "https://localhost:8000/v1",
+        "https://[::1]:8443/v1",
+    ] {
+        let toml = format!(
+            r#"
+[model]
+provider = "openai_compatible"
+
+[providers.openai_compatible]
+base_url = "{url}"
+api_key_env = "FAKE_KEY"
+"#
+        );
+        let settings = SettingsFile::from_toml_str(&toml, "test").expect("settings parse");
+        AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
+            (name == "FAKE_KEY").then(|| "k".to_string())
+        })
+        .unwrap_or_else(|err| panic!("loopback https {url:?} must be accepted: {err}"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn shell_escape_resolves_string_value_to_stdout() {

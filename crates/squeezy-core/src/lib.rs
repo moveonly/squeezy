@@ -9040,13 +9040,46 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
 /// (`localhost`, `127.0.0.0/8`, or `[::1]`). Anything else (LAN IPs, public
 /// hostnames) must use HTTPS so a misconfigured config file cannot silently
 /// exfiltrate API keys + prompt content to an attacker-controlled origin.
+/// Independently of scheme, refuses any host that is a cloud-metadata
+/// sentinel or IPv4/IPv6 link-local address. `https://169.254.169.254/...`,
+/// `https://metadata.google.internal/...`, and `https://[fe80::1]/...`
+/// would otherwise sail through the http-only filter and ship the Bearer
+/// token to AWS IMDS / GCP metadata / Azure IMDS / a link-local
+/// adversary on the LAN.
 fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
     let trimmed = base_url.trim();
-    let Some(rest) = trimmed.strip_prefix("http://") else {
+    // Extract the host irrespective of scheme so the metadata-sentinel
+    // check fires for `https://` too (the original http-only filter
+    // shipped Bearer tokens to AWS IMDS over TLS without complaint).
+    let host_only = extract_host_only(trimmed);
+    if let Some(host) = host_only.as_deref()
+        && is_metadata_or_link_local_host(host)
+    {
+        return Err(SqueezyError::Config(format!(
+            "providers.{section}.base_url host {host:?} resolves to a cloud-metadata or \
+             link-local address (got {trimmed:?}); refusing to ship API keys or prompt \
+             content to IMDS / metadata endpoints"
+        )));
+    }
+    let Some(_rest) = trimmed.strip_prefix("http://") else {
         // Empty, https://, or any non-http scheme: the existing emptiness +
         // reachability checks elsewhere handle these. We only police http.
         return Ok(());
     };
+    if host_only.as_deref().is_some_and(is_loopback_host) {
+        return Ok(());
+    }
+    Err(SqueezyError::Config(format!(
+        "providers.{section}.base_url must use https:// for non-loopback hosts (got {trimmed:?}); \
+         API keys and prompt content would otherwise transit in cleartext"
+    )))
+}
+
+/// Parse the host component out of a `base_url` string irrespective of
+/// scheme. Returns `None` when the input lacks an `://` separator (we
+/// only have a path) or is empty after the separator.
+fn extract_host_only(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, rest)| rest)?;
     let host = rest
         .split('/')
         .next()
@@ -9054,18 +9087,19 @@ fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
         .rsplit('@')
         .next()
         .unwrap_or("");
-    let host_only = host
+    if host.is_empty() {
+        return None;
+    }
+    let stripped = host
         .strip_prefix('[')
         .and_then(|s| s.split_once(']'))
-        .map(|(h, _)| h)
-        .unwrap_or_else(|| host.split(':').next().unwrap_or(""));
-    if is_loopback_host(host_only) {
-        return Ok(());
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| host.split(':').next().unwrap_or("").to_string());
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
     }
-    Err(SqueezyError::Config(format!(
-        "providers.{section}.base_url must use https:// for non-loopback hosts (got {trimmed:?}); \
-         API keys and prompt content would otherwise transit in cleartext"
-    )))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -9080,30 +9114,40 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Secondary env-var names accepted as fallbacks when the preset's
 /// canonical `default_api_key_env` is empty. Lets squeezy honor the
-/// out-of-band conventions mainstream platforms inject (Vercel
-/// runtimes always have `VERCEL_OIDC_TOKEN`; older Cloudflare and
-/// DeepInfra docs reference alternate names). Returning `&'static
-/// [&'static str]` keeps the lookup zero-allocation. The list is the
-/// preset metadata's "alias chain" — the canonical env wins when set,
-/// the first non-empty alias takes over when not. Ordering matters:
-/// list the alias that the platform's tooling actually injects first.
+/// out-of-band conventions mainstream platforms inject.
 fn preset_api_key_env_aliases(preset: OpenAiCompatiblePreset) -> &'static [&'static str] {
     match preset {
-        // Vercel functions auto-inject `VERCEL_OIDC_TOKEN` (12h TTL) so
-        // a session inside a Vercel runtime authenticates against
-        // AI Gateway without a manually-pasted key. Production docs:
-        // /docs/ai-gateway/authentication-and-byok/oidc.
         OpenAiCompatiblePreset::Vercel => &["VERCEL_OIDC_TOKEN"],
-        // Cloudflare's API token historically shipped under
-        // `CLOUDFLARE_API_TOKEN` (their dashboard) and
-        // `CLOUDFLARE_API_KEY` (Workers AI docs). Honor both so
-        // operators who already set one don't have to mirror it.
         OpenAiCompatiblePreset::CloudflareWorkersAi
         | OpenAiCompatiblePreset::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
-        // DeepInfra's CLI ships `DEEPINFRA_TOKEN`; the docs call it
-        // `DEEPINFRA_API_KEY`.
         OpenAiCompatiblePreset::DeepInfra => &["DEEPINFRA_TOKEN"],
         _ => &[],
+    }
+}
+
+/// `true` when the literal host (no DNS resolution) names a cloud-metadata
+/// sentinel or sits in an IPv4/IPv6 link-local range.
+pub fn is_metadata_or_link_local_host(host: &str) -> bool {
+    const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata", "metadata.google"];
+    for needle in METADATA_HOSTS {
+        if host.eq_ignore_ascii_case(needle) {
+            return true;
+        }
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_metadata_or_link_local_ip(&ip);
+    }
+    false
+}
+
+/// IP-address half of the metadata / link-local filter.
+pub fn is_metadata_or_link_local_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            (segments[0] & 0xffc0) == 0xfe80 || segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+        }
     }
 }
 
