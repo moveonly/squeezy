@@ -96,7 +96,6 @@ impl Worker for SseClientWorker {
         self,
         mut context: WorkerContext<Self>,
     ) -> Result<(), WorkerQuitReason<Self::Error>> {
-        let sse_url = self.sse_url.clone();
         let response = self
             .open_stream()
             .await
@@ -105,7 +104,7 @@ impl Worker for SseClientWorker {
         // The server MUST advertise the message-post URL via `event: endpoint`
         // before sending any `message` events. We keep draining until we either
         // see that event or hit a recoverable end-of-stream that we drain again.
-        let mut endpoint_url = match read_endpoint(&sse_url, &mut frames).await {
+        let mut endpoint_url = match read_endpoint(&self.sse_url, &mut frames).await {
             Ok(url) => url,
             Err(error) => {
                 return Err(WorkerQuitReason::fatal(error, "reading endpoint event"));
@@ -113,7 +112,7 @@ impl Worker for SseClientWorker {
         };
         debug!(
             target: "squeezy::mcp::sse",
-            sse_url = %sse_url,
+            sse_url = %self.sse_url,
             endpoint_url = %endpoint_url,
             "established legacy MCP SSE session"
         );
@@ -176,7 +175,7 @@ impl Worker for SseClientWorker {
                                 }
                             };
                             frames = sse_frame_stream(response);
-                            match read_endpoint(&sse_url, &mut frames).await {
+                            match read_endpoint(&self.sse_url, &mut frames).await {
                                 Ok(new_endpoint) => endpoint_url = new_endpoint,
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
