@@ -1085,6 +1085,159 @@ fn request_body_passes_reasoning_effort_in_both_legacy_and_unified_shapes() {
 }
 
 #[test]
+fn request_body_drops_reasoning_nested_form_for_mistral() {
+    // H-55: Mistral 422s on the nested `reasoning: {effort}` form
+    // and on `low`/`medium`/`minimal` enum values. Emit a top-
+    // level `reasoning_effort: "high"` only.
+    use squeezy_core::ReasoningEffort;
+    let mut request = sample_request();
+    request.model = "mistral-large-latest".to_string().into();
+    request.reasoning_effort = Some(ReasoningEffort::Low);
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &request,
+        OpenAiCompatiblePreset::Mistral,
+    );
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("reasoning").is_none(), "no nested form on Mistral");
+}
+
+#[test]
+fn request_body_emits_deepseek_thinking_body_field() {
+    // H-49: DeepSeek V4 uses body.thinking = {type, budget_tokens}.
+    use squeezy_core::ReasoningEffort;
+    let mut request = sample_request();
+    request.model = "deepseek-v4-pro".to_string().into();
+    request.reasoning_effort = Some(ReasoningEffort::High);
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &request,
+        OpenAiCompatiblePreset::DeepSeek,
+    );
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert!(body["thinking"]["budget_tokens"].is_number());
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "DeepSeek must not also carry OpenAI-style reasoning_effort"
+    );
+}
+
+#[test]
+fn request_body_emits_groq_include_reasoning_for_gpt_oss_family() {
+    // H-52 gpt-oss-*: Groq accepts `include_reasoning: true` for
+    // the gpt-oss family but rejects `reasoning_effort` mixed
+    // with the format flag.
+    use squeezy_core::ReasoningEffort;
+    let mut request = sample_request();
+    request.model = "gpt-oss-120b".to_string().into();
+    request.reasoning_effort = Some(ReasoningEffort::Medium);
+    let body =
+        OpenAiCompatibleProvider::request_body_for_preset(&request, OpenAiCompatiblePreset::Groq);
+    assert_eq!(body["include_reasoning"], true);
+    assert!(
+        body.get("reasoning_format").is_none(),
+        "gpt-oss must NOT also carry reasoning_format"
+    );
+}
+
+#[test]
+fn request_body_emits_groq_reasoning_format_for_qwen_and_deepseek() {
+    // H-52 Qwen / DeepSeek-R1: Groq accepts `reasoning_format`
+    // string enum.
+    use squeezy_core::ReasoningEffort;
+    for model in ["qwen3.5-32b", "deepseek-r1-distill-llama-70b"] {
+        let mut request = sample_request();
+        request.model = model.to_string().into();
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        let body = OpenAiCompatibleProvider::request_body_for_preset(
+            &request,
+            OpenAiCompatiblePreset::Groq,
+        );
+        assert_eq!(
+            body["reasoning_format"], "parsed",
+            "model {model} must opt into reasoning_format"
+        );
+        assert!(
+            body.get("include_reasoning").is_none(),
+            "model {model} must not also carry include_reasoning"
+        );
+    }
+}
+
+#[test]
+fn request_body_emits_vercel_provider_options_per_upstream_namespace() {
+    // H-62: Vercel ignores top-level reasoning_effort; the hint
+    // rides under providerOptions.{anthropic,openai} keyed off
+    // the upstream the gateway is dialing.
+    use squeezy_core::ReasoningEffort;
+    let mut anthropic = sample_request();
+    anthropic.model = "anthropic/claude-opus-4-7".to_string().into();
+    anthropic.reasoning_effort = Some(ReasoningEffort::High);
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &anthropic,
+        OpenAiCompatiblePreset::Vercel,
+    );
+    assert!(body["providerOptions"]["anthropic"]["thinkingBudget"].is_number());
+    assert!(body.get("reasoning_effort").is_none());
+
+    let mut openai = sample_request();
+    openai.model = "openai/gpt-5.5".to_string().into();
+    openai.reasoning_effort = Some(ReasoningEffort::Medium);
+    let body =
+        OpenAiCompatibleProvider::request_body_for_preset(&openai, OpenAiCompatiblePreset::Vercel);
+    assert_eq!(
+        body["providerOptions"]["openai"]["reasoningEffort"],
+        "medium"
+    );
+    assert_eq!(
+        body["providerOptions"]["openai"]["reasoningSummary"],
+        "auto"
+    );
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn request_body_emits_vertex_thinking_config_extra_body() {
+    // H-65: Vertex's OpenAI-compat layer translates via
+    // extra_body.google.thinking_config.thinking_budget.
+    use squeezy_core::ReasoningEffort;
+    let mut request = sample_request();
+    request.model = "google/gemini-2.5-pro".to_string().into();
+    request.reasoning_effort = Some(ReasoningEffort::High);
+    let body =
+        OpenAiCompatibleProvider::request_body_for_preset(&request, OpenAiCompatiblePreset::Vertex);
+    assert!(body["extra_body"]["google"]["thinking_config"]["thinking_budget"].is_number());
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "Vertex must not also carry the OpenAI-style hint"
+    );
+}
+
+#[test]
+fn request_body_drops_prompt_cache_retention_on_mistral() {
+    // H-56: Mistral 422s on unknown body fields; suppress
+    // prompt_cache_retention on the Mistral preset.
+    use crate::{CacheRetention, CacheSpec};
+    let mut request = sample_request();
+    request.cache = CacheSpec {
+        key: Some("k".to_string()),
+        retention: CacheRetention::Long,
+    };
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &request,
+        OpenAiCompatiblePreset::Mistral,
+    );
+    assert!(
+        body.get("prompt_cache_retention").is_none(),
+        "Mistral must not carry the unknown prompt_cache_retention field"
+    );
+    // The other presets keep it.
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &request,
+        OpenAiCompatiblePreset::OpenRouter,
+    );
+    assert_eq!(body["prompt_cache_retention"], "24h");
+}
+
+#[test]
 fn request_body_emits_chat_template_args_enable_thinking_for_local_presets() {
     // H-39: Baseten + vLLM + llamacpp speak the
     // `chat_template_args.enable_thinking` flag the jinja
