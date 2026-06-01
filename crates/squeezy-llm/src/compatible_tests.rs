@@ -1507,6 +1507,93 @@ fn build_with_cf_upstream(
     provider
 }
 
+#[test]
+fn substitute_url_placeholders_leaves_provider_for_cloudflare_ai_gateway() {
+    // C-12 follow-up: the new CF REST URL shape carries the
+    // upstream provider in a path segment. The provider is
+    // per-request (derived from the model id at stream time), so
+    // `substitute_url_placeholders` must leave `{provider}` in the
+    // string for the AI Gateway preset and let `stream_response`
+    // resolve it later.
+    let resolved = substitute_url_placeholders(
+        "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/{provider}/v1",
+        OpenAiCompatiblePreset::CloudflareAiGateway,
+        Some("acct"),
+        None,
+    )
+    .expect("CF AI Gateway with {provider} placeholder must build");
+    assert_eq!(
+        resolved, "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/{provider}/v1",
+        "{{provider}} survives construction for AI Gateway",
+    );
+}
+
+#[test]
+fn substitute_url_placeholders_rejects_provider_for_non_ai_gateway_presets() {
+    // Misconfiguration guard: a `{provider}` placeholder in a
+    // non-AI-Gateway preset is almost certainly a copy/paste
+    // mistake (or a typo in `[providers.custom.base_url]`). Surface
+    // it as a config-time error rather than letting the literal
+    // `{provider}` segment escape to the wire.
+    let error = substitute_url_placeholders(
+        "https://example.com/{provider}/chat/completions",
+        OpenAiCompatiblePreset::Custom,
+        None,
+        None,
+    )
+    .expect_err("non-AI-Gateway preset must reject the placeholder");
+    assert!(
+        matches!(error, SqueezyError::ProviderNotConfigured(_)),
+        "got: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("{provider}"),
+        "error must name the offending placeholder: {message}"
+    );
+    assert!(
+        message.contains("cloudflare_ai_gateway"),
+        "error must point users at the right preset: {message}"
+    );
+}
+
+#[test]
+fn resolve_provider_segment_maps_known_model_prefixes_to_upstream_path() {
+    // The function pulls the upstream segment from the namespace
+    // prefix on the model id. Anthropic, OpenAI, Google, xAI all
+    // classify via COMPAT_TABLE; everything else falls back to the
+    // bare prefix or the Workers-AI / compat default.
+    let base = "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/{provider}/v1";
+    assert_eq!(
+        resolve_provider_segment(base, "anthropic/claude-opus-4-7"),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/anthropic/v1",
+        "anthropic/ prefix must route to /anthropic"
+    );
+    assert_eq!(
+        resolve_provider_segment(base, "openai/gpt-5.5"),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/openai/v1",
+    );
+    assert_eq!(
+        resolve_provider_segment(base, "@cf/meta/llama-3.3-70b"),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/workers-ai/v1",
+        "@cf/ models route through Workers AI"
+    );
+    assert_eq!(
+        resolve_provider_segment(base, "perplexity/sonar-large"),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/perplexity/v1",
+        "unknown prefix passes through as the segment"
+    );
+    assert_eq!(
+        resolve_provider_segment(base, "unprefixed-model"),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/compat/v1",
+        "unprefixed models default to the compat upstream"
+    );
+    // No-op for URLs without the placeholder so non-CF routes pay
+    // nothing.
+    let plain = "https://api.openai.com/v1";
+    assert_eq!(resolve_provider_segment(plain, "openai/gpt-5.5"), plain);
+}
+
 #[tokio::test]
 async fn cloudflare_ai_gateway_swaps_upstream_key_into_bearer_slot() {
     // C-11: When the user has set `CF_UPSTREAM_KEY` the constructed

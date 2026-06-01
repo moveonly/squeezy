@@ -553,7 +553,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
-        let url = format!("{}/chat/completions", self.base_url);
+        // C-12 follow-up: resolve any `{provider}` placeholder that
+        // survived construction (left for the AI Gateway preset's
+        // per-request upstream routing) before appending the
+        // chat-completions suffix. `resolve_provider_segment` is a
+        // no-op when the URL contains no placeholder, so non-CF
+        // routes pay nothing for this hop.
+        let resolved_base = resolve_provider_segment(&self.base_url, &request.model);
+        let url = format!("{resolved_base}/chat/completions");
         let extra_headers = self.extra_headers.clone();
         let preset = self.preset;
         // We previously auto-injected `x-portkey-provider` from a
@@ -869,7 +876,56 @@ pub(crate) fn substitute_url_placeholders(
         };
         resolved = resolved.replace(placeholder, value);
     }
+    // C-12 follow-up: the new CF AI Gateway REST URL shape
+    // (`api.cloudflare.com/.../ai/v1/{provider}/v1/chat/completions`)
+    // routes by the upstream provider in the URL path, but the
+    // provider is a *per-request* property (derived from the model's
+    // namespace prefix). Leave any `{provider}` placeholder in the
+    // string untouched at construction time so the request-time
+    // resolver in `stream_response` can substitute the right value
+    // per turn (e.g. `openai/gpt-5.5` -> `openai`). Other presets
+    // don't accept the placeholder — surface an explicit error so a
+    // typo in `[providers.custom.base_url]` doesn't escape as a
+    // literal `{provider}` segment.
+    if resolved.contains("{provider}") && preset != OpenAiCompatiblePreset::CloudflareAiGateway {
+        return Err(SqueezyError::ProviderNotConfigured(format!(
+            "providers.{section}.base_url contains the {{provider}} \
+             placeholder but the {preset_label} preset does not support \
+             per-request upstream routing; remove the placeholder or \
+             switch to the cloudflare_ai_gateway preset"
+        )));
+    }
     Ok(resolved)
+}
+
+/// Resolve any `{provider}` placeholder that survived construction
+/// (left in place by [`substitute_url_placeholders`] for the AI
+/// Gateway preset) by deriving the upstream provider from the
+/// model id's namespace prefix. Used at request build time so each
+/// turn can route through the correct upstream without rebuilding
+/// the provider.
+///
+/// Falls back to `workers-ai` for unprefixed models because that is
+/// the only Cloudflare-direct upstream that the AI Gateway exposes
+/// for Workers AI checkpoints (model ids like `@cf/meta/...`).
+pub(crate) fn resolve_provider_segment(base_url: &str, model: &str) -> String {
+    if !base_url.contains("{provider}") {
+        return base_url.to_string();
+    }
+    let provider = if let Some(entry) = compat_entry(model) {
+        // Strip the trailing slash to land on the segment name.
+        entry.model_prefix.trim_end_matches('/').to_string()
+    } else if model.starts_with("@cf/") {
+        "workers-ai".to_string()
+    } else if let Some((prefix, _)) = model.split_once('/') {
+        prefix.to_ascii_lowercase()
+    } else {
+        // Default upstream for legacy callers that pass an
+        // unprefixed model id. Cloudflare auto-discovers the
+        // upstream when the segment is `compat`.
+        "compat".to_string()
+    };
+    base_url.replace("{provider}", &provider)
 }
 
 fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
