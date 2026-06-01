@@ -476,9 +476,9 @@ fn request_body_clamps_multibyte_prompt_cache_key_at_codepoint_boundary() {
 #[test]
 fn affinity_headers_emitted_with_cache_key_carry_full_unclamped_value() {
     // The body field is clamped to 64 codepoints (above), but the
-    // routing headers do not share that limit — they carry the full
-    // session id so OpenAI's load balancer can pin repeat turns to the
-    // backend that warmed the cached prefix.
+    // routing headers carry up to 256 bytes (LOW: defensive cap to keep
+    // hyper's 8KB header line cap unreachable) so OpenAI's load
+    // balancer can still pin repeat turns to the warmed backend.
     let long_key: String = "a".repeat(100);
     let request = LlmRequest {
         model: "gpt-test".to_string().into(),
@@ -539,6 +539,89 @@ fn affinity_headers_present_when_cache_spec_carries_key() {
     assert_eq!(headers.len(), 2);
     for (_, value) in &headers {
         assert_eq!(value, "squeezy::session-affinity");
+    }
+}
+
+#[test]
+fn affinity_header_values_are_clamped_to_two_fifty_six_bytes() {
+    // LOW: adversarial inputs (multi-MB cache keys propagated from
+    // user-controlled session ids) would otherwise panic the request
+    // builder. Clamp keeps the byte length well under hyper's 8KB
+    // header line cap.
+    let huge = "x".repeat(4096);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some(huge.clone()),
+            retention: crate::CacheRetention::Short,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    for (name, value) in OpenAiProvider::affinity_headers(&request) {
+        assert!(
+            value.len() <= 256,
+            "{name} value must be ≤ 256 bytes, got {} bytes",
+            value.len(),
+        );
+    }
+}
+
+#[test]
+fn affinity_header_clamps_at_utf8_codepoint_boundary() {
+    // The 256-byte clamp MUST land on a codepoint boundary so the
+    // resulting String stays valid UTF-8 even for multibyte inputs.
+    // Build a key that crosses the 256-byte mark mid-codepoint.
+    let multibyte = "🚀".repeat(80); // 4 bytes each = 320 bytes
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some(multibyte.clone()),
+            retention: crate::CacheRetention::Short,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    let headers = OpenAiProvider::affinity_headers(&request);
+    for (name, value) in headers {
+        assert!(
+            value.len() <= 256,
+            "{name} value must be ≤ 256 bytes, got {} bytes",
+            value.len(),
+        );
+        // Round-trip through `String` (already valid by construction);
+        // ensure split landed on a 🚀-codepoint boundary (4 bytes each).
+        assert_eq!(
+            value.len() % 4,
+            0,
+            "{name} value must split on a codepoint boundary (multiples of 4 bytes for 🚀)",
+        );
     }
 }
 

@@ -267,15 +267,37 @@ impl OpenAiProvider {
     /// header values are `session_id` and `x-client-request-id`, both
     /// taken from the request's cache key.
     ///
-    /// The header values carry the full (unclamped) cache key — the
-    /// 64-codepoint limit is specific to the body field; routing headers
-    /// have OpenAI's general (much larger) header length cap.
+    /// The header values carry up to 256 bytes of the cache key — the
+    /// 64-codepoint limit is specific to the body field. Defensive
+    /// 256-byte clamp (audit LOW): reqwest/hyper enforce an 8KB header
+    /// line cap and adversarial inputs (multi-MB cache keys propagated
+    /// from user-controlled session ids) would panic the request builder
+    /// before the cap kicks in.
     pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
         let Some(key) = request.effective_cache_spec().key else {
             return Vec::new();
         };
-        vec![("session_id", key.clone()), ("x-client-request-id", key)]
+        let clamped = clamp_affinity_header_value(&key);
+        vec![
+            ("session_id", clamped.clone()),
+            ("x-client-request-id", clamped),
+        ]
     }
+}
+
+/// Clamp a cache-key value to 256 bytes for use as an HTTP header.
+/// Splits on a UTF-8 codepoint boundary so the result is still a valid
+/// `String`. Values already at or under the cap pass through verbatim.
+fn clamp_affinity_header_value(value: &str) -> String {
+    const MAX_BYTES: usize = 256;
+    if value.len() <= MAX_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
