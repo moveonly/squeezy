@@ -92,7 +92,17 @@ impl GoogleProvider {
         if reasoning_capable || request.reasoning_effort.is_some() {
             let mut thinking = json!({ "includeThoughts": true });
             if let Some(effort) = request.reasoning_effort {
-                thinking["thinkingBudget"] = json!(effort.thinking_budget_tokens());
+                // Clamp per-model. ReasoningEffort::thinking_budget_tokens
+                // returns an Anthropic-shaped scale (XHigh = 60_000) that
+                // exceeds Gemini 2.5's documented maxima (Pro 32_768,
+                // Flash / Flash-Lite 24_576). Pre-clamp, every
+                // `xhigh` caller on Gemini 2.5 got a 400. The Phase 3
+                // registry will carry per-model
+                // `thinking_budget_min` / `thinking_budget_max` so the
+                // clamp tightens to the right ranges automatically.
+                let raw = effort.thinking_budget_tokens();
+                let clamped = clamp_thinking_budget(caps.as_ref(), raw);
+                thinking["thinkingBudget"] = json!(clamped);
             }
             body["generationConfig"]["thinkingConfig"] = thinking;
         }
@@ -111,6 +121,23 @@ impl GoogleProvider {
         }
         body
     }
+}
+
+/// Clamp a raw `thinking_budget_tokens` value (from `ReasoningEffort`)
+/// to the per-model max / min that Phase 3 stamps into the registry.
+/// `caps == None` (off-registry model) or `caps` without the new fields
+/// leaves the raw value in place to preserve historical behavior.
+pub(crate) fn clamp_thinking_budget(caps: Option<&crate::ModelCapabilities>, raw: u32) -> u32 {
+    let mut value = raw;
+    if let Some(caps) = caps {
+        if let Some(max) = caps.thinking_budget_max {
+            value = value.min(max);
+        }
+        if let Some(min) = caps.thinking_budget_min {
+            value = value.max(min);
+        }
+    }
+    value
 }
 
 /// Project a JSON Schema into Gemini's OpenAPI-3.03 subset. Gemini's

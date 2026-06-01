@@ -403,6 +403,24 @@ fn parallel_tool_calls_across_chunks_get_distinct_ids() {
 }
 
 #[test]
+fn clamp_thinking_budget_uses_registry_max_and_min() {
+    use crate::ModelCapabilities;
+    let caps = ModelCapabilities {
+        thinking_budget_min: Some(128),
+        thinking_budget_max: Some(32_768),
+        ..ModelCapabilities::TEXT_TOOLS
+    };
+    // XHigh (60_000) clamps down to Pro's 32_768.
+    assert_eq!(clamp_thinking_budget(Some(&caps), 60_000), 32_768);
+    // A budget below the min lifts to the min.
+    assert_eq!(clamp_thinking_budget(Some(&caps), 0), 128);
+    // A value inside the range passes through.
+    assert_eq!(clamp_thinking_budget(Some(&caps), 16_000), 16_000);
+    // Off-registry models leave the raw value alone.
+    assert_eq!(clamp_thinking_budget(None, 60_000), 60_000);
+}
+
+#[test]
 fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
     use squeezy_core::ReasoningEffort;
     let request = LlmRequest {
