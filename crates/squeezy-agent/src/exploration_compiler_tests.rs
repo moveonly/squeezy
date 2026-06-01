@@ -301,6 +301,21 @@ fn subclasses_phrasing_also_compiles_to_hierarchy() {
 }
 
 #[test]
+fn dart_mixes_in_phrasing_compiles_to_hierarchy() {
+    // The dart realworld scenario phrases the question as
+    // "every concrete class declared under ... that mixes in
+    // WidgetsBindingObserver". An earlier keyword list only had
+    // "classes that mix" (plural) and missed this singular form, so
+    // the planner stayed silent and the model bottomed out at 66.7%
+    // recall on the Flutter SDK benchmark.
+    let plan =
+        compile_exploration_plan("find every concrete class that mixes in WidgetsBindingObserver")
+            .expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
+    assert_eq!(plan.query.as_deref(), Some("WidgetsBindingObserver"));
+}
+
+#[test]
 fn file_named_prompt_suppresses_speculative_planner() {
     // Prompts that name ≥2 explicit source file paths are doing a
     // targeted multi-file read where speculative graph plumbing is dead
