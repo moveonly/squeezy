@@ -102,7 +102,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": true
+      "prompt_caching": true,
+      "thinking_budget_min": 1024,
+      "thinking_budget_max": 60000
     },
     "pricing": {
       "input_usd_micros_per_mtok": 15000000,
@@ -132,7 +134,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": true
+      "prompt_caching": true,
+      "thinking_budget_min": 1024,
+      "thinking_budget_max": 60000
     },
     "pricing": {
       "input_usd_micros_per_mtok": 3000000,
@@ -162,7 +166,9 @@
       "reasoning_tokens": true,
       "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": true
+      "prompt_caching": true,
+      "thinking_budget_min": 1024,
+      "thinking_budget_max": 60000
     },
     "pricing": {
       "input_usd_micros_per_mtok": 1000000,
@@ -189,10 +195,12 @@
       "json_mode": true,
       "vision": true,
       "response_state": false,
-      "reasoning_tokens": false,
-      "reasoning_effort": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true,
+      "thinking_budget_min": 128,
+      "thinking_budget_max": 32768
     },
     "pricing": {
       "input_usd_micros_per_mtok": 1250000,
@@ -219,10 +227,12 @@
       "json_mode": true,
       "vision": true,
       "response_state": false,
-      "reasoning_tokens": false,
-      "reasoning_effort": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true,
+      "thinking_budget_min": 0,
+      "thinking_budget_max": 24576
     },
     "pricing": {
       "input_usd_micros_per_mtok": 300000,
@@ -252,7 +262,9 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true,
+      "thinking_budget_min": 0,
+      "thinking_budget_max": 24576
     },
     "pricing": {
       "input_usd_micros_per_mtok": 100000,
@@ -428,7 +440,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -453,7 +465,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -478,7 +490,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -516,7 +528,132 @@
     "metadata_source": "https://openrouter.ai/google/gemini-2.5-pro"
   },
   {
-    "provider": "vercel",
+    "provider": "openrouter",
+    "id": "anthropic/claude-opus-4.7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-opus-4.7"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-sonnet-4.6",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-sonnet-4.6"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-haiku-4.5",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-haiku-4.5"
+  },
+  {
+    "provider": "openrouter",
+    "id": "openai/gpt-5.4-mini",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/openai/gpt-5.4-mini"
+  },
+  {
+    "provider": "openrouter",
+    "id": "openai/gpt-5.4-nano",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/openai/gpt-5.4-nano"
+  },
+  {
+    "provider": "portkey",
     "id": "anthropic/claude-opus-4-7",
     "profile": "strong",
     "capabilities": {
@@ -529,6 +666,106 @@
       "reasoning_effort": false,
       "text_verbosity": false,
       "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://portkey.ai/docs/integrations/llms/anthropic"
+  },
+  {
+    "provider": "portkey",
+    "id": "anthropic/claude-haiku-4-5",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://portkey.ai/docs/integrations/llms/anthropic"
+  },
+  {
+    "provider": "portkey",
+    "id": "openai/gpt-5.5",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": true,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://portkey.ai/docs/integrations/llms/openai"
+  },
+  {
+    "provider": "portkey",
+    "id": "google/gemini-2.5-pro",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://portkey.ai/docs/integrations/llms/google-gemini"
+  },
+  {
+    "provider": "vercel",
+    "id": "anthropic/claude-opus-4.7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -553,7 +790,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -562,6 +799,31 @@
       "effective_context_window_percent": 95
     },
     "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://vercel.com/docs/ai-gateway/models"
+  },
+  {
+    "provider": "vercel",
+    "id": "google/gemini-3.1-pro-preview",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
     "lifecycle": "active",
     "metadata_source": "https://vercel.com/docs/ai-gateway/models"
   },
@@ -578,7 +840,7 @@
       "reasoning_tokens": false,
       "reasoning_effort": false,
       "text_verbosity": false,
-      "prompt_caching": false
+      "prompt_caching": true
     },
     "pricing": null,
     "limits": {
@@ -682,7 +944,7 @@
   },
   {
     "provider": "xai",
-    "id": "grok-4",
+    "id": "grok-4.3",
     "profile": "strong",
     "capabilities": {
       "streaming": true,
@@ -690,14 +952,46 @@
       "json_mode": true,
       "vision": true,
       "response_state": false,
-      "reasoning_tokens": false,
-      "reasoning_effort": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": false,
+      "thinking_budget_min": 0,
+      "thinking_budget_max": 32768
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1250000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 256000,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.x.ai/docs/models"
+  },
+  {
+    "provider": "xai",
+    "id": "grok-4.20-0309-reasoning",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
       "text_verbosity": false,
       "prompt_caching": false
     },
     "pricing": {
-      "input_usd_micros_per_mtok": 3000000,
-      "output_usd_micros_per_mtok": 15000000,
+      "input_usd_micros_per_mtok": 200000,
+      "output_usd_micros_per_mtok": 500000,
       "cache_read_usd_micros_per_mtok": null,
       "cache_write_usd_micros_per_mtok": null
     },
@@ -772,7 +1066,157 @@
   },
   {
     "provider": "deepseek",
-    "id": "deepseek-chat",
+    "id": "deepseek-v4-flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 140000,
+      "output_usd_micros_per_mtok": 280000,
+      "cache_read_usd_micros_per_mtok": 2800,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  {
+    "provider": "deepseek",
+    "id": "deepseek-vision-preview",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 280000,
+      "output_usd_micros_per_mtok": 560000,
+      "cache_read_usd_micros_per_mtok": 5600,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  {
+    "provider": "deepseek",
+    "id": "deepseek-reasoner-v4",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1740000,
+      "output_usd_micros_per_mtok": 3480000,
+      "cache_read_usd_micros_per_mtok": 14500,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  {
+    "provider": "mistral",
+    "id": "mistral-large-2512",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 2000000,
+      "output_usd_micros_per_mtok": 6000000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.mistral.ai/api"
+  },
+  {
+    "provider": "mistral",
+    "id": "ministral-8b",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 100000,
+      "output_usd_micros_per_mtok": 100000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.mistral.ai/api"
+  },
+  {
+    "provider": "mistral",
+    "id": "codestral-2026",
     "profile": "balanced",
     "capabilities": {
       "streaming": true,
@@ -786,23 +1230,443 @@
       "prompt_caching": false
     },
     "pricing": {
-      "input_usd_micros_per_mtok": 270000,
-      "output_usd_micros_per_mtok": 1100000,
-      "cache_read_usd_micros_per_mtok": 27000,
+      "input_usd_micros_per_mtok": 300000,
+      "output_usd_micros_per_mtok": 900000,
+      "cache_read_usd_micros_per_mtok": null,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
-      "context_window_tokens": 131072,
-      "max_output_tokens": 8192,
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
       "effective_context_window_percent": 95
     },
     "tokenizer": "openai_compatible",
     "lifecycle": "active",
-    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+    "metadata_source": "https://docs.mistral.ai/api"
   },
   {
-    "provider": "deepseek",
-    "id": "deepseek-reasoner",
+    "provider": "mistral",
+    "id": "ministral-3b-2410",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 40000,
+      "output_usd_micros_per_mtok": 40000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.mistral.ai/api"
+  },
+  {
+    "provider": "mistral",
+    "id": "pixtral-large-2411",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 2000000,
+      "output_usd_micros_per_mtok": 6000000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.mistral.ai/api"
+  },
+  {
+    "provider": "together",
+    "id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 270000,
+      "output_usd_micros_per_mtok": 880000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.together.ai/pricing"
+  },
+  {
+    "provider": "together",
+    "id": "deepseek-ai/DeepSeek-V4-Flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 140000,
+      "output_usd_micros_per_mtok": 280000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.together.ai/pricing"
+  },
+  {
+    "provider": "together",
+    "id": "Qwen/Qwen3.5-A22B-Instruct",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2400000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.together.ai/pricing"
+  },
+  {
+    "provider": "fireworks",
+    "id": "accounts/fireworks/models/llama-v4-scout-instruct",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 80000,
+      "output_usd_micros_per_mtok": 300000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://fireworks.ai/models"
+  },
+  {
+    "provider": "fireworks",
+    "id": "accounts/fireworks/models/deepseek-v4-flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 140000,
+      "output_usd_micros_per_mtok": 280000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://fireworks.ai/models"
+  },
+  {
+    "provider": "cerebras",
+    "id": "gpt-oss-120b",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 250000,
+      "output_usd_micros_per_mtok": 690000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.cerebras.ai/inference"
+  },
+  {
+    "provider": "cerebras",
+    "id": "zai-glm-4.7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2200000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.cerebras.ai/inference"
+  },
+  {
+    "provider": "deepinfra",
+    "id": "meta-llama/Llama-4-Scout-17B-128E-Instruct",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 80000,
+      "output_usd_micros_per_mtok": 300000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://deepinfra.com/pricing"
+  },
+  {
+    "provider": "deepinfra",
+    "id": "deepseek-ai/DeepSeek-V4-Flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 100000,
+      "output_usd_micros_per_mtok": 200000,
+      "cache_read_usd_micros_per_mtok": 20000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://deepinfra.com/pricing"
+  },
+  {
+    "provider": "deepinfra",
+    "id": "Qwen/Qwen3-Omni-Instruct",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 800000,
+      "output_usd_micros_per_mtok": 2400000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://deepinfra.com/pricing"
+  },
+  {
+    "provider": "deepinfra",
+    "id": "Qwen/Qwen3.6-235B-A22B-Instruct",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2200000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://deepinfra.com/pricing"
+  },
+  {
+    "provider": "baseten",
+    "id": "moonshotai/kimi-k2.6-instruct",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": 60000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "baseten",
+    "id": "deepseek-ai/DeepSeek-V4-Pro",
     "profile": "strong",
     "capabilities": {
       "streaming": true,
@@ -816,19 +1680,229 @@
       "prompt_caching": false
     },
     "pricing": {
-      "input_usd_micros_per_mtok": 550000,
-      "output_usd_micros_per_mtok": 2190000,
-      "cache_read_usd_micros_per_mtok": 55000,
+      "input_usd_micros_per_mtok": 1740000,
+      "output_usd_micros_per_mtok": 3480000,
+      "cache_read_usd_micros_per_mtok": 14500,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
-      "context_window_tokens": 131072,
-      "max_output_tokens": 8192,
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
       "effective_context_window_percent": 95
     },
     "tokenizer": "openai_compatible",
     "lifecycle": "active",
-    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "baseten",
+    "id": "zai-org/GLM-5.1",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 500000,
+      "output_usd_micros_per_mtok": 1500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "baseten",
+    "id": "nvidia/Nemotron-Super-120B-A12B",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1500000,
+      "output_usd_micros_per_mtok": 4500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.baseten.co/api-reference/openai"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 290000,
+      "output_usd_micros_per_mtok": 2250000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 500000,
+      "output_usd_micros_per_mtok": 4880000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/google/gemma-4-26b-a4b-it",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 290000,
+      "output_usd_micros_per_mtok": 2250000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "cloudflare_workers_ai",
+    "id": "@cf/moonshotai/kimi-k2.6",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.cloudflare.com/workers-ai/models/"
+  },
+  {
+    "provider": "vertex",
+    "id": "google/gemini-3.1-pro-preview",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1250000,
+      "output_usd_micros_per_mtok": 10000000,
+      "cache_read_usd_micros_per_mtok": 312500,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://cloud.google.com/vertex-ai/generative-ai/pricing"
   },
   {
     "provider": "vertex",

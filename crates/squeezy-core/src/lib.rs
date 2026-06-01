@@ -53,7 +53,7 @@ pub const GOOGLE_SMALL_FAST_MODEL: &str = "gemini-2.5-flash-lite";
 pub const BEDROCK_SMALL_FAST_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
 pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
-pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4.5";
 pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 
 /// Returns the built-in small-fast-model id for `provider`. `provider` is the
@@ -79,34 +79,34 @@ pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
 pub const DEFAULT_VERCEL_AI_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
-pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4.7";
 pub const DEFAULT_PORTKEY_BASE_URL: &str = "https://api.portkey.ai/v1";
 pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-opus-4-7";
 // OpenAI-compatible single-vendor (full preset tier).
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const DEFAULT_GROQ_MODEL: &str = "llama-3.3-70b-versatile";
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
-pub const DEFAULT_XAI_MODEL: &str = "grok-4";
+pub const DEFAULT_XAI_MODEL: &str = "grok-4.3";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
-pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 // Google Cloud Vertex AI's OpenAI-compatible endpoint. The base URL is
 // per-project + per-region, so users must set `vertex_project` and
 // `vertex_location` (or override `base_url` directly).
 pub const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
-pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-2.5-pro";
+pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-3.1-pro-preview";
 // OpenAI-compatible single-vendor (light preset tier — no curated models, no dedicated costly test).
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
-pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-latest";
+pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-2512";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_TOGETHER_MODEL: &str = "meta-llama/Llama-3.3-70B-Instruct-Turbo";
 pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
-pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v3p3-70b-instruct";
+pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v4-scout-instruct";
 pub const DEFAULT_CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
-pub const DEFAULT_CEREBRAS_MODEL: &str = "llama-3.3-70b";
+pub const DEFAULT_CEREBRAS_MODEL: &str = "gpt-oss-120b";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
-pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Llama-4-Scout-17B-128E-Instruct";
 pub const DEFAULT_BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
-pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_BASETEN_MODEL: &str = "moonshotai/kimi-k2.6-instruct";
 // OpenAI-compatible local self-hosted (light preset tier — loopback default,
 // auth optional, model id depends on whatever the local server has loaded).
 pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
@@ -122,7 +122,7 @@ pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL: &str =
     "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL: &str =
-    "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat";
+    "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -2027,7 +2027,7 @@ impl OpenAiCompatiblePreset {
             Self::XAi => "xAI",
             Self::DeepSeek => "DeepSeek",
             Self::Vertex => "Google Vertex AI",
-            Self::Mistral => "Mistral La Plateforme",
+            Self::Mistral => "Mistral AI",
             Self::Together => "Together AI",
             Self::Fireworks => "Fireworks AI",
             Self::Cerebras => "Cerebras",
@@ -2046,11 +2046,14 @@ impl OpenAiCompatiblePreset {
     /// integration test ships in `crates/squeezy-llm/tests/`. Light presets
     /// return `false` and fall back to generic context-window estimates.
     pub const fn is_full_tier(self) -> bool {
+        // PortKey was historically full-tier but has no dedicated costly
+        // integration test and routes via user-defined virtual keys /
+        // integration slugs (see preset-portkey.md PK-3). Treat as a light
+        // preset until a costly test ships.
         matches!(
             self,
             Self::OpenRouter
                 | Self::Vercel
-                | Self::PortKey
                 | Self::Groq
                 | Self::XAi
                 | Self::DeepSeek
@@ -2123,9 +2126,29 @@ impl OpenAiCompatiblePreset {
             // upstream bearer when routing through AI Gateway. The optional
             // gateway-level token (`cf-aig-authorization`) is configured
             // separately via `CF_AIG_TOKEN` and injected as an extra header.
+            // Vendor-canonical alias `CLOUDFLARE_API_TOKEN` is exposed via
+            // [`Self::default_api_key_env_aliases`].
             Self::CloudflareWorkersAi => "CLOUDFLARE_API_KEY",
             Self::CloudflareAiGateway => "CLOUDFLARE_API_KEY",
             Self::Custom => "",
+        }
+    }
+
+    /// Vendor-canonical alternate env vars the caller may fall back to when
+    /// the primary [`Self::default_api_key_env`] is unset. The list is in
+    /// preference order (primary first is implied — only aliases are
+    /// returned). Empty for presets with no documented alias.
+    pub const fn default_api_key_env_aliases(self) -> &'static [&'static str] {
+        match self {
+            // Cloudflare's cURL + AI Gateway docs use CLOUDFLARE_API_TOKEN;
+            // only the JS SDK uses CLOUDFLARE_API_KEY. Both are valid.
+            Self::CloudflareWorkersAi | Self::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
+            // DeepInfra's vendor docs use DEEPINFRA_TOKEN in every code
+            // sample; LangChain uses DEEPINFRA_API_TOKEN; only the Vercel
+            // AI SDK uses DEEPINFRA_API_KEY. Accept all three so users
+            // who copy from DeepInfra's docs are not bounced.
+            Self::DeepInfra => &["DEEPINFRA_TOKEN", "DEEPINFRA_API_TOKEN"],
+            _ => &[],
         }
     }
 
