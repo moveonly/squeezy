@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs,
 };
 
@@ -304,7 +304,7 @@ impl LanguageParser {
             .collect::<Vec<_>>();
         let chunk_size = jobs.len().div_ceil(worker_count);
         let mut outputs = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
+            let mut handles = Vec::with_capacity(worker_count);
             let mut remaining_jobs = jobs;
             while !remaining_jobs.is_empty() {
                 let split_at = remaining_jobs.len().saturating_sub(chunk_size);
@@ -444,13 +444,13 @@ struct ParserPool {
 
 impl ParserPool {
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
-        if !self.parsers.contains_key(&language) {
-            let parser = parser_for_language_kind(language)?;
-            self.parsers.insert(language, parser);
+        match self.parsers.entry(language) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let parser = parser_for_language_kind(language)?;
+                Ok(entry.insert(parser))
+            }
         }
-        self.parsers
-            .get_mut(&language)
-            .ok_or_else(|| SqueezyError::Parse(format!("unsupported parser language {language:?}")))
     }
 }
 

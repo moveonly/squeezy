@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
@@ -457,9 +459,6 @@ impl WorkspaceCrawler {
                 }
             }
             let size_bytes = metadata.len();
-            let extension = path
-                .extension()
-                .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
             // Java source files frequently contain many nested declarations
             // in a single file, so we lift the default cap when the user has
@@ -509,7 +508,7 @@ impl WorkspaceCrawler {
                     unsupported.push(unsupported_file(
                         &path,
                         relative_path.clone(),
-                        extension,
+                        extension_string(&path),
                         size_bytes,
                         UnsupportedReason::BinaryLike,
                     ));
@@ -545,7 +544,7 @@ impl WorkspaceCrawler {
                 unsupported.push(unsupported_file(
                     &path,
                     relative_path.clone(),
-                    extension,
+                    extension_string(&path),
                     size_bytes,
                     UnsupportedReason::UnsupportedExtension,
                 ));
@@ -669,7 +668,16 @@ pub fn classify_language(path: &Path) -> LanguageKind {
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return LanguageKind::Unknown;
     };
-    LanguageKind::from_extension(&extension.to_ascii_lowercase())
+    if extension.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        LanguageKind::from_extension(&extension.to_ascii_lowercase())
+    } else {
+        LanguageKind::from_extension(extension)
+    }
+}
+
+fn extension_string(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
 }
 
 fn refine_c_family_header_languages(files: &mut [FileRecord]) {
@@ -909,11 +917,8 @@ fn read_dir_entries(root: &Path) -> Option<Vec<fs::DirEntry>> {
     )
 }
 
-fn root_entry_names(entries: &[fs::DirEntry]) -> BTreeSet<String> {
-    entries
-        .iter()
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .collect()
+fn root_entry_names(entries: &[fs::DirEntry]) -> BTreeSet<OsString> {
+    entries.iter().map(fs::DirEntry::file_name).collect()
 }
 
 fn is_readme_entry(entry: &fs::DirEntry) -> bool {
@@ -926,7 +931,7 @@ fn is_readme_entry(entry: &fs::DirEntry) -> bool {
 
 fn project_markers_from_root(
     root: &Path,
-    root_scan: Option<(&BTreeSet<String>, &[fs::DirEntry])>,
+    root_scan: Option<(&BTreeSet<OsString>, &[fs::DirEntry])>,
 ) -> Vec<String> {
     CODE_PROJECT_MARKERS
         .iter()
@@ -943,13 +948,13 @@ fn project_markers_from_root(
 fn project_marker_exists(
     root: &Path,
     marker: &str,
-    root_entry_names: Option<&BTreeSet<String>>,
+    root_entry_names: Option<&BTreeSet<OsString>>,
 ) -> bool {
     if marker.contains('/') {
         return root.join(marker).exists();
     }
     root_entry_names
-        .map(|names| names.contains(marker) && root.join(marker).exists())
+        .map(|names| names.contains(std::ffi::OsStr::new(marker)) && root.join(marker).exists())
         .unwrap_or_else(|| root.join(marker).exists())
 }
 
@@ -968,7 +973,8 @@ fn dotnet_project_markers(root: &Path, entries: Option<&[fs::DirEntry]>) -> Vec<
 }
 
 fn dotnet_project_marker_from_entry(entry: &fs::DirEntry) -> Option<String> {
-    let path = entry.path();
+    let file_name = entry.file_name();
+    let path = Path::new(&file_name);
     let name = path.file_name()?.to_str()?.to_string();
     let extension = path.extension()?.to_str()?;
     matches!(extension, "csproj" | "sln" | "slnx").then(|| format!("project marker {name}"))

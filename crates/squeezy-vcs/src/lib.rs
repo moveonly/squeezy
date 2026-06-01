@@ -1711,9 +1711,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let digest = hasher.finalize();
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
+        push_hex_byte(&mut output, byte);
     }
     output
+}
+
+fn push_hex_byte(output: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    output.push(HEX[(byte >> 4) as usize] as char);
+    output.push(HEX[(byte & 0x0f) as usize] as char);
 }
 
 fn now_ms() -> u128 {
@@ -2047,13 +2053,12 @@ fn extract_diff_git_path<'a>(suffix: &'a str, expected: &BTreeSet<&'a str>) -> O
         }
     }
     // Fallback for paths with spaces: scan every ` b/<known-path>` suffix.
-    for path in expected {
-        let needle = format!(" b/{path}");
-        if trimmed.ends_with(&needle) {
-            let prefix_len = trimmed.len() - needle.len();
-            if trimmed[..prefix_len] == *path.to_string() {
-                return Some((*path).to_string());
-            }
+    for &path in expected {
+        if let Some(prefix) = trimmed.strip_suffix(path)
+            && let Some(prefix) = prefix.strip_suffix(" b/")
+            && prefix == path
+        {
+            return Some(path.to_string());
         }
     }
     None
