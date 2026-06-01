@@ -1076,6 +1076,96 @@
     "metadata_source": "https://docs.mistral.ai/api"
   },
   {
+    "provider": "together",
+    "id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 270000,
+      "output_usd_micros_per_mtok": 880000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.together.ai/pricing"
+  },
+  {
+    "provider": "together",
+    "id": "deepseek-ai/DeepSeek-V4-Flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 140000,
+      "output_usd_micros_per_mtok": 280000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.together.ai/pricing"
+  },
+  {
+    "provider": "together",
+    "id": "Qwen/Qwen3.5-A22B-Instruct",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 600000,
+      "output_usd_micros_per_mtok": 2400000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 262144,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://www.together.ai/pricing"
+  },
+  {
     "provider": "vertex",
     "id": "google/gemini-3.1-pro-preview",
     "profile": "strong",
