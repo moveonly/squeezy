@@ -560,8 +560,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
     let take_chars = max_chars.saturating_sub(TRUNCATED_SUFFIX_CHARS);
     let mut cutoff = value.len();
-    let mut count = 0usize;
-    for (index, _) in value.char_indices() {
+    for (count, (index, _)) in value.char_indices().enumerate() {
         if count == take_chars {
             cutoff = index;
         }
@@ -571,7 +570,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
             output.push_str(TRUNCATED_SUFFIX);
             return output;
         }
-        count += 1;
     }
     value.to_string()
 }

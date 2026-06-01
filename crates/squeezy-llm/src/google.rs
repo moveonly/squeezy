@@ -315,10 +315,10 @@ impl GoogleReasoningBuffer {
         if !text.is_empty() {
             self.summary.push(text.to_string());
         }
-        if let Some(sig) = signature {
-            if self.signature.as_deref() != Some(sig) {
-                self.signature = Some(sig.to_string());
-            }
+        if let Some(sig) = signature
+            && self.signature.as_deref() != Some(sig)
+        {
+            self.signature = Some(sig.to_string());
         }
     }
 
@@ -374,10 +374,9 @@ fn parse_google_event(
         .and_then(|candidates| candidates.first())
         .and_then(|candidate| candidate.get("finishReason"))
         .and_then(Value::as_str)
+        && last_finish_reason.as_deref() != Some(reason)
     {
-        if last_finish_reason.as_deref() != Some(reason) {
-            *last_finish_reason = Some(reason.to_string());
-        }
+        *last_finish_reason = Some(reason.to_string());
     }
     let parts = value
         .get("candidates")

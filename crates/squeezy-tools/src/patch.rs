@@ -306,9 +306,9 @@ fn append_search_replace_hunk(
 fn append_create_hunk(out: &mut String, path: &str, contents: &str, remaining: &mut usize) {
     let total = contents.lines().count();
     let _ = write!(out, "--- /dev/null\n+++ b/{path}\n");
-    let _ = write!(out, "@@ -0,0 +1,{total} @@\n");
+    let _ = writeln!(out, "@@ -0,0 +1,{total} @@");
     if *remaining > 0 {
-        let _ = write!(out, "@@ create b/{path} @@\n");
+        let _ = writeln!(out, "@@ create b/{path} @@");
         *remaining -= 1;
     }
     for line in contents.lines() {
@@ -325,7 +325,7 @@ fn append_create_hunk(out: &mut String, path: &str, contents: &str, remaining: &
 fn append_delete_hunk(out: &mut String, path: &str, remaining: &mut usize) {
     let _ = write!(out, "--- a/{path}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n");
     if *remaining > 0 {
-        let _ = write!(out, "@@ delete a/{path} @@\n");
+        let _ = writeln!(out, "@@ delete a/{path} @@");
         *remaining -= 1;
     }
 }
@@ -333,7 +333,7 @@ fn append_delete_hunk(out: &mut String, path: &str, remaining: &mut usize) {
 fn append_move_hunk(out: &mut String, from: &str, to: &str, remaining: &mut usize) {
     let _ = write!(out, "--- a/{from}\n+++ b/{to}\n@@ -1,0 +1,0 @@\n");
     if *remaining > 0 {
-        let _ = write!(out, "@@ rename a/{from} -> b/{to} @@\n");
+        let _ = writeln!(out, "@@ rename a/{from} -> b/{to} @@");
         *remaining -= 1;
     }
 }

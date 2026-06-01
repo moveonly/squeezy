@@ -581,6 +581,7 @@ fn apply_sgr(params: &[u16], style: &mut TextStyle) {
 /// Convert a single ANSI-bearing string to HTML. Text outside of ANSI
 /// sequences is HTML-escaped; styled regions are wrapped in
 /// `<span style="…">` so the rendered document needs no class table.
+#[allow(dead_code)]
 pub(crate) fn ansi_to_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     push_ansi_html(&mut out, text);

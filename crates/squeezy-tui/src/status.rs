@@ -367,7 +367,7 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
         }
         StatusLineItem::ProviderAndModel => {
             let mut text = String::with_capacity(app.provider_name.len() + 1 + app.model.len());
-            text.push_str(&app.provider_name);
+            text.push_str(app.provider_name);
             text.push(':');
             text.push_str(&app.model);
             Some(compact_text(&text, 54))

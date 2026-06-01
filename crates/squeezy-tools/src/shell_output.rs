@@ -342,7 +342,7 @@ fn text_may_start_json_value(text: &str) -> bool {
 }
 
 fn trim_json_whitespace(text: &str) -> &str {
-    text.trim_start_matches(|ch| matches!(ch, ' ' | '\n' | '\r' | '\t'))
+    text.trim_start_matches([' ', '\n', '\r', '\t'])
 }
 
 fn json_test_summary(value: &Value, family: &str) -> String {

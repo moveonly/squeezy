@@ -373,12 +373,13 @@ impl LanguageParser {
             ));
         }
 
-        if let Some(cached) = self.cache.get(&record.id) {
-            if cached.language == record.language && cached.hash == record.hash {
-                let mut parsed = extract_language(record.clone(), &source, &cached.tree);
-                parsed.changed_ranges = Vec::new();
-                return Ok(parsed);
-            }
+        if let Some(cached) = self.cache.get(&record.id)
+            && cached.language == record.language
+            && cached.hash == record.hash
+        {
+            let mut parsed = extract_language(record.clone(), &source, &cached.tree);
+            parsed.changed_ranges = Vec::new();
+            return Ok(parsed);
         }
 
         let old = self

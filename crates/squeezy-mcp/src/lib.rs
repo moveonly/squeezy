@@ -1846,10 +1846,9 @@ fn collect_ref_field(key: &str, child: &Value, prefix: &str, out: &mut BTreeSet<
     if key == "$ref"
         && let Some(text) = child.as_str()
         && let Some(name) = text.strip_prefix(prefix)
+        && !out.contains(name)
     {
-        if !out.contains(name) {
-            out.insert(name.to_string());
-        }
+        out.insert(name.to_string());
     }
 }
 
@@ -2133,7 +2132,7 @@ fn sha256_hex_prefix(bytes: impl AsRef<[u8]>, max_hex_chars: usize) -> String {
     use std::fmt::Write as _;
 
     let digest = Sha256::digest(bytes.as_ref());
-    let digest_bytes = ((max_hex_chars + 1) / 2).min(digest.len());
+    let digest_bytes = max_hex_chars.div_ceil(2).min(digest.len());
     let mut output = String::with_capacity(digest_bytes * 2);
     for &byte in digest.iter().take(digest_bytes) {
         write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
