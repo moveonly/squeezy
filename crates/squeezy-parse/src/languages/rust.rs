@@ -1429,7 +1429,18 @@ pub(crate) fn symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Opt
 
 pub(crate) fn impl_name(node: Node<'_>, source: &str) -> String {
     let raw = signature_text(node, node.child_by_field_name("body"), source);
-    trim_impl_header(&raw.split_whitespace().collect::<Vec<_>>().join(" "))
+    trim_impl_header(&collapse_whitespace(&raw))
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for segment in text.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(segment);
+    }
+    normalized
 }
 
 pub(crate) fn trim_impl_header(raw: &str) -> String {
@@ -1482,17 +1493,15 @@ pub(crate) fn symbol_id(
     name: &str,
     span: SourceSpan,
 ) -> SymbolId {
-    let kind_name = format!("{kind:?}").to_lowercase();
-    let safe_name = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    let kind_name = symbol_kind_name(kind);
+    let mut safe_name = String::with_capacity(name.len());
+    for ch in name.chars() {
+        safe_name.push(if ch.is_ascii_alphanumeric() || ch == '_' {
+            ch
+        } else {
+            '_'
+        });
+    }
     let base = parent_id
         .map(|id| id.0.clone())
         .unwrap_or_else(|| file.relative_path.clone());
@@ -1500,6 +1509,31 @@ pub(crate) fn symbol_id(
         "{base}::{kind_name}:{safe_name}@{}",
         span.start_byte
     ))
+}
+
+fn symbol_kind_name(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Crate => "crate",
+        SymbolKind::File => "file",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Module => "module",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Union => "union",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Impl => "impl",
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::TypeAlias => "typealias",
+        SymbolKind::Field => "field",
+        SymbolKind::Variant => "variant",
+        SymbolKind::Macro => "macro",
+        SymbolKind::Test => "test",
+        SymbolKind::Unknown => "unknown",
+    }
 }
 
 pub(crate) fn signature_text(node: Node<'_>, body: Option<Node<'_>>, source: &str) -> String {
@@ -1693,12 +1727,20 @@ pub(crate) fn split_top_level_use_commas(text: &str) -> Vec<&str> {
 
 pub(crate) fn join_use_segments(prefix: &str, item: &str, suffix: &str) -> String {
     let item = if item == "self" { "" } else { item };
-    [prefix, item, suffix]
-        .into_iter()
-        .filter(|segment| !segment.trim().is_empty())
-        .map(|segment| segment.trim().trim_matches(':'))
-        .collect::<Vec<_>>()
-        .join("::")
+    let mut joined = String::with_capacity(prefix.len() + item.len() + suffix.len() + 4);
+    let mut has_segment = false;
+    for segment in [prefix, item, suffix] {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if has_segment {
+            joined.push_str("::");
+        }
+        joined.push_str(trimmed.trim_matches(':'));
+        has_segment = true;
+    }
+    joined
 }
 
 pub(crate) fn extract_import(
