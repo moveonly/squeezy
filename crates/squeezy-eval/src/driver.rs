@@ -2265,6 +2265,7 @@ impl Driver {
                 }
                 AgentEvent::SubagentStarted {
                     turn_id,
+                    id,
                     agent,
                     prompt,
                 } => {
@@ -2272,12 +2273,27 @@ impl Driver {
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "started", "agent": agent, "prompt": prompt}),
+                            event: json!({"kind": "started", "id": id, "agent": agent, "prompt": prompt}),
+                        },
+                    )?;
+                }
+                AgentEvent::SubagentActivity {
+                    turn_id,
+                    id,
+                    agent,
+                    message,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::SubagentEvent {
+                            event: json!({"kind": "activity", "id": id, "agent": agent, "message": message}),
                         },
                     )?;
                 }
                 AgentEvent::SubagentCompleted {
                     turn_id,
+                    id,
                     agent,
                     summary,
                     ..
@@ -2286,12 +2302,13 @@ impl Driver {
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "completed", "agent": agent, "summary": summary}),
+                            event: json!({"kind": "completed", "id": id, "agent": agent, "summary": summary}),
                         },
                     )?;
                 }
                 AgentEvent::SubagentFailed {
                     turn_id,
+                    id,
                     agent,
                     error,
                     ..
@@ -2300,7 +2317,7 @@ impl Driver {
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "failed", "agent": agent, "error": error}),
+                            event: json!({"kind": "failed", "id": id, "agent": agent, "error": error}),
                         },
                     )?;
                 }

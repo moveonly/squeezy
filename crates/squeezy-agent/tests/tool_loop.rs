@@ -65,6 +65,94 @@ impl LlmProvider for ScriptedProvider {
     }
 }
 
+#[derive(Default)]
+struct DelegateFanoutProvider {
+    requests: Mutex<Vec<LlmRequest>>,
+}
+
+impl DelegateFanoutProvider {
+    fn requests(&self) -> Vec<LlmRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+impl LlmProvider for DelegateFanoutProvider {
+    fn name(&self) -> &'static str {
+        "fanout"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let has_delegate_tool = request.tools.iter().any(|tool| tool.name == "delegate");
+        let has_outputs = request
+            .input
+            .iter()
+            .any(|item| matches!(item, LlmInputItem::FunctionCallOutput { .. }));
+        self.requests.lock().expect("requests").push(request);
+
+        let events = if has_delegate_tool && !has_outputs {
+            let mut events = vec![Ok(LlmEvent::Started)];
+            for index in 0..3 {
+                events.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: format!("delegate_{index}"),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({
+                        "prompt": format!("Inspect folder slice {index}"),
+                        "scope": format!("slice{index}/"),
+                    }),
+                })));
+            }
+            events.push(Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }));
+            events
+        } else if has_delegate_tool && has_outputs {
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ]
+        } else if has_outputs {
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("subagent summary".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("delegate_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ]
+        } else {
+            const TOOL_CALLS: usize = 8;
+            let mut events = vec![Ok(LlmEvent::Started)];
+            for index in 0..TOOL_CALLS {
+                events.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: format!("sub_read_{index}"),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": format!("file{index}.rs")}),
+                })));
+            }
+            events.push(Ok(LlmEvent::Completed {
+                response_id: Some("delegate_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }));
+            events
+        };
+
+        Box::pin(stream::iter(events))
+    }
+}
+
 fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -666,6 +754,52 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
     assert_eq!(content["model"], "main-model");
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn delegate_batch_with_child_tool_fanout_runs_on_default_worker_stack() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(2 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build default-stack test runtime");
+    runtime.block_on(async {
+        let root = temp_workspace("delegate_batch_default_stack");
+        const TOOL_CALLS: usize = 8;
+        const SUBAGENTS: usize = 3;
+        for index in 0..TOOL_CALLS {
+            fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
+        }
+        let provider = Arc::new(DelegateFanoutProvider::default());
+        let mut config = config_for(root.clone());
+        config.subagents.max_concurrent = SUBAGENTS;
+        let agent = Agent::new(config, provider.clone());
+
+        let drain = drain_turn(agent.start_turn("fan out".to_string(), CancellationToken::new()));
+        tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("delegate fanout should finish on a normal worker stack");
+
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(snapshot.metrics.subagent_calls, SUBAGENTS as u64);
+        assert_eq!(snapshot.metrics.subagent_failures, 0);
+        assert_eq!(
+            snapshot.metrics.subagent_tool_calls,
+            (SUBAGENTS * TOOL_CALLS) as u64
+        );
+        assert_eq!(
+            provider
+                .requests()
+                .iter()
+                .filter(|request| request.tools.iter().any(|tool| tool.name == "delegate"))
+                .count(),
+            2,
+            "parent should make one tool-call request and one final request"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]

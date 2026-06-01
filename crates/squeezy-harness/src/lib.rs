@@ -666,6 +666,7 @@ async fn run_agent_with_config(
             | AgentEvent::RequestUserInputRequested { .. }
             | AgentEvent::ContextCompacted { .. }
             | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentActivity { .. }
             | AgentEvent::SubagentCompleted { .. }
             | AgentEvent::SubagentFailed { .. }
             | AgentEvent::SubagentRejected { .. }

@@ -217,17 +217,32 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         report.record.after.estimated_tokens
                     ));
                 }
-                AgentEvent::SubagentStarted { agent, prompt, .. } => {
+                AgentEvent::SubagentStarted {
+                    id, agent, prompt, ..
+                } => {
                     app.status = format!("{agent} subagent running");
+                    app.note_subagent_started(id, agent.clone(), prompt.clone());
                     app.push_log(format!("{agent} subagent started: {prompt}"));
                 }
+                AgentEvent::SubagentActivity {
+                    id, agent, message, ..
+                } => {
+                    app.note_subagent_activity(id, agent, message);
+                }
                 AgentEvent::SubagentCompleted {
+                    id,
                     agent,
                     summary,
                     metrics,
                     ..
                 } => {
                     app.status = format!("{agent} subagent completed");
+                    app.note_subagent_completed(
+                        id,
+                        agent.clone(),
+                        summary.clone(),
+                        metrics.clone(),
+                    );
                     app.push_log(format!(
                         "{agent} subagent completed tools={} bytes={} summary={}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
@@ -236,12 +251,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     ));
                 }
                 AgentEvent::SubagentFailed {
+                    id,
                     agent,
                     error,
                     metrics,
                     ..
                 } => {
                     app.status = format!("{agent} subagent failed");
+                    app.note_subagent_failed(id, agent.clone(), error.clone(), metrics.clone());
                     app.push_log(format!(
                         "{agent} subagent failed tools={} bytes={} error={}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),

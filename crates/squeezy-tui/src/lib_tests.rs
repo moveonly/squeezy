@@ -227,6 +227,115 @@ fn plan_mode_indicator_line_uses_existing_mode_purple_palette() {
     assert_eq!(label_span.style.fg, Some(crate::render::theme::magenta()));
 }
 
+#[test]
+fn subagent_pane_renders_below_status_without_hiding_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(
+        7,
+        "explore".to_string(),
+        "Squeezy Haiku baseline 15 langs n=3".to_string(),
+    );
+    app.note_subagent_activity(7, "explore".to_string(), "running read_file".to_string());
+
+    let output = render_to_string(&app, 120, 18);
+    assert!(output.contains("main"), "{output}");
+    assert!(output.contains("explore"), "{output}");
+    assert!(output.contains("running read_file"), "{output}");
+    assert!(output.contains("Enter send"), "{output}");
+
+    let lines = output.lines().collect::<Vec<_>>();
+    let status_line = lines
+        .iter()
+        .position(|line| line.contains("Enter send"))
+        .expect("status line");
+    let pane_line = lines
+        .iter()
+        .position(|line| line.contains("explore"))
+        .expect("subagent pane line");
+    assert!(pane_line > status_line, "{output}");
+}
+
+#[tokio::test]
+async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert!(app.subagent_pane.focused);
+    assert_eq!(app.subagent_pane.selected, 1);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("select subagent");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
+    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(80), false));
+    assert!(
+        subagent_view.contains("delegate subagent"),
+        "{subagent_view}"
+    );
+    assert!(subagent_view.contains("running grep"), "{subagent_view}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("return to main");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
+    assert!(!app.subagent_pane.focused);
+}
+
+#[tokio::test]
+async fn config_screen_keeps_subagent_pane_from_owning_arrows() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(3, "explore".to_string(), "Inspect docs".to_string());
+    app.config_screen = Some(config_screen::ConfigScreenState::new(
+        test_config(SessionMode::Build),
+        None,
+    ));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("route to config");
+
+    assert!(
+        !app.subagent_pane.focused,
+        "config screen should retain key ownership"
+    );
+}
+
+#[test]
+fn transcript_overlay_uses_active_subagent_conversation() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(11, "delegate".to_string(), "Inspect crates".to_string());
+    app.note_subagent_activity(11, "delegate".to_string(), "running repo_map".to_string());
+    app.subagent_pane.active = ConversationSource::Subagent(11);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 90, 16);
+    assert!(output.contains("delegate subagent"), "{output}");
+    assert!(output.contains("running repo_map"), "{output}");
+    assert!(output.contains("Ctrl-T"), "{output}");
+}
+
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);

@@ -3856,7 +3856,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         subagents: deps.subagents.clone(),
         hooks: deps.hooks.clone(),
     };
-    let execution = run_subagent(&parent, SubagentKind::DocHelp, request).await;
+    let execution = run_subagent(&parent, SubagentKind::DocHelp, request, None).await;
 
     let mut metrics = TurnMetrics::default();
     metrics.merge_subagent_tool_metrics(&execution.metrics);
@@ -7529,7 +7529,7 @@ async fn handle_subagent_call(
     broker: &mut CostBroker,
 ) -> ToolResult {
     record_subagent_call(&mut broker.metrics, kind);
-    let outcome = run_subagent_dispatch(context, call, kind).await;
+    let outcome = Box::pin(run_subagent_dispatch(context, call, kind)).await;
     apply_subagent_dispatch(broker, kind, &outcome);
     outcome.result
 }
@@ -7698,6 +7698,7 @@ async fn run_subagent_dispatch(
         .tx
         .send(AgentEvent::SubagentStarted {
             turn_id: context.turn_id,
+            id: subagent_id,
             agent: kind.as_str().to_string(),
             prompt: started_prompt,
         })
@@ -7710,7 +7711,13 @@ async fn run_subagent_dispatch(
     // stream, nested tool calls, and any sub-subagents — a real
     // cancellation tree instead of a flat sibling list under the turn.
     let child_context = context.with_cancel(child_cancel.clone());
-    let execution = run_subagent(&child_context, kind, request).await;
+    let execution = Box::pin(run_subagent(
+        &child_context,
+        kind,
+        request,
+        Some(subagent_id),
+    ))
+    .await;
     drop(lease);
     if let Some(registry) = context.hooks.as_ref() {
         dispatch_subagent_stop(
@@ -7748,6 +7755,7 @@ async fn run_subagent_dispatch(
                 .tx
                 .send(AgentEvent::SubagentCompleted {
                     turn_id: context.turn_id,
+                    id: subagent_id,
                     agent: kind.as_str().to_string(),
                     summary: compact_text(&execution.summary, 320),
                     metrics: execution.metrics.clone(),
@@ -7775,6 +7783,7 @@ async fn run_subagent_dispatch(
                 .tx
                 .send(AgentEvent::SubagentFailed {
                     turn_id: context.turn_id,
+                    id: subagent_id,
                     agent: kind.as_str().to_string(),
                     error: compact_text(&error, 320),
                     metrics: execution.metrics.clone(),
@@ -7875,6 +7884,7 @@ async fn run_subagent(
     parent: &ToolExecutionContext<'_>,
     kind: SubagentKind,
     request: SubagentRequest,
+    activity_id: Option<SubagentId>,
 ) -> SubagentExecution {
     let mut config = parent.config.clone();
     config.session_mode = SessionMode::Plan;
@@ -7947,7 +7957,25 @@ async fn run_subagent(
     // the channel buffer and the `send().await` inside the tool dispatcher
     // would block forever.
     let (hidden_tx, mut hidden_rx) = mpsc::channel::<AgentEvent>(64);
-    let drain_handle = tokio::spawn(async move { while hidden_rx.recv().await.is_some() {} });
+    let parent_tx = parent.tx.clone();
+    let parent_turn_id = parent.turn_id;
+    let activity_agent = kind.as_str().to_string();
+    let drain_handle = tokio::spawn(async move {
+        while let Some(event) = hidden_rx.recv().await {
+            let Some(id) = activity_id else {
+                continue;
+            };
+            let Some(message) = subagent_activity_message(event) else {
+                continue;
+            };
+            let _ = parent_tx.try_send(AgentEvent::SubagentActivity {
+                turn_id: parent_turn_id,
+                id,
+                agent: activity_agent.clone(),
+                message,
+            });
+        }
+    });
     let local_jobs = JobRegistry::new();
     let local_task_state = Arc::new(Mutex::new(None));
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
@@ -8069,6 +8097,22 @@ fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
         .collect()
 }
 
+fn subagent_activity_message(event: AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::ToolCallStarted { call, .. } => {
+            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+            let args = compact_text(&args, 140);
+            Some(format!("running {} {}", call.name, args))
+        }
+        AgentEvent::ToolCallCompleted { result, .. } => Some(format!(
+            "completed {} {}",
+            result.tool_name,
+            tool_status_label(result.status)
+        )),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_loop(
     parent: &ToolExecutionContext<'_>,
@@ -8093,7 +8137,7 @@ async fn run_subagent_loop(
 ) -> SubagentExecution {
     let runtime_budget = config.subagents.max_runtime_secs.map(Duration::from_secs);
     let Some(budget) = runtime_budget else {
-        return run_subagent_rounds(
+        return Box::pin(run_subagent_rounds(
             parent,
             config,
             tool_specs,
@@ -8113,13 +8157,13 @@ async fn run_subagent_loop(
             conversation,
             supporting_receipts,
             model,
-        )
+        ))
         .await;
     };
     let loop_model = model.clone();
     let timed = tokio::time::timeout(
         budget,
-        run_subagent_rounds(
+        Box::pin(run_subagent_rounds(
             parent,
             config,
             tool_specs,
@@ -8139,7 +8183,7 @@ async fn run_subagent_loop(
             conversation,
             supporting_receipts,
             loop_model,
-        ),
+        )),
     )
     .await;
     match timed {
@@ -8325,7 +8369,7 @@ async fn run_subagent_rounds(
         let mut results = rejected;
         if !approved.is_empty() {
             results.extend(
-                execute_tool_calls(
+                Box::pin(execute_tool_calls(
                     approved,
                     ToolExecutionContext {
                         turn_id: parent.turn_id,
@@ -8352,7 +8396,7 @@ async fn run_subagent_rounds(
                         hooks: parent.hooks.clone(),
                     },
                     broker,
-                )
+                ))
                 .await,
             );
         }
@@ -9812,7 +9856,7 @@ async fn flush_delegate_batch(
     let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
-            let outcome = run_subagent_dispatch(&context, &call, kind).await;
+            let outcome = Box::pin(run_subagent_dispatch(&context, &call, kind)).await;
             (index, kind, outcome)
         }
     }))
@@ -13107,17 +13151,26 @@ pub enum AgentEvent {
     },
     SubagentStarted {
         turn_id: TurnId,
+        id: SubagentId,
         agent: String,
         prompt: String,
     },
+    SubagentActivity {
+        turn_id: TurnId,
+        id: SubagentId,
+        agent: String,
+        message: String,
+    },
     SubagentCompleted {
         turn_id: TurnId,
+        id: SubagentId,
         agent: String,
         summary: String,
         metrics: TurnMetrics,
     },
     SubagentFailed {
         turn_id: TurnId,
+        id: SubagentId,
         agent: String,
         error: String,
         metrics: TurnMetrics,

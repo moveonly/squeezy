@@ -115,6 +115,48 @@ impl FileWatcher {
             _debouncer: Box::new(debouncer),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn start_polling_for_tests<F>(config: WatcherConfig, on_change: F) -> Result<Self>
+    where
+        F: Fn(ChangeBatch) + Send + 'static,
+    {
+        let timeout = Duration::from_millis(config.debounce_ms);
+        let poll_interval = Duration::from_millis(50).min(timeout.max(Duration::from_millis(1)));
+        let mut debouncer = notify_debouncer_full::new_debouncer_opt::<
+            _,
+            notify_debouncer_full::notify::PollWatcher,
+            notify_debouncer_full::RecommendedCache,
+        >(
+            timeout,
+            None,
+            move |result: DebounceEventResult| {
+                if let Some(batch) = handle_debounce_result(result) {
+                    on_change(batch);
+                }
+            },
+            notify_debouncer_full::RecommendedCache::new(),
+            notify_debouncer_full::notify::Config::default()
+                .with_poll_interval(poll_interval)
+                .with_compare_contents(true),
+        )
+        .map_err(|err| {
+            SqueezyError::Tool(format!("watcher: failed to start poll debouncer: {err}"))
+        })?;
+
+        for dir in &config.src_dirs {
+            let real_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            debouncer
+                .watch(&real_dir, RecursiveMode::Recursive)
+                .map_err(|err| {
+                    SqueezyError::Tool(format!("watcher: failed to watch {}: {err}", dir.display()))
+                })?;
+        }
+
+        Ok(Self {
+            _debouncer: Box::new(debouncer),
+        })
+    }
 }
 
 fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
