@@ -336,21 +336,41 @@ fn file_named_prompt_suppresses_speculative_planner() {
 }
 
 #[test]
-fn repo_map_and_route_intents_are_exempt_from_file_path_gate() {
-    // Even with explicit file paths in the prompt, RepoMap and
-    // RouteDiscovery genuinely need a wide-tree view. Gate must not
-    // suppress them.
-    let route = compile_exploration_plan(
+fn file_path_gate_applies_universally_even_to_repo_map_and_route() {
+    // Earlier carve-out exempted RepoMap and RouteDiscovery from the
+    // file-path gate "because they need a wide-tree view." In practice
+    // it was a foot-gun: bare "route" in `RoutesBuilder` filenames on
+    // the swift benchmark was triggering a speculative repo_map +
+    // downstream_flow round that consumed ~1k tokens per run with no
+    // recall benefit. If the prompt names ≥2 explicit file paths, the
+    // user has already bounded the scope — suppress the planner round
+    // regardless of which intent matched.
+    let route_plus_paths = compile_exploration_plan(
         "Trace the flow from RequestHandler::dispatch through src/server.rs and src/router.rs",
-    )
-    .expect("route plan");
-    assert_eq!(route.intent, ExplorationIntent::RouteDiscovery);
+    );
+    assert!(
+        route_plus_paths.is_none(),
+        "route prompt with 2 paths must hit the file-path gate"
+    );
 
-    let repo_map = compile_exploration_plan(
+    let repo_map_plus_paths = compile_exploration_plan(
         "Show me the repo map even though I'm touching src/lib.rs and src/main.rs",
+    );
+    assert!(
+        repo_map_plus_paths.is_none(),
+        "repo_map prompt with 2 paths must hit the file-path gate"
+    );
+
+    // Without explicit paths the planner still fires for these intents.
+    let route_only = compile_exploration_plan(
+        "Trace the flow from RequestHandler::dispatch to the cache handler",
     )
-    .expect("repo_map plan");
-    assert_eq!(repo_map.intent, ExplorationIntent::RepoMap);
+    .expect("route plan without paths");
+    assert_eq!(route_only.intent, ExplorationIntent::RouteDiscovery);
+
+    let repo_map_only =
+        compile_exploration_plan("Give me a repository map").expect("repo_map plan without paths");
+    assert_eq!(repo_map_only.intent, ExplorationIntent::RepoMap);
 }
 
 #[test]

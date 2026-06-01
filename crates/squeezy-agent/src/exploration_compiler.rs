@@ -87,16 +87,13 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
     let plan = compile_exploration_plan_inner(input)?;
     // File-named tasks (prompt mentions ≥2 explicit source file paths)
     // are a poor fit for speculative graph plumbing: the model can read
-    // the named files directly. Suppressing the planner here saves the
-    // tool round + tokens its result would have added. RepoMap and
-    // RouteDiscovery are exempt — both genuinely need a wide-tree view
-    // regardless of whether the prompt happens to cite a file path.
-    if matches!(
-        plan.intent,
-        ExplorationIntent::RepoMap | ExplorationIntent::RouteDiscovery
-    ) {
-        return Some(plan);
-    }
+    // the named files directly. The earlier carve-out for RepoMap and
+    // RouteDiscovery turned out to be a foot-gun — RouteDiscovery
+    // matches anywhere "route" appears as a substring, so the swift
+    // benchmark's `RoutesBuilder` filename was triggering a 1k-token
+    // speculative repo_map + downstream_flow round on every run. If the
+    // user has already bounded the scope by naming the files, treat
+    // that as the source of truth regardless of which intent matched.
     if explicit_file_path_count(input) >= 2 {
         return None;
     }
