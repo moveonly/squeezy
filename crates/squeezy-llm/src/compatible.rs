@@ -391,6 +391,23 @@ impl OpenAiCompatibleProvider {
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        // X-05: forward `output_schema` as the chat-completions
+        // `response_format: { type: "json_schema", json_schema: { ... } }`
+        // shape so providers that honour structured outputs
+        // (OpenAI through any aggregator, Together, Mistral, Groq)
+        // see the JSON schema. The OpenAI Responses provider has
+        // already emitted this via `text.format` on its native
+        // path; the chat-completions path was a silent gap.
+        if let Some(schema) = request.output_schema.as_ref() {
+            body["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.name,
+                    "schema": schema.schema,
+                    "strict": schema.strict,
+                }
+            });
+        }
         if let Some(effort) = request.reasoning_effort {
             emit_reasoning_hints(&mut body, preset, &request.model, effort);
         }
@@ -477,7 +494,7 @@ impl OpenAiCompatibleProvider {
             // calling at least one tool per turn by passing the field
             // through verbatim.
             if let Some(choice) = request.tool_choice.as_deref() {
-                body["tool_choice"] = json!(choice);
+                body["tool_choice"] = normalize_tool_choice(preset, choice);
             }
             // H-32: forward `parallel_tool_calls` when the caller
             // explicitly set it. OpenAI's Responses provider already
@@ -1467,6 +1484,19 @@ fn local_jit_load_hint(
         }
         _ => "",
     }
+}
+
+/// X-04: per-preset normalization for `tool_choice`. Most
+/// aggregators accept the OpenAI shape verbatim
+/// (`"auto" / "none" / "required" / {type, function}`). Mistral
+/// renamed `required` to `any` and 422s on the OpenAI value; map
+/// it client-side so user-facing configs stay uniform.
+fn normalize_tool_choice(preset: OpenAiCompatiblePreset, choice: &str) -> Value {
+    if matches!(preset, OpenAiCompatiblePreset::Mistral) && choice.eq_ignore_ascii_case("required")
+    {
+        return json!("any");
+    }
+    json!(choice)
 }
 
 /// H-39 / H-49 / H-52 / H-55 / H-62 / H-65: per-preset reasoning-

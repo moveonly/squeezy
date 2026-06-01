@@ -633,6 +633,61 @@ fn parse_chat_event_ignores_unknown_delta_shapes_without_panic() {
 }
 
 #[test]
+fn request_body_normalizes_mistral_tool_choice_required_to_any() {
+    // X-04: Mistral calls the OpenAI `tool_choice = "required"`
+    // value `"any"`; the OpenAI shape 422s. Normalize client-side
+    // so user configs stay uniform across presets.
+    let mut request = sample_request();
+    request.tool_choice = Some("required".to_string());
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &request,
+        OpenAiCompatiblePreset::Mistral,
+    );
+    assert_eq!(body["tool_choice"], "any");
+    // Other presets keep the OpenAI shape.
+    let body = OpenAiCompatibleProvider::request_body_for_preset(
+        &request,
+        OpenAiCompatiblePreset::OpenRouter,
+    );
+    assert_eq!(body["tool_choice"], "required");
+}
+
+#[test]
+fn request_body_forwards_output_schema_as_response_format() {
+    // X-05: structured-output schemas must surface as the chat-
+    // completions `response_format: {type: "json_schema", ...}`
+    // shape so providers that honor it (OpenAI via aggregator,
+    // Together, Mistral, Groq) receive the contract.
+    let mut request = sample_request();
+    request.output_schema = Some(crate::LlmOutputSchema {
+        name: "answer".to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {"value": {"type": "number"}},
+            "required": ["value"]
+        }),
+        strict: true,
+    });
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(body["response_format"]["json_schema"]["name"], "answer");
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"]["properties"]["value"]["type"],
+        "number"
+    );
+}
+
+#[test]
+fn request_body_omits_response_format_when_no_output_schema() {
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(
+        body.get("response_format").is_none(),
+        "response_format must be absent when output_schema is None: {body}"
+    );
+}
+
+#[test]
 fn request_body_forwards_parallel_tool_calls_when_set() {
     // H-32: aggregator routes that proxy to OpenAI need
     // parallel_tool_calls to flow through so users can serialise
