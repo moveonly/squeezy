@@ -686,6 +686,17 @@ pub enum StopReason {
     ContextWindowExceeded,
     StopSequence,
     Refusal,
+    /// Anthropic Messages API `pause_turn`: the model voluntarily
+    /// paused mid-turn (typically when a hosted tool is still
+    /// processing) and expects the caller to re-issue the request
+    /// with the partial state. Distinct from `EndTurn` so the agent
+    /// can branch the recovery path.
+    PauseTurn,
+    /// Google Gemini `MALFORMED_FUNCTION_CALL`: the model emitted a
+    /// tool call whose arguments JSON the upstream parser rejected.
+    /// Distinct from `Refusal` (safety) and `Other` so the agent can
+    /// retry with stricter `tool_choice` shaping.
+    MalformedFunctionCall,
     Other(String),
 }
 
@@ -699,6 +710,7 @@ impl StopReason {
             "model_context_window_exceeded" => Self::ContextWindowExceeded,
             "stop_sequence" => Self::StopSequence,
             "refusal" => Self::Refusal,
+            "pause_turn" => Self::PauseTurn,
             other => Self::Other(other.to_string()),
         }
     }
@@ -719,6 +731,7 @@ impl StopReason {
             "MAX_TOKENS" => Self::MaxTokens,
             "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY"
             | "LANGUAGE" | "RECITATION" => Self::Refusal,
+            "MALFORMED_FUNCTION_CALL" => Self::MalformedFunctionCall,
             other => Self::Other(other.to_string()),
         }
     }
