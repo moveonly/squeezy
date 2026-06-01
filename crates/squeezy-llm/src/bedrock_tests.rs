@@ -18,9 +18,9 @@ use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 use super::{
     BedrockProvider, BedrockStreamState, apply_inference_profile_prefix,
     apply_thinking_extra_fields, bedrock_effort_label, bedrock_request_metadata_map,
-    build_bedrock_client, compute_thinking_extra_fields, conversation_messages,
-    current_bearer_token, handle_bedrock_event, inference_configuration, json_to_document,
-    region_prefix, system_blocks, tool_configuration,
+    bedrock_tool_choice, build_bedrock_client, compute_thinking_extra_fields,
+    conversation_messages, current_bearer_token, handle_bedrock_event, inference_configuration,
+    json_to_document, region_prefix, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -233,7 +233,7 @@ fn tool_configuration_cache_point_carries_one_hour_ttl_for_long() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, CacheRetention::Long)
+    let config = tool_configuration(&specs, CacheRetention::Long, None)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -260,7 +260,7 @@ fn tool_configuration_round_trips_json_schema() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, CacheRetention::None)
+    let config = tool_configuration(&specs, CacheRetention::None, None)
         .expect("ok")
         .expect("present");
     assert_eq!(config.tools().len(), 1);
@@ -297,7 +297,7 @@ fn tool_configuration_appends_cache_point_after_last_tool() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, CacheRetention::Short)
+    let config = tool_configuration(&specs, CacheRetention::Short, None)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -319,12 +319,12 @@ fn tool_configuration_appends_cache_point_after_last_tool() {
 #[test]
 fn tool_configuration_returns_none_when_empty() {
     assert!(
-        tool_configuration(&[], CacheRetention::None)
+        tool_configuration(&[], CacheRetention::None, None)
             .expect("ok")
             .is_none()
     );
     assert!(
-        tool_configuration(&[], CacheRetention::Short)
+        tool_configuration(&[], CacheRetention::Short, None)
             .expect("ok")
             .is_none(),
         "no tools means no tool config, even when caching is requested"
@@ -349,7 +349,7 @@ fn tool_configuration_cache_point_skips_mcp_prefixed_tools() {
         }
         .into(),
     ];
-    let config = tool_configuration(&specs, CacheRetention::Short)
+    let config = tool_configuration(&specs, CacheRetention::Short, None)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -386,7 +386,7 @@ fn tool_configuration_cache_point_skips_mcp_prefixed_tools() {
         }
         .into(),
     ];
-    let config = tool_configuration(&all_mcp, CacheRetention::Short)
+    let config = tool_configuration(&all_mcp, CacheRetention::Short, None)
         .expect("ok")
         .expect("present");
     let tools = config.tools();
@@ -1080,4 +1080,98 @@ fn apply_thinking_extra_fields_no_emit_when_capabilities_missing() {
         "unregistered model must not get thinking; got {:?}",
         fields,
     );
+}
+
+#[test]
+fn bedrock_tool_choice_maps_none_and_empty_to_none() {
+    // Unset / empty / whitespace `tool_choice` must omit the field so
+    // the provider applies its default (typically `auto`). Matches
+    // squeezy's historical behavior before the X-04 plumbing.
+    assert!(bedrock_tool_choice(None).expect("ok").is_none());
+    assert!(bedrock_tool_choice(Some("")).expect("ok").is_none());
+    assert!(bedrock_tool_choice(Some("   ")).expect("ok").is_none());
+}
+
+#[test]
+fn bedrock_tool_choice_maps_auto_to_auto_variant() {
+    // The OpenAI-style `auto` literal must land as
+    // `ToolChoice::Auto(...)` so callers using the cross-provider
+    // surface keep parity with Anthropic / OpenAI behavior.
+    use aws_sdk_bedrockruntime::types::ToolChoice;
+    let choice = bedrock_tool_choice(Some("auto"))
+        .expect("ok")
+        .expect("present");
+    assert!(matches!(choice, ToolChoice::Auto(_)));
+    // Case-insensitive — operators sometimes upper-case literals.
+    let choice = bedrock_tool_choice(Some("AUTO"))
+        .expect("ok")
+        .expect("present");
+    assert!(matches!(choice, ToolChoice::Auto(_)));
+}
+
+#[test]
+fn bedrock_tool_choice_maps_required_and_any_to_any_variant() {
+    // Tool-shy models (Mistral / Nova) benefit from `Any` so the
+    // model MUST emit a tool call instead of free-form text. Both the
+    // OpenAI literal `required` and Bedrock's literal `any` route to
+    // the same variant.
+    use aws_sdk_bedrockruntime::types::ToolChoice;
+    let choice = bedrock_tool_choice(Some("required"))
+        .expect("ok")
+        .expect("present");
+    assert!(matches!(choice, ToolChoice::Any(_)));
+    let choice = bedrock_tool_choice(Some("any"))
+        .expect("ok")
+        .expect("present");
+    assert!(matches!(choice, ToolChoice::Any(_)));
+}
+
+#[test]
+fn bedrock_tool_choice_maps_specific_tool_name() {
+    // Any other non-empty value names a specific tool the agent has
+    // already advertised. Strips an optional `tool:` prefix so callers
+    // using the OpenAI Responses convention can route through without
+    // a separate code path.
+    use aws_sdk_bedrockruntime::types::ToolChoice;
+    let choice = bedrock_tool_choice(Some("search"))
+        .expect("ok")
+        .expect("present");
+    let ToolChoice::Tool(specific) = choice else {
+        panic!("expected ToolChoice::Tool");
+    };
+    assert_eq!(specific.name(), "search");
+
+    let prefixed = bedrock_tool_choice(Some("tool:search"))
+        .expect("ok")
+        .expect("present");
+    let ToolChoice::Tool(specific) = prefixed else {
+        panic!("expected ToolChoice::Tool");
+    };
+    assert_eq!(specific.name(), "search");
+
+    // An empty name after the prefix degrades to None instead of
+    // failing the request — the caller asked for "no specific tool"
+    // by passing only the prefix.
+    assert!(bedrock_tool_choice(Some("tool:")).expect("ok").is_none());
+}
+
+#[test]
+fn tool_configuration_forwards_tool_choice() {
+    let specs: Vec<Arc<LlmToolSpec>> = vec![
+        LlmToolSpec {
+            name: "search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: false,
+        }
+        .into(),
+    ];
+    let config = tool_configuration(&specs, CacheRetention::None, Some("required"))
+        .expect("ok")
+        .expect("present");
+    let choice = config.tool_choice().expect("tool_choice must round-trip");
+    assert!(matches!(
+        choice,
+        aws_sdk_bedrockruntime::types::ToolChoice::Any(_)
+    ));
 }

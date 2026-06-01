@@ -231,7 +231,9 @@ impl LlmProvider for BedrockProvider {
             for message in conversation_messages(&normalized_input, retention)? {
                 builder = builder.messages(message);
             }
-            if let Some(config) = tool_configuration(&request.tools, retention)? {
+            if let Some(config) =
+                tool_configuration(&request.tools, retention, request.tool_choice.as_deref())?
+            {
                 builder = builder.tool_config(config);
             }
             if let Some(inference) = inference_configuration(&request) {
@@ -929,6 +931,7 @@ fn push_message(
 pub(crate) fn tool_configuration(
     specs: &[Arc<LlmToolSpec>],
     retention: CacheRetention,
+    tool_choice: Option<&str>,
 ) -> Result<Option<ToolConfiguration>> {
     if specs.is_empty() {
         return Ok(None);
@@ -954,13 +957,68 @@ pub(crate) fn tool_configuration(
     {
         tools.insert(idx + 1, Tool::CachePoint(cache_point_block(retention)?));
     }
-    let config = ToolConfiguration::builder()
-        .set_tools(Some(tools))
-        .build()
-        .map_err(|err| {
-            SqueezyError::ProviderRequest(format!("failed to build Bedrock toolConfig: {err}"))
-        })?;
+    let mut builder = ToolConfiguration::builder().set_tools(Some(tools));
+    if let Some(choice) = bedrock_tool_choice(tool_choice)? {
+        builder = builder.tool_choice(choice);
+    }
+    let config = builder.build().map_err(|err| {
+        SqueezyError::ProviderRequest(format!("failed to build Bedrock toolConfig: {err}"))
+    })?;
     Ok(Some(config))
+}
+
+/// Map cross-provider `LlmRequest.tool_choice` to Bedrock's
+/// [`ToolChoice`] enum. The cross-provider surface uses the OpenAI
+/// vocabulary (`auto`, `required`, `<tool_name>`); the helper
+/// normalizes case and routes:
+///
+/// * `Some("auto")` → [`ToolChoice::Auto`] — model picks freely.
+/// * `Some("required")` / `Some("any")` → [`ToolChoice::Any`] —
+///   the model MUST emit a tool call (no free-form reply allowed).
+///   Tool-shy models like Mistral / Nova benefit from `Any` to force a
+///   call. Mirrors the opencode mapping
+///   (`bedrock-converse.ts:232-238`).
+/// * `Some(name)` (any other non-empty value, optionally prefixed
+///   `tool:`) → [`ToolChoice::Tool`] with the literal tool name. The
+///   caller has already advertised this name in `LlmRequest.tools`;
+///   Bedrock rejects the request otherwise.
+/// * `None` / `Some("")` → `Ok(None)`, leaving the field unset so the
+///   provider applies its default (typically `auto`).
+pub(crate) fn bedrock_tool_choice(
+    raw: Option<&str>,
+) -> Result<Option<aws_sdk_bedrockruntime::types::ToolChoice>> {
+    use aws_sdk_bedrockruntime::types::{
+        AnyToolChoice, AutoToolChoice, SpecificToolChoice, ToolChoice,
+    };
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "auto" => Ok(Some(ToolChoice::Auto(AutoToolChoice::builder().build()))),
+        "required" | "any" => Ok(Some(ToolChoice::Any(AnyToolChoice::builder().build()))),
+        _ => {
+            // Strip an optional `tool:` prefix so callers using the
+            // OpenAI Responses convention can route through without a
+            // separate code path.
+            let name = trimmed.strip_prefix("tool:").unwrap_or(trimmed).trim();
+            if name.is_empty() {
+                return Ok(None);
+            }
+            let specific = SpecificToolChoice::builder()
+                .name(name.to_string())
+                .build()
+                .map_err(|err| {
+                    SqueezyError::ProviderRequest(format!(
+                        "failed to build Bedrock SpecificToolChoice for `{name}`: {err}"
+                    ))
+                })?;
+            Ok(Some(ToolChoice::Tool(specific)))
+        }
+    }
 }
 
 /// Lower the cross-provider sampling knobs on [`LlmRequest`] into a
