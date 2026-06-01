@@ -1276,7 +1276,8 @@ async fn read_file_returns_bounded_content_and_hash() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success);
-    assert_eq!(result.content["content"], "cde");
+    assert_eq!(result.content["content"], "     1\tcde");
+    assert_eq!(result.content["start_line"], 1);
     assert_eq!(
         result.content["sha256"],
         sha256_hex("abcdef".as_bytes()).as_str()
@@ -1482,7 +1483,10 @@ async fn read_file_does_not_dedup_when_content_changed() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert!(result.content.get("dedup").is_none());
-    assert_eq!(result.content["content"], current);
+    assert_eq!(
+        result.content["content"],
+        "     1\talpha\n     2\tDELTA\n     3\tgamma\n"
+    );
     assert_eq!(
         result.receipt.content_sha256,
         Some(sha256_hex(current.as_bytes()))
@@ -1528,7 +1532,8 @@ async fn read_file_does_not_dedup_when_window_differs() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert!(result.content.get("dedup").is_none());
-    assert_eq!(result.content["content"], "beta");
+    assert_eq!(result.content["content"], "     2\tbeta");
+    assert_eq!(result.content["start_line"], 2);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3943,7 +3948,7 @@ async fn secret_name_checks_use_workspace_relative_paths() {
         )
         .await;
     assert_eq!(plain.status, ToolStatus::Success);
-    assert_eq!(plain.content["content"], "visible");
+    assert_eq!(plain.content["content"], "     1\tvisible");
 
     let secret = registry
         .execute(
@@ -10832,7 +10837,7 @@ async fn read_file_dispatch_normalizes_filepath_alias_via_hook() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success);
-    assert_eq!(result.content["content"], "hello world");
+    assert_eq!(result.content["content"], "     1\thello world");
     assert_eq!(result.content["path"], "sample.txt");
 
     let _ = fs::remove_dir_all(root);

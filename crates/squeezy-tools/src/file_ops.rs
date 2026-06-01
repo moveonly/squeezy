@@ -696,7 +696,16 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
         let end = offset.saturating_add(bytes.len());
-        let content = String::from_utf8_lossy(&bytes).to_string();
+        let raw_content = String::from_utf8_lossy(&bytes).to_string();
+        let start_line_1based: u32 = if offset == 0 {
+            1
+        } else {
+            crate::graph_tools::window_line_offset(&path, offset)
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        let content =
+            crate::graph_tools::prefix_lines_with_numbers(&raw_content, start_line_1based);
         let cost = ToolCostHint {
             bytes_read: total_bytes,
             output_bytes: content.len() as u64,
@@ -707,13 +716,12 @@ impl ToolRegistry {
         let mut payload = serde_json::Map::new();
         payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
+        payload.insert("start_line".to_string(), json!(start_line_1based));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
         payload.insert("sha256".to_string(), json!(content_sha256));
         payload.insert("truncated".to_string(), json!(end < total_bytes as usize));
         if let Some(reason) = ignored_reason {
-            // Keep this opt-in: most reads are not from ignored paths, so
-            // skipping these fields shaves two keys off the common case.
             payload.insert("ignored".to_string(), json!(true));
             payload.insert("ignored_reason".to_string(), json!(reason));
         }

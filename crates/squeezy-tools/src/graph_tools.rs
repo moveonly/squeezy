@@ -444,7 +444,10 @@ fn line_number_for_byte_bytes(bytes: &[u8], byte: usize) -> u32 {
 /// promote window-local line numbers to file-absolute ones in
 /// `read_slice_last_receipt_diff` without slurping the full file into memory
 /// twice. Returns the count of `\n` bytes in `[0, offset)`.
-fn window_line_offset(path: &Path, offset: usize) -> std::result::Result<u32, std::io::Error> {
+pub(crate) fn window_line_offset(
+    path: &Path,
+    offset: usize,
+) -> std::result::Result<u32, std::io::Error> {
     if offset == 0 {
         return Ok(0);
     }
@@ -2041,7 +2044,7 @@ fn read_slice_target(
 /// row per source line. The first line of the returned string maps to
 /// `start_line`, the second to `start_line + 1`, and so on. Trailing
 /// content without a final `\n` is emitted as a final unterminated row.
-fn prefix_lines_with_numbers(content: &str, start_line: u32) -> String {
+pub(crate) fn prefix_lines_with_numbers(content: &str, start_line: u32) -> String {
     if content.is_empty() {
         return String::new();
     }
