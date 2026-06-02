@@ -301,8 +301,16 @@ impl ToolRegistry {
             }
             let response_sha256 = sha256_hex(&response.body);
             let response_text = String::from_utf8_lossy(&response.body).to_string();
-            let result = parse_mcp_websearch_response(&response_text)
-                .ok_or_else(|| "websearch provider returned no text content".to_string())?;
+            let result = match parse_mcp_websearch_response(&response_text) {
+                Some(result) => result,
+                None => {
+                    let message = parse_mcp_websearch_error(&response_text).map_or_else(
+                        || "websearch provider returned no text content".to_string(),
+                        |message| format!("websearch provider error: {message}"),
+                    );
+                    return Err(message);
+                }
+            };
             Ok::<_, String>((response_text.len(), response_sha256, result))
         };
 
@@ -712,6 +720,42 @@ fn parse_mcp_payload(payload: &str) -> Option<String> {
         texts.push_str(text);
     }
     (!texts.is_empty()).then_some(texts)
+}
+
+/// Extracts the message from a top-level JSON-RPC `error` object. JSON-RPC
+/// servers conventionally return protocol-level failures (quota, invalid
+/// argument, transient server error) with HTTP 200 and no `result`, so
+/// `parse_mcp_websearch_response` yields `None`; this recovers the actual
+/// `error.message` (prefixed with `error.code` when present) so the failure
+/// reason is not swallowed.
+pub(crate) fn parse_mcp_websearch_error(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{')
+        && let Some(message) = parse_mcp_error_payload(trimmed)
+    {
+        return Some(message);
+    }
+
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(parse_mcp_error_payload)
+}
+
+fn parse_mcp_error_payload(payload: &str) -> Option<String> {
+    let trimmed = payload.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(trimmed).ok()?;
+    let error = value.get("error")?;
+    let message = error.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    match error.get("code").and_then(Value::as_i64) {
+        Some(code) => Some(format!("{message} (code {code})")),
+        None => Some(message.to_string()),
+    }
 }
 
 fn web_fetch_request_sha256(

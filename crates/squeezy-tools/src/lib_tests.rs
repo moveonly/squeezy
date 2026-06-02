@@ -7474,6 +7474,46 @@ async fn websearch_reports_missing_text_content() {
 }
 
 #[tokio::test]
+async fn websearch_surfaces_jsonrpc_error_message() {
+    let root = temp_workspace("websearch_jsonrpc_error");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response(
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"monthly quota exceeded"}}"#,
+    ));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    let error = result.content["error"].as_str().expect("error");
+    assert!(
+        error.contains("monthly quota exceeded"),
+        "expected provider error message, got: {error}"
+    );
+    assert!(
+        !error.contains("no text content"),
+        "JSON-RPC error must not be reported as empty content: {error}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn websearch_reports_http_client_errors() {
     let root = temp_workspace("websearch_client_error");
     let http = Arc::new(MockWebHttpClient::default());
