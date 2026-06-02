@@ -6043,6 +6043,13 @@ fn validate_env_allowlist_pattern(pattern: &str, source: &str) -> Result<()> {
              only supports an exact name or a single trailing `*` (e.g. `LC_*`)"
         )));
     }
+    if trimmed == "*" {
+        return Err(SqueezyError::Config(format!(
+            "{source}: permissions.shell_sandbox.env_allowlist pattern {pattern:?} \
+             matches every variable and would preserve the entire host \
+             environment; use an exact name or a non-empty prefix (e.g. `LC_*`)"
+        )));
+    }
     Ok(())
 }
 

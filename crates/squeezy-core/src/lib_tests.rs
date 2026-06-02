@@ -1581,6 +1581,15 @@ env_allowlist = ["*_PROXY"]
     let err = try_app_config(
         r#"
 [permissions.shell_sandbox]
+env_allowlist = ["*"]
+"#,
+    )
+    .expect_err("env_allowlist bare * must be rejected");
+    assert!(format!("{err}").contains("env_allowlist"));
+
+    let err = try_app_config(
+        r#"
+[permissions.shell_sandbox]
 sensitive_path_patterns = ["**"]
 "#,
     )
