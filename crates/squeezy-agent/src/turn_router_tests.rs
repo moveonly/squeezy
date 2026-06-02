@@ -655,6 +655,17 @@ fn estimate_routing_savings_zero_when_actual_already_above_parent_estimate() {
     cheap_cost.estimated_usd_micros = Some(u64::MAX); // pretend cheap cost is enormous
     let savings = estimate_routing_savings("anthropic", "claude-opus-4-7", &cheap_cost);
     assert_eq!(savings, 0);
-    let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost);
+    let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 0);
     assert!(net < 0);
+}
+
+#[test]
+fn estimate_routing_net_savings_subtracts_judge_cost() {
+    let cheap_cost = cost_with(10_000, 1_000);
+    let gross = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 0);
+    assert!(gross > 100);
+
+    let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 100);
+
+    assert_eq!(net, gross - 100);
 }
