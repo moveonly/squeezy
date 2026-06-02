@@ -5374,12 +5374,12 @@ impl TurnRuntime {
                 let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
                 let projected_output_tokens = CostBroker::projected_output_tokens(
                     self.config.max_output_tokens,
-                    squeezy_llm::model_info_for(self.provider.name(), &self.config.model)
+                    squeezy_llm::model_info_for(self.provider.name(), &current_model)
                         .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
                 );
                 broker.projected_session_cap_overrun(
                     self.provider.name(),
-                    &self.config.model,
+                    &current_model,
                     projected_input_tokens,
                     projected_output_tokens,
                 )
