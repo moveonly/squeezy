@@ -1719,7 +1719,20 @@ impl Agent {
             if let Some(session) = &self.session_log {
                 let _ = session.write_resume_state(&conversation_state.to_resume_state());
             }
+            return;
         }
+        let conversation_state = self.conversation_state.clone();
+        let session_log = self.session_log.clone();
+        tokio::spawn(async move {
+            let resume = {
+                let mut conversation_state = conversation_state.lock().await;
+                conversation_state.set_routing_session_disabled(disabled);
+                conversation_state.to_resume_state()
+            };
+            if let Some(session) = session_log {
+                let _ = session.write_resume_state(&resume);
+            }
+        });
     }
 
     /// Test-only handle to the subagent registry so callers can

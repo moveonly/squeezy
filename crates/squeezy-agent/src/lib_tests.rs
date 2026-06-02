@@ -566,6 +566,49 @@ fn routing_session_disabled_persists_resume_snapshot() {
 }
 
 #[tokio::test]
+async fn routing_session_disabled_persists_after_busy_state_lock() {
+    let root = temp_workspace("routing-disabled-busy-resume");
+    let config = AppConfig {
+        workspace_root: root,
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config.clone(), Arc::new(MockProvider::new(Vec::new())));
+    let session_id = agent.session_id().expect("session id");
+
+    let guard = agent.conversation_state.lock().await;
+    agent.set_routing_session_disabled(true);
+    assert!(!guard.routing_session_disabled());
+    drop(guard);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if agent
+                .conversation_state
+                .lock()
+                .await
+                .routing_session_disabled()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background resume update");
+
+    let store = squeezy_store::SessionStore::open(&config);
+    let resume = store
+        .open_session(session_id)
+        .read_resume_state()
+        .expect("resume state");
+    assert!(resume.routing_session_disabled);
+}
+
+#[tokio::test]
 async fn stalled_model_stream_fails_after_idle_timeout() {
     let provider = Arc::new(HangingProvider::new());
     let config = AppConfig {
