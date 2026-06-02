@@ -1158,7 +1158,11 @@ fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome
                 {
                     0
                 } else {
-                    fidx
+                    // `field_index` is a display-row index; translate the raw
+                    // matched field index through the section's synthetic-row
+                    // layout so Models fields at/after the API-key row resolve
+                    // back to the intended field.
+                    ConfigScreenState::display_row_for_field(section, fidx)
                 };
             }
             state.search = None;

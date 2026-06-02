@@ -442,6 +442,17 @@ impl ConfigScreenState {
         }
     }
 
+    /// Inverse of [`field_at_row`]: map a raw `section.fields` index to the
+    /// display row that focuses it. For Models the synthetic API-key row at
+    /// `SYNTHETIC_KEY_ROW` shifts every field at or below it down by one, so
+    /// the two mappings must stay in lockstep — `field_at_row(display_row_for_field(i)) == fields[i]`.
+    pub(crate) fn display_row_for_field(section: &'static ConfigSectionMeta, fidx: usize) -> usize {
+        match section.id {
+            SectionId::Models if fidx >= SYNTHETIC_KEY_ROW => fidx + 1,
+            _ => fidx,
+        }
+    }
+
     pub(crate) fn theme_row_at(&self, row: usize) -> Option<ThemeRow> {
         if self.current_section().id != SectionId::Themes {
             return None;

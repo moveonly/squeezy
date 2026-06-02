@@ -622,6 +622,68 @@ async fn slash_opens_search_and_enter_jumps_to_field() {
 }
 
 #[tokio::test]
+async fn search_enter_lands_on_models_field_past_synthetic_key_row() {
+    // Searching to a Models field at or after the synthetic API-key row must
+    // resolve back to the intended field, not one display row too high.
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+
+    let models_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Models)
+        .expect("Models section exists");
+    let target_fidx = field_index(SectionId::Models, &["model", "reasoning_effort"]);
+    assert!(
+        target_fidx >= 2,
+        "reasoning_effort should sit at/after the synthetic key row for this test to be meaningful"
+    );
+
+    // Open search and type "reason" so Models → reasoning_effort is matched.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+    );
+    for ch in ['r', 'e', 'a', 's', 'o', 'n'] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+    }
+
+    // Point the cursor at the Models → reasoning_effort match regardless of
+    // its rank among other "reason"-ish matches.
+    let search = state.search.as_mut().expect("search overlay open");
+    search.cursor = search
+        .matches
+        .iter()
+        .position(|&(sidx, fidx, _)| sidx == models_sidx && fidx == target_fidx)
+        .expect("reasoning_effort is among the matches for 'reason'");
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert_eq!(state.section_index, models_sidx);
+    assert!(
+        !state.on_synthetic_api_key_row(),
+        "Enter must not land on the synthetic API-key row"
+    );
+    let resolved = state.field_at_row(state.field_index).expect("real field");
+    assert_eq!(
+        resolved.toml_path, CONFIG_SECTIONS[models_sidx].fields[target_fidx].toml_path,
+        "focused field should be reasoning_effort, not the row above it"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_r_resets_field_to_default() {
     // Use a field whose schema declares no env_override, so the test stays
     // robust against other tests setting SQUEEZY_* env vars in parallel.
