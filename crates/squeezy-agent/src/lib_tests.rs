@@ -8553,6 +8553,51 @@ fn tool_round_path_collector_counts_distinct_path_like_values() {
 }
 
 #[test]
+fn tool_round_path_collector_ignores_dotted_non_path_tokens() {
+    let calls = vec![ToolCall {
+        call_id: "call-1".to_string(),
+        name: "grep".to_string(),
+        arguments: json!({
+            "pattern": "example.com",
+            "version": "3.14",
+            "symbol": "foo.bar",
+        }),
+    }];
+    let result = squeezy_tools::ToolResult {
+        call_id: "call-1".to_string(),
+        tool_name: "grep".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "matches": [
+                {"text": "example.com"},
+                {"text": "3.14"},
+                {"text": "foo.bar"},
+                {"text": "v1.2.3"},
+                {"path": "lib.rs"},
+                {"path": "src/main.rs"}
+            ],
+            "summary": "saw 3.14 and example.com in foo.bar"
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let pending = SeenToolOutputs::default().prepare_results(vec![result]);
+    let mut paths = BTreeSet::new();
+
+    let observed = collect_tool_round_paths(&calls, &pending, 3, &mut paths);
+
+    assert_eq!(observed, 1);
+    assert_eq!(
+        paths,
+        BTreeSet::from(["lib.rs".to_string(), "src/main.rs".to_string()])
+    );
+}
+
+#[test]
 fn subagent_activity_message_maps_tool_lifecycle_events() {
     let call = ToolCall {
         call_id: "c1".to_string(),

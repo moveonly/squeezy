@@ -9045,6 +9045,10 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+// Predictive escalation watches the first few tool results for one
+// broad result that spans many files, not a long sequence of
+// one-file reads. The normal tool-call ceiling handles sequential
+// call sprawl.
 const ROUTING_DIVERSITY_RESULT_WINDOW: u64 = 3;
 const ROUTING_DIVERSITY_DISTINCT_PATHS: usize = 8;
 
@@ -9072,33 +9076,78 @@ fn collect_tool_round_paths(
 }
 
 fn collect_path_like_values(value: &Value, paths: &mut BTreeSet<String>) {
+    collect_path_like_values_with_key(None, value, paths);
+}
+
+fn collect_path_like_values_with_key(
+    parent_key: Option<&str>,
+    value: &Value,
+    paths: &mut BTreeSet<String>,
+) {
     match value {
-        Value::String(text) if looks_path_like(text) => {
+        Value::String(text) if looks_path_like(text, parent_key.is_some_and(is_path_key)) => {
             paths.insert(text.to_string());
         }
         Value::Array(items) => {
             for item in items {
-                collect_path_like_values(item, paths);
+                collect_path_like_values_with_key(parent_key, item, paths);
             }
         }
         Value::Object(map) => {
-            for value in map.values() {
-                collect_path_like_values(value, paths);
+            for (key, value) in map {
+                collect_path_like_values_with_key(Some(key.as_str()), value, paths);
             }
         }
         _ => {}
     }
 }
 
-fn looks_path_like(text: &str) -> bool {
+fn is_path_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "path"
+            | "paths"
+            | "filepath"
+            | "filepaths"
+            | "filename"
+            | "filenames"
+            | "file"
+            | "files"
+            | "sourcepath"
+            | "targetpath"
+            | "oldpath"
+            | "newpath"
+            | "frompath"
+            | "topath"
+            | "relativepath"
+            | "absolutepath"
+            | "workspacepath"
+    )
+}
+
+fn looks_path_like(text: &str, allow_bare_file: bool) -> bool {
     let trimmed = text.trim();
     if trimmed.len() < 3 || trimmed.contains('\n') {
         return false;
     }
-    trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.starts_with('.')
-        || Path::new(trimmed).extension().is_some()
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return false;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    if allow_bare_file
+        && (trimmed.starts_with('.') || Path::new(trimmed).extension().is_some())
+        && !trimmed.chars().any(char::is_whitespace)
+    {
+        return true;
+    }
+    false
 }
 
 fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> String {
