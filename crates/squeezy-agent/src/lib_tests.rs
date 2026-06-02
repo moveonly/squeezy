@@ -541,6 +541,30 @@ async fn turn_stream_reports_provider_error() {
     assert!(saw_error);
 }
 
+#[test]
+fn routing_session_disabled_persists_resume_snapshot() {
+    let root = temp_workspace("routing-disabled-resume");
+    let config = AppConfig {
+        workspace_root: root,
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config.clone(), Arc::new(MockProvider::new(Vec::new())));
+    let session_id = agent.session_id().expect("session id");
+
+    agent.set_routing_session_disabled(true);
+
+    let store = squeezy_store::SessionStore::open(&config);
+    let resume = store
+        .open_session(session_id)
+        .read_resume_state()
+        .expect("resume state");
+    assert!(resume.routing_session_disabled);
+}
+
 #[tokio::test]
 async fn stalled_model_stream_fails_after_idle_timeout() {
     let provider = Arc::new(HangingProvider::new());

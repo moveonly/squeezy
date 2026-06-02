@@ -195,6 +195,7 @@ struct ConversationState {
     /// router's cross-turn state without a parallel plumbing change.
     /// Read back into the live router on `Agent::resume`.
     routing_sticky_remaining_turns: u8,
+    routing_session_disabled: bool,
 }
 
 impl ConversationState {
@@ -214,6 +215,7 @@ impl ConversationState {
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
+            routing_session_disabled: state.routing_session_disabled,
         }
     }
 
@@ -223,6 +225,14 @@ impl ConversationState {
 
     fn set_routing_sticky_remaining_turns(&mut self, value: u8) {
         self.routing_sticky_remaining_turns = value;
+    }
+
+    fn routing_session_disabled(&self) -> bool {
+        self.routing_session_disabled
+    }
+
+    fn set_routing_session_disabled(&mut self, disabled: bool) {
+        self.routing_session_disabled = disabled;
     }
 
     fn to_resume_state(&self) -> SessionResumeState {
@@ -247,6 +257,7 @@ impl ConversationState {
             context_attachments: self.context_attachments.clone(),
             context_compaction: self.context_compaction.clone(),
             routing_sticky_remaining_turns: self.routing_sticky_remaining_turns,
+            routing_session_disabled: self.routing_session_disabled,
         }
     }
 }
@@ -1337,6 +1348,7 @@ impl Agent {
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
         let routing_sticky_remaining = conversation_state.routing_sticky_remaining_turns();
+        let routing_session_disabled = conversation_state.routing_session_disabled();
         let agent = Self::build(
             config,
             provider,
@@ -1344,12 +1356,15 @@ impl Agent {
             conversation_state,
             None,
         );
-        if routing_sticky_remaining > 0 {
+        if routing_sticky_remaining > 0 || routing_session_disabled {
             // Honour the persisted sticky window so a follow-up
             // prompt on a resumed mid-hard-task session continues to
-            // skip the per-turn router until the window expires.
+            // skip the per-turn router until the window expires. Also
+            // honour `/router off`, which is session state rather than
+            // a one-shot override.
             let mut state = agent.routing_state.lock().expect("routing state lock");
             state.sticky.remaining_turns = routing_sticky_remaining;
+            state.pending_override.session_disabled = routing_session_disabled;
         }
         let _ = handle.update_metadata(|metadata| {
             metadata.status = SessionStatus::Running;
@@ -1686,6 +1701,13 @@ impl Agent {
     pub fn set_routing_session_disabled(&self, disabled: bool) {
         let mut state = self.routing_state.lock().expect("routing state lock");
         state.pending_override.session_disabled = disabled;
+        drop(state);
+        if let Ok(mut conversation_state) = self.conversation_state.try_lock() {
+            conversation_state.set_routing_session_disabled(disabled);
+            if let Some(session) = &self.session_log {
+                let _ = session.write_resume_state(&conversation_state.to_resume_state());
+            }
+        }
     }
 
     /// Test-only handle to the subagent registry so callers can
