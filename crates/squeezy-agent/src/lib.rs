@@ -99,7 +99,9 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
-pub use cost_broker::{CostCapStatus, format_warn_threshold_notice};
+pub use cost_broker::{
+    CostCapStatus, format_cap_unenforceable_notice, format_warn_threshold_notice,
+};
 pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 pub use subagent_catalog::{
@@ -5903,6 +5905,16 @@ impl TurnRuntime {
                                 estimate_cost(self.provider.name(), &request_model, &cost);
                         }
                         let warning = broker.record_provider_cost(&cost);
+                        if broker.note_unenforceable_cap_round(&cost) {
+                            let _ = self
+                                .tx
+                                .send(AgentEvent::CostCapUnenforceable {
+                                    turn_id: self.turn_id,
+                                    provider: self.provider.name().to_string(),
+                                    model: request_model.to_string(),
+                                })
+                                .await;
+                        }
                         if broker.metrics.routed_to_cheap
                             && request_model.as_ref() != parent_model_str.as_str()
                         {
@@ -13994,6 +14006,17 @@ pub enum AgentEvent {
     CostWarning {
         turn_id: TurnId,
         status: CostCapStatus,
+    },
+    /// Emitted at most once per turn, the first round where a configured
+    /// `max_session_cost_usd_micros` cap cannot be enforced because the
+    /// active `(provider, model)` has no registry pricing (the per-round
+    /// dollar estimate is `None`, so the running total never advances and
+    /// the cap can never trip). The TUI renders a transcript notice so the
+    /// user knows the guardrail is inert; non-TUI consumers can ignore it.
+    CostCapUnenforceable {
+        turn_id: TurnId,
+        provider: String,
+        model: String,
     },
     /// Emitted at most once per session, the first time the shell tool's OS
     /// sandbox backend silently degrades to the best_effort path (probe

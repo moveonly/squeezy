@@ -61,6 +61,12 @@ pub(crate) struct CostBroker {
     /// but `warn_emitted` follows from `session_cost_usd_micros` already
     /// being above the threshold at construction).
     warn_emitted: bool,
+    /// One-shot latch for the "cap configured but pricing unknown" notice.
+    /// Set the first time a round is recorded under a configured cap with
+    /// no per-round dollar estimate, so the user is told once that the cap
+    /// cannot be enforced for this `(provider, model)` instead of the cap
+    /// silently no-op'ing.
+    cap_unenforceable_emitted: bool,
     /// Per-token-byte calibration carried through the turn. Seeded from
     /// the session metadata (or the global file) and snapshot back out
     /// after every recorded provider response.
@@ -78,6 +84,7 @@ impl CostBroker {
             max_session_cost_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             cost_warn_percent: config.cost_warn_percent.clamp(1, 100),
             warn_emitted: false,
+            cap_unenforceable_emitted: false,
             calibration: squeezy_llm::TokenCalibration::default(),
         }
     }
@@ -123,6 +130,27 @@ impl CostBroker {
             cap_usd_micros: cap,
             percent: cap_percent(self.session_cost_usd_micros, cap),
         })
+    }
+
+    /// Reports whether a configured session cost cap cannot be enforced for
+    /// the round just recorded, returning `true` exactly once.
+    ///
+    /// The cap is dollar-based, but a round whose `(provider, model)` has no
+    /// registry pricing yields `estimated_usd_micros == None`: the running
+    /// total can't advance, so neither the warning threshold nor the hard cap
+    /// ever fires. Left silent, a guardrail the user explicitly configured is
+    /// a no-op with no feedback. The one-shot latch lets the caller surface a
+    /// single transcript notice that the cap is inert for this model rather
+    /// than failing closed on an unpriced round.
+    pub(crate) fn note_unenforceable_cap_round(&mut self, cost: &CostSnapshot) -> bool {
+        if self.max_session_cost_usd_micros.is_none()
+            || cost.estimated_usd_micros.is_some()
+            || self.cap_unenforceable_emitted
+        {
+            return false;
+        }
+        self.cap_unenforceable_emitted = true;
+        true
     }
 
     /// Returns `Some(status)` if the running session cost has reached or
@@ -376,6 +404,19 @@ pub fn format_warn_threshold_notice(status: CostCapStatus) -> String {
         status.spent_usd_micros as f64 / 1_000_000.0,
         status.cap_usd_micros as f64 / 1_000_000.0,
         status.percent,
+    )
+}
+
+/// Render the one-time notice shown when a session cost cap is configured
+/// but the active `(provider, model)` has no registry pricing, so the cap
+/// cannot be enforced. Surfaced by the TUI when the broker reports an
+/// unenforceable-cap round so the user knows the guardrail is inert instead
+/// of silently trusting a cap that never trips.
+pub fn format_cap_unenforceable_notice(provider: &str, model: &str) -> String {
+    format!(
+        "session cost cap configured but pricing for `{provider}/{model}` is unknown; \
+         the cap cannot be enforced for this model. Switch to a model with known pricing, \
+         or remove `max_session_cost_usd_micros` to silence this notice."
     )
 }
 

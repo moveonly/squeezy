@@ -74,6 +74,91 @@ fn warn_threshold_notice_includes_next_step_guidance() {
     );
 }
 
+fn config_with_cap(cap_micros: u64) -> AppConfig {
+    AppConfig {
+        max_session_cost_usd_micros: Some(cap_micros),
+        ..AppConfig::default()
+    }
+}
+
+#[test]
+fn unenforceable_cap_round_signals_once_and_freezes_accumulator() {
+    // A cap is configured but the round has no per-round dollar estimate
+    // (no registry pricing for this model). The accumulator can't advance,
+    // so neither the warning nor the hard cap can ever fire — surface a
+    // single notice instead of silently no-op'ing the guardrail.
+    let mut broker = CostBroker::new(&config_with_cap(10_000));
+    let no_pricing = CostSnapshot {
+        input_tokens: Some(50_000),
+        output_tokens: Some(50_000),
+        estimated_usd_micros: None,
+        ..Default::default()
+    };
+
+    let cap_status = broker.record_provider_cost(&no_pricing);
+    assert!(
+        cap_status.is_none(),
+        "no dollar estimate means no warning/cap event can fire"
+    );
+    assert_eq!(
+        broker.session_cost_usd_micros, 0,
+        "an unpriced round leaves the accumulator at 0"
+    );
+    assert!(
+        broker.note_unenforceable_cap_round(&no_pricing),
+        "first unpriced round under a cap must emit the cap-unenforceable signal"
+    );
+    assert!(
+        !broker.note_unenforceable_cap_round(&no_pricing),
+        "the cap-unenforceable signal is one-shot"
+    );
+}
+
+#[test]
+fn unenforceable_cap_signal_suppressed_without_cap_or_with_pricing() {
+    // No cap configured: the cap can't be unenforceable, so stay silent.
+    let mut no_cap = CostBroker::new(&AppConfig::default());
+    let no_pricing = CostSnapshot {
+        input_tokens: Some(1_000),
+        estimated_usd_micros: None,
+        ..Default::default()
+    };
+    assert!(
+        !no_cap.note_unenforceable_cap_round(&no_pricing),
+        "no cap means there is nothing to warn about"
+    );
+
+    // Cap configured and the round carries a dollar estimate: the cap is
+    // enforceable, so no notice.
+    let mut priced = CostBroker::new(&config_with_cap(10_000));
+    let priced_round = CostSnapshot {
+        input_tokens: Some(1_000),
+        estimated_usd_micros: Some(2_000),
+        ..Default::default()
+    };
+    assert!(
+        !priced.note_unenforceable_cap_round(&priced_round),
+        "a priced round keeps the cap enforceable"
+    );
+}
+
+#[test]
+fn cap_unenforceable_notice_names_provider_model_and_setting() {
+    let notice = format_cap_unenforceable_notice("openrouter", "anthropic/claude-opus-4-7");
+    assert!(
+        notice.contains("openrouter/anthropic/claude-opus-4-7"),
+        "notice must cite the provider/model; got: {notice}"
+    );
+    assert!(
+        notice.contains("cannot be enforced"),
+        "notice must state the cap is inert; got: {notice}"
+    );
+    assert!(
+        notice.contains("max_session_cost_usd_micros"),
+        "notice must name the setting; got: {notice}"
+    );
+}
+
 #[test]
 fn budget_denied_result_counts_once_across_accounting_paths() {
     let mut broker = CostBroker::new(&AppConfig::default());

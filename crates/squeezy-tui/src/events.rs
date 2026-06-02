@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use squeezy_agent::{
     AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, RequestUserInputResponse, format_warn_threshold_notice,
+    MAX_JOBS_RETAINED, RequestUserInputResponse, format_cap_unenforceable_notice,
+    format_warn_threshold_notice,
 };
 use squeezy_core::SessionMode;
 use squeezy_tools::{McpElicitationResponse, McpStatusSnapshot, ToolStatus};
@@ -385,6 +386,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::CostWarning { status, .. } => {
                     let notice = format_warn_threshold_notice(status);
+                    app.push_transcript_item(TranscriptItem::system(notice));
+                }
+                AgentEvent::CostCapUnenforceable {
+                    provider, model, ..
+                } => {
+                    let notice = format_cap_unenforceable_notice(&provider, &model);
                     app.push_transcript_item(TranscriptItem::system(notice));
                 }
                 AgentEvent::ShellSandboxBestEffortFallback {

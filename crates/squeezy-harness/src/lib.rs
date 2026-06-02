@@ -673,6 +673,7 @@ async fn run_agent_with_config(
             | AgentEvent::AiReviewerTripped { .. } => {}
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
             AgentEvent::CostWarning { .. }
+            | AgentEvent::CostCapUnenforceable { .. }
             | AgentEvent::CostUpdate { .. }
             | AgentEvent::ToolProgress { .. }
             | AgentEvent::ReasoningDelta { .. }
