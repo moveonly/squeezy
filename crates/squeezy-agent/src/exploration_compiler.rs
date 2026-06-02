@@ -10,6 +10,7 @@ pub(crate) enum ExplorationIntent {
     TestPairing,
     RepoMap,
     MethodListing,
+    Hierarchy,
 }
 
 impl ExplorationIntent {
@@ -22,6 +23,7 @@ impl ExplorationIntent {
             Self::TestPairing => "test_pairing",
             Self::RepoMap => "repo_map",
             Self::MethodListing => "method_listing",
+            Self::Hierarchy => "hierarchy",
         }
     }
 }
@@ -35,6 +37,13 @@ pub(crate) struct ExplorationPlan {
 }
 
 pub(crate) const RAW_READ_DENIAL_REASON: &str = "exploration compiler refused raw read before graph context; call repo_map, definition_search, symbol_context, or another graph navigation tool first";
+/// Cap on `max_results` for graph-tool calls the planner emits before the
+/// model has run. A real-world subclass/hierarchy fan-out (e.g. all
+/// `WidgetsBindingObserver` subclasses in a Flutter app) routinely exceeds
+/// the previous value of 8 and silently truncated the tail. Keeping headroom
+/// at 32 covers the realistic-but-not-pathological cases the planner sees;
+/// the model can paginate or widen further from there.
+pub(crate) const PLANNER_GRAPH_MAX_RESULTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExplorationTurnState {
@@ -75,6 +84,35 @@ impl ExplorationTurnState {
 }
 
 pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
+    let plan = compile_exploration_plan_inner(input)?;
+    // Hierarchy intent is exempt from the file-path gate below: it only
+    // matches on tight subclass/implementors/extends keywords, so a
+    // hierarchy plan is exactly the case where firing `hierarchy(<base>)`
+    // upfront is high-value — the model would otherwise grep across a
+    // whole folder subtree (the dart Flutter benchmark walked 1.5 GB
+    // looking for `WidgetsBindingObserver` mixers). The bare-token
+    // false-positives that motivated removing RepoMap/RouteDiscovery
+    // exemptions do not apply here: "subclass", "that mixes in", and
+    // friends are intent-specific phrases.
+    if plan.intent == ExplorationIntent::Hierarchy {
+        return Some(plan);
+    }
+    // File-named tasks (prompt mentions ≥2 explicit source file paths)
+    // are a poor fit for speculative graph plumbing on other intents:
+    // the model can read the named files directly. The earlier carve-out
+    // for RepoMap and RouteDiscovery turned out to be a foot-gun —
+    // RouteDiscovery matches anywhere "route" appears as a substring,
+    // so the swift benchmark's `RoutesBuilder` filename was triggering
+    // a 1k-token speculative repo_map + downstream_flow round on every
+    // run. Outside Hierarchy, if the user has already bounded the scope
+    // by naming the files, treat that as the source of truth.
+    if explicit_file_path_count(input) >= 2 {
+        return None;
+    }
+    Some(plan)
+}
+
+fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
     let lowered = input.to_ascii_lowercase();
     let extracted = extract_symbol_query(input);
     let query = extracted.as_ref().map(|q| q.value.clone());
@@ -111,7 +149,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                 tool_call(
                     "planner_symbol_context",
                     "symbol_context",
-                    json!({"query": query.clone(), "max_results": 8, "max_references": 12}),
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS, "max_references": 12}),
                 ),
                 tool_call(
                     "planner_test_glob",
@@ -133,7 +171,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                 tool_call(
                     "planner_symbol_context",
                     "symbol_context",
-                    json!({"query": query.clone(), "max_results": 8, "max_references": 20}),
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS, "max_references": 20}),
                 ),
                 tool_call(
                     "planner_upstream_flow",
@@ -160,7 +198,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                 tool_call(
                     "planner_definition_search",
                     "definition_search",
-                    json!({"query": query.clone(), "max_results": 8}),
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
                 ),
                 tool_call(
                     "planner_upstream_flow",
@@ -168,6 +206,35 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
                     json!({"query": query.clone(), "max_depth": 3, "max_results": 25}),
                 ),
             ],
+            guard_raw_reads: true,
+        });
+    }
+
+    if hierarchy_intent(&lowered)
+        && let Some(query) = symbolic_query.clone()
+    {
+        // A "subclasses of Foo" / "implementors of Trait" question is
+        // exactly what `hierarchy` answers — the model would otherwise
+        // grep for `extends Foo` / `: Foo` / etc. across the tree, which
+        // is both noisier and language-specific. Pre-issuing the graph
+        // call lets the model see the canonical subclass list in one
+        // round and decide whether to drill into individual subclasses.
+        //
+        // Hierarchy is checked BEFORE RouteDiscovery because
+        // `route_intent` matches anywhere `"route"` appears as a
+        // substring (lifecycle hook names like `didPopRoute` /
+        // `didPushRoute` trigger it on the dart Flutter benchmark) and
+        // would otherwise win even when the prompt is unambiguously a
+        // subclass query. Hierarchy keywords are tight enough not to
+        // false-positive.
+        return Some(ExplorationPlan {
+            intent: ExplorationIntent::Hierarchy,
+            query: Some(query.clone()),
+            calls: vec![tool_call(
+                "planner_hierarchy",
+                "hierarchy",
+                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS}),
+            )],
             guard_raw_reads: true,
         });
     }
@@ -204,7 +271,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
             calls: vec![tool_call(
                 "planner_symbol_context",
                 "symbol_context",
-                json!({"query": query, "max_results": 8, "max_references": 4}),
+                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS, "max_references": 4}),
             )],
             guard_raw_reads: true,
         });
@@ -224,7 +291,7 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
             calls: vec![tool_call(
                 "planner_definition_search",
                 "definition_search",
-                json!({"query": query.clone(), "max_results": 8}),
+                json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
             )],
             guard_raw_reads: true,
         });
@@ -317,6 +384,79 @@ fn method_listing_intent(input: &str) -> bool {
         || input.contains("api for")
 }
 
+/// Cheap heuristic: count substrings in `input` that look like a source
+/// file path (e.g. `Sources/Vapor/Routing/RoutesBuilder+Method.swift`,
+/// `crates/squeezy-tools/src/file_ops.rs`). A prompt that names ≥2 such
+/// paths is almost always doing a targeted multi-file read where
+/// speculative graph queries are dead overhead. Avoids a regex
+/// dependency: walks the bytes, finds `.<ext>` tokens whose preceding
+/// run is path-shaped, dedupes by case-insensitive value.
+fn explicit_file_path_count(input: &str) -> usize {
+    const EXTS: &[&str] = &[
+        "rs", "go", "py", "java", "cs", "js", "ts", "tsx", "jsx", "swift", "kt", "scala", "php",
+        "rb", "c", "cpp", "h", "hpp", "dart",
+    ];
+    let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, _) in input.match_indices('.') {
+        let after = &input[idx + 1..];
+        let ext_end = after
+            .find(|ch: char| !ch.is_ascii_alphanumeric())
+            .unwrap_or(after.len());
+        let ext = &after[..ext_end];
+        if ext.is_empty() || !EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+            continue;
+        }
+        // Walk backwards from `.` to find the run of path-shaped chars.
+        let before = &input[..idx];
+        let start = before
+            .rfind(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '+' | '.'))
+            })
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let path = &input[start..idx + 1 + ext_end];
+        // Must contain at least one `/` to count as a path (not bare filename
+        // commentary like "fix.rs is a file"). Two file paths in a directory
+        // section like `{widgets,material,cupertino}/...` will naturally pass
+        // this check because the realistic prompts always include the parent
+        // package or `src/` prefix.
+        if !path.contains('/') {
+            continue;
+        }
+        found.insert(path.to_ascii_lowercase());
+        if found.len() >= 2 {
+            return found.len();
+        }
+    }
+    found.len()
+}
+
+fn hierarchy_intent(input: &str) -> bool {
+    input.contains("subclass")
+        || input.contains("subclasses")
+        || input.contains("implementors")
+        || input.contains("implementers")
+        || input.contains("implementations of")
+        || input.contains("concrete class")
+        || input.contains("classes that extend")
+        || input.contains("classes that implement")
+        || input.contains("classes that mix")
+        || input.contains("class extends")
+        || input.contains("class implements")
+        || input.contains("that mixes in")
+        || input.contains("that extends")
+        || input.contains("that implements")
+        || input.contains("uses the mixin")
+        || input.contains("mixers of")
+        || input.contains("inherit from")
+        || input.contains("inheritors")
+        || input.contains("derived classes")
+        || input.contains("derived types")
+        || input.contains("everything that implements")
+        || input.contains("every implementor")
+        || input.contains("every subclass")
+}
+
 fn test_pairing_intent(input: &str) -> bool {
     input.contains("test")
         && (input.contains("pair")
@@ -371,6 +511,7 @@ fn extract_quoted(input: &str) -> Option<String> {
 }
 
 fn extract_identifier(input: &str) -> Option<String> {
+    let mut type_shaped = None; // 2+ uppercase letters → CamelCase type name
     let mut rust_like = None;
     let mut fallback = None;
     for token in input
@@ -384,13 +525,32 @@ fn extract_identifier(input: &str) -> Option<String> {
         fallback = Some(token);
         if looks_like_rust_symbol(token) {
             rust_like = Some(token);
+            if looks_like_type_name(token) {
+                type_shaped = Some(token);
+            }
         }
     }
     // Prefer tokens that look like Rust identifier paths so prompts like
     // "Who calls Runner::run from main()?" do not pick up `main` as the
-    // symbol just because it appears last. Fall back to the last remaining
-    // token only when nothing identifier-shaped is present.
-    rust_like.or(fallback).map(str::to_string)
+    // symbol just because it appears last. Inside the rust-like bucket,
+    // prefer multi-capital CamelCase type names like
+    // `RequiresMessageQueue` over single-capital English nouns like
+    // `Separate`, which can otherwise win simply because they appear later
+    // in the prompt's output-format instructions.
+    type_shaped.or(rust_like).or(fallback).map(str::to_string)
+}
+
+/// CamelCase-shaped type names — used to prefer `RequiresMessageQueue` over
+/// single-capital tokens like `Separate` when both pass `looks_like_rust_symbol`.
+/// Two or more uppercase letters is enough to distinguish a proper type from
+/// a sentence-initial English noun. Snake-case tokens (have `_`) and
+/// path-shaped tokens (have `::`) already qualify via `looks_like_rust_symbol`
+/// and pass this gate too.
+fn looks_like_type_name(token: &str) -> bool {
+    if token.contains("::") || token.contains('_') {
+        return true;
+    }
+    token.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
 }
 
 fn looks_like_rust_symbol(token: &str) -> bool {
@@ -400,7 +560,86 @@ fn looks_like_rust_symbol(token: &str) -> bool {
 }
 
 fn is_useful_query(token: &str) -> bool {
-    token.len() >= 3 && token.chars().any(|ch| ch.is_ascii_alphabetic())
+    if token.len() < 3 || !token.chars().any(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+    if looks_like_path(token) {
+        return false;
+    }
+    !is_prompt_noise_word(token)
+}
+
+/// English prompt scaffolding words (`ONLY`, `OUTPUT`, `EXPECTED`, ...) that
+/// the surrounding instructions routinely capitalize for emphasis. Without
+/// this rejection, `looks_like_rust_symbol` accepts them as identifier-shaped
+/// (uppercase first char) and the planner fires nonsense graph queries like
+/// `symbol_context "ONLY"` that drag whole runs into degraded paths.
+fn is_prompt_noise_word(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "only"
+            | "todo"
+            | "note"
+            | "notes"
+            | "output"
+            | "outputs"
+            | "return"
+            | "returns"
+            | "error"
+            | "errors"
+            | "warning"
+            | "warnings"
+            | "stop"
+            | "exactly"
+            | "must"
+            | "expect"
+            | "expects"
+            | "expected"
+            | "actual"
+            | "input"
+            | "inputs"
+            | "testing"
+            | "please"
+            | "answer"
+            | "explain"
+            | "describe"
+            | "summary"
+            | "summarize"
+    )
+}
+
+fn looks_like_path(token: &str) -> bool {
+    if token.contains('/') {
+        return true;
+    }
+    let lower = token.to_ascii_lowercase();
+    matches!(
+        std::path::Path::new(lower.as_str())
+            .extension()
+            .and_then(|ext| ext.to_str()),
+        Some(
+            "rs" | "py"
+                | "java"
+                | "cs"
+                | "go"
+                | "cpp"
+                | "hpp"
+                | "c"
+                | "h"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "rb"
+                | "php"
+                | "kt"
+                | "kts"
+                | "swift"
+                | "scala"
+                | "sc"
+                | "dart"
+        )
+    )
 }
 
 fn is_stopword(token: &str) -> bool {

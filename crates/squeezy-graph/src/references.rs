@@ -112,6 +112,25 @@ impl SemanticGraph {
         if self.reference_is_symbol_declaration(symbol, reference) {
             return None;
         }
+        // Workspace-cross-crate qualified reference fallback runs
+        // BEFORE the package-key gate because that gate rejects every
+        // cross-crate reference by default. A reference of the shape
+        // `<workspace-crate-alias>::Name` whose target is the unique
+        // workspace symbol named `Name` is the standard Rust monorepo
+        // cross-crate access pattern (e.g.
+        // `impl squeezy_llm::LlmProvider for ...` from another
+        // crate); without this fallback `reference_search` silently
+        // misses every such call/impl site outside the symbol's own
+        // crate.
+        if self.workspace_cross_crate_qualified_match(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
+        if self.go_cross_package_method_match(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
+        if self.c_family_namespace_qualified_callable_match(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if !self.reference_is_in_symbol_package(symbol, reference) {
             return None;
         }
@@ -132,8 +151,31 @@ impl SemanticGraph {
         if self.associated_type_reference_matches_symbol(symbol, reference) {
             return Some(Confidence::Heuristic);
         }
+        // Self-crate qualified call check runs BEFORE call/semantic
+        // edge resolution because both of those branches short-circuit
+        // to None on the unresolved-call path (`edge.to = None`) and
+        // on the `Function` rejection inside
+        // `reference_kind_can_bind_symbol`. The check is conservative
+        // (unique same-crate callable by name) so promoting it doesn't
+        // override authoritative resolved-call bindings — those are
+        // captured later for non-self-crate paths.
+        if self.self_crate_qualified_callable_matches(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if let Some(edge) = self.call_edge_for_reference(reference) {
-            return self.edge_binding_confidence(symbol, edge);
+            if let Some(confidence) = self.edge_binding_confidence(symbol, edge) {
+                return Some(confidence);
+            }
+            // A call edge with `to = None` is unresolved (e.g. a C#
+            // namespace-qualified static call that `resolve_call`
+            // couldn't disambiguate). Fall through so the later
+            // `semantic_edge_for_reference` branch — which DOES bind
+            // via the `References` edge whose `to` is `Some(symbol.id)` —
+            // gets a chance. Only short-circuit when the call edge is
+            // authoritatively resolved to a different symbol.
+            if edge.to.is_some() {
+                return None;
+            }
         }
         if self.imported_reference_matches_symbol(symbol, reference) {
             return Some(Confidence::ImportResolved);
@@ -161,6 +203,553 @@ impl SemanticGraph {
             return Some(Confidence::Heuristic);
         }
         None
+    }
+
+    /// Bind references like `<crate-name-in-underscores>::foo` that
+    /// originate from inside `crates/<crate-name>/`. Tree-sitter emits
+    /// a `ParsedReference` for the qualified path but `Calls`-edge
+    /// resolution falls through when the receiver is the current
+    /// crate's own name (a common Rust idiom: `mycrate::foo()` from
+    /// another module of the same crate, often through a `pub use`
+    /// re-export). The default qualified-reference rule rejects
+    /// Functions outright via `reference_kind_can_bind_symbol`, so
+    /// without this fallback `reference_search` silently misses the
+    /// call site.
+    ///
+    /// Conservatively bound: only fires when the symbol is the
+    /// unique workspace candidate of its name living in the same
+    /// crate. With ambiguity we bail rather than risk a false bind.
+    pub(crate) fn self_crate_qualified_callable_matches(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+        ) {
+            return false;
+        }
+        // The reference may be the whole qualified path
+        // (`crate_alias::foo`, ReferenceKind::Path) or the bare leaf
+        // (`foo`, ReferenceKind::Identifier) that the parser emits
+        // alongside it. For the bare leaf, the qualifier lives in the
+        // source bytes immediately before the reference span; consult
+        // the same helper used by `reference_has_external_scope_prefix`.
+        let qualified_first_segment: Option<String> = if reference.text.contains("::") {
+            let segments = path_segments(&reference.text);
+            if segments.last().map(String::as_str) != Some(symbol.name.as_str())
+                || segments.len() < 2
+            {
+                return false;
+            }
+            segments.first().cloned()
+        } else if reference.text == symbol.name {
+            self.reference_source_scope_prefix_first_segment(reference)
+        } else {
+            return false;
+        };
+        let Some(first_segment) = qualified_first_segment else {
+            return false;
+        };
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        let Some(crate_alias) =
+            crate_underscore_alias_for_relative_path(&reference_file.relative_path)
+        else {
+            return false;
+        };
+        if first_segment != crate_alias {
+            return false;
+        }
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        if package_key(&symbol_file.relative_path) != package_key(&reference_file.relative_path) {
+            return false;
+        }
+        let mut same_crate_callable_count = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if package_key(&candidate_file.relative_path)
+                != package_key(&reference_file.relative_path)
+            {
+                continue;
+            }
+            same_crate_callable_count += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if same_crate_callable_count > 1 {
+                return false;
+            }
+        }
+        symbol_seen && same_crate_callable_count == 1
+    }
+
+    /// Bind a `<workspace-crate-alias>::Name` reference from one
+    /// workspace crate to a symbol named `Name` that lives in
+    /// `crates/<workspace-crate-alias-kebab>/`. Mirrors
+    /// [`Self::self_crate_qualified_callable_matches`] but for the
+    /// cross-crate direction: a reference of this shape in
+    /// `crates/other/` must bind to the symbol in the alias crate
+    /// even though `reference_is_in_symbol_package` would otherwise
+    /// reject the pair on package-key mismatch.
+    ///
+    /// Conservatism: requires the symbol to be the unique
+    /// workspace-wide candidate of its name within the alias's crate
+    /// (Function / Method / Test / Trait / Class / Struct / Enum /
+    /// Union / TypeAlias / Const / Static / Module). Ambiguous names
+    /// stay unresolved.
+    pub(crate) fn workspace_cross_crate_qualified_match(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function
+                | SymbolKind::Method
+                | SymbolKind::Test
+                | SymbolKind::Trait
+                | SymbolKind::Class
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Union
+                | SymbolKind::TypeAlias
+                | SymbolKind::Const
+                | SymbolKind::Static
+                | SymbolKind::Module
+        ) {
+            return false;
+        }
+        // Pull the qualifying first segment from one of three places,
+        // in order of confidence:
+        //  1. The reference text itself (full `crate::Name` path).
+        //  2. The source-byte scope prefix that immediately precedes
+        //     the reference (covers the bare-leaf reference the
+        //     parser emits alongside a scoped_identifier).
+        //  3. A non-glob `use <crate>::Name` or `use <crate>::Name as
+        //     <alias>` import that brings the symbol into scope as
+        //     either `Name` or the alias the reference uses. This
+        //     covers the very common bare call (`estimate_cost(...)`)
+        //     after `use squeezy_llm::estimate_cost;`.
+        let qualified_first_segment: Option<String> = if reference.text.contains("::") {
+            let segments = path_segments(&reference.text);
+            if segments.last().map(String::as_str) != Some(symbol.name.as_str())
+                || segments.len() < 2
+            {
+                return false;
+            }
+            segments.first().cloned()
+        } else if reference.text == symbol.name {
+            self.reference_source_scope_prefix_first_segment(reference)
+                .or_else(|| self.import_root_for_workspace_reference(symbol, reference))
+        } else {
+            // The reference text might be an alias (`use crate::foo as
+            // bar; bar()`). Check imports for `bar` mapping to the
+            // symbol via a workspace crate alias.
+            self.import_root_for_workspace_reference(symbol, reference)
+        };
+        let Some(first_segment) = qualified_first_segment else {
+            return false;
+        };
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        let Some(symbol_crate_alias) =
+            crate_underscore_alias_for_relative_path(&symbol_file.relative_path)
+        else {
+            return false;
+        };
+        if first_segment != symbol_crate_alias {
+            return false;
+        }
+        // Self-crate path is already handled by
+        // `self_crate_qualified_callable_matches`; bail here so the
+        // two helpers don't overlap.
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        if package_key(&symbol_file.relative_path) == package_key(&reference_file.relative_path) {
+            return false;
+        }
+        let symbol_crate_key = package_key(&symbol_file.relative_path);
+        let mut candidates_in_symbol_crate = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Test
+                    | SymbolKind::Trait
+                    | SymbolKind::Class
+                    | SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Union
+                    | SymbolKind::TypeAlias
+                    | SymbolKind::Const
+                    | SymbolKind::Static
+                    | SymbolKind::Module
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if package_key(&candidate_file.relative_path) != symbol_crate_key {
+                continue;
+            }
+            candidates_in_symbol_crate += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if candidates_in_symbol_crate > 1 {
+                return false;
+            }
+        }
+        symbol_seen && candidates_in_symbol_crate == 1
+    }
+
+    /// Bind Go cross-package method references like `cmd.VisitParents(...)`
+    /// from a sibling Go package that imports the symbol's package.
+    /// Tree-sitter emits a `Field`-kind reference with text equal to
+    /// the method name; the receiver `cmd` is a variable typed by
+    /// another package, which Squeezy doesn't track type-by-type.
+    /// This helper accepts the binding when:
+    ///   1. both files are Go,
+    ///   2. the reference text matches the symbol name,
+    ///   3. the reference's file imports a path whose leaf (or
+    ///      alias) equals the symbol's package name, and
+    ///   4. the symbol is the unique callable of its name in that
+    ///      package.
+    ///
+    /// Mirrors the Rust [`Self::workspace_cross_crate_qualified_match`]
+    /// but for Go's package + import shape.
+    pub(crate) fn go_cross_package_method_match(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+        ) {
+            return false;
+        }
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        if symbol_file.language != LanguageKind::Go || reference_file.language != LanguageKind::Go {
+            return false;
+        }
+        // Same-package references already pass `reference_is_in_symbol_package`;
+        // this helper only owns the cross-package case.
+        if self.packages.get(&symbol.file_id) == self.packages.get(&reference.file_id) {
+            return false;
+        }
+        if reference.text != symbol.name && last_path_segment(&reference.text) != symbol.name {
+            return false;
+        }
+        let Some(symbol_package) = self.packages.get(&symbol.file_id).cloned() else {
+            return false;
+        };
+        // Reference's file must import the symbol's package by name or
+        // alias.
+        let import_visible = self.imports_for_file(&reference.file_id).any(|import| {
+            let import_leaf = import
+                .alias
+                .as_deref()
+                .filter(|alias| *alias != "_")
+                .map(str::to_string)
+                .unwrap_or_else(|| last_path_segment(&import.path));
+            import_leaf == symbol_package || last_path_segment(&import.path) == symbol_package
+        });
+        if !import_visible {
+            return false;
+        }
+        // Symbol must be the unique callable by name within its package.
+        let mut count = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if candidate_file.language != LanguageKind::Go {
+                continue;
+            }
+            if self.packages.get(&candidate.file_id).cloned().as_deref()
+                != Some(symbol_package.as_str())
+            {
+                continue;
+            }
+            count += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if count > 1 {
+                return false;
+            }
+        }
+        symbol_seen && count == 1
+    }
+
+    /// Bind C/C++ namespace-qualified function calls like
+    /// `details::os::localtime(...)`. The reference text after the
+    /// tree-sitter `Path`-kind reduction is just `localtime`; the
+    /// scope qualifier `details::os` sits in the source bytes
+    /// preceding the reference span. Tail-match those scope segments
+    /// against the symbol's enclosing-module chain (Squeezy stores
+    /// C++ namespaces as `SymbolKind::Module` ancestors) and bind
+    /// when the symbol is the unique callable of its name under that
+    /// namespace.
+    ///
+    /// Mirrors [`Self::self_crate_qualified_callable_matches`] but
+    /// keys off the namespace chain rather than the Rust crate
+    /// underscore alias.
+    pub(crate) fn c_family_namespace_qualified_callable_match(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+        ) {
+            return false;
+        }
+        let Some(reference_file) = self.files.get(&reference.file_id) else {
+            return false;
+        };
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        if !matches!(reference_file.language, LanguageKind::C | LanguageKind::Cpp) {
+            return false;
+        }
+        if !matches!(symbol_file.language, LanguageKind::C | LanguageKind::Cpp) {
+            return false;
+        }
+        // Reference text must match the symbol's bare name (or its
+        // leaf when the parser produced a longer path).
+        if reference.text != symbol.name && last_path_segment(&reference.text) != symbol.name {
+            return false;
+        }
+        // Scope qualifier — what `details::os::` would look like
+        // immediately before the reference start in the source.
+        let Some(scope_prefix) = self.reference_source_scope_prefix(reference) else {
+            return false;
+        };
+        let scope_segments: Vec<String> = scope_prefix
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+        if scope_segments.is_empty() {
+            return false;
+        }
+        // Symbol's enclosing namespace chain (innermost last).
+        let symbol_namespaces = self.namespace_chain_for_symbol(symbol);
+        if symbol_namespaces.is_empty() {
+            return false;
+        }
+        // The scope tail must equal a suffix of the symbol's
+        // namespace chain.
+        if scope_segments.len() > symbol_namespaces.len() {
+            return false;
+        }
+        let tail_start = symbol_namespaces.len() - scope_segments.len();
+        if symbol_namespaces[tail_start..] != scope_segments[..] {
+            return false;
+        }
+        // Conservatism: the symbol must be the unique workspace
+        // candidate of its name living under the same namespace tail.
+        let mut count = 0u32;
+        let mut symbol_seen = false;
+        for id in self.symbols_by_name_or_scan(&symbol.name) {
+            let Some(candidate) = self.symbols.get(&id) else {
+                continue;
+            };
+            if !matches!(
+                candidate.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test,
+            ) {
+                continue;
+            }
+            let Some(candidate_file) = self.files.get(&candidate.file_id) else {
+                continue;
+            };
+            if !matches!(candidate_file.language, LanguageKind::C | LanguageKind::Cpp) {
+                continue;
+            }
+            let candidate_ns = self.namespace_chain_for_symbol(candidate);
+            if candidate_ns.len() < scope_segments.len() {
+                continue;
+            }
+            let candidate_tail_start = candidate_ns.len() - scope_segments.len();
+            if candidate_ns[candidate_tail_start..] != scope_segments[..] {
+                continue;
+            }
+            count += 1;
+            if candidate.id == symbol.id {
+                symbol_seen = true;
+            }
+            if count > 1 {
+                return false;
+            }
+        }
+        symbol_seen && count == 1
+    }
+
+    /// Walk a symbol's parent chain collecting consecutive
+    /// `SymbolKind::Module` parents. Outermost namespace first,
+    /// innermost last.
+    fn namespace_chain_for_symbol(&self, symbol: &GraphSymbol) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut current = symbol.parent_id.clone();
+        while let Some(id) = current {
+            let Some(parent) = self.symbols.get(&id) else {
+                break;
+            };
+            if parent.kind != SymbolKind::Module {
+                break;
+            }
+            chain.push(parent.name.clone());
+            current = parent.parent_id.clone();
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Read the raw `::`-delimited scope qualifier sitting in the
+    /// source bytes immediately before `reference`. Returns the
+    /// qualifier with trailing `::` stripped, or `None` when no scope
+    /// is present. The qualifier may contain multiple `::` segments
+    /// (e.g. `details::os` for `details::os::localtime`).
+    fn reference_source_scope_prefix(&self, reference: &ParsedReference) -> Option<String> {
+        let file = self.files.get(&reference.file_id)?;
+        let source = std::fs::read_to_string(&file.path).ok()?;
+        // First try the source bytes COVERED BY the reference span.
+        // Some parsers (e.g. tree-sitter-cpp for `scoped_identifier`)
+        // keep the full qualified path in the span while reducing
+        // `reference.text` to just the leaf identifier; the qualifier
+        // then lives inside the span, not before it.
+        if let Some(span_text) =
+            source.get(reference.span.start_byte as usize..reference.span.end_byte as usize)
+            && span_text.contains("::")
+            && let Some((qualifier, _)) = span_text.trim().rsplit_once("::")
+        {
+            let qualifier = qualifier.trim();
+            if !qualifier.is_empty() {
+                return Some(qualifier.to_string());
+            }
+        }
+        // Fallback: walk backward from the reference start byte and
+        // pick up an identifier/`::` chain immediately preceding it.
+        // Covers the `Foo.Bar` (dot-style) and Rust `crate::Bar`
+        // qualified shapes.
+        let prefix = source.get(..reference.span.start_byte as usize)?;
+        let scope = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let scope = scope.trim_end_matches("::");
+        if scope.is_empty() {
+            return None;
+        }
+        Some(scope.to_string())
+    }
+
+    /// For a bare-identifier reference whose enclosing file contains
+    /// an explicit `use <crate>::Name [as <alias>]` import that names
+    /// `symbol`, return the workspace crate's first path segment.
+    /// `None` when no such import is present.
+    fn import_root_for_workspace_reference(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> Option<String> {
+        for import in self.imports_for_file(&reference.file_id) {
+            if import.is_glob || import.alias.as_deref() == Some("__java_package__") {
+                continue;
+            }
+            // The leaf of the import path must name the symbol.
+            if last_path_segment(&import.path) != symbol.name {
+                continue;
+            }
+            // The reference text must either be the symbol name
+            // (default) or the alias.
+            let expected_name = import.alias.clone().unwrap_or_else(|| symbol.name.clone());
+            if reference.text != expected_name {
+                continue;
+            }
+            // First path segment is the workspace crate alias.
+            let mut segments = path_segments(&import.path);
+            if segments.len() < 2 {
+                continue;
+            }
+            return Some(segments.swap_remove(0));
+        }
+        None
+    }
+
+    /// Read the source-byte scope prefix that immediately precedes a
+    /// bare-identifier reference and return its first path segment.
+    /// Returns `None` when no scope prefix is present or the scope can
+    /// not be read.
+    fn reference_source_scope_prefix_first_segment(
+        &self,
+        reference: &ParsedReference,
+    ) -> Option<String> {
+        let file = self.files.get(&reference.file_id)?;
+        let source = std::fs::read_to_string(&file.path).ok()?;
+        let prefix = source.get(..reference.span.start_byte as usize)?;
+        let scope = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let scope = scope.trim_end_matches("::");
+        if scope.is_empty() {
+            return None;
+        }
+        scope.split("::").next().map(str::to_string)
     }
 
     pub(crate) fn reference_alias_matches_symbol(

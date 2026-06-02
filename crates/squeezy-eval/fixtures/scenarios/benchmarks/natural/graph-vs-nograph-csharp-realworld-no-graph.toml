@@ -1,0 +1,109 @@
+id = "graph-vs-nograph-csharp-realworld-no-graph"
+title = "Newtonsoft.Json sync Read* override strategy audit — no graph (openai mini)"
+description = """
+No-graph half of the C# real-world A/B. Same prompt as the with-graph
+variant, but the semantic-graph tool family is removed so the model
+has to fall back to grep + read_file across the repo and disambiguate
+JsonReader-side overrides from JsonWriter-side overrides by reading
+each match's containing class.
+"""
+
+[workspace.github]
+repo = "JamesNK/Newtonsoft.Json"
+sha = "4f73e74372445108d2c1bda37b36e6f5e43402e0"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+The abstract class `Newtonsoft.Json.JsonReader` (declared in
+`Src/Newtonsoft.Json/JsonReader.cs`) defines nine virtual sync
+`Read*` slots:
+
+- `public virtual bool Read()`
+- `public virtual string? ReadAsString()`
+- `public virtual byte[]? ReadAsBytes()`
+- `public virtual bool? ReadAsBoolean()`
+- `public virtual int? ReadAsInt32()`
+- `public virtual decimal? ReadAsDecimal()`
+- `public virtual double? ReadAsDouble()`
+- `public virtual DateTime? ReadAsDateTime()`
+- `public virtual DateTimeOffset? ReadAsDateTimeOffset()`
+
+For every concrete (non-abstract) subclass of `JsonReader` declared
+under `Src/Newtonsoft.Json/`, enumerate every `public override` of
+those nine sync slots and classify each override's body by its
+delegation strategy.
+
+Do NOT confuse these with `JsonWriter`-side overrides (`JsonWriter`,
+`JsonTextWriter`, `BsonWriter`, `TraceJsonWriter`, `JTokenWriter`)
+or with async `Read*Async` overrides declared in files named
+`*.Async.cs`. Only count sync `Read*` overrides whose enclosing
+class transitively derives from `JsonReader`.
+
+Exclude:
+- Anything under `Src/Newtonsoft.Json.Tests/`.
+- Files named `*.Async.cs` (async overrides are out of scope).
+- The base class `JsonReader` itself.
+
+Include both `public` and `internal` classes, and treat `partial`
+classes as a single type — search every partial file when looking
+for an override.
+
+For each override, give exactly four fields, one per line, in the
+order listed:
+- `type`: subclass name (just the type, not the full path)
+- `method`: the method name (e.g. `Read`, `ReadAsString`)
+- `file_line`: the path relative to repo root plus the 1-based line
+  number of the override's `public override` line, joined with `:`
+  (e.g. `Src/Newtonsoft.Json/JsonTextReader.cs:488`)
+- `strategy`: `delegate` if the override body invokes the same-named
+  method on a private/internal `JsonReader`-typed field of the
+  enclosing class (forms `<field>.<sameMethodName>()`, e.g.
+  `_reader.ReadAsString()` or `_innerReader.Read()`); `compute`
+  otherwise (the body parses internal state, calls a private helper
+  like `ReadStringValue` / `ReadNumberValue` / `ReadNormal`, or
+  computes the value any other way).
+
+Output as a compact plain-text list. No prose, no extra commentary.
+Group rows by `type` (all `JsonTextReader` rows, then all
+`JsonValidatingReader` rows, etc.).
+"""
+
+[expect]
+max_wall_clock_seconds = 540
+max_input_tokens = 250000
+
+[triage]
+enabled = false

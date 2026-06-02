@@ -1,0 +1,66 @@
+id = "graph-vs-nograph-refactor-rename-no-graph"
+title = "Refactor: rename run_scenario to execute_scenario — no graph (openai mini)"
+description = """
+No-graph half of the refactor-rename A/B.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+I want to rename the Rust function `run_scenario` to `execute_scenario`
+across this repository. List EVERY file:line that needs to be modified
+to complete this rename consistently — definition, re-exports (`pub
+use`), import lines (`use ... run_scenario`), and call sites.
+
+For each location give exactly three fields, one per line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number of the existing reference
+- `change`: a short word describing the kind of edit
+  (`definition`, `pub_use`, `import`, or `call`)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+Skip files under `tests/` or `*_tests.rs` unless they import or call
+`run_scenario`.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

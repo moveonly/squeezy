@@ -1,0 +1,62 @@
+id = "graph-vs-nograph-cpp-architectural-with-graph"
+title = "spdlog base_sink<Mutex> direct subclasses — with graph (openai mini)"
+description = """
+Cross-language A/B (C++). Architectural audit: list every concrete sink
+class that derives **directly** from the template
+`spdlog::sinks::base_sink<Mutex>`. Exercises template-instantiation
+references and namespace-qualified inheritance — grep hits noisy
+member-access lines (`base_sink<Mutex>::mutex_`, etc.) and `using` alias
+declarations, and one indirect descendant (`dup_filter_sink` :
+`dist_sink<Mutex>`) must be excluded.
+"""
+
+[workspace.github]
+repo = "gabime/spdlog"
+sha = "d5275e3343c4dca4feb9fa772199181509f2a657"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every concrete C++ class declared under `include/spdlog/sinks/`
+that derives **directly** from the class template
+`spdlog::sinks::base_sink<Mutex>` (declared in
+`include/spdlog/sinks/base_sink.h`).
+
+Rules:
+- Only direct subclasses. Exclude classes that inherit transitively
+  via another sink template (e.g. `dist_sink<Mutex>`, `ansicolor_sink`,
+  `wincolor_sink`, `stdout_sink_base`).
+- Exclude `using` / `typedef` aliases such as `*_mt` / `*_st`.
+- Exclude `base_sink` itself.
+- Exclude anything outside `include/spdlog/sinks/` (tests, examples,
+  bench).
+
+For each class give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the class declaration
+- `class`: the (unqualified) class name
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

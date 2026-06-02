@@ -1,0 +1,84 @@
+id = "graph-vs-nograph-csharp-deep-with-graph"
+title = "Newtonsoft.Json JsonReader.Close() override audit — with graph (openai mini)"
+description = """
+Cross-language A/B (C#), deep variant. For every concrete subclass of
+the abstract `Newtonsoft.Json.JsonReader` declared under
+`Src/Newtonsoft.Json/`, decide (a) whether it overrides the virtual
+`Close()` method and (b) if so, whether `base.Close()` is invoked
+anywhere in the override body. The question fundamentally requires
+override resolution restricted to the JsonReader hierarchy: a naive
+`grep "override.*Close()"` pulls in JsonWriter, BsonWriter,
+TraceJsonWriter, and JTokenWriter overrides too, and the model must
+filter them out by walking each containing class's base list. After
+override resolution, the body must be inspected for a `base.Close()`
+call. The graph answers step (a) via a single `hierarchy` lookup on
+`JsonReader` and step (b) via `read_slice` on each override; the
+no-graph half has to grep + read across the repo and disambiguate
+reader overrides from writer overrides by hand.
+"""
+
+[workspace.github]
+repo = "JamesNK/Newtonsoft.Json"
+sha = "4f73e74372445108d2c1bda37b36e6f5e43402e0"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+For every concrete (non-abstract) subclass of the abstract class
+`Newtonsoft.Json.JsonReader` declared under `Src/Newtonsoft.Json/`
+in this repository, report whether it overrides the virtual
+`Close()` method declared on `JsonReader` and, if so, whether the
+override's body invokes `base.Close()` anywhere.
+
+The base class is declared in
+`Src/Newtonsoft.Json/JsonReader.cs`. Its `Close()` is declared as
+`public virtual void Close()` and is the method you must reason
+about. Do NOT confuse it with `JsonWriter.Close()` (also virtual)
+or with `Close()` methods on unrelated `TextReader` / `Stream`
+fields — only count overrides whose enclosing class transitively
+derives from `JsonReader`.
+
+Exclude:
+- Anything under `Src/Newtonsoft.Json.Tests/`.
+- The base class `JsonReader` itself.
+- Indirect subclasses reached only through an intermediate base
+  class declared inside `Src/Newtonsoft.Json.Tests/`.
+
+Include both `public` and `internal` classes, and treat `partial`
+classes as a single type — search every partial file when looking
+for the override and the `base.Close()` call.
+
+For each subclass give exactly four fields, one per line:
+- `type`: the subclass's name (just the type, not the full path)
+- `file`: path relative to repo root containing the class
+  declaration line that names `JsonReader` as the base
+- `overridesClose`: `yes` if the class declares an
+  `override` of `Close()`, otherwise `no`
+- `callsBaseClose`: `yes` if the override body contains a
+  `base.Close()` invocation, `no` if it does not, or `n_a` if
+  `overridesClose` is `no`.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

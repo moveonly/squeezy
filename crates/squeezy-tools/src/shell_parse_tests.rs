@@ -4,7 +4,11 @@
 //! so downstream classifiers can stop re-splitting segment text via
 //! `split_whitespace`.
 
-use super::{CommandUnit, Redirect, extract_command_units};
+use super::{
+    CommandUnit, Redirect, analyze_shell_command, extract_command_units,
+    shell_segment_has_destructive_redirect,
+};
+use crate::PermissionCapability;
 
 #[test]
 fn extract_commands_returns_units() {
@@ -117,6 +121,26 @@ fn extract_commands_handles_compound_andand() {
     assert_eq!(units[0].args, vec!["fmt".to_string()]);
     assert_eq!(units[1].name, "cargo");
     assert_eq!(units[1].args, vec!["test".to_string()]);
+}
+
+#[test]
+fn js_arrow_inside_heredoc_body_is_not_destructive_redirect() {
+    // When tree-sitter cannot resolve the heredoc to a single command node,
+    // analysis falls back to byte-scanning the raw text. A JS arrow `=>`
+    // inside a `node - <<'NODE' ... NODE` heredoc body must NOT be
+    // classified as a `>` file-redirect. Trace evidence: 3/3 no-graph JS
+    // realworld eval runs denied this shape via the pre-classifier.
+    let cmd = "node - <<'NODE'\nconst x = arr.filter(f => f.endsWith('.js'));\nNODE";
+    assert!(
+        !shell_segment_has_destructive_redirect(cmd),
+        "arrow `=>` must not register as a file redirect",
+    );
+    let analysis = analyze_shell_command(cmd);
+    assert!(
+        !analysis.destructive,
+        "node heredoc with a JS arrow body must not be flagged destructive: {analysis:?}",
+    );
+    assert_ne!(analysis.capability, PermissionCapability::Destructive);
 }
 
 #[test]

@@ -1,0 +1,112 @@
+id = "graph-vs-nograph-swift-realworld-with-graph"
+title = "RoutesBuilder HTTP-method extension audit — with graph (openai mini)"
+description = """
+Realistic Swift A/B half. Models the user request "I'm preparing a
+Vapor migration that deprecates the synchronous,
+`ResponseEncodable`-constrained `RoutesBuilder` HTTP method
+extension functions in favor of the async,
+`AsyncResponseEncodable`-constrained versions. Before I write the
+migration I need a per-overload classification of every public
+function on `extension RoutesBuilder` declared under
+`Sources/Vapor/Routing/RoutesBuilder+Method.swift` and
+`Sources/Vapor/Concurrency/RoutesBuilder+Concurrency.swift`,
+so I know how the sync and async surfaces line up overload-for-overload."
+
+The two files together define 24 generic public functions, all on
+`extension RoutesBuilder`, all constrained by either
+`where Response: ResponseEncodable` (12 sync overloads in
+`RoutesBuilder+Method.swift`) or
+`where Response: AsyncResponseEncodable` (12 async overloads in
+`RoutesBuilder+Concurrency.swift`). For each overload the model must
+classify (1) the closure flavor (`sync` vs `async`), (2) the path arity
+(`variadic` `PathComponent...` vs `array` `[PathComponent]`), and (3)
+the constraint (`ResponseEncodable` vs `AsyncResponseEncodable`).
+
+This exercises Swift protocol conformance + extension members +
+generic where-clauses. The graph half can resolve
+`extension RoutesBuilder` members in one `hierarchy`/`decl_search`
+sweep and `read_slice` each signature; the no-graph half has to grep
+across both files and distinguish `public func` declarations from
+internal callers and from the trailing `self.on(...)` bodies. Pair
+with `graph-vs-nograph-swift-realworld-no-graph.toml` and run
+`squeezy-eval diff`.
+"""
+
+[workspace.github]
+repo = "vapor/vapor"
+sha = "712b0919a3ba772f7402ccaf07cdb6ca823dd650"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+
+[[steps]]
+kind = "prompt"
+text = """
+I'm planning a migration that deprecates the synchronous,
+`ResponseEncodable`-constrained `RoutesBuilder` HTTP method extension
+functions in favor of the async, `AsyncResponseEncodable`-constrained
+versions. Before I write the migration I need a per-overload table
+that lines up the sync and async surfaces.
+
+For every `public func` declared on `extension RoutesBuilder` in
+exactly these two files:
+
+- `Sources/Vapor/Routing/RoutesBuilder+Method.swift`
+- `Sources/Vapor/Concurrency/RoutesBuilder+Concurrency.swift`
+
+…that is generic over `<Response: VaporSendableMetatype>` AND has a
+`where Response: ResponseEncodable` or
+`where Response: AsyncResponseEncodable` constraint, report exactly
+five fields, one per line:
+
+- `file`: path relative to repo root
+- `line`: 1-based line number of the `public func` declaration (the
+  line that starts with `public func`, not the `where` clause line
+  and not an attribute line like `@discardableResult`)
+- `name`: the function name (one of `get`, `post`, `put`, `patch`,
+  `delete`, `on`)
+- `closure`: one of
+    - `sync`  — the `use closure:` parameter type is
+                `(Request) throws -> Response`
+    - `async` — the `use closure:` parameter type is
+                `(Request) async throws -> Response`
+- `path`: one of
+    - `variadic` — first path parameter is `PathComponent...`
+    - `array`    — first path parameter is `[PathComponent]`
+- `constraint`: one of
+    - `ResponseEncodable`      — exact `where Response: ResponseEncodable`
+    - `AsyncResponseEncodable` — exact
+                                  `where Response: AsyncResponseEncodable`
+
+EXCLUDE:
+- Any `public func` outside these two files.
+- Any `public func` without the `where Response: …` constraint
+  (e.g. `webSocket`, `grouped`, `group`, `responseCompression`,
+  `redirect`).
+- Internal / private helpers.
+- Doc-comment example code (`///` lines).
+
+Output as a compact plain-text list. No prose, no extra commentary.
+Separate overloads with a blank line. There should be exactly 24
+overloads — if you find fewer than 20 or more than 28, double-check
+the two files.
+"""
+
+[expect]
+max_wall_clock_seconds = 420
+max_input_tokens = 250000
+
+[triage]
+enabled = false

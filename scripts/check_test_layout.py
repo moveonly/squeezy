@@ -65,6 +65,11 @@ def find_src_roots(repo_root: Path) -> list[Path]:
         # not part of the repo's enforced layout.
         if ".claude" in cargo_toml.parts:
             continue
+        # Skip throwaway eval workspaces under `.scratch*/` — these hold
+        # third-party source cloned for benchmark scenarios and are not
+        # part of the repo's enforced layout.
+        if any(part.startswith(".scratch") for part in cargo_toml.parts):
+            continue
         src = cargo_toml.parent / "src"
         if src.is_dir():
             roots.append(src)

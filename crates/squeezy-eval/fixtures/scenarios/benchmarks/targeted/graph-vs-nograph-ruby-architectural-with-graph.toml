@@ -1,0 +1,74 @@
+id = "graph-vs-nograph-ruby-architectural-with-graph"
+title = "sidekiq/sidekiq Sidekiq::Component mixin audit — with graph (openai mini)"
+description = """
+Cross-language A/B (Ruby), architectural variant. Asks the model to
+enumerate every class under `lib/` that mixes in the
+`Sidekiq::Component` module via `include Sidekiq::Component`, and
+for each one report its fully-qualified Ruby class path plus
+whether that class is nested under an intermediate module other
+than the top-level `Sidekiq` namespace (e.g. `Sidekiq::Scheduled::Enq`,
+`Sidekiq::Metrics::ExecutionTracker`). Exercises Ruby's mixin /
+nested-module resolution, which the semantic graph answers in a
+single decl walk; the no-graph half has to grep for the include
+directive and then read each enclosing file to reconstruct the path.
+"""
+
+[workspace.github]
+repo = "sidekiq/sidekiq"
+sha = "63f24c050bed5ab4e6b4efadb9f7f4f3932d5f0f"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every Ruby class under `lib/` in this repository that mixes in
+the `Sidekiq::Component` module via an `include Sidekiq::Component`
+directive in its class body. The module itself is declared in
+`lib/sidekiq/component.rb`.
+
+Exclude:
+- Anything under `test/`, `web/`, `bin/`, `examples/`, `myapp/`,
+  `bare/`, or `docs/`.
+- The `Sidekiq::Component` module declaration itself.
+- Test fixtures or scratch classes outside `lib/`.
+
+Treat each `class Foo` ... `include Sidekiq::Component` ... `end`
+body that names the module on its own line as one entry, regardless
+of how many other modules it also includes.
+
+For each class give exactly four fields, one per line:
+- `file`: path relative to repo root containing the
+  `include Sidekiq::Component` line
+- `line`: 1-based line number of the `include Sidekiq::Component`
+  directive
+- `class`: the fully-qualified Ruby class path, including every
+  enclosing module (e.g. `Sidekiq::Scheduled::Enq`,
+  `Sidekiq::Metrics::ExecutionTracker`)
+- `nested`: `yes` if the class sits under at least one intermediate
+  module besides the top-level `Sidekiq` namespace (so
+  `Sidekiq::Foo` is `no`, `Sidekiq::Foo::Bar` is `yes`), otherwise
+  `no`.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

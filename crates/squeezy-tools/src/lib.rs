@@ -160,11 +160,15 @@ pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// Upper bound a graph tool waits for the deferred
 /// `GraphManager::open_with_store` background task to finish before it
-/// falls back to `graph_unavailable_result`. Generous enough to cover
-/// cold crawls of large repos; capped so a pathological hang (e.g.
-/// fsync stall on a misconfigured filesystem) can't strand the model
-/// indefinitely.
-pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(30);
+/// falls back to `graph_unavailable_result`. Tuned to be short enough
+/// that a slow cold-open on a large monorepo (akka/akka, ~4.7k files)
+/// doesn't strand every graph tool call behind a multi-second wait —
+/// once the bg task finishes the condvar fires and subsequent calls
+/// return instantly, so the model only pays this wait on the very first
+/// graph tool of a session. Most projects open in well under this
+/// window; slow-opening ones surface `graph_indexing` quickly and the
+/// model falls back to grep without burning a wall-time budget waiting.
+pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
 pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 50;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
@@ -710,16 +714,18 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// JSON-serialized payload sent to the LLM as the body of a
+    /// `FunctionCallOutput`. Only `status` and `content` are projected —
+    /// the call id is already carried by the wrapping `FunctionCallOutput`,
+    /// `tool_name` is already known to the model from the matching
+    /// `FunctionCall`, and `cost_hint` / `receipt` are telemetry-only.
     pub fn model_output(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
-            json!({
-                "call_id": self.call_id,
-                "tool_name": self.tool_name,
-                "status": "error",
-                "content": {"error": "tool result serialization failed"},
-            })
-            .to_string()
-        })
+        let payload = json!({
+            "status": self.status,
+            "content": self.content,
+        });
+        serde_json::to_string(&payload)
+            .unwrap_or_else(|_| json!({"error": "tool result serialization failed"}).to_string())
     }
 
     pub fn with_spill_model_output(mut self, output: String) -> Self {
@@ -847,6 +853,32 @@ pub struct ToolRegistry {
     /// the model's stated semantic neighborhood. Keyed by `plan_id`; entries
     /// expire after [`PATCH_PLAN_TTL`].
     pub(crate) patch_plans: Arc<StdMutex<HashMap<String, PatchPlan>>>,
+    /// Tool-level dedup for `read_tool_output`. Spilled bodies are
+    /// immutable for the session; a second fetch of the same
+    /// `(handle_or_path, offset, limit)` window emits a brief receipt
+    /// stub instead of re-serializing the bytes.
+    pub(crate) tool_output_replay_seen:
+        Arc<StdMutex<HashMap<ToolOutputReplayKey, ToolOutputReplayServed>>>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct ToolOutputReplayKey {
+    pub(crate) source: ToolOutputReplaySource,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) enum ToolOutputReplaySource {
+    Handle(String),
+    Path(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolOutputReplayServed {
+    pub(crate) call_id: String,
+    pub(crate) size_bytes: usize,
+    pub(crate) sha256_short: String,
 }
 
 #[derive(Debug, Default)]
@@ -1196,6 +1228,7 @@ impl ToolRegistry {
             )),
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
+            tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -1244,6 +1277,7 @@ impl ToolRegistry {
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
+            tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -2899,7 +2933,7 @@ impl ToolRegistry {
             captured_unix_millis: unix_millis(),
         };
 
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let report = {
             let mut graph = match self.graph.lock() {
                 Ok(graph) => graph,
@@ -2914,7 +2948,7 @@ impl ToolRegistry {
                 }
             };
             let Some(manager) = graph.as_mut() else {
-                return graph_unavailable_result(call);
+                return graph_unavailable_result(call, !graph_ready);
             };
             if let Err(err) = manager.refresh_before_query() {
                 return tool_error(call, err);

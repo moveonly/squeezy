@@ -17,7 +17,7 @@ use squeezy_graph::{
 use squeezy_vcs::{
     DiffFileStatus, DiffHunk, DiffMode, DiffOptions, DiffSnapshot, canonicalize_workspace_root,
 };
-use squeezy_workspace::{ExclusionReason, IndexCoverage};
+use squeezy_workspace::ExclusionReason;
 
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
@@ -150,32 +150,7 @@ enum ReadSliceSpanKind {
     Signature,
     Body,
 }
-fn coverage_json(coverage: &IndexCoverage) -> Option<Value> {
-    if coverage.skipped_files == 0 && coverage.skipped_dirs == 0 && coverage.reasons.is_empty() {
-        return None;
-    }
-    let reasons = coverage
-        .reasons
-        .iter()
-        .map(|(reason, coverage)| {
-            (
-                reason.clone(),
-                json!({
-                    "files": coverage.files,
-                    "dirs": coverage.dirs,
-                    "bytes": coverage.bytes,
-                    "samples": coverage.samples,
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    Some(json!({
-        "skipped_files": coverage.skipped_files,
-        "skipped_dirs": coverage.skipped_dirs,
-        "skipped_bytes": coverage.skipped_bytes,
-        "reasons": reasons,
-    }))
-}
+
 fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
     match baseline {
         DiffReadBaseline::Worktree => "worktree",
@@ -469,7 +444,10 @@ fn line_number_for_byte_bytes(bytes: &[u8], byte: usize) -> u32 {
 /// promote window-local line numbers to file-absolute ones in
 /// `read_slice_last_receipt_diff` without slurping the full file into memory
 /// twice. Returns the count of `\n` bytes in `[0, offset)`.
-fn window_line_offset(path: &Path, offset: usize) -> std::result::Result<u32, std::io::Error> {
+pub(crate) fn window_line_offset(
+    path: &Path,
+    offset: usize,
+) -> std::result::Result<u32, std::io::Error> {
     if offset == 0 {
         return Ok(0);
     }
@@ -495,13 +473,33 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
     let Some(filter) = filter else {
         return true;
     };
-    let path = symbol.file_id.0.as_str();
+    path_matches_filter(symbol.file_id.0.as_str(), filter)
+}
+
+/// Match `path` against a model-supplied `filter`.
+///
+/// Filters that look like a directory path (contain `/`) match by strict
+/// prefix with a directory boundary — `gson/src/main/java` matches files
+/// under that tree but not siblings like `gson/src/test/java/...`. This is
+/// what the model intuitively means when it writes a multi-segment path.
+///
+/// Single-token filters (no `/`, e.g. `squeezy_graph`) keep the loose
+/// trailing-segment + fuzzy fallback so casual "find a crate" queries
+/// still resolve. The fuzzy path was the source of cross-tree noise only
+/// when the model already wrote a real prefix; gating on `/` removes that
+/// noise without regressing the bareword UX.
+fn path_matches_filter(path: &str, filter: &str) -> bool {
+    if filter.contains('/') {
+        let filter = filter.trim_end_matches('/');
+        if filter.is_empty() {
+            return true;
+        }
+        return path == filter
+            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'));
+    }
     if path_matches_exact_or_suffix(path, filter) {
         return true;
     }
-    // Append fuzzy path matching as a fallback so casual queries like
-    // `path: "graph_mgr"` resolve to `crates/squeezy-graph/src/lib.rs`.
-    // Suffix matching above keeps precedence; fuzzy only rescues misses.
     squeezy_rank::fuzzy::fuzzy_path_score(path, filter).is_some()
 }
 
@@ -568,27 +566,37 @@ fn symbol_context_json(
         .take(max_references)
         .map(|hit| cargo_diagnostic_hit_json(&hit))
         .collect::<Vec<_>>();
-    json!({
-        "id": symbol.id.0,
-        "name": symbol.name,
-        "kind": format!("{:?}", symbol.kind),
-        "path": symbol.file_id.0,
-        "signature": symbol.signature,
-        "visibility": symbol.visibility,
-        "span": span_json(symbol.span),
-        "dirty": symbol.dirty.as_ref().map(|dirty| json!({
-            "status": dirty.status,
-            "ranges": dirty.ranges.iter().map(|range| json!({
-                "start_line": range.start_line,
-                "end_line": range.end_line,
-            })).collect::<Vec<_>>(),
-        })),
-        "references": references,
-        "callers": callers,
-        "diagnostics": diagnostics,
-        "confidence": symbol.confidence.id(),
-        "freshness": format!("{:?}", symbol.freshness),
-    })
+    // Same trim policy as `symbol_json`: drop `freshness` (always "Fresh" in
+    // steady state) and emit `visibility`/`dirty` only when set. `signature`
+    // stays because `diff_context` lists changed symbols and the model needs
+    // it to triage them without an extra `read_slice`.
+    let mut object = serde_json::Map::with_capacity(11);
+    object.insert("id".to_string(), json!(symbol.id.0));
+    object.insert("name".to_string(), json!(symbol.name));
+    object.insert("kind".to_string(), json!(format!("{:?}", symbol.kind)));
+    object.insert("path".to_string(), json!(symbol.file_id.0));
+    object.insert("signature".to_string(), json!(symbol.signature));
+    object.insert("span".to_string(), span_json(symbol.span));
+    if let Some(visibility) = symbol.visibility.as_deref() {
+        object.insert("visibility".to_string(), json!(visibility));
+    }
+    if let Some(dirty) = symbol.dirty.as_ref() {
+        object.insert(
+            "dirty".to_string(),
+            json!({
+                "status": dirty.status,
+                "ranges": dirty.ranges.iter().map(|range| json!({
+                    "start_line": range.start_line,
+                    "end_line": range.end_line,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    object.insert("references".to_string(), json!(references));
+    object.insert("callers".to_string(), json!(callers));
+    object.insert("diagnostics".to_string(), json!(diagnostics));
+    object.insert("confidence".to_string(), json!(symbol.confidence.id()));
+    Value::Object(object)
 }
 
 fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
@@ -602,21 +610,42 @@ fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
     }
 }
 
-pub(crate) fn graph_unavailable_result(call: &ToolCall) -> ToolResult {
+pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) -> ToolResult {
+    // `fallback.suggested_tools` is intentionally absent — the reason code is
+    // enough for the model to pick a non-graph retry path on its own.
+    //
+    // `still_indexing` distinguishes the transient cold-start window (the
+    // background `GraphManager::open_with_store` task is still running and
+    // the wait condvar timed out) from a workspace where the open completed
+    // with `None` (structurally unavailable). The transient case carries a
+    // `retryable: true` hint so the model knows the same call will succeed
+    // shortly — without it, a cold-open that overran the wait stranded the
+    // model on a single `graph_unavailable` reading and it fell back to
+    // grep instead of retrying.
+    let (status, reason, retryable) = if still_indexing {
+        (
+            "graph_indexing",
+            "semantic graph is still being indexed; retry this tool call",
+            true,
+        )
+    } else {
+        (
+            "graph_unavailable",
+            "semantic graph is unavailable for this workspace",
+            false,
+        )
+    };
     make_result(
         call,
         ToolStatus::Success,
         json!({
             "tool": call.name,
             "graph_available": false,
-            "reason": "semantic graph is unavailable for this workspace",
+            "reason": reason,
             "packets": [],
             "fallback": {
-                "status": "graph_unavailable",
-                "suggested_tools": [
-                    {"tool": "glob", "arguments": {"pattern": "**/*"}},
-                    {"tool": "grep", "arguments": {"pattern": "<query>", "output_mode": "files_with_matches"}}
-                ]
+                "status": status,
+                "retryable": retryable,
             }
         }),
         ToolCostHint::default(),
@@ -626,35 +655,17 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall) -> ToolResult {
 
 pub(crate) fn graph_payload(
     tool: &str,
-    manager: &GraphManager,
-    refresh: &squeezy_graph::RefreshReport,
+    _manager: &GraphManager,
+    _refresh: &squeezy_graph::RefreshReport,
 ) -> serde_json::Map<String, Value> {
+    // Trim policy: `refresh` and `coverage` are dropped from the wire payload.
+    // The model never branched on either; the byte cost ran ~150-400B per
+    // graph tool result. Both signals still flow to telemetry via the typed
+    // graph events emitted around `refresh_before_query()`.
     let mut payload = serde_json::Map::new();
     payload.insert("tool".to_string(), json!(tool));
     payload.insert("graph_available".to_string(), json!(true));
-    payload.insert("refresh".to_string(), refresh_report_json(refresh));
-    if let Some(coverage) = coverage_json(&manager.build_report().coverage) {
-        payload.insert("coverage".to_string(), coverage);
-    }
     payload
-}
-
-fn refresh_report_json(report: &squeezy_graph::RefreshReport) -> Value {
-    // Intentionally omits `duration_ms`: that field changes between otherwise
-    // identical calls and breaks the receipt-stub layer for graph tools.
-    // Telemetry still records wall-clock timing via the typed graph event.
-    json!({
-        "refreshed": report.refreshed,
-        "changed_files": report.changed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-        "removed_files": report.removed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-        "reparsed_files": report.reparsed_files,
-        "excluded_files": report.excluded_files,
-        "excluded_dirs": report.excluded_dirs,
-        "excluded_bytes": report.excluded_bytes,
-        "bytes_reparsed": report.bytes_reparsed,
-        "skipped_due_to_interval": report.skipped_due_to_interval,
-        "budget_exhausted": report.budget_exhausted,
-    })
 }
 
 fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
@@ -1093,12 +1104,14 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
 /// - `reason`: one of `supported_language_no_match`, `path_unsupported`,
 ///   `path_unknown`, `no_path_scope`
 /// - `path` / `language` (nullable)
-/// - `suggested_tools`: a regex-escaped `grep` invocation plus a
-///   `decl_search` retry shape
+///
+/// `suggested_tools` is intentionally omitted from the wire payload —
+/// recommending grep/decl_search retries was decoration the model already
+/// knows how to do unprompted; the reason code is the load-bearing signal.
 fn graph_zero_hit_fallback(
     graph: &squeezy_graph::SemanticGraph,
     path: Option<&str>,
-    query: Option<&str>,
+    _query: Option<&str>,
     packet_count: usize,
 ) -> Value {
     if packet_count > 0 {
@@ -1128,24 +1141,11 @@ fn graph_zero_hit_fallback(
         }
         None => (Value::Null, Value::Null, "no_path_scope"),
     };
-    let grep_path = match &path_value {
-        Value::String(p) => p.clone(),
-        _ => ".".to_string(),
-    };
-    let grep_pattern = match query {
-        Some(q) if !q.is_empty() => regex::escape(q),
-        _ => "<query>".to_string(),
-    };
-    let decl_query = query.unwrap_or("<query>").to_string();
     json!({
         "status": "no_graph_evidence",
         "reason": reason,
         "path": path_value,
         "language": language_value,
-        "suggested_tools": [
-            {"tool": "grep", "arguments": {"pattern": grep_pattern, "path": grep_path}},
-            {"tool": "decl_search", "arguments": {"query": decl_query, "kind": null}}
-        ]
     })
 }
 
@@ -1157,23 +1157,24 @@ fn graph_status_for_language(language: LanguageKind) -> &'static str {
     }
 }
 
+// Trim policy: graph evidence packets drop `claim`, `freshness`, `provenance`,
+// `cost_hint`, and `next_action` from the wire payload. The structured spans,
+// symbol/edge bodies, and confidence id are the load-bearing data the model
+// actually uses; the dropped fields were decorations that ate tokens without
+// changing decisions. Telemetry that needs provenance/freshness reads from
+// the typed graph events rather than the tool result JSON.
 fn evidence_packet(
-    claim: impl Into<String>,
+    _claim: impl Into<String>,
     spans: Vec<Value>,
     confidence: Confidence,
-    freshness: Freshness,
-    provenance: Vec<Provenance>,
-    cost_hint: ToolCostHint,
-    next_action: Value,
+    _freshness: Freshness,
+    _provenance: Vec<Provenance>,
+    _cost_hint: ToolCostHint,
+    _next_action: Value,
 ) -> Value {
     json!({
-        "claim": claim.into(),
         "spans": spans,
         "confidence": confidence.id(),
-        "freshness": format!("{:?}", freshness),
-        "provenance": provenance.into_iter().map(provenance_json).collect::<Vec<_>>(),
-        "cost_hint": cost_hint,
-        "next_action": next_action,
     })
 }
 
@@ -1688,27 +1689,44 @@ fn hierarchy_node_packet(
 }
 
 pub(crate) fn symbol_json(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> Value {
-    json!({
-        "id": symbol.id.0,
-        "name": symbol.name,
-        "kind": format!("{:?}", symbol.kind),
-        "path": symbol.file_id.0,
-        "language": graph.files.get(&symbol.file_id).map(|file| file.language.display_name()),
-        "signature": symbol.signature,
-        "visibility": symbol.visibility,
-        "span": span_json(symbol.span),
-        "body_span": symbol.body_span.map(span_json),
-        "attributes": symbol.attributes,
-        "dirty": symbol.dirty.as_ref().map(|dirty| json!({
-            "status": dirty.status,
-            "ranges": dirty.ranges.iter().map(|range| json!({
-                "start_line": range.start_line,
-                "end_line": range.end_line,
-            })).collect::<Vec<_>>(),
-        })),
-        "confidence": symbol.confidence.id(),
-        "freshness": format!("{:?}", symbol.freshness),
-    })
+    // Lean shape for first-emit symbol packets. Every dropped field paid for
+    // itself in measured trace bytes without changing the model's next-call
+    // routing:
+    //   * `body_span` near-duplicated `span`; the model only needs it when
+    //     it already decided to read the body, and at that point it calls
+    //     `read_slice` with `symbol_id + span_kind=body` and the graph
+    //     resolves the body span internally.
+    //   * `attributes` is a search-time filter (`decl_search` accepts
+    //     `attribute`), not a downstream decision input.
+    //   * `language` and `freshness` were decorations the agent never
+    //     branched on. Telemetry still carries both via typed graph events.
+    //   * `visibility` and `dirty` are emitted only when set so the common
+    //     case (unannotated symbols) sheds two keys per packet.
+    let _ = graph;
+    let mut object = serde_json::Map::with_capacity(8);
+    object.insert("id".to_string(), json!(symbol.id.0));
+    object.insert("name".to_string(), json!(symbol.name));
+    object.insert("kind".to_string(), json!(format!("{:?}", symbol.kind)));
+    object.insert("path".to_string(), json!(symbol.file_id.0));
+    object.insert("signature".to_string(), json!(symbol.signature));
+    object.insert("span".to_string(), span_json(symbol.span));
+    if let Some(visibility) = symbol.visibility.as_deref() {
+        object.insert("visibility".to_string(), json!(visibility));
+    }
+    if let Some(dirty) = symbol.dirty.as_ref() {
+        object.insert(
+            "dirty".to_string(),
+            json!({
+                "status": dirty.status,
+                "ranges": dirty.ranges.iter().map(|range| json!({
+                    "start_line": range.start_line,
+                    "end_line": range.end_line,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    object.insert("confidence".to_string(), json!(symbol.confidence.id()));
+    Value::Object(object)
 }
 
 pub(crate) fn symbol_summary_json(symbol: &GraphSymbol) -> Value {
@@ -1722,6 +1740,11 @@ pub(crate) fn symbol_summary_json(symbol: &GraphSymbol) -> Value {
 }
 
 fn edge_json(edge: &GraphEdge) -> Value {
+    // `freshness` and `provenance` were per-edge decorations the model never
+    // branched on: freshness is "Fresh" in steady state and provenance is
+    // the squeezy-graph stub. Telemetry still emits both via the typed
+    // graph events; dropping them from the wire payload cuts ~40-60B per
+    // edge and every call_graph/downstream_flow packet carries several.
     let mut value = json!({
         "from": edge.from.0,
         "to": edge.to.as_ref().map(|id| id.0.clone()),
@@ -1729,8 +1752,6 @@ fn edge_json(edge: &GraphEdge) -> Value {
         "kind": format!("{:?}", edge.kind),
         "span": edge.span.map(span_json),
         "confidence": edge.confidence.id(),
-        "freshness": format!("{:?}", edge.freshness),
-        "provenance": provenance_json(edge.provenance.clone()),
     });
     if !edge.candidates.is_empty()
         && let Some(object) = value.as_object_mut()
@@ -1749,13 +1770,24 @@ fn edge_json(edge: &GraphEdge) -> Value {
 }
 
 fn hierarchy_node_json(graph: &squeezy_graph::SemanticGraph, node: &HierarchyNode) -> Value {
+    // The nested `symbol` mirror (id, name, kind, path, span) duplicated every
+    // field the node itself already carried except `path`, which we now hoist
+    // directly. A real hierarchy result measured at ~24kB before this trim was
+    // carrying ~10kB in nested symbol mirrors alone, and the redundant byte
+    // coordinates inside `span_json` doubled the spend. `freshness` was a
+    // per-node decoration the model never branched on (the file-level signal
+    // still flows via the typed graph event), so dropping it shaves another
+    // ~15B per node.
+    let path = graph
+        .symbols
+        .get(&node.id)
+        .map(|symbol| symbol.file_id.0.clone());
     json!({
         "id": node.id.0,
         "name": node.name,
         "kind": format!("{:?}", node.kind),
+        "path": path,
         "span": span_json(node.span),
-        "freshness": format!("{:?}", node.freshness),
-        "symbol": graph.symbols.get(&node.id).map(symbol_summary_json),
         "children": node.children.iter().map(|child| hierarchy_node_json(graph, child)).collect::<Vec<_>>(),
     })
 }
@@ -2011,6 +2043,31 @@ fn read_slice_target(
     ))
 }
 
+/// Prefix each line of `content` with its 1-based absolute line number,
+/// followed by a tab. Earlier this used cat -n's 6-char right-aligned
+/// format (`     1\t<line>`), which lined up nicely visually but cost
+/// 7 bytes/line of overhead regardless of how many digits the line
+/// number actually had. Per-trace cost analysis on mini-ruby showed
+/// the prefix accounted for 20–25 % of read_file payload bytes; the
+/// model never branches on the padding, only the line number itself.
+/// Compact form (`1\t<line>`) gives the same parsing affordance at
+/// 2–3 bytes/line for typical files. `start_line` carries the first
+/// line's absolute number on the result envelope so the model still
+/// has the anchor without counting newlines.
+pub(crate) fn prefix_lines_with_numbers(content: &str, start_line: u32) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(content.len() + content.len() / 12);
+    let mut line_no = start_line;
+    for piece in content.split_inclusive('\n') {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{line_no}\t{piece}");
+        line_no = line_no.saturating_add(1);
+    }
+    out
+}
+
 fn read_slice_byte_window(
     path: &Path,
     total_bytes: u64,
@@ -2047,17 +2104,53 @@ fn read_slice_byte_window(
     Ok((offset, limit, None))
 }
 
+/// Targeted total span (in lines) the read_slice line-range mode auto-widens
+/// toward when the caller passes a tight window. Picked to comfortably contain
+/// a typical Rust `impl Trait for Foo { fn name() … }` block (~10 lines) plus
+/// enough surrounding context that a single fetch covers the enclosing
+/// function/impl in most languages — without forcing a second read when the
+/// model only knew the method's body span.
+const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 80;
+/// Threshold below which a caller-supplied line range is treated as "too
+/// tight" and gets auto-widened up to `READ_SLICE_AUTO_WIDEN_TARGET_LINES`.
+/// Ranges already at or above this size are left exactly as the caller asked.
+const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 60;
+
 fn line_window(
     text: &str,
     args: &ReadSliceArgs,
 ) -> std::result::Result<(usize, usize, SourceSpan), String> {
     let total_lines = text.lines().count().max(1) as u32;
     let context = args.context_lines.unwrap_or(0);
-    let start_line = args.start_line.unwrap_or(1).max(1).saturating_sub(context);
-    let start_line = start_line.max(1);
-    let end_line = args
+    let raw_start = args.start_line.unwrap_or(1).max(1);
+    let raw_end = args
         .end_line
         .unwrap_or(args.start_line.unwrap_or(total_lines))
+        .max(raw_start);
+    // Auto-widen tight caller-supplied windows so the enclosing
+    // function/impl block fits in one fetch. Honored only when `start_line`
+    // (and optionally `end_line`) drove the call — symbol_id / byte modes
+    // never reach this helper, and explicit `context_lines` still adds on top
+    // of the widened range.
+    let (auto_pad_above, auto_pad_below) = if args.start_line.is_some() {
+        let requested = raw_end.saturating_sub(raw_start).saturating_add(1);
+        if requested < READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES {
+            let extra = READ_SLICE_AUTO_WIDEN_TARGET_LINES.saturating_sub(requested);
+            let above = extra / 2;
+            let below = extra - above;
+            (above, below)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    let start_line = raw_start
+        .saturating_sub(auto_pad_above)
+        .saturating_sub(context)
+        .max(1);
+    let end_line = raw_end
+        .saturating_add(auto_pad_below)
         .saturating_add(context)
         .min(total_lines)
         .max(start_line);
@@ -2111,11 +2204,18 @@ pub(crate) fn reference_json(hit: ReferenceHit) -> Value {
 }
 
 fn span_json(span: squeezy_core::SourceSpan) -> Value {
+    // The wire payload addresses spans by 1-based line numbers only. The
+    // model routes every follow-up by line range (`read_slice` accepts
+    // `start_line`/`end_line`, and the agent compaction pipeline derives
+    // the byte window from `offset` + `content.len()` rather than reading
+    // a span's byte offsets), so the raw byte coordinates were doubling
+    // each span's footprint without changing decisions. `end.column` is
+    // dropped for the same reason — start column plus the line range pins
+    // the span. Saves ~40-60B per span across every packet, repo_map node,
+    // symbol, edge, and reference hit.
     json!({
-        "start_byte": span.start_byte,
-        "end_byte": span.end_byte,
         "start": {"line": span.start.line, "column": span.start.column},
-        "end": {"line": span.end.line, "column": span.end.column},
+        "end": {"line": span.end.line},
     })
 }
 
@@ -2144,7 +2244,7 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -2158,7 +2258,7 @@ impl ToolRegistry {
             }
         };
         let Some(manager) = graph.as_mut() else {
-            return graph_unavailable_result(call);
+            return graph_unavailable_result(call, !graph_ready);
         };
         let refresh = match manager.refresh_before_query() {
             Ok(report) => report,
@@ -2827,11 +2927,21 @@ impl ToolRegistry {
             Err(err) => return tool_error(call, err),
         };
         let end = offset.saturating_add(bytes.len());
-        let content = String::from_utf8_lossy(&bytes).to_string();
+        let raw_content = String::from_utf8_lossy(&bytes).to_string();
         let content_sha256 = match sha256_file(&path) {
             Ok(hash) => hash,
             Err(err) => return tool_error(call, err),
         };
+        let start_line_1based: u32 = if let Some(span) = resolved_span {
+            span.start.line.saturating_add(1)
+        } else if offset == 0 {
+            1
+        } else {
+            window_line_offset(&path, offset)
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        let content = prefix_lines_with_numbers(&raw_content, start_line_1based);
         let truncated = end < total_bytes as usize
             && args
                 .end_byte
@@ -2844,43 +2954,28 @@ impl ToolRegistry {
             truncated,
             ..ToolCostHint::default()
         };
-        let mut packet = evidence_packet(
-            "read_slice returned a bounded exact file slice",
-            vec![span_for_path_json(&rel_str, resolved_span)],
-            confidence,
-            Freshness::Fresh,
-            provenance,
-            cost.clone(),
-            json!({
-                "tool": "read_file",
-                "arguments": {
-                    "path": &rel_str,
-                    "offset": end,
-                    "limit": DEFAULT_READ_LIMIT
-                },
-                "reason": "continue reading after this slice if more context is needed"
-            }),
-        );
-        if let Some(object) = packet.as_object_mut() {
-            object.insert("path".to_string(), json!(&rel_str));
-            object.insert("offset".to_string(), json!(offset));
-            object.insert("bytes_returned".to_string(), json!(bytes.len()));
-        }
+        // Slice-mode wire payload now prefixes each line in `content` with
+        // its 1-based absolute line number (cat -n format) so the model can
+        // report line numbers without counting newlines. `start_line` is
+        // included explicitly so the model can build line-relative offsets
+        // without parsing the prefix. `bytes_returned` is always emitted —
+        // when content is line-numbered, `content.len()` no longer matches
+        // raw bytes read, so the compaction snapshot needs the explicit
+        // byte count to size the window correctly.
         let mut payload = serde_json::Map::new();
         payload.insert("tool".to_string(), json!("read_slice"));
-        payload.insert("graph_available".to_string(), json!(graph.is_some()));
-        payload.insert("graph_status".to_string(), json!(graph_status));
         payload.insert("path".to_string(), json!(&rel_str));
         payload.insert("offset".to_string(), json!(offset));
+        payload.insert("start_line".to_string(), json!(start_line_1based));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
-        payload.insert("total_bytes".to_string(), json!(total_bytes));
-        payload.insert("sha256".to_string(), json!(&content_sha256));
-        payload.insert("truncated".to_string(), json!(truncated));
+        if truncated {
+            payload.insert("truncated".to_string(), json!(true));
+            payload.insert("total_bytes".to_string(), json!(total_bytes));
+        }
         if let Some(reason) = ignored_reason {
             payload.insert("ignored".to_string(), json!(true));
             payload.insert("ignored_reason".to_string(), json!(reason));
         }
-        payload.insert("packets".to_string(), json!([packet]));
         payload.insert("content".to_string(), json!(content));
         make_result(
             call,
@@ -3375,13 +3470,27 @@ impl ToolRegistry {
         max_symbols_per_file: usize,
         max_references: usize,
     ) -> Value {
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),
         };
         let Some(manager) = graph.as_mut() else {
-            return json!({"available": false, "reason": "semantic graph is unavailable for this workspace"});
+            return if !graph_ready {
+                json!({
+                    "available": false,
+                    "status": "graph_indexing",
+                    "retryable": true,
+                    "reason": "semantic graph is still being indexed",
+                })
+            } else {
+                json!({
+                    "available": false,
+                    "status": "graph_unavailable",
+                    "retryable": false,
+                    "reason": "semantic graph is unavailable for this workspace",
+                })
+            };
         };
         let refresh = manager.refresh_before_query().ok();
         annotate_graph(manager, snapshot);
@@ -3410,48 +3519,172 @@ impl ToolRegistry {
                 })
             })
             .collect::<Vec<_>>();
+        // Trim policy: `refresh` and `coverage` are dropped from the wire
+        // payload for the same reason as `graph_payload` — the model never
+        // branched on either. The refresh side-effect still runs and still
+        // emits its typed graph event.
+        let _ = refresh;
         let mut payload = serde_json::Map::new();
         payload.insert("available".to_string(), json!(true));
-        if let Some(report) = refresh {
-            let mut refresh_obj = serde_json::Map::new();
-            refresh_obj.insert("refreshed".to_string(), json!(report.refreshed));
-            refresh_obj.insert(
-                "changed_files".to_string(),
-                json!(
-                    report
-                        .changed_files
-                        .iter()
-                        .map(|id| id.0.clone())
-                        .collect::<Vec<_>>()
-                ),
-            );
-            refresh_obj.insert(
-                "removed_files".to_string(),
-                json!(
-                    report
-                        .removed_files
-                        .iter()
-                        .map(|id| id.0.clone())
-                        .collect::<Vec<_>>()
-                ),
-            );
-            refresh_obj.insert("reparsed_files".to_string(), json!(report.reparsed_files));
-            refresh_obj.insert("excluded_files".to_string(), json!(report.excluded_files));
-            refresh_obj.insert("excluded_dirs".to_string(), json!(report.excluded_dirs));
-            refresh_obj.insert("excluded_bytes".to_string(), json!(report.excluded_bytes));
-            if let Some(coverage) = coverage_json(&report.coverage) {
-                refresh_obj.insert("coverage".to_string(), coverage);
-            }
-            refresh_obj.insert(
-                "budget_exhausted".to_string(),
-                json!(report.budget_exhausted),
-            );
-            payload.insert("refresh".to_string(), Value::Object(refresh_obj));
-        }
-        if let Some(coverage) = coverage_json(&manager.build_report().coverage) {
-            payload.insert("coverage".to_string(), coverage);
-        }
         payload.insert("files".to_string(), json!(files));
         Value::Object(payload)
+    }
+}
+
+#[cfg(test)]
+mod line_window_auto_widen_tests {
+    use super::{
+        READ_SLICE_AUTO_WIDEN_TARGET_LINES, READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES, ReadSliceArgs,
+        line_window,
+    };
+
+    fn args(start_line: u32, end_line: u32) -> ReadSliceArgs {
+        let raw = serde_json::json!({
+            "path": "ignored",
+            "start_line": start_line,
+            "end_line": end_line,
+        });
+        serde_json::from_value(raw).expect("ReadSliceArgs")
+    }
+
+    fn text_with(lines: u32) -> String {
+        (1..=lines)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tight_window_auto_widens_toward_target() {
+        // The realworld pattern: model picked a 21-line window (470..=490) around
+        // a 3-line method body — auto-widen pushes it toward
+        // ~READ_SLICE_AUTO_WIDEN_TARGET_LINES so the enclosing impl block fits.
+        let text = text_with(1000);
+        let (_, _, span) = line_window(&text, &args(470, 490)).expect("line_window");
+        let actual_lines = span.end.line.saturating_sub(span.start.line) + 1;
+        assert!(
+            actual_lines >= READ_SLICE_AUTO_WIDEN_TARGET_LINES - 1,
+            "expected widened to ~{}, got {actual_lines}",
+            READ_SLICE_AUTO_WIDEN_TARGET_LINES
+        );
+        assert!(
+            span.start.line < 470,
+            "expected start line padded above 470, got {}",
+            span.start.line + 1
+        );
+        assert!(
+            span.end.line > 490,
+            "expected end line padded below 490, got {}",
+            span.end.line + 1
+        );
+    }
+
+    #[test]
+    fn wide_window_is_left_alone() {
+        // Caller already asked for >= READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES,
+        // so honor the request exactly. SourcePoint::line is 0-based here.
+        let text = text_with(1000);
+        let start = 100;
+        let end = start + READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES; // 60-line span
+        let (_, _, span) = line_window(&text, &args(start, end)).expect("line_window");
+        assert_eq!(span.start.line, start - 1);
+        assert_eq!(span.end.line, end - 1);
+    }
+
+    #[test]
+    fn single_line_request_expands_to_target_window() {
+        // Common shape: model picks a single line because the packet said
+        // start.line=476 and it forgot to read body_span.end.line.
+        let text = text_with(1000);
+        let (_, _, span) = line_window(&text, &args(476, 476)).expect("line_window");
+        let actual_lines = span.end.line.saturating_sub(span.start.line) + 1;
+        assert!(
+            actual_lines >= READ_SLICE_AUTO_WIDEN_TARGET_LINES - 1,
+            "expected widened to ~{}, got {actual_lines}",
+            READ_SLICE_AUTO_WIDEN_TARGET_LINES
+        );
+    }
+
+    #[test]
+    fn auto_widen_respects_file_bounds() {
+        // Asking near the top of a small file must not panic, and must clamp
+        // start_line at 1 without overshooting end_line past file length.
+        let text = text_with(20);
+        let (_, _, span) = line_window(&text, &args(2, 5)).expect("line_window");
+        assert_eq!(span.start.line, 0, "start_line clamped to 1");
+        assert!(
+            span.end.line <= 19,
+            "end_line clamped to file length, got {}",
+            span.end.line + 1
+        );
+    }
+}
+
+#[cfg(test)]
+mod path_filter_tests {
+    use super::path_matches_filter;
+
+    #[test]
+    fn multi_segment_filter_requires_directory_boundary() {
+        // The Java realworld bug: `gson/src/main/java` was returning 27
+        // matches because suffix/fuzzy matching admitted `src/test/java`
+        // siblings. Strict prefix semantics keep only the real children.
+        assert!(path_matches_filter(
+            "gson/src/main/java/com/google/gson/TypeAdapter.java",
+            "gson/src/main/java",
+        ));
+        assert!(!path_matches_filter(
+            "gson/src/test/java/com/google/gson/TypeAdapterTest.java",
+            "gson/src/main/java",
+        ));
+    }
+
+    #[test]
+    fn multi_segment_filter_rejects_substring_neighbour() {
+        // `src/main` must not bleed into `experimental_src/main` — a
+        // substring/fuzzy match would incorrectly let it through.
+        assert!(path_matches_filter("src/main/foo.rs", "src/main"));
+        assert!(!path_matches_filter(
+            "experimental_src/main/foo.rs",
+            "src/main",
+        ));
+    }
+
+    #[test]
+    fn multi_segment_filter_allows_exact_directory_match() {
+        // `path == filter` (the directory itself) is a legitimate match
+        // when a symbol's file_id happens to equal the filter.
+        assert!(path_matches_filter(
+            "gson/src/main/java",
+            "gson/src/main/java"
+        ));
+        // Trailing slashes are tolerated; the model occasionally types them.
+        assert!(path_matches_filter(
+            "gson/src/main/java/Foo.java",
+            "gson/src/main/java/",
+        ));
+    }
+
+    #[test]
+    fn single_token_filter_retains_fuzzy_segment_match() {
+        // The casual `path: "squeezy_graph"` UX still resolves to
+        // `crates/squeezy-graph/src/lib.rs` via fuzzy/separator-insensitive
+        // matching. Strict prefix only kicks in when the filter has a `/`.
+        assert!(path_matches_filter(
+            "crates/squeezy-graph/src/lib.rs",
+            "squeezy_graph",
+        ));
+        assert!(path_matches_filter(
+            "gson/src/main/java/com/google/gson/Foo.java",
+            "Foo.java",
+        ));
+    }
+
+    #[test]
+    fn single_token_filter_still_rejects_unrelated_paths() {
+        assert!(!path_matches_filter(
+            "crates/squeezy-graph/src/lib.rs",
+            "zzzznope",
+        ));
     }
 }

@@ -246,17 +246,24 @@ compaction_max_summary_bytes = 4096
 }
 
 #[test]
-fn subagent_config_defaults_stay_within_cost_broker_ceiling() {
+fn subagent_config_defaults_match_parent_per_turn_caps() {
+    // The cost broker — not these per-call caps — is the load-bearing
+    // safeguard on runaway subagent cost. Keeping subagent defaults at
+    // parity with the parent per-turn caps avoids surprising aborts on
+    // real workloads (a general-purpose explore subagent should not get
+    // 10x/20x less headroom than the turn that spawned it).
     let defaults = SubagentConfig::default();
-    assert!(
-        defaults.max_tool_bytes_read_per_call <= 100_000_000,
-        "default max_tool_bytes_read_per_call = {} exceeds 100MB ceiling",
-        defaults.max_tool_bytes_read_per_call
+    assert_eq!(
+        defaults.max_tool_calls_per_call,
+        DEFAULT_MAX_TOOL_CALLS_PER_TURN
     );
-    assert!(
-        defaults.max_search_files_per_call <= 50_000,
-        "default max_search_files_per_call = {} exceeds 50K ceiling",
-        defaults.max_search_files_per_call
+    assert_eq!(
+        defaults.max_tool_bytes_read_per_call,
+        DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN
+    );
+    assert_eq!(
+        defaults.max_search_files_per_call,
+        DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
 }
 

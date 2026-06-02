@@ -1,0 +1,66 @@
+id = "graph-vs-nograph-impls-no-graph"
+title = "LlmProvider impls — no semantic graph tools (openai mini)"
+description = """
+No-graph half of A/B task #2. Same prompt as
+`graph-vs-nograph-impls-with-graph.toml`. Graph family is excluded and
+the planner is disabled; the model has to find the impls with grep +
+read_file.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+List every Rust type in this repo that implements the `LlmProvider`
+trait (from the `squeezy_llm` crate). Include declarations under
+`#[cfg(test)]` blocks if they exist.
+
+For each implementor give exactly two fields, one per line:
+- `file`: path relative to the repo root containing the `impl
+  LlmProvider for <Type> { ... }` block
+- `type`: the implementing type's name (just the type, not the full
+  path)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

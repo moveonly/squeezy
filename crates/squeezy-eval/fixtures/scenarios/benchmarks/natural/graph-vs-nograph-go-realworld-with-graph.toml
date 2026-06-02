@@ -1,0 +1,92 @@
+id = "graph-vs-nograph-go-realworld-with-graph"
+title = "spf13/cobra cross-package *Command method audit — with graph (openai mini)"
+description = """
+Realistic Go A/B half. Enumerates every exported method on
+`*cobra.Command` that is invoked from the cross-package `doc/`
+directory in `spf13/cobra`. For each method the model must report
+the cobra-root file + line where the method is defined plus the
+sorted set of `doc/*.go` files that call it. Ground truth is 14
+methods, all defined in `command.go`, spanning 5 caller files
+(`doc/man_docs.go`, `doc/md_docs.go`, `doc/rest_docs.go`,
+`doc/util.go`, `doc/yaml_docs.go`).
+
+The task is intentionally multi-step + cross-package:
+  1. enumerate every method call on a `*cobra.Command` receiver
+     under `doc/` — the receivers vary (`cmd`, `c`, `child`,
+     `parent`, `command`, indexed `s[i]`)
+  2. resolve each method to its definition in the cobra root
+     package (need to filter out methods that are on other
+     receiver types like `*pflag.FlagSet`)
+  3. record the per-method set of `doc/` files that call it
+Graph tooling can answer per-method via `reference_search` and
+read the definition with `decl_search`. Grep alone has to (a)
+enumerate distinct method names from `doc/` lexically, (b) decide
+which receivers are `*cobra.Command` (which is not visible from a
+single grep line), and (c) re-grep each method individually to
+collect caller files.
+"""
+
+[workspace.github]
+repo = "spf13/cobra"
+sha = "ad460ea8f249db69c943a365fb84f3a59042d54e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+
+[[steps]]
+kind = "prompt"
+text = """
+Audit every distinct exported method on the receiver type
+`*cobra.Command` that is invoked anywhere in the cross-package
+`doc/` directory of the `spf13/cobra` repo. An exported method
+starts with an uppercase letter; the method is on `*cobra.Command`
+when its receiver value is itself a `*cobra.Command` — this
+includes obvious receivers (`cmd *cobra.Command`, `command
+*cobra.Command`), traversal variables (`c` inside a `VisitParents`
+callback or `for _, c := range cmd.Commands()`), `child` from a
+range over `children := cmd.Commands()`, the result of
+`cmd.Parent()`, and the indexed `s[i]` / `s[j]` where `s` is a
+`[]*cobra.Command` slice.
+
+Exclude:
+  - Methods on any other receiver type (e.g. `*pflag.FlagSet`,
+    package-level helpers like `cobra.WriteStringAndCheck`, std-lib
+    methods like `strings.ReplaceAll`, `fmt.Fprintf`).
+  - Anything inside a file ending in `_test.go`.
+  - Doc comments and `//` lines.
+  - Package-level functions on `cobra` (only methods on the
+    `*Command` receiver count).
+
+For each method emit exactly four fields, one per line per method,
+separated by a blank line between methods:
+  - `name`: the method name (e.g. `CommandPath`)
+  - `def_file`: path relative to repo root of the file that
+    contains the `func (... *Command) <name>(...)` declaration
+  - `def_line`: 1-based line number of the `func` keyword in that
+    declaration
+  - `caller_files`: comma-separated, sorted list of `doc/` files
+    that contain at least one call to this method (e.g.
+    `doc/man_docs.go,doc/md_docs.go,doc/rest_docs.go,doc/yaml_docs.go`)
+
+Sort the method blocks alphabetically by `name`. Output as a
+compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 480
+max_input_tokens = 200000
+
+[triage]
+enabled = false

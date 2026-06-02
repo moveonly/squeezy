@@ -1,0 +1,76 @@
+id = "graph-vs-nograph-kotlin-architectural-with-graph"
+title = "detekt CliArgument sealed-interface subclass audit — with graph (openai mini)"
+description = """
+Cross-language A/B (Kotlin), architectural variant. Asks the model to
+enumerate every named subclass of the sealed interface
+`dev.detekt.gradle.invoke.CliArgument` declared in
+`detekt-gradle-plugin/src/main/kotlin/dev/detekt/gradle/invoke/CliArgument.kt`,
+and report two things per subclass: which Kotlin declaration form it
+uses (`object`, `data class`, or `sealed class`) and whether it extends
+`CliArgument` directly or only through the intermediate sealed class
+`BoolCliArgument`. Exercises sealed-hierarchy walking + declaration-kind
+predicates — the semantic graph answers this in a single `hierarchy`
++ per-decl lookup; the no-graph half has to grep `: CliArgument` plus
+`: BoolCliArgument(` and read each declaration to classify it.
+
+Pair with `graph-vs-nograph-kotlin-architectural-no-graph.toml` and
+`squeezy-eval diff` to compare cost and accuracy.
+"""
+
+[workspace.github]
+repo = "detekt/detekt"
+sha = "e9a4e755930ce3c23f59ff688b5e7679cdabf0cc"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every named subclass of the sealed interface
+`dev.detekt.gradle.invoke.CliArgument`. The base interface is declared
+in
+`detekt-gradle-plugin/src/main/kotlin/dev/detekt/gradle/invoke/CliArgument.kt`.
+Include both subclasses that name `CliArgument` directly in their
+supertype list AND subclasses that reach it through the intermediate
+sealed class `BoolCliArgument`.
+
+Exclude:
+- The sealed interface `CliArgument` itself.
+- Anything under `src/test/`.
+- Anonymous object expressions (`object : CliArgument { ... }`) — only
+  named top-level declarations count.
+
+For each subclass give exactly four fields, one per line:
+- `file`: path relative to repo root containing the declaration
+- `line`: 1-based line number where the subclass declaration starts
+  (the line that introduces the type name, even if its supertype list
+  continues on the next line)
+- `type`: the subclass's simple name (no package, no generics)
+- `kind`: one of `object`, `data class`, or `sealed class`, matching
+  the Kotlin declaration form used at the declaration site
+- `via`: `direct` if the supertype list names `CliArgument`, or
+  `BoolCliArgument` if it only reaches `CliArgument` through the
+  intermediate sealed class `BoolCliArgument`
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

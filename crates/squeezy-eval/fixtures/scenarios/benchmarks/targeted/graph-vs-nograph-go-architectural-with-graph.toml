@@ -1,0 +1,65 @@
+id = "graph-vs-nograph-go-architectural-with-graph"
+title = "spf13/cobra ValidArgsFunction field-write audit — with graph (openai mini)"
+description = """
+Architectural audit half of the Go A/B. Asks the model to enumerate every
+non-test code site that ASSIGNS a value to the `ValidArgsFunction` field
+of `*Command` in `spf13/cobra` — either via struct-literal
+(`ValidArgsFunction: <expr>`) or statement (`cmd.ValidArgsFunction =
+<expr>`). Ground truth has 6 writes spanning `command.go` and
+`completions.go`; lexical search must filter out the field declaration,
+the type-doc comments, and several read-side references that grep also
+matches. Pair with `graph-vs-nograph-go-architectural-no-graph.toml`
+and `squeezy-eval diff`.
+"""
+
+[workspace.github]
+repo = "spf13/cobra"
+sha = "ad460ea8f249db69c943a365fb84f3a59042d54e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+Audit every non-test code site in the `spf13/cobra` repo that ASSIGNS a
+value to the `ValidArgsFunction` field of `*Command`. An assignment is
+either:
+  - a struct-literal field set:   `ValidArgsFunction: <expr>`
+  - a statement assignment:       `<receiver>.ValidArgsFunction = <expr>`
+
+Exclude:
+  - The field declaration on the `Command` struct itself.
+  - Doc comments and references inside `//` lines.
+  - Read-side references (e.g. `finalCmd.ValidArgsFunction` used as an
+    rvalue, or `if cmd.ValidArgsFunction != nil`).
+  - Any file ending in `_test.go`.
+
+For each assignment site give exactly three fields, one per line:
+  - `file`: path relative to repo root
+  - `line`: 1-based line number of the assignment
+  - `value`: the symbol being assigned (e.g. `NoFileCompletions`), or
+    the literal string `inline_closure` if the right-hand side is an
+    anonymous function literal.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

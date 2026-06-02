@@ -1591,7 +1591,16 @@ fn read_snapshot_from_result(
         .and_then(Value::as_u64)
         .or_else(|| result.content.get("start_byte").and_then(Value::as_u64))
         .unwrap_or(0);
-    let bytes_returned = result.content.get("bytes_returned")?.as_u64()?;
+    // `bytes_returned` was dropped from the `read_slice` envelope to cut
+    // tokens; derive it from `content.len()` so the snapshot keying still
+    // matches the window the model saw. `read_file` and `read_tool_output`
+    // still surface `bytes_returned` explicitly, so prefer that when present
+    // (it covers the case where `content` was truncated for transport).
+    let bytes_returned = result
+        .content
+        .get("bytes_returned")
+        .and_then(Value::as_u64)
+        .unwrap_or(content.len() as u64);
     Some(StoredReadSnapshot {
         path,
         tool_name: seen.tool_name.clone(),

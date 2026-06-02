@@ -1,0 +1,76 @@
+id = "graph-vs-nograph-swift-callers-with-graph"
+title = "vapor/vapor Response convenience init callers — with graph (openai mini)"
+description = """
+Cross-language A/B (Swift). Asks the model to enumerate non-test
+call sites of the public convenience initializer
+`Response.init(status:version:headers:body:)` declared at
+`Sources/Vapor/Response/Response.swift:199`. The other public
+initializer on `Response` — `init(status:version:headersNoUpdate:body:)`
+at line 216 — must NOT be reported. Naive grep on `Response(` also
+matches documentation comments, type references in signatures, and
+calls to the second initializer; the semantic graph can resolve the
+exact init being invoked.
+"""
+
+[workspace.github]
+repo = "vapor/vapor"
+sha = "712b0919a3ba772f7402ccaf07cdb6ca823dd650"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every call site of the public convenience initializer
+`Response.init(status:version:headers:body:)` declared at
+`Sources/Vapor/Response/Response.swift:199`. Every form that
+resolves to this initializer counts — including the zero-argument
+`Response()` form (all four parameters have defaults) and partial
+forms such as `Response(status:)`, `Response(headers:body:)`, and
+`Response(status:headers:)`.
+
+Scope:
+- ONLY look at paths under `Sources/Vapor/`. Skip `Sources/Development/`,
+  `Sources/VaporTesting/`, `Sources/VaporTestUtils/`, `Sources/XCTVapor/`,
+  and the entire `Tests/` tree.
+
+Exclude:
+- The defining file itself (`Sources/Vapor/Response/Response.swift`)
+  — both the definition at line 199 and any internal use.
+- Call sites of the second initializer
+  `Response.init(status:version:headersNoUpdate:body:)` at line 216
+  (these always have an explicit `headersNoUpdate:` argument label).
+- Occurrences inside `///` doc-comments and `//` line comments.
+- Type references in function signatures, return types, and generic
+  constraints (e.g. `-> Response`, `EventLoopFuture<Response>`).
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number where `Response(` begins
+- `caller`: enclosing function or method (use `Type.method` form for
+  methods, e.g. `FileIO.streamFile` or
+  `View.encodeResponse(for:)`; use `<top-level>` for free
+  functions / closures declared at the top level of a file)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

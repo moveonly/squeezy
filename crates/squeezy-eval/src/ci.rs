@@ -7,10 +7,39 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ignore::WalkBuilder;
 use tokio::sync::Semaphore;
 
 use crate::driver::{EvalError, RunOptions, run_scenario};
 use crate::scenario;
+
+/// Recursively gather every `*.toml` scenario beneath `dir`. Used by
+/// both `squeezy-eval list` and `squeezy-eval check` so that grouping
+/// scenarios into subdirectories (e.g. `benchmarks/{natural,targeted}`)
+/// does not require touching every call site.
+pub fn collect_scenario_paths(dir: &Path) -> Result<Vec<PathBuf>, EvalError> {
+    let walker = WalkBuilder::new(dir)
+        .standard_filters(false)
+        .hidden(false)
+        .build();
+    let mut out = Vec::new();
+    for entry in walker {
+        let entry = entry.map_err(|err| EvalError::Io(format!("walk {dir:?}: {err}")))?;
+        let path = entry.path();
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let is_toml = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("toml"))
+            .unwrap_or(false);
+        if is_toml {
+            out.push(path.to_path_buf());
+        }
+    }
+    Ok(out)
+}
 
 #[derive(Debug, Clone)]
 pub struct CheckOptions {
@@ -91,17 +120,7 @@ impl CheckReport {
 }
 
 pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&opts.dir)
-        .map_err(|err| EvalError::Io(format!("read_dir {:?}: {err}", opts.dir)))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("toml"))
-                .unwrap_or(false)
-        })
-        .collect();
+    let mut entries = collect_scenario_paths(&opts.dir)?;
     entries.sort();
 
     // Phase 7: parallel runner. `parallelism = None | Some(1)` means

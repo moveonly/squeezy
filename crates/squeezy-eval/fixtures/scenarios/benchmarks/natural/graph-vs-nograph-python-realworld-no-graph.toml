@@ -1,0 +1,94 @@
+id = "graph-vs-nograph-python-realworld-no-graph"
+title = "psf/requests cross-tree subclass surface — no graph (openai mini)"
+description = """
+No-graph half of the realistic Python A/B. Same prompt and pinned SHA
+as the with-graph half; graph tools excluded and the graph-first
+exploration planner disabled. The model must enumerate every direct
+subclass of the listed hierarchy bases across `src/requests/` AND
+`tests/` and list each subclass's directly-defined non-dunder method
+surface using only `grep` / `glob` / `read_file`.
+"""
+
+[workspace.github]
+repo = "psf/requests"
+sha = "cd90742ed94d901759e26766197d0ce7c7bd9c8e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+Let B be the set of base-class names:
+
+  BaseAdapter, Session, SessionRedirectMixin, AuthBase, HTTPBasicAuth,
+  RequestEncodingMixin, RequestHooksMixin, PreparedRequest, CookieJar
+
+Scan every `*.py` file under `src/requests/` AND under `tests/` (any
+depth). For every class declaration `class C(...):` whose
+IMMEDIATE/DIRECT base list (as written at the `class` line — do NOT
+walk transitive ancestors) names at least one element of B (matched
+by the last name segment — `cookielib.CookieJar` matches `CookieJar`,
+`requests.Session` matches `Session`), emit one line:
+
+  <relative_path>::<C>: <comma-separated alphabetically-sorted
+  non-dunder method names defined directly on C, or `(none)`>
+
+Rules:
+- Use repo-relative paths (e.g. `src/requests/sessions.py`,
+  `tests/test_requests.py`). No leading `./`.
+- Non-dunder means the method name does NOT both start and end with
+  `__` (so `__init__`, `__repr__`, `__call__` are excluded;
+  `_find`, `_build_raw` are INCLUDED).
+- Only direct `def` children of the class body count. Methods nested
+  inside an `if TYPE_CHECKING:` block or inside another function do
+  NOT count.
+- Include subclasses that appear inside a function body or a
+  `TYPE_CHECKING` block IF the class line's base list matches B —
+  e.g. `src/requests/_types.py::_ValidatedRequest` (under
+  `if TYPE_CHECKING:`) extends `PreparedRequest` and must be
+  included with `(none)` since it has no `def`s.
+- If a subclass defines no qualifying methods, output `(none)`.
+- One line per (path, class) pair. Sort lines alphabetically by the
+  full `<path>::<class>` key.
+
+Output only the lines (no prose, no headers, no commentary, no code
+fences). Do not echo class declarations or method bodies — emit only
+the `<path>::<C>: <methods>` format.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

@@ -1,0 +1,88 @@
+id = "graph-vs-nograph-rust-realworld-with-graph"
+title = "LlmProvider migration audit: classify name() bodies — with graph (openai mini)"
+description = """
+Realistic A/B half. Models the user request "I want to deprecate the
+`name() -> &'static str` method on `squeezy_llm::LlmProvider` and
+replace it with an enum-returning `name_static()`. Before I write the
+migration I need to know, for every production implementor of the
+trait, whether its current `name()` body is a string literal (purely
+mechanical replacement), a `self.<field>` access (need to plumb the
+new enum value into the struct), or a more complex expression like
+`self.<field>.<method>()` (refactor is non-mechanical and needs
+review)."
+
+The trait has 16 production implementors spread across `squeezy-llm`,
+`squeezy-agent`, `squeezy-eval`, and `squeezy-harness`. Naive grep
+hits 25 `impl LlmProvider for` sites because tests and harness
+fixtures also implement the trait, and a further classification step
+is needed per-impl. The graph half can resolve the trait identifier
+to its decl in `crates/squeezy-llm/src/lib.rs`, ask `hierarchy` /
+`reference_search` for implementors, and `read_slice` each `name()`
+body. Pair with `graph-vs-nograph-rust-realworld-no-graph.toml` and
+run `squeezy-eval diff`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+I plan to deprecate the `name(&self) -> &'static str` method on the
+`squeezy_llm::LlmProvider` trait (defined in
+`crates/squeezy-llm/src/lib.rs`) and replace it with an
+enum-returning `name_static() -> ProviderName`. Before I write the
+migration I need a per-implementor classification of the current
+`name()` body so I know which sites are mechanical and which need
+review.
+
+For every PRODUCTION `impl LlmProvider for X { ... }` block in the
+workspace, report exactly four fields, one per line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number of the `impl LlmProvider for X` line
+- `type`: the implementing type (e.g. `AnthropicProvider`)
+- `kind`: one of
+    - `literal`     — the `name()` body returns a string literal
+                      (e.g. `"anthropic"`)
+    - `self_field`  — the body returns a bare `self.<field>` access
+                      with no further method call
+                      (e.g. `self.name`)
+    - `self_method` — the body returns an expression that calls a
+                      method on a `self.<field>` (or otherwise
+                      involves a method/function call)
+                      (e.g. `self.preset.as_str()`)
+
+EXCLUDE all of the following:
+- The trait declaration itself (`pub trait LlmProvider` in
+  `crates/squeezy-llm/src/lib.rs`).
+- Files under `tests/` or named `*_tests.rs` (test fixtures).
+- Blanket / generic impls (none exist today, but skip them if you
+  find any).
+- Macro-generated impls that are not visible as source.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+Separate impls with a blank line. If you find fewer than 5 impls,
+double-check — there are more than that in this repo.
+"""
+
+[expect]
+max_wall_clock_seconds = 300
+max_input_tokens = 250000
+
+[triage]
+enabled = false

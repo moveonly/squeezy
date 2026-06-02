@@ -1,0 +1,72 @@
+id = "graph-vs-nograph-no-graph"
+title = "run_scenario references — no semantic graph tools (openai mini)"
+description = """
+A/B half #2 of the graph-vs-no-graph comparison. Same prompt and model
+as `graph-vs-nograph-with-graph.toml` but with the entire semantic
+graph tool family (`repo_map`, `decl_search`, `definition_search`,
+`reference_search`, `symbol_context`, `hierarchy`, `read_slice`,
+`upstream_flow`, `downstream_flow`, `diff_context`, `plan_patch`,
+`refresh_compiler_facts`) excluded from the advertised tool list.
+The model has to fall back to `grep` / `glob` / `read_file`.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+# Disable the graph-first planner so the no-graph half is genuinely
+# graph-free. Without this, the planner pre-fires `definition_search`
+# before the model takes its first turn, polluting the comparison.
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+List every call site of the Rust function `run_scenario` in this repo
+(the `squeezy_eval::run_scenario` defined in `crates/squeezy-eval/`).
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number of the call
+- `caller`: name of the enclosing function
+
+Also report the definition's file and line. Output as a compact
+plain-text list. No prose, no extra commentary. If you find zero call
+sites outside the definition file, say so explicitly.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

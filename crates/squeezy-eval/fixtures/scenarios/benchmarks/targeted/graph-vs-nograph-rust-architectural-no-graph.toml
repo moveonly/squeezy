@@ -1,0 +1,93 @@
+id = "graph-vs-nograph-rust-architectural-no-graph"
+title = "Architectural audit: direct ToolResult struct literals — no graph (openai mini)"
+description = """
+No-graph half of the architectural-audit A/B. Same prompt as
+`graph-vs-nograph-rust-architectural-with-graph.toml`. Graph family is
+excluded and the exploration planner is disabled; the model has to
+disambiguate `ToolResult` struct-literal sites from `-> ToolResult {
+... }` return-type sigs and `Enum::ToolResult { ... }` variant
+patterns using grep + read_file alone.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+I want to centralise all construction of the
+`squeezy_tools::ToolResult` struct through the canonical helper
+`make_result(...)` defined in `crates/squeezy-tools/src/lib.rs`. To
+plan the refactor I need to know every NON-TEST site in this repo
+that still constructs a `ToolResult` directly via struct literal
+syntax — i.e. an expression of the form:
+
+  ToolResult {
+      call_id: ...,
+      tool_name: ...,
+      status: ...,
+      content: ...,
+      cost_hint: ...,
+      receipt: ...,
+      spill_model_output: ...,
+  }
+
+EXCLUDE all of the following:
+- The `make_result` helper itself (it is the canonical builder; do
+  not list its own body).
+- Function return-type annotations such as `-> ToolResult { ... }` and
+  closure / async-block return-type sigs that just *mention* the type.
+- Enum-variant struct patterns like `TranscriptEvent::ToolResult {
+  ... }` and `HydratedTranscriptItem::ToolResult { ... }` from
+  `squeezy-store` — those are unrelated enum variants that happen to
+  share the name.
+- Files under `tests/` or named `*_tests.rs` (test fixtures).
+
+For each remaining call site give exactly three fields, one per
+line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number where `ToolResult {` begins
+- `fn`: name of the enclosing function
+
+Output as a compact plain-text list. No prose, no extra commentary.
+If you find zero non-test struct-literal sites, say so explicitly.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

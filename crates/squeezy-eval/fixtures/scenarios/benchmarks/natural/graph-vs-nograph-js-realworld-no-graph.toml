@@ -1,0 +1,109 @@
+id = "graph-vs-nograph-js-realworld-no-graph"
+title = "lodash fp wrapper resolution — no graph (openai mini)"
+description = """
+No-graph half of the realistic JS A/B. Same prompt and pinned SHA as
+`graph-vs-nograph-js-realworld-with-graph.toml`; graph tools excluded
+and the graph-first exploration planner disabled. The model must
+classify each `fp/*.js` by its top-level form, chase the alias chain
+across `fp/*` files, and pin every wrapper to its terminal root
+module using only `grep` / `glob` / `read_file`.
+"""
+
+[workspace.github]
+repo = "lodash/lodash"
+sha = "4f0b76e2eca13de1c1fe8b4305abc1f7d63f4b86"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+In the lodash repository (the CommonJS `npm` build at the root), the
+`fp/` directory contains wrapper modules around root modules. Each
+`fp/<name>.js` module is one of two forms:
+
+- pure-alias: a single top-level statement
+    `module.exports = require('./<target>');`
+  where `<target>` resolves to another `fp/<target>.js`. The alias
+  chain may be more than one hop — chase it through `fp/` until you
+  land on a non-alias module.
+- convert: a `convert(...)` curry wrapper that imports its source via
+  a dynamic `require('../<root>')` — for example
+    `var convert = require('./convert'),
+         func = convert('<name>', require('../<root>'));`
+  Here `<root>` is the terminal root module at the repository root
+  (a sibling of `fp/`, not inside `fp/`).
+
+For EACH `fp/<name>.js` module whose terminal root resolution is one
+of these five root modules:
+
+- `./get.js`
+- `./set.js`
+- `./spread.js`
+- `./assignIn.js`
+- `./assignInWith.js`
+
+output exactly one line, three space-separated fields in this order:
+
+  <fp-name> <kind> <root-target>.js
+
+where:
+- `<fp-name>` is the `fp/<name>.js` file's base name without the
+  `.js` extension (e.g. `path` for `fp/path.js`).
+- `<kind>` is the literal string `pure-alias` if `fp/<fp-name>.js`'s
+  top-level form is `module.exports = require('./X');`, or `convert`
+  if it is a `convert(...)` wrapper. The classification reflects
+  THIS module's own form — NOT any module it chains through.
+- `<root-target>.js` is the terminal root module name (one of the
+  five listed above).
+
+Exclude:
+- Files inside `fp/_*.js` (helpers starting with `_`).
+- Any `fp/*.js` whose terminal root resolution is NOT one of the
+  five listed root modules.
+- Anything under `.git/`.
+
+Example output line:
+
+  path pure-alias get.js
+
+Sort the lines lexicographically by `<fp-name>`. Output a compact
+plain-text list. No prose, no extra commentary, no headers.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

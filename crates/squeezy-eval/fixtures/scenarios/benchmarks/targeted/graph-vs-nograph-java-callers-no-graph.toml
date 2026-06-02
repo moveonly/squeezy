@@ -1,0 +1,69 @@
+id = "graph-vs-nograph-java-callers-no-graph"
+title = "google/gson Gson.newJsonWriter callers — no graph (openai mini)"
+description = """
+No-graph half of the Java cross-language A/B.
+"""
+
+[workspace.github]
+repo = "google/gson"
+sha = "df53d2f1f50b1c3abb2937e7675867e3f284eb1a"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+List every call site of `com.google.gson.Gson.newJsonWriter` in this
+repository. The method is defined in
+`gson/src/main/java/com/google/gson/Gson.java`.
+
+Include callers in `gson/src/test/java/`.
+
+Exclude:
+- Javadoc `{@link ...}` references (these are not call sites).
+- The definition site itself.
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing method name
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

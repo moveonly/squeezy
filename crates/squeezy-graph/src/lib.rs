@@ -3433,6 +3433,21 @@ fn package_key(path: &str) -> String {
     }
 }
 
+/// For a workspace-relative Rust source path, return the crate
+/// identifier that appears in code (kebab-case crate name turned into
+/// underscores). Returns `None` for paths outside `crates/<name>/`.
+pub(crate) fn crate_underscore_alias_for_relative_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    if parts.next() != Some("crates") {
+        return None;
+    }
+    let crate_dir = parts.next()?;
+    if crate_dir.is_empty() {
+        return None;
+    }
+    Some(crate_dir.replace('-', "_"))
+}
+
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;

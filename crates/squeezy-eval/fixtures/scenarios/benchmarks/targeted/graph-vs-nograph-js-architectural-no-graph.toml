@@ -1,0 +1,95 @@
+id = "graph-vs-nograph-js-architectural-no-graph"
+title = "lodash base-helper public-API audit — no graph (openai mini)"
+description = """
+No-graph half of the JS architectural A/B. Same prompt and model as
+`graph-vs-nograph-js-architectural-with-graph.toml` but with the
+semantic-graph tool family removed so the model must rely on `grep` /
+`glob` / `read_file`.
+"""
+
+[workspace.github]
+repo = "lodash/lodash"
+sha = "d85490ebfb8f49ddc1eab84892aa33a3ef547894"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+In the lodash repository (the `es` modular build at the root), four
+internal helpers are widely used across the public API:
+
+- `_baseClone.js`
+- `_baseGet.js`
+- `_baseIsEqual.js`
+- `_baseSet.js`
+
+For each of those four helpers, identify every public-API source
+module — a `*.js` file in the repository root whose name does NOT
+start with an underscore — that DIRECTLY imports the default export
+of that helper (i.e., has a top-level `import <name> from
+'./_baseX.js';` statement).
+
+For every such public module, also recover the name of the function it
+default-exports (the identifier in its `export default <name>;` line,
+or the function name in `export default function <name>(...) { ... }`
+if the file uses that form).
+
+Exclude:
+- The helper files themselves (`_*.js`).
+- Categorical aggregator files that only re-export (e.g., `array.js`,
+  `collection.js`, `date.js`, `function.js`, `lang.js`, `math.js`,
+  `number.js`, `object.js`, `seq.js`, `string.js`, `util.js`). These
+  use `export { default as ... } from './X.js'`; they do not directly
+  import any base helper.
+- Anything under `.git/` or `test/`.
+
+For each match output exactly one line, three space-separated fields
+in this order:
+
+  <public-file>.js <function-name> <helper-file>.js
+
+Example:
+
+  clone.js clone _baseClone.js
+
+Sort the lines lexicographically by `<public-file>`. Output a compact
+plain-text list. No prose, no extra commentary, no headers.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

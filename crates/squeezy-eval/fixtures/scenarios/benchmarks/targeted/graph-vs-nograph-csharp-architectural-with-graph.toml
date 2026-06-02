@@ -1,0 +1,71 @@
+id = "graph-vs-nograph-csharp-architectural-with-graph"
+title = "Newtonsoft.Json JsonReader hierarchy audit — with graph (openai mini)"
+description = """
+Cross-language A/B (C#), architectural variant. Asks the model to
+enumerate every concrete subclass of the abstract `JsonReader` base
+class — across the `Newtonsoft.Json`, `Newtonsoft.Json.Bson`,
+`Newtonsoft.Json.Linq`, and `Newtonsoft.Json.Serialization`
+namespaces — and report, for each subclass, whether its class
+declaration directly lists `IJsonLineInfo` as an implemented
+interface. Exercises hierarchy walking + interface-implementation
+predicates across four namespaces, which the semantic graph answers
+in a single `hierarchy` + per-decl lookup; the no-graph half has to
+grep + read across the repo.
+"""
+
+[workspace.github]
+repo = "JamesNK/Newtonsoft.Json"
+sha = "4f73e74372445108d2c1bda37b36e6f5e43402e0"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every concrete (non-abstract) subclass of the abstract class
+`Newtonsoft.Json.JsonReader` defined under `Src/Newtonsoft.Json/`
+in this repository. The base class is declared in
+`Src/Newtonsoft.Json/JsonReader.cs`.
+
+Exclude:
+- Anything under `Src/Newtonsoft.Json.Tests/`.
+- The base class itself.
+- Indirect subclasses reached only through an intermediate base
+  class declared inside `Src/Newtonsoft.Json.Tests/`.
+
+Include both `public` and `internal` classes, and treat `partial`
+classes as a single type (report the file containing the class
+declaration that names the base list `: JsonReader`).
+
+For each subclass give exactly four fields, one per line:
+- `file`: path relative to repo root containing the class
+  declaration line that names `JsonReader` as the base
+- `line`: 1-based line number of the class declaration
+- `type`: the subclass's name (just the type, not the full path)
+- `iJsonLineInfo`: `yes` if that class declaration's base list
+  directly lists the `IJsonLineInfo` interface, otherwise `no`.
+  Inheritance of the interface through an intermediate base does
+  not count.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

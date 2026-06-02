@@ -1,0 +1,53 @@
+id = "graph-vs-nograph-with-graph"
+title = "run_scenario references — with semantic graph tools (openai mini)"
+description = """
+A/B half #1 of the graph-vs-no-graph comparison. Asks the model to list
+every call site of `run_scenario` in the squeezy repo. The graph tools
+(`decl_search`, `reference_search`, `symbol_context`, `read_slice`, …)
+are available; pair the run with `graph-vs-nograph-no-graph.toml` and
+`squeezy-eval diff` to compare cost and accuracy.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+# Neutral instructions so both halves of the A/B see the same system
+# prompt. The graph-leaning preamble in DEFAULT_INSTRUCTIONS would bias
+# the no-graph half toward tools it cannot call.
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every call site of the Rust function `run_scenario` in this repo
+(the `squeezy_eval::run_scenario` defined in `crates/squeezy-eval/`).
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number of the call
+- `caller`: name of the enclosing function
+
+Also report the definition's file and line. Output as a compact
+plain-text list. No prose, no extra commentary. If you find zero call
+sites outside the definition file, say so explicitly.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

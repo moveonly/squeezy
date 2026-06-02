@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
@@ -94,20 +95,24 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Run {
-            scenario,
-            workspace_override,
-            no_triage,
-            emit,
-            gh_repo,
-            out,
-            quiet,
-        } => {
-            run_cmd(
+    // Build the runtime explicitly so we can bound shutdown with
+    // `shutdown_timeout`. The default `#[tokio::main]` drops the
+    // runtime, which blocks until every spawned task completes —
+    // including the telemetry crate's 5-second
+    // `tokio::spawn(time::sleep(FLUSH_INTERVAL))` and any
+    // fire-and-forget MCP/refresh task that outlived its parent.
+    // Parallel `check` workers were stalling for ~5 minutes after
+    // `run.json` was already on disk because of this, prompting the
+    // sweep watchdog to SIGKILL them mid-flush.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let result = runtime.block_on(async {
+        match cli.command {
+            Command::Run {
                 scenario,
                 workspace_override,
                 no_triage,
@@ -115,26 +120,41 @@ async fn main() -> ExitCode {
                 gh_repo,
                 out,
                 quiet,
-            )
-            .await
+            } => {
+                run_cmd(
+                    scenario,
+                    workspace_override,
+                    no_triage,
+                    emit,
+                    gh_repo,
+                    out,
+                    quiet,
+                )
+                .await
+            }
+            Command::List { dir } => list_cmd(dir),
+            Command::Replay { trace } => replay_cmd(trace),
+            Command::View { run } => view_cmd(run),
+            Command::Diff {
+                a,
+                b,
+                format,
+                schema_check,
+            } => diff_cmd(a, b, format, schema_check),
+            Command::Check {
+                dir,
+                junit,
+                fail_on,
+                out,
+                parallelism,
+            } => check_cmd(dir, junit, fail_on, out, parallelism).await,
         }
-        Command::List { dir } => list_cmd(dir),
-        Command::Replay { trace } => replay_cmd(trace),
-        Command::View { run } => view_cmd(run),
-        Command::Diff {
-            a,
-            b,
-            format,
-            schema_check,
-        } => diff_cmd(a, b, format, schema_check),
-        Command::Check {
-            dir,
-            junit,
-            fail_on,
-            out,
-            parallelism,
-        } => check_cmd(dir, junit, fail_on, out, parallelism).await,
-    };
+    });
+    // 2 s is well beyond the wall-clock of any tracked task the
+    // post-run drain leaves behind (telemetry's `FLUSH_INTERVAL` is
+    // 5 s but its `send_batch` is bounded by `REQUEST_TIMEOUT = 2 s`)
+    // and well short of the 5-minute sweep watchdog window.
+    runtime.shutdown_timeout(Duration::from_secs(2));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -183,21 +203,9 @@ async fn run_cmd(
 
 fn list_cmd(dir: Option<PathBuf>) -> Result<(), squeezy_eval::driver::EvalError> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("crates/squeezy-eval/fixtures/scenarios"));
-    let mut entries = std::fs::read_dir(&dir)
-        .map_err(|err| squeezy_eval::driver::EvalError::Io(format!("read_dir {dir:?}: {err}")))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("toml"))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
+    let mut paths = squeezy_eval::ci::collect_scenario_paths(&dir)?;
+    paths.sort();
+    for path in paths {
         match squeezy_eval::scenario::load(&path) {
             Ok(scenario) => {
                 println!("{:<40} {}", scenario.id, scenario.title);

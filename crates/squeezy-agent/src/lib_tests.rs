@@ -2422,8 +2422,6 @@ async fn bang_command_completes_locally_without_provider_request() {
     let tool_result = tool_result.expect("ls should run through the shell tool");
     assert_eq!(tool_result.tool_name, "shell");
     assert_eq!(tool_result.status, ToolStatus::Success);
-    assert_eq!(tool_result.content["policy"]["direct_user_shell"], true);
-    assert_eq!(tool_result.content["sandbox"]["backend"], "none");
     let completed = completed.expect("ls turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
     assert!(completed.contains("src"), "{completed}");
@@ -2506,10 +2504,6 @@ async fn double_bang_command_runs_locally_and_skips_llm_context() {
     let quiet_tool_result =
         quiet_tool_result.expect("!!ls should still execute the shell tool locally");
     assert_eq!(quiet_tool_result.status, ToolStatus::Success);
-    assert_eq!(
-        quiet_tool_result.content["policy"]["direct_user_shell"], true,
-        "double-bang must keep the direct-user-shell sandbox bypass",
-    );
     assert!(
         quiet_completed
             .as_deref()
@@ -3428,6 +3422,7 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
             "explore".to_string(),
         ],
         discoverable: vec!["totally_made_up".to_string()],
+        excluded: Vec::new(),
     };
 
     tracing::subscriber::with_default(subscriber, || {
@@ -8588,6 +8583,193 @@ async fn switch_session_allow_hook_proceeds_to_resume_current() {
     );
 }
 
+// Verifies that a long-running subagent body emits `AgentEvent::ToolProgress`
+// heartbeats on the parent's event channel even before the subagent fires
+// its first inner tool call.
+//
+// Regression for the no-graph `explore` deadlock: when `excluded_tools`
+// strips the subagent's graph-tool whitelist down to glob/grep/read_file,
+// the subagent's first model round can spend tens of seconds reasoning
+// about how to substitute for the missing tools. The drain task in
+// `run_subagent` only forwards `ToolProgress` events from inside the
+// subagent (and those only fire while an inner tool is running), so the
+// parent's per-event timeout (60s in the eval driver) would expire with
+// nothing but a `SubagentStarted` line in the trace, abandoning the turn
+// with $0 cost. The fix wraps the `run_subagent` await in a per-tick
+// progress emitter on the parent's `tx`, mirroring the per-tool ticker
+// used elsewhere, so the explore call looks like any other long-running
+// tool from the parent's perspective.
+#[tokio::test]
+async fn explore_subagent_emits_tool_progress_heartbeats_during_slow_first_round() {
+    use std::task::{Context as TaskContext, Poll};
+
+    // Custom stream that returns `Pending` until the configured delay
+    // elapses, then yields its queued events one by one.
+    struct DelayedStream {
+        delay: Option<Pin<Box<tokio::time::Sleep>>>,
+        events: VecDeque<Result<LlmEvent>>,
+    }
+
+    impl Stream for DelayedStream {
+        type Item = Result<LlmEvent>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(sleep) = self.delay.as_mut() {
+                match sleep.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(()) => {
+                        self.delay = None;
+                    }
+                }
+            }
+            match self.events.pop_front() {
+                Some(event) => Poll::Ready(Some(event)),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    struct DelayedSubagentProvider {
+        responses: Mutex<VecDeque<(Duration, Vec<Result<LlmEvent>>)>>,
+    }
+
+    impl LlmProvider for DelayedSubagentProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+            let (delay, events) = self
+                .responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .unwrap_or((Duration::from_millis(0), Vec::new()));
+            let sleep = if delay.is_zero() {
+                None
+            } else {
+                Some(Box::pin(tokio::time::sleep(delay)))
+            };
+            Box::pin(DelayedStream {
+                delay: sleep,
+                events: events.into(),
+            })
+        }
+    }
+
+    // Parent round 1: model immediately calls `explore`.
+    // Subagent round 1: sleeps ~1.6s before yielding any event, then
+    // returns a one-line text answer. The sleep is long enough to cross
+    // the 1s `TOOL_PROGRESS_INTERVAL` so we observe at least one
+    // heartbeat tick from the parent-side progress emitter.
+    // Parent round 2: closes the turn.
+    let responses = VecDeque::from(vec![
+        (
+            Duration::from_millis(0),
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_explore_heartbeat".to_string(),
+                    name: "explore".to_string(),
+                    arguments: json!({"prompt": "investigate slow subagent heartbeat path"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_heartbeat_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ),
+        (
+            Duration::from_millis(1600),
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ok".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_sub_heartbeat_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ),
+        (
+            Duration::from_millis(0),
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_heartbeat_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ),
+    ]);
+    let provider = Arc::new(DelayedSubagentProvider {
+        responses: Mutex::new(responses),
+    });
+
+    let root = temp_workspace("explore_subagent_heartbeat");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn(
+        "trigger an explore subagent".to_string(),
+        CancellationToken::new(),
+    );
+    let mut subagent_started = false;
+    let mut subagent_completed = false;
+    let mut explore_progress_count: u32 = 0;
+    while let Some(event) = rx.recv().await {
+        match &event {
+            AgentEvent::SubagentStarted { agent, .. } if agent == "explore" => {
+                subagent_started = true;
+            }
+            AgentEvent::ToolProgress {
+                tool_name, call_id, ..
+            } if tool_name == "explore"
+                && call_id == "call_explore_heartbeat"
+                && subagent_started =>
+            {
+                explore_progress_count += 1;
+            }
+            AgentEvent::SubagentCompleted { agent, .. } if agent == "explore" => {
+                subagent_completed = true;
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        subagent_started,
+        "explore subagent must have emitted SubagentStarted"
+    );
+    assert!(
+        subagent_completed,
+        "explore subagent must have emitted SubagentCompleted"
+    );
+    assert!(
+        explore_progress_count >= 1,
+        "parent must receive at least one ToolProgress heartbeat \
+         tagged with tool_name=explore between SubagentStarted and \
+         SubagentCompleted so the eval driver's 60s event_timeout \
+         does not abandon a subagent whose first model round is \
+         silent; got {explore_progress_count}",
+    );
+}
+
 #[tokio::test]
 async fn switch_session_deny_hook_aborts_before_resume_current() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
@@ -8616,6 +8798,183 @@ async fn switch_session_deny_hook_aborts_before_resume_current() {
         initial_session_id,
         "deny must leave the in-process session id untouched",
     );
+}
+
+fn graph_indexing_fallback_result(tool_name: &str) -> squeezy_tools::ToolResult {
+    // Mirrors the wire shape produced by
+    // `squeezy_tools::graph_tools::graph_unavailable_result(call, true)`
+    // (the `still_indexing = true` branch added in `fddd56e7`). Kept in
+    // sync there is a build-time guarantee — the agent only retries when
+    // *this* shape is observed, so divergence would cause the retry to
+    // silently stop firing.
+    squeezy_tools::ToolResult {
+        call_id: "call-graph-indexing".to_string(),
+        tool_name: tool_name.to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "tool": tool_name,
+            "graph_available": false,
+            "reason": "semantic graph is still being indexed; retry this tool call",
+            "packets": [],
+            "fallback": {
+                "status": "graph_indexing",
+                "retryable": true,
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+fn graph_success_result(tool_name: &str) -> squeezy_tools::ToolResult {
+    squeezy_tools::ToolResult {
+        call_id: "call-graph-success".to_string(),
+        tool_name: tool_name.to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "tool": tool_name,
+            "graph_available": true,
+            "packets": [{"id": "pkt-1"}],
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "1".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+#[test]
+fn graph_indexing_detector_matches_post_fddd56e7_fallback() {
+    let result = graph_indexing_fallback_result("definition_search");
+    assert!(super::is_graph_indexing_retryable_fallback(&result));
+}
+
+#[test]
+fn graph_indexing_detector_rejects_non_graph_tool() {
+    // The detector is gated on the tool family. A grep result that
+    // happens to carry an identical-looking `fallback` blob must not be
+    // retried — the registry only emits this shape for graph tools.
+    let mut result = graph_indexing_fallback_result("definition_search");
+    result.tool_name = "grep".to_string();
+    assert!(!super::is_graph_indexing_retryable_fallback(&result));
+}
+
+#[test]
+fn graph_indexing_detector_rejects_structurally_unavailable_result() {
+    // `still_indexing = false` means the workspace has no graph at all;
+    // retrying would just burn the budget. The detector must distinguish
+    // it from the transient cold-start signal.
+    let mut result = graph_indexing_fallback_result("definition_search");
+    result.content = json!({
+        "tool": "definition_search",
+        "graph_available": false,
+        "reason": "semantic graph is unavailable for this workspace",
+        "packets": [],
+        "fallback": {
+            "status": "graph_unavailable",
+            "retryable": false,
+        }
+    });
+    assert!(!super::is_graph_indexing_retryable_fallback(&result));
+}
+
+#[test]
+fn graph_indexing_detector_rejects_missing_fallback() {
+    let mut result = graph_indexing_fallback_result("definition_search");
+    result.content = json!({
+        "tool": "definition_search",
+        "graph_available": true,
+        "packets": [],
+    });
+    assert!(!super::is_graph_indexing_retryable_fallback(&result));
+}
+
+#[tokio::test]
+async fn maybe_retry_graph_indexing_invokes_executor_exactly_once_on_indexing() {
+    // Regression for the cold-open Scala/Ruby trace: the first graph
+    // call returns `graph_indexing`, the second succeeds, and the
+    // executor closure must be reached exactly once so the model only
+    // ever sees the successful packet — never the stub.
+    let initial = graph_indexing_fallback_result("definition_search");
+    let success = graph_success_result("definition_search");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let executor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor_calls_handle = Arc::clone(&executor_calls);
+    let success_for_executor = success.clone();
+    let observed =
+        super::maybe_retry_graph_indexing(initial, &cancel, Duration::from_millis(0), move || {
+            executor_calls_handle.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let success = success_for_executor.clone();
+            async move { success }
+        })
+        .await;
+    assert_eq!(
+        executor_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "executor must be invoked exactly once when initial is graph_indexing",
+    );
+    assert_eq!(
+        observed.content, success.content,
+        "the retry's success payload must surface to the model, not the stub",
+    );
+    assert_eq!(observed.tool_name, success.tool_name);
+}
+
+#[tokio::test]
+async fn maybe_retry_graph_indexing_passes_through_when_initial_already_succeeded() {
+    // No retry, no sleep — the success result returns unchanged. This
+    // is the dominant case (warm graph, or first turn of a previously
+    // opened workspace).
+    let success = graph_success_result("definition_search");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let executor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor_calls_handle = Arc::clone(&executor_calls);
+    let observed = super::maybe_retry_graph_indexing(
+        success.clone(),
+        &cancel,
+        Duration::from_millis(0),
+        move || {
+            executor_calls_handle.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { panic!("executor must not be reached on a healthy initial result") }
+        },
+    )
+    .await;
+    assert_eq!(
+        executor_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no retry executor call when the initial result is already healthy",
+    );
+    assert_eq!(observed.content, success.content);
+}
+
+#[tokio::test]
+async fn maybe_retry_graph_indexing_skips_when_cancelled_before_sleep() {
+    // A cancelled turn must short-circuit before sleeping so the agent
+    // tears down promptly. The model still sees the indexing fallback;
+    // the agent has already given up.
+    let initial = graph_indexing_fallback_result("definition_search");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let executor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor_calls_handle = Arc::clone(&executor_calls);
+    let observed = super::maybe_retry_graph_indexing(
+        initial.clone(),
+        &cancel,
+        Duration::from_millis(0),
+        move || {
+            executor_calls_handle.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { panic!("cancelled turn must not invoke the executor") }
+        },
+    )
+    .await;
+    assert_eq!(executor_calls.load(std::sync::atomic::Ordering::SeqCst), 0,);
+    assert_eq!(observed.content, initial.content);
 }
 
 #[test]

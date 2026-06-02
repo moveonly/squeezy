@@ -1,0 +1,113 @@
+id = "graph-vs-nograph-dart-realworld-no-graph"
+title = "flutter WidgetsBindingObserver mixin lifecycle audit — no graph (openai mini)"
+description = """
+No-graph half of the realistic Dart audit A/B at scale. Same prompt as
+the with-graph counterpart but the semantic graph tool family is
+excluded — the model has to grep + read_file across twelve sibling
+Flutter source files in three subpackages
+(`packages/flutter/lib/src/{widgets,material,cupertino}/`) to
+enumerate fifteen classes that mix in `WidgetsBindingObserver` and
+list each class's overrides of the seventeen lifecycle hooks defined
+on that mixin in `widgets/binding.dart`.
+"""
+
+[workspace.github]
+repo = "flutter/flutter"
+sha = "6d7a86512e6e819c82cb7981aec9218a77cb2f35"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 64
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+The mixin `WidgetsBindingObserver` is declared in
+`packages/flutter/lib/src/widgets/binding.dart`. It exposes seventeen
+default-noop lifecycle hooks: `didPopRoute`, `handleStartBackGesture`,
+`handleUpdateBackGestureProgress`, `handleCommitBackGesture`,
+`handleCancelBackGesture`, `handleStatusBarTap`, `didPushRoute`,
+`didPushRouteInformation`, `didChangeMetrics`,
+`didChangeTextScaleFactor`, `didChangePlatformBrightness`,
+`didChangeLocales`, `didChangeAppLifecycleState`, `didChangeViewFocus`,
+`didRequestAppExit`, `didHaveMemoryPressure`,
+`didChangeAccessibilityFeatures`.
+
+For every concrete class declared under
+`packages/flutter/lib/src/{widgets,material,cupertino}/` that mixes
+in `WidgetsBindingObserver` (i.e. its `class ...` signature contains
+`with ... WidgetsBindingObserver ...`), list the lifecycle hooks
+that the class itself overrides (marked with `@override`, declared
+inside that class's body).
+
+Inclusion rules:
+- Treat a class as a mixer when the `with` clause of its declaration
+  literally names `WidgetsBindingObserver`. Indirect mixers (a class
+  whose superclass mixes it in) do **not** count.
+- Only count overrides of methods that are **defined on**
+  `WidgetsBindingObserver` — the seventeen hooks listed above. Skip
+  `initState`, `dispose`, `build`, `didChangeDependencies`,
+  `didUpdateWidget`, `notifyListeners`, `toString`, `debugFillProperties`,
+  and any other overrides that come from `State<T>`, `ChangeNotifier`,
+  `Diagnosticable`, etc.
+- Exclude anything under a `test/` directory, an `example/`
+  directory, or anywhere outside
+  `packages/flutter/lib/src/{widgets,material,cupertino}/`.
+- Skip the base mixin itself (the declaration in
+  `widgets/binding.dart`).
+- A class that mixes in `WidgetsBindingObserver` but overrides zero
+  lifecycle hooks is still in scope — emit one row for it with
+  `hooks = (none)`.
+
+For each mixer give exactly four fields, tab-separated, one row per
+class, no header row:
+- `file`: path relative to repo root containing the class declaration.
+- `line`: 1-based line number of the `class <Name>` keyword line (the
+  line where the `class` keyword appears, even if the `with` clause
+  wraps onto a continuation line).
+- `class`: the unqualified class name (e.g. `_WidgetsAppState`,
+  `RootBackButtonDispatcher`).
+- `hooks`: space-separated, alphabetically sorted list of overridden
+  lifecycle hook names from the seventeen-name list above (e.g.
+  `didChangeAppLifecycleState didPopRoute didPushRouteInformation`).
+  When the class overrides none of the seventeen hooks, use the
+  literal string `(none)` for this field.
+
+Output the rows sorted in ascending order by `file`, then by `line`.
+No prose, no header line, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 600
+max_input_tokens = 300000
+
+[triage]
+enabled = false

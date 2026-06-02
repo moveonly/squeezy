@@ -1,0 +1,108 @@
+id = "graph-vs-nograph-scala-realworld-no-graph"
+title = "akka/akka RequiresMessageQueue mailbox audit — no graph (openai mini)"
+description = """
+No-graph half of the Scala real-world A/B. Same prompt as the
+with-graph variant, but the semantic graph tools are removed so the
+model has to fall back to grep + read_file across the repo.
+"""
+
+[workspace.github]
+repo = "akka/akka"
+sha = "d65463d1bc0d76f332959127c79ffacf3e14f3f2"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+Audit every named (non-anonymous) Scala class declared under
+`akka-actor/src/main/scala/akka/` whose declaration *directly* mixes
+in the trait `akka.dispatch.RequiresMessageQueue[X]` (for any
+concrete `X`). The mixin must appear in the class's own `extends ...
+with ...` base list; inheritance through an intermediate base does
+not count.
+
+Scope:
+- ONLY look at paths under `akka-actor/src/main/scala/akka/`. Skip
+  every other module, including `akka-actor-tests/`, `akka-testkit/`,
+  `akka-bench-jmh/`, `akka-docs/`, and any `src/test/` path.
+
+Include:
+- Both file-level (top-level) classes AND nested classes declared
+  inside another type (e.g. inside a companion `object`). Nested
+  classes count as long as the *class's own* base list directly
+  contains `with RequiresMessageQueue[...]`.
+
+Exclude:
+- The `RequiresMessageQueue` trait itself.
+- The traits `Stash` and `UnboundedStash` in
+  `akka-actor/src/main/scala/akka/actor/Stash.scala` — they mix in
+  `RequiresMessageQueue` but are declared with `trait`, not `class`.
+- Anonymous classes (`new SomeBase with RequiresMessageQueue[X] { ... }`).
+- Occurrences inside a Scaladoc `/** ... */` block, a `//` comment,
+  or a string literal.
+
+Treat `class`, `final class`, `private class`, `private[akka] class`,
+`private[io] class`, `final case class`, and `abstract class`
+declarations uniformly — they all count if the declaration directly
+mixes in `RequiresMessageQueue[X]`.
+
+For each matching class give exactly six fields, one per line:
+- `file`: path relative to repo root containing the class declaration
+- `line`: 1-based line number where the class declaration starts
+  (the line containing `class <Name>(...)` or `class <Name>`, even
+  when the `with RequiresMessageQueue[...]` clause is on a later
+  continuation line).
+- `class`: the class's simple name (no generics, no package).
+- `nested`: `yes` if the class is declared inside another type
+  (object/class/trait), `no` if it's a file-level declaration.
+- `abstract_class`: `yes` if the class declaration includes the
+  `abstract` modifier, `no` otherwise.
+- `actor_logging`: `yes` if the class's *own* base list also mixes
+  in `ActorLogging` directly (i.e. the declaration contains
+  `with ActorLogging`), `no` otherwise.
+- `queue_semantics`: the simple name of the type argument `X` passed
+  to `RequiresMessageQueue[X]` (e.g. `UnboundedMessageQueueSemantics`,
+  `LoggerMessageQueueSemantics`).
+
+Output as a compact plain-text list. Separate classes with a blank
+line. No prose, no extra commentary. If you find fewer than 8 hits,
+double-check — there are more than that in this repo.
+"""
+
+[expect]
+max_wall_clock_seconds = 480
+max_input_tokens = 250000
+
+[triage]
+enabled = false

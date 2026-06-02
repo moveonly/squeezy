@@ -1,0 +1,51 @@
+id = "graph-vs-nograph-callers-with-graph"
+title = "estimate_cost callers — with semantic graph tools (openai mini)"
+description = """
+Task #3 of the graph-vs-no-graph A/B. Enumerates non-test call sites
+of the `squeezy_llm::estimate_cost` function. Tests
+`reference_search` / `symbol_context` at scale; the no-graph half has
+to grep across multiple workspace crates.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every non-test call site of `estimate_cost` (defined in the
+`squeezy_llm` crate) across this workspace. Exclude:
+- The function's own definition
+- `pub use` re-exports
+- Doc comments mentioning the name
+- Files under `tests/` or `*_tests.rs`
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number of the call
+- `caller`: name of the enclosing function
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

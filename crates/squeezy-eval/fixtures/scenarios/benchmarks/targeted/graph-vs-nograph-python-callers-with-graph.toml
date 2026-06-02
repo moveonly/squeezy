@@ -1,0 +1,56 @@
+id = "graph-vs-nograph-python-callers-with-graph"
+title = "psf/requests get_auth_from_url callers — with graph (openai mini)"
+description = """
+Cross-language A/B (Python). The repo is checked out via GitHub at a
+pinned SHA so the comparison is reproducible. Asks the model to
+enumerate the non-test call sites of `requests.utils.get_auth_from_url`
+in `psf/requests`. Pair with `graph-vs-nograph-python-callers-no-graph.toml`
+and `squeezy-eval diff`.
+"""
+
+[workspace.github]
+repo = "psf/requests"
+sha = "cd90742ed94d901759e26766197d0ce7c7bd9c8e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every non-test call site of `requests.utils.get_auth_from_url`
+in this repository. The function is defined in
+`src/requests/utils.py`.
+
+Exclude:
+- Files under `tests/`.
+- The definition site itself.
+- `import` / `from ... import` statements (count only call expressions).
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing function or method (use `Class.method` form for
+  methods)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

@@ -8,8 +8,8 @@ use crate::web::{
     MAX_WEB_TIMEOUT_MS,
 };
 use crate::{
-    DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
-    MAX_READ_LIMIT, MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
+    DEFAULT_MAX_FILES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT,
+    MAX_SHELL_TIMEOUT_MS, PermissionCapability, ToolSpec,
 };
 
 /// Strict-parse a first-party tool schema literal into [`JsonSchema`]. A
@@ -191,29 +191,18 @@ pub(crate) fn diff_context_spec() -> ToolSpec {
     }
 }
 
-/// Comma-joined list of supported language families, generated from
-/// `squeezy_core::LanguageFamily::all()` so the prose stays in sync when
-/// new families are added.
-fn supported_language_list() -> String {
-    let names: Vec<&'static str> = squeezy_core::LanguageFamily::all()
-        .iter()
-        .map(|family| family.display_name())
-        .collect();
-    match names.as_slice() {
-        [] => String::new(),
-        [only] => only.to_string(),
-        [head @ .., last] => format!("{}, and {}", head.join(", "), last),
-    }
-}
-
 /// Preamble that promotes graph-anchored tools (`decl_search`,
 /// `reference_search`, `symbol_context`) over the lexical fallbacks
-/// (`grep`, `glob`, `read_file`). The language list is built from
-/// `LanguageFamily::all()` at runtime.
+/// (`grep`, `glob`, `read_file`). The list of supported languages used
+/// to live inline here but expanded to ~14 mainstream families; the
+/// per-prompt token overhead outweighed the guidance value once
+/// coverage was effectively universal, so the prose just says
+/// "indexed source files" now. Unsupported file types still resolve
+/// gracefully — graph tools return empty packets and the model falls
+/// back to the lexical tool on its own.
 fn graph_first_preamble(fallback_tool: &str) -> String {
     format!(
-        "Prefer `decl_search`, `reference_search`, or `symbol_context` first for symbol-shaped queries in {languages} files. Use `{fallback_tool}` for free-form text, unsupported languages, or after the graph returned zero packets.",
-        languages = supported_language_list(),
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` for bare-name symbol queries in indexed source files — they follow imports and re-exports that regex misses. Use `{fallback_tool}` for literal text or for file types the graph does not index.",
     )
 }
 
@@ -233,11 +222,11 @@ pub(crate) fn grep_spec() -> ToolSpec {
                 "pattern": {"type": "string", "description": "Rust regex pattern to search for."},
                 "path": {"type": "string", "description": "Workspace-relative file or directory to search.", "default": "."},
                 "include": {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns such as *.rs or crates/**/lib.rs."},
+                "exclude": {"type": "array", "items": {"type": "string"}, "description": "Optional glob patterns whose matches are skipped. Mirrors `include` but in reverse."},
                 "include_ignored": {"type": "boolean", "description": "When true, include files ignored by .gitignore and other ignore files. Default false."},
                 "diff_only": {"type": "boolean", "description": "When true, search only files changed in the current Git worktree diff. Default false."},
                 "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Return matching lines, only files containing matches, or only a count. Default content."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_FILES},
-                "max_bytes_per_file": {"type": "integer", "minimum": 1, "maximum": DEFAULT_MAX_BYTES_PER_FILE},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "offset": {"type": "integer", "minimum": 0, "description": "Number of matching lines to skip for pagination."},
@@ -279,7 +268,7 @@ pub(crate) fn read_file_spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".to_string(),
         description: format!(
-            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span.",
+            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Each line in `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); `start_line` carries the same number for the first line so the model never has to count newlines to report a line. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span. When grep has flagged the relevant lines, pass `offset` and `limit` to fetch only that section — reading whole files when you only need one function body burns input tokens for no recall benefit. For symbol-shaped reads where a graph packet already returned a `symbol_id`, `read_slice` with `symbol_id` + `span_kind=body` is strictly cheaper.",
             preamble = graph_first_preamble("read_file"),
         ),
         capability: PermissionCapability::Read,
@@ -358,7 +347,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For inheritance queries in class-based languages pass `attribute=\"base:<TypeName>\"`; do not embed `base:` in `query`. One decl_search returns the whole matching declaration set at once — strongly prefer it over multiple greps when you're enumerating \"every X that does Y\". Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -367,7 +356,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
             "properties": {
                 "query": {"type": "string", "description": "Optional text to match against indexed declaration names and signatures. Omit it when using filters for counts."},
                 "kind": {"type": "string", "description": "Optional symbol kind such as callable, function, method, struct, module, trait, class."},
-                "path": {"type": "string", "description": "Optional workspace-relative path suffix filter."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter. Multi-segment values (e.g. `gson/src/main/java`) match by strict directory prefix; single tokens (e.g. `squeezy_graph`) fall back to fuzzy segment matching."},
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
                 "attribute": {"type": "string"},
@@ -404,7 +393,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find references through the graph. Use symbol_id for conservative symbol-bound references or text/query for broad heuristic reference search.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when one was returned by a prior graph call. One reference_search returns every callsite at once — strongly prefer it over issuing N greps for the same symbol name.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -472,7 +461,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy for the workspace, a symbol_id, or a declaration query.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`. When the prompt asks about every method (or every field/variant) of one class, call `hierarchy(symbol_id=<class>)` first to fix the member set before reading bodies — one hierarchy call enumerates every member, replacing a sequence of file reads or member-by-member greps.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -494,7 +483,7 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. Prefer spans returned by graph evidence packets.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each line in the returned `content` is prefixed with its 1-based absolute line number followed by a tab (cat -n format); the result also carries `start_line` so the model never has to count newlines. Set read_mode=diff to return only changed ranges against a baseline. When a graph packet returns a symbol_id (definition_search, symbol_context, hierarchy, reference_search), `symbol_id=<id>` with `span_kind=body` returns the body span directly.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -502,16 +491,16 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
             "additionalProperties": false,
             "properties": {
                 "path": {"type": "string"},
-                "symbol_id": {"type": "string"},
-                "span_kind": {"type": "string", "enum": ["signature", "body"]},
+                "symbol_id": {"type": "string", "description": "Symbol id from a graph packet. With span_kind=body returns the full body span — preferred over guessing start_line/end_line."},
+                "span_kind": {"type": "string", "enum": ["signature", "body"], "description": "With symbol_id: `signature` returns the declaration line(s); `body` returns the full body span. Default signature."},
                 "read_mode": {"type": "string", "enum": ["slice", "diff"], "description": "slice returns the requested exact range; diff returns only changed ranges for the same path or symbol. Default slice."},
                 "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD including staged, unstaged, and untracked changes; branch_base compares against the default-branch merge base; index compares staged changes; last_receipt compares against the most recent model-visible read snapshot for this path and falls back to worktree if unavailable."},
                 "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
-                "start_line": {"type": "integer", "minimum": 1},
-                "end_line": {"type": "integer", "minimum": 1},
-                "context_lines": {"type": "integer", "minimum": 0},
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. When the requested window is narrower than ~60 lines it auto-widens symmetrically toward ~80 lines so the enclosing block fits in one fetch."},
+                "end_line": {"type": "integer", "minimum": 1, "description": "1-based end line, inclusive. Pair with start_line; the window auto-widens when too tight."},
+                "context_lines": {"type": "integer", "minimum": 0, "description": "Extra context to add on each side of the line range. Adds on top of the auto-widening default."},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT},
                 "diff_only": {"type": "boolean"}

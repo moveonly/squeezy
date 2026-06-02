@@ -1,0 +1,89 @@
+id = "graph-vs-nograph-swift-architectural-with-graph"
+title = "vapor/vapor ContentEncoder/ContentDecoder conformers — with graph (openai mini)"
+description = """
+Cross-language A/B (Swift), architectural variant. Asks the model to
+enumerate every type under `Sources/Vapor/` that conforms to the
+`ContentEncoder` or `ContentDecoder` protocol (declared in
+`Sources/Vapor/Content/ContentCoders.swift`), and to report for each
+conformer whether the conformance is declared via the type's own
+declaration line (e.g. `public struct PlaintextEncoder:
+ContentEncoder`) or added retroactively via an `extension`
+(e.g. `extension JSONEncoder: ContentEncoder`). The semantic graph
+answers this in a single `hierarchy` lookup; the no-graph half has
+to grep + read across multiple subdirectories
+(`Content/`, `Multipart/`, `URLEncodedForm/`) and distinguish
+true conformance declarations from `func encode(...) using encoder:
+ContentEncoder` parameter types and dictionary storage of the form
+`[HTTPMediaType: ContentEncoder]`.
+"""
+
+[workspace.github]
+repo = "vapor/vapor"
+sha = "712b0919a3ba772f7402ccaf07cdb6ca823dd650"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every type defined under `Sources/Vapor/` that conforms to
+either `ContentEncoder` or `ContentDecoder` — the two protocols
+declared in `Sources/Vapor/Content/ContentCoders.swift`.
+
+Scope:
+- ONLY look at paths under `Sources/Vapor/`. Skip `Sources/Development/`,
+  `Sources/VaporTesting/`, `Sources/VaporTestUtils/`, `Sources/XCTVapor/`,
+  and the entire `Tests/` tree.
+
+Include:
+- `public`, `internal`, `fileprivate`, and `private` types.
+- Both direct conformance (`struct X: ContentEncoder { ... }` /
+  `class X: ContentDecoder { ... }`) and retroactive conformance
+  via `extension X: ContentEncoder { ... }` / `extension X:
+  ContentDecoder { ... }`.
+
+Exclude:
+- The protocols themselves (`ContentEncoder`, `ContentDecoder`).
+- Property/parameter type annotations and dictionary value types
+  (e.g. `var encoders: [HTTPMediaType: ContentEncoder]`,
+  `func use(encoder: ContentEncoder, ...)`).
+- Doc-comment example code.
+
+For each conformer give exactly four fields, one per line:
+- `file`: path relative to repo root containing the conformance
+  declaration line
+- `line`: 1-based line number of the declaration
+- `type`: the conforming type's simple name (no module, no
+  generics)
+- `decl`: one of
+  - `struct` if the conformance is on a `struct X: ...` line,
+  - `class` if on a `final class X: ...` / `class X: ...` line,
+  - `extension` if on an `extension X: ...` line.
+  Also append `:Encoder` or `:Decoder` (with the leading colon) to
+  indicate which of the two protocols this conformance is for —
+  e.g. `struct:Encoder`, `extension:Decoder`. If a single
+  declaration line lists both, emit two separate output rows (one
+  per protocol).
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

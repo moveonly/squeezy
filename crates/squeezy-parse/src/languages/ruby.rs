@@ -710,14 +710,26 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
         ParsedCallKind::Direct
     };
 
-    // Emit a Field reference for explicit-receiver dispatch (`obj.method`).
-    // Mirrors Python's `attribute` handling so `references_to_symbol` can
-    // index the dotted form keyed off the method leaf, and the Ruby graph
-    // resolver can bind it to the receiver class via the
-    // `ruby_property_reference_matches` helper. We skip the bare-call
-    // path (`foo`) because the identifier visitor already emits that as a
-    // plain Identifier reference, and double-emitting would inflate
-    // reference_search counts.
+    // Emit a reference for the method-name leaf so `reference_search`
+    // and `references_to_symbol` both surface every call site. Two
+    // shapes:
+    //
+    // - Explicit-receiver dispatch (`obj.method`) becomes a Field
+    //   reference whose `text` is the dotted target so the Ruby graph
+    //   resolver can bind it to the receiver class via
+    //   `ruby_property_reference_matches`. The reference index also
+    //   keys the leaf so a bare `reference_search("method")` still
+    //   matches.
+    // - Bare-name dispatch (`fire_event(:x)`) becomes an Identifier
+    //   reference whose `text` is the method name. The identifier
+    //   visitor itself skips this token because
+    //   `ruby_node_is_declared_name` suppresses the `method` field of
+    //   a `call`; without this emission `reference_search` and
+    //   `references_to_symbol` would miss every mixin-resolved call
+    //   site (a Ruby idiom: `include Sidekiq::Component; fire_event`).
+    //   The owner_id pins the reference to the enclosing method, so
+    //   per-class attribution still flows through `method.parent_id`
+    //   when sibling classes both `include` the same module.
     if receiver_text.is_some() {
         ctx.references.push(ParsedReference {
             file_id: ctx.file.id.clone(),
@@ -726,6 +738,15 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
             kind: ReferenceKind::Field,
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-ruby", "dotted call reference"),
+        });
+    } else {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: name.clone(),
+            kind: ReferenceKind::Identifier,
+            span: span_from_node(method_node),
+            provenance: Provenance::new("tree-sitter-ruby", "bare call reference"),
         });
     }
 

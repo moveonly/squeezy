@@ -1,0 +1,114 @@
+id = "graph-vs-nograph-c-realworld-with-graph"
+title = "nginx HTTP phase-handler audit — with graph (openai mini)"
+description = """
+Cross-language A/B (C only, no .cpp/.hpp/.cc/.cxx/.h++ files in the
+nginx tree). Realistic, multi-step audit: for every nginx HTTP module
+under `src/http/modules/` whose `postconfiguration` callback installs
+one or more request-phase handlers via
+`ngx_array_push(&cmcf->phases[NGX_HTTP_*_PHASE].handlers); *h = …;`,
+enumerate every (module, phase, handler) triple. The answer set has
+19 rows across 17 module files; two modules
+(`ngx_http_realip_module`, `ngx_http_rewrite_module`) install the
+same handler into two distinct phases each and therefore contribute
+two rows apiece. Modules whose `postconfiguration` is `NULL`,
+filter modules that only chain into `ngx_http_top_header_filter`/
+`ngx_http_top_body_filter`, and modules whose postconfig only adds
+variables or initializes SSL are excluded.
+
+The graph half can resolve `ngx_module_t` instances via
+`decl_search`, follow the `ngx_http_module_t` context pointer to the
+postconfig function via `definition_search`/`symbol_context`, and
+`reference_search` the `phases` field to land on each push site;
+the no-graph half has to grep every push pattern, then read each
+module file backwards to recover the enclosing module variable
+name and the postconfig function name from the `ngx_http_module_t`
+struct-literal block.
+"""
+
+[workspace.github]
+repo = "nginx/nginx"
+sha = "d44205284fa41662da803b796d6056fc1e59b1f3"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 64
+
+[[steps]]
+kind = "prompt"
+text = """
+This audit is C only. Restrict every lookup to nginx C sources
+(`*.c`/`*.h`); ignore any file with a C++ extension
+(`.cpp`/`.hpp`/`.cc`/`.cxx`/`.h++`) — nginx has none in this tree, so
+seeing one means you wandered into the wrong place.
+
+For every nginx HTTP module under `src/http/modules/` whose
+`postconfiguration` callback (the 2nd field of the
+`static ngx_http_module_t  <name>_ctx = { ... }` struct literal)
+points at a non-NULL function that installs one or more
+request-phase handlers via the canonical pattern
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_<PHASE>_PHASE].handlers);
+    if (h == NULL) { return NGX_ERROR; }
+    *h = ngx_http_<handler>;
+
+enumerate every distinct push site.
+
+Inclusion rules:
+- Only modules whose `.c` file lives directly under
+  `src/http/modules/` (not `src/http/`, not `src/core/`, not
+  `src/event/`, not the upstream balancer files outside
+  `src/http/modules/`).
+- Only the `ngx_array_push(&cmcf->phases[…].handlers)` pattern
+  counts. Filter modules that install only into
+  `ngx_http_top_header_filter` / `ngx_http_top_body_filter`
+  (e.g. `ngx_http_addition_filter_module`,
+  `ngx_http_gzip_filter_module`) do NOT count and must be excluded.
+- Modules whose postconfig only adds variables, log handlers,
+  body filters, or initializes SSL/QUIC (e.g.
+  `ngx_http_ssl_module`, `ngx_http_charset_filter_module`) do NOT
+  count and must be excluded.
+- Postconfig = NULL modules are excluded.
+- A module that pushes into N distinct phases contributes N rows
+  (e.g. `ngx_http_realip_module` pushes into both
+  `NGX_HTTP_POST_READ_PHASE` and `NGX_HTTP_PREACCESS_PHASE`).
+- Pushes inside `#if`/`#ifdef` blocks still count.
+
+For each push site give exactly five fields, tab-separated, one row
+per push, no header row:
+- `module_file`: path relative to repo root of the module's `.c`
+  file (e.g. `src/http/modules/ngx_http_access_module.c`).
+- `module_var`: the C identifier of the file-scope
+  `ngx_module_t` instance (e.g. `ngx_http_access_module`). This is
+  the symbol declared `ngx_module_t  <name> = { NGX_MODULE_V1, … };`
+  NOT the `<name>_ctx` static.
+- `postconfig_fn`: the C identifier in the `postconfiguration`
+  slot of the `ngx_http_module_t` context struct (e.g.
+  `ngx_http_access_init`).
+- `phase`: the `NGX_HTTP_*_PHASE` enumerator inside the
+  `phases[…]` subscript (e.g. `NGX_HTTP_ACCESS_PHASE`,
+  `NGX_HTTP_CONTENT_PHASE`).
+- `handler_fn`: the C identifier assigned via `*h = …;` right after
+  the matching `ngx_array_push` (e.g. `ngx_http_access_handler`).
+
+Output the rows sorted ascending by `module_file`, then by the
+order the push appears within that postconfig function body. No
+prose, no header line, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 600
+max_input_tokens = 200000
+
+[triage]
+enabled = false

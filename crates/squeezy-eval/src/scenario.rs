@@ -219,6 +219,16 @@ pub struct SqueezyOverlay {
     /// being set in the operator's shell.
     #[serde(default)]
     pub checkpoints_enabled: Option<bool>,
+    /// Names of tools that must be hidden from the model for this
+    /// run. Pushed into `AppConfig.tools.excluded`. Used by the
+    /// graph-vs-no-graph eval scenarios to remove the semantic-graph
+    /// family (`repo_map`, `decl_search`, `definition_search`,
+    /// `reference_search`, `symbol_context`, `hierarchy`,
+    /// `read_slice`, `upstream_flow`, `downstream_flow`,
+    /// `diff_context`, `plan_patch`, `refresh_compiler_facts`) so
+    /// the model is forced to fall back to lexical tools.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

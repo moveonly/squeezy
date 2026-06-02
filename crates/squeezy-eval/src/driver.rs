@@ -234,6 +234,15 @@ pub async fn run_scenario(
 
     driver.dispatch_steps().await?;
 
+    // Drain the agent's tracked background tasks (MCP tool-palette
+    // refresh fired during `start_turn`) before the post-run findings
+    // / manifest pass. Without this, parallel `check` runs leave
+    // detached spawns alive past their parent task's `tokio::spawn`,
+    // and a watchdog SIGKILLs the worker while `run.json` is on disk
+    // but the runtime is still waiting on the spawn — stalling the
+    // sweep by ~5 minutes per worker.
+    driver.agent.shutdown().await;
+
     // 4. Run the auto-finding pattern matchers over the captured trace,
     //    write findings.jsonl, and embed Finding events back into the
     //    trace so triage and downstream tools see them.
@@ -552,6 +561,25 @@ fn apply_overlay(
     }
     if let Some(enabled) = overlay.checkpoints_enabled {
         config.checkpoints_enabled = enabled;
+    }
+    if !overlay.excluded_tools.is_empty() {
+        for name in &overlay.excluded_tools {
+            if !config
+                .tools
+                .excluded
+                .iter()
+                .any(|existing| existing == name)
+            {
+                config.tools.excluded.push(name.clone());
+            }
+        }
+        let excluded: std::collections::BTreeSet<String> =
+            config.tools.excluded.iter().cloned().collect();
+        config.tools.core.retain(|name| !excluded.contains(name));
+        config
+            .tools
+            .discoverable
+            .retain(|name| !excluded.contains(name));
     }
     Ok(())
 }

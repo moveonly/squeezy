@@ -1,0 +1,70 @@
+id = "graph-vs-nograph-java-architectural-with-graph"
+title = "google/gson TypeAdapter<T> subclasses — with graph (openai mini)"
+description = """
+Architectural A/B half (Java). Asks the model to enumerate every
+top-level (file-level) named class declared under `gson/src/main/java/`
+that directly extends `com.google.gson.TypeAdapter<T>`. The task
+exercises package-qualified type references, the interface/superclass
+hierarchy walk, and generic instantiation — places where the semantic
+graph (`hierarchy`, `decl_search`, `definition_search`) gives a
+disambiguated, scoped answer that pure-grep cannot produce without
+re-reading each candidate to filter out anonymous classes, nested
+classes inside other types, and Javadoc-example occurrences.
+
+Pair with `graph-vs-nograph-java-architectural-no-graph.toml` and
+`squeezy-eval diff` to compare cost and accuracy.
+"""
+
+[workspace.github]
+repo = "google/gson"
+sha = "df53d2f1f50b1c3abb2937e7675867e3f284eb1a"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every top-level (file-level) named Java class declared under
+`gson/src/main/java/` that **directly extends `com.google.gson.TypeAdapter<T>`**
+(for any concrete or bounded `T`).
+
+Scope:
+- ONLY look at paths under `gson/src/main/java/`. Skip `proto/`,
+  `extras/`, `test-graal-native-image/`, `test-jpms/`, `test-shrinker/`,
+  and every `src/test/` path.
+
+Exclude:
+- Anonymous classes (`new TypeAdapter<X>() { ... }`).
+- Nested / inner classes declared inside another type (only the class
+  at the file's top level counts).
+- The abstract `TypeAdapter` base class itself.
+- Occurrences inside Javadoc `/** ... */` block comments (these are
+  documentation examples, not real declarations).
+
+For each subclass give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number where the class declaration starts
+- `class`: simple class name (no generics, no package)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

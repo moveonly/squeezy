@@ -63,7 +63,6 @@ pub(crate) struct ShellRunOutcome {
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_bytes: Vec<u8>,
     pub(crate) stderr_truncated: bool,
-    pub(crate) preserved_env: Vec<String>,
 }
 
 struct ShellRunRequest<'a> {
@@ -390,7 +389,6 @@ impl ToolRegistry {
             stdout_truncated,
             stderr_bytes,
             stderr_truncated,
-            preserved_env,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -483,26 +481,14 @@ impl ToolRegistry {
             "stderr": stderr,
             "error": error,
             "truncated": truncated,
-            "policy": {
-                "capability": analysis.capability.as_str(),
-                "target": analysis.rule_target,
-                "risk": analysis.risk.as_str(),
-                "network": if analysis.network { "classified" } else { "none" },
-                "destructive": analysis.destructive,
-                "parser_backed": analysis.parser_backed,
-                "dynamic": analysis.dynamic,
-                "direct_user_shell": direct_user_shell,
-                "tty": args.tty,
-                "timeout_ms": timeout_ms,
-                "output_byte_cap": output_cap,
-            },
-            "sandbox": sandbox_plan.metadata(),
-            "env": {
-                "policy": "allowlist",
-                "values": "redacted",
-                "preserved": preserved_env,
-            },
         });
+        if let Some(fallback) = sandbox_plan.metadata().get("best_effort_fallback").cloned() {
+            insert_content_field(
+                &mut raw_content,
+                "sandbox",
+                json!({ "best_effort_fallback": fallback }),
+            );
+        }
         if let Some(summary) = implicit_skill {
             insert_content_field(
                 &mut raw_content,
@@ -620,7 +606,7 @@ impl ToolRegistry {
         };
         configure_shell_process_group(&mut command);
         configure_linux_shell_sandbox(&mut command, sandbox_plan);
-        let mut preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+        apply_shell_environment_policy(&mut command, &self.shell_sandbox);
         let ask_server = if let Some(approver) = shell_ask_approver {
             match ShellAskServer::start(
                 &self.root,
@@ -635,8 +621,6 @@ impl ToolRegistry {
                 Ok(server) => {
                     command.env(SQUEEZY_ASK_SOCKET_ENV, server.env_value());
                     command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
-                    preserved_env.push(SQUEEZY_ASK_SOCKET_ENV.to_string());
-                    preserved_env.push(SQUEEZY_ASK_CALL_ID_ENV.to_string());
                     Some(server)
                 }
                 Err(_err) => None,
@@ -742,7 +726,6 @@ impl ToolRegistry {
             stdout_truncated,
             stderr_bytes,
             stderr_truncated,
-            preserved_env,
         })
     }
 }
@@ -1329,10 +1312,7 @@ fn kill_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-fn apply_shell_environment_policy(
-    command: &mut Command,
-    config: &ShellSandboxConfig,
-) -> Vec<String> {
+fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxConfig) {
     let mut preserved = BTreeMap::<String, OsString>::new();
     for (name, value) in env::vars_os() {
         let Some(name) = name.to_str() else {
@@ -1347,7 +1327,6 @@ fn apply_shell_environment_policy(
     for (name, value) in &preserved {
         command.env(name, value);
     }
-    preserved.into_keys().collect()
 }
 
 pub(crate) fn shell_env_should_preserve(name: &str, allowlist: &[String]) -> bool {

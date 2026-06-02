@@ -1,0 +1,73 @@
+id = "graph-vs-nograph-php-callers-with-graph"
+title = "laravel/framework HasTimestamps::usesTimestamps callers — with graph (openai mini)"
+description = """
+Cross-language A/B (PHP). Asks the model to enumerate the non-test
+call sites of the trait method `usesTimestamps` defined on the
+`HasTimestamps` trait in
+`src/Illuminate/Database/Eloquent/Concerns/HasTimestamps.php`. Callers
+are spread across the Eloquent `Model`, `Builder`, `SoftDeletes`,
+`HasAttributes`, and `HasTimestamps` trait/class files, and several
+hit the method via a chained property access (`$this->model->...`)
+rather than `$this->...`, which is where the semantic graph's
+reference search disambiguates from raw grep.
+
+Pair with `graph-vs-nograph-php-callers-no-graph.toml` and
+`squeezy-eval diff` to compare cost and accuracy.
+"""
+
+[workspace.github]
+repo = "laravel/framework"
+sha = "c32ead90e14dfe04e98dc0639d3377b2605914dd"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every non-test call site of the trait method `usesTimestamps`
+defined on the `HasTimestamps` trait in
+`src/Illuminate/Database/Eloquent/Concerns/HasTimestamps.php`.
+
+Scope:
+- ONLY look at paths under `src/Illuminate/`. Skip everything under
+  `tests/`, `workbench/`, `bin/`, `types/`, `config-stubs/`, and any
+  file whose path contains `/tests/` or whose basename ends in
+  `Test.php`.
+
+Exclude:
+- The definition site itself (the `function usesTimestamps()`
+  declaration in `HasTimestamps.php`).
+- The unrelated static helper `isIgnoringTimestamps` — it is not a
+  call to `usesTimestamps`.
+- Calls inside PHPDoc `/** ... */` block comments.
+
+Include calls reached via any receiver shape (e.g. `$this->...`,
+`$this->model->...`, `$instance->...`).
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing function or method name
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

@@ -1,0 +1,115 @@
+id = "graph-vs-nograph-ts-realworld-no-graph"
+title = "nest microservices transport hierarchy — no graph (openai mini)"
+description = """
+No-graph half of the TS real-world A/B. Same prompt and pinned SHA
+as `graph-vs-nograph-ts-realworld-with-graph.toml`. The semantic
+graph family is excluded and the exploration planner is disabled;
+the model must enumerate every subclass of `ClientProxy`, `Server`,
+and `BaseRpcContext` under `packages/microservices/` by grep, filter
+out type-parameter-constraint noise (`TContext extends BaseRpcContext
+= any` in interface and function signatures), and read each
+subclass's `extends` clause — including multi-line clauses on
+`ClientGrpcProxy`, `ClientKafka`, and `ServerNats` — to capture the
+literal type arguments.
+"""
+
+[workspace.github]
+repo = "nestjs/nest"
+sha = "8859e8957ab07ce5503fa871c6ceb63d447e71ca"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+In the `nestjs/nest` repository, the microservices package
+(`packages/microservices/`) defines three abstract base classes
+that every transport implementation extends:
+
+- `ClientProxy<EventsMap, Status>` declared in
+  `packages/microservices/client/client-proxy.ts`
+- `Server<EventsMap, Status>` declared in
+  `packages/microservices/server/server.ts`
+- `BaseRpcContext<T>` declared in
+  `packages/microservices/ctx-host/base-rpc.context.ts`
+
+Audit every CONCRETE TypeScript subclass of these three bases under
+`packages/microservices/`. For each subclass, report the exact type
+arguments it pins on its abstract base — i.e. the literal text
+between the angle brackets on its `extends <Base><...>` clause.
+
+For each subclass give exactly four space-separated fields, one row
+per line, in this order:
+
+  <subclass> <base> <type-args> <file>
+
+where:
+- `<subclass>` is the class name (e.g. `ClientTCP`, `ServerGrpc`,
+  `KafkaContext`).
+- `<base>` is one of `ClientProxy`, `Server`, `BaseRpcContext`.
+- `<type-args>` is the literal text inside the `<...>` immediately
+  following the base-class name on the `extends` clause, with no
+  surrounding spaces, separated by `, ` (comma + single space).
+  Examples: `TcpEvents, TcpStatus`, `never, never`,
+  `never, KafkaStatus`, `E, S`, `KafkaContextArgs`. When the
+  `extends` clause spans multiple lines, read enough of the file to
+  recover the full bracketed list.
+- `<file>` is the path of the subclass's `.ts` file relative to the
+  repo root.
+
+Constraints:
+- TypeScript only — exclude `.js`, `.jsx`, `.mjs`, `.cjs` files
+  entirely. Only look at `.ts` files.
+- Exclude anything under `test/`, `*.spec.ts`, `*.d.ts`,
+  `external/` (the bundled `kafka.interface.ts` declarations are
+  not subclasses of the three bases anyway), and `node_modules/`.
+- Only count CLASSES that `extends <Base><...>` as part of their
+  declaration. Do NOT count generic type-parameter constraints of
+  the form `TContext extends BaseRpcContext = any` that appear in
+  interface or function signatures — those are not subclasses.
+- Only count CONCRETE subclasses (i.e. `export class ...`). Do not
+  include the abstract base classes themselves.
+- For `BaseRpcContext`, the gRPC transport intentionally has no
+  context subclass — do not invent one.
+
+Sort the rows lexicographically by `<subclass>`. Output a compact
+plain-text list. No prose, no extra commentary, no headers. The
+expected answer has 20 rows.
+"""
+
+[expect]
+max_wall_clock_seconds = 540
+max_input_tokens = 250000
+
+[triage]
+enabled = false

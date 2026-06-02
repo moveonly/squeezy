@@ -1,0 +1,72 @@
+id = "graph-vs-nograph-scala-callers-with-graph"
+title = "akka/akka MessageDispatcher.registerForExecution callers — with graph (openai mini)"
+description = """
+Cross-language A/B (Scala). Asks the model to enumerate the call sites
+of `registerForExecution` on `akka.dispatch.MessageDispatcher` inside
+`akka-actor/src/main/`. The method is declared abstract on
+`MessageDispatcher` and overridden by `Dispatcher`; calls are spread
+across `Dispatcher`, `BalancingDispatcher`, `AbstractDispatcher`, and
+the `Mailbox` runnable, mixing same-class (`registerForExecution(...)`),
+receiver-qualified (`dispatcher.registerForExecution(...)`), and
+nested-function call shapes.
+"""
+
+[workspace.github]
+repo = "akka/akka"
+sha = "d65463d1bc0d76f332959127c79ffacf3e14f3f2"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+List every call site of the method `registerForExecution` defined on
+`akka.dispatch.MessageDispatcher` in
+`akka-actor/src/main/scala/akka/dispatch/AbstractDispatcher.scala`
+(the abstract declaration) and overridden in
+`akka-actor/src/main/scala/akka/dispatch/Dispatcher.scala`.
+
+Scope:
+- ONLY look at paths under `akka-actor/src/main/`. Skip every other
+  module, including `akka-testkit/`, `akka-actor-tests/`,
+  `akka-bench-jmh/`, `akka-docs/`, and any `src/test/` path.
+
+Exclude:
+- The abstract declaration line itself.
+- The overriding declaration line itself.
+- Any occurrence inside a Scaladoc `/** ... */` comment, a `//`
+  comment, or a string literal.
+
+Include the same-class bare calls (e.g. `registerForExecution(...)`)
+and the receiver-qualified calls (e.g.
+`dispatcher.registerForExecution(...)`). Include calls inside nested
+local functions.
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing method or function name (e.g. `attach`,
+  `Mailbox.run`, `BalancingDispatcher.teamWork.scheduleOne`)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

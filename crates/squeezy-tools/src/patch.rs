@@ -460,7 +460,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_PATCH_MAX_RELATED)
             .clamp(1, MAX_GRAPH_MAX_RESULTS);
         let candidate_paths = normalized_path_set(args.candidate_paths.as_deref().unwrap_or(&[]));
-        self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -476,13 +476,27 @@ impl ToolRegistry {
         let Some(manager) = graph.as_mut() else {
             let locality = patch_locality_json(&candidate_paths, &BTreeSet::new());
             let plan_id = patch_plan_id(&call.arguments, &candidate_paths);
+            let still_indexing = !graph_ready;
+            let (status, top_reason, next_action_reason) = if still_indexing {
+                (
+                    "graph_indexing",
+                    "semantic graph is still being indexed; retry plan_patch",
+                    "semantic graph is still indexing; rerun plan_patch shortly or widen the search with decl_search or grep",
+                )
+            } else {
+                (
+                    "graph_unavailable",
+                    "semantic graph is unavailable for this workspace",
+                    "semantic graph is unavailable; widen the search with decl_search or grep before patching",
+                )
+            };
             let next_action = if candidate_paths.is_empty() {
                 json!({
                     "tool": "decl_search",
                     "arguments_template": {
                         "query": args.query.as_deref().unwrap_or("<symbol or text>")
                     },
-                    "reason": "semantic graph is unavailable; widen the search with decl_search or grep before patching",
+                    "reason": next_action_reason,
                     "fallback_tools": ["decl_search", "grep"]
                 })
             } else {
@@ -493,16 +507,18 @@ impl ToolRegistry {
                 ToolStatus::Success,
                 json!({
                     "tool": "plan_patch",
-                    "status": "graph_unavailable",
+                    "status": status,
                     "graph_available": false,
-                    "reason": "semantic graph is unavailable for this workspace",
+                    "reason": top_reason,
+                    "retryable": still_indexing,
                     "objective": args.objective,
                     "patch_format": "search_replace",
                     "plan_id": plan_id,
                     "impact": {
                         "neighborhood_paths": candidate_paths.iter().cloned().collect::<Vec<_>>(),
                         "fallback": {
-                            "status": "graph_unavailable",
+                            "status": status,
+                            "retryable": still_indexing,
                             "suggested_tools": [
                                 {"tool": "grep", "arguments_template": {"pattern": args.query.as_deref().unwrap_or("<query>"), "output_mode": "files_with_matches"}},
                                 {"tool": "read_file", "arguments_template": {"path": "<candidate-path>"}}

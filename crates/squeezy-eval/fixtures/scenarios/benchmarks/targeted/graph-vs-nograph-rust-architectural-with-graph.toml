@@ -1,0 +1,88 @@
+id = "graph-vs-nograph-rust-architectural-with-graph"
+title = "Architectural audit: direct ToolResult struct literals — with graph (openai mini)"
+description = """
+Architectural-audit A/B task. The user wants to centralise all
+`squeezy_tools::ToolResult` construction through the canonical
+`make_result(...)` helper in `crates/squeezy-tools/src/lib.rs`. The task
+is to enumerate every NON-TEST site that still constructs a `ToolResult`
+directly via struct literal syntax (`ToolResult { call_id: ...,
+tool_name: ..., status: ..., content: ..., cost_hint: ..., receipt:
+..., spill_model_output: ... }`).
+
+Distinguishing the struct literal from `-> ToolResult { ... }` function
+return-type sigs and `HydratedTranscriptItem::ToolResult { ... }` /
+`TranscriptEvent::ToolResult { ... }` enum-variant patterns is the core
+test — naive grep flags all three identically. The graph half can
+resolve the `ToolResult` identifier to its struct decl in
+`squeezy-tools` and ask for references that are struct-init
+expressions, skipping the false positives.
+
+Pair with `graph-vs-nograph-rust-architectural-no-graph.toml` and run
+`squeezy-eval diff` to compare cost / accuracy.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+
+[[steps]]
+kind = "prompt"
+text = """
+I want to centralise all construction of the
+`squeezy_tools::ToolResult` struct through the canonical helper
+`make_result(...)` defined in `crates/squeezy-tools/src/lib.rs`. To
+plan the refactor I need to know every NON-TEST site in this repo
+that still constructs a `ToolResult` directly via struct literal
+syntax — i.e. an expression of the form:
+
+  ToolResult {
+      call_id: ...,
+      tool_name: ...,
+      status: ...,
+      content: ...,
+      cost_hint: ...,
+      receipt: ...,
+      spill_model_output: ...,
+  }
+
+EXCLUDE all of the following:
+- The `make_result` helper itself (it is the canonical builder; do
+  not list its own body).
+- Function return-type annotations such as `-> ToolResult { ... }` and
+  closure / async-block return-type sigs that just *mention* the type.
+- Enum-variant struct patterns like `TranscriptEvent::ToolResult {
+  ... }` and `HydratedTranscriptItem::ToolResult { ... }` from
+  `squeezy-store` — those are unrelated enum variants that happen to
+  share the name.
+- Files under `tests/` or named `*_tests.rs` (test fixtures).
+
+For each remaining call site give exactly three fields, one per
+line:
+- `file`: path relative to the repo root
+- `line`: 1-based line number where `ToolResult {` begins
+- `fn`: name of the enclosing function
+
+Output as a compact plain-text list. No prose, no extra commentary.
+If you find zero non-test struct-literal sites, say so explicitly.
+"""
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+
+[triage]
+enabled = false

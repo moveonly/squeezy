@@ -1,0 +1,82 @@
+id = "graph-vs-nograph-dart-architectural-no-graph"
+title = "felangel/bloc LintRule subclass audit — no graph (openai mini)"
+description = """
+No-graph half of the Dart architectural A/B. Same prompt as the
+with-graph variant, but the semantic graph tools are removed so the
+model has to fall back to grep + read_file across the repo.
+"""
+
+[workspace.github]
+repo = "felangel/bloc"
+sha = "ff675f7078aa90470b222a8ae07673522ef32233"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+List every concrete (non-abstract) subclass of the abstract class
+`LintRule` defined under `packages/bloc_lint/lib/` in this repository.
+The base class is declared in `packages/bloc_lint/lib/src/lint_rule.dart`.
+
+Exclude:
+- Anything under a `test/` directory.
+- Anything under an `example/` directory.
+- The base class itself.
+- Mock or test-double classes that only `implements LintRule`
+  without extending it.
+
+Treat `extends LintRule` as the inclusion criterion. Indirect
+subclasses (reached only through an intermediate subclass) count and
+should be reported in the same form.
+
+For each subclass give exactly four fields, one per line:
+- `file`: path relative to repo root containing the `class ... extends
+  LintRule` declaration
+- `line`: 1-based line number of the class declaration
+- `type`: the subclass's name (just the type, not the full path)
+- `defaultSeverity`: the lowercase name of the `Severity` value that
+  the subclass's constructor falls back to when no severity argument
+  is passed (the right-hand side of the `severity ?? Severity.X`
+  expression inside the `super(...)` call). Use one of: `info`,
+  `warning`, `error`, `hint`.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

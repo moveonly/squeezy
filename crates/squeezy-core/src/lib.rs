@@ -279,31 +279,54 @@ pub const DEFAULT_ROUTING_HEURISTIC_MAX_CHARS: u32 = 2_000;
 /// long judge call would erode the savings the router is trying to
 /// produce. Sized at ~1500 tokens of English.
 pub const DEFAULT_ROUTING_JUDGE_MAX_CHARS: u32 = 6_000;
-// Per-subagent-invocation budgets, sized so they never bind in
-// realistic use; the subagent's natural exit is the model emitting a
-// final answer with no tool calls.
+// Per-subagent-invocation budgets, sized so each is only ever
+// reached when something has demonstrably gone wrong (a stuck
+// retry loop, a runaway scan, a model that won't emit a final
+// answer). The natural exit path is the model emitting a final
+// answer with no tool calls; legitimate research work has plenty of
+// headroom under these numbers. Do NOT lower any of these in a
+// "more conservative defaults" pass — that creates false-positive
+// aborts on real workloads where the cost broker is already the
+// load-bearing safeguard.
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
-pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
 /// Maximum number of subagents that may be active at once for a single
 /// parent Agent. The registry rejects further `start()` calls until an
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
 /// predictable rather than letting a model spawn an unbounded swarm.
 pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: usize = 20;
-// Emergency belt on subagent model rounds. Plan/Delegate/Review
-// subagents run full agent work, sized to match what real long-running
-// agent sessions reach in practice. The cost broker, cancellation
-// token, and per-tool-call truncations are the load-bearing safeguards;
-// this is the last-resort belt.
+// Last-resort belt on subagent model rounds. 1 000 rounds is well
+// above what real long-running agent sessions reach — by then the
+// `max_session_cost_usd_micros` broker has already capped the
+// subagent (1 000 rounds at gpt-5.4-mini pricing is roughly $5–$10
+// of spend, comfortably beyond the $5 default cap). Reaching this
+// cap is a signal that the cost broker was either disabled or
+// raised much higher than usual AND the model is failing to
+// converge, both of which already indicate "something went wrong"
+// — so it's safe to keep as a belt even when the user's principle
+// rules out false-positive limits.
 pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 1_000;
-// Wall-clock ceiling for a single subagent run. None of the per-call
-// budgets (tool calls, bytes, model rounds, summary tokens) measure elapsed
-// time, so a slow model stream or a chain of slow tool calls can pin the
-// parent indefinitely without ever tripping them. 300s sits well above the
-// median Explore/Plan/Review run while still guaranteeing the parent's turn
-// loop reclaims control on the order of minutes. Set to `0` in TOML or
-// `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0` to disable.
-pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 900;
+// Wall-clock ceiling for a single subagent run. Disabled by default
+// (`0` = no cap). The earlier 300s default was a legacy carryover
+// from when the subagent's event channel didn't heartbeat back to
+// the parent: a subagent could go silent from the parent's
+// perspective for >60s, the parent's per-event timeout would fire,
+// and the parent would abort the turn while the subagent was still
+// legitimately working. That root cause is fixed now (the
+// subagent's `ToolProgress` heartbeats forward to the parent's tx,
+// so the parent's window resets on every subagent tool tick), so we
+// no longer need a wall-clock fallback to compensate. A subagent
+// doing real research work — `explore` walking a 50-file callgraph,
+// `delegate` reasoning through a multi-step plan — is no different
+// from the main agent's right to run for as long as the user is
+// willing to pay. The load-bearing safeguards are the cost broker
+// (`max_session_cost_usd_micros`), the agent-side cancellation
+// token, and the provider's own rate limits / connection timeouts.
+// Re-enable with `max_runtime_secs = <secs>` in TOML or
+// `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=<secs>` for environments that
+// want a wall-clock belt.
+pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 0;
 // Generous default sized for Plan/Delegate/Review summaries under a
 // reasoning model: thinking tokens burn first, then the actual summary.
 // 64K leaves room for both across every model we ship a preset for. The
@@ -1787,8 +1810,12 @@ impl AppConfig {
         ));
         output.push_str(&format!("core = {}\n", toml_string_array(&self.tools.core)));
         output.push_str(&format!(
-            "discoverable = {}\n\n",
+            "discoverable = {}\n",
             toml_string_array(&self.tools.discoverable)
+        ));
+        output.push_str(&format!(
+            "excluded = {}\n\n",
+            toml_string_array(&self.tools.excluded)
         ));
 
         output.push_str("[tui]\n");
@@ -4073,6 +4100,12 @@ pub struct ToolSchemaConfig {
     pub lazy_schema_loading: bool,
     pub core: Vec<String>,
     pub discoverable: Vec<String>,
+    /// Names that must be filtered out before tools are advertised to
+    /// the model, even if they would otherwise be in `core` or
+    /// `discoverable`. Used by graph-vs-no-graph eval scenarios to
+    /// hide the semantic-graph family (`repo_map`, `decl_search`, …)
+    /// so the model is forced to fall back to lexical tools.
+    pub excluded: Vec<String>,
 }
 
 impl Default for ToolSchemaConfig {
@@ -4084,6 +4117,7 @@ impl Default for ToolSchemaConfig {
                 .map(|name| (*name).to_string())
                 .collect(),
             discoverable: Vec::new(),
+            excluded: Vec::new(),
         }
     }
 }
@@ -4104,12 +4138,14 @@ impl ToolSchemaConfig {
         }
         let discoverable = settings.discoverable.unwrap_or(defaults.discoverable);
         core.retain(|tool| !discoverable.contains(tool));
+        let excluded = settings.excluded.unwrap_or(defaults.excluded);
         Ok(Self {
             lazy_schema_loading: settings
                 .lazy_schema_loading
                 .unwrap_or(defaults.lazy_schema_loading),
             core,
             discoverable,
+            excluded,
         })
     }
 
@@ -4120,6 +4156,10 @@ impl ToolSchemaConfig {
     pub fn discoverable_contains(&self, name: &str) -> bool {
         self.discoverable.iter().any(|tool| tool == name)
     }
+
+    pub fn is_excluded(&self, name: &str) -> bool {
+        self.excluded.iter().any(|tool| tool == name)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -4128,6 +4168,7 @@ pub struct ToolSchemaSettings {
     pub lazy_schema_loading: Option<bool>,
     pub core: Option<Vec<String>>,
     pub discoverable: Option<Vec<String>>,
+    pub excluded: Option<Vec<String>>,
 }
 
 impl ToolSchemaSettings {
@@ -4139,6 +4180,7 @@ impl ToolSchemaSettings {
                 "lazy_schema_loading",
                 "core",
                 "discoverable",
+                "excluded",
             ],
             source,
             path,
@@ -4163,6 +4205,7 @@ impl ToolSchemaSettings {
                 source,
                 &field(path, "discoverable"),
             )?,
+            excluded: string_array_value(table, "excluded", source, &field(path, "excluded"))?,
         })
     }
 
@@ -4171,6 +4214,7 @@ impl ToolSchemaSettings {
         replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
         merge_string_lists(&mut self.core, next.core);
         merge_string_lists(&mut self.discoverable, next.discoverable);
+        merge_string_lists(&mut self.excluded, next.excluded);
     }
 }
 
@@ -4769,7 +4813,7 @@ impl SubagentSettings {
                 source,
                 &field(path, "max_summary_tokens"),
             )?,
-            max_runtime_secs: u64_value(
+            max_runtime_secs: u64_nonnegative_value(
                 table,
                 "max_runtime_secs",
                 source,
@@ -4913,7 +4957,7 @@ impl Default for SubagentConfig {
             max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
             max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
-            max_runtime_secs: Some(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS),
+            max_runtime_secs: None,
             include_transcript: false,
         }
     }
@@ -12613,7 +12657,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call. Do not issue duplicate tool calls — if you need the same result you already have, refer to the earlier output instead of re-running the call. For simple existence checks (e.g. \"does function X exist?\") or simple definition questions (e.g. \"which file defines X?\"), a single grep or definition_search is usually enough; stop once graph evidence directly answers the user instead of adding repo_map, grep, or relationship tools. Before a batch of two or more related tool calls, emit a brief preamble (1–2 sentences, roughly 8–12 words) saying what you are about to do — for example: \"Looking up Error in src/lib.rs, then tracing its constructors.\" Logically group related tools under one preamble; if a turn covers two unrelated topics, emit one preamble per group. Skip the preamble for a single tool call or a trivial answer.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. When you would otherwise issue the same grep or read_file repeatedly against one symbol or one type, a single graph call replaces them — reach for it even when grep would also work, because the graph result already follows imports, re-exports, and renamed aliases that regex misses. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call. Do not issue duplicate tool calls — if you need the same result you already have, refer to the earlier output instead of re-running the call. For simple existence checks (e.g. \"does function X exist?\") or simple definition questions (e.g. \"which file defines X?\"), a single grep or definition_search is usually enough; stop once graph evidence directly answers the user instead of adding repo_map, grep, or relationship tools. Before a batch of two or more related tool calls, emit a brief preamble (1–2 sentences, roughly 8–12 words) saying what you are about to do — for example: \"Looking up Error in src/lib.rs, then tracing its constructors.\" Logically group related tools under one preamble; if a turn covers two unrelated topics, emit one preamble per group. Skip the preamble for a single tool call or a trivial answer.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

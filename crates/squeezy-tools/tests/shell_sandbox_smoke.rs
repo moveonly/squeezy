@@ -115,6 +115,14 @@ fn smoke_host_cannot_run_sandbox(result: &ToolResult) -> bool {
     !truncated && exit_code_unknown && stdout_empty && stderr_empty
 }
 
+/// Read the shell audit log written to disk. The trimmed shell tool result
+/// no longer carries `policy`/`sandbox`/`env` in the model-facing content,
+/// so smoke tests assert on the audit row (which still has every
+/// classification + sandbox metadata field) instead.
+fn read_audit_log(root: &Path) -> String {
+    fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log")
+}
+
 fn required_deny_config() -> ShellSandboxConfig {
     ShellSandboxConfig {
         mode: ShellSandboxMode::Required,
@@ -188,9 +196,10 @@ async fn shell_sandbox_exec_runs_benign_command_with_required_mode() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(result.content["sandbox"]["mode"], "required");
-    assert_eq!(result.content["sandbox"]["backend"], "macos-sandbox-exec");
-    assert_eq!(result.content["sandbox"]["network"], "denied");
+    let audit = read_audit_log(&root);
+    assert!(audit.contains("\"mode\":\"required\""));
+    assert!(audit.contains("\"backend\":\"macos-sandbox-exec\""));
+    assert!(audit.contains("\"network\":\"denied\""));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -225,10 +234,11 @@ async fn shell_sandbox_exec_result_carries_network_metadata() {
         return;
     }
 
-    assert_eq!(result.content["policy"]["network"], "classified");
-    assert_eq!(result.content["sandbox"]["mode"], "required");
-    assert_eq!(result.content["sandbox"]["backend"], "macos-sandbox-exec");
-    assert_eq!(result.content["sandbox"]["network"], "denied_classified");
+    let audit = read_audit_log(&root);
+    assert!(audit.contains("\"network\":true"));
+    assert!(audit.contains("\"mode\":\"required\""));
+    assert!(audit.contains("\"backend\":\"macos-sandbox-exec\""));
+    assert!(audit.contains("\"network\":\"denied_classified\""));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -266,10 +276,13 @@ async fn shell_sandbox_allows_configured_extra_write_root() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(fs::read_to_string(&target).expect("extra write"), "ok");
-    assert_eq!(
-        result.content["sandbox"]["write_roots"][0],
-        extra.display().to_string()
-    );
+    let audit = read_audit_log(&root);
+    let extra_basename = extra
+        .file_name()
+        .expect("extra basename")
+        .to_string_lossy()
+        .into_owned();
+    assert!(audit.contains(&extra_basename));
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(extra);
 }
@@ -338,12 +351,10 @@ async fn shell_linux_userns_runs_benign_command_with_required_mode() {
 
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
-    assert_eq!(result.content["sandbox"]["mode"], "required");
-    assert_eq!(
-        result.content["sandbox"]["backend"],
-        "linux-direct-syscalls"
-    );
-    assert_eq!(result.content["sandbox"]["network"], "denied");
+    let audit = read_audit_log(&root);
+    assert!(audit.contains("\"mode\":\"required\""));
+    assert!(audit.contains("\"backend\":\"linux-direct-syscalls\""));
+    assert!(audit.contains("\"network\":\"denied\""));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -373,13 +384,11 @@ async fn shell_linux_userns_result_carries_network_metadata() {
         return;
     }
 
-    assert_eq!(result.content["policy"]["network"], "classified");
-    assert_eq!(result.content["sandbox"]["mode"], "required");
-    assert_eq!(
-        result.content["sandbox"]["backend"],
-        "linux-direct-syscalls"
-    );
-    assert_eq!(result.content["sandbox"]["network"], "denied_classified");
+    let audit = read_audit_log(&root);
+    assert!(audit.contains("\"network\":true"));
+    assert!(audit.contains("\"mode\":\"required\""));
+    assert!(audit.contains("\"backend\":\"linux-direct-syscalls\""));
+    assert!(audit.contains("\"network\":\"denied_classified\""));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -438,10 +447,8 @@ async fn shell_windows_best_effort_runs_with_job_object_backend() {
         .await;
 
     assert_eq!(result.status, ToolStatus::Success, "{:?}", result);
-    assert_eq!(result.content["sandbox"]["backend"], "windows-job-object");
-    assert_eq!(
-        result.content["sandbox"]["filesystem"],
-        "best_effort_unavailable"
-    );
+    let audit = read_audit_log(&root);
+    assert!(audit.contains("\"backend\":\"windows-job-object\""));
+    assert!(audit.contains("\"filesystem\":\"best_effort_unavailable\""));
     let _ = fs::remove_dir_all(root);
 }

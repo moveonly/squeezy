@@ -2097,6 +2097,7 @@ impl Agent {
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
+        retain_non_excluded_tools(&mut all_tool_specs, &self.config.tools);
         let session_id_for_plan_mode = self.session_id();
         let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
             mode,
@@ -3573,6 +3574,7 @@ impl Agent {
                 let mut all_tool_specs =
                     core_control_tools(&config.subagents, load_session_mode(&session_mode));
                 all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
+                retain_non_excluded_tools(&mut all_tool_specs, &config.tools);
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
                 refresh_mcp_tools_in_background(
                     tools.clone(),
@@ -3881,6 +3883,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         load_session_mode(&deps.session_mode),
     );
     all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
+    retain_non_excluded_tools(&mut all_tool_specs, &deps.config.tools);
     let jobs = JobRegistry::new();
     let parent = ToolExecutionContext {
         turn_id: TurnId::new(0),
@@ -7971,13 +7974,46 @@ async fn run_subagent_dispatch(
     // stream, nested tool calls, and any sub-subagents — a real
     // cancellation tree instead of a flat sibling list under the turn.
     let child_context = context.with_cancel(child_cancel.clone());
-    let execution = Box::pin(run_subagent(
-        &child_context,
-        kind,
-        request,
-        Some(subagent_id),
-    ))
-    .await;
+    // Emit `ToolProgress` heartbeats from the parent's perspective while
+    // the subagent body runs. The subagent's first model round (just
+    // reasoning, no tool calls yet) is otherwise invisible to the
+    // parent's per-event timeout: `run_subagent`'s drain task only
+    // forwards inner `ToolProgress` events, which fire only once the
+    // subagent itself launches a tool. On a no-graph variant where the
+    // subagent's allowed-tool set is whittled down to glob/grep/read_file
+    // and the model spends >60s reasoning about how to substitute for
+    // the missing graph tools, the eval driver's 60s `event_timeout`
+    // expires and the whole turn is abandoned with $0 cost. Tick at the
+    // same `TOOL_PROGRESS_INTERVAL` as a regular tool call so consumers
+    // see the explore call behaving like any other long-running tool.
+    let subagent_started = Instant::now();
+    let progress_call_id = call.call_id.clone();
+    let progress_tool_name = call.name.clone();
+    let progress_tx = context.tx.clone();
+    let progress_turn_id = context.turn_id;
+    let subagent_future = run_subagent(&child_context, kind, request, Some(subagent_id));
+    tokio::pin!(subagent_future);
+    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+    // `interval` fires immediately on first poll; skip that tick so the
+    // heartbeat only fires once the subagent has actually been running.
+    progress_ticker.tick().await;
+    let execution = loop {
+        tokio::select! {
+            execution = &mut subagent_future => break execution,
+            _ = progress_ticker.tick() => {
+                // try_send instead of send().await: heartbeats are advisory
+                // and dropping one on a full buffer is benign, but blocking
+                // the select! loop on a full mpsc deadlocks the tool —
+                // 6-hour Flutter SDK hang was reproduced this way.
+                let _ = progress_tx.try_send(AgentEvent::ToolProgress {
+                    turn_id: progress_turn_id,
+                    call_id: progress_call_id.clone(),
+                    tool_name: progress_tool_name.clone(),
+                    elapsed_ms: subagent_started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+    };
     drop(lease);
     if let Some(registry) = context.hooks.as_ref() {
         dispatch_subagent_stop(
@@ -8216,12 +8252,35 @@ async fn run_subagent(
     // active drain a high-fanout round (>~4 parallel tool calls) would fill
     // the channel buffer and the `send().await` inside the tool dispatcher
     // would block forever.
+    //
+    // BUT: `ToolProgress` events from inside the subagent must still reach
+    // the parent's `tx`. Without them, a long-running subagent (e.g.
+    // explore with `DEFAULT_SUBAGENT_MAX_RUNTIME_SECS = 300`) goes silent
+    // from the parent's perspective for longer than the parent's per-event
+    // timeout (`event_timeout_seconds`, 60s default in the eval driver),
+    // and the parent gives up on the whole turn while the subagent is
+    // still alive and billing. The drain loop forwards exactly those
+    // heartbeat-shaped events so the parent's timeout window resets each
+    // time the subagent reports liveness; everything else is dropped to
+    // keep the parent's transcript clean.
     let (hidden_tx, mut hidden_rx) = mpsc::channel::<AgentEvent>(64);
     let parent_tx = parent.tx.clone();
     let parent_turn_id = parent.turn_id;
     let activity_agent = kind.as_str().to_string();
     let drain_handle = tokio::spawn(async move {
         while let Some(event) = hidden_rx.recv().await {
+            // ToolProgress heartbeats forward as-is so the parent's
+            // per-event timeout window resets each time the subagent
+            // reports liveness (dart hang fix; see also the try_send
+            // heartbeat above and the subagent-side equivalent).
+            if matches!(event, AgentEvent::ToolProgress { .. }) {
+                let _ = parent_tx.try_send(event);
+                continue;
+            }
+            // Other interesting events surface to the parent transcript
+            // as a compact SubagentActivity line so a watching user can
+            // see the subagent's tool churn without seeing its raw
+            // events.
             let Some(id) = activity_id else {
                 continue;
             };
@@ -10800,36 +10859,55 @@ async fn run_one_tool(
         );
         ToolResult::denied(&call_for_telemetry, reason)
     } else {
-        let exec_future = context.tools.execute_for_group_with_options(
+        let tool_cancel = tracked_job
+            .as_ref()
+            .map(|(_, cancel)| cancel.clone())
+            .unwrap_or_else(|| context.cancel.clone());
+        let retry_cancel = context.cancel.clone();
+        let retry_tool_cancel = tool_cancel.clone();
+        let retry_context = context.clone();
+        let retry_call_for_executor = call_for_telemetry.clone();
+        let retry_progress_call_id = progress_call_id.clone();
+        let retry_progress_tool_name = progress_tool_name.clone();
+        let initial = run_tool_exec_with_progress(
+            &context,
             call,
-            tracked_job
-                .as_ref()
-                .map(|(_, cancel)| cancel.clone())
-                .unwrap_or_else(|| context.cancel.clone()),
-            context.turn_id.to_string(),
+            tool_cancel,
             ToolExecutionOptions { shell_ask_approver },
-        );
-        tokio::pin!(exec_future);
-        let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
-        // `interval` fires immediately on first poll; skip that tick so the
-        // heartbeat only fires once the tool has actually been running.
-        progress_ticker.tick().await;
-        loop {
-            tokio::select! {
-                r = &mut exec_future => break r,
-                _ = progress_ticker.tick() => {
-                    let _ = context
-                        .tx
-                        .send(AgentEvent::ToolProgress {
-                            turn_id: context.turn_id,
-                            call_id: progress_call_id.clone(),
-                            tool_name: progress_tool_name.clone(),
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        })
-                        .await;
-                }
-            }
-        }
+            &progress_call_id,
+            &progress_tool_name,
+            started,
+        )
+        .await;
+        // Graph cold-start: when the tool registry returns the
+        // `fallback.status = "graph_indexing"` sentinel introduced in
+        // `fddd56e7`, retry once after a short wait. The underlying
+        // dispatcher already waits up to `GRAPH_READY_WAIT` on the
+        // first attempt; this retry covers the narrow window where the
+        // indexer finishes a fraction of a second after that wait
+        // closed. The cap of one retry keeps the agent from looping
+        // when the indexer is genuinely backlogged — the second result,
+        // whatever it is, is surfaced to the model as-is.
+        maybe_retry_graph_indexing(
+            initial,
+            &retry_cancel,
+            GRAPH_INDEXING_RETRY_WAIT,
+            || async move {
+                run_tool_exec_with_progress(
+                    &retry_context,
+                    retry_call_for_executor,
+                    retry_tool_cancel,
+                    ToolExecutionOptions {
+                        shell_ask_approver: None,
+                    },
+                    &retry_progress_call_id,
+                    &retry_progress_tool_name,
+                    started,
+                )
+                .await
+            },
+        )
+        .await
     };
     // Fire the PostToolUse hook as soon as the tool result is in hand,
     // before downstream job/telemetry bookkeeping. Same observational
@@ -10893,6 +10971,142 @@ const COST_UPDATE_STRIDE: u64 = 3;
 /// terminal needs feedback within roughly a second to feel the
 /// agent is alive but stable.
 const TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Wait between the first attempt and a single transparent retry when a
+/// graph tool returns `fallback.status = "graph_indexing"`. The
+/// underlying tool registry already burns up to `GRAPH_READY_WAIT`
+/// waiting for the cold-start indexer; this short follow-up sleep
+/// covers the common case where the indexer finishes a fraction of a
+/// second after the first attempt's wait window closes. Total agent-
+/// side wait per call is bounded by one sleep here.
+const GRAPH_INDEXING_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Tool names whose results are produced by the graph dispatcher and
+/// therefore can carry the `fallback.status = "graph_indexing"` signal
+/// the retry honours. Mirrors the match arm in
+/// `ToolRegistry::execute_for_group_with_options`.
+const GRAPH_RETRYABLE_TOOL_NAMES: &[&str] = &[
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "upstream_flow",
+    "downstream_flow",
+    "hierarchy",
+    "read_slice",
+    "symbol_context",
+];
+
+/// Detect the transient cold-start signal emitted by
+/// `graph_unavailable_result(_, still_indexing = true)`:
+///
+/// ```json
+/// { "graph_available": false,
+///   "fallback": { "status": "graph_indexing", "retryable": true },
+///   ... }
+/// ```
+///
+/// Only graph-tool results are eligible — the tool-name gate is what
+/// keeps an unrelated tool whose payload happens to contain the same
+/// keys from being retried. A `ToolStatus::Success` is required because
+/// the graph dispatcher always wraps the fallback in `Success` (the
+/// fallback IS the success payload from the model's perspective until
+/// the agent decides to retry).
+fn is_graph_indexing_retryable_fallback(result: &ToolResult) -> bool {
+    if result.status != ToolStatus::Success {
+        return false;
+    }
+    if !GRAPH_RETRYABLE_TOOL_NAMES.contains(&result.tool_name.as_str()) {
+        return false;
+    }
+    let Some(fallback) = result.content.get("fallback") else {
+        return false;
+    };
+    let status = fallback
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let retryable = fallback
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
+    status == "graph_indexing" && retryable
+}
+
+/// Apply the transparent retry policy for graph cold-start. Given an
+/// `initial` tool result, this:
+///
+/// 1. Returns `initial` unchanged when it does not look like a
+///    `graph_indexing` retryable fallback (most calls), when the turn
+///    was already cancelled, or when sleeping for `wait` would block
+///    progress past a fresh cancel signal.
+/// 2. Otherwise sleeps for `wait`, then invokes `executor` to retry the
+///    same call once. The retry's outcome (success, another fallback,
+///    or an error) is what the caller sees — there is no third attempt.
+///
+/// Extracted from `run_one_tool` so the orchestration is testable in
+/// isolation without standing up a real `ToolRegistry` / tool I/O.
+async fn maybe_retry_graph_indexing<F, Fut>(
+    initial: ToolResult,
+    cancel: &CancellationToken,
+    wait: Duration,
+    executor: F,
+) -> ToolResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ToolResult>,
+{
+    if cancel.is_cancelled() || !is_graph_indexing_retryable_fallback(&initial) {
+        return initial;
+    }
+    tokio::time::sleep(wait).await;
+    if cancel.is_cancelled() {
+        return initial;
+    }
+    executor().await
+}
+
+/// Execute one tool call against the registry while emitting periodic
+/// `AgentEvent::ToolProgress` heartbeats. Factored out of `run_one_tool`
+/// so the transparent `graph_indexing` retry can invoke the same
+/// execution loop twice without duplicating the progress-ticker dance.
+async fn run_tool_exec_with_progress(
+    context: &ToolExecutionContext<'_>,
+    call: ToolCall,
+    cancel: CancellationToken,
+    options: ToolExecutionOptions,
+    progress_call_id: &str,
+    progress_tool_name: &str,
+    started: Instant,
+) -> ToolResult {
+    let exec_future = context.tools.execute_for_group_with_options(
+        call,
+        cancel,
+        context.turn_id.to_string(),
+        options,
+    );
+    tokio::pin!(exec_future);
+    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+    // `interval` fires immediately on first poll; skip that tick so the
+    // heartbeat only fires once the tool has actually been running.
+    progress_ticker.tick().await;
+    loop {
+        tokio::select! {
+            r = &mut exec_future => break r,
+            _ = progress_ticker.tick() => {
+                // See subagent heartbeat above for rationale: try_send so a
+                // full mpsc buffer can never block the select! loop and
+                // deadlock the running tool.
+                let _ = context.tx.try_send(AgentEvent::ToolProgress {
+                    turn_id: context.turn_id,
+                    call_id: progress_call_id.to_string(),
+                    tool_name: progress_tool_name.to_string(),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+    }
+}
 
 /// Emit an `AgentEvent::CostUpdate` if the broker has just crossed a
 /// `COST_UPDATE_STRIDE`-sized boundary. Call this immediately after
@@ -12081,6 +12295,20 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
             strict: false,
         }),
     }
+}
+
+/// Drop entries from `tools` whose name appears in
+/// `tools_config.excluded`. The list is small (typically <20 names) and
+/// the excluded set is short (used today by graph-vs-no-graph eval
+/// scenarios), so a per-entry scan is fine.
+pub(crate) fn retain_non_excluded_tools(
+    tools: &mut Vec<AdvertisedTool>,
+    tools_config: &ToolSchemaConfig,
+) {
+    if tools_config.excluded.is_empty() {
+        return;
+    }
+    tools.retain(|tool| !tools_config.is_excluded(tool.spec.name.as_str()));
 }
 
 /// Synthetic control tools that are advertised to the model on every

@@ -1,0 +1,78 @@
+id = "graph-vs-nograph-python-architectural-no-graph"
+title = "psf/requests exception-hierarchy audit — no graph (openai mini)"
+description = """
+No-graph half of the architectural Python A/B. Same prompt and pinned
+SHA as the with-graph half; graph tools excluded and the graph-first
+exploration planner disabled. The model must enumerate the
+`RequestException` subclass tree and count `raise` sites — including
+aliased imports — with only `grep` / `glob` / `read_file`.
+"""
+
+[workspace.github]
+repo = "psf/requests"
+sha = "cd90742ed94d901759e26766197d0ce7c7bd9c8e"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+Audit the exception hierarchy in `src/requests/exceptions.py`. List
+EVERY class that is a subclass (direct or transitive) of
+`RequestException` AND is defined in that file. Exclude the base
+`RequestException` itself and the `*Warning` classes
+(`RequestsWarning`, `FileModeWarning`, `RequestsDependencyWarning`).
+
+For each subclass, count its `raise` sites under `src/requests/`
+(exclude `tests/` and the `exceptions.py` definition file itself).
+Count BOTH the bare name (`raise SSLError(...)`) AND any aliased
+imports of that class (e.g. `from .exceptions import SSLError as
+RequestsSSLError` followed by `raise RequestsSSLError(...)` counts
+toward `SSLError`). Count only `raise <Name>(...)` expressions —
+ignore `except` clauses and docstring mentions.
+
+Output one line per subclass in this exact format, sorted
+alphabetically by class name:
+
+  <ClassName> <count>
+
+No prose, no extra commentary, no headers. Include subclasses with a
+count of `0`.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

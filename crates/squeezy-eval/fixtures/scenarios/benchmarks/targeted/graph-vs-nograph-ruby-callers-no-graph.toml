@@ -1,0 +1,76 @@
+id = "graph-vs-nograph-ruby-callers-no-graph"
+title = "sidekiq/sidekiq Sidekiq::Component#fire_event callers — no graph (openai mini)"
+description = """
+No-graph half of the Ruby cross-language A/B. Same prompt as the
+with-graph variant, but the semantic graph tools are removed so the
+model has to fall back to grep + read_file across the repo.
+"""
+
+[workspace.github]
+repo = "sidekiq/sidekiq"
+sha = "63f24c050bed5ab4e6b4efadb9f7f4f3932d5f0f"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+List every non-test call site of the instance method `fire_event`,
+defined on the `Sidekiq::Component` module in
+`lib/sidekiq/component.rb`.
+
+Exclude:
+- Files under `test/`.
+- The definition site itself (the `def fire_event` line).
+- Any `require` lines.
+
+Mixin-dispatched calls count: a bare `fire_event(...)` inside a
+class that `include`s `Sidekiq::Component` resolves to the module
+method and must be included.
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing method, in `Class#method` form for instance
+  methods (e.g. `Sidekiq::Launcher#stop`). Use the fully-qualified
+  class name including any enclosing module.
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false

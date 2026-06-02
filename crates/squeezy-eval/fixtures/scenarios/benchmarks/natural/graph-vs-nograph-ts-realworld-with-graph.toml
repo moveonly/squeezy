@@ -1,0 +1,123 @@
+id = "graph-vs-nograph-ts-realworld-with-graph"
+title = "nest microservices transport hierarchy — with graph (openai mini)"
+description = """
+Realistic TS A/B half. Pinned `nestjs/nest` SHA, focused on
+`packages/microservices/`. Models the user request "I want to audit
+every transport in the microservices package — for each backend
+(TCP, RMQ, Redis, NATS, Kafka, MQTT, gRPC) list the matching
+`Client*`, `Server*`, and `*Context` class, and for each one record
+the exact type arguments it pins on its abstract base
+(`ClientProxy<E, S>` / `Server<E, S>` / `BaseRpcContext<T>`). I need
+this because I'm about to drop the `EventsMap` slot on `ClientProxy`
+and need to know which transports already hard-pin it to `never`."
+
+The expected answer has 20 rows — one per concrete subclass of the
+three abstract base classes (7 `ClientProxy<E, S>`, 7
+`Server<E, S>`, 6 `BaseRpcContext<T>`). Each row requires type-aware
+reasoning: the subclasses are scattered across
+`packages/microservices/{client,server,ctx-host}/` and the base
+classes themselves are declared in three separate files; the
+generic arguments are the literal TypeScript types written between
+`<...>` in the `extends` clause (e.g. `TcpEvents, TcpStatus`,
+`never, KafkaStatus`, `KafkaContextArgs`), so the model has to read
+each subclass's class declaration line — multi-line `extends`
+clauses (`ClientGrpcProxy`, `ClientKafka`, `ServerNats`) require
+careful reading.
+
+The graph half can resolve each base class via `decl_search`, ask
+`hierarchy` or `reference_search` for the set of subclasses (TS
+graph knows that `extends` constraints on generic interface params
+are NOT subclass edges, so it cleanly excludes
+`TContext extends BaseRpcContext = any` noise in
+`request-context.interface.ts` and `request-context-host.ts`), and
+then `read_slice` each subclass's class-declaration span; the
+no-graph half has to grep `extends ClientProxy`,
+`extends Server`, `extends BaseRpcContext` across the whole tree,
+manually filter the type-parameter-constraint noise, and per match
+read enough lines to capture the full `<...>` (with multi-line
+clauses making naïve single-line greps lose data).
+"""
+
+[workspace.github]
+repo = "nestjs/nest"
+sha = "8859e8957ab07ce5503fa871c6ceb63d447e71ca"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 48
+
+[[steps]]
+kind = "prompt"
+text = """
+In the `nestjs/nest` repository, the microservices package
+(`packages/microservices/`) defines three abstract base classes
+that every transport implementation extends:
+
+- `ClientProxy<EventsMap, Status>` declared in
+  `packages/microservices/client/client-proxy.ts`
+- `Server<EventsMap, Status>` declared in
+  `packages/microservices/server/server.ts`
+- `BaseRpcContext<T>` declared in
+  `packages/microservices/ctx-host/base-rpc.context.ts`
+
+Audit every CONCRETE TypeScript subclass of these three bases under
+`packages/microservices/`. For each subclass, report the exact type
+arguments it pins on its abstract base — i.e. the literal text
+between the angle brackets on its `extends <Base><...>` clause.
+
+For each subclass give exactly four space-separated fields, one row
+per line, in this order:
+
+  <subclass> <base> <type-args> <file>
+
+where:
+- `<subclass>` is the class name (e.g. `ClientTCP`, `ServerGrpc`,
+  `KafkaContext`).
+- `<base>` is one of `ClientProxy`, `Server`, `BaseRpcContext`.
+- `<type-args>` is the literal text inside the `<...>` immediately
+  following the base-class name on the `extends` clause, with no
+  surrounding spaces, separated by `, ` (comma + single space).
+  Examples: `TcpEvents, TcpStatus`, `never, never`,
+  `never, KafkaStatus`, `E, S`, `KafkaContextArgs`. When the
+  `extends` clause spans multiple lines, read enough of the file to
+  recover the full bracketed list.
+- `<file>` is the path of the subclass's `.ts` file relative to the
+  repo root.
+
+Constraints:
+- TypeScript only — exclude `.js`, `.jsx`, `.mjs`, `.cjs` files
+  entirely. Only look at `.ts` files.
+- Exclude anything under `test/`, `*.spec.ts`, `*.d.ts`,
+  `external/` (the bundled `kafka.interface.ts` declarations are
+  not subclasses of the three bases anyway), and `node_modules/`.
+- Only count CLASSES that `extends <Base><...>` as part of their
+  declaration. Do NOT count generic type-parameter constraints of
+  the form `TContext extends BaseRpcContext = any` that appear in
+  interface or function signatures — those are not subclasses.
+- Only count CONCRETE subclasses (i.e. `export class ...`). Do not
+  include the abstract base classes themselves.
+- For `BaseRpcContext`, the gRPC transport intentionally has no
+  context subclass — do not invent one.
+
+Sort the rows lexicographically by `<subclass>`. Output a compact
+plain-text list. No prose, no extra commentary, no headers. The
+expected answer has 20 rows.
+"""
+
+[expect]
+max_wall_clock_seconds = 540
+max_input_tokens = 250000
+
+[triage]
+enabled = false

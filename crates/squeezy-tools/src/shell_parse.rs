@@ -1103,6 +1103,16 @@ fn shell_segment_has_destructive_redirect(segment: &str) -> bool {
                 i += 2;
             }
             (None, b'>') => {
+                // `=>` is a JS/TS arrow (e.g. inside a `node - <<'NODE'`
+                // heredoc body the byte-scan fallback inspects when the
+                // bash grammar choked on the body). It is not a shell
+                // redirect, so skip it. Mirrors the existing `>&` (fd
+                // duplication) and `>|` (force-overwrite) exclusions
+                // below.
+                if i > 0 && bytes[i - 1] == b'=' {
+                    i += 1;
+                    continue;
+                }
                 // Skip the run of `>` characters (handles `>`, `>>`).
                 let mut j = i + 1;
                 while j < bytes.len() && bytes[j] == b'>' {

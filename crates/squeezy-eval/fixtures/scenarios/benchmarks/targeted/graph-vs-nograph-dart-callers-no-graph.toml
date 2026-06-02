@@ -1,0 +1,77 @@
+id = "graph-vs-nograph-dart-callers-no-graph"
+title = "felangel/bloc LintContext.reportToken callers — no graph (openai mini)"
+description = """
+No-graph half of the Dart callers A/B. Same prompt as the with-graph
+variant, but the semantic graph tools are removed so the model has to
+fall back to grep + read_file across the repo.
+"""
+
+[workspace.github]
+repo = "felangel/bloc"
+sha = "ff675f7078aa90470b222a8ae07673522ef32233"
+
+[squeezy]
+provider = "openai"
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+tool_choice = "auto"
+instructions = """
+You are Squeezy, a cost-aware coding agent. Answer code questions
+concisely using whatever tools are available to you. Cite file paths
+and 1-based line numbers when relevant. Do not invent symbols. Stop
+once you have enough evidence to answer the question, and answer in
+the exact requested format.
+"""
+max_tool_calls_per_turn = 32
+excluded_tools = [
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "read_slice",
+    "upstream_flow",
+    "downstream_flow",
+    "diff_context",
+    "plan_patch",
+    "refresh_compiler_facts",
+]
+
+[env_vars]
+SQUEEZY_EXPLORATION_COMPILER = "0"
+
+[[steps]]
+kind = "prompt"
+text = """
+List every call site of the instance method `reportToken` declared on
+`LintContext` in `packages/bloc_lint/lib/src/linter.dart`.
+
+Exclude:
+- The definition site itself.
+- Any call to the sibling method `reportTokenRange` (different method,
+  same prefix).
+- Anything under a `test/` directory.
+- Anything under an `example/` directory.
+- Doc-comment references (lines whose call appears inside `///` or
+  `/** ... */`).
+
+Include calls written as `context.reportToken(...)` and any other
+syntactic form that resolves to the same `LintContext.reportToken`
+method.
+
+For each call site give exactly three fields, one per line:
+- `file`: path relative to repo root
+- `line`: 1-based line number of the call
+- `caller`: enclosing method name (e.g. `_Listener.beginImport`)
+
+Output as a compact plain-text list. No prose, no extra commentary.
+"""
+
+[expect]
+max_wall_clock_seconds = 360
+max_input_tokens = 200000
+
+[triage]
+enabled = false
