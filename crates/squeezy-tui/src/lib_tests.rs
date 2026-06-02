@@ -255,6 +255,58 @@ fn subagent_pane_renders_below_status_without_hiding_prompt() {
     assert!(pane_line > status_line, "{output}");
 }
 
+fn render_subagent_pane_to_string(app: &TuiApp, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, width, height);
+            render_subagent_pane(frame, area, app);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut output = String::new();
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
+}
+
+#[test]
+fn subagent_pane_overflow_marks_hidden_and_keeps_newest_reachable() {
+    let mut app = test_app(SessionMode::Build);
+    for id in 1..=8 {
+        app.note_subagent_started(id, "delegate".to_string(), format!("task {id}"));
+        app.note_subagent_activity(id, "delegate".to_string(), format!("running tool {id}"));
+    }
+    // Default unfocused state during a turn: nothing record-level selected.
+    assert_eq!(app.subagent_pane.selected, 0);
+    assert!(!app.subagent_pane.focused);
+    assert_eq!(app.subagent_pane.records.len(), 8);
+    // Layout caps the pane at 7 rows (1 header + 6 record slots).
+    assert_eq!(subagent_pane_height(&app), 7);
+
+    let output = render_subagent_pane_to_string(&app, 120, 7);
+    // The header carries an overflow marker for the records scrolled past.
+    assert!(output.contains("main"), "{output}");
+    assert!(
+        output.contains("↑2 more"),
+        "header should mark hidden subagents: {output}"
+    );
+    // The newest subagent (#8, started last) must remain visible; the oldest
+    // two are the ones scrolled out of view.
+    assert!(output.contains("delegate #8"), "{output}");
+    assert!(output.contains("delegate #3"), "{output}");
+    assert!(
+        !output.contains("delegate #1"),
+        "oldest record should be hidden, not the newest: {output}"
+    );
+    assert!(!output.contains("delegate #2"), "{output}");
+}
+
 #[tokio::test]
 async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     let mut agent = test_agent(SessionMode::Build);

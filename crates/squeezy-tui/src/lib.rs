@@ -12233,18 +12233,55 @@ fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if area.height == 0 {
         return;
     }
-    let all_lines = subagent_pane_lines(app, area.width);
     let visible = usize::from(area.height);
-    let selected = app
+    let record_count = app.subagent_pane.records.len();
+    // The `main` header is pinned to the top; records scroll within the
+    // remaining slots so a high-fanout list overflows without hiding the
+    // header. With room for every record we render the full list.
+    let record_slots = visible.saturating_sub(1);
+    if record_count <= record_slots || record_slots == 0 {
+        frame.render_widget(Paragraph::new(subagent_pane_lines(app, area.width)), area);
+        return;
+    }
+    // Records overflow the window. Slide it so the selected record stays
+    // visible; when nothing record-level is selected (the default while a
+    // turn is in flight and the pane is unfocused), anchor to the newest
+    // records so the live view tracks the current fanout instead of pinning
+    // to the oldest few. `selected == 0` addresses the `main` row.
+    let start = match app.subagent_pane.selected.checked_sub(1) {
+        Some(sel) if sel < record_slots => 0,
+        Some(sel) => (sel + 1 - record_slots).min(record_count - record_slots),
+        None => record_count - record_slots,
+    };
+    let hidden_above = start;
+    let hidden_below = record_count - (start + record_slots);
+    let mut main_row = subagent_main_row(app, area.width);
+    if hidden_above > 0 {
+        main_row.spans.push(Span::styled(
+            format!(" · ↑{hidden_above} more"),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    let mut lines = Vec::with_capacity(record_slots + 1);
+    lines.push(main_row);
+    for (index, record) in app
         .subagent_pane
-        .selected
-        .min(all_lines.len().saturating_sub(1));
-    let offset = selected.saturating_add(1).saturating_sub(visible);
-    let lines = all_lines
-        .into_iter()
-        .skip(offset)
-        .take(visible)
-        .collect::<Vec<_>>();
+        .records
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(record_slots)
+    {
+        lines.push(subagent_record_row(app, index, record, area.width));
+    }
+    if hidden_below > 0 {
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled(
+                format!(" · +{hidden_below} more"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
