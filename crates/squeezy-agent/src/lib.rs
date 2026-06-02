@@ -129,7 +129,7 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// Hard cap on the number of steps a single `delegate_chain` call may
 /// declare. Each step burns a full subagent lease + LLM round, so the
 /// chain is intentionally narrower than the parent agent's per-turn tool
-/// budget. Eight steps is enough to thread a non-trivial multi-stage
+/// budget. A modest cap is enough to thread a non-trivial multi-stage
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
