@@ -570,7 +570,7 @@ async fn run_judge(
         }
         (Some(text), cost)
     };
-    let (raw, cost) = tokio::select! {
+    let (raw, mut cost) = tokio::select! {
         biased;
         _ = cancel.cancelled() => return (None, CostSnapshot::default()),
         _ = tokio::time::sleep(Duration::from_millis(JUDGE_TIMEOUT_MS)) => {
@@ -578,6 +578,9 @@ async fn run_judge(
         }
         result = fetch => result,
     };
+    if cost.estimated_usd_micros.is_none() {
+        cost.estimated_usd_micros = squeezy_llm::estimate_cost(provider_name, cheap_model, &cost);
+    }
     let verdict = raw.and_then(|text| parse_judge_reply(&text));
     (verdict, cost)
 }
