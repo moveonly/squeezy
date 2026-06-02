@@ -48,10 +48,11 @@ pub(crate) struct PromptInput {
 /// exclamation mark (e.g. "!important: …"). Whitespace before the
 /// double-bang is preserved as content so callers can't accidentally
 /// hide the prefix behind a leading newline.
-pub(crate) fn classify_prompt(content: String) -> PromptInput {
-    if let Some(rest) = content.strip_prefix("!!") {
+pub(crate) fn classify_prompt(mut content: String) -> PromptInput {
+    if content.starts_with("!!") {
+        content.drain(..2);
         PromptInput {
-            content: rest.to_string(),
+            content,
             exclude_from_context: true,
         }
     } else {

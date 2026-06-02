@@ -49,13 +49,20 @@ pub(crate) fn anthropic_header_value(betas: &[Arc<str>]) -> Option<String> {
     if deduped.is_empty() {
         return None;
     }
-    Some(
+    let mut header = String::with_capacity(
         deduped
             .iter()
-            .map(|beta| beta.as_ref())
-            .collect::<Vec<_>>()
-            .join(","),
-    )
+            .map(|beta| beta.as_ref().len())
+            .sum::<usize>()
+            + deduped.len().saturating_sub(1),
+    );
+    for (index, beta) in deduped.iter().enumerate() {
+        if index > 0 {
+            header.push(',');
+        }
+        header.push_str(beta.as_ref());
+    }
+    Some(header)
 }
 
 /// Subset of `betas` that Bedrock accepts via

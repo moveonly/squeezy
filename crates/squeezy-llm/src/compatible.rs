@@ -7,8 +7,7 @@
 //! native OpenAI provider stays on the `/responses` endpoint and is not
 //! routed through here.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use async_stream::try_stream;
 use base64::Engine as _;
@@ -1408,9 +1407,9 @@ fn drain_reasoning(state: &mut StreamState) -> Option<LlmEvent> {
 /// an array whose elements expose either a `text` or `delta` string field
 /// (regardless of `type`, which varies — `text`, `output_text`,
 /// `output_text_delta`, `text_delta`, `reasoning`, etc).
-fn collect_delta_text(value: Option<&Value>) -> String {
+fn collect_delta_text(value: Option<&Value>) -> Option<Cow<'_, str>> {
     match value {
-        Some(Value::String(text)) => text.clone(),
+        Some(Value::String(text)) if !text.is_empty() => Some(Cow::Borrowed(text)),
         Some(Value::Array(parts)) => {
             let mut out = String::new();
             for part in parts {
@@ -1420,9 +1419,29 @@ fn collect_delta_text(value: Option<&Value>) -> String {
                     out.push_str(delta);
                 }
             }
-            out
+            if out.is_empty() {
+                None
+            } else {
+                Some(Cow::Owned(out))
+            }
         }
-        _ => String::new(),
+        _ => None,
+    }
+}
+
+fn collect_reasoning_delta(delta: &Value) -> Option<Cow<'_, str>> {
+    match (
+        collect_delta_text(delta.get("reasoning_content")),
+        collect_delta_text(delta.get("reasoning")),
+    ) {
+        (Some(left), Some(right)) => {
+            let mut text = String::with_capacity(left.len() + right.len());
+            text.push_str(&left);
+            text.push_str(&right);
+            Some(Cow::Owned(text))
+        }
+        (Some(text), None) | (None, Some(text)) => Some(text),
+        (None, None) => None,
     }
 }
 
@@ -1920,17 +1939,14 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
             // accumulator partitions correctly across choices.
             let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if let Some(delta) = choice.get("delta") {
-                let reasoning = collect_delta_text(delta.get("reasoning_content"))
-                    + &collect_delta_text(delta.get("reasoning"));
-                if !reasoning.is_empty() {
+                if let Some(reasoning) = collect_reasoning_delta(delta) {
                     state.reasoning_buf.push_str(&reasoning);
                     events.push(LlmEvent::ReasoningDelta {
-                        text: reasoning,
+                        text: reasoning.into_owned(),
                         kind: ReasoningKind::Summary,
                     });
                 }
-                let content = collect_delta_text(delta.get("content"));
-                if !content.is_empty() {
+                if let Some(content) = collect_delta_text(delta.get("content")) {
                     // H-43: when the preset is CF Workers AI (or
                     // another upstream we know inlines reasoning
                     // via `<think>...</think>` tags on the
@@ -1941,7 +1957,8 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                     // the thinking pane and downstream cost /
                     // event consumers see the right kind of
                     // signal.
-                    let (reasoning_span, visible_span) = split_inline_think(state, content);
+                    let (reasoning_span, visible_span) =
+                        split_inline_think(state, content.into_owned());
                     if !reasoning_span.is_empty() {
                         state.reasoning_buf.push_str(&reasoning_span);
                         events.push(LlmEvent::ReasoningDelta {

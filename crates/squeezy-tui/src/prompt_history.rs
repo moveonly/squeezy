@@ -99,12 +99,17 @@ impl PromptHistory {
         } else {
             false
         };
-        self.entries.push_back(prompt.clone());
-        if let Some(path) = self.persist_path.clone() {
+        self.entries.push_back(prompt);
+        if let Some(path) = self.persist_path.as_deref() {
             let result = if dropped_oldest {
-                rewrite_disk(&path, &self.entries)
+                rewrite_disk(path, &self.entries)
             } else {
-                append_disk(&path, &prompt)
+                append_disk(
+                    path,
+                    self.entries
+                        .back()
+                        .expect("newly pushed prompt remains in history"),
+                )
             };
             if let Err(err) = result {
                 tracing::warn!(

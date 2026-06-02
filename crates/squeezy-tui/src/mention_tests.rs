@@ -110,6 +110,29 @@ fn rank_reports_total_candidates_above_max_matches() {
 }
 
 #[test]
+fn rank_preserves_stable_tie_order_when_truncated() {
+    let files: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("ab_tie_{i}.rs")))
+        .collect();
+    let (out, total) = rank_files("ab", &files);
+    assert_eq!(total, files.len());
+    assert_eq!(out, files[..MAX_MATCHES].to_vec());
+}
+
+#[test]
+fn rank_keeps_late_high_score_inside_top_matches() {
+    let mut files: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("a_____b_{i}.rs")))
+        .collect();
+    files.push(PathBuf::from("ab.rs"));
+
+    let (out, total) = rank_files("ab", &files);
+    assert_eq!(total, files.len());
+    assert_eq!(out.len(), MAX_MATCHES);
+    assert_eq!(out.first(), Some(&PathBuf::from("ab.rs")));
+}
+
+#[test]
 fn apply_inserts_path_and_returns_new_cursor() {
     let q = MentionQuery {
         start: 6,

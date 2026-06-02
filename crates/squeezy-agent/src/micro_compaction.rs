@@ -16,7 +16,7 @@
 //! already return receipt-stubbed or otherwise small payloads
 //! (`notes_recall`, `checkpoint_*`, MCP control calls) are intentionally
 //! excluded — there is nothing worth clearing.
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::AppConfig;
@@ -93,34 +93,30 @@ pub(crate) fn maybe_micro_compact_mid_turn(
         return None;
     }
 
-    let compactable_ids = collect_compactable_call_ids(conversation);
-    if compactable_ids.len() <= cc.micro_compaction_keep_recent {
-        return None;
-    }
-    let keep_recent = cc.micro_compaction_keep_recent.max(1);
-    let clear_count = compactable_ids.len().saturating_sub(keep_recent);
-    let clear_set: BTreeSet<&str> = compactable_ids
-        .iter()
-        .take(clear_count)
-        .map(|(call_id, _)| call_id.as_str())
-        .collect();
+    let clear_targets: BTreeMap<String, String> = {
+        let compactable_ids = collect_compactable_call_ids(conversation);
+        if compactable_ids.len() <= cc.micro_compaction_keep_recent {
+            return None;
+        }
+        let keep_recent = cc.micro_compaction_keep_recent.max(1);
+        let clear_count = compactable_ids.len().saturating_sub(keep_recent);
+        compactable_ids
+            .iter()
+            .take(clear_count)
+            .map(|(call_id, name)| ((*call_id).to_string(), (*name).to_string()))
+            .collect()
+    };
 
-    let mut tool_names: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
-    for (call_id, name) in &compactable_ids {
-        tool_names.insert(call_id.as_str(), name.as_str());
-    }
-
-    let mut cleared_call_ids = Vec::new();
+    let mut cleared_call_ids = Vec::with_capacity(clear_targets.len());
     let mut bytes_saved: usize = 0;
     for item in conversation.iter_mut() {
         if let LlmInputItem::FunctionCallOutput {
             call_id, output, ..
         } = item
-            && clear_set.contains(call_id.as_str())
+            && let Some(tool_name) = clear_targets.get(call_id.as_str())
             && !is_already_cleared(output)
         {
             let original_bytes = output.len();
-            let tool_name = tool_names.get(call_id.as_str()).copied().unwrap_or("?");
             let replacement = format!(
                 "{prefix} — call_id={call_id}, name={tool_name}, original_bytes={original_bytes}]",
                 prefix = MICRO_COMPACT_CLEARED_PREFIX,
@@ -148,9 +144,8 @@ pub(crate) fn maybe_micro_compact_mid_turn(
 /// for every `FunctionCallOutput` whose declaring `FunctionCall` names a
 /// compactable tool. Order is preserved so the caller can drop the
 /// trailing `keep_recent` and clear the rest.
-fn collect_compactable_call_ids(conversation: &[LlmInputItem]) -> Vec<(String, String)> {
-    let mut tool_for_call: std::collections::BTreeMap<&str, &str> =
-        std::collections::BTreeMap::new();
+fn collect_compactable_call_ids(conversation: &[LlmInputItem]) -> Vec<(&str, &str)> {
+    let mut tool_for_call: BTreeMap<&str, &str> = BTreeMap::new();
     for item in conversation {
         if let LlmInputItem::FunctionCall { call_id, name, .. } = item
             && COMPACTABLE_TOOL_NAMES.contains(&name.as_str())
@@ -158,12 +153,12 @@ fn collect_compactable_call_ids(conversation: &[LlmInputItem]) -> Vec<(String, S
             tool_for_call.insert(call_id.as_str(), name.as_str());
         }
     }
-    let mut pairs = Vec::new();
+    let mut pairs = Vec::with_capacity(tool_for_call.len());
     for item in conversation {
         if let LlmInputItem::FunctionCallOutput { call_id, .. } = item
             && let Some(name) = tool_for_call.get(call_id.as_str())
         {
-            pairs.push((call_id.clone(), (*name).to_string()));
+            pairs.push((call_id.as_str(), *name));
         }
     }
     pairs

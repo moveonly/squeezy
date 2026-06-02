@@ -256,19 +256,21 @@ pub(crate) fn parse_keyspec(spec: &str) -> Option<KeyBinding> {
         if token.is_empty() {
             return None;
         }
-        match token.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
-            "alt" | "meta" | "opt" | "option" => modifiers |= KeyModifiers::ALT,
-            "shift" => modifiers |= KeyModifiers::SHIFT,
-            "super" | "cmd" | "win" | "windows" => modifiers |= KeyModifiers::SUPER,
-            _ => {
-                if key_part.is_some() {
-                    // More than one non-modifier token isn't a valid
-                    // spec ("Ctrl+a+b" makes no sense).
-                    return None;
-                }
-                key_part = Some(token);
+        if eq_any_ignore_ascii_case(token, &["ctrl", "control"]) {
+            modifiers |= KeyModifiers::CONTROL;
+        } else if eq_any_ignore_ascii_case(token, &["alt", "meta", "opt", "option"]) {
+            modifiers |= KeyModifiers::ALT;
+        } else if token.eq_ignore_ascii_case("shift") {
+            modifiers |= KeyModifiers::SHIFT;
+        } else if eq_any_ignore_ascii_case(token, &["super", "cmd", "win", "windows"]) {
+            modifiers |= KeyModifiers::SUPER;
+        } else {
+            if key_part.is_some() {
+                // More than one non-modifier token isn't a valid
+                // spec ("Ctrl+a+b" makes no sense).
+                return None;
             }
+            key_part = Some(token);
         }
     }
     let key = key_part?;
@@ -277,65 +279,96 @@ pub(crate) fn parse_keyspec(spec: &str) -> Option<KeyBinding> {
 }
 
 fn parse_keycode(token: &str) -> Option<KeyCode> {
-    let lower = token.to_ascii_lowercase();
-    match lower.as_str() {
-        "enter" | "return" => Some(KeyCode::Enter),
-        "tab" => Some(KeyCode::Tab),
-        "backtab" | "shift-tab" | "shifttab" => Some(KeyCode::BackTab),
-        "esc" | "escape" => Some(KeyCode::Esc),
-        "space" => Some(KeyCode::Char(' ')),
-        "backspace" | "bs" => Some(KeyCode::Backspace),
-        "delete" | "del" => Some(KeyCode::Delete),
-        "insert" | "ins" => Some(KeyCode::Insert),
-        "home" => Some(KeyCode::Home),
-        "end" => Some(KeyCode::End),
-        "pageup" | "pgup" => Some(KeyCode::PageUp),
-        "pagedown" | "pgdn" => Some(KeyCode::PageDown),
-        "left" => Some(KeyCode::Left),
-        "right" => Some(KeyCode::Right),
-        "up" => Some(KeyCode::Up),
-        "down" => Some(KeyCode::Down),
-        _ => {
-            // Function keys: F1..F24.
-            if let Some(rest) = lower.strip_prefix('f') {
-                if let Ok(n) = rest.parse::<u8>()
-                    && (1..=24).contains(&n)
-                {
-                    return Some(KeyCode::F(n));
-                }
-                return None;
+    if eq_any_ignore_ascii_case(token, &["enter", "return"]) {
+        Some(KeyCode::Enter)
+    } else if token.eq_ignore_ascii_case("tab") {
+        Some(KeyCode::Tab)
+    } else if eq_any_ignore_ascii_case(token, &["backtab", "shift-tab", "shifttab"]) {
+        Some(KeyCode::BackTab)
+    } else if eq_any_ignore_ascii_case(token, &["esc", "escape"]) {
+        Some(KeyCode::Esc)
+    } else if token.eq_ignore_ascii_case("space") {
+        Some(KeyCode::Char(' '))
+    } else if eq_any_ignore_ascii_case(token, &["backspace", "bs"]) {
+        Some(KeyCode::Backspace)
+    } else if eq_any_ignore_ascii_case(token, &["delete", "del"]) {
+        Some(KeyCode::Delete)
+    } else if eq_any_ignore_ascii_case(token, &["insert", "ins"]) {
+        Some(KeyCode::Insert)
+    } else if token.eq_ignore_ascii_case("home") {
+        Some(KeyCode::Home)
+    } else if token.eq_ignore_ascii_case("end") {
+        Some(KeyCode::End)
+    } else if eq_any_ignore_ascii_case(token, &["pageup", "pgup"]) {
+        Some(KeyCode::PageUp)
+    } else if eq_any_ignore_ascii_case(token, &["pagedown", "pgdn"]) {
+        Some(KeyCode::PageDown)
+    } else if token.eq_ignore_ascii_case("left") {
+        Some(KeyCode::Left)
+    } else if token.eq_ignore_ascii_case("right") {
+        Some(KeyCode::Right)
+    } else if token.eq_ignore_ascii_case("up") {
+        Some(KeyCode::Up)
+    } else if token.eq_ignore_ascii_case("down") {
+        Some(KeyCode::Down)
+    } else {
+        // Function keys: F1..F24.
+        if let Some(rest) = token.strip_prefix('f').or_else(|| token.strip_prefix('F')) {
+            if let Ok(n) = rest.parse::<u8>()
+                && (1..=24).contains(&n)
+            {
+                return Some(KeyCode::F(n));
             }
-            // Single character: keep the user's casing so shifted
-            // letters round-trip through `display()` cleanly.
-            let mut chars = token.chars();
-            let ch = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            Some(KeyCode::Char(ch))
+            return None;
         }
+        // Single character: keep the user's casing so shifted
+        // letters round-trip through `display()` cleanly.
+        let mut chars = token.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        Some(KeyCode::Char(ch))
     }
 }
 
+fn eq_any_ignore_ascii_case(token: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| token.eq_ignore_ascii_case(candidate))
+}
+
 fn format_binding(code: KeyCode, modifiers: KeyModifiers) -> String {
-    let mut parts: Vec<&'static str> = Vec::new();
+    let key = format_keycode(code);
+    let mut out = String::new();
     if modifiers.contains(KeyModifiers::CONTROL) {
-        parts.push("Ctrl");
+        out.push_str("Ctrl");
     }
     if modifiers.contains(KeyModifiers::ALT) {
-        parts.push("Alt");
+        if !out.is_empty() {
+            out.push('+');
+        }
+        out.push_str("Alt");
     }
     if modifiers.contains(KeyModifiers::SHIFT) {
-        parts.push("Shift");
+        if !out.is_empty() {
+            out.push('+');
+        }
+        out.push_str("Shift");
     }
     if modifiers.contains(KeyModifiers::SUPER) {
-        parts.push("Super");
+        if !out.is_empty() {
+            out.push('+');
+        }
+        out.push_str("Super");
     }
-    let key = format_keycode(code);
-    if parts.is_empty() {
+    if out.is_empty() {
         key
     } else {
-        format!("{}+{}", parts.join("+"), key)
+        out.reserve(key.len() + 1);
+        out.push('+');
+        out.push_str(&key);
+        out
     }
 }
 
@@ -400,8 +433,14 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
         lines.push(String::new());
         lines.push("Collisions:".to_string());
         for (binding, actions) in collisions {
-            let names: Vec<String> = actions.iter().map(|a| a.slug().to_string()).collect();
-            lines.push(format!("  {} → {}", binding.display(), names.join(", ")));
+            let mut names = String::new();
+            for action in actions {
+                if !names.is_empty() {
+                    names.push_str(", ");
+                }
+                names.push_str(action.slug());
+            }
+            lines.push(format!("  {} → {}", binding.display(), names));
         }
     }
     if !resolver.unknown_actions.is_empty() {

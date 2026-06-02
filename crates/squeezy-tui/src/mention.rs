@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -194,7 +195,7 @@ fn git_index_mtime(root: &Path) -> Option<SystemTime> {
 /// can render a `(idx/total)` footer that still reflects how many
 /// matches exist beyond the displayed window.
 ///
-/// Delegates to [`crate::fuzzy::score`] (higher is better) so the
+/// Delegates to the fuzzy scorer (higher is better) so the
 /// composer typeahead shares the same word-boundary / consecutive-run
 /// scoring as the slash menu. Filename-prefix hits stay on top
 /// naturally — `@lib` matched against `lib.rs` earns word-boundary
@@ -209,28 +210,53 @@ pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> (Vec<PathBuf>, usize
             .collect();
         return (matches, files.len());
     }
-    let query_lower = query.to_ascii_lowercase();
-    let mut scored: Vec<(i32, &Path)> = files
-        .iter()
-        .filter_map(|path| {
+    let query = crate::fuzzy::PreparedQuery::new(query);
+    let mut top = Vec::with_capacity(MAX_MATCHES + 1);
+    let mut total = 0;
+    for (index, path) in files.iter().enumerate() {
+        if let Some(score) = {
             let display = path.to_string_lossy();
-            let score = crate::fuzzy::score(&display, &query_lower)?;
-            Some((score, path.as_path()))
-        })
-        .collect();
-    let total = scored.len();
-    // Higher score first; on tie shorter path first since it is
-    // usually closer to what the user meant.
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(a.1.as_os_str().len().cmp(&b.1.as_os_str().len()))
-    });
-    let matches: Vec<PathBuf> = scored
+            crate::fuzzy::score_prepared(&display, &query)
+        } {
+            total += 1;
+            top.push(ScoredPath {
+                score,
+                path: path.as_path(),
+                index,
+            });
+            top.sort_by(compare_scored_paths);
+            if top.len() > MAX_MATCHES {
+                top.pop();
+            }
+        }
+    }
+    let matches = top
         .into_iter()
-        .take(MAX_MATCHES)
-        .map(|(_, p)| p.to_path_buf())
+        .map(|scored| scored.path.to_path_buf())
         .collect();
     (matches, total)
+}
+
+struct ScoredPath<'a> {
+    score: i32,
+    path: &'a Path,
+    index: usize,
+}
+
+fn compare_scored_paths(left: &ScoredPath<'_>, right: &ScoredPath<'_>) -> Ordering {
+    // Higher score first; on tie shorter path first since it is
+    // usually closer to what the user meant. Equal score and length
+    // preserve the input order that the previous stable full sort used.
+    right
+        .score
+        .cmp(&left.score)
+        .then(
+            left.path
+                .as_os_str()
+                .len()
+                .cmp(&right.path.as_os_str().len()),
+        )
+        .then(left.index.cmp(&right.index))
 }
 
 /// Popup state attached to the app.

@@ -61,29 +61,41 @@ pub(crate) fn shape_shell_output(
 fn shell_output_family(command: &str) -> &'static str {
     let command = collapse_whitespace(command);
     let segments = shell_segments(&command);
-    let prefixes = segments
-        .iter()
-        .map(|segment| shell_command_prefix(segment))
-        .collect::<Vec<_>>();
-    if prefixes.iter().any(|prefix| prefix == "cargo nextest") {
+    let mut has_nextest = false;
+    let mut has_cargo = false;
+    let mut has_rustc = false;
+    let mut has_pytest = false;
+    let mut has_jest = false;
+    let mut has_vitest = false;
+    for segment in &segments {
+        let prefix = shell_command_prefix(segment);
+        if prefix == "cargo nextest" {
+            has_nextest = true;
+        } else if prefix.starts_with("cargo ") {
+            has_cargo = true;
+        } else if prefix == "rustc" {
+            has_rustc = true;
+        } else if prefix == "pytest" {
+            has_pytest = true;
+        }
+        if prefix == "jest" || shell_segment_contains_command(segment, "jest") {
+            has_jest = true;
+        }
+        if prefix == "vitest" || shell_segment_contains_command(segment, "vitest") {
+            has_vitest = true;
+        }
+    }
+    if has_nextest {
         "nextest"
-    } else if prefixes.iter().any(|prefix| prefix.starts_with("cargo ")) {
+    } else if has_cargo {
         "cargo"
-    } else if prefixes.iter().any(|prefix| prefix == "rustc") {
+    } else if has_rustc {
         "rustc"
-    } else if prefixes.iter().any(|prefix| prefix == "pytest") {
+    } else if has_pytest {
         "pytest"
-    } else if prefixes.iter().any(|prefix| prefix == "jest")
-        || segments
-            .iter()
-            .any(|segment| shell_segment_contains_command(segment, "jest"))
-    {
+    } else if has_jest {
         "jest"
-    } else if prefixes.iter().any(|prefix| prefix == "vitest")
-        || segments
-            .iter()
-            .any(|segment| shell_segment_contains_command(segment, "vitest"))
-    {
+    } else if has_vitest {
         "vitest"
     } else {
         "shell"
@@ -93,7 +105,10 @@ fn shell_output_family(command: &str) -> &'static str {
 fn shell_segment_contains_command(segment: &str, command: &str) -> bool {
     segment.split_whitespace().any(|word| {
         let word = word.trim_matches(|ch| matches!(ch, '\'' | '"' | '(' | ')' | ';'));
-        word == command || word.ends_with(&format!("/{command}"))
+        word == command
+            || word
+                .strip_suffix(command)
+                .is_some_and(|prefix| prefix.ends_with('/'))
     })
 }
 
@@ -119,7 +134,12 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
     let mut parsed = 0usize;
     let mut finished = None;
     for line in stdout.lines().chain(stderr.lines()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+        let value = if line_may_start_json_object(line) {
+            serde_json::from_str::<Value>(line).ok()
+        } else {
+            None
+        };
+        let Some(value) = value else {
             // Cargo emits libtest's plain-text harness output (e.g. "test result:
             // FAILED.", panic backtraces, "FAILED" markers) interleaved with the
             // JSON stream. Preserve those signal lines so shaped output still
@@ -220,6 +240,9 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     let mut skipped = 0usize;
     let mut last_summary: Option<Value> = None;
     for line in stdout.lines().chain(stderr.lines()) {
+        if !line_may_start_json_object(line) {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -287,7 +310,9 @@ fn parse_first_valid_json(text: &str) -> Option<Value> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+    if text_may_start_json_value(trimmed)
+        && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+    {
         return Some(value);
     }
     // Fall back to scanning for the first line that parses as JSON, so a
@@ -295,7 +320,29 @@ fn parse_first_valid_json(text: &str) -> Option<Value> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| text_may_start_json_value(line))
         .find_map(|line| serde_json::from_str::<Value>(line).ok())
+}
+
+fn line_may_start_json_object(line: &str) -> bool {
+    trim_json_whitespace(line).as_bytes().first() == Some(&b'{')
+}
+
+fn text_may_start_json_value(text: &str) -> bool {
+    let text = trim_json_whitespace(text);
+    let bytes = text.as_bytes();
+    match bytes.first().copied() {
+        Some(b'{' | b'[' | b'"' | b'0'..=b'9') => true,
+        Some(b'-') => matches!(bytes.get(1), Some(b'0'..=b'9')),
+        Some(b't') => text.starts_with("true"),
+        Some(b'f') => text.starts_with("false"),
+        Some(b'n') => text.starts_with("null"),
+        _ => false,
+    }
+}
+
+fn trim_json_whitespace(text: &str) -> &str {
+    text.trim_start_matches([' ', '\n', '\r', '\t'])
 }
 
 fn json_test_summary(value: &Value, family: &str) -> String {
@@ -531,9 +578,15 @@ fn trim_shaped_block(text: &str, max_chars: usize) -> String {
 }
 
 fn join_shaped_lines(lines: Vec<String>) -> String {
-    lines
-        .into_iter()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut output = String::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&line);
+    }
+    output
 }

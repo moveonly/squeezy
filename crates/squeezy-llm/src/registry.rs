@@ -1,4 +1,8 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+    sync::{Arc, LazyLock, RwLock},
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -143,6 +147,10 @@ pub struct RequestTokenEstimate {
 }
 
 pub static MODEL_REGISTRY: LazyLock<Vec<ModelInfo>> = LazyLock::new(load_models);
+static FALLBACK_MODEL_CACHE: LazyLock<RwLock<FallbackModelCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+type FallbackModelCache = HashMap<&'static str, HashMap<&'static str, &'static ModelInfo>>;
 
 #[derive(Debug, Deserialize)]
 struct RawModelInfo {
@@ -181,11 +189,11 @@ fn model_info_from_raw(raw: RawModelInfo) -> ModelInfo {
     }
 }
 
-fn fallback_model_info(provider: &str, model: &str) -> ModelInfo {
+fn fallback_model_info(provider: &'static str, model: &'static str) -> ModelInfo {
     let tokenizer = fallback_tokenizer(provider, model);
     ModelInfo {
-        provider: leak_string(provider.to_string()),
-        id: leak_string(model.to_string()),
+        provider,
+        id: model,
         profile: ModelProfile::Balanced,
         capabilities: ModelCapabilities::TEXT_TOOLS,
         pricing: None,
@@ -202,6 +210,39 @@ fn fallback_model_info(provider: &str, model: &str) -> ModelInfo {
         },
         metadata_source: "fallback",
     }
+}
+
+fn cached_fallback_model_info(provider: &str, model: &str) -> &'static ModelInfo {
+    {
+        let guard = FALLBACK_MODEL_CACHE
+            .read()
+            .expect("fallback model cache lock poisoned");
+        if let Some(entry) = guard
+            .get(provider)
+            .and_then(|models| models.get(model))
+            .copied()
+        {
+            return entry;
+        }
+    }
+
+    let mut guard = FALLBACK_MODEL_CACHE
+        .write()
+        .expect("fallback model cache lock poisoned");
+    if let Some(entry) = guard
+        .get(provider)
+        .and_then(|models| models.get(model))
+        .copied()
+    {
+        return entry;
+    }
+
+    let provider = leak_string(provider.to_string());
+    let model = leak_string(model.to_string());
+    let leaked: &'static mut ModelInfo = Box::leak(Box::new(fallback_model_info(provider, model)));
+    let entry: &'static ModelInfo = &*leaked;
+    guard.entry(provider).or_default().insert(model, entry);
+    entry
 }
 
 /// Best-guess tokenizer for `(provider, model)` pairs that aren't in the
@@ -269,11 +310,7 @@ pub fn model_info_for(provider: &str, model: &str) -> Option<&'static ModelInfo>
     MODEL_REGISTRY
         .iter()
         .find(|entry| entry.provider == provider && entry.id == model)
-        .or_else(|| {
-            let leaked: &'static mut ModelInfo =
-                Box::leak(Box::new(fallback_model_info(provider, model)));
-            Some(&*leaked)
-        })
+        .or_else(|| Some(cached_fallback_model_info(provider, model)))
 }
 
 pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
@@ -516,8 +553,9 @@ fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 
 }
 
 fn estimate_json_tokens(value: &Value, bytes_per_token: f64) -> u64 {
-    serde_json::to_string(value)
-        .map(|text| estimate_text_tokens(&text, bytes_per_token))
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map(|_| estimate_byte_tokens(writer.bytes, bytes_per_token))
         .unwrap_or(0)
 }
 
@@ -526,12 +564,31 @@ fn estimate_json_tokens(value: &Value, bytes_per_token: f64) -> u64 {
 /// when a `TokenCalibration` is in play) so calibrated callers see closer
 /// estimates than the historical hard-coded `bytes / 4`.
 fn estimate_text_tokens(text: &str, bytes_per_token: f64) -> u64 {
-    if text.is_empty() {
+    estimate_byte_tokens(text.len(), bytes_per_token)
+}
+
+fn estimate_byte_tokens(bytes: usize, bytes_per_token: f64) -> u64 {
+    if bytes == 0 {
         return 0;
     }
-    let bytes = text.len() as f64;
-    let estimate = (bytes / bytes_per_token.max(0.1)).ceil() as u64;
+    let estimate = (bytes as f64 / bytes_per_token.max(0.1)).ceil() as u64;
     estimate.max(1)
+}
+
+#[derive(Debug, Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

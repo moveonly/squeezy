@@ -5,7 +5,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Mutex as StdMutex,
+        Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -296,14 +296,17 @@ pub(crate) fn shell_sandbox_status_metadata(config: &ShellSandboxConfig, status:
 }
 
 pub(crate) fn macos_sandbox_exec_supported() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        Path::new("/usr/bin/sandbox-exec").exists()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            Path::new("/usr/bin/sandbox-exec").exists()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    })
 }
 
 pub(crate) fn prepare_shell_sandbox_plan(
@@ -1114,7 +1117,8 @@ const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 #[cfg(target_os = "linux")]
 fn linux_landlock_supported() -> bool {
-    linux_landlock_abi_version() > 0
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| linux_landlock_abi_version() > 0)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1281,6 +1285,12 @@ fn linux_landlock_write_access(handled_access_fs: u64) -> u64 {
 /// silently failing inside the child.
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_unshare_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(linux_unshare_supported_uncached)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_unshare_supported_uncached() -> bool {
     if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
         && value.trim() == "0"
     {

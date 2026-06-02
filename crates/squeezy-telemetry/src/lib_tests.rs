@@ -17,6 +17,18 @@ fn disabled_client_does_not_send() {
 }
 
 #[test]
+fn draining_event_buffer_preserves_batch_capacity() {
+    let config = AppConfig::default();
+    let mut events = vec![TelemetryEvent::app_started(&config)];
+
+    let drained = drain_event_buffer(&mut events);
+
+    assert_eq!(drained.len(), 1);
+    assert!(events.is_empty());
+    assert!(events.capacity() >= MAX_BATCH_EVENTS);
+}
+
+#[test]
 fn telemetry_disabled_when_install_id_cannot_be_persisted() {
     let root = telemetry_temp_root();
     fs::create_dir_all(&root).unwrap();

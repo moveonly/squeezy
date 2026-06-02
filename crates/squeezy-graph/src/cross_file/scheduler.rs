@@ -102,20 +102,21 @@ pub fn schedule(graph: &ImportGraph) -> Schedule {
 }
 
 fn tarjan_sccs(graph: &ImportGraph) -> (Vec<Scc>, HashMap<FileId, u32>) {
+    let node_count = graph.node_count();
     let mut state = TarjanState {
         index_counter: 0,
-        stack: Vec::new(),
-        on_stack: HashMap::new(),
-        indices: HashMap::new(),
-        lowlinks: HashMap::new(),
-        sccs: Vec::new(),
+        stack: Vec::with_capacity(node_count),
+        on_stack: HashSet::with_capacity(node_count),
+        indices: HashMap::with_capacity(node_count),
+        lowlinks: HashMap::with_capacity(node_count),
+        sccs: Vec::with_capacity(node_count),
     };
     for node in graph.sorted_nodes() {
         if !state.indices.contains_key(&node) {
             tarjan_visit(&node, graph, &mut state);
         }
     }
-    let mut file_to_scc = HashMap::new();
+    let mut file_to_scc = HashMap::with_capacity(node_count);
     for scc in &state.sccs {
         for file in &scc.files {
             file_to_scc.insert(file.clone(), scc.id);
@@ -127,7 +128,7 @@ fn tarjan_sccs(graph: &ImportGraph) -> (Vec<Scc>, HashMap<FileId, u32>) {
 struct TarjanState {
     index_counter: u32,
     stack: Vec<FileId>,
-    on_stack: HashMap<FileId, bool>,
+    on_stack: HashSet<FileId>,
     indices: HashMap<FileId, u32>,
     lowlinks: HashMap<FileId, u32>,
     sccs: Vec<Scc>,
@@ -138,7 +139,7 @@ fn tarjan_visit(node: &FileId, graph: &ImportGraph, state: &mut TarjanState) {
     state.lowlinks.insert(node.clone(), state.index_counter);
     state.index_counter += 1;
     state.stack.push(node.clone());
-    state.on_stack.insert(node.clone(), true);
+    state.on_stack.insert(node.clone());
 
     for succ in graph.sorted_successors(node) {
         if !state.indices.contains_key(&succ) {
@@ -146,7 +147,7 @@ fn tarjan_visit(node: &FileId, graph: &ImportGraph, state: &mut TarjanState) {
             let succ_low = state.lowlinks[&succ];
             let node_low = state.lowlinks[node];
             state.lowlinks.insert(node.clone(), node_low.min(succ_low));
-        } else if state.on_stack.get(&succ).copied().unwrap_or(false) {
+        } else if state.on_stack.contains(&succ) {
             let succ_idx = state.indices[&succ];
             let node_low = state.lowlinks[node];
             state.lowlinks.insert(node.clone(), node_low.min(succ_idx));
@@ -156,7 +157,7 @@ fn tarjan_visit(node: &FileId, graph: &ImportGraph, state: &mut TarjanState) {
     if state.lowlinks[node] == state.indices[node] {
         let mut files = Vec::new();
         while let Some(top) = state.stack.pop() {
-            state.on_stack.insert(top.clone(), false);
+            state.on_stack.remove(&top);
             let done = &top == node;
             files.push(top);
             if done {
@@ -201,7 +202,7 @@ fn topological_levels(
     // from) has already been emitted. Result: `levels[0]` are the SCCs
     // that depend on nothing in the project; `levels[k]` depend only on
     // earlier levels.
-    let mut remaining = out_edges.clone();
+    let mut remaining = out_edges;
     let mut levels: Vec<Vec<u32>> = Vec::new();
     let mut emitted: HashSet<u32> = HashSet::new();
     loop {

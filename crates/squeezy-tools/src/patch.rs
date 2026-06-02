@@ -24,6 +24,7 @@
 
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs,
     path::Path,
     time::{Duration, SystemTime},
@@ -189,7 +190,8 @@ pub(crate) const APPROVAL_DIFF_MAX_LINES: usize = 40;
 /// one undelimited block (the renderer's `is_diff_metadata_line` filter
 /// strips `---` / `+++` lines before display).
 pub(crate) fn render_apply_patch_diff(args: &ApplyPatchArgs) -> Option<String> {
-    let mut out = String::new();
+    let op_count = args.patches.len().saturating_add(args.operations.len());
+    let mut out = String::with_capacity(op_count.saturating_mul(256));
     let mut remaining = APPROVAL_DIFF_MAX_LINES;
     let mut emitted_any = false;
     for patch in &args.patches {
@@ -264,6 +266,15 @@ pub(crate) fn apply_patch_paths(args: &ApplyPatchArgs) -> BTreeSet<String> {
     paths
 }
 
+fn apply_patch_op_path_refs(op: &ApplyPatchOperation) -> (&str, Option<&str>) {
+    match op {
+        ApplyPatchOperation::SearchReplace { path, .. }
+        | ApplyPatchOperation::CreateFile { path, .. }
+        | ApplyPatchOperation::DeleteFile { path, .. } => (path.as_str(), None),
+        ApplyPatchOperation::MoveFile { from, to, .. } => (from.as_str(), Some(to.as_str())),
+    }
+}
+
 fn append_search_replace_hunk(
     out: &mut String,
     path: &str,
@@ -271,52 +282,58 @@ fn append_search_replace_hunk(
     replace: &str,
     remaining: &mut usize,
 ) {
-    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"));
+    let _ = write!(out, "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n");
     for line in search.lines() {
         if *remaining == 0 {
             return;
         }
-        out.push_str(&format!("-{line}\n"));
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
         *remaining -= 1;
     }
     for line in replace.lines() {
         if *remaining == 0 {
             return;
         }
-        out.push_str(&format!("+{line}\n"));
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
         *remaining -= 1;
     }
 }
 
 fn append_create_hunk(out: &mut String, path: &str, contents: &str, remaining: &mut usize) {
     let total = contents.lines().count();
-    out.push_str(&format!("--- /dev/null\n+++ b/{path}\n"));
-    out.push_str(&format!("@@ -0,0 +1,{total} @@\n"));
+    let _ = write!(out, "--- /dev/null\n+++ b/{path}\n");
+    let _ = writeln!(out, "@@ -0,0 +1,{total} @@");
     if *remaining > 0 {
-        out.push_str(&format!("@@ create b/{path} @@\n"));
+        let _ = writeln!(out, "@@ create b/{path} @@");
         *remaining -= 1;
     }
     for line in contents.lines() {
         if *remaining == 0 {
             return;
         }
-        out.push_str(&format!("+{line}\n"));
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
         *remaining -= 1;
     }
 }
 
 fn append_delete_hunk(out: &mut String, path: &str, remaining: &mut usize) {
-    out.push_str(&format!("--- a/{path}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n"));
+    let _ = write!(out, "--- a/{path}\n+++ /dev/null\n@@ -1,0 +0,0 @@\n");
     if *remaining > 0 {
-        out.push_str(&format!("@@ delete a/{path} @@\n"));
+        let _ = writeln!(out, "@@ delete a/{path} @@");
         *remaining -= 1;
     }
 }
 
 fn append_move_hunk(out: &mut String, from: &str, to: &str, remaining: &mut usize) {
-    out.push_str(&format!("--- a/{from}\n+++ b/{to}\n@@ -1,0 +1,0 @@\n"));
+    let _ = write!(out, "--- a/{from}\n+++ b/{to}\n@@ -1,0 +1,0 @@\n");
     if *remaining > 0 {
-        out.push_str(&format!("@@ rename a/{from} -> b/{to} @@\n"));
+        let _ = writeln!(out, "@@ rename a/{from} -> b/{to} @@");
         *remaining -= 1;
     }
 }
@@ -329,7 +346,8 @@ pub(crate) fn render_write_file_diff(path: &str, content: &str) -> Option<String
     if content.is_empty() {
         return None;
     }
-    let mut out = format!("--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n");
+    let mut out = String::with_capacity(path.len().saturating_mul(2) + content.len().min(4096));
+    let _ = write!(out, "--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n");
     for (i, line) in content.lines().enumerate() {
         if i >= APPROVAL_DIFF_MAX_LINES {
             break;
@@ -634,18 +652,25 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        if !args.patches.is_empty() && !args.operations.is_empty() {
+        let ApplyPatchArgs {
+            patches,
+            operations,
+            impact_paths,
+            plan_id,
+            dry_run,
+            confirm_outside_plan,
+        } = args;
+        if !patches.is_empty() && !operations.is_empty() {
             return tool_error(
                 call,
                 "apply_patch accepts either `patches` (legacy) or `operations`, not both",
             );
         }
-        let raw_ops: Vec<ApplyPatchOperation> = if !args.operations.is_empty() {
-            args.operations.clone()
+        let raw_ops: Vec<ApplyPatchOperation> = if !operations.is_empty() {
+            operations
         } else {
-            args.patches
-                .iter()
-                .cloned()
+            patches
+                .into_iter()
                 .map(|patch| ApplyPatchOperation::SearchReplace {
                     path: patch.path,
                     search: patch.search,
@@ -677,19 +702,18 @@ impl ToolRegistry {
             );
         }
 
-        let dry_run = args.dry_run.unwrap_or(false);
-        let impact_paths = normalized_path_set(args.impact_paths.as_deref().unwrap_or(&[]));
+        let dry_run = dry_run.unwrap_or(false);
+        let impact_paths = normalized_path_set(impact_paths.as_deref().unwrap_or(&[]));
         // Collect every workspace-relative path each op touches (for locality,
         // plan-binding, and secret-path checks).
-        let touched_paths: Vec<String> = raw_ops
-            .iter()
-            .flat_map(|op| match op {
-                ApplyPatchOperation::SearchReplace { path, .. }
-                | ApplyPatchOperation::CreateFile { path, .. }
-                | ApplyPatchOperation::DeleteFile { path, .. } => vec![path.clone()],
-                ApplyPatchOperation::MoveFile { from, to, .. } => vec![from.clone(), to.clone()],
-            })
-            .collect();
+        let mut touched_paths = Vec::with_capacity(raw_ops.len().saturating_mul(2));
+        for op in &raw_ops {
+            let (first, second) = apply_patch_op_path_refs(op);
+            touched_paths.push(first.to_string());
+            if let Some(second) = second {
+                touched_paths.push(second.to_string());
+            }
+        }
         // Jupyter notebooks have JSON cell structure that text search/replace
         // (and full overwrite) will silently corrupt. Redirect the model to
         // `notebook_edit` rather than letting the patch land.
@@ -712,9 +736,9 @@ impl ToolRegistry {
 
         // Plan-binding (F84): every touched path must intersect the plan's
         // neighborhood, unless the caller explicitly opts out.
-        if let Some(plan_id) = args.plan_id.as_deref()
+        if let Some(plan_id) = plan_id.as_deref()
             && let Some(plan) = self.lookup_patch_plan(plan_id)
-            && !args.confirm_outside_plan
+            && !confirm_outside_plan
         {
             let outside: Vec<String> = patch_paths
                 .iter()
@@ -742,15 +766,8 @@ impl ToolRegistry {
         // Sandbox + secret + protected-metadata block — applied per-op so the
         // legacy patches[] and new operations[] shapes share one safety floor.
         for op in &raw_ops {
-            let op_paths: Vec<String> = match op {
-                ApplyPatchOperation::SearchReplace { path, .. }
-                | ApplyPatchOperation::CreateFile { path, .. }
-                | ApplyPatchOperation::DeleteFile { path, .. } => vec![path.clone()],
-                ApplyPatchOperation::MoveFile { from, to, .. } => {
-                    vec![from.clone(), to.clone()]
-                }
-            };
-            for rel in &op_paths {
+            let (first, second) = apply_patch_op_path_refs(op);
+            for rel in [Some(first), second].into_iter().flatten() {
                 if let Err(err) = safety::assess_write_path(rel, &self.root, &self.shell_sandbox) {
                     return make_result(
                         call,
@@ -850,7 +867,7 @@ impl ToolRegistry {
             let unified_diff = build_unified_diff(&staged);
             let content = json!({
                 "dry_run": true,
-                "plan_id": args.plan_id,
+                "plan_id": &plan_id,
                 "patch_format": "search_replace",
                 "operations": preview_ops,
                 "files": changed_files,
@@ -909,7 +926,7 @@ impl ToolRegistry {
             let mut error_content = json!({
                 "error": format!("failed to apply op at {failed_path}: {error}"),
                 "failed_path": failed_path,
-                "plan_id": args.plan_id,
+                "plan_id": &plan_id,
                 "patch_format": "search_replace",
                 "operations": preview_ops,
                 "files": changed_files,
@@ -945,7 +962,7 @@ impl ToolRegistry {
         let unified_diff = build_unified_diff(&staged);
         let mut content = json!({
             "dry_run": false,
-            "plan_id": args.plan_id,
+            "plan_id": &plan_id,
             "patch_format": "search_replace",
             "operations": preview_ops,
             "files": changed_files,

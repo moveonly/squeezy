@@ -272,10 +272,8 @@ impl DispatchCommand {
             "/attachments" => Self::Attachments,
             "/compact" => {
                 let mut tokens = rest.split_whitespace();
-                let undo = matches!(
-                    tokens.next().map(str::to_ascii_lowercase).as_deref(),
-                    Some("undo")
-                );
+                let undo =
+                    matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case("undo"));
                 Self::Compact { undo }
             }
             "/diff" => Self::Diff,

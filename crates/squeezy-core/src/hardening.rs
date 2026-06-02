@@ -74,8 +74,8 @@ type SetrlimitResource = libc::c_int;
 #[cfg(target_os = "macos")]
 fn remove_env_vars_with_prefix(prefix: &str) {
     let keys = std::env::vars_os()
-        .filter_map(|(key, _)| key.into_string().ok())
-        .filter(|key| key.starts_with(prefix))
+        .map(|(key, _)| key)
+        .filter(|key| key.to_str().is_some_and(|key| key.starts_with(prefix)))
         .collect::<Vec<_>>();
     for key in keys {
         unsafe {

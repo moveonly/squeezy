@@ -349,16 +349,17 @@ pub(crate) fn compact_conversation(
 /// "nothing left to compact" and bails out without bumping generation.
 fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) -> usize {
     let mut split = initial_split;
+    let declared_in_older: BTreeSet<&str> = conversation[..initial_split]
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
     while split < conversation.len() {
         match &conversation[split] {
             LlmInputItem::FunctionCallOutput { call_id, .. } => {
-                let declared_in_older = conversation[..split].iter().any(|item| match item {
-                    LlmInputItem::FunctionCall {
-                        call_id: declared, ..
-                    } => declared == call_id,
-                    _ => false,
-                });
-                if declared_in_older {
+                if declared_in_older.contains(call_id.as_str()) {
                     split += 1;
                 } else {
                     break;
@@ -375,21 +376,19 @@ fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) ->
 /// the kept slice cannot reference a tool call that lived only in the
 /// summarized older slice. Order is preserved.
 pub(crate) fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
-    use std::collections::BTreeSet;
-    let declared: BTreeSet<&str> = items
+    let declared: BTreeSet<String> = items
         .iter()
         .filter_map(|item| match item {
-            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.clone()),
             _ => None,
         })
         .collect();
     items
-        .iter()
+        .into_iter()
         .filter(|item| match item {
             LlmInputItem::FunctionCallOutput { call_id, .. } => declared.contains(call_id.as_str()),
             _ => true,
         })
-        .cloned()
         .collect()
 }
 
@@ -402,10 +401,10 @@ pub(crate) fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec
 /// *"tool_use blocks must be followed by a tool_result"* and the failure
 /// is sticky until `/clear`. Order is preserved.
 pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
-    let answered: BTreeSet<&str> = items
+    let answered: BTreeSet<String> = items
         .iter()
         .filter_map(|item| match item {
-            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.clone()),
             _ => None,
         })
         .collect();
@@ -973,11 +972,11 @@ pub(crate) fn build_compaction_summary(
         lines.push("Unresolved questions:".to_string());
         lines.extend(unresolved);
     }
-    let active_attachments = attachments
+    let mut active_attachments = attachments
         .iter()
         .filter(|attachment| attachment.is_active())
-        .collect::<Vec<_>>();
-    if !active_attachments.is_empty() {
+        .peekable();
+    if active_attachments.peek().is_some() {
         lines.push("Active attached context:".to_string());
         for attachment in active_attachments {
             lines.push(format!(
@@ -1066,18 +1065,14 @@ fn file_lineage_blocks(older: &[LlmInputItem], previous_summary: Option<&str>) -
         };
         match classify_file_tool(name) {
             FileOpClass::Read => {
-                for path in extract_tool_paths(name, arguments) {
-                    if read_set.insert(path.clone()) {
-                        read.push(path);
-                    }
-                }
+                visit_tool_paths(name, arguments, |path| {
+                    push_unique_path(&mut read, &mut read_set, path);
+                });
             }
             FileOpClass::Modified => {
-                for path in extract_tool_paths(name, arguments) {
-                    if modified_set.insert(path.clone()) {
-                        modified.push(path);
-                    }
-                }
+                visit_tool_paths(name, arguments, |path| {
+                    push_unique_path(&mut modified, &mut modified_set, path);
+                });
             }
             FileOpClass::None => {}
         }
@@ -1101,15 +1096,39 @@ fn file_lineage_blocks(older: &[LlmInputItem], previous_summary: Option<&str>) -
 
     let mut blocks = Vec::with_capacity(2);
     if !read.is_empty() {
-        blocks.push(format!("<read-files>\n{}\n</read-files>", read.join("\n")));
+        blocks.push(file_lineage_block("read-files", &read));
     }
     if !modified.is_empty() {
-        blocks.push(format!(
-            "<modified-files>\n{}\n</modified-files>",
-            modified.join("\n")
-        ));
+        blocks.push(file_lineage_block("modified-files", &modified));
     }
     blocks
+}
+
+fn push_unique_path(paths: &mut Vec<String>, seen: &mut BTreeSet<String>, path: &str) {
+    if !seen.contains(path) {
+        let path = path.to_string();
+        seen.insert(path.clone());
+        paths.push(path);
+    }
+}
+
+fn file_lineage_block(tag: &str, paths: &[String]) -> String {
+    let paths_len = paths.iter().map(String::len).sum::<usize>();
+    let separators = paths.len().saturating_sub(1);
+    let mut block = String::with_capacity(tag.len() * 2 + paths_len + separators + 7);
+    block.push('<');
+    block.push_str(tag);
+    block.push_str(">\n");
+    for (index, path) in paths.iter().enumerate() {
+        if index > 0 {
+            block.push('\n');
+        }
+        block.push_str(path);
+    }
+    block.push_str("\n</");
+    block.push_str(tag);
+    block.push('>');
+    block
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1138,34 +1157,32 @@ fn classify_file_tool(name: &str) -> FileOpClass {
 /// function; for `apply_patch` we also walk both the legacy `patches[]`
 /// shape and the modern `operations[]` shape (including `MoveFile`'s
 /// `from`/`to` pair) so the modified set is exhaustive.
-fn extract_tool_paths(name: &str, arguments: &Value) -> Vec<String> {
-    let mut paths = Vec::new();
+fn visit_tool_paths(name: &str, arguments: &Value, mut visit: impl FnMut(&str)) {
     if let Some(path) = arguments.get("path").and_then(Value::as_str) {
-        paths.push(path.to_string());
+        visit(path);
     }
     if name == "apply_patch" {
         if let Some(patches) = arguments.get("patches").and_then(Value::as_array) {
             for entry in patches {
                 if let Some(path) = entry.get("path").and_then(Value::as_str) {
-                    paths.push(path.to_string());
+                    visit(path);
                 }
             }
         }
         if let Some(ops) = arguments.get("operations").and_then(Value::as_array) {
             for op in ops {
                 if let Some(path) = op.get("path").and_then(Value::as_str) {
-                    paths.push(path.to_string());
+                    visit(path);
                 }
                 if let Some(from) = op.get("from").and_then(Value::as_str) {
-                    paths.push(from.to_string());
+                    visit(from);
                 }
                 if let Some(to) = op.get("to").and_then(Value::as_str) {
-                    paths.push(to.to_string());
+                    visit(to);
                 }
             }
         }
     }
-    paths
 }
 
 /// Pull the line list out of the `<tag>...</tag>` block in

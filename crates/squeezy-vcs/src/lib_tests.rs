@@ -117,6 +117,13 @@ fn parses_numstat_with_binary_counts() {
 }
 
 #[test]
+fn parses_numstat_paths_containing_tabs() {
+    let parsed = parse_numstat(b"1\t2\tsrc/path\twith-tab.rs\0");
+    assert_eq!(parsed["src/path\twith-tab.rs"].additions, 1);
+    assert_eq!(parsed["src/path\twith-tab.rs"].deletions, 2);
+}
+
+#[test]
 fn branch_mode_snapshot_reports_files_changed_since_default_branch() {
     let root = temp_repo("branch_mode");
     init_repo(&root);

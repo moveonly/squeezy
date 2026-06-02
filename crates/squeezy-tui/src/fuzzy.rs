@@ -31,20 +31,43 @@ const GAP_PENALTY: i32 = -3;
 /// down into the sentinel band — `i32::MIN / 4` leaves ~536M of headroom.
 const NEG_INF: i32 = i32::MIN / 4;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedQuery {
+    chars: Vec<char>,
+}
+
+impl PreparedQuery {
+    pub(crate) fn new(query: &str) -> Self {
+        Self {
+            chars: query.chars().flat_map(char::to_lowercase).collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.chars.len()
+    }
+}
+
 /// Score `candidate` against `query`. Returns `None` if the lowercased
 /// chars of `query` are not, in order, a subsequence of the lowercased
 /// chars of `candidate`. Higher is better. An empty query returns
 /// `Some(0)`.
+#[allow(dead_code)]
 pub fn score(candidate: &str, query: &str) -> Option<i32> {
+    let query = PreparedQuery::new(query);
+    score_prepared(candidate, &query)
+}
+
+pub(crate) fn score_prepared(candidate: &str, query: &PreparedQuery) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
     let cand: Vec<char> = candidate.chars().flat_map(char::to_lowercase).collect();
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if q.is_empty() {
-        return Some(0);
-    }
-    if q.len() > cand.len() {
+    if query.len() > cand.len() {
         return None;
     }
 
@@ -52,7 +75,7 @@ pub fn score(candidate: &str, query: &str) -> Option<i32> {
     let is_word_boundary = |j: usize| j == 0 || !cand[j - 1].is_alphanumeric();
 
     // Pass 1: seed `prev[j]` with the score of matching `q[0]` at `j`.
-    let q0 = q[0];
+    let q0 = query.chars[0];
     let mut prev = vec![NEG_INF; n];
     for (j, &ch) in cand.iter().enumerate() {
         if ch == q0 {
@@ -68,7 +91,7 @@ pub fn score(candidate: &str, query: &str) -> Option<i32> {
     // position `k < j` and apply the bonus/penalty deltas for the
     // transition `k -> j`.
     let mut curr = vec![NEG_INF; n];
-    for (i, &qi) in q.iter().enumerate().skip(1) {
+    for (i, &qi) in query.chars.iter().enumerate().skip(1) {
         curr.fill(NEG_INF);
         for (j, &ch) in cand.iter().enumerate().skip(i) {
             if ch != qi {

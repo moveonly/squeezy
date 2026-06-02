@@ -48,25 +48,65 @@ pub(crate) fn persist_permission_rule(path: &Path, rule: &PermissionRule) -> io:
 fn format_permission_rule(rule: &PermissionRule) -> String {
     let reason = rule
         .reason
-        .clone()
-        .unwrap_or_else(|| "added from approval prompt".to_string());
+        .as_deref()
+        .unwrap_or("added from approval prompt");
     format!(
         "[[permissions.rules]]\ncapability = {}\ntarget = {}\naction = {}\nsource = {}\nreason = {}\n",
         escape_toml_basic_string(&rule.capability),
         escape_toml_basic_string(&rule.target),
         escape_toml_basic_string(rule.action.as_str()),
         escape_toml_basic_string(rule.source.as_str()),
-        escape_toml_basic_string(&reason),
+        escape_toml_basic_string(reason),
     )
 }
 
 fn contains_rule(text: &str, rule: &PermissionRule) -> bool {
-    parse_rule_keys(text).into_iter().any(|key| {
-        key.capability == rule.capability
-            && key.target == rule.target
-            && key.action == rule.action
-            && key.source == rule.source
-    })
+    let mut current: Option<RuleKey> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[permissions.rules]]" {
+            if current
+                .as_ref()
+                .is_some_and(|key| rule_key_matches(key, rule))
+            {
+                return true;
+            }
+            current = Some(RuleKey::default());
+            continue;
+        }
+        let Some(candidate) = current.as_mut() else {
+            continue;
+        };
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let value = parse_basic_string(value.trim());
+        match key.trim() {
+            "capability" => candidate.capability = value,
+            "target" => candidate.target = value,
+            "action" => {
+                if let Some(action) = PermissionAction::parse(&value) {
+                    candidate.action = action;
+                }
+            }
+            "source" => {
+                if let Some(source) = PermissionRuleSource::parse(&value) {
+                    candidate.source = source;
+                }
+            }
+            _ => {}
+        }
+    }
+    current
+        .as_ref()
+        .is_some_and(|key| rule_key_matches(key, rule))
+}
+
+fn rule_key_matches(key: &RuleKey, rule: &PermissionRule) -> bool {
+    key.capability == rule.capability
+        && key.target == rule.target
+        && key.action == rule.action
+        && key.source == rule.source
 }
 
 #[derive(Debug)]
@@ -86,51 +126,6 @@ impl Default for RuleKey {
             source: PermissionRuleSource::User,
         }
     }
-}
-
-fn parse_rule_keys(text: &str) -> Vec<RuleKey> {
-    let mut rules = Vec::new();
-    let mut current: Option<RuleKey> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[[permissions.rules]]" {
-            if let Some(rule) = current.take() {
-                rules.push(rule);
-            }
-            current = Some(RuleKey {
-                action: PermissionAction::Ask,
-                source: PermissionRuleSource::User,
-                ..RuleKey::default()
-            });
-            continue;
-        }
-        let Some(rule) = current.as_mut() else {
-            continue;
-        };
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let value = parse_basic_string(value.trim());
-        match key.trim() {
-            "capability" => rule.capability = value,
-            "target" => rule.target = value,
-            "action" => {
-                if let Some(action) = PermissionAction::parse(&value) {
-                    rule.action = action;
-                }
-            }
-            "source" => {
-                if let Some(source) = PermissionRuleSource::parse(&value) {
-                    rule.source = source;
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Some(rule) = current.take() {
-        rules.push(rule);
-    }
-    rules
 }
 
 fn parse_basic_string(value: &str) -> String {

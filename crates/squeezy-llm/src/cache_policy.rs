@@ -133,7 +133,7 @@ impl CachePolicy {
 /// more than reads); the registry gate keeps us from sending markers to
 /// models that would 400.
 pub(crate) fn should_apply_caching(provider: &str, request: &LlmRequest) -> bool {
-    request.effective_cache_spec().retention != CacheRetention::None
+    request.effective_cache_retention() != CacheRetention::None
         && capabilities_for(provider, &request.model)
             .is_some_and(|capabilities| capabilities.prompt_caching)
 }

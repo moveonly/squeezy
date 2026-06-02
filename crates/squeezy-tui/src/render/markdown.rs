@@ -733,17 +733,15 @@ fn find_next_confidence_label(text: &str, from: usize) -> Option<(usize, usize, 
             }
         }
         // `— label` form: match the literal " — label" with an em dash.
-        let with_em_dash = format!(" — {label}");
-        if let Some(off) = haystack.find(&with_em_dash) {
+        if let Some(off) = find_label_with_affixes(haystack, " — ", label, "") {
             // Highlight just the label, not the em-dash separator.
-            let label_start = from + off + with_em_dash.len() - label.len();
+            let label_start = from + off + " — ".len();
             let label_end = label_start + label.len();
             if is_identifier_boundary(text, label_start, label_end) {
                 pick_earliest(&mut best, (label_start, label_end, label));
             }
         }
-        let bracketed = format!("[{label}]");
-        if let Some(off) = haystack.find(&bracketed) {
+        if let Some(off) = find_label_with_affixes(haystack, "[", label, "]") {
             // Skip the leading `[`; colour `label` only (the brackets
             // stay in the inherited style so the punctuation reads
             // normally).
@@ -753,6 +751,28 @@ fn find_next_confidence_label(text: &str, from: usize) -> Option<(usize, usize, 
         }
     }
     best
+}
+
+fn find_label_with_affixes(
+    haystack: &str,
+    prefix: &str,
+    label: &str,
+    suffix: &str,
+) -> Option<usize> {
+    let mut cursor = 0;
+    while let Some(off) = haystack[cursor..].find(prefix) {
+        let candidate = cursor + off;
+        let label_start = candidate + prefix.len();
+        let suffix_start = label_start + label.len();
+        let suffix_end = suffix_start + suffix.len();
+        if haystack.get(label_start..suffix_start) == Some(label)
+            && haystack.get(suffix_start..suffix_end) == Some(suffix)
+        {
+            return Some(candidate);
+        }
+        cursor = label_start;
+    }
+    None
 }
 
 fn pick_earliest<'a>(
@@ -810,16 +830,28 @@ fn middle_truncate_chars(text: &str, max_chars: usize) -> String {
     let keep = max_chars - marker.len();
     let head = keep / 2;
     let tail = keep - head;
-    let prefix: String = text.chars().take(head).collect();
-    let suffix: String = text
-        .chars()
-        .rev()
-        .take(tail)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}{marker}{suffix}")
+    let prefix_end = if head == 0 {
+        0
+    } else {
+        text.char_indices()
+            .nth(head)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    };
+    let suffix_start = if tail == 0 {
+        text.len()
+    } else {
+        text.char_indices()
+            .nth(len - tail)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    };
+    let mut out =
+        String::with_capacity(prefix_end + marker.len() + text.len().saturating_sub(suffix_start));
+    out.push_str(&text[..prefix_end]);
+    out.push_str(marker);
+    out.push_str(&text[suffix_start..]);
+    out
 }
 
 fn compact_unbroken_text_tokens(text: &str) -> String {

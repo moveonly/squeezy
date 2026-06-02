@@ -1,6 +1,8 @@
 use std::{
-    collections::BTreeMap,
-    env, fs,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
@@ -17,6 +19,47 @@ const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_JAVA_MAX_FILE_BYTES: u64 = 2_000_000;
 const BINARY_GENERATED_PREFIX_BYTES: usize = 4096;
+const CODE_PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "CMakeLists.txt",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "Dockerfile",
+    "Justfile",
+    "Makefile",
+    "MODULE.bazel",
+    "Taskfile.yml",
+    "WORKSPACE",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.json",
+    "docker-compose.yml",
+    "go.mod",
+    "global.json",
+    "gradlew",
+    "noxfile.py",
+    "package.json",
+    "package-lock.json",
+    "packages.lock.json",
+    "pom.xml",
+    "pnpm-lock.yaml",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.cfg",
+    "setup.py",
+    "tox.ini",
+    "tsconfig.json",
+    "yarn.lock",
+    ".github/workflows",
+    "BUILD",
+    "BUILD.bazel",
+    "Pipfile",
+    "poetry.lock",
+    "uv.lock",
+];
+const CODE_DIRECTORY_MARKERS: &[&str] = &[
+    "app", "cmd", "crates", "include", "internal", "lib", "packages", "pkg", "src",
+];
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -282,6 +325,28 @@ pub struct IndexingDecision {
 }
 
 #[derive(Debug, Clone)]
+struct IndexingDecisionContext {
+    canonical_home: Option<PathBuf>,
+}
+
+impl IndexingDecisionContext {
+    fn from_env() -> Self {
+        Self {
+            canonical_home: env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|home| fs::canonicalize(home).ok()),
+        }
+    }
+
+    fn is_home_dir(&self, root: &Path) -> bool {
+        self.canonical_home
+            .as_deref()
+            .map(|home| home == root)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkspaceCrawler {
     options: CrawlOptions,
     compiled_policy: Arc<CompiledIndexingPolicy>,
@@ -394,9 +459,6 @@ impl WorkspaceCrawler {
                 }
             }
             let size_bytes = metadata.len();
-            let extension = path
-                .extension()
-                .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
             // Java source files frequently contain many nested declarations
             // in a single file, so we lift the default cap when the user has
@@ -446,7 +508,7 @@ impl WorkspaceCrawler {
                     unsupported.push(unsupported_file(
                         &path,
                         relative_path.clone(),
-                        extension,
+                        extension_string(&path),
                         size_bytes,
                         UnsupportedReason::BinaryLike,
                     ));
@@ -482,7 +544,7 @@ impl WorkspaceCrawler {
                 unsupported.push(unsupported_file(
                     &path,
                     relative_path.clone(),
-                    extension,
+                    extension_string(&path),
                     size_bytes,
                     UnsupportedReason::UnsupportedExtension,
                 ));
@@ -606,11 +668,20 @@ pub fn classify_language(path: &Path) -> LanguageKind {
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return LanguageKind::Unknown;
     };
-    LanguageKind::from_extension(&extension.to_ascii_lowercase())
+    if extension.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        LanguageKind::from_extension(&extension.to_ascii_lowercase())
+    } else {
+        LanguageKind::from_extension(extension)
+    }
+}
+
+fn extension_string(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
 }
 
 fn refine_c_family_header_languages(files: &mut [FileRecord]) {
-    let mut by_stem = BTreeMap::<String, Vec<LanguageKind>>::new();
+    let mut by_stem = BTreeMap::<String, CFamilySiblingFlags>::new();
     let mut c_files = 0usize;
     let mut cpp_files = 0usize;
     for file in files.iter() {
@@ -622,7 +693,11 @@ fn refine_c_family_header_languages(files: &mut [FileRecord]) {
         if !is_plain_c_header(&file.relative_path)
             && let Some(stem) = path_without_extension(&file.relative_path)
         {
-            by_stem.entry(stem).or_default().push(file.language);
+            match file.language {
+                LanguageKind::C => by_stem.entry(stem.to_string()).or_default().has_c = true,
+                LanguageKind::Cpp => by_stem.entry(stem.to_string()).or_default().has_cpp = true,
+                _ => {}
+            }
         }
     }
     let project_default = if c_files > cpp_files {
@@ -638,15 +713,27 @@ fn refine_c_family_header_languages(files: &mut [FileRecord]) {
             file.language = project_default;
             continue;
         };
-        let sibling_languages = by_stem.get(&stem).cloned().unwrap_or_default();
-        file.language = if sibling_languages.contains(&LanguageKind::C) {
+        let sibling_languages = by_stem.get(stem);
+        file.language = if sibling_languages
+            .map(|languages| languages.has_c)
+            .unwrap_or(false)
+        {
             LanguageKind::C
-        } else if sibling_languages.contains(&LanguageKind::Cpp) {
+        } else if sibling_languages
+            .map(|languages| languages.has_cpp)
+            .unwrap_or(false)
+        {
             LanguageKind::Cpp
         } else {
             project_default
         };
     }
+}
+
+#[derive(Debug, Default)]
+struct CFamilySiblingFlags {
+    has_c: bool,
+    has_cpp: bool,
 }
 
 fn is_plain_c_header(relative_path: &str) -> bool {
@@ -656,10 +743,8 @@ fn is_plain_c_header(relative_path: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn path_without_extension(relative_path: &str) -> Option<String> {
-    relative_path
-        .rsplit_once('.')
-        .map(|(stem, _)| stem.to_string())
+fn path_without_extension(relative_path: &str) -> Option<&str> {
+    relative_path.rsplit_once('.').map(|(stem, _)| stem)
 }
 
 pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
@@ -674,8 +759,10 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 
     let mut positive_signals = Vec::new();
     let mut negative_signals = Vec::new();
+    let context = IndexingDecisionContext::from_env();
+    let workspace_signals = scan_workspace_signals(root);
 
-    if is_home_dir(root) {
+    if context.is_home_dir(root) {
         negative_signals.push("workspace root is the user's home directory".to_string());
     }
     if is_protected_root(root) {
@@ -684,22 +771,22 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 
     let mut has_strong_positive = false;
 
-    if let Some(marker) = vcs_marker_signal(root) {
+    if let Some(marker) = vcs_marker_signal(root, &context) {
         has_strong_positive = true;
         positive_signals.push(marker);
     }
-    if has_readme(root) {
+    if workspace_signals.has_readme {
         positive_signals.push("README at workspace root".to_string());
     }
-    for marker in code_project_markers(root) {
+    for marker in workspace_signals.project_markers {
         has_strong_positive = true;
         positive_signals.push(marker);
     }
-    for source in shallow_source_markers(root) {
+    for source in workspace_signals.shallow_source_markers {
         has_strong_positive = true;
         positive_signals.push(source);
     }
-    for code_dir in code_directory_markers(root) {
+    for code_dir in workspace_signals.code_directory_markers {
         has_strong_positive = true;
         positive_signals.push(code_dir);
     }
@@ -733,14 +820,6 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
     }
 }
 
-fn is_home_dir(root: &Path) -> bool {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| fs::canonicalize(home).ok())
-        .map(|home| home == root)
-        .unwrap_or(false)
-}
-
 fn is_protected_root(root: &Path) -> bool {
     const PROTECTED: &[&str] = &[
         "/",
@@ -772,9 +851,9 @@ fn is_personal_folder(root: &Path) -> bool {
     )
 }
 
-fn vcs_marker_signal(root: &Path) -> Option<String> {
+fn vcs_marker_signal(root: &Path, context: &IndexingDecisionContext) -> Option<String> {
     for (index, ancestor) in root.ancestors().enumerate() {
-        if index > 0 && (is_home_dir(ancestor) || is_protected_root(ancestor)) {
+        if index > 0 && (context.is_home_dir(ancestor) || is_protected_root(ancestor)) {
             break;
         }
         if let Some(marker) = vcs_marker_at(ancestor) {
@@ -795,158 +874,206 @@ fn vcs_marker_at(path: &Path) -> Option<&'static str> {
         .find(|marker| path.join(marker).exists())
 }
 
-fn has_readme(root: &Path) -> bool {
-    fs::read_dir(root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| {
-                    name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme")
-                })
-                .unwrap_or(false)
-        })
+#[derive(Debug, Default)]
+struct WorkspaceSignalScan {
+    has_readme: bool,
+    project_markers: Vec<String>,
+    shallow_source_markers: Vec<String>,
+    code_directory_markers: Vec<String>,
 }
 
-fn code_project_markers(root: &Path) -> Vec<String> {
-    [
-        "Cargo.toml",
-        "CMakeLists.txt",
-        "Directory.Build.props",
-        "Directory.Build.targets",
-        "Dockerfile",
-        "Justfile",
-        "Makefile",
-        "MODULE.bazel",
-        "Taskfile.yml",
-        "WORKSPACE",
-        "build.gradle",
-        "build.gradle.kts",
-        "composer.json",
-        "docker-compose.yml",
-        "go.mod",
-        "global.json",
-        "gradlew",
-        "noxfile.py",
-        "package.json",
-        "package-lock.json",
-        "packages.lock.json",
-        "pom.xml",
-        "pnpm-lock.yaml",
-        "pyproject.toml",
-        "requirements.txt",
-        "setup.cfg",
-        "setup.py",
-        "tox.ini",
-        "tsconfig.json",
-        "yarn.lock",
-        ".github/workflows",
-        "BUILD",
-        "BUILD.bazel",
-        "Pipfile",
-        "poetry.lock",
-        "uv.lock",
-    ]
-    .into_iter()
-    .filter(|marker| root.join(marker).exists())
-    .map(|marker| format!("project marker {marker}"))
-    .chain(dotnet_project_markers(root))
-    .collect()
+fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
+    let Some(root_entries) = read_dir_entries(root) else {
+        return WorkspaceSignalScan {
+            project_markers: project_markers_from_root(root, None),
+            code_directory_markers: code_directory_markers(root, &BTreeSet::new()),
+            ..WorkspaceSignalScan::default()
+        };
+    };
+    let root_entry_names = root_entry_names(&root_entries);
+    let has_readme = root_entries.iter().any(is_readme_entry);
+    let project_markers = project_markers_from_root(root, Some((&root_entry_names, &root_entries)));
+
+    let mut source_scan = SourceMarkerScan::default();
+    collect_source_markers_from_entries(&root_entries, 0, None, &mut source_scan);
+    source_scan.signals.sort();
+    source_scan.signals.dedup();
+
+    let code_directory_markers = code_directory_markers(root, &source_scan.direct_code_dirs);
+    WorkspaceSignalScan {
+        has_readme,
+        project_markers,
+        shallow_source_markers: source_scan.signals,
+        code_directory_markers,
+    }
 }
 
-fn dotnet_project_markers(root: &Path) -> Vec<String> {
-    fs::read_dir(root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?.to_string();
-            let extension = path.extension()?.to_str()?;
-            matches!(extension, "csproj" | "sln" | "slnx").then(|| format!("project marker {name}"))
-        })
+fn read_dir_entries(root: &Path) -> Option<Vec<fs::DirEntry>> {
+    Some(
+        fs::read_dir(root)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .collect(),
+    )
+}
+
+fn root_entry_names(entries: &[fs::DirEntry]) -> BTreeSet<OsString> {
+    entries.iter().map(fs::DirEntry::file_name).collect()
+}
+
+fn is_readme_entry(entry: &fs::DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map(|name| name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme"))
+        .unwrap_or(false)
+}
+
+fn project_markers_from_root(
+    root: &Path,
+    root_scan: Option<(&BTreeSet<OsString>, &[fs::DirEntry])>,
+) -> Vec<String> {
+    CODE_PROJECT_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| project_marker_exists(root, marker, root_scan.map(|(names, _)| names)))
+        .map(|marker| format!("project marker {marker}"))
+        .chain(dotnet_project_markers(
+            root,
+            root_scan.map(|(_, entries)| entries),
+        ))
         .collect()
 }
 
-fn shallow_source_markers(root: &Path) -> Vec<String> {
-    let mut signals = Vec::new();
-    let mut visited = 0;
-    collect_source_markers(root, 0, &mut visited, &mut signals);
-    signals.sort();
-    signals.dedup();
-    signals
+fn project_marker_exists(
+    root: &Path,
+    marker: &str,
+    root_entry_names: Option<&BTreeSet<OsString>>,
+) -> bool {
+    if marker.contains('/') {
+        return root.join(marker).exists();
+    }
+    // The read_dir listing is a fast positive shortcut: an exact-case hit
+    // proves existence without a stat. On a miss we must still defer to
+    // `exists()`, which is authoritative and matches the filesystem's own
+    // case semantics (e.g. `cargo.toml` satisfying `Cargo.toml` on
+    // case-insensitive volumes). Using `&&` here would drop such markers.
+    root_entry_names
+        .map(|names| names.contains(std::ffi::OsStr::new(marker)) || root.join(marker).exists())
+        .unwrap_or_else(|| root.join(marker).exists())
+}
+
+fn dotnet_project_markers(root: &Path, entries: Option<&[fs::DirEntry]>) -> Vec<String> {
+    if let Some(entries) = entries {
+        return entries
+            .iter()
+            .filter_map(dotnet_project_marker_from_entry)
+            .collect();
+    }
+    read_dir_entries(root)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(dotnet_project_marker_from_entry)
+        .collect()
+}
+
+fn dotnet_project_marker_from_entry(entry: &fs::DirEntry) -> Option<String> {
+    let file_name = entry.file_name();
+    let path = Path::new(&file_name);
+    let name = path.file_name()?.to_str()?.to_string();
+    let extension = path.extension()?.to_str()?;
+    matches!(extension, "csproj" | "sln" | "slnx").then(|| format!("project marker {name}"))
+}
+
+#[derive(Debug, Default)]
+struct SourceMarkerScan {
+    visited: usize,
+    signals: Vec<String>,
+    direct_code_dirs: BTreeSet<String>,
 }
 
 fn collect_source_markers(
     dir: &Path,
     depth: usize,
-    visited: &mut usize,
-    signals: &mut Vec<String>,
+    direct_code_dir: Option<&str>,
+    scan: &mut SourceMarkerScan,
 ) {
-    if depth > SOURCE_SCAN_MAX_DEPTH || *visited >= SOURCE_SCAN_MAX_ENTRIES {
+    if depth > SOURCE_SCAN_MAX_DEPTH || scan.visited >= SOURCE_SCAN_MAX_ENTRIES {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if *visited >= SOURCE_SCAN_MAX_ENTRIES {
-            return;
-        }
-        *visited += 1;
-        let path = entry.path();
-        if path.is_dir() {
-            if depth < SOURCE_SCAN_MAX_DEPTH && should_scan_source_dir(&path) {
-                collect_source_markers(&path, depth + 1, visited, signals);
-            }
-            continue;
-        }
-        match classify_language(&path) {
-            LanguageKind::C => signals.push("shallow C source".to_string()),
-            LanguageKind::Cpp => signals.push("shallow C/C++ source".to_string()),
-            LanguageKind::CSharp => signals.push("shallow C# source".to_string()),
-            LanguageKind::Go => signals.push("shallow Go source".to_string()),
-            LanguageKind::Java => signals.push("shallow Java source".to_string()),
-            LanguageKind::JavaScript | LanguageKind::Jsx => {
-                signals.push("shallow JavaScript source".to_string())
-            }
-            LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
-            LanguageKind::Python => signals.push("shallow Python source".to_string()),
-            LanguageKind::TypeScript | LanguageKind::Tsx => {
-                signals.push("shallow TypeScript source".to_string())
-            }
-            _ => {
-                if let Some(label) = code_extension_signal(&path) {
-                    signals.push(label);
-                }
-            }
-        }
+        collect_source_marker_entry(&entry.path(), depth, direct_code_dir, scan);
     }
 }
 
-fn code_directory_markers(root: &Path) -> Vec<String> {
-    [
-        "app", "cmd", "crates", "include", "internal", "lib", "packages", "pkg", "src",
-    ]
-    .into_iter()
-    .filter(|name| {
-        let path = root.join(name);
-        path.is_dir() && directory_contains_code(&path)
-    })
-    .map(|name| format!("code directory {name} contains source"))
-    .collect()
+fn collect_source_markers_from_entries(
+    entries: &[fs::DirEntry],
+    depth: usize,
+    direct_code_dir: Option<&str>,
+    scan: &mut SourceMarkerScan,
+) {
+    if depth > SOURCE_SCAN_MAX_DEPTH || scan.visited >= SOURCE_SCAN_MAX_ENTRIES {
+        return;
+    }
+    for entry in entries {
+        collect_source_marker_entry(&entry.path(), depth, direct_code_dir, scan);
+    }
+}
+
+fn collect_source_marker_entry(
+    path: &Path,
+    depth: usize,
+    direct_code_dir: Option<&str>,
+    scan: &mut SourceMarkerScan,
+) {
+    if scan.visited >= SOURCE_SCAN_MAX_ENTRIES {
+        return;
+    }
+    scan.visited += 1;
+    if path.is_dir() {
+        if depth < SOURCE_SCAN_MAX_DEPTH && should_scan_source_dir(path) {
+            let child_code_dir = if depth == 0 {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| is_code_directory_name(name))
+            } else {
+                None
+            };
+            collect_source_markers(path, depth + 1, child_code_dir, scan);
+        }
+        return;
+    }
+    if let Some(signal) = source_marker_signal(path) {
+        if let Some(name) = direct_code_dir {
+            scan.direct_code_dirs.insert(name.to_string());
+        }
+        scan.signals.push(signal);
+    }
+}
+
+fn code_directory_markers(root: &Path, direct_code_dirs: &BTreeSet<String>) -> Vec<String> {
+    CODE_DIRECTORY_MARKERS
+        .iter()
+        .copied()
+        .filter(|name| {
+            let path = root.join(name);
+            path.is_dir() && (direct_code_dirs.contains(*name) || directory_contains_code(&path))
+        })
+        .map(|name| format!("code directory {name} contains source"))
+        .collect()
 }
 
 fn directory_contains_code(dir: &Path) -> bool {
-    let mut signals = Vec::new();
-    let mut visited = 0;
-    collect_source_markers(dir, SOURCE_SCAN_MAX_DEPTH, &mut visited, &mut signals);
-    !signals.is_empty()
+    let mut scan = SourceMarkerScan::default();
+    collect_source_markers(dir, SOURCE_SCAN_MAX_DEPTH, None, &mut scan);
+    !scan.signals.is_empty()
+}
+
+fn is_code_directory_name(name: &str) -> bool {
+    CODE_DIRECTORY_MARKERS.contains(&name)
 }
 
 fn should_scan_source_dir(path: &Path) -> bool {
@@ -970,6 +1097,25 @@ fn should_scan_source_dir(path: &Path) -> bool {
             | "venv"
             | ".gradle"
     )
+}
+
+fn source_marker_signal(path: &Path) -> Option<String> {
+    match classify_language(path) {
+        LanguageKind::C => Some("shallow C source".to_string()),
+        LanguageKind::Cpp => Some("shallow C/C++ source".to_string()),
+        LanguageKind::CSharp => Some("shallow C# source".to_string()),
+        LanguageKind::Go => Some("shallow Go source".to_string()),
+        LanguageKind::Java => Some("shallow Java source".to_string()),
+        LanguageKind::JavaScript | LanguageKind::Jsx => {
+            Some("shallow JavaScript source".to_string())
+        }
+        LanguageKind::Rust => Some("shallow Rust source".to_string()),
+        LanguageKind::Python => Some("shallow Python source".to_string()),
+        LanguageKind::TypeScript | LanguageKind::Tsx => {
+            Some("shallow TypeScript source".to_string())
+        }
+        _ => code_extension_signal(path),
+    }
 }
 
 fn code_extension_signal(path: &Path) -> Option<String> {
@@ -1005,7 +1151,12 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
             root.display()
         ))
     })?;
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+    let relative = relative.to_string_lossy();
+    if relative.contains('\\') {
+        Ok(relative.replace('\\', "/"))
+    } else {
+        Ok(relative.into_owned())
+    }
 }
 
 fn unsupported_file(
@@ -1060,14 +1211,29 @@ fn normalize_reason_class(class: &str) -> String {
 }
 
 fn normalize_path(relative_path: &str, is_dir: bool) -> String {
-    let mut normalized = relative_path.replace('\\', "/");
-    while normalized.starts_with("./") {
-        normalized = normalized[2..].to_string();
+    let mut start = 0;
+    while let Some(rest) = relative_path.get(start..) {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0] == b'.' && matches!(bytes[1], b'/' | b'\\') {
+            start += 2;
+        } else {
+            break;
+        }
     }
-    if is_dir && !normalized.ends_with('/') {
-        normalized.push('/');
+    let normalized = &relative_path[start..];
+    let has_backslash = normalized.as_bytes().contains(&b'\\');
+    let needs_trailing_slash = is_dir && !normalized.ends_with('/') && !normalized.ends_with('\\');
+    if !has_backslash && !needs_trailing_slash {
+        return normalized.to_string();
     }
-    normalized
+    let mut output = String::with_capacity(normalized.len() + usize::from(needs_trailing_slash));
+    for ch in normalized.chars() {
+        output.push(if ch == '\\' { '/' } else { ch });
+    }
+    if needs_trailing_slash {
+        output.push('/');
+    }
+    output
 }
 
 fn default_path_reason(relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {

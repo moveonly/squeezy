@@ -465,28 +465,18 @@ impl SkipCursor {
                 }
             }
             LlmEvent::TextDelta(text) => {
-                let chars: Vec<char> = text.chars().collect();
                 let already = skip.emitted_text_chars.saturating_sub(self.seen_text_chars);
-                self.seen_text_chars += chars.len();
-                if already >= chars.len() {
-                    None
-                } else {
-                    let suffix: String = chars[already..].iter().collect();
-                    Some(LlmEvent::TextDelta(suffix))
-                }
+                let (seen, forwarded) = skip_delta_prefix(text, already);
+                self.seen_text_chars += seen;
+                forwarded.map(LlmEvent::TextDelta)
             }
             LlmEvent::ReasoningDelta { text, kind } => {
-                let chars: Vec<char> = text.chars().collect();
                 let already = skip
                     .emitted_reasoning_chars
                     .saturating_sub(self.seen_reasoning_chars);
-                self.seen_reasoning_chars += chars.len();
-                if already >= chars.len() {
-                    None
-                } else {
-                    let suffix: String = chars[already..].iter().collect();
-                    Some(LlmEvent::ReasoningDelta { text: suffix, kind })
-                }
+                let (seen, forwarded) = skip_delta_prefix(text, already);
+                self.seen_reasoning_chars += seen;
+                forwarded.map(|text| LlmEvent::ReasoningDelta { text, kind })
             }
             LlmEvent::ReasoningDone(payload) => {
                 self.seen_reasoning_done += 1;
@@ -538,6 +528,31 @@ impl SkipCursor {
             other => Some(other),
         }
     }
+}
+
+fn skip_delta_prefix(text: String, skip_chars: usize) -> (usize, Option<String>) {
+    if text.is_empty() {
+        return (0, None);
+    }
+    if skip_chars == 0 {
+        return (text.chars().count(), Some(text));
+    }
+
+    let mut total_chars = 0usize;
+    let mut split_at = None;
+    for (byte_index, _) in text.char_indices() {
+        if total_chars == skip_chars {
+            split_at = Some(byte_index);
+        }
+        total_chars += 1;
+    }
+    if skip_chars >= total_chars {
+        return (total_chars, None);
+    }
+
+    let mut text = text;
+    let suffix = text.split_off(split_at.expect("split point exists when skip_chars < chars"));
+    (total_chars, Some(suffix))
 }
 
 /// Wraps a stream-producing closure so transient mid-stream errors trigger a

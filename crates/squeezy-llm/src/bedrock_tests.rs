@@ -8,7 +8,7 @@ use aws_sdk_bedrockruntime::types::{
     ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
     ToolInputSchema,
 };
-use aws_smithy_types::{Document, Number};
+use aws_smithy_types::{Blob, Document, Number};
 use serde_json::json;
 use squeezy_core::SqueezyError;
 
@@ -432,6 +432,12 @@ fn json_to_document_preserves_numeric_kinds() {
         panic!("expected array document");
     };
     assert_eq!(arr.len(), 2);
+}
+
+#[test]
+fn hex_encode_formats_lowercase_two_digit_bytes() {
+    let blob = Blob::new(vec![0x00, 0x0f, 0x10, 0xab, 0xff]);
+    assert_eq!(hex_encode(&blob), "000f10abff");
 }
 
 #[test]

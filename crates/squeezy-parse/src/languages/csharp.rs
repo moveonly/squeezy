@@ -460,28 +460,71 @@ fn csharp_language_identity(
 }
 
 fn csharp_type_identity_name(scope: &CsharpScope, name: &str) -> String {
-    let mut parts = Vec::new();
-    if let Some(namespace) = scope.current_namespace() {
-        parts.push(namespace);
+    let mut identity = String::with_capacity(csharp_identity_capacity(
+        &scope.namespace_segments,
+        &scope.type_path,
+        &[],
+        Some(name),
+    ));
+    for segment in &scope.namespace_segments {
+        push_csharp_identity_segment(&mut identity, segment);
     }
-    parts.extend(scope.type_path.iter().cloned());
-    parts.push(name.to_string());
-    parts.join(".")
+    for segment in &scope.type_path {
+        push_csharp_identity_segment(&mut identity, segment);
+    }
+    push_csharp_identity_segment(&mut identity, name);
+    identity
 }
 
 fn csharp_member_owner_identity(scope: &CsharpScope) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(namespace) = scope.current_namespace() {
-        parts.push(namespace);
-    }
-    parts.extend(scope.type_path.iter().cloned());
-    if parts.is_empty() {
+    if scope.namespace_segments.is_empty() && scope.type_path.is_empty() {
         return None;
     }
-    if !scope.callable_path.is_empty() {
-        parts.extend(scope.callable_path.iter().cloned());
+
+    let mut identity = String::with_capacity(csharp_identity_capacity(
+        &scope.namespace_segments,
+        &scope.type_path,
+        &scope.callable_path,
+        None,
+    ));
+    for segment in &scope.namespace_segments {
+        push_csharp_identity_segment(&mut identity, segment);
     }
-    Some(parts.join("."))
+    for segment in &scope.type_path {
+        push_csharp_identity_segment(&mut identity, segment);
+    }
+    for segment in &scope.callable_path {
+        push_csharp_identity_segment(&mut identity, segment);
+    }
+    Some(identity)
+}
+
+fn push_csharp_identity_segment(identity: &mut String, segment: &str) {
+    if !identity.is_empty() {
+        identity.push('.');
+    }
+    identity.push_str(segment);
+}
+
+fn csharp_identity_capacity(
+    namespace_segments: &[String],
+    type_path: &[String],
+    callable_path: &[String],
+    tail: Option<&str>,
+) -> usize {
+    let segment_count = namespace_segments.len()
+        + type_path.len()
+        + callable_path.len()
+        + usize::from(tail.is_some());
+    let separator_count = segment_count.saturating_sub(1);
+    namespace_segments
+        .iter()
+        .chain(type_path)
+        .chain(callable_path)
+        .map(String::len)
+        .sum::<usize>()
+        + tail.map(str::len).unwrap_or(0)
+        + separator_count
 }
 
 fn csharp_operator_identity_name(name: &str) -> String {
@@ -536,8 +579,9 @@ pub(crate) fn csharp_field_text(node: Node<'_>, field: &str, source: &str) -> Op
 
 pub(crate) fn csharp_qualified_segments(raw: &str) -> Vec<String> {
     raw.split('.')
-        .map(|segment| segment.trim().to_string())
+        .map(str::trim)
         .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
@@ -1261,7 +1305,7 @@ pub(crate) fn csharp_is_keyword_or_predefined(text: &str) -> bool {
 }
 
 pub(crate) fn dedup_csharp_facts(ctx: &mut ExtractContext<'_>) {
-    let mut import_seen = HashSet::new();
+    let mut import_seen = HashSet::with_capacity(ctx.imports.len());
     ctx.imports.retain(|import| {
         import_seen.insert(format!(
             "{}|{:?}|{}|{:?}|{}|{}",
@@ -1274,7 +1318,7 @@ pub(crate) fn dedup_csharp_facts(ctx: &mut ExtractContext<'_>) {
         ))
     });
 
-    let mut reference_seen = HashSet::new();
+    let mut reference_seen = HashSet::with_capacity(ctx.references.len());
     ctx.references.retain(|reference| {
         reference_seen.insert(format!(
             "{}|{:?}|{}|{:?}|{}|{}",

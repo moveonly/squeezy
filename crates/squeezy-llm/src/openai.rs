@@ -220,8 +220,7 @@ impl OpenAiProvider {
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
-        let cache_spec = request.effective_cache_spec();
-        if let Some(key) = cache_spec.key.as_deref() {
+        if let Some(key) = request.effective_cache_key() {
             // OpenAI's Responses API silently drops `prompt_cache_key`
             // values longer than 64 codepoints — the request succeeds
             // but the field is ignored server-side, so every turn pays
@@ -229,7 +228,7 @@ impl OpenAiProvider {
             // cache hits. Clamp client-side. See [`clamp_prompt_cache_key`].
             body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
         }
-        if cache_spec.retention == crate::CacheRetention::Long {
+        if request.effective_cache_retention() == crate::CacheRetention::Long {
             body["prompt_cache_retention"] = json!("24h");
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
@@ -269,21 +268,17 @@ impl OpenAiProvider {
             }
         }
         if !request.tools.is_empty() {
-            body["tools"] = json!(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                            "strict": tool.strict,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            );
+            let mut tools = Vec::with_capacity(request.tools.len());
+            for tool in request.tools.iter() {
+                tools.push(json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "strict": tool.strict,
+                }));
+            }
+            body["tools"] = Value::Array(tools);
         }
         // M-03: forward `tool_choice` unconditionally — Responses-state
         // continuations re-attach the prior turn's tools via
@@ -1119,7 +1114,13 @@ fn openai_input(input: &[LlmInputItem]) -> Value {
     // removed because (a) OpenAI is phasing it out for Responses, and
     // (b) it produced a different prompt-cache prefix than the array
     // form for otherwise-identical bodies.
-    Value::Array(input.iter().filter_map(openai_input_item).collect())
+    let mut items = Vec::with_capacity(input.len());
+    for item in input {
+        if let Some(value) = openai_input_item(item) {
+            items.push(value);
+        }
+    }
+    Value::Array(items)
 }
 
 fn openai_input_item(item: &LlmInputItem) -> Option<Value> {

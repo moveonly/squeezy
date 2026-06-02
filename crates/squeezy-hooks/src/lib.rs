@@ -319,16 +319,55 @@ impl HookRegistry {
     /// replies. The event discriminant is derived from `payload` so
     /// dispatch sites never need to pass both.
     pub fn dispatch(&self, payload: HookPayload) -> Vec<HookResult> {
+        if self.handlers.is_empty() {
+            return Vec::new();
+        }
         let ctx = HookContext::new(payload);
         self.dispatch_context(&ctx)
     }
 
     /// Like [`HookRegistry::dispatch`] but accepts a pre-built context.
     pub fn dispatch_context(&self, ctx: &HookContext) -> Vec<HookResult> {
-        self.handlers
-            .iter()
-            .map(|handler| handler.handle(ctx))
-            .collect()
+        let mut results = Vec::with_capacity(self.handlers.len());
+        for handler in &self.handlers {
+            results.push(handler.handle(ctx));
+        }
+        results
+    }
+
+    /// Fan out `payload` to every handler without retaining replies.
+    ///
+    /// Use this for observation-only sites that only need handler side
+    /// effects; decision points should continue using [`HookRegistry::dispatch`].
+    pub fn dispatch_no_collect(&self, payload: HookPayload) {
+        if self.handlers.is_empty() {
+            return;
+        }
+        let ctx = HookContext::new(payload);
+        self.dispatch_context_no_collect(&ctx);
+    }
+
+    /// Like [`HookRegistry::dispatch_no_collect`] but accepts a pre-built
+    /// context.
+    pub fn dispatch_context_no_collect(&self, ctx: &HookContext) {
+        for handler in &self.handlers {
+            let _ = handler.handle(ctx);
+        }
+    }
+
+    fn first_denial_message(&self, ctx: &HookContext) -> Option<String> {
+        let mut first_denial = None;
+        for handler in &self.handlers {
+            let result = handler.handle(ctx);
+            if !result.allow && first_denial.is_none() {
+                first_denial = Some(
+                    result
+                        .message
+                        .unwrap_or_else(|| "tool call denied by legacy hook".to_string()),
+                );
+            }
+        }
+        first_denial
     }
 }
 
@@ -640,7 +679,7 @@ impl AgentHook for LegacyHookForwarder {
             if self.registry.is_empty() {
                 return;
             }
-            let _ = self.registry.dispatch(HookPayload::PreTurn {
+            self.registry.dispatch_no_collect(HookPayload::PreTurn {
                 turn_id: req.turn_id.clone(),
             });
         })
@@ -651,18 +690,13 @@ impl AgentHook for LegacyHookForwarder {
             if self.registry.is_empty() {
                 return Decision::Allow;
             }
-            let results = self.registry.dispatch(HookPayload::PreToolUse {
+            let ctx = HookContext::new(HookPayload::PreToolUse {
                 turn_id: call.turn_id.clone(),
                 tool_name: call.tool_name.clone(),
                 call_id: call.call_id.clone(),
             });
-            for result in results {
-                if !result.allow {
-                    let message = result
-                        .message
-                        .unwrap_or_else(|| "tool call denied by legacy hook".to_string());
-                    return Decision::Deny { message };
-                }
+            if let Some(message) = self.registry.first_denial_message(&ctx) {
+                return Decision::Deny { message };
             }
             Decision::Allow
         })
@@ -673,7 +707,7 @@ impl AgentHook for LegacyHookForwarder {
             if self.registry.is_empty() {
                 return;
             }
-            let _ = self.registry.dispatch(HookPayload::PostToolUse {
+            self.registry.dispatch_no_collect(HookPayload::PostToolUse {
                 turn_id: result.turn_id.clone(),
                 tool_name: result.tool_name.clone(),
                 call_id: result.call_id.clone(),

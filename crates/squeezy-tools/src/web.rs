@@ -52,10 +52,13 @@ impl WebSearchProvider {
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "exa" => Some(Self::Exa),
-            "parallel" => Some(Self::Parallel),
-            _ => None,
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("exa") {
+            Some(Self::Exa)
+        } else if raw.eq_ignore_ascii_case("parallel") {
+            Some(Self::Parallel)
+        } else {
+            None
         }
     }
 }
@@ -95,7 +98,8 @@ pub(crate) struct WebHttpResponse {
 impl WebHttpResponse {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
-            .get(&name.to_ascii_lowercase())
+            .get(name)
+            .or_else(|| self.headers.get(&name.to_ascii_lowercase()))
             .map(String::as_str)
     }
 
@@ -669,16 +673,19 @@ pub(crate) fn parse_mcp_websearch_response(body: &str) -> Option<String> {
         return Some(result);
     }
 
-    let mut chunks = Vec::new();
+    let mut chunks = String::new();
     for line in body.lines() {
         let Some(payload) = line.strip_prefix("data: ") else {
             continue;
         };
         if let Some(result) = parse_mcp_payload(payload) {
-            chunks.push(result);
+            if !chunks.is_empty() {
+                chunks.push_str("\n\n");
+            }
+            chunks.push_str(&result);
         }
     }
-    (!chunks.is_empty()).then(|| chunks.join("\n\n"))
+    (!chunks.is_empty()).then_some(chunks)
 }
 
 fn parse_mcp_payload(payload: &str) -> Option<String> {
@@ -687,7 +694,8 @@ fn parse_mcp_payload(payload: &str) -> Option<String> {
         return None;
     }
     let value = serde_json::from_str::<Value>(trimmed).ok()?;
-    let texts = value
+    let mut texts = String::new();
+    for text in value
         .get("result")?
         .get("content")?
         .as_array()?
@@ -695,8 +703,13 @@ fn parse_mcp_payload(payload: &str) -> Option<String> {
         .filter_map(|item| item.get("text")?.as_str())
         .filter(|text| !text.trim().is_empty())
         .map(str::trim)
-        .collect::<Vec<_>>();
-    (!texts.is_empty()).then(|| texts.join("\n\n"))
+    {
+        if !texts.is_empty() {
+            texts.push_str("\n\n");
+        }
+        texts.push_str(text);
+    }
+    (!texts.is_empty()).then_some(texts)
 }
 
 fn web_fetch_request_sha256(
@@ -813,16 +826,18 @@ async fn read_response_bytes(
     response: reqwest::Response,
     max_response_bytes: usize,
 ) -> std::result::Result<Vec<u8>, String> {
-    if response
-        .content_length()
-        .is_some_and(|len| len > max_response_bytes as u64)
-    {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|len| len > max_response_bytes as u64) {
         return Err(format!(
             "response too large; content-length exceeds {max_response_bytes} bytes"
         ));
     }
 
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        content_length
+            .map(|len| len.min(max_response_bytes as u64) as usize)
+            .unwrap_or_default(),
+    );
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| format!("failed to read response body: {err}"))?;
@@ -929,20 +944,26 @@ fn strip_html_block_tag(input: &str, tag: &str) -> String {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(start) = lower.find(&open) else {
+        let Some(start) = find_ascii_case_insensitive(rest, &open) else {
             output.push_str(rest);
             break;
         };
         output.push_str(&rest[..start]);
         let after_start = &rest[start..];
-        let lower_after_start = after_start.to_ascii_lowercase();
-        let Some(end) = lower_after_start.find(&close) else {
+        let Some(end) = find_ascii_case_insensitive(after_start, &close) else {
             break;
         };
         rest = &after_start[end + close.len()..];
     }
     output
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn decode_html_entities(input: &str) -> String {

@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -1685,11 +1687,14 @@ fn startup_language_summary(loaded: &RepoProfileLoad) -> String {
     if families.is_empty() {
         return "none".to_string();
     }
-    families
-        .into_values()
-        .map(|(name, files)| format!("{name} {files}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut summary = String::new();
+    for (name, files) in families.into_values() {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        let _ = write!(summary, "{name} {files}");
+    }
+    summary
 }
 
 fn language_family_display<'a>(family: &str, fallback: &'a str) -> &'a str {

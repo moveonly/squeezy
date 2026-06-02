@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,11 +71,13 @@ impl SqueezyHelp {
     }
 
     pub fn topic_index(&self) -> HelpAnswer {
-        let topics = TOPICS
-            .iter()
-            .map(|topic| format!("- `{}`: {}", topic.id, topic.title))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut topics = String::new();
+        for topic in TOPICS {
+            if !topics.is_empty() {
+                topics.push('\n');
+            }
+            let _ = write!(topics, "- `{}`: {}", topic.id, topic.title);
+        }
         HelpAnswer {
             topic: "index".to_string(),
             status: HelpStatus::Answered,
@@ -159,11 +161,13 @@ impl SqueezyHelp {
     }
 
     fn unsupported(&self, topic: &str) -> HelpAnswer {
-        let suggestions = TOPICS
-            .iter()
-            .map(|topic| topic.id)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut suggestions = String::new();
+        for topic in TOPICS {
+            if !suggestions.is_empty() {
+                suggestions.push_str(", ");
+            }
+            suggestions.push_str(topic.id);
+        }
         HelpAnswer {
             topic: topic.trim().to_string(),
             status: HelpStatus::Unsupported,
@@ -776,13 +780,13 @@ fn clean_token(tok: &str) -> &str {
 // Returns true when `needle` (already normalized) appears as a contiguous run
 // of whole tokens inside `haystack_tokens`. Empty needles never match.
 fn contains_word_sequence(haystack_tokens: &[&str], needle: &str) -> bool {
-    let needle_tokens: Vec<&str> = needle.split_whitespace().collect();
-    if needle_tokens.is_empty() || needle_tokens.len() > haystack_tokens.len() {
+    let needle_len = needle.split_whitespace().count();
+    if needle_len == 0 || needle_len > haystack_tokens.len() {
         return false;
     }
     haystack_tokens
-        .windows(needle_tokens.len())
-        .any(|window| window == needle_tokens.as_slice())
+        .windows(needle_len)
+        .any(|window| window.iter().copied().eq(needle.split_whitespace()))
 }
 
 fn extract_config_sections(config_inspect: &str, wanted: &[&str]) -> Vec<ConfigSection> {
@@ -860,13 +864,24 @@ fn parse_section_header(line: &str) -> Option<&str> {
 }
 
 fn normalize(input: &str) -> String {
-    input
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['_', '-'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(input.len());
+    let mut pending_space = false;
+    for ch in input.trim().chars() {
+        let ch = match ch {
+            '_' | '-' => ' ',
+            _ => ch.to_ascii_lowercase(),
+        };
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {

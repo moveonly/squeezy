@@ -731,12 +731,16 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
             draft: String::new(),
             cursor: 0,
         },
-        (FieldKind::Integer { min, max, .. }, FieldValue::Integer(v)) => FieldEditor::Integer {
-            draft: v.to_string(),
-            cursor: v.to_string().len(),
-            min,
-            max,
-        },
+        (FieldKind::Integer { min, max, .. }, FieldValue::Integer(v)) => {
+            let draft = v.to_string();
+            let cursor = draft.len();
+            FieldEditor::Integer {
+                draft,
+                cursor,
+                min,
+                max,
+            }
+        }
         (FieldKind::Integer { min, max, .. }, _) => FieldEditor::Integer {
             draft: String::new(),
             cursor: 0,
@@ -744,9 +748,11 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
             max,
         },
         (FieldKind::OptionalInteger { min, max, .. }, FieldValue::OptionalInteger(Some(v))) => {
+            let draft = v.to_string();
+            let cursor = draft.len();
             FieldEditor::OptionalInteger {
-                draft: v.to_string(),
-                cursor: v.to_string().len(),
+                draft,
+                cursor,
                 min,
                 max,
             }
@@ -775,10 +781,11 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
         }
         (FieldKind::Bool, FieldValue::Bool(v)) => FieldEditor::Bool(v),
         (FieldKind::Bool, _) => FieldEditor::Bool(false),
-        (FieldKind::DurationMs, FieldValue::Duration(d)) => FieldEditor::Duration {
-            draft: d.as_millis().to_string(),
-            cursor: d.as_millis().to_string().len(),
-        },
+        (FieldKind::DurationMs, FieldValue::Duration(d)) => {
+            let draft = d.as_millis().to_string();
+            let cursor = draft.len();
+            FieldEditor::Duration { draft, cursor }
+        }
         (FieldKind::DurationMs, _) => FieldEditor::Duration {
             draft: String::new(),
             cursor: 0,

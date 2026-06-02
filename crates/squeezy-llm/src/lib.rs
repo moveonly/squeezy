@@ -300,14 +300,32 @@ impl LlmRequest {
     ///   set, retention is lifted to `Short` so old callers preserve their
     ///   pre-retention-enum 5m / in-memory behavior.
     pub fn effective_cache_spec(&self) -> CacheSpec {
-        let mut spec = self.cache.clone();
-        if spec.key.is_none() {
-            spec.key = self.cache_key.clone();
+        CacheSpec {
+            key: self.effective_cache_key().map(ToOwned::to_owned),
+            retention: self.effective_cache_retention(),
         }
-        if spec.retention == CacheRetention::None && self.cache_key.is_some() {
-            spec.retention = CacheRetention::Short;
+    }
+
+    /// Effective cache key after applying the legacy
+    /// [`LlmRequest::cache_key`] fallback, returned as a borrow for callers
+    /// that only need to inspect or forward the value.
+    pub fn effective_cache_key(&self) -> Option<&str> {
+        self.cache.key.as_deref().or(self.cache_key.as_deref())
+    }
+
+    /// Effective cache retention without cloning the full [`CacheSpec`].
+    ///
+    /// Mirrors [`LlmRequest::effective_cache_spec`]: explicit
+    /// `cache.retention` wins, and a legacy `cache_key` lifts an otherwise
+    /// disabled retention to [`CacheRetention::Short`].
+    pub fn effective_cache_retention(&self) -> CacheRetention {
+        if self.cache.retention != CacheRetention::None {
+            self.cache.retention
+        } else if self.cache_key.is_some() {
+            CacheRetention::Short
+        } else {
+            CacheRetention::None
         }
-        spec
     }
 }
 

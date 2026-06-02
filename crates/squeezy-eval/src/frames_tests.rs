@@ -24,3 +24,16 @@ fn render_styled_plain_text() {
     assert!(all_spans.iter().any(|s| s.text.contains("plain text")));
     assert!(ansi.contains("plain text"));
 }
+
+#[test]
+fn push_ansi_preserves_combined_sgr_order() {
+    let style = Style::default()
+        .fg(Color::Rgb(1, 2, 3))
+        .bg(Color::Indexed(4))
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mut ansi = String::new();
+
+    push_ansi(&mut ansi, &style, "x");
+
+    assert_eq!(ansi, "\x1b[38;2;1;2;3;48;5;4;1;4mx\x1b[0m");
+}

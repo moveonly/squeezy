@@ -208,20 +208,19 @@ fn render_markdown(a: &RunSnapshot, b: &RunSnapshot) -> String {
     let _ = writeln!(out, "## Tool-call set delta per turn");
     let pairs = align_frames(&a.frames, &b.frames);
     for pair in &pairs {
-        let (a_set, b_set) = (
-            tool_set(pair.a.map(|f| &f.tool_calls).unwrap_or(&vec![])),
-            tool_set(pair.b.map(|f| &f.tool_calls).unwrap_or(&vec![])),
-        );
-        let added: Vec<_> = b_set.difference(&a_set).collect();
-        let removed: Vec<_> = a_set.difference(&b_set).collect();
-        if added.is_empty() && removed.is_empty() {
+        let a_calls: &[ToolCallSummary] = pair.a.map_or(&[], |f| f.tool_calls.as_slice());
+        let b_calls: &[ToolCallSummary] = pair.b.map_or(&[], |f| f.tool_calls.as_slice());
+        let (a_set, b_set) = (tool_set(a_calls), tool_set(b_calls));
+        let has_removed = a_set.difference(&b_set).next().is_some();
+        let has_added = b_set.difference(&a_set).next().is_some();
+        if !has_added && !has_removed {
             continue;
         }
         let _ = writeln!(out, "### {}", pair.label);
-        for entry in &removed {
+        for entry in a_set.difference(&b_set) {
             let _ = writeln!(out, "- `-` {} `{}`", entry.0, short_sha(&entry.1));
         }
-        for entry in &added {
+        for entry in b_set.difference(&a_set) {
             let _ = writeln!(out, "- `+` {} `{}`", entry.0, short_sha(&entry.1));
         }
         let _ = writeln!(out);
@@ -302,8 +301,8 @@ struct AlignedPair<'a> {
 }
 
 fn align_frames<'a>(a: &'a [FrameRecord], b: &'a [FrameRecord]) -> Vec<AlignedPair<'a>> {
-    let mut pairs = Vec::new();
     let max = a.len().max(b.len());
+    let mut pairs = Vec::with_capacity(max);
     for i in 0..max {
         pairs.push(AlignedPair {
             label: format!("turn #{}", i + 1),

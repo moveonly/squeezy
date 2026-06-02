@@ -267,7 +267,7 @@ pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Opti
     // because the marker check earlier already rejected the prompt).
     for extra in &cfg.extra_heuristic_verbs {
         if extra.eq_ignore_ascii_case(first) {
-            return Some(CheapReason::ExtraVerb(Arc::from(first.to_string())));
+            return Some(CheapReason::ExtraVerb(Arc::from(first)));
         }
     }
     None
@@ -535,7 +535,7 @@ async fn run_judge(
     };
     let request = LlmRequest {
         model: cheap_model.clone(),
-        instructions: Arc::from(judge_instructions_for(provider_name).to_string()),
+        instructions: Arc::from(judge_instructions_for(provider_name)),
         input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
         max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
         response_verbosity: None,
@@ -591,10 +591,13 @@ fn parse_judge_reply(raw: &str) -> Option<bool> {
         .map(|stripped| stripped.trim().trim_end_matches("```").trim())
         .unwrap_or(trimmed);
     let reply: JudgeReply = serde_json::from_str(body).ok()?;
-    match reply.route.trim().to_ascii_lowercase().as_str() {
-        "cheap" => Some(true),
-        "parent" => Some(false),
-        _ => None,
+    let route = reply.route.trim();
+    if route.eq_ignore_ascii_case("cheap") {
+        Some(true)
+    } else if route.eq_ignore_ascii_case("parent") {
+        Some(false)
+    } else {
+        None
     }
 }
 

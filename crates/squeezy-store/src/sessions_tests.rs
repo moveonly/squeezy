@@ -284,6 +284,47 @@ fn replay_tape_round_trips_and_exports() {
 }
 
 #[test]
+fn open_session_seeds_replay_sequence_from_existing_jsonl() {
+    let root = temp_root("replay-open-count");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::UserMessage,
+            Some("1".to_string()),
+            json!({"input": "find a bug"}),
+        ))
+        .expect("append user");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelStarted,
+            Some("1".to_string()),
+            json!({"model": "test-model"}),
+        ))
+        .expect("append start");
+
+    let session_id = handle.session_id().to_string();
+    let reopened = store.open_session(session_id.clone());
+    reopened
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelCompleted,
+            Some("1".to_string()),
+            json!({"response_id": "resp_1", "cost": CostSnapshot::default()}),
+        ))
+        .expect("append completion after open");
+
+    let tape = store.replay_tape(&session_id).expect("read replay");
+    let sequences: Vec<u64> = tape.events.iter().map(|event| event.sequence).collect();
+    assert_eq!(sequences, vec![1, 2, 3]);
+}
+
+#[test]
 fn replay_tape_counts_tampered_lines_as_warnings() {
     let root = temp_root("replay-tamper");
     let config = AppConfig {
@@ -863,6 +904,21 @@ fn state_store_round_trips_graph_receipts_and_observations() {
     store
         .put_read_snapshot(&second_window)
         .expect("put second window snapshot");
+    let nul_suffixed_path = StoredReadSnapshot {
+        path: "src/lib.rs\0generated".to_string(),
+        tool_name: "read_slice".to_string(),
+        call_id: "read_3".to_string(),
+        stable_output_sha256: "read-out-3".to_string(),
+        content_sha256: Some("generated-content".to_string()),
+        start_byte: 0,
+        end_byte: 4,
+        content: "fake".to_string(),
+        model_output_bytes: 64,
+        created_unix_millis: 4,
+    };
+    store
+        .put_read_snapshot(&nul_suffixed_path)
+        .expect("put similar path snapshot");
     let mut snapshots = store
         .read_snapshots_for_path("src/lib.rs")
         .expect("snapshots for path");

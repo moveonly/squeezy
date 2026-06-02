@@ -63,6 +63,7 @@ fn rejects_workspace_paths_outside_root() {
 #[test]
 fn path_matches_requires_segment_boundary_for_literal_patterns() {
     assert!(path_matches("*.rs", "src/lib.rs"));
+    assert!(path_matches("*.tar.gz", "dist/archive.tar.gz"));
     assert!(path_matches("lib.rs", "src/lib.rs"));
     assert!(path_matches("src/main.rs", "src/main.rs"));
     assert!(path_matches("/src/main.rs", "src/main.rs"));

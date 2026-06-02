@@ -920,15 +920,16 @@ fn edit_theme_text(
 }
 
 fn parse_rgb_draft(draft: &str) -> Option<[u8; 3]> {
-    let parts: Vec<&str> = draft.split(',').map(str::trim).collect();
-    if parts.len() != 3 {
+    let mut parts = draft.split(',').map(str::trim);
+    let rgb = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
+    if parts.next().is_some() {
         return None;
     }
-    Some([
-        parts[0].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[2].parse().ok()?,
-    ])
+    Some(rgb)
 }
 
 fn open_api_key_entry_for_current_provider(

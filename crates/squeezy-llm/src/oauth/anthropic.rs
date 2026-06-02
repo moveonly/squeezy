@@ -182,12 +182,23 @@ impl AnthropicLoginConfig {
             ("code_challenge_method", "S256"),
             ("state", codes.verifier.as_str()),
         ];
-        let query = params
+        let query_len = params
             .iter()
-            .map(|(k, v)| format!("{}={}", k, url_encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("{}?{}", self.authorize_url, query)
+            .map(|(key, value)| key.len() + 1 + value.len())
+            .sum::<usize>()
+            + params.len().saturating_sub(1);
+        let mut url = String::with_capacity(self.authorize_url.len() + 1 + query_len);
+        url.push_str(&self.authorize_url);
+        url.push('?');
+        for (index, (key, value)) in params.iter().enumerate() {
+            if index > 0 {
+                url.push('&');
+            }
+            url.push_str(key);
+            url.push('=');
+            push_url_encoded(&mut url, value);
+        }
+        url
     }
 }
 
@@ -678,20 +689,20 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn url_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
+fn push_url_encoded(out: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char);
+                out.push(byte as char);
             }
             _ => {
                 out.push('%');
-                out.push_str(&format!("{byte:02X}"));
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
             }
         }
     }
-    out
 }
 
 fn url_decode(value: &str) -> String {

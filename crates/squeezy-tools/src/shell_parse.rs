@@ -287,14 +287,17 @@ pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         return hit;
     }
     let parsed = parse_shell_command(command);
-    let parser_backed = parsed.is_some();
-    let dynamic = parsed.as_ref().is_some_and(|parsed| parsed.dynamic);
-    let heredoc_prefix = parsed.as_ref().is_some_and(|parsed| parsed.heredoc_prefix);
-    let raw_segments = parsed
-        .as_ref()
-        .map(|parsed| parsed.segments.clone())
-        .filter(|segments| !segments.is_empty())
-        .unwrap_or_else(|| shell_segments(&normalized));
+    let (parser_backed, dynamic, heredoc_prefix, raw_segments) = match parsed {
+        Some(parsed) => {
+            let segments = if parsed.segments.is_empty() {
+                shell_segments(&normalized)
+            } else {
+                parsed.segments
+            };
+            (true, parsed.dynamic, parsed.heredoc_prefix, segments)
+        }
+        None => (false, false, false, shell_segments(&normalized)),
+    };
     // Wrappers (sh -c "...", env BAR=v cmd, nohup cmd, xargs cmd, ...) hide
     // the real command behind boilerplate. Append the recursively unwrapped
     // inner commands so destructive/network/compiler checks fire on the
@@ -526,17 +529,7 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
                 }
             }
             let inner = tokens.get(idx..)?;
-            if inner.is_empty() {
-                None
-            } else {
-                Some(
-                    inner
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-            }
+            join_shell_tokens(inner)
         }
         "nohup" | "time" | "sudo" => {
             // Skip the wrapper and any leading flags so the inner argv is
@@ -551,17 +544,7 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
                 }
             }
             let inner = tokens.get(idx..)?;
-            if inner.is_empty() {
-                None
-            } else {
-                Some(
-                    inner
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-            }
+            join_shell_tokens(inner)
         }
         "nice" => {
             let mut idx = 1;
@@ -575,17 +558,7 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
                 idx += 1;
             }
             let inner = tokens.get(idx..)?;
-            if inner.is_empty() {
-                None
-            } else {
-                Some(
-                    inner
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-            }
+            join_shell_tokens(inner)
         }
         "stdbuf" => {
             let mut idx = 1;
@@ -597,17 +570,7 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
                 idx += 1;
             }
             let inner = tokens.get(idx..)?;
-            if inner.is_empty() {
-                None
-            } else {
-                Some(
-                    inner
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-            }
+            join_shell_tokens(inner)
         }
         "timeout" => {
             let mut idx = 1;
@@ -623,17 +586,7 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
                 idx += 1;
             }
             let inner = tokens.get(idx..)?;
-            if inner.is_empty() {
-                None
-            } else {
-                Some(
-                    inner
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-            }
+            join_shell_tokens(inner)
         }
         "xargs" => {
             let mut idx = 1;
@@ -654,20 +607,27 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
                 }
             }
             let inner = tokens.get(idx..)?;
-            if inner.is_empty() {
-                None
-            } else {
-                Some(
-                    inner
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
-            }
+            join_shell_tokens(inner)
         }
         _ => None,
     }
+}
+
+fn join_shell_tokens(tokens: &[String]) -> Option<String> {
+    let (first, rest) = tokens.split_first()?;
+    let mut joined = String::with_capacity(
+        tokens
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(tokens.len().saturating_sub(1)),
+    );
+    joined.push_str(first);
+    for token in rest {
+        joined.push(' ');
+        joined.push_str(token);
+    }
+    Some(joined)
 }
 
 /// True for tokens shaped like `NAME=value` (the env-assignment prefix

@@ -202,20 +202,21 @@ fn write_messages(
                 if !opts.include_tool_outputs {
                     continue;
                 }
-                let call_id = output
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let body = output
-                    .get("output")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| pretty_json(&output));
-                let matched = call_id.as_ref().and_then(|id| pending_calls.remove(id));
-                if let Some(call) = matched {
-                    write_tool_call(out, &call.tool, &call.arguments, Some(&body))?;
+                let call_id = output.get("call_id").and_then(Value::as_str);
+                let matched = call_id.and_then(|id| pending_calls.remove(id));
+                if let Some(body) = output.get("output").and_then(Value::as_str) {
+                    if let Some(call) = matched {
+                        write_tool_call(out, &call.tool, &call.arguments, Some(body))?;
+                    } else {
+                        write_tool_result_only(out, call_id, body)?;
+                    }
                 } else {
-                    write_tool_result_only(out, call_id.as_deref(), &body)?;
+                    let body = pretty_json(&output);
+                    if let Some(call) = matched {
+                        write_tool_call(out, &call.tool, &call.arguments, Some(&body))?;
+                    } else {
+                        write_tool_result_only(out, call_id, &body)?;
+                    }
                 }
             }
             SessionEventKind::Reasoning { .. } => {
@@ -333,15 +334,16 @@ fn write_tool_result_only(
     call_id: Option<&str>,
     body: &str,
 ) -> Result<(), ExportError> {
-    let label = call_id
-        .map(|id| format!("Tool result · {id}"))
-        .unwrap_or_else(|| "Tool result".to_string());
     writeln!(out, "      <li class=\"msg msg-tool\">")?;
-    writeln!(
-        out,
-        "        <div class=\"role\">{}</div>",
-        escape_html(&label)
-    )?;
+    if let Some(id) = call_id {
+        writeln!(
+            out,
+            "        <div class=\"role\">Tool result · {}</div>",
+            escape_html(id)
+        )?;
+    } else {
+        writeln!(out, "        <div class=\"role\">Tool result</div>")?;
+    }
     writeln!(
         out,
         "        <div class=\"tool-output\">{}</div>",
@@ -391,14 +393,18 @@ fn escape_html(s: &str) -> String {
 
 fn push_escaped_html(out: &mut String, s: &str) {
     for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(ch),
-        }
+        push_escaped_char(out, ch);
+    }
+}
+
+fn push_escaped_char(out: &mut String, ch: char) {
+    match ch {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#x27;"),
+        _ => out.push(ch),
     }
 }
 
@@ -446,37 +452,47 @@ impl TextStyle {
             && !self.underline
     }
 
-    fn inline_css(self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+    fn push_inline_css(self, out: &mut String) {
+        let start = out.len();
         if let Some(color) = self.fg {
-            parts.push(format!("color:{}", color_hex(color)));
+            push_color_decl(out, start, "color", color);
         }
         if let Some(color) = self.bg {
-            parts.push(format!("background-color:{}", color_hex(color)));
+            push_color_decl(out, start, "background-color", color);
         }
         if self.bold {
-            parts.push("font-weight:bold".to_string());
+            push_css_decl(out, start, "font-weight:bold");
         }
         if self.dim {
-            parts.push("opacity:0.6".to_string());
+            push_css_decl(out, start, "opacity:0.6");
         }
         if self.italic {
-            parts.push("font-style:italic".to_string());
+            push_css_decl(out, start, "font-style:italic");
         }
         if self.underline {
-            parts.push("text-decoration:underline".to_string());
+            push_css_decl(out, start, "text-decoration:underline");
         }
-        parts.join(";")
     }
 }
 
-fn color_hex(rgb: u32) -> String {
-    format!(
-        "#{:02x}{:02x}{:02x}",
+fn push_css_decl(out: &mut String, start: usize, decl: &str) {
+    if out.len() > start {
+        out.push(';');
+    }
+    out.push_str(decl);
+}
+
+fn push_color_decl(out: &mut String, start: usize, property: &str, rgb: u32) {
+    if out.len() > start {
+        out.push(';');
+    }
+    let _ = write!(
+        out,
+        "{property}:#{:02x}{:02x}{:02x}",
         (rgb >> 16) & 0xff,
         (rgb >> 8) & 0xff,
         rgb & 0xff,
-    )
+    );
 }
 
 fn palette_color(index: u8) -> u32 {
@@ -565,8 +581,14 @@ fn apply_sgr(params: &[u16], style: &mut TextStyle) {
 /// Convert a single ANSI-bearing string to HTML. Text outside of ANSI
 /// sequences is HTML-escaped; styled regions are wrapped in
 /// `<span style="…">` so the rendered document needs no class table.
+#[allow(dead_code)]
 pub(crate) fn ansi_to_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    push_ansi_html(&mut out, text);
+    out
+}
+
+fn push_ansi_html(out: &mut String, text: &str) {
     let mut style = TextStyle::default();
     let mut in_span = false;
     let bytes = text.as_bytes();
@@ -596,7 +618,7 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
             apply_sgr(&params, &mut style);
             if !style.is_empty() {
                 out.push_str("<span style=\"");
-                out.push_str(&style.inline_css());
+                style.push_inline_css(out);
                 out.push_str("\">");
                 in_span = true;
             }
@@ -607,7 +629,7 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
         // UTF-8 sequence with the index-based byte cursor.
         let remaining = std::str::from_utf8(&bytes[cursor..]).unwrap_or("");
         if let Some(ch) = remaining.chars().next() {
-            push_escaped_html(&mut out, &ch.to_string());
+            push_escaped_char(out, ch);
             cursor += ch.len_utf8();
         } else {
             cursor += 1;
@@ -616,7 +638,6 @@ pub(crate) fn ansi_to_html(text: &str) -> String {
     if in_span {
         out.push_str("</span>");
     }
-    out
 }
 
 /// Walk `bytes` starting at `start` until we hit the SGR terminator
@@ -646,14 +667,13 @@ fn find_sgr_end(bytes: &[u8], start: usize) -> Option<usize> {
 fn ansi_lines_to_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 64);
     for line in text.split('\n') {
-        let body = ansi_to_html(line);
         out.push_str("<div class=\"ansi-line\">");
-        if body.is_empty() {
+        let body_start = out.len();
+        push_ansi_html(&mut out, line);
+        if out.len() == body_start {
             // Empty line still needs to take up vertical space so the
             // whitespace is faithful — same trick pi uses.
             out.push_str("&nbsp;");
-        } else {
-            out.push_str(&body);
         }
         out.push_str("</div>");
     }

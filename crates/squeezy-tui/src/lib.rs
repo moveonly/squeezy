@@ -38,7 +38,8 @@ use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
     Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
     JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
-    RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
+    RequestUserInputRequest, RequestUserInputResponse, SubagentId, ToolApprovalDecision,
+    ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
@@ -46,8 +47,8 @@ use squeezy_core::{
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     SessionResumePicker, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
     TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
-    TuiSynchronizedOutput, context_attachment_storage_text, detect_context_attachment_kind,
-    detect_image_mime,
+    TuiSynchronizedOutput, TurnMetrics, context_attachment_storage_text,
+    detect_context_attachment_kind, detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
@@ -1739,6 +1740,76 @@ fn debug_log_key_event(key: &KeyEvent) {
     );
 }
 
+fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.subagent_pane.records.is_empty() || !key.modifiers.is_empty() {
+        return false;
+    }
+    let row_count = 1 + app.subagent_pane.records.len();
+    app.subagent_pane.selected = app.subagent_pane.selected.min(row_count.saturating_sub(1));
+    match key.code {
+        KeyCode::Down if app.subagent_pane.focused => {
+            app.subagent_pane.selected = (app.subagent_pane.selected + 1).min(row_count - 1);
+            app.status = "subagent pane selection changed".to_string();
+            true
+        }
+        KeyCode::Down if app.input.is_empty() => {
+            app.subagent_pane.focused = true;
+            if row_count > 1 && app.subagent_pane.selected == 0 {
+                app.subagent_pane.selected = 1;
+            }
+            app.status = "subagent pane focused".to_string();
+            true
+        }
+        KeyCode::Up if app.subagent_pane.focused && app.subagent_pane.selected > 0 => {
+            app.subagent_pane.selected -= 1;
+            app.status = "subagent pane selection changed".to_string();
+            true
+        }
+        KeyCode::Up if app.subagent_pane.focused => {
+            app.subagent_pane.focused = false;
+            app.status = "subagent pane closed".to_string();
+            true
+        }
+        KeyCode::Enter if app.subagent_pane.focused => {
+            app.subagent_pane.active = if app.subagent_pane.selected == 0 {
+                ConversationSource::Main
+            } else {
+                app.subagent_pane
+                    .records
+                    .get(app.subagent_pane.selected - 1)
+                    .map(|record| ConversationSource::Subagent(record.id))
+                    .unwrap_or(ConversationSource::Main)
+            };
+            app.transcript_scroll_from_bottom = 0;
+            app.status = match app.subagent_pane.active {
+                ConversationSource::Main => "main conversation selected".to_string(),
+                ConversationSource::Subagent(_) => "subagent conversation selected".to_string(),
+            };
+            true
+        }
+        KeyCode::Esc if app.subagent_pane.focused => {
+            app.subagent_pane.focused = false;
+            app.subagent_pane.active = ConversationSource::Main;
+            app.subagent_pane.selected = 0;
+            app.transcript_scroll_from_bottom = 0;
+            app.status = "main conversation selected".to_string();
+            true
+        }
+        KeyCode::Delete | KeyCode::Backspace if app.subagent_pane.focused => {
+            app.clear_finished_subagents();
+            true
+        }
+        // Any other key releases pane focus and falls through to its normal
+        // handler (the composer, slash commands, …) so the prompt is never
+        // trapped behind the pane.
+        _ if app.subagent_pane.focused => {
+            app.subagent_pane.focused = false;
+            false
+        }
+        _ => false,
+    }
+}
+
 pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
@@ -2002,7 +2073,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // Enter-time pre-intercept used to live here, but it silently dropped
     // any input with a trailing space (e.g. `/plan `).
 
-    if key.code == KeyCode::Esc && request_turn_interrupt(app) {
+    // A focused subagent pane owns Esc (to close itself); don't let Esc
+    // cancel an in-flight turn out from under the user while they're
+    // navigating the pane.
+    if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
         return Ok(false);
     }
 
@@ -2015,6 +2089,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if app.mention_popup.is_some() && handle_mention_popup_key(app, key) {
+        return Ok(false);
+    }
+
+    if handle_subagent_pane_key(app, key) {
         return Ok(false);
     }
 
@@ -5416,6 +5494,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app, area.width);
     let plan_indicator_height = plan_mode_indicator_height(app);
+    let subagent_height = subagent_pane_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
             task_panel_height(app).min(5)
@@ -5431,6 +5510,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         .saturating_add(approval_height)
         .saturating_add(input_height)
         .saturating_add(plan_indicator_height)
+        .saturating_add(subagent_height)
         .saturating_add(2);
     let optional_height = area.height.saturating_sub(required_height);
     let attachment_height = attachment_panel_height(app, optional_height);
@@ -5474,6 +5554,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         constraints.push(Constraint::Length(notification_height));
     }
     constraints.push(Constraint::Length(2));
+    if subagent_height > 0 {
+        constraints.push(Constraint::Length(subagent_height));
+    }
     constraints.push(Constraint::Min(0));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -5511,6 +5594,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     render_status(frame, chunks[index], app);
     index += 1;
+    if subagent_height > 0 {
+        render_subagent_pane(frame, chunks[index], app);
+        index += 1;
+    }
     // Flexible filler keeps the prompt/status block attached to the transcript
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
@@ -5649,6 +5736,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
+    let subagent_height = subagent_pane_height(app);
     let live_lines = pending_assistant_lines(app);
     let live_visual_height = visual_line_count(&live_lines, area.width);
     let live_gap = if live_visual_height > 0 { 1 } else { 0 };
@@ -5658,6 +5746,7 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         .saturating_add(approval_height)
         .saturating_add(plan_indicator_height)
         .saturating_add(status_height)
+        .saturating_add(subagent_height)
         .saturating_add(live_gap);
     let attachment_height =
         attachment_panel_height(app, area.height.saturating_sub(required_height));
@@ -5685,6 +5774,9 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         constraints.push(Constraint::Length(approval_height));
     }
     constraints.push(Constraint::Length(status_height));
+    if subagent_height > 0 {
+        constraints.push(Constraint::Length(subagent_height));
+    }
     constraints.push(Constraint::Min(0));
 
     let chunks = Layout::default()
@@ -5722,11 +5814,17 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         index += 1;
     }
     render_status(frame, chunks[index], app);
+    index += 1;
+    if subagent_height > 0 {
+        render_subagent_pane(frame, chunks[index], app);
+    }
     render_toast_overlay(frame, area, app);
 }
 
 fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
-    if app.transcript.is_empty() && app.pending_assistant.is_empty() {
+    if active_transcript_entries(app).is_empty()
+        && (active_subagent_record(app).is_some() || app.pending_assistant.is_empty())
+    {
         0
     } else {
         1
@@ -6249,22 +6347,24 @@ fn with_transcript_overlay_rows<R>(
 
 fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
     let mut transcript_hasher = std::collections::hash_map::DefaultHasher::new();
-    for entry in &app.transcript {
+    let entries = active_transcript_entries(app);
+    for entry in entries {
         entry.id.hash(&mut transcript_hasher);
         entry.revision.hash(&mut transcript_hasher);
     }
+    app.subagent_pane.active.hash(&mut transcript_hasher);
 
     let mut pending_hasher = std::collections::hash_map::DefaultHasher::new();
-    app.pending_reasoning.hash(&mut pending_hasher);
-    if !app.pending_assistant.trim_is_empty() {
+    active_pending_reasoning(app).hash(&mut pending_hasher);
+    if active_subagent_record(app).is_none() && !app.pending_assistant.trim_is_empty() {
         app.pending_assistant.text().hash(&mut pending_hasher);
     }
 
     TranscriptOverlayRenderKey {
         width,
-        transcript_len: app.transcript.len(),
+        transcript_len: entries.len(),
         transcript_revision_hash: transcript_hasher.finish(),
-        selected_entry: app.selected_entry,
+        selected_entry: active_selected_entry(app),
         pending_hash: pending_hasher.finish(),
         show_reasoning_usage: app.show_reasoning_usage,
         coalesce_tool_runs: app.coalesce_tool_runs,
@@ -6491,8 +6591,14 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
     // even when the user has `/verbosity compact` set for inline cards.
     let overlay_verbosity = ToolOutputVerbosity::Verbose;
     let mut lines = Vec::new();
-    for (index, entry) in app.transcript.iter().enumerate() {
-        match reasoning_run_info(&app.transcript, index) {
+    if let Some(title) = active_conversation_title(app) {
+        lines.push(title);
+        lines.push(Line::from(""));
+    }
+    let entries = active_transcript_entries(app);
+    let selected_entry = active_selected_entry(app);
+    for (index, entry) in entries.iter().enumerate() {
+        match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
                 if app.show_reasoning_usage
@@ -6501,7 +6607,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                     lines.extend(reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         false,
-                        app.selected_entry == Some(index),
+                        selected_entry == Some(index),
                         extras,
                     ));
                     lines.push(Line::from(""));
@@ -6510,16 +6616,16 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             }
             None => {}
         }
-        match tool_run_info(&app.transcript, index, app.coalesce_tool_runs) {
+        match tool_run_info(entries, index, app.coalesce_tool_runs) {
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
-                let members = collect_tool_run_members(&app.transcript, index, extras);
+                let members = collect_tool_run_members(entries, index, extras);
                 // Overlay always forces expanded form so users browsing
                 // the full transcript can read every member's body.
                 lines.extend(format_grouped_tool_result_entry(
                     &members,
                     false,
-                    app.selected_entry == Some(index),
+                    selected_entry == Some(index),
                     overlay_verbosity,
                     width,
                     ToolCardSurface::Plain,
@@ -6531,15 +6637,15 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
         lines.extend(cached_transcript_entry_lines(
             app.render_cache_session,
             entry,
-            app.selected_entry == Some(index),
+            selected_entry == Some(index),
             overlay_verbosity,
-            message_outcome(&app.transcript, index),
+            message_outcome(entries, index),
             width,
             app.show_reasoning_usage,
             true,
         ));
     }
-    let pending = pending_assistant_lines(app);
+    let pending = active_pending_assistant_lines(app);
     if !pending.is_empty() {
         if !lines.is_empty() {
             lines.push(Line::from(""));
@@ -6707,19 +6813,87 @@ fn render_context_hash(
     h
 }
 
+fn active_subagent_record(app: &TuiApp) -> Option<&SubagentRecord> {
+    let ConversationSource::Subagent(id) = app.subagent_pane.active else {
+        return None;
+    };
+    app.subagent_pane
+        .records
+        .iter()
+        .find(|record| record.id == id)
+}
+
+fn active_transcript_entries(app: &TuiApp) -> &[TranscriptEntry] {
+    active_subagent_record(app)
+        .map(|record| record.transcript.as_slice())
+        .unwrap_or(app.transcript.as_slice())
+}
+
+fn active_selected_entry(app: &TuiApp) -> Option<usize> {
+    if active_subagent_record(app).is_some() {
+        None
+    } else {
+        app.selected_entry
+    }
+}
+
+fn active_pending_reasoning(app: &TuiApp) -> &str {
+    if active_subagent_record(app).is_some() {
+        ""
+    } else {
+        &app.pending_reasoning
+    }
+}
+
+fn active_pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    if active_subagent_record(app).is_some() {
+        Vec::new()
+    } else {
+        pending_assistant_lines(app)
+    }
+}
+
+fn active_conversation_title(app: &TuiApp) -> Option<Line<'static>> {
+    let record = active_subagent_record(app)?;
+    Some(Line::from(vec![
+        Span::styled(
+            record.lifecycle.glyph(true),
+            Style::default()
+                .fg(record.lifecycle.color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            record.agent.clone(),
+            Style::default()
+                .fg(crate::render::theme::foreground())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" subagent · {}", record.lifecycle.label()),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]))
+}
+
 fn transcript_lines_for_render(
     app: &TuiApp,
     width: Option<u16>,
     include_startup_card: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if include_startup_card {
+    if let Some(title) = active_conversation_title(app) {
+        lines.push(title);
+        lines.push(Line::from(""));
+    } else if include_startup_card {
         let card_width = width.unwrap_or(64);
         lines.extend(startup_card_lines(app, card_width));
         lines.push(Line::from(""));
     }
-    for (index, item) in app.transcript.iter().enumerate() {
-        match reasoning_run_info(&app.transcript, index) {
+    let entries = active_transcript_entries(app);
+    let selected_entry = active_selected_entry(app);
+    for (index, item) in entries.iter().enumerate() {
+        match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
                 if app.show_reasoning_usage
@@ -6728,7 +6902,7 @@ fn transcript_lines_for_render(
                     lines.extend(reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         item.collapsed,
-                        app.selected_entry == Some(index),
+                        selected_entry == Some(index),
                         extras,
                     ));
                     lines.push(Line::from(""));
@@ -6737,14 +6911,14 @@ fn transcript_lines_for_render(
             }
             None => {}
         }
-        match tool_run_info(&app.transcript, index, app.coalesce_tool_runs) {
+        match tool_run_info(entries, index, app.coalesce_tool_runs) {
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
-                let members = collect_tool_run_members(&app.transcript, index, extras);
+                let members = collect_tool_run_members(entries, index, extras);
                 lines.extend(format_grouped_tool_result_entry(
                     &members,
                     item.collapsed,
-                    app.selected_entry == Some(index),
+                    selected_entry == Some(index),
                     app.tool_output_verbosity,
                     width,
                     ToolCardSurface::Tinted,
@@ -6756,18 +6930,21 @@ fn transcript_lines_for_render(
         lines.extend(cached_transcript_entry_lines(
             app.render_cache_session,
             item,
-            app.selected_entry == Some(index),
+            selected_entry == Some(index),
             app.tool_output_verbosity,
-            message_outcome(&app.transcript, index),
+            message_outcome(entries, index),
             width,
             app.show_reasoning_usage,
             false,
         ));
     }
-    if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
-        lines.extend(streaming_reasoning_lines(&app.pending_reasoning));
+    let pending_reasoning = active_pending_reasoning(app);
+    if app.show_reasoning_usage && !pending_reasoning.trim().is_empty() {
+        lines.extend(streaming_reasoning_lines(pending_reasoning));
     }
-    if let Some(pending_assistant) = pending_assistant_display_content(app) {
+    if active_subagent_record(app).is_none()
+        && let Some(pending_assistant) = pending_assistant_display_content(app)
+    {
         lines.extend(assistant_text_lines(
             false,
             turn_coin_span(app),
@@ -12014,6 +12191,140 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
+fn subagent_pane_height(app: &TuiApp) -> u16 {
+    if app.subagent_pane.records.is_empty() {
+        return 0;
+    }
+    (1 + app.subagent_pane.records.len()).min(7) as u16
+}
+
+fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height == 0 {
+        return;
+    }
+    let all_lines = subagent_pane_lines(app, area.width);
+    let visible = usize::from(area.height);
+    let selected = app
+        .subagent_pane
+        .selected
+        .min(all_lines.len().saturating_sub(1));
+    let offset = selected.saturating_add(1).saturating_sub(visible);
+    let lines = all_lines
+        .into_iter()
+        .skip(offset)
+        .take(visible)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn subagent_pane_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(subagent_main_row(app, width));
+    for (index, record) in app.subagent_pane.records.iter().enumerate() {
+        lines.push(subagent_record_row(app, index, record, width));
+    }
+    lines
+}
+
+fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
+    let selected = app.subagent_pane.selected == 0;
+    let active = matches!(app.subagent_pane.active, ConversationSource::Main);
+    let glyph = if selected || active { "⏺" } else { "◯" };
+    let style = if selected {
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(crate::render::theme::quiet())
+    };
+    let hint = if selected && app.subagent_pane.focused {
+        "↑/↓ to select · Enter view"
+    } else if active {
+        "active"
+    } else {
+        ""
+    };
+    subagent_pane_row(
+        glyph,
+        style,
+        "main",
+        Style::default().fg(crate::render::theme::foreground()),
+        hint,
+        width,
+    )
+}
+
+fn subagent_record_row(
+    app: &TuiApp,
+    index: usize,
+    record: &SubagentRecord,
+    width: u16,
+) -> Line<'static> {
+    let row = index + 1;
+    let selected = app.subagent_pane.selected == row;
+    let active = app.subagent_pane.active == ConversationSource::Subagent(record.id);
+    let glyph = record.lifecycle.glyph(selected || active);
+    let glyph_style = Style::default()
+        .fg(record.lifecycle.color())
+        .add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let detail = if selected && app.subagent_pane.focused {
+        "↑/↓ to select · Enter view".to_string()
+    } else if !record.latest.trim().is_empty() {
+        record.latest.clone()
+    } else {
+        compact_text(&record.prompt, 120)
+    };
+    let detail = match record.metrics.as_ref() {
+        Some(metrics) if !selected || !app.subagent_pane.focused => format!(
+            "{} · tools={} bytes={}",
+            detail,
+            metrics.subagent_tool_calls.max(metrics.tool_calls),
+            metrics.subagent_bytes_read.max(metrics.bytes_read)
+        ),
+        _ => detail,
+    };
+    // Lead with the lifecycle word so the state survives a monochrome
+    // terminal and the selected-row glyph (which is always ⏺) can't mask a
+    // failed/running/capped subagent.
+    let detail = format!("{} · {}", record.lifecycle.label(), detail);
+    // Disambiguate same-kind rows during parallel fanout (e.g. three
+    // "delegate" subagents) with their row ordinal.
+    let label = format!("{} #{row}", record.agent);
+    subagent_pane_row(
+        glyph,
+        glyph_style,
+        &label,
+        Style::default().fg(crate::render::theme::foreground()),
+        &detail,
+        width,
+    )
+}
+
+fn subagent_pane_row(
+    glyph: &str,
+    glyph_style: Style,
+    label: &str,
+    label_style: Style,
+    detail: &str,
+    width: u16,
+) -> Line<'static> {
+    let label_width = label.chars().count();
+    let reserved = 4 + label_width;
+    let detail_width = usize::from(width).saturating_sub(reserved + 2);
+    let detail = fit_chars(detail, detail_width);
+    Line::from(vec![
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::raw(" "),
+        Span::styled(label.to_string(), label_style),
+        Span::raw("  "),
+        Span::styled(detail, Style::default().fg(crate::render::theme::quiet())),
+    ])
+}
+
 #[cfg(test)]
 fn format_status_tokens(app: &TuiApp) -> String {
     let mut lines = vec![
@@ -12213,6 +12524,10 @@ fn format_status_hint_base(app: &TuiApp) -> String {
             "PgUp/PgDn/Wheel scroll · M scrollbar drag · native select/copy · Esc close".to_string()
         };
     }
+    if app.subagent_pane.focused {
+        return "Up/Down select · Enter view · Del clear done · type/Esc back to prompt"
+            .to_string();
+    }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
         if pending.request.choices.is_empty() && pending.request.allow_freeform {
             return "type your answer · Enter send · Esc cancel".to_string();
@@ -12241,6 +12556,9 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         let mut hint = String::from(
             "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
         );
+        if !app.subagent_pane.records.is_empty() {
+            hint.push_str(" · Down subagents");
+        }
         if !app.prompt_queue.is_empty() {
             hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
         }
@@ -12274,6 +12592,9 @@ fn format_status_hint_base(app: &TuiApp) -> String {
             app.prompt_queue.len()
         ));
     }
+    if !app.subagent_pane.records.is_empty() {
+        base.push_str(" · Down subagents");
+    }
     base
 }
 
@@ -12293,6 +12614,10 @@ const USER_ACTION_STATUS_PREFIXES: &[&str] = &[
     "exit cancelled",
     "Ctrl+X…",
     "transcript overlay",
+    "subagent pane ",
+    "main conversation selected",
+    "subagent conversation selected",
+    "cleared finished subagents",
     "task panel ",
     "/statusline cancelled",
     "no recent session",
@@ -12735,6 +13060,88 @@ enum PromptAttachmentPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum ConversationSource {
+    #[default]
+    Main,
+    Subagent(SubagentId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentLifecycle {
+    Running,
+    Completed,
+    Failed,
+    /// Refused before a lease was acquired (e.g. the concurrency cap was
+    /// hit). Has no real subagent id and never produces further events.
+    Rejected,
+}
+
+impl SubagentLifecycle {
+    fn glyph(self, selected: bool) -> &'static str {
+        match (selected, self) {
+            (true, _) => "⏺",
+            (false, Self::Running) => "◐",
+            (false, Self::Completed) => "●",
+            (false, Self::Failed) => "◯",
+            (false, Self::Rejected) => "⊘",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "done",
+            Self::Failed => "failed",
+            Self::Rejected => "capped",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Running => crate::render::theme::accent(),
+            Self::Completed => crate::render::theme::green(),
+            Self::Failed => crate::render::theme::red(),
+            Self::Rejected => crate::render::theme::quiet(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SubagentRecord {
+    id: SubagentId,
+    agent: String,
+    prompt: String,
+    lifecycle: SubagentLifecycle,
+    latest: String,
+    metrics: Option<TurnMetrics>,
+    transcript: Vec<TranscriptEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentPaneState {
+    focused: bool,
+    selected: usize,
+    active: ConversationSource,
+    records: Vec<SubagentRecord>,
+    /// Source of ids for rejected subagents, which never acquire a real
+    /// lease id. Drawn from the top of the u64 range downward so they can
+    /// never collide with the session's low, increasing lease ids.
+    next_synthetic_id: SubagentId,
+}
+
+impl Default for SubagentPaneState {
+    fn default() -> Self {
+        Self {
+            focused: false,
+            selected: 0,
+            active: ConversationSource::Main,
+            records: Vec::new(),
+            next_synthetic_id: u64::MAX,
+        }
+    }
+}
+
 pub(crate) struct TuiApp {
     pub(crate) provider_name: &'static str,
     pub(crate) version: &'static str,
@@ -12810,6 +13217,7 @@ pub(crate) struct TuiApp {
     pub(crate) context_estimate: ContextEstimate,
     pub(crate) checkpoints_enabled: bool,
     pub(crate) transcript: Vec<TranscriptEntry>,
+    pub(crate) subagent_pane: SubagentPaneState,
     pub(crate) selected_entry: Option<usize>,
     pub(crate) next_entry_id: u64,
     /// Per-app discriminator for the global entry render cache. Allocated
@@ -13250,6 +13658,7 @@ impl TuiApp {
             context_estimate: ContextEstimate::default(),
             checkpoints_enabled: config.checkpoints_enabled,
             transcript,
+            subagent_pane: SubagentPaneState::default(),
             selected_entry: None,
             next_entry_id,
             render_cache_session: render::cache::next_session_id(),
@@ -13601,6 +14010,209 @@ impl TuiApp {
             LogKind::Operational,
             self.transcript_default,
         ));
+    }
+
+    pub(crate) fn note_subagent_started(&mut self, id: SubagentId, agent: String, prompt: String) {
+        let prompt_entry_id = self.next_id();
+        let start_entry_id = self.next_id();
+        let transcript = vec![
+            TranscriptEntry::message(
+                prompt_entry_id,
+                TranscriptItem::user(prompt.clone()),
+                self.transcript_default,
+            ),
+            TranscriptEntry::log_with_kind(
+                start_entry_id,
+                format!("{agent} subagent started"),
+                LogKind::Operational,
+                self.transcript_default,
+            ),
+        ];
+        if let Some(record) = self.subagent_pane.records.iter_mut().find(|r| r.id == id) {
+            record.agent = agent;
+            record.prompt = prompt;
+            record.lifecycle = SubagentLifecycle::Running;
+            record.latest = "starting".to_string();
+            record.metrics = None;
+            record.transcript = transcript;
+        } else {
+            self.subagent_pane.records.push(SubagentRecord {
+                id,
+                agent,
+                prompt,
+                lifecycle: SubagentLifecycle::Running,
+                latest: "starting".to_string(),
+                metrics: None,
+                transcript,
+            });
+        }
+        self.prune_subagent_records();
+        self.clamp_subagent_selection();
+    }
+
+    pub(crate) fn note_subagent_activity(
+        &mut self,
+        id: SubagentId,
+        agent: String,
+        message: String,
+    ) {
+        let entry_id = self.next_id();
+        let entry = TranscriptEntry::log_with_kind(
+            entry_id,
+            message.clone(),
+            LogKind::Operational,
+            self.transcript_default,
+        );
+        if let Some(record) = self.subagent_pane.records.iter_mut().find(|r| r.id == id) {
+            record.agent = agent;
+            record.latest = compact_text(&message, 120);
+            record.transcript.push(entry);
+            // Keep the seed prompt + "started" log (the first two entries);
+            // drop the oldest activity beyond the cap so a long-running
+            // subagent's stored transcript stays bounded.
+            const MAX_SUBAGENT_TRANSCRIPT: usize = 256;
+            if record.transcript.len() > MAX_SUBAGENT_TRANSCRIPT {
+                let overflow = record.transcript.len() - MAX_SUBAGENT_TRANSCRIPT;
+                record.transcript.drain(2..2 + overflow);
+            }
+        }
+    }
+
+    pub(crate) fn note_subagent_completed(
+        &mut self,
+        id: SubagentId,
+        agent: String,
+        summary: String,
+        metrics: TurnMetrics,
+    ) {
+        let entry_id = self.next_id();
+        let entry = TranscriptEntry::message(
+            entry_id,
+            TranscriptItem::assistant(summary.clone()),
+            self.transcript_default,
+        );
+        if let Some(record) = self.subagent_pane.records.iter_mut().find(|r| r.id == id) {
+            record.agent = agent;
+            record.lifecycle = SubagentLifecycle::Completed;
+            record.latest = compact_text(&summary, 140);
+            record.metrics = Some(metrics);
+            record.transcript.push(entry);
+        }
+    }
+
+    pub(crate) fn note_subagent_failed(
+        &mut self,
+        id: SubagentId,
+        agent: String,
+        error: String,
+        metrics: TurnMetrics,
+    ) {
+        let entry_id = self.next_id();
+        let entry = TranscriptEntry::log_with_kind(
+            entry_id,
+            format!("subagent failed: {error}"),
+            LogKind::Warn,
+            self.transcript_default,
+        );
+        if let Some(record) = self.subagent_pane.records.iter_mut().find(|r| r.id == id) {
+            record.agent = agent;
+            record.lifecycle = SubagentLifecycle::Failed;
+            record.latest = compact_text(&error, 140);
+            record.metrics = Some(metrics);
+            record.transcript.push(entry);
+        }
+    }
+
+    /// Record a subagent that was refused before it ever ran (e.g. the
+    /// concurrency cap was hit). Rejections carry no lease id, so they get a
+    /// synthetic one and a single-line transcript explaining the cap; the
+    /// row is otherwise a normal (finished) pane entry that Del can clear.
+    pub(crate) fn note_subagent_rejected(
+        &mut self,
+        agent: String,
+        reason: String,
+        limit: usize,
+        active: usize,
+    ) {
+        let id = self.subagent_pane.next_synthetic_id;
+        self.subagent_pane.next_synthetic_id =
+            self.subagent_pane.next_synthetic_id.saturating_sub(1);
+        let detail = format!("{reason} ({active}/{limit} already running)");
+        let entry_id = self.next_id();
+        let transcript = vec![TranscriptEntry::log_with_kind(
+            entry_id,
+            format!("{agent} subagent capped: {detail}"),
+            LogKind::Warn,
+            self.transcript_default,
+        )];
+        self.subagent_pane.records.push(SubagentRecord {
+            id,
+            agent,
+            prompt: detail.clone(),
+            lifecycle: SubagentLifecycle::Rejected,
+            latest: compact_text(&detail, 120),
+            metrics: None,
+            transcript,
+        });
+        self.prune_subagent_records();
+        self.clamp_subagent_selection();
+    }
+
+    fn clamp_subagent_selection(&mut self) {
+        let max = self.subagent_pane.records.len();
+        self.subagent_pane.selected = self.subagent_pane.selected.min(max);
+        if let ConversationSource::Subagent(id) = self.subagent_pane.active
+            && !self
+                .subagent_pane
+                .records
+                .iter()
+                .any(|record| record.id == id)
+        {
+            self.subagent_pane.active = ConversationSource::Main;
+        }
+    }
+
+    /// Bound the retained subagent records so a long session can't grow the
+    /// pane (and its cloned transcripts) without limit. Oldest *finished*
+    /// records are dropped first; the actively-viewed record and any still-
+    /// running subagents are always kept.
+    fn prune_subagent_records(&mut self) {
+        const MAX_SUBAGENT_RECORDS: usize = 32;
+        while self.subagent_pane.records.len() > MAX_SUBAGENT_RECORDS {
+            let active_id = match self.subagent_pane.active {
+                ConversationSource::Subagent(id) => Some(id),
+                ConversationSource::Main => None,
+            };
+            let Some(pos) = self.subagent_pane.records.iter().position(|record| {
+                !matches!(record.lifecycle, SubagentLifecycle::Running)
+                    && Some(record.id) != active_id
+            }) else {
+                break;
+            };
+            self.subagent_pane.records.remove(pos);
+        }
+    }
+
+    /// Drop every completed/failed subagent row, leaving only those still
+    /// running. When nothing remains the pane disappears and focus returns
+    /// to the main conversation. Bound to Del/Backspace while the pane is
+    /// focused.
+    pub(crate) fn clear_finished_subagents(&mut self) {
+        self.subagent_pane
+            .records
+            .retain(|record| matches!(record.lifecycle, SubagentLifecycle::Running));
+        if self.subagent_pane.records.is_empty() {
+            self.subagent_pane.focused = false;
+            self.subagent_pane.active = ConversationSource::Main;
+            self.subagent_pane.selected = 0;
+        } else {
+            self.subagent_pane.selected = self
+                .subagent_pane
+                .selected
+                .min(self.subagent_pane.records.len());
+        }
+        self.clamp_subagent_selection();
+        self.status = "cleared finished subagents".to_string();
     }
 
     pub(crate) fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {

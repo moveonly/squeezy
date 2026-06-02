@@ -533,11 +533,11 @@ fn try_substitute_dollar(slice: &str, args: &[String], out: &mut String) -> Opti
         return Some(1 + digit_bytes);
     }
     if first == '@' {
-        out.push_str(&args.join(" "));
+        push_joined_args(out, args);
         return Some(1 + '@'.len_utf8());
     }
     if rest.starts_with("ARGUMENTS") {
-        out.push_str(&args.join(" "));
+        push_joined_args(out, args);
         return Some(1 + "ARGUMENTS".len());
     }
     if first == '{' {
@@ -559,7 +559,7 @@ fn try_substitute_dollar(slice: &str, args: &[String], out: &mut String) -> Opti
             }
             None => &args[start..],
         };
-        out.push_str(&slice_args.join(" "));
+        push_joined_args(out, slice_args);
         return Some(1 + 1 + end + 1);
     }
     None
@@ -581,7 +581,7 @@ fn try_substitute_brace(
         return None;
     }
     if name == "ARGUMENTS" {
-        out.push_str(&args.join(" "));
+        push_joined_args(out, args);
         return Some(1 + end + 1);
     }
     if let Ok(idx) = name.parse::<usize>() {
@@ -597,6 +597,15 @@ fn try_substitute_brace(
         out.push_str(value);
     }
     Some(1 + end + 1)
+}
+
+fn push_joined_args(out: &mut String, args: &[String]) {
+    for (idx, arg) in args.iter().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        out.push_str(arg);
+    }
 }
 
 fn home_prompts_dir() -> Option<PathBuf> {

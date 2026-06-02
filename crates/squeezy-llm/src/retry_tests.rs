@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, is_terminal_quota_error,
-    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, with_stream_retry,
+    jitter_sample, parse_retry_after, send_with_auth_retry, send_with_retry, skip_delta_prefix,
+    with_stream_retry,
 };
 use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream};
@@ -95,6 +96,24 @@ fn full_event_sequence() -> Vec<LlmEvent> {
         LlmEvent::TextDelta("world".to_string()),
         LlmEvent::completed(Some("resp_1".to_string()), CostSnapshot::default()),
     ]
+}
+
+#[test]
+fn skip_delta_prefix_keeps_no_skip_path_allocation_free_for_callers() {
+    let (seen, forwarded) = skip_delta_prefix("hello".to_string(), 0);
+    assert_eq!(seen, 5);
+    assert_eq!(forwarded.as_deref(), Some("hello"));
+}
+
+#[test]
+fn skip_delta_prefix_splits_on_char_boundary() {
+    let (seen, forwarded) = skip_delta_prefix("héllo".to_string(), 1);
+    assert_eq!(seen, 5);
+    assert_eq!(forwarded.as_deref(), Some("éllo"));
+
+    let (seen, forwarded) = skip_delta_prefix("héllo".to_string(), 5);
+    assert_eq!(seen, 5);
+    assert!(forwarded.is_none());
 }
 
 #[tokio::test]

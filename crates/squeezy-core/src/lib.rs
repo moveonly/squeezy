@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     env, fmt, fs,
     path::{Path, PathBuf},
     process,
@@ -5865,13 +5865,17 @@ impl ShellSandboxConfig {
                 config.sensitive_path_patterns = merged;
             }
         }
+        let root_validation = (settings.read_roots.is_some() || settings.write_roots.is_some())
+            .then(|| ShellSandboxRootValidation::new(workspace_root));
         if let Some(read_roots) = settings.read_roots {
             config.read_roots = validate_shell_sandbox_roots(
                 read_roots,
                 "read_roots",
                 source,
-                workspace_root,
                 &config.sensitive_path_patterns,
+                root_validation
+                    .as_ref()
+                    .expect("root validation context exists when roots are configured"),
             )?;
         }
         if let Some(write_roots) = settings.write_roots {
@@ -5879,8 +5883,10 @@ impl ShellSandboxConfig {
                 write_roots,
                 "write_roots",
                 source,
-                workspace_root,
                 &config.sensitive_path_patterns,
+                root_validation
+                    .as_ref()
+                    .expect("root validation context exists when roots are configured"),
             )?;
         }
         if let Some(protected_metadata_names) = settings.protected_metadata_names {
@@ -5945,8 +5951,8 @@ fn validate_shell_sandbox_roots(
     roots: Vec<String>,
     key: &str,
     source: &str,
-    workspace_root: &Path,
     sensitive_patterns: &[String],
+    root_validation: &ShellSandboxRootValidation,
 ) -> Result<Vec<PathBuf>> {
     let mut validated = Vec::new();
     for raw in roots {
@@ -5975,7 +5981,7 @@ fn validate_shell_sandbox_roots(
             )));
         }
         if let Some(sensitive) =
-            shell_root_sensitive_overlap(&canonical, workspace_root, sensitive_patterns)
+            shell_root_sensitive_overlap(&canonical, sensitive_patterns, root_validation)
         {
             return Err(SqueezyError::Config(format!(
                 "{source}: permissions.shell_sandbox.{key} path {} is inside sensitive path {}",
@@ -5993,6 +5999,25 @@ fn validate_shell_sandbox_roots(
     }
     validated.sort();
     Ok(validated)
+}
+
+struct ShellSandboxRootValidation {
+    workspace_root: PathBuf,
+    home: Option<PathBuf>,
+}
+
+impl ShellSandboxRootValidation {
+    fn new(workspace_root: &Path) -> Self {
+        let workspace_root =
+            fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| fs::canonicalize(&home).unwrap_or(home));
+        Self {
+            workspace_root,
+            home,
+        }
+    }
 }
 
 fn reject_duplicate_shell_roots(
@@ -6042,24 +6067,19 @@ fn validate_protected_metadata_names(names: Vec<String>, source: &str) -> Result
 
 fn shell_root_sensitive_overlap(
     root: &Path,
-    workspace_root: &Path,
     sensitive_patterns: &[String],
+    root_validation: &ShellSandboxRootValidation,
 ) -> Option<PathBuf> {
-    let workspace_root =
-        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| fs::canonicalize(&home).ok().or(Some(home)));
     for pattern in sensitive_patterns {
         let base = sensitive_pattern_base(pattern);
         if base.is_empty() {
             continue;
         }
-        let workspace_sensitive = workspace_root.join(&base);
+        let workspace_sensitive = root_validation.workspace_root.join(&base);
         if root.starts_with(&workspace_sensitive) {
             return Some(workspace_sensitive);
         }
-        if let Some(home) = &home {
+        if let Some(home) = &root_validation.home {
             let home_sensitive = home.join(&base);
             if root.starts_with(&home_sensitive) {
                 return Some(home_sensitive);
@@ -7028,7 +7048,10 @@ impl StreamRedactor {
         // Redaction markers are idempotent w.r.t. the built-in patterns, so
         // running the redactor over the whole buffer on each push is safe;
         // the previously-emitted prefix has been removed from `buffer`.
-        let RedactedText { text, redactions } = self.redactor.redact(&self.buffer);
+        let RedactedText {
+            mut text,
+            redactions,
+        } = self.redactor.redact(&self.buffer);
         self.redactions += redactions;
 
         if text.len() <= STREAM_TAIL_BYTES {
@@ -7049,12 +7072,8 @@ impl StreamRedactor {
                 redactions,
             };
         }
-        let emitted = text[..emit_end].to_string();
-        self.buffer = text[emit_end..].to_string();
-        StreamChunk {
-            text: emitted,
-            redactions,
-        }
+        self.buffer = text.split_off(emit_end);
+        StreamChunk { text, redactions }
     }
 }
 
@@ -9543,10 +9562,12 @@ impl McpSettings {
 
     fn merge(&mut self, next: Self) {
         for (name, server) in next.servers {
-            self.servers
-                .entry(name)
-                .and_modify(|existing| existing.merge(server.clone()))
-                .or_insert(server);
+            match self.servers.entry(name) {
+                Entry::Occupied(mut entry) => entry.get_mut().merge(server),
+                Entry::Vacant(entry) => {
+                    entry.insert(server);
+                }
+            }
         }
     }
 }
@@ -10480,9 +10501,9 @@ pub(crate) fn wildcard_match(value: &str, pattern: &str) -> bool {
     if !pattern.contains('*') {
         return false;
     }
-    let segments: Vec<&str> = pattern.split('*').collect();
-    let first = segments[0];
-    let last = segments[segments.len() - 1];
+    let mut segments = pattern.split('*');
+    let first = segments.next().unwrap_or_default();
+    let last = segments.next_back().unwrap_or_default();
     if !value.starts_with(first) || !value.ends_with(last) {
         return false;
     }
@@ -10491,7 +10512,7 @@ pub(crate) fn wildcard_match(value: &str, pattern: &str) -> bool {
     }
     let mut cursor = first.len();
     let end = value.len() - last.len();
-    for segment in &segments[1..segments.len().saturating_sub(1)] {
+    for segment in segments {
         if segment.is_empty() {
             continue;
         }
@@ -10871,10 +10892,12 @@ fn merge_provider_maps(
     };
     let target = target.get_or_insert_with(BTreeMap::new);
     for (name, provider) in next {
-        target
-            .entry(name)
-            .and_modify(|existing| existing.merge(provider.clone()))
-            .or_insert(provider);
+        match target.entry(name) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(provider),
+            Entry::Vacant(entry) => {
+                entry.insert(provider);
+            }
+        }
     }
 }
 
@@ -10883,10 +10906,12 @@ fn merge_tui_theme_maps(
     next: BTreeMap<String, TuiThemeSettings>,
 ) {
     for (name, theme) in next {
-        target
-            .entry(name)
-            .and_modify(|existing| existing.merge(theme.clone()))
-            .or_insert(theme);
+        match target.entry(name) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(theme),
+            Entry::Vacant(entry) => {
+                entry.insert(theme);
+            }
+        }
     }
 }
 
@@ -10899,10 +10924,12 @@ fn merge_profiles_maps(
     };
     let target = target.get_or_insert_with(BTreeMap::new);
     for (name, profile) in next {
-        target
-            .entry(name)
-            .and_modify(|existing| existing.merge(profile.clone()))
-            .or_insert(profile);
+        match target.entry(name) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(profile),
+            Entry::Vacant(entry) => {
+                entry.insert(profile);
+            }
+        }
     }
 }
 
@@ -10992,14 +11019,28 @@ impl ReasoningPayload {
     pub fn display_text(&self) -> String {
         match self {
             ReasoningPayload::OpenAi { summary, .. } => summary.join("\n\n"),
-            ReasoningPayload::Anthropic { blocks } => blocks
-                .iter()
-                .map(|block| match block.kind {
-                    AnthropicThinkingKind::Thinking => block.text.clone(),
-                    AnthropicThinkingKind::Redacted => "[redacted reasoning]".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            ReasoningPayload::Anthropic { blocks } => {
+                const REDACTED_REASONING: &str = "[redacted reasoning]";
+                let capacity = blocks
+                    .iter()
+                    .map(|block| match block.kind {
+                        AnthropicThinkingKind::Thinking => block.text.len(),
+                        AnthropicThinkingKind::Redacted => REDACTED_REASONING.len(),
+                    })
+                    .sum::<usize>()
+                    + blocks.len().saturating_sub(1) * 2;
+                let mut text = String::with_capacity(capacity);
+                for (index, block) in blocks.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str("\n\n");
+                    }
+                    match block.kind {
+                        AnthropicThinkingKind::Thinking => text.push_str(&block.text),
+                        AnthropicThinkingKind::Redacted => text.push_str(REDACTED_REASONING),
+                    }
+                }
+                text
+            }
             ReasoningPayload::Google { summary, .. } => summary.join("\n\n"),
         }
     }
@@ -11397,13 +11438,12 @@ fn looks_like_binary(bytes: &[u8]) -> bool {
 }
 
 fn looks_like_stack_trace(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("traceback (most recent call last)")
-        || lower.contains("stack backtrace:")
-        || lower.contains("caused by:")
-        || lower.contains("thread '")
-        || lower.contains("panic")
-        || lower.contains("exception in thread")
+    if ascii_contains_ignore_case(text, "traceback (most recent call last)")
+        || ascii_contains_ignore_case(text, "stack backtrace:")
+        || ascii_contains_ignore_case(text, "caused by:")
+        || ascii_contains_ignore_case(text, "thread '")
+        || ascii_contains_ignore_case(text, "panic")
+        || ascii_contains_ignore_case(text, "exception in thread")
     {
         return true;
     }
@@ -11420,6 +11460,16 @@ fn looks_like_stack_trace(text: &str) -> bool {
         .take(3)
         .count();
     stackish_lines >= 2
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn looks_like_log(text: &str) -> bool {
@@ -12345,24 +12395,29 @@ impl TaskStateSnapshot {
     }
 
     pub fn compact_summary(&self) -> String {
-        let mut parts = Vec::new();
+        let mut summary = String::with_capacity(
+            self.task.len()
+                + self.blocker.as_ref().map_or(0, String::len)
+                + self.next_action.as_ref().map_or(0, String::len)
+                + 64,
+        );
         if !self.task.is_empty() {
-            parts.push(self.task.clone());
+            push_compact_summary_part(&mut summary, "", &self.task);
         }
-        parts.push(format!("status={}", self.status.as_str()));
+        push_compact_summary_part(&mut summary, "status=", self.status.as_str());
         if let Some(step) = self.active_step_title()
             && !step.is_empty()
         {
-            parts.push(format!("active={step}"));
+            push_compact_summary_part(&mut summary, "active=", step);
         }
         if let Some(blocker) = &self.blocker {
-            parts.push(format!("blocker={blocker}"));
+            push_compact_summary_part(&mut summary, "blocker=", blocker);
         }
         if let Some(next_action) = &self.next_action {
-            parts.push(format!("next={next_action}"));
+            push_compact_summary_part(&mut summary, "next=", next_action);
         }
-        parts.push(format!("verification={}", self.verification.as_str()));
-        parts.join(" | ")
+        push_compact_summary_part(&mut summary, "verification=", self.verification.as_str());
+        summary
     }
 
     pub fn normalized(mut self) -> Self {
@@ -12392,6 +12447,14 @@ impl TaskStateSnapshot {
         }
         self
     }
+}
+
+fn push_compact_summary_part(summary: &mut String, prefix: &str, value: &str) {
+    if !summary.is_empty() {
+        summary.push_str(" | ");
+    }
+    summary.push_str(prefix);
+    summary.push_str(value);
 }
 
 fn normalize_optional_task_text(value: Option<String>, limit: usize) -> Option<String> {

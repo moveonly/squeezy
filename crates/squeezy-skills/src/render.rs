@@ -38,7 +38,7 @@ pub fn render_active_skills(
         return None;
     }
 
-    let mut blocks = Vec::new();
+    let mut blocks = Vec::with_capacity(skills.len());
     for skill in skills {
         let body_chars = char_count(&skill.body);
         if body_chars > body_cap_chars {
@@ -208,7 +208,8 @@ pub fn render_skill_preamble(
     });
 
     let header = "Available Squeezy skills. Use `load_skill` when a task benefits from one of these local instruction sets.";
-    let mut lines = vec![header.to_string()];
+    let mut lines = Vec::with_capacity(sorted.len() + 1);
+    lines.push(header.to_string());
     let mut omitted = 0usize;
     for summary in &sorted {
         let line = format!(
@@ -218,12 +219,9 @@ pub fn render_skill_preamble(
             summary.source.as_str(),
             summary.name
         );
-        let mut attempt = lines.clone();
-        attempt.push(line);
-        let body = wrap_preamble(&attempt);
-        if char_count(&body) <= budget_chars {
-            lines = attempt;
-        } else {
+        lines.push(line);
+        if char_count(&wrap_preamble(&lines)) > budget_chars {
+            lines.pop();
             omitted += 1;
         }
     }
@@ -303,16 +301,15 @@ pub fn render_active_skills_with_metrics(
         };
         let mut inserted = false;
         for (candidate, candidate_is_stub) in candidates {
-            let mut attempt = fitted.clone();
-            attempt.push(candidate.clone());
-            if let Some(rendered) = wrap_blocks(&attempt)
+            fitted.push(candidate);
+            if let Some(rendered) = wrap_blocks(&fitted)
                 && char_count(&rendered) <= budget_chars
             {
-                fitted = attempt;
                 included_is_stub.push(candidate_is_stub);
                 inserted = true;
                 break;
             }
+            fitted.pop();
         }
         if !inserted {
             metrics.dropped += 1;

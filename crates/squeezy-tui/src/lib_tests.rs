@@ -227,6 +227,333 @@ fn plan_mode_indicator_line_uses_existing_mode_purple_palette() {
     assert_eq!(label_span.style.fg, Some(crate::render::theme::magenta()));
 }
 
+#[test]
+fn subagent_pane_renders_below_status_without_hiding_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(
+        7,
+        "explore".to_string(),
+        "Squeezy Haiku baseline 15 langs n=3".to_string(),
+    );
+    app.note_subagent_activity(7, "explore".to_string(), "running read_file".to_string());
+
+    let output = render_to_string(&app, 120, 18);
+    assert!(output.contains("main"), "{output}");
+    assert!(output.contains("explore"), "{output}");
+    assert!(output.contains("running read_file"), "{output}");
+    assert!(output.contains("Enter send"), "{output}");
+
+    let lines = output.lines().collect::<Vec<_>>();
+    let status_line = lines
+        .iter()
+        .position(|line| line.contains("Enter send"))
+        .expect("status line");
+    let pane_line = lines
+        .iter()
+        .position(|line| line.contains("explore"))
+        .expect("subagent pane line");
+    assert!(pane_line > status_line, "{output}");
+}
+
+#[tokio::test]
+async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert!(app.subagent_pane.focused);
+    assert_eq!(app.subagent_pane.selected, 1);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("select subagent");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
+    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(80), false));
+    assert!(
+        subagent_view.contains("delegate subagent"),
+        "{subagent_view}"
+    );
+    assert!(subagent_view.contains("running grep"), "{subagent_view}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("return to main");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
+    assert!(!app.subagent_pane.focused);
+}
+
+#[test]
+fn selected_subagent_conversation_preserves_full_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    let prompt_tail = "PROMPT_SENTINEL_VISIBLE_IN_SUBAGENT";
+    let long_prompt = format!(
+        "Modernize src/cli/client.rs. Review the code for outdated patterns, deprecated APIs, \
+         or Rust idioms that could be improved. Suggest and implement modernization improvements. \
+         {} {prompt_tail}",
+        "let-else try-operator iterator-cleanup ".repeat(12)
+    );
+    assert!(
+        long_prompt.chars().count() > 240,
+        "prompt must exceed the old subagent event preview cap"
+    );
+
+    app.note_subagent_started(12, "delegate".to_string(), long_prompt);
+    app.subagent_pane.active = ConversationSource::Subagent(12);
+
+    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(96), false));
+    assert!(
+        subagent_view.contains(prompt_tail),
+        "selected subagent transcript should show the full assignment: {subagent_view}"
+    );
+    assert!(
+        !subagent_view.contains("[truncated]"),
+        "selected subagent transcript should not receive pre-truncated event text: {subagent_view}"
+    );
+}
+
+#[tokio::test]
+async fn config_screen_keeps_subagent_pane_from_owning_arrows() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(3, "explore".to_string(), "Inspect docs".to_string());
+    app.config_screen = Some(config_screen::ConfigScreenState::new(
+        test_config(SessionMode::Build),
+        None,
+    ));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("route to config");
+
+    assert!(
+        !app.subagent_pane.focused,
+        "config screen should retain key ownership"
+    );
+}
+
+#[test]
+fn transcript_overlay_uses_active_subagent_conversation() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(11, "delegate".to_string(), "Inspect crates".to_string());
+    app.note_subagent_activity(11, "delegate".to_string(), "running repo_map".to_string());
+    app.subagent_pane.active = ConversationSource::Subagent(11);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 90, 16);
+    assert!(output.contains("delegate subagent"), "{output}");
+    assert!(output.contains("running repo_map"), "{output}");
+    assert!(output.contains("Ctrl-T"), "{output}");
+}
+
+#[tokio::test]
+async fn focused_pane_esc_closes_pane_without_cancelling_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(5, "delegate".to_string(), "Inspect src".to_string());
+    let cancel = CancellationToken::new();
+    app.cancel = Some(cancel.clone()); // a turn is in flight
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert!(app.subagent_pane.focused);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(
+        !app.subagent_pane.focused,
+        "Esc should close the focused pane"
+    );
+    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
+    assert!(
+        !cancel.is_cancelled(),
+        "Esc inside the pane must not cancel the running turn"
+    );
+}
+
+#[tokio::test]
+async fn typing_releases_focused_pane_to_the_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(8, "delegate".to_string(), "Inspect src".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert!(app.subagent_pane.focused);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type char");
+    assert!(
+        !app.subagent_pane.focused,
+        "typing should release pane focus so the prompt is never trapped"
+    );
+    assert!(
+        app.input.contains('h'),
+        "the character should reach the composer: {:?}",
+        app.input
+    );
+}
+
+#[tokio::test]
+async fn delete_clears_finished_subagents_and_keeps_running_ones() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string()); // still running
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("clear finished");
+
+    assert_eq!(app.subagent_pane.records.len(), 1);
+    assert_eq!(app.subagent_pane.records[0].id, 2);
+    assert_eq!(app.status, "cleared finished subagents");
+}
+
+#[test]
+fn prune_caps_retained_subagent_records() {
+    let mut app = test_app(SessionMode::Build);
+    for id in 0..40u64 {
+        app.note_subagent_started(id, "delegate".to_string(), format!("task {id}"));
+        app.note_subagent_completed(
+            id,
+            "delegate".to_string(),
+            "done".to_string(),
+            TurnMetrics::default(),
+        );
+    }
+    assert!(
+        app.subagent_pane.records.len() <= 32,
+        "records should be capped, got {}",
+        app.subagent_pane.records.len()
+    );
+    assert!(
+        app.subagent_pane.records.iter().any(|r| r.id == 39),
+        "the newest subagent must be retained"
+    );
+}
+
+#[test]
+fn subagent_activity_transcript_stays_bounded() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(4, "delegate".to_string(), "seed".to_string());
+    for i in 0..1000 {
+        app.note_subagent_activity(4, "delegate".to_string(), format!("running tool {i}"));
+    }
+    let record = &app.subagent_pane.records[0];
+    assert!(
+        record.transcript.len() <= 256,
+        "per-subagent transcript should be bounded, got {}",
+        record.transcript.len()
+    );
+    // The most recent activity must survive the trimming.
+    assert_eq!(record.latest, compact_text("running tool 999", 120));
+}
+
+#[test]
+fn rejected_subagent_appears_in_pane_and_is_clearable() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "real one".to_string());
+    app.note_subagent_rejected("delegate".to_string(), "concurrency cap".to_string(), 3, 3);
+
+    assert_eq!(app.subagent_pane.records.len(), 2);
+    let rejected = app
+        .subagent_pane
+        .records
+        .iter()
+        .find(|r| matches!(r.lifecycle, SubagentLifecycle::Rejected))
+        .expect("rejected record present");
+    // Synthetic id must not collide with the real lease id (1).
+    assert_ne!(rejected.id, 1);
+    assert!(
+        rejected.latest.contains("concurrency cap"),
+        "{}",
+        rejected.latest
+    );
+
+    // The pane renders the capped row with its state word.
+    let output = render_to_string(&app, 120, 18);
+    assert!(output.contains("capped"), "{output}");
+
+    // A rejection is "finished", so Del clears it but keeps the running one.
+    app.clear_finished_subagents();
+    assert_eq!(app.subagent_pane.records.len(), 1);
+    assert_eq!(app.subagent_pane.records[0].id, 1);
+}
+
+#[test]
+fn subagent_row_shows_lifecycle_word_for_accessibility() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(2, "explore".to_string(), "look".to_string());
+    app.note_subagent_failed(
+        2,
+        "explore".to_string(),
+        "boom".to_string(),
+        TurnMetrics::default(),
+    );
+    // Even with the row selected (glyph forced to ⏺), the failed state is
+    // still conveyed as text.
+    app.subagent_pane.selected = 1;
+    let output = render_to_string(&app, 120, 18);
+    assert!(output.contains("failed"), "{output}");
+}
+
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);
@@ -11307,6 +11634,10 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
 #[test]
 fn status_line_languages_use_squeezy_amber() {
     use crate::status::StatusLineItem;
+    let expected_theme =
+        crate::render::theme::resolve_theme(&squeezy_core::AppConfig::default(), "default");
+    let expected_language_color = expected_theme.color(crate::render::theme::token::PALETTE_ACCENT);
+    let expected_dir_color = expected_theme.color(crate::render::theme::token::PALETTE_GREEN);
     let mut app = test_app(SessionMode::Build);
     app.directory = "~/project".to_string();
     app.language_summary = "Python 10, Rust 247".to_string();
@@ -11327,12 +11658,12 @@ fn status_line_languages_use_squeezy_amber() {
 
     assert_eq!(
         language_span.style.fg,
-        Some(crate::render::theme::accent()),
+        Some(expected_language_color),
         "languages should use Squeezy's darker brand accent"
     );
     assert_eq!(
         dir_span.style.fg,
-        Some(crate::render::theme::green()),
+        Some(expected_dir_color),
         "other path-family status items should keep their existing color"
     );
 }

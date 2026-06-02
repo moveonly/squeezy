@@ -12,6 +12,7 @@
 //! where the previous `String` lived.
 
 use std::fmt;
+use std::hash::Hasher;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct StreamingController {
@@ -54,10 +55,33 @@ impl StreamingController {
     pub(crate) fn text(&self) -> String {
         let mut out =
             String::with_capacity(self.committed.len() + self.held.len() + self.pending.len());
-        out.push_str(&self.committed);
-        out.push_str(&self.held);
-        out.push_str(&self.pending);
+        self.write_to(&mut out)
+            .expect("writing to String cannot fail");
         out
+    }
+
+    pub(crate) fn segments(&self) -> impl Iterator<Item = &str> {
+        [
+            self.committed.as_str(),
+            self.held.as_str(),
+            self.pending.as_str(),
+        ]
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+    }
+
+    pub(crate) fn write_to(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        for segment in self.segments() {
+            f.write_str(segment)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hash_text<H: Hasher>(&self, state: &mut H) {
+        for segment in self.segments() {
+            state.write(segment.as_bytes());
+        }
+        state.write_u8(0xff);
     }
 
     #[allow(dead_code)]
@@ -157,10 +181,13 @@ impl StreamingController {
 
 impl fmt::Display for StreamingController {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.committed)?;
-        f.write_str(&self.held)?;
-        f.write_str(&self.pending)?;
-        Ok(())
+        self.write_to(f)
+    }
+}
+
+impl std::hash::Hash for StreamingController {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash_text(state);
     }
 }
 

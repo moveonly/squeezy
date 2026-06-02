@@ -115,16 +115,16 @@ impl GoogleProvider {
             body["generationConfig"]["thinkingConfig"] = thinking;
         }
         if !request.tools.is_empty() {
+            let mut function_declarations = Vec::with_capacity(request.tools.len());
+            for tool in request.tools.iter() {
+                function_declarations.push(json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": sanitize_for_gemini(&tool.parameters),
+                }));
+            }
             body["tools"] = json!([{
-                "functionDeclarations": request
-                    .tools
-                    .iter()
-                    .map(|tool| json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": sanitize_for_gemini(&tool.parameters),
-                    }))
-                    .collect::<Vec<_>>()
+                "functionDeclarations": function_declarations
             }]);
             // Forward `tool_choice` as `toolConfig.functionCallingConfig.mode`.
             // Without this, tool-shy small models (Qwen via aggregators et al.)
@@ -521,7 +521,7 @@ pub(crate) fn google_stream_url(base_url: &str, model: &str) -> String {
 }
 
 fn google_contents(input: &[LlmInputItem]) -> Value {
-    let mut contents = Vec::new();
+    let mut contents = Vec::with_capacity(input.len());
     let mut tool_names_by_call_id = BTreeMap::new();
     for item in input {
         match item {
@@ -600,19 +600,17 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 summary,
                 thought_signature,
             }) => {
-                let parts: Vec<Value> = summary
-                    .iter()
-                    .map(|text| {
-                        let mut part = json!({
-                            "text": text,
-                            "thought": true,
-                        });
-                        if let Some(sig) = thought_signature {
-                            part["thoughtSignature"] = json!(sig);
-                        }
-                        part
-                    })
-                    .collect();
+                let mut parts = Vec::with_capacity(summary.len());
+                for text in summary {
+                    let mut part = json!({
+                        "text": text,
+                        "thought": true,
+                    });
+                    if let Some(sig) = thought_signature {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(part);
+                }
                 if !parts.is_empty() {
                     contents.push(json!({
                         "role": "model",
@@ -663,7 +661,9 @@ impl GoogleReasoningBuffer {
         if !text.is_empty() {
             self.summary.push(text.to_string());
         }
-        if let Some(sig) = signature {
+        if let Some(sig) = signature
+            && self.signature.as_deref() != Some(sig)
+        {
             self.signature = Some(sig.to_string());
         }
     }
@@ -779,10 +779,10 @@ fn parse_google_event(
         .and_then(|candidates| candidates.first())
         .and_then(|candidate| candidate.get("finishReason"))
         .and_then(Value::as_str)
+        && last_finish_reason.as_deref() != Some(reason)
     {
         *last_finish_reason = Some(reason.to_string());
     }
-    let mut events = Vec::new();
     let parts = value
         .get("candidates")
         .and_then(Value::as_array)
@@ -791,8 +791,9 @@ fn parse_google_event(
         .and_then(|content| content.get("parts"))
         .and_then(Value::as_array);
     let Some(parts) = parts else {
-        return Ok(events);
+        return Ok(Vec::new());
     };
+    let mut events = Vec::with_capacity(parts.len());
     for part in parts.iter() {
         let is_thought = part
             .get("thought")

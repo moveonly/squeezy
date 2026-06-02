@@ -464,7 +464,7 @@ async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
         let mut queue = state.queue.lock().await;
         queue.events.push(event);
         if queue.events.len() >= MAX_BATCH_EVENTS {
-            let events = std::mem::take(&mut queue.events);
+            let events = drain_event_buffer(&mut queue.events);
             queue.flush_scheduled = false;
             TelemetryAction::Flush(events)
         } else if !queue.flush_scheduled {
@@ -500,7 +500,13 @@ enum TelemetryAction {
 async fn drain_queued_events(state: &TelemetryState) -> Vec<TelemetryEvent> {
     let mut queue = state.queue.lock().await;
     queue.flush_scheduled = false;
-    std::mem::take(&mut queue.events)
+    drain_event_buffer(&mut queue.events)
+}
+
+fn drain_event_buffer(events: &mut Vec<TelemetryEvent>) -> Vec<TelemetryEvent> {
+    let mut drained = Vec::with_capacity(MAX_BATCH_EVENTS);
+    std::mem::swap(events, &mut drained);
+    drained
 }
 
 async fn send_batch(
@@ -1274,10 +1280,7 @@ fn random_trace_id() -> String {
     let mut bytes = [0u8; 16];
     fill_random_bytes(&mut bytes);
     let mut out = String::with_capacity(32);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
+    push_hex_bytes(&mut out, &bytes);
     out
 }
 
@@ -1286,10 +1289,7 @@ fn random_span_id() -> String {
     let mut bytes = [0u8; 8];
     fill_random_bytes(&mut bytes);
     let mut out = String::with_capacity(16);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
+    push_hex_bytes(&mut out, &bytes);
     out
 }
 
@@ -1321,25 +1321,26 @@ fn random_uuid_like() -> String {
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15]
-    )
+    let mut out = String::with_capacity(36);
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        push_hex_byte(&mut out, byte);
+    }
+    out
+}
+
+fn push_hex_bytes(output: &mut String, bytes: &[u8]) {
+    for byte in bytes {
+        push_hex_byte(output, *byte);
+    }
+}
+
+fn push_hex_byte(output: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    output.push(HEX[(byte >> 4) as usize] as char);
+    output.push(HEX[(byte & 0x0f) as usize] as char);
 }
 
 fn is_uuid_like(value: &str) -> bool {

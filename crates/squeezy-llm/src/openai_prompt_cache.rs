@@ -26,6 +26,9 @@ pub(crate) const OPENAI_PROMPT_CACHE_KEY_MAX_CODEPOINTS: usize = 64;
 /// codepoints (`char_indices`), not bytes, so multibyte session ids survive
 /// up to the codepoint cap regardless of UTF-8 byte length.
 pub(crate) fn clamp_prompt_cache_key(key: &str) -> &str {
+    if key.len() <= OPENAI_PROMPT_CACHE_KEY_MAX_CODEPOINTS {
+        return key;
+    }
     match key
         .char_indices()
         .nth(OPENAI_PROMPT_CACHE_KEY_MAX_CODEPOINTS)

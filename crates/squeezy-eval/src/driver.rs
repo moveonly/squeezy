@@ -2273,6 +2273,7 @@ impl Driver {
                 }
                 AgentEvent::SubagentStarted {
                     turn_id,
+                    id,
                     agent,
                     prompt,
                 } => {
@@ -2280,12 +2281,27 @@ impl Driver {
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "started", "agent": agent, "prompt": prompt}),
+                            event: json!({"kind": "started", "id": id, "agent": agent, "prompt": prompt}),
+                        },
+                    )?;
+                }
+                AgentEvent::SubagentActivity {
+                    turn_id,
+                    id,
+                    agent,
+                    message,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::SubagentEvent {
+                            event: json!({"kind": "activity", "id": id, "agent": agent, "message": message}),
                         },
                     )?;
                 }
                 AgentEvent::SubagentCompleted {
                     turn_id,
+                    id,
                     agent,
                     summary,
                     ..
@@ -2294,12 +2310,13 @@ impl Driver {
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "completed", "agent": agent, "summary": summary}),
+                            event: json!({"kind": "completed", "id": id, "agent": agent, "summary": summary}),
                         },
                     )?;
                 }
                 AgentEvent::SubagentFailed {
                     turn_id,
+                    id,
                     agent,
                     error,
                     ..
@@ -2308,7 +2325,7 @@ impl Driver {
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "failed", "agent": agent, "error": error}),
+                            event: json!({"kind": "failed", "id": id, "agent": agent, "error": error}),
                         },
                     )?;
                 }
@@ -2875,7 +2892,7 @@ fn preview_overlay_lines(lines: &[squeezy_tools::preview::PreviewLine]) -> Vec<S
 }
 
 fn normalize_overlay_text(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapse_whitespace(text);
     let mut out = String::with_capacity(collapsed.len());
     let mut chars = collapsed.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -2886,6 +2903,20 @@ fn normalize_overlay_text(text: &str) -> String {
         {
             out.push(' ');
         }
+    }
+    out
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(first);
+    for word in words {
+        out.push(' ');
+        out.push_str(word);
     }
     out
 }

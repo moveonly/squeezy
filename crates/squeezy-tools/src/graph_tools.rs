@@ -496,7 +496,7 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
         return true;
     };
     let path = symbol.file_id.0.as_str();
-    if path == filter || path.ends_with(&format!("/{filter}")) {
+    if path_matches_exact_or_suffix(path, filter) {
         return true;
     }
     // Append fuzzy path matching as a fallback so casual queries like
@@ -714,11 +714,9 @@ fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
 }
 
 fn graph_language_counts_json(graph: &squeezy_graph::SemanticGraph) -> Value {
-    let mut counts = BTreeMap::<String, usize>::new();
+    let mut counts = BTreeMap::<&'static str, usize>::new();
     for file in graph.files.values() {
-        *counts
-            .entry(file.language.display_name().to_string())
-            .or_default() += 1;
+        *counts.entry(file.language.display_name()).or_default() += 1;
     }
     json!(counts)
 }
@@ -895,12 +893,11 @@ fn resolve_dotted_query(
 ) -> Option<Vec<GraphSymbol>> {
     // Split on `.` or `::`. Require at least one separator and at
     // least two non-empty segments — otherwise this is a plain name.
-    let separators: &[&str] = &["::", "."];
-    let mut segments: Vec<&str> = vec![query];
-    for sep in separators {
-        segments = segments.into_iter().flat_map(|s| s.split(*sep)).collect();
-    }
-    let segments: Vec<&str> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = query
+        .split("::")
+        .flat_map(|segment| segment.split('.'))
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.len() < 2 {
         return None;
     }
@@ -913,23 +910,20 @@ fn resolve_dotted_query(
     if member_candidates.is_empty() {
         return None;
     }
-    let expected_chain: Vec<&str> = segments[..segments.len() - 1].to_vec();
     member_candidates.retain(|cand| {
-        let mut want = expected_chain.iter().rev().peekable();
-        let mut current = cand.parent_id.clone();
+        let mut want = segments[..segments.len() - 1].iter().rev().peekable();
+        let mut current = cand.parent_id.as_ref();
         while let Some(needed) = want.peek() {
-            let Some(parent_id) = current.clone() else {
+            let Some(parent_id) = current else {
                 return false;
             };
-            let Some(parent) = graph.symbols.get(&parent_id) else {
+            let Some(parent) = graph.symbols.get(parent_id) else {
                 return false;
             };
             if parent.name.as_str() == **needed {
                 want.next();
-                current = parent.parent_id.clone();
-            } else {
-                current = parent.parent_id.clone();
             }
+            current = parent.parent_id.as_ref();
         }
         want.peek().is_none()
     });
@@ -941,24 +935,22 @@ fn resolve_dotted_query(
 }
 
 fn decl_counts_by_language(graph: &squeezy_graph::SemanticGraph, symbols: &[GraphSymbol]) -> Value {
-    let mut counts = BTreeMap::<String, usize>::new();
+    let mut counts = BTreeMap::<&'static str, usize>::new();
     for symbol in symbols {
         let label = graph
             .files
             .get(&symbol.file_id)
             .map(|file| file.language.display_name())
             .unwrap_or("unknown");
-        *counts.entry(label.to_string()).or_default() += 1;
+        *counts.entry(label).or_default() += 1;
     }
     json!(counts)
 }
 
 fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
-    let mut counts = BTreeMap::<String, usize>::new();
+    let mut counts = BTreeMap::<&'static str, usize>::new();
     for symbol in symbols {
-        *counts
-            .entry(symbol_kind_label(symbol.kind).to_string())
-            .or_default() += 1;
+        *counts.entry(symbol_kind_label(symbol.kind)).or_default() += 1;
     }
     json!(counts)
 }
@@ -1114,9 +1106,10 @@ fn graph_zero_hit_fallback(
     }
     let (path_value, language_value, reason) = match path {
         Some(path) => {
-            let file = graph.files.values().find(|file| {
-                file.relative_path == path || file.relative_path.ends_with(&format!("/{path}"))
-            });
+            let file = graph
+                .files
+                .values()
+                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path));
             match file {
                 Some(file) => {
                     let reason = match file.language {
@@ -1334,7 +1327,14 @@ fn reference_packet(hit: &ReferenceHit) -> Value {
 
 fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     let path = hit.reference.file_id.0.as_str();
-    path == filter || path.ends_with(&format!("/{filter}"))
+    path_matches_exact_or_suffix(path, filter)
+}
+
+fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
+    path == filter
+        || path
+            .strip_suffix(filter)
+            .is_some_and(|prefix| prefix.ends_with('/'))
 }
 
 fn call_edge_packet(
@@ -1608,16 +1608,15 @@ fn call_chain_packet(
     let symbols = chain
         .iter()
         .filter_map(|id| graph.symbols.get(id))
-        .cloned()
         .collect::<Vec<_>>();
-    let claim = format!(
-        "call chain found: {}",
-        symbols
-            .iter()
-            .map(|symbol| symbol.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    );
+    let mut chain_names = String::new();
+    for symbol in &symbols {
+        if !chain_names.is_empty() {
+            chain_names.push_str(" -> ");
+        }
+        chain_names.push_str(&symbol.name);
+    }
+    let claim = format!("call chain found: {chain_names}");
     let mut packet = evidence_packet(
         claim,
         symbols
@@ -1648,7 +1647,12 @@ fn call_chain_packet(
         object.insert("target".to_string(), symbol_json(graph, target));
         object.insert(
             "chain".to_string(),
-            json!(symbols.iter().map(symbol_summary_json).collect::<Vec<_>>()),
+            json!(
+                symbols
+                    .iter()
+                    .map(|symbol| symbol_summary_json(symbol))
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     packet
@@ -1984,9 +1988,10 @@ fn read_slice_target(
         .ok_or_else(|| "read_slice requires path or symbol_id".to_string())?;
     let status = graph
         .and_then(|graph| {
-            graph.files.values().find(|file| {
-                file.relative_path == path || file.relative_path.ends_with(&format!("/{path}"))
-            })
+            graph
+                .files
+                .values()
+                .find(|file| path_matches_exact_or_suffix(&file.relative_path, &path))
         })
         .map(|file| graph_status_for_language(file.language))
         .unwrap_or("not_indexed");

@@ -33,19 +33,38 @@ impl PathRank {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PathQueryContext {
+    tokens: Vec<String>,
+    collapsed: String,
+}
+
+impl PathQueryContext {
+    fn new(query: &str) -> Self {
+        let tokens = path_tokens(query);
+        let collapsed = tokens.join("");
+        Self { tokens, collapsed }
+    }
+}
+
 /// Score `path` against `query`. `query` is tokenised the same way as
 /// the path (split on `/`, `_`, `-`, `.`, whitespace) and lowercased.
 /// Empty queries score zero overlap and zero trigram similarity.
 pub fn path_rank(path: &str, query: &str) -> PathRank {
-    let query_tokens = path_tokens(query);
-    if query_tokens.is_empty() {
+    let context = PathQueryContext::new(query);
+    path_rank_with_context(path, &context)
+}
+
+fn path_rank_with_context(path: &str, context: &PathQueryContext) -> PathRank {
+    if context.tokens.is_empty() {
         return PathRank {
             overlap: 0,
             trigram: 0.0,
         };
     }
     let path_token_set: HashSet<String> = path_tokens(path).into_iter().collect();
-    let overlap = query_tokens
+    let overlap = context
+        .tokens
         .iter()
         .filter(|q| {
             path_token_set
@@ -55,8 +74,7 @@ pub fn path_rank(path: &str, query: &str) -> PathRank {
         .count() as u32;
 
     let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let collapsed_query: String = query_tokens.join("");
-    let trigram = trigram_jaccard(basename, &collapsed_query);
+    let trigram = trigram_jaccard(basename, &context.collapsed);
 
     PathRank { overlap, trigram }
 }
@@ -65,10 +83,11 @@ pub fn path_rank(path: &str, query: &str) -> PathRank {
 /// pairs sorted best-first. Stable: paths with identical ranks keep
 /// their original relative order.
 pub fn rank_paths(paths: &[&str], query: &str) -> Vec<(usize, PathRank)> {
+    let context = PathQueryContext::new(query);
     let mut scored: Vec<(usize, PathRank)> = paths
         .iter()
         .enumerate()
-        .map(|(idx, path)| (idx, path_rank(path, query)))
+        .map(|(idx, path)| (idx, path_rank_with_context(path, &context)))
         .collect();
     scored.sort_by(|a, b| a.1.sort_key().cmp(&b.1.sort_key()).then(a.0.cmp(&b.0)));
     scored

@@ -29,13 +29,14 @@ pub(crate) fn truncate_middle_chars(value: &str, cap: usize) -> String {
     if value.len() <= cap {
         return value.to_string();
     }
+    let value_chars = char_count(value);
 
     // Marker length grows with the digit count of the removed-char count, but
     // we don't know that count until we know the marker length. Iterate a
     // couple times — convergence is immediate after the first pass because
     // the digit count rarely changes once the split is in the right
     // neighborhood.
-    let mut marker = format!("\n…{} chars truncated…\n", value.chars().count());
+    let mut marker = format!("\n…{value_chars} chars truncated…\n");
     for _ in 0..3 {
         if marker.len() >= cap {
             // Cap is too small to hold the marker; fall back to a byte-bounded
@@ -45,9 +46,11 @@ pub(crate) fn truncate_middle_chars(value: &str, cap: usize) -> String {
         let body_budget = cap - marker.len();
         let left = body_budget / 2;
         let right = body_budget - left;
-        let head = prefix_to_char_boundary(value, left);
-        let tail = suffix_to_char_boundary(value, right);
-        let removed = value.chars().count() - head.chars().count() - tail.chars().count();
+        let (head, head_chars) = prefix_to_char_boundary_with_count(value, left);
+        let (tail, tail_chars) = suffix_to_char_boundary_with_count(value, right);
+        let removed = value_chars
+            .saturating_sub(head_chars)
+            .saturating_sub(tail_chars);
         let next_marker = format!("\n…{removed} chars truncated…\n");
         if next_marker.len() == marker.len() {
             let mut out = String::with_capacity(head.len() + marker.len() + tail.len());
@@ -66,6 +69,25 @@ pub(crate) fn truncate_middle_chars(value: &str, cap: usize) -> String {
     prefix_to_char_boundary(value, cap)
 }
 
+fn char_count(value: &str) -> usize {
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.chars().count()
+    }
+}
+
+fn prefix_to_char_boundary_with_count(value: &str, mut end: usize) -> (String, usize) {
+    if end >= value.len() {
+        return (value.to_string(), char_count(value));
+    }
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = &value[..end];
+    (text.to_string(), char_count(text))
+}
+
 fn prefix_to_char_boundary(value: &str, mut end: usize) -> String {
     if end >= value.len() {
         return value.to_string();
@@ -76,15 +98,16 @@ fn prefix_to_char_boundary(value: &str, mut end: usize) -> String {
     value[..end].to_string()
 }
 
-fn suffix_to_char_boundary(value: &str, max_bytes: usize) -> String {
+fn suffix_to_char_boundary_with_count(value: &str, max_bytes: usize) -> (String, usize) {
     if max_bytes >= value.len() {
-        return value.to_string();
+        return (value.to_string(), char_count(value));
     }
     let mut start = value.len() - max_bytes;
     while start < value.len() && !value.is_char_boundary(start) {
         start += 1;
     }
-    value[start..].to_string()
+    let text = &value[start..];
+    (text.to_string(), char_count(text))
 }
 
 #[cfg(test)]

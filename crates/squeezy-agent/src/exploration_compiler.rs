@@ -354,11 +354,15 @@ fn extract_quoted(input: &str) -> Option<String> {
         // like `What's` don't yield the trailing fragment as a query. A
         // properly-delimited literal produces at least three parts after
         // `splitn` (prefix, inside, suffix).
-        let parts: Vec<&str> = input.splitn(3, quote).collect();
-        if parts.len() < 3 {
+        let mut parts = input.splitn(3, quote);
+        let _prefix = parts.next();
+        let Some(candidate) = parts.next() else {
+            continue;
+        };
+        if parts.next().is_none() {
             continue;
         }
-        let candidate = parts[1].trim();
+        let candidate = candidate.trim();
         if is_useful_query(candidate) {
             return Some(candidate.to_string());
         }
@@ -367,24 +371,26 @@ fn extract_quoted(input: &str) -> Option<String> {
 }
 
 fn extract_identifier(input: &str) -> Option<String> {
-    let tokens: Vec<String> = input
+    let mut rust_like = None;
+    let mut fallback = None;
+    for token in input
         .split(|ch: char| {
             !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '-' | '/'))
         })
         .map(|token| token.trim_matches(|ch: char| matches!(ch, '.' | ':' | '-' | '/')))
         .filter(|token| is_useful_query(token))
         .filter(|token| !is_stopword(token))
-        .map(str::to_string)
-        .collect();
+    {
+        fallback = Some(token);
+        if looks_like_rust_symbol(token) {
+            rust_like = Some(token);
+        }
+    }
     // Prefer tokens that look like Rust identifier paths so prompts like
     // "Who calls Runner::run from main()?" do not pick up `main` as the
     // symbol just because it appears last. Fall back to the last remaining
     // token only when nothing identifier-shaped is present.
-    tokens
-        .iter()
-        .rfind(|token| looks_like_rust_symbol(token))
-        .or_else(|| tokens.last())
-        .cloned()
+    rust_like.or(fallback).map(str::to_string)
 }
 
 fn looks_like_rust_symbol(token: &str) -> bool {

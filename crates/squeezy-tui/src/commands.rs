@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::time::SystemTime;
 
 use squeezy_agent::{Agent, ReviewerAuditEntry, SessionAccountingSnapshot};
@@ -510,15 +511,18 @@ pub(crate) fn format_reviewer_command(entries: &[ReviewerAuditEntry], now: Syste
     if entries.is_empty() {
         return "AI reviewer audit\nno auto-decisions recorded this session.".to_string();
     }
-    let mut lines: Vec<String> = Vec::with_capacity(entries.len() + 1);
-    lines.push(format!(
+    let mut out = String::with_capacity(64 + entries.len() * 128);
+    write!(
+        &mut out,
         "AI reviewer audit\n{} recent decision(s); newest first.",
         entries.len()
-    ));
+    )
+    .expect("writing to String cannot fail");
     for entry in entries.iter().rev() {
         let age = format_audit_age(now, entry.recorded_at);
-        lines.push(format!(
-            "{age} turn={turn} {verdict} {capability} {tool} target={target}\n    reason: {reason}",
+        write!(
+            &mut out,
+            "\n{age} turn={turn} {verdict} {capability} {tool} target={target}\n    reason: {reason}",
             age = age,
             turn = entry.turn_id,
             verdict = entry.verdict.as_str(),
@@ -526,9 +530,10 @@ pub(crate) fn format_reviewer_command(entries: &[ReviewerAuditEntry], now: Syste
             tool = entry.tool_name,
             target = entry.target,
             reason = entry.reason,
-        ));
+        )
+        .expect("writing to String cannot fail");
     }
-    lines.join("\n")
+    out
 }
 
 fn format_audit_age(now: SystemTime, when: SystemTime) -> String {

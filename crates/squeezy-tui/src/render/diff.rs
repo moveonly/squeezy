@@ -54,6 +54,17 @@ pub(crate) fn render_patch_full_lines(
     render_patch(patch, language_hint)
 }
 
+pub(crate) fn render_patch_full_lines_cached(
+    patch: &str,
+    language_hint: Option<&str>,
+) -> Vec<Line<'static>> {
+    let cache_key = match language_hint {
+        Some(hint) => format!("<raw-patch:{hint}>"),
+        None => "<raw-patch>".to_string(),
+    };
+    cache::get_or_compute_diff(&cache_key, patch, || render_patch(patch, language_hint))
+}
+
 fn render_patch(patch: &str, language_hint: Option<&str>) -> Vec<Line<'static>> {
     let lines = parse_patch(patch);
     render_parsed_lines(&lines, language_hint)

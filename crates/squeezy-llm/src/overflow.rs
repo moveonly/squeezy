@@ -146,7 +146,6 @@ pub fn classify_terminal(
 /// rather than per-provider tables so a new aggregator (OpenRouter,
 /// LiteLLM, Vertex) usually classifies correctly without code.
 fn error_indicates_overflow(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
     const NEEDLES: &[&str] = &[
         "prompt is too long",
         "context length",
@@ -159,7 +158,19 @@ fn error_indicates_overflow(err: &str) -> bool {
         "tokens exceed",
         "exceeds the model",
     ];
-    NEEDLES.iter().any(|needle| lower.contains(needle))
+    NEEDLES
+        .iter()
+        .any(|needle| contains_ignore_ascii_case(err, needle))
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Match the provider strings that mean "the model stopped because

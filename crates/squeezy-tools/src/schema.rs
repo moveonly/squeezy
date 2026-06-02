@@ -29,7 +29,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Write},
+};
 
 pub(crate) const MAX_TOOL_SCHEMA_BYTES: usize = 4_000;
 pub(crate) const MAX_TOOL_SCHEMA_DEPTH: usize = 2;
@@ -238,9 +241,43 @@ pub(crate) fn compact_tool_parameters(value: &mut Value) {
 }
 
 fn fits_budget(schema: &JsonSchema) -> bool {
-    serde_json::to_vec(schema)
-        .map(|bytes| bytes.len() <= MAX_TOOL_SCHEMA_BYTES)
-        .unwrap_or(true)
+    let mut writer = CountingWriter::new(MAX_TOOL_SCHEMA_BYTES);
+    match serde_json::to_writer(&mut writer, schema) {
+        Ok(()) => true,
+        Err(_) if writer.exceeded => false,
+        Err(_) => true,
+    }
+}
+
+struct CountingWriter {
+    limit: usize,
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl CountingWriter {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            bytes: 0,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        if self.bytes > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other("schema byte budget exceeded"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Pre-pass that normalizes a raw `Value` *before* it round-trips through the

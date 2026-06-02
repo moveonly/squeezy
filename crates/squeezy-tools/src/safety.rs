@@ -32,29 +32,6 @@ pub enum ShellPreClassification {
     AskAi,
 }
 
-/// Interpreter executables that can run arbitrary code from an inline
-/// argument (`-c`, `-e`, etc.) or stdin. Approving a single Ask
-/// short-circuit for these effectively approves anything the wrapped
-/// language can do, so the pre-classifier always denies them here and
-/// forces a per-call prompt.
-const DANGEROUS_INTERPRETERS: &[&str] = &[
-    "python",
-    "python2",
-    "python3",
-    "node",
-    "deno",
-    "ruby",
-    "perl",
-    "php",
-    "lua",
-    "tclsh",
-    "osascript",
-    "eval",
-    "exec",
-    "sudo",
-    "doas",
-];
-
 pub fn pre_classify_shell(
     command: &str,
     shell_sandbox: &ShellSandboxConfig,
@@ -125,10 +102,24 @@ fn dangerous_interpreter(segment: &str) -> Option<&'static str> {
         }
         break tok;
     };
-    let interpreter = DANGEROUS_INTERPRETERS
-        .iter()
-        .copied()
-        .find(|name| *name == head)?;
+    let interpreter = match head {
+        "python" => "python",
+        "python2" => "python2",
+        "python3" => "python3",
+        "node" => "node",
+        "deno" => "deno",
+        "ruby" => "ruby",
+        "perl" => "perl",
+        "php" => "php",
+        "lua" => "lua",
+        "tclsh" => "tclsh",
+        "osascript" => "osascript",
+        "eval" => "eval",
+        "exec" => "exec",
+        "sudo" => "sudo",
+        "doas" => "doas",
+        _ => return None,
+    };
     // `sudo`, `doas`, `eval`, `exec` are always elevation/arbitrary-code
     // verbs regardless of args, so deny on bare head match.
     if matches!(interpreter, "sudo" | "doas" | "eval" | "exec") {
@@ -253,6 +244,9 @@ fn protected_metadata_component(
     workspace_root: &Path,
     shell_sandbox: &ShellSandboxConfig,
 ) -> Option<String> {
+    if shell_sandbox.protected_metadata_names.is_empty() {
+        return None;
+    }
     let roots = std::iter::once(workspace_root)
         .chain(shell_sandbox.write_roots.iter().map(PathBuf::as_path));
     for root in roots {

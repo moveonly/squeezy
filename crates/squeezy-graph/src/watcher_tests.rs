@@ -2,7 +2,7 @@ use std::{
     fs,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{ChangeBatch, FileWatcher, WatcherConfig};
@@ -43,15 +43,20 @@ fn watcher_emits_change_batch_after_debounce_window() {
         // default is 10s.
         debounce_ms: 250,
     };
-    let watcher = FileWatcher::start(config, move |batch: ChangeBatch| {
+    let watcher = FileWatcher::start_polling_for_tests(config, move |batch: ChangeBatch| {
         captured_clone.lock().unwrap().push(batch);
     })
     .expect("watcher start");
 
     let file = root.join("touched.txt");
-    fs::write(&file, b"hello").expect("write file");
-    // Wait long enough for the debounce window to close plus a tick.
-    thread::sleep(Duration::from_millis(900));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempt = 0usize;
+    while Instant::now() < deadline && captured.lock().unwrap().is_empty() {
+        fs::write(&file, format!("hello {attempt}\n")).expect("write file");
+        // Wait long enough for the debounce window to close plus a tick.
+        thread::sleep(Duration::from_millis(500));
+        attempt += 1;
+    }
 
     let batches = captured.lock().unwrap().clone();
     drop(watcher);

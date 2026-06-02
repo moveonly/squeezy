@@ -91,7 +91,7 @@ impl SessionStore {
         }
 
         let redactor = config.redaction.redactor()?;
-        let record = self.show(session_id)?;
+        let record = self.show_without_context_attachments(session_id)?;
         let report_id = random_uuid_like();
         let mut sections = Vec::new();
         let mut excluded = BTreeSet::new();

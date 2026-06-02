@@ -164,6 +164,13 @@ pub fn apply_edits(
             skipped += 1;
         }
     }
+    if applied == 0 {
+        return Ok(WriteOutcome {
+            path: scope.path.clone(),
+            edits_applied: applied,
+            edits_skipped: skipped,
+        });
+    }
     write_atomic(&scope.path, doc.to_string().as_bytes(), &scope.kind)?;
     Ok(WriteOutcome {
         path: scope.path.clone(),
@@ -222,6 +229,13 @@ fn apply_one(doc: &mut DocumentMut, edit: &SettingsEdit) -> bool {
 }
 
 fn apply_scalar(root: &mut Table, parents: &[&str], leaf: &str, op: &EditOp) -> bool {
+    if matches!(op, EditOp::Unset) {
+        let Some(parent) = descend_existing_table(root, parents) else {
+            return false;
+        };
+        return parent.remove(leaf).is_some();
+    }
+
     let parent = descend_or_create_table(root, parents);
     match op {
         EditOp::SetString(s) => set_leaf(parent, leaf, value(s.as_str())),
@@ -230,20 +244,10 @@ fn apply_scalar(root: &mut Table, parents: &[&str], leaf: &str, op: &EditOp) -> 
         EditOp::SetBool(v) => set_leaf(parent, leaf, value(*v)),
         EditOp::SetPath(p) => set_leaf(parent, leaf, value(p.display().to_string().as_str())),
         EditOp::SetArrayOfStrings(items) => {
-            let mut arr = Array::new();
-            for item in items {
-                arr.push(item.as_str());
-            }
+            let arr = items.iter().map(String::as_str).collect::<Array>();
             set_leaf(parent, leaf, Item::Value(Value::Array(arr)))
         }
-        EditOp::Unset => {
-            if parent.contains_key(leaf) {
-                parent.remove(leaf);
-                true
-            } else {
-                false
-            }
-        }
+        EditOp::Unset => unreachable!("handled before parent table creation"),
         EditOp::SetTableEntry { .. }
         | EditOp::RemoveTableEntry { .. }
         | EditOp::AppendArrayOfTables { .. }
@@ -290,13 +294,10 @@ fn apply_set_table_entry(
 }
 
 fn apply_remove_table_entry(doc: &mut DocumentMut, table_path: SettingsPath, key: &str) -> bool {
-    let parent = descend_or_create_table(doc.as_table_mut(), table_path);
-    if parent.contains_key(key) {
-        parent.remove(key);
-        true
-    } else {
-        false
-    }
+    let Some(parent) = descend_existing_table(doc.as_table_mut(), table_path) else {
+        return false;
+    };
+    parent.remove(key).is_some()
 }
 
 fn apply_append_array_of_tables(
@@ -335,17 +336,13 @@ fn apply_remove_array_of_tables_by_match(
     let (leaf, parents) = path
         .split_last()
         .expect("RemoveArrayOfTablesByMatch requires a non-empty path");
-    let parent = descend_or_create_table(doc.as_table_mut(), parents);
+    let Some(parent) = descend_existing_table(doc.as_table_mut(), parents) else {
+        return false;
+    };
     let Some(Item::ArrayOfTables(aot)) = parent.get_mut(leaf) else {
         return false;
     };
-    let mut idx_to_remove: Option<usize> = None;
-    for (i, row) in aot.iter().enumerate() {
-        if row_matches(row, predicate) {
-            idx_to_remove = Some(i);
-            break;
-        }
-    }
+    let idx_to_remove = aot.iter().position(|row| row_matches(row, predicate));
     match idx_to_remove {
         Some(i) => {
             aot.remove(i);
@@ -386,12 +383,7 @@ fn apply_remove_theme_color(doc: &mut DocumentMut, theme: &str, token: &str) -> 
     let Some(colors) = existing_theme_colors_table(doc, theme) else {
         return false;
     };
-    if colors.contains_key(token) {
-        colors.remove(token);
-        true
-    } else {
-        false
-    }
+    colors.remove(token).is_some()
 }
 
 fn existing_theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> Option<&'a mut Table> {
@@ -455,10 +447,7 @@ fn theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> &'a mut Tabl
 }
 
 fn rgb_item(rgb: [u8; 3]) -> Item {
-    let mut arr = Array::new();
-    arr.push(i64::from(rgb[0]));
-    arr.push(i64::from(rgb[1]));
-    arr.push(i64::from(rgb[2]));
+    let arr = rgb.into_iter().map(i64::from).collect::<Array>();
     Item::Value(Value::Array(arr))
 }
 
@@ -491,6 +480,31 @@ fn set_leaf(table: &mut Table, key: &str, new_item: Item) -> bool {
 
 fn items_equal(a: &Item, b: &Item) -> bool {
     a.to_string().trim() == b.to_string().trim()
+}
+
+fn descend_existing_table<'a>(root: &'a mut Table, parents: &[&str]) -> Option<&'a mut Table> {
+    let mut current = root;
+    for seg in parents {
+        let entry = current.get_mut(seg)?;
+        match entry {
+            Item::Table(t) => {
+                current = t;
+            }
+            Item::Value(Value::InlineTable(inline)) => {
+                let mut promoted = Table::new();
+                for (k, v) in inline.iter() {
+                    promoted.insert(k, Item::Value(v.clone()));
+                }
+                *entry = Item::Table(promoted);
+                match entry {
+                    Item::Table(t) => current = t,
+                    _ => unreachable!(),
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 fn descend_or_create_table<'a>(root: &'a mut Table, parents: &[&str]) -> &'a mut Table {

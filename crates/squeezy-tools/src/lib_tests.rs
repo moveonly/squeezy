@@ -6650,6 +6650,35 @@ fn test_report_json_parses_when_stderr_has_non_json_chatter() {
 }
 
 #[test]
+fn test_report_json_scans_past_plain_text_header() {
+    let output =
+        "Running tests...\n{\"failed\":1,\"passed\":0,\"total\":1,\"message\":\"error: bad\"}\n";
+
+    let shaped = shape_shell_output("pytest --json-report", output, "", false, Some(1));
+
+    assert_eq!(shaped.family, "pytest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("failed=1"));
+    assert!(shaped.stdout.contains("error: bad"));
+}
+
+#[test]
+fn structured_family_plain_text_falls_back_to_line_shaping() {
+    let shaped = shape_shell_output(
+        "jest --json",
+        "Running tests...\nFAIL src/example.test.ts\n",
+        "",
+        false,
+        Some(1),
+    );
+
+    assert_eq!(shaped.family, "jest");
+    assert_eq!(shaped.kind, "raw_passthrough_shaped");
+    assert!(shaped.fallback_reason.is_some());
+    assert!(shaped.stdout.contains("FAIL src/example.test.ts"));
+}
+
+#[test]
 fn nextest_json_emits_pass_fail_summary_even_when_all_pass() {
     let pass = include_str!("../tests/artifacts/tool-output-shaping/nextest-pass.txt");
 

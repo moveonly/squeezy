@@ -462,19 +462,28 @@ fn bounded_transcript(
     };
 
     kept.sort_by_key(|(index, _)| *index);
-    let mut lines = Vec::new();
+    let mut rendered = String::new();
     if let Some(delta_marker) = delta_marker {
-        lines.push(delta_marker.to_string());
+        push_transcript_output_line(&mut rendered, delta_marker);
     }
     if let Some(summary) = summary_line {
-        lines.push(summary);
+        push_transcript_output_line(&mut rendered, &summary);
     }
-    lines.extend(kept.into_iter().map(|(_, line)| line));
-    if lines.is_empty() {
+    for (_, line) in kept {
+        push_transcript_output_line(&mut rendered, &line);
+    }
+    if rendered.is_empty() {
         "No recent transcript entries fit the review budget.".to_string()
     } else {
-        lines.join("\n")
+        rendered
     }
+}
+
+fn push_transcript_output_line(out: &mut String, line: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(line);
 }
 
 /// Collapse pre-window transcript items into a single budgeted summary line.
@@ -550,15 +559,23 @@ fn format_transcript_line(
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
+    const TRUNCATED_SUFFIX: &str = " [truncated]";
+    const TRUNCATED_SUFFIX_CHARS: usize = 12;
+
+    let take_chars = max_chars.saturating_sub(TRUNCATED_SUFFIX_CHARS);
+    let mut cutoff = value.len();
+    for (count, (index, _)) in value.char_indices().enumerate() {
+        if count == take_chars {
+            cutoff = index;
+        }
+        if count == max_chars {
+            let mut output = String::with_capacity(cutoff + TRUNCATED_SUFFIX.len());
+            output.push_str(&value[..cutoff]);
+            output.push_str(TRUNCATED_SUFFIX);
+            return output;
+        }
     }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(12))
-        .collect::<String>();
-    output.push_str(" [truncated]");
-    output
+    value.to_string()
 }
 
 fn approx_tokens(value: &str) -> usize {

@@ -814,18 +814,19 @@ impl OpenAiCodexOAuthSource {
     }
 
     async fn refresh_now(&self) -> Result<String> {
-        let refresh_token = {
-            let guard = self.state.read().await;
-            guard.refresh_token.clone()
-        };
+        let mut guard = self.state.write().await;
+        // Re-check under the writer lock so concurrent callers queue
+        // behind the first refresh instead of all rotating the same
+        // refresh token.
+        if !guard.is_near_expiry(SystemTime::now()) {
+            return Ok(guard.access_token.clone());
+        }
+        let refresh_token = guard.refresh_token.clone();
         let new_token =
             refresh_codex_token(&self.http_client, &self.token_url, &refresh_token).await?;
         save_codex_token(&self.auth_path, &new_token)?;
         let access = new_token.access_token.clone();
-        {
-            let mut guard = self.state.write().await;
-            *guard = new_token;
-        }
+        *guard = new_token;
         Ok(access)
     }
 }

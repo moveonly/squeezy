@@ -351,25 +351,27 @@ pub(crate) fn strip_v_prefix(version: &str) -> &str {
 /// `Less / Equal / Greater` decision — so a hand-rolled parser keeps the
 /// dependency surface unchanged.
 pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> Vec<u64> {
+    fn core(version: &str) -> &str {
+        let version = strip_v_prefix(version);
         // Drop pre-release / build metadata. `1.2.3-rc1+sha` becomes `1.2.3`.
-        let core = s.split(['-', '+']).next().unwrap_or(s);
-        core.split('.')
-            .map(|piece| piece.parse::<u64>().unwrap_or(0))
-            .collect()
-    };
-    let a = parse(strip_v_prefix(a));
-    let b = parse(strip_v_prefix(b));
-    let len = a.len().max(b.len());
-    for i in 0..len {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
+        version.split(['-', '+']).next().unwrap_or(version)
+    }
+
+    let mut a = core(a).split('.');
+    let mut b = core(b).split('.');
+    loop {
+        let x = a.next();
+        let y = b.next();
+        if x.is_none() && y.is_none() {
+            return std::cmp::Ordering::Equal;
+        }
+        let x = x.and_then(|piece| piece.parse::<u64>().ok()).unwrap_or(0);
+        let y = y.and_then(|piece| piece.parse::<u64>().ok()).unwrap_or(0);
         match x.cmp(&y) {
             std::cmp::Ordering::Equal => continue,
             non_eq => return non_eq,
         }
     }
-    std::cmp::Ordering::Equal
 }
 
 #[cfg(test)]

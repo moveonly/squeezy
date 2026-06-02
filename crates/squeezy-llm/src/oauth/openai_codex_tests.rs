@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Barrier, oneshot};
 
 use super::*;
 use crate::credentials::ApiKeySource;
@@ -196,6 +196,38 @@ async fn spawn_token_server(
     (addr, rx)
 }
 
+async fn spawn_counting_token_server(
+    response_status: u16,
+    response_body: String,
+    response_delay: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                accepted = listener.accept() => {
+                    let (mut socket, _) = accepted.expect("accept");
+                    let response_body = response_body.clone();
+                    let server_count = server_count.clone();
+                    tokio::spawn(async move {
+                        server_count.fetch_add(1, Ordering::SeqCst);
+                        let _request = read_http_request(&mut socket).await;
+                        tokio::time::sleep(response_delay).await;
+                        write_http_response(&mut socket, response_status, &response_body).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            }
+        }
+    });
+    (addr, request_count, stop_tx)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_codex_token_round_trips_against_captive_endpoint() {
     let fresh_token = make_jwt_with_account("acct_refresh");
@@ -302,6 +334,69 @@ async fn oauth_source_refreshes_when_near_expiry() {
     let persisted = load_codex_token(&path).expect("load").expect("present");
     assert_eq!(persisted.access_token, rotated);
     assert_eq!(persisted.refresh_token, "rt-fresh");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_source_coalesces_concurrent_near_expiry_refreshes() {
+    let path = tmp_path("coalesce");
+    let initial = make_jwt_with_account("acct_initial");
+    let rotated = make_jwt_with_account("acct_rotated");
+    let token = OpenAiCodexTokenSet {
+        access_token: initial,
+        refresh_token: "rt-initial".to_string(),
+        expires_at_unix_ms: 1,
+        account_id: "acct_initial".to_string(),
+    };
+    save_codex_token(&path, &token).expect("save");
+
+    let response = json!({
+        "access_token": rotated.clone(),
+        "refresh_token": "rt-fresh",
+        "expires_in": 3600u64,
+    });
+    let (addr, request_count, stop_tx) =
+        spawn_counting_token_server(200, response.to_string(), Duration::from_millis(100)).await;
+    let token_url = format!("http://{addr}/oauth/token");
+    let source = Arc::new(OpenAiCodexOAuthSource::with_token_url(
+        token,
+        path.clone(),
+        token_url,
+    ));
+    let barrier = Arc::new(Barrier::new(3));
+
+    let first = {
+        let source = source.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            source.current_key().await
+        })
+    };
+    let second = {
+        let source = source.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            source.current_key().await
+        })
+    };
+    barrier.wait().await;
+
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first task").expect("first key");
+    let second = second.expect("second task").expect("second key");
+
+    assert_eq!(first, rotated);
+    assert_eq!(second, rotated);
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        1,
+        "concurrent current_key calls should share one refresh"
+    );
+    let persisted = load_codex_token(&path).expect("load").expect("present");
+    assert_eq!(persisted.access_token, rotated);
+    assert_eq!(persisted.refresh_token, "rt-fresh");
+    let _ = stop_tx.send(());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

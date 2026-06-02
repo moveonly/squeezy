@@ -186,6 +186,22 @@ fn markdown_colors_standalone_confidence_labels_in_prose() {
 }
 
 #[test]
+fn markdown_skips_embedded_confidence_label_before_valid_match() {
+    let lines = render_markdown("notexact_syntax is plain, but [exact_syntax] is a label.");
+    let spans: Vec<_> = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .filter(|span| span.content.as_ref() == "exact_syntax")
+        .collect();
+    assert_eq!(
+        spans.len(),
+        1,
+        "only the bracketed label should be split out"
+    );
+    assert_eq!(spans[0].style.fg, Some(crate::render::theme::green()));
+}
+
+#[test]
 fn markdown_renders_three_column_table_with_separators_and_divider() {
     let source = "\
 | Feature | Codex | Squeezy |

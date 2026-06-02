@@ -52,10 +52,9 @@ const EFFORT_BETA_HEADER: &str = "effort-2025-11-24";
 /// or sonnet-5-0 pick up adaptive without a code change. Haiku and any
 /// pre-4.6 model fall back to the explicit-budget form.
 pub(crate) fn model_uses_adaptive_thinking(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
     ["opus", "sonnet"]
         .iter()
-        .any(|family| extract_claude_version(&lower, family).is_some_and(|v| v >= (4, 6)))
+        .any(|family| extract_claude_version(model, family).is_some_and(|v| v >= (4, 6)))
 }
 
 fn extract_claude_version(model: &str, family: &str) -> Option<(u32, u32)> {
@@ -161,7 +160,7 @@ impl AnthropicProvider {
         let policy = CachePolicy::AUTO;
         let prompt_caching = should_apply_caching("anthropic", request);
         let retention = if prompt_caching {
-            request.effective_cache_spec().retention
+            request.effective_cache_retention()
         } else {
             CacheRetention::None
         };
@@ -258,17 +257,14 @@ impl AnthropicProvider {
             }
         }
         if !request.tools.is_empty() {
-            let mut tool_values: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    })
-                })
-                .collect();
+            let mut tool_values = Vec::with_capacity(request.tools.len());
+            for tool in request.tools.iter() {
+                tool_values.push(json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
+                }));
+            }
             if tools_marker {
                 json_markers::mark_last_stable_tool(&mut tool_values, retention);
             }
@@ -476,7 +472,7 @@ fn anthropic_messages(
     policy: CachePolicy,
     retention: CacheRetention,
 ) -> Value {
-    let mut messages = Vec::new();
+    let mut messages = Vec::with_capacity(input.len());
     for item in input {
         match item {
             LlmInputItem::UserText(text) => push_anthropic_message(
@@ -533,9 +529,9 @@ fn anthropic_messages(
                 })],
             ),
             LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
-                let blocks_json: Vec<Value> = blocks
-                    .iter()
-                    .map(|block| match block.kind {
+                let mut blocks_json = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    blocks_json.push(match block.kind {
                         AnthropicThinkingKind::Thinking => {
                             let mut obj = json!({
                                 "type": "thinking",
@@ -566,8 +562,8 @@ fn anthropic_messages(
                                 "data": data,
                             })
                         }
-                    })
-                    .collect();
+                    });
+                }
                 if !blocks_json.is_empty() {
                     push_anthropic_message(&mut messages, "assistant", blocks_json);
                 }
@@ -628,15 +624,20 @@ impl LlmProvider for AnthropicProvider {
             && model_uses_adaptive_thinking(&request.model)
             && crate::capabilities_for("anthropic", &request.model)
                 .is_some_and(|caps| caps.reasoning_effort);
-        let mut effective_betas: Vec<Arc<str>> = request.beta_headers.iter().cloned().collect();
-        if needs_effort_beta
-            && !effective_betas
+        let caller_beta_header = if needs_effort_beta {
+            let mut effective_betas: Vec<Arc<str>> =
+                Vec::with_capacity(request.beta_headers.len() + 1);
+            effective_betas.extend(request.beta_headers.iter().cloned());
+            if !effective_betas
                 .iter()
                 .any(|beta| beta.as_ref() == EFFORT_BETA_HEADER)
-        {
-            effective_betas.push(Arc::<str>::from(EFFORT_BETA_HEADER));
-        }
-        let caller_beta_header = anthropic_header_value(&effective_betas);
+            {
+                effective_betas.push(Arc::<str>::from(EFFORT_BETA_HEADER));
+            }
+            anthropic_header_value(&effective_betas)
+        } else {
+            anthropic_header_value(&request.beta_headers)
+        };
         let transport = self.transport;
         let request_for_attempts = request.clone();
 

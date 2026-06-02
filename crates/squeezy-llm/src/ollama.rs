@@ -530,8 +530,9 @@ impl LlmProvider for OllamaProvider {
 }
 
 fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
-    let mut messages = Vec::new();
-    if !instructions.trim().is_empty() {
+    let has_instructions = !instructions.trim().is_empty();
+    let mut messages = Vec::with_capacity(input.len() + usize::from(has_instructions));
+    if has_instructions {
         messages.push(json!({ "role": "system", "content": instructions }));
     }
     for item in input {
@@ -640,14 +641,21 @@ impl JsonLineDecoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>> {
         self.buffer.extend_from_slice(bytes);
         let mut lines = Vec::new();
-        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line = self.buffer.drain(..=index).collect::<Vec<_>>();
-            if let Ok(text) = String::from_utf8(line) {
-                let text = text.trim();
-                if !text.is_empty() {
-                    lines.push(text.to_string());
-                }
-            }
+        let mut consumed = 0usize;
+
+        while let Some(index) = self.buffer[consumed..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let line_end = consumed + index;
+            push_json_line(&self.buffer[consumed..line_end], &mut lines);
+            consumed = line_end + 1;
+        }
+
+        if consumed != 0 {
+            let remaining = self.buffer.len() - consumed;
+            self.buffer.copy_within(consumed.., 0);
+            self.buffer.truncate(remaining);
         }
         if self.buffer.len() > MAX_NDJSON_LINE_BYTES {
             return Err(SqueezyError::ProviderStream(format!(
@@ -662,12 +670,18 @@ impl JsonLineDecoder {
             return Vec::new();
         }
         let line = std::mem::take(&mut self.buffer);
-        String::from_utf8(line)
-            .ok()
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .into_iter()
-            .collect()
+        let mut lines = Vec::new();
+        push_json_line(&line, &mut lines);
+        lines
+    }
+}
+
+fn push_json_line(bytes: &[u8], lines: &mut Vec<String>) {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let text = text.trim();
+        if !text.is_empty() {
+            lines.push(text.to_string());
+        }
     }
 }
 

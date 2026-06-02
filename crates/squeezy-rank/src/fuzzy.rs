@@ -12,10 +12,14 @@
 /// - subtract `100` if the first matched character is at byte 0
 /// - subtract `25` if the entire match is contiguous (no gaps between chars)
 pub fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
-    if needle.is_empty() {
-        return Some(0);
-    }
     let needle_lower: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    fuzzy_score_with_lowercase_needle(haystack, &needle_lower)
+}
+
+pub(crate) fn fuzzy_score_with_lowercase_needle(
+    haystack: &str,
+    needle_lower: &[char],
+) -> Option<i32> {
     if needle_lower.is_empty() {
         return Some(0);
     }

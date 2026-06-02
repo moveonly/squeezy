@@ -1118,10 +1118,12 @@ fn hash_optional(hasher: &mut Sha256, value: Option<&str>) {
 }
 
 fn hex_digest(hasher: Sha256) -> String {
+    use std::fmt::Write as _;
+
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

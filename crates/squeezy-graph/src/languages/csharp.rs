@@ -9,22 +9,19 @@ impl SemanticGraph {
     }
 
     fn add_csharp_base_edges(&mut self) {
-        let symbols = self
+        let mut edges = Vec::new();
+        for symbol in self
             .symbols
             .values()
             .filter(|symbol| self.symbol_is_csharp_type(symbol))
-            .cloned()
-            .collect::<Vec<_>>();
-        for symbol in symbols {
-            let bases = symbol
+        {
+            for base in symbol
                 .attributes
                 .iter()
                 .filter_map(|attribute| attribute.strip_prefix("base:"))
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            for base in bases {
+            {
                 let candidates =
-                    self.csharp_type_candidates_for_name_in_file(&symbol.file_id, &base);
+                    self.csharp_type_candidates_for_name_in_file(&symbol.file_id, base);
                 let (to, confidence, edge_candidates) = match candidates.as_slice() {
                     [only] => (Some(only.clone()), Confidence::Heuristic, Vec::new()),
                     [] => (None, Confidence::External, Vec::new()),
@@ -49,10 +46,10 @@ impl SemanticGraph {
                         }
                     })
                     .unwrap_or(EdgeKind::Extends);
-                self.edges.push(GraphEdge {
+                edges.push(GraphEdge {
                     from: symbol.id.clone(),
                     to,
-                    target_text: base,
+                    target_text: base.to_string(),
                     kind,
                     span: Some(symbol.span),
                     confidence,
@@ -62,44 +59,50 @@ impl SemanticGraph {
                 });
             }
         }
+        self.edges.extend(edges);
     }
 
     fn add_csharp_partial_edges(&mut self) {
-        let mut groups: BTreeMap<String, Vec<GraphSymbol>> = BTreeMap::new();
-        for symbol in self.symbols.values() {
-            if !self.symbol_is_csharp_type(symbol)
-                || !symbol
-                    .attributes
-                    .iter()
-                    .any(|attribute| attribute == "csharp:partial")
-            {
-                continue;
+        let edges = {
+            let mut groups: BTreeMap<&str, Vec<&GraphSymbol>> = BTreeMap::new();
+            for symbol in self.symbols.values() {
+                if !self.symbol_is_csharp_type(symbol)
+                    || !symbol
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute == "csharp:partial")
+                {
+                    continue;
+                }
+                let Some(identity) = symbol.language_identity.as_deref() else {
+                    continue;
+                };
+                groups.entry(identity).or_default().push(symbol);
             }
-            let Some(identity) = symbol.language_identity.clone() else {
-                continue;
-            };
-            groups.entry(identity).or_default().push(symbol.clone());
-        }
-        for (_identity, mut symbols) in groups {
-            if symbols.len() < 2 {
-                continue;
+            let mut edges = Vec::new();
+            for (_identity, mut symbols) in groups {
+                if symbols.len() < 2 {
+                    continue;
+                }
+                symbols.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+                let canonical = symbols[0].id.clone();
+                for symbol in symbols.into_iter().skip(1) {
+                    edges.push(GraphEdge {
+                        from: symbol.id.clone(),
+                        to: Some(canonical.clone()),
+                        target_text: "partial".to_string(),
+                        kind: EdgeKind::PartialOf,
+                        span: Some(symbol.span),
+                        confidence: Confidence::ExactSyntax,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new("tree-sitter-c-sharp", "partial type identity"),
+                        candidates: Vec::new(),
+                    });
+                }
             }
-            symbols.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-            let canonical = symbols[0].id.clone();
-            for symbol in symbols.into_iter().skip(1) {
-                self.edges.push(GraphEdge {
-                    from: symbol.id,
-                    to: Some(canonical.clone()),
-                    target_text: "partial".to_string(),
-                    kind: EdgeKind::PartialOf,
-                    span: Some(symbol.span),
-                    confidence: Confidence::ExactSyntax,
-                    freshness: Freshness::Fresh,
-                    provenance: Provenance::new("tree-sitter-c-sharp", "partial type identity"),
-                    candidates: Vec::new(),
-                });
-            }
-        }
+            edges
+        };
+        self.edges.extend(edges);
     }
 
     fn symbol_is_csharp_type(&self, symbol: &GraphSymbol) -> bool {
@@ -152,9 +155,9 @@ pub(crate) fn csharp_import_matches_symbol(import: &ParsedImport, symbol: &Graph
         return false;
     };
     let full_type_path = identity.strip_prefix("T:").unwrap_or(identity);
-    let suffix = format!(".{}", symbol.name);
     let namespace = full_type_path
-        .strip_suffix(&suffix)
+        .strip_suffix(symbol.name.as_str())
+        .and_then(|prefix| prefix.strip_suffix('.'))
         .unwrap_or(full_type_path);
     import.path == namespace || import.path == full_type_path
 }
@@ -183,14 +186,17 @@ pub(crate) fn dotnet_source_root_facts(
 ) -> Vec<(&'static str, String, &'static str)> {
     let mut roots = BTreeSet::new();
     for path in csharp_paths {
+        let mut segments = path.split('/');
+        let first = segments.next().unwrap_or_default();
+        let second = segments.next();
+        let has_third = segments.next().is_some();
         let lower = path.to_ascii_lowercase();
-        let segments = path.split('/').collect::<Vec<_>>();
-        let root = if segments.len() >= 3 && matches!(segments[0], "src" | "test" | "tests") {
-            format!("{}/{}", segments[0], segments[1])
-        } else if segments.len() >= 2
-            && (lower.contains("/test") || matches!(segments[0], "src" | "test" | "tests"))
+        let root = if has_third && matches!(first, "src" | "test" | "tests") {
+            format!("{}/{}", first, second.unwrap_or_default())
+        } else if second.is_some()
+            && (lower.contains("/test") || matches!(first, "src" | "test" | "tests"))
         {
-            segments[0].to_string()
+            first.to_string()
         } else {
             continue;
         };

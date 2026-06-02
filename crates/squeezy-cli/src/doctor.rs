@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
 
 use clap::Args;
 use serde_json::json;
@@ -57,13 +57,14 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn print(&self) {
+        let (warnings, failures) = check_counts(&self.checks);
         if self.json {
             let body = json!({
                 "version": self.version,
                 "target": self.target,
-                "ok": self.checks.iter().all(|c| c.status != Status::Fail),
-                "warnings": self.checks.iter().filter(|c| c.status == Status::Warn).count(),
-                "failures": self.checks.iter().filter(|c| c.status == Status::Fail).count(),
+                "ok": failures == 0,
+                "warnings": warnings,
+                "failures": failures,
                 "checks": self.checks.iter().map(|c| json!({
                     "name": c.name,
                     "status": c.status.as_str(),
@@ -78,7 +79,7 @@ impl DoctorReport {
         }
         let header = if self.exit_code != 0 {
             "squeezy: fail"
-        } else if self.checks.iter().any(|c| c.status == Status::Warn) {
+        } else if warnings > 0 {
             "squeezy: ok (warnings)"
         } else {
             "squeezy: ok"
@@ -102,6 +103,16 @@ impl DoctorReport {
             );
         }
     }
+}
+
+fn check_counts(checks: &[Check]) -> (usize, usize) {
+    checks
+        .iter()
+        .fold((0, 0), |(warnings, failures), check| match check.status {
+            Status::Warn => (warnings + 1, failures),
+            Status::Fail => (warnings, failures + 1),
+            Status::Ok => (warnings, failures),
+        })
 }
 
 pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
@@ -178,7 +189,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     // environments where keys are absent and still need the binary to come up
     // green. Only hard failures (config load broken, session store unwritable)
     // produce a non-zero exit, matching the old `--health` contract.
-    let failures = checks.iter().filter(|c| c.status == Status::Fail).count();
+    let (_, failures) = check_counts(&checks);
     let exit_code = if failures > 0 { 1 } else { 0 };
 
     Ok(DoctorReport {
@@ -329,14 +340,17 @@ fn providers_check(settings: &SettingsFile) -> Check {
             detail: "no [providers.*] sections in settings.toml".to_string(),
         };
     };
-    let mut entries = Vec::new();
+    let mut detail = String::new();
     let mut missing = 0usize;
     for (name, settings) in providers {
         let state = provider_settings_state(name, settings);
         if state.starts_with("missing") {
             missing += 1;
         }
-        entries.push(format!("{name}={state}"));
+        if !detail.is_empty() {
+            detail.push_str(", ");
+        }
+        let _ = write!(detail, "{name}={state}");
     }
     let status = if missing > 0 {
         Status::Warn
@@ -346,7 +360,7 @@ fn providers_check(settings: &SettingsFile) -> Check {
     Check {
         name: "providers".to_string(),
         status,
-        detail: entries.join(", "),
+        detail,
     }
 }
 
@@ -384,7 +398,7 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
     }
     let mut enabled = 0usize;
     let mut disabled = 0usize;
-    let mut issues = Vec::new();
+    let mut issues = String::new();
     for (name, server) in servers {
         if !server.enabled {
             disabled += 1;
@@ -400,7 +414,10 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
                     .unwrap_or("")
                     .is_empty()
                 {
-                    issues.push(format!("{name}: stdio transport without command"));
+                    if !issues.is_empty() {
+                        issues.push_str(", ");
+                    }
+                    let _ = write!(issues, "{name}: stdio transport without command");
                 }
             }
             McpTransport::Http | McpTransport::Sse => {
@@ -411,10 +428,14 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
                     .unwrap_or("")
                     .is_empty()
                 {
-                    issues.push(format!(
+                    if !issues.is_empty() {
+                        issues.push_str(", ");
+                    }
+                    let _ = write!(
+                        issues,
                         "{name}: {} transport without url",
                         server.transport.as_str()
-                    ));
+                    );
                 }
             }
         }
@@ -430,7 +451,7 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
         Check {
             name: "mcp".to_string(),
             status: Status::Warn,
-            detail: format!("{summary}; {}", issues.join(", ")),
+            detail: format!("{summary}; {issues}"),
         }
     }
 }

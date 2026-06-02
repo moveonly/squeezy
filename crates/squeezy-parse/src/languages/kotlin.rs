@@ -1012,19 +1012,14 @@ pub(crate) fn extract_kotlin_call_expression(
     let (name, receiver, call_kind) = match callee.kind() {
         "navigation_expression" => {
             // Receiver is the first child; method name is the last `identifier`.
-            let mut cursor = callee.walk();
-            let children = callee.named_children(&mut cursor).collect::<Vec<_>>();
-            let method = children
-                .iter()
-                .rev()
-                .find(|child| child.kind() == "identifier")
-                .and_then(|child| node_text(*child, ctx.source).ok())
+            let (first_child, last_identifier) = kotlin_first_child_and_last_identifier(callee);
+            let method = last_identifier
+                .and_then(|child| node_text(child, ctx.source).ok())
                 .map(|text| text.trim().to_string())
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| method_name_from_text(&raw));
-            let receiver = children
-                .first()
-                .and_then(|child| node_text(*child, ctx.source).ok())
+            let receiver = first_child
+                .and_then(|child| node_text(child, ctx.source).ok())
                 .map(|text| text.trim().to_string())
                 .filter(|text| !text.is_empty());
             (method, receiver, ParsedCallKind::Method)
@@ -1272,19 +1267,14 @@ fn kotlin_navigation_call_summary(
     node: Node<'_>,
     source: &str,
 ) -> (String, Option<String>, ParsedCallKind) {
-    let mut cursor = node.walk();
-    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-    let method = children
-        .iter()
-        .rev()
-        .find(|child| child.kind() == "identifier")
-        .and_then(|child| node_text(*child, source).ok())
+    let (first_child, last_identifier) = kotlin_first_child_and_last_identifier(node);
+    let method = last_identifier
+        .and_then(|child| node_text(child, source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
         .unwrap_or_default();
-    let receiver = children
-        .first()
-        .and_then(|child| node_text(*child, source).ok())
+    let receiver = first_child
+        .and_then(|child| node_text(child, source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
     (method, receiver, ParsedCallKind::Method)
@@ -1309,16 +1299,11 @@ pub(crate) fn extract_kotlin_navigation_expression(
         return;
     }
 
-    let mut cursor = node.walk();
-    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-    let Some(last_id) = children
-        .iter()
-        .rev()
-        .find(|child| child.kind() == "identifier")
-    else {
+    let (first_child, last_identifier) = kotlin_first_child_and_last_identifier(node);
+    let Some(last_id) = last_identifier else {
         return;
     };
-    let field_text = node_text(*last_id, ctx.source)
+    let field_text = node_text(last_id, ctx.source)
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -1328,7 +1313,7 @@ pub(crate) fn extract_kotlin_navigation_expression(
             owner_id: owner_id.clone(),
             text: field_text.clone(),
             kind: ReferenceKind::Field,
-            span: span_from_node(*last_id),
+            span: span_from_node(last_id),
             provenance: Provenance::new("tree-sitter-kotlin", "navigation_expression field"),
         });
     }
@@ -1337,10 +1322,10 @@ pub(crate) fn extract_kotlin_navigation_expression(
     // capitalised identifier (object, companion, class name); a lowercase
     // receiver is almost always a property/local and would dominate the
     // reference list.
-    if let Some(first_child) = children.first()
+    if let Some(first_child) = first_child
         && first_child.kind() == "identifier"
     {
-        let receiver_text = node_text(*first_child, ctx.source)
+        let receiver_text = node_text(first_child, ctx.source)
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -1353,7 +1338,7 @@ pub(crate) fn extract_kotlin_navigation_expression(
                 owner_id: owner_id.clone(),
                 text: receiver_text,
                 kind: ReferenceKind::Type,
-                span: span_from_node(*first_child),
+                span: span_from_node(first_child),
                 provenance: Provenance::new("tree-sitter-kotlin", "navigation_expression receiver"),
             });
         }
@@ -1811,17 +1796,16 @@ fn kotlin_property_is_var(node: Node<'_>, _source: &str) -> bool {
 /// `Partial` confidence per spec §4(c).
 fn kotlin_extension_receiver(node: Node<'_>, source: &str) -> (Option<String>, bool) {
     let mut cursor = node.walk();
-    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
     // Find the function name (first `identifier` after optional modifiers
     // and type-parameter blocks). If a `user_type` / `nullable_type` appears
     // *before* the name and *after* the modifiers/type-parameters block,
     // it's the extension receiver.
     let mut receiver_type: Option<Node<'_>> = None;
-    for child in &children {
+    for child in node.named_children(&mut cursor) {
         match child.kind() {
             "modifiers" | "type_modifiers" | "type_parameters" => continue,
             "user_type" | "nullable_type" | "parenthesized_type" => {
-                receiver_type = Some(*child);
+                receiver_type = Some(child);
                 continue;
             }
             "identifier" => break,
@@ -1892,8 +1876,7 @@ fn kotlin_user_type_is_extension_receiver(parent: Node<'_>, idx: usize) -> bool 
         return false;
     }
     let mut cursor = parent.walk();
-    let children = parent.named_children(&mut cursor).collect::<Vec<_>>();
-    for (i, child) in children.iter().enumerate() {
+    for (i, child) in parent.named_children(&mut cursor).enumerate() {
         if i == idx {
             return child.kind() == "user_type";
         }
@@ -1908,6 +1891,23 @@ fn kotlin_user_type_is_extension_receiver(parent: Node<'_>, idx: usize) -> bool 
         }
     }
     false
+}
+
+fn kotlin_first_child_and_last_identifier<'tree>(
+    node: Node<'tree>,
+) -> (Option<Node<'tree>>, Option<Node<'tree>>) {
+    let mut cursor = node.walk();
+    let mut first_child = None;
+    let mut last_identifier = None;
+    for child in node.named_children(&mut cursor) {
+        if first_child.is_none() {
+            first_child = Some(child);
+        }
+        if child.kind() == "identifier" {
+            last_identifier = Some(child);
+        }
+    }
+    (first_child, last_identifier)
 }
 
 fn kotlin_parameter_count(node: Node<'_>) -> usize {

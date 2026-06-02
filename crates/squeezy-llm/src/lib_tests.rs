@@ -108,6 +108,34 @@ fn registry_lists_ollama_as_zero_cost_local_provider() {
 }
 
 #[test]
+fn effective_cache_helpers_match_legacy_bridge_rules() {
+    let mut request = LlmRequest::user_text(
+        "gpt-5.1".to_string(),
+        "system".to_string(),
+        "hello".to_string(),
+        None,
+    );
+
+    assert_eq!(request.effective_cache_key(), None);
+    assert_eq!(request.effective_cache_retention(), CacheRetention::None);
+
+    request.cache_key = Some("legacy-session".to_string());
+    assert_eq!(request.effective_cache_key(), Some("legacy-session"));
+    assert_eq!(request.effective_cache_retention(), CacheRetention::Short);
+
+    request.cache = CacheSpec {
+        key: Some("explicit-session".to_string()),
+        retention: CacheRetention::Long,
+    };
+    assert_eq!(request.effective_cache_key(), Some("explicit-session"));
+    assert_eq!(request.effective_cache_retention(), CacheRetention::Long);
+
+    let spec = request.effective_cache_spec();
+    assert_eq!(spec.key.as_deref(), Some("explicit-session"));
+    assert_eq!(spec.retention, CacheRetention::Long);
+}
+
+#[test]
 fn registry_lists_context_limits_for_hosted_defaults() {
     let openai = model_info_for("openai", squeezy_core::DEFAULT_OPENAI_MODEL).expect("openai");
     assert_eq!(openai.limits.unwrap().context_window_tokens, 400_000);

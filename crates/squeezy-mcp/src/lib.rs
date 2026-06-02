@@ -425,6 +425,10 @@ impl McpClientRegistry {
         }
 
         let mut next = normalize_palette(raw_tools);
+        let mut cached_tool_counts = BTreeMap::<String, usize>::new();
+        for tool in prior_cache.values() {
+            *cached_tool_counts.entry(tool.server.clone()).or_default() += 1;
+        }
 
         for (model_name, tool) in &prior_cache {
             let server_still_enabled = self
@@ -440,10 +444,10 @@ impl McpClientRegistry {
                 per_server
                     .entry(tool.server.clone())
                     .or_insert(McpServerStatus::Ready {
-                        tools_count: prior_cache
-                            .values()
-                            .filter(|cached| cached.server == tool.server)
-                            .count(),
+                        tools_count: cached_tool_counts
+                            .get(&tool.server)
+                            .copied()
+                            .unwrap_or_default(),
                         cached: true,
                     });
             }
@@ -575,7 +579,7 @@ impl McpClientRegistry {
                     .session_for(&server_name_owned, &server_for_call)
                     .await?;
                 let response = service
-                    .read_resource(ReadResourceRequestParams::new(uri_owned.clone()))
+                    .read_resource(ReadResourceRequestParams::new(uri_owned))
                     .await
                     .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
                 serde_json::to_value(response).map_err(|err| McpError::Transport {
@@ -621,12 +625,12 @@ impl McpClientRegistry {
                     .list_all_tools()
                     .await
                     .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
-                Ok((server_name_owned, tools))
+                Ok(tools)
             },
         )
         .await;
         match result {
-            Ok((_, tools)) => Ok(convert_tools(server_name, server, tools)),
+            Ok(tools) => Ok(convert_tools(server_name, server, tools)),
             Err(error) => {
                 self.invalidate_session(server_name).await;
                 Err(error)
@@ -691,8 +695,7 @@ impl McpClientRegistry {
                     .await?;
                 let response = service
                     .call_tool(
-                        CallToolRequestParams::new(tool_name_owned.clone())
-                            .with_arguments(arguments),
+                        CallToolRequestParams::new(tool_name_owned).with_arguments(arguments),
                     )
                     .await
                     .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
@@ -1510,7 +1513,9 @@ where
     });
 
     let mut custom_headers: std::collections::HashMap<HeaderName, HeaderValue> =
-        std::collections::HashMap::new();
+        std::collections::HashMap::with_capacity(
+            server.http_headers.len() + server.env_http_headers.len(),
+        );
     for (name, value) in &server.http_headers {
         match (
             HeaderName::try_from(name.as_str()),
@@ -1637,39 +1642,44 @@ fn convert_tools(
     server: &McpServerConfig,
     tools: Vec<RmcpTool>,
 ) -> Vec<ExternalMcpTool> {
-    tools
-        .into_iter()
-        .filter(|tool| tool_allowed(server, &tool.name))
-        .map(|tool| {
-            let raw_name = tool.name.to_string();
-            let description = tool
-                .description
-                .as_ref()
-                .map(|description| description.to_string())
-                .unwrap_or_else(|| format!("MCP tool {server_name}/{raw_name}"));
-            let raw_parameters = schema_object(tool.schema_as_json_value());
-            let (parameters, stats) = compact_tool_schema(&raw_parameters, MAX_TOOL_SCHEMA_BYTES);
-            if stats.compacted_bytes < stats.original_bytes {
-                tracing::debug!(
-                    target: "squeezy::mcp",
-                    server = %server_name,
-                    tool = %raw_name,
-                    original_bytes = stats.original_bytes,
-                    compacted_bytes = stats.compacted_bytes,
-                    ratio = stats.ratio,
-                    "compacted MCP tool schema"
-                );
-            }
-            ExternalMcpTool {
-                server: server_name.to_string(),
-                raw_name: raw_name.clone(),
-                model_name: external_tool_name(server_name, &raw_name),
-                description,
-                parameters,
-                transport: server.transport,
-            }
-        })
-        .collect()
+    let mut model_name_prefix = None;
+    let mut converted = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if !tool_allowed(server, &tool.name) {
+            continue;
+        }
+        let raw_name = tool.name.to_string();
+        let description = tool
+            .description
+            .as_ref()
+            .map(|description| description.to_string())
+            .unwrap_or_else(|| format!("MCP tool {server_name}/{raw_name}"));
+        let raw_parameters = schema_object(tool.schema_as_json_value());
+        let (parameters, stats) = compact_tool_schema(&raw_parameters, MAX_TOOL_SCHEMA_BYTES);
+        if stats.compacted_bytes < stats.original_bytes {
+            tracing::debug!(
+                target: "squeezy::mcp",
+                server = %server_name,
+                tool = %raw_name,
+                original_bytes = stats.original_bytes,
+                compacted_bytes = stats.compacted_bytes,
+                ratio = stats.ratio,
+                "compacted MCP tool schema"
+            );
+        }
+        let prefix =
+            model_name_prefix.get_or_insert_with(|| external_tool_name_prefix(server_name));
+        let model_name = external_tool_name_with_prefix(prefix, &raw_name);
+        converted.push(ExternalMcpTool {
+            server: server_name.to_string(),
+            raw_name,
+            model_name,
+            description,
+            parameters,
+            transport: server.transport,
+        });
+    }
+    converted
 }
 
 fn tool_allowed(server: &McpServerConfig, raw_name: &str) -> bool {
@@ -1759,7 +1769,7 @@ fn prune_unreachable_defs(mut value: Value) -> Value {
         None => return value,
     };
     for key in ["$defs", "definitions"] {
-        let Some(Value::Object(defs)) = object.get(key).cloned() else {
+        let Some(defs) = object.get(key).and_then(Value::as_object) else {
             continue;
         };
         if defs.is_empty() {
@@ -1767,10 +1777,13 @@ fn prune_unreachable_defs(mut value: Value) -> Value {
             continue;
         }
         // Build the set of refs that appear OUTSIDE the defs block itself.
-        let mut probe = object.clone();
-        probe.remove(key);
+        let prefix = ref_prefix(key);
         let mut referenced = BTreeSet::new();
-        collect_refs(&Value::Object(probe), key, &mut referenced);
+        collect_refs_outside_key(object, key, &prefix, &mut referenced);
+        let Some(defs) = object.get_mut(key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let defs = std::mem::take(defs);
         // Walk over def bodies too — a referenced def may itself ref another def.
         let mut frontier: Vec<String> = referenced.iter().cloned().collect();
         while let Some(name) = frontier.pop() {
@@ -1778,7 +1791,7 @@ fn prune_unreachable_defs(mut value: Value) -> Value {
                 continue;
             };
             let mut nested = BTreeSet::new();
-            collect_refs(body, key, &mut nested);
+            collect_refs_with_prefix(body, &prefix, &mut nested);
             for next in nested {
                 if referenced.insert(next.clone()) {
                     frontier.push(next);
@@ -1791,34 +1804,56 @@ fn prune_unreachable_defs(mut value: Value) -> Value {
             .collect();
         if kept.is_empty() {
             object.remove(key);
-        } else {
-            object.insert(key.to_string(), Value::Object(kept));
+        } else if let Some(defs) = object.get_mut(key) {
+            *defs = Value::Object(kept);
         }
     }
     value
 }
 
-fn collect_refs(value: &Value, defs_key: &str, out: &mut BTreeSet<String>) {
-    let prefix = format!("#/{defs_key}/");
+fn collect_refs_outside_key(
+    object: &serde_json::Map<String, Value>,
+    skip_key: &str,
+    prefix: &str,
+    out: &mut BTreeSet<String>,
+) {
+    for (key, child) in object {
+        if key != skip_key {
+            collect_ref_field(key, child, prefix, out);
+            collect_refs_with_prefix(child, prefix, out);
+        }
+    }
+}
+
+fn collect_refs_with_prefix(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                if key == "$ref"
-                    && let Some(text) = child.as_str()
-                    && let Some(name) = text.strip_prefix(&prefix)
-                {
-                    out.insert(name.to_string());
-                }
-                collect_refs(child, defs_key, out);
+                collect_ref_field(key, child, prefix, out);
+                collect_refs_with_prefix(child, prefix, out);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_refs(item, defs_key, out);
+                collect_refs_with_prefix(item, prefix, out);
             }
         }
         _ => {}
     }
+}
+
+fn collect_ref_field(key: &str, child: &Value, prefix: &str, out: &mut BTreeSet<String>) {
+    if key == "$ref"
+        && let Some(text) = child.as_str()
+        && let Some(name) = text.strip_prefix(prefix)
+        && !out.contains(name)
+    {
+        out.insert(name.to_string());
+    }
+}
+
+fn ref_prefix(defs_key: &str) -> String {
+    format!("#/{defs_key}/")
 }
 
 fn arguments_object(tool: &str, arguments: Value) -> McpResult<JsonObject> {
@@ -1831,12 +1866,21 @@ fn arguments_object(tool: &str, arguments: Value) -> McpResult<JsonObject> {
     }
 }
 
+#[cfg(test)]
 fn external_tool_name(server: &str, tool: &str) -> String {
-    format!("mcp__{}__{}", sanitize_name(server), sanitize_name(tool))
+    external_tool_name_with_prefix(&external_tool_name_prefix(server), tool)
+}
+
+fn external_tool_name_prefix(server: &str) -> String {
+    format!("mcp__{}__", sanitize_name(server))
+}
+
+fn external_tool_name_with_prefix(prefix: &str, tool: &str) -> String {
+    format!("{prefix}{}", sanitize_name(tool))
 }
 
 fn sanitize_name(value: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
@@ -1844,11 +1888,13 @@ fn sanitize_name(value: &str) -> String {
             out.push('_');
         }
     }
-    let out = out.trim_matches('_').to_string();
-    if out.is_empty() {
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
         "tool".to_string()
-    } else {
+    } else if trimmed.len() == out.len() {
         out
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1867,33 +1913,55 @@ fn normalize_palette(tools: Vec<ExternalMcpTool>) -> BTreeMap<String, ExternalMc
     }
     let mut next = BTreeMap::new();
     for mut tool in tools {
-        let raw_identity = format!("{}\0{}", tool.server, tool.raw_name);
-        let base = tool.model_name.clone();
-        let collides = by_base.get(&base).copied().unwrap_or_default() > 1;
-        tool.model_name = fit_model_name(&base, &raw_identity, collides || base.len() > 64);
-        let mut attempt = 0u32;
-        while next.contains_key(&tool.model_name) {
-            attempt = attempt.saturating_add(1);
-            tool.model_name = fit_model_name(&base, &format!("{raw_identity}\0{attempt}"), true);
+        let force_hash = by_base
+            .get(tool.model_name.as_str())
+            .copied()
+            .unwrap_or_default()
+            > 1
+            || tool.model_name.len() > MAX_MODEL_TOOL_NAME_BYTES;
+        if force_hash || next.contains_key(tool.model_name.as_str()) {
+            ensure_unique_model_name(&mut tool, &next, force_hash);
         }
         next.insert(tool.model_name.clone(), tool);
     }
     next
 }
 
+fn ensure_unique_model_name(
+    tool: &mut ExternalMcpTool,
+    existing: &BTreeMap<String, ExternalMcpTool>,
+    force_initial_hash: bool,
+) {
+    let base = tool.model_name.clone();
+    let raw_identity = format!("{}\0{}", tool.server, tool.raw_name);
+    if force_initial_hash {
+        tool.model_name = fit_model_name(&base, &raw_identity, true);
+    }
+    let mut attempt = 0u32;
+    while existing.contains_key(tool.model_name.as_str()) {
+        attempt = attempt.saturating_add(1);
+        tool.model_name = fit_model_name(&base, &format!("{raw_identity}\0{attempt}"), true);
+    }
+}
+
 fn fit_model_name(base: &str, raw_identity: &str, force_hash: bool) -> String {
     if !force_hash && base.len() <= MAX_MODEL_TOOL_NAME_BYTES {
         return base.to_string();
     }
-    let suffix = format!(
-        "_{}",
-        &sha256_hex(raw_identity.as_bytes())[..HASH_SUFFIX_BYTES]
-    );
-    let max_prefix = MAX_MODEL_TOOL_NAME_BYTES.saturating_sub(suffix.len());
-    format!("{}{}", truncate_ascii(base, max_prefix), suffix)
+    let hash = sha256_hex_prefix(raw_identity.as_bytes(), HASH_SUFFIX_BYTES);
+    let max_prefix = MAX_MODEL_TOOL_NAME_BYTES.saturating_sub(1 + hash.len());
+    let prefix = truncate_ascii(base, max_prefix);
+    let mut out = String::with_capacity(prefix.len() + 1 + hash.len());
+    out.push_str(&prefix);
+    out.push('_');
+    out.push_str(&hash);
+    out
 }
 
 fn truncate_ascii(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
     value.chars().take(max_bytes).collect()
 }
 
@@ -1917,19 +1985,16 @@ fn strip_untrusted_meta(mut value: Value) -> Value {
 }
 
 fn service_error_to_mcp(server: &str, err: rmcp::ServiceError) -> McpError {
-    if service_error_is_session_expired(&err) {
+    let message = err.to_string();
+    if message.contains("Session expired (HTTP 404)") {
         return McpError::SessionExpired {
             server: server.to_string(),
         };
     }
     McpError::Transport {
         server: server.to_string(),
-        message: err.to_string(),
+        message,
     }
-}
-
-fn service_error_is_session_expired(err: &rmcp::ServiceError) -> bool {
-    err.to_string().contains("Session expired (HTTP 404)")
 }
 
 fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool {
@@ -2053,11 +2118,26 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
 }
 
 fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+
     let digest = Sha256::digest(bytes.as_ref());
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
     }
+    output
+}
+
+fn sha256_hex_prefix(bytes: impl AsRef<[u8]>, max_hex_chars: usize) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes.as_ref());
+    let digest_bytes = max_hex_chars.div_ceil(2).min(digest.len());
+    let mut output = String::with_capacity(digest_bytes * 2);
+    for &byte in digest.iter().take(digest_bytes) {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output.truncate(max_hex_chars);
     output
 }
 

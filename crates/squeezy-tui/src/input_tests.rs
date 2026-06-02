@@ -264,6 +264,24 @@ fn slash_suggestions_returns_no_matches_for_unrelated_input() {
 }
 
 #[test]
+fn slash_suggestion_count_matches_full_suggestions() {
+    for input in ["/", "/co", "please /", "please /att", "/zzz"] {
+        assert_eq!(
+            slash_suggestion_count_at(input, input.len(), true),
+            slash_suggestions(input).len(),
+            "{input:?}"
+        );
+    }
+
+    let checkpoint_disabled_count = slash_suggestion_count_at("/", 1, false);
+    let filtered_count = slash_suggestions("/")
+        .into_iter()
+        .filter(|cmd| cmd.visible_with_checkpoints(false))
+        .count();
+    assert_eq!(checkpoint_disabled_count, filtered_count);
+}
+
+#[test]
 fn slash_suggestions_mid_prompt_only_show_inline_commands() {
     let names = slash_suggestions("please /")
         .into_iter()
@@ -305,4 +323,22 @@ fn slash_command_ranges_highlight_inline_commands_only() {
     );
     assert!(slash_command_ranges("please /cost").is_empty());
     assert_eq!(slash_command_ranges("/cost"), vec![(0, 5)]);
+}
+
+#[test]
+fn inline_slash_scan_continues_past_unusable_commands() {
+    let input = "please /cost then /attach Cargo.toml";
+    let attach_start = input.find("/attach").expect("fixture");
+    assert_eq!(
+        find_inline_slash_dispatch_command(input).map(|occurrence| (
+            occurrence.start,
+            occurrence.end,
+            occurrence.command.name
+        )),
+        Some((attach_start, attach_start + "/attach".len(), "/attach"))
+    );
+    assert_eq!(
+        slash_command_ranges(input),
+        vec![(attach_start, attach_start + "/attach".len())]
+    );
 }

@@ -165,100 +165,120 @@ fn color_name(c: Color) -> Option<String> {
 }
 
 fn push_ansi(out: &mut String, style: &Style, text: &str) {
-    let mut codes: Vec<String> = Vec::new();
+    let sgr_start = out.len();
+    out.push_str("\x1b[");
+    let mut wrote_code = false;
     if let Some(c) = style.fg {
-        codes.extend(fg_codes(c));
+        push_fg_codes(out, c, &mut wrote_code);
     }
     if let Some(c) = style.bg {
-        codes.extend(bg_codes(c));
+        push_bg_codes(out, c, &mut wrote_code);
     }
     let mods = style.add_modifier;
     if mods.contains(Modifier::BOLD) {
-        codes.push("1".into());
+        push_sgr_code(out, &mut wrote_code, "1");
     }
     if mods.contains(Modifier::DIM) {
-        codes.push("2".into());
+        push_sgr_code(out, &mut wrote_code, "2");
     }
     if mods.contains(Modifier::ITALIC) {
-        codes.push("3".into());
+        push_sgr_code(out, &mut wrote_code, "3");
     }
     if mods.contains(Modifier::UNDERLINED) {
-        codes.push("4".into());
+        push_sgr_code(out, &mut wrote_code, "4");
     }
     if mods.contains(Modifier::REVERSED) {
-        codes.push("7".into());
+        push_sgr_code(out, &mut wrote_code, "7");
     }
     if mods.contains(Modifier::CROSSED_OUT) {
-        codes.push("9".into());
+        push_sgr_code(out, &mut wrote_code, "9");
     }
-    if !codes.is_empty() {
-        out.push_str("\x1b[");
-        out.push_str(&codes.join(";"));
+    if wrote_code {
         out.push('m');
+    } else {
+        out.truncate(sgr_start);
     }
     out.push_str(text);
-    if !codes.is_empty() {
+    if wrote_code {
         out.push_str("\x1b[0m");
     }
 }
 
-fn fg_codes(c: Color) -> Vec<String> {
+fn push_sgr_code(out: &mut String, wrote_code: &mut bool, code: impl std::fmt::Display) {
+    use std::fmt::Write as _;
+    if *wrote_code {
+        out.push(';');
+    } else {
+        *wrote_code = true;
+    }
+    let _ = write!(out, "{code}");
+}
+
+fn push_fg_codes(out: &mut String, c: Color, wrote_code: &mut bool) {
     match c {
-        Color::Reset => vec!["39".into()],
-        Color::Black => vec!["30".into()],
-        Color::Red => vec!["31".into()],
-        Color::Green => vec!["32".into()],
-        Color::Yellow => vec!["33".into()],
-        Color::Blue => vec!["34".into()],
-        Color::Magenta => vec!["35".into()],
-        Color::Cyan => vec!["36".into()],
-        Color::Gray => vec!["37".into()],
-        Color::DarkGray => vec!["90".into()],
-        Color::LightRed => vec!["91".into()],
-        Color::LightGreen => vec!["92".into()],
-        Color::LightYellow => vec!["93".into()],
-        Color::LightBlue => vec!["94".into()],
-        Color::LightMagenta => vec!["95".into()],
-        Color::LightCyan => vec!["96".into()],
-        Color::White => vec!["97".into()],
-        Color::Rgb(r, g, b) => vec![
-            "38".into(),
-            "2".into(),
-            r.to_string(),
-            g.to_string(),
-            b.to_string(),
-        ],
-        Color::Indexed(i) => vec!["38".into(), "5".into(), i.to_string()],
+        Color::Reset => push_sgr_code(out, wrote_code, "39"),
+        Color::Black => push_sgr_code(out, wrote_code, "30"),
+        Color::Red => push_sgr_code(out, wrote_code, "31"),
+        Color::Green => push_sgr_code(out, wrote_code, "32"),
+        Color::Yellow => push_sgr_code(out, wrote_code, "33"),
+        Color::Blue => push_sgr_code(out, wrote_code, "34"),
+        Color::Magenta => push_sgr_code(out, wrote_code, "35"),
+        Color::Cyan => push_sgr_code(out, wrote_code, "36"),
+        Color::Gray => push_sgr_code(out, wrote_code, "37"),
+        Color::DarkGray => push_sgr_code(out, wrote_code, "90"),
+        Color::LightRed => push_sgr_code(out, wrote_code, "91"),
+        Color::LightGreen => push_sgr_code(out, wrote_code, "92"),
+        Color::LightYellow => push_sgr_code(out, wrote_code, "93"),
+        Color::LightBlue => push_sgr_code(out, wrote_code, "94"),
+        Color::LightMagenta => push_sgr_code(out, wrote_code, "95"),
+        Color::LightCyan => push_sgr_code(out, wrote_code, "96"),
+        Color::White => push_sgr_code(out, wrote_code, "97"),
+        Color::Rgb(r, g, b) => {
+            push_sgr_code(out, wrote_code, "38");
+            push_sgr_code(out, wrote_code, "2");
+            push_sgr_code(out, wrote_code, r);
+            push_sgr_code(out, wrote_code, g);
+            push_sgr_code(out, wrote_code, b);
+        }
+        Color::Indexed(i) => {
+            push_sgr_code(out, wrote_code, "38");
+            push_sgr_code(out, wrote_code, "5");
+            push_sgr_code(out, wrote_code, i);
+        }
     }
 }
 
-fn bg_codes(c: Color) -> Vec<String> {
+fn push_bg_codes(out: &mut String, c: Color, wrote_code: &mut bool) {
     match c {
-        Color::Reset => vec!["49".into()],
-        Color::Black => vec!["40".into()],
-        Color::Red => vec!["41".into()],
-        Color::Green => vec!["42".into()],
-        Color::Yellow => vec!["43".into()],
-        Color::Blue => vec!["44".into()],
-        Color::Magenta => vec!["45".into()],
-        Color::Cyan => vec!["46".into()],
-        Color::Gray => vec!["47".into()],
-        Color::DarkGray => vec!["100".into()],
-        Color::LightRed => vec!["101".into()],
-        Color::LightGreen => vec!["102".into()],
-        Color::LightYellow => vec!["103".into()],
-        Color::LightBlue => vec!["104".into()],
-        Color::LightMagenta => vec!["105".into()],
-        Color::LightCyan => vec!["106".into()],
-        Color::White => vec!["107".into()],
-        Color::Rgb(r, g, b) => vec![
-            "48".into(),
-            "2".into(),
-            r.to_string(),
-            g.to_string(),
-            b.to_string(),
-        ],
-        Color::Indexed(i) => vec!["48".into(), "5".into(), i.to_string()],
+        Color::Reset => push_sgr_code(out, wrote_code, "49"),
+        Color::Black => push_sgr_code(out, wrote_code, "40"),
+        Color::Red => push_sgr_code(out, wrote_code, "41"),
+        Color::Green => push_sgr_code(out, wrote_code, "42"),
+        Color::Yellow => push_sgr_code(out, wrote_code, "43"),
+        Color::Blue => push_sgr_code(out, wrote_code, "44"),
+        Color::Magenta => push_sgr_code(out, wrote_code, "45"),
+        Color::Cyan => push_sgr_code(out, wrote_code, "46"),
+        Color::Gray => push_sgr_code(out, wrote_code, "47"),
+        Color::DarkGray => push_sgr_code(out, wrote_code, "100"),
+        Color::LightRed => push_sgr_code(out, wrote_code, "101"),
+        Color::LightGreen => push_sgr_code(out, wrote_code, "102"),
+        Color::LightYellow => push_sgr_code(out, wrote_code, "103"),
+        Color::LightBlue => push_sgr_code(out, wrote_code, "104"),
+        Color::LightMagenta => push_sgr_code(out, wrote_code, "105"),
+        Color::LightCyan => push_sgr_code(out, wrote_code, "106"),
+        Color::White => push_sgr_code(out, wrote_code, "107"),
+        Color::Rgb(r, g, b) => {
+            push_sgr_code(out, wrote_code, "48");
+            push_sgr_code(out, wrote_code, "2");
+            push_sgr_code(out, wrote_code, r);
+            push_sgr_code(out, wrote_code, g);
+            push_sgr_code(out, wrote_code, b);
+        }
+        Color::Indexed(i) => {
+            push_sgr_code(out, wrote_code, "48");
+            push_sgr_code(out, wrote_code, "5");
+            push_sgr_code(out, wrote_code, i);
+        }
     }
 }
 

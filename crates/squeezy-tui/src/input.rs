@@ -856,8 +856,8 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         (Some(0), HistoryDirection::Previous) => Some(0),
         (Some(index), HistoryDirection::Previous) => Some(index - 1),
         (Some(index), HistoryDirection::Next) if index >= last => {
-            set_input(app, app.input_history_draft.clone());
-            app.input_history_draft.clear();
+            let draft = std::mem::take(&mut app.input_history_draft);
+            set_input(app, draft);
             app.input_history_index = None;
             app.slash_menu_index = 0;
             return;
@@ -884,24 +884,23 @@ pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashComma
         return Vec::new();
     };
     let needle = &input[context.start..context.end];
-    let include =
-        |command: &&SlashCommand| context.at_prompt_start || command.supports_inline_use();
     // Bare `/` lists every command, ordered alphabetically by name.
     if needle == "/" {
         let mut suggestions = SLASH_COMMANDS
             .iter()
-            .filter(include)
+            .filter(|command| slash_command_matches_context(command, context))
             .copied()
             .collect::<Vec<_>>();
         suggestions.sort_by(|left, right| left.name.cmp(right.name));
         return suggestions;
     }
+    let query = crate::fuzzy::PreparedQuery::new(needle);
     let mut scored: Vec<(SlashCommand, i32)> = SLASH_COMMANDS
         .iter()
-        .filter(include)
+        .filter(|command| slash_command_matches_context(command, context))
         .copied()
         .filter_map(|command| {
-            crate::fuzzy::score(command.name, needle).map(|score| (command, score))
+            crate::fuzzy::score_prepared(command.name, &query).map(|score| (command, score))
         })
         .collect();
     // Word-boundary / consecutive bonuses keep prefix hits on top;
@@ -915,6 +914,34 @@ pub(crate) fn slash_suggestions_for_app(app: &TuiApp) -> Vec<SlashCommand> {
         .into_iter()
         .filter(|command| command.visible_with_checkpoints(app.checkpoints_enabled))
         .collect()
+}
+
+fn slash_suggestion_count_for_app(app: &TuiApp) -> usize {
+    slash_suggestion_count_at(&app.input, app.input_cursor, app.checkpoints_enabled)
+}
+
+fn slash_suggestion_count_at(input: &str, cursor: usize, checkpoints_enabled: bool) -> usize {
+    let Some(context) = slash_completion_context(input, cursor) else {
+        return 0;
+    };
+    let needle = &input[context.start..context.end];
+    let include = |command: &&SlashCommand| {
+        slash_command_matches_context(command, context)
+            && command.visible_with_checkpoints(checkpoints_enabled)
+    };
+    if needle == "/" {
+        return SLASH_COMMANDS.iter().filter(include).count();
+    }
+    let query = crate::fuzzy::PreparedQuery::new(needle);
+    SLASH_COMMANDS
+        .iter()
+        .filter(include)
+        .filter(|command| crate::fuzzy::score_prepared(command.name, &query).is_some())
+        .count()
+}
+
+fn slash_command_matches_context(command: &SlashCommand, context: SlashCompletionContext) -> bool {
+    context.at_prompt_start || command.supports_inline_use()
 }
 
 fn slash_completion_context(input: &str, cursor: usize) -> Option<SlashCompletionContext> {
@@ -947,58 +974,64 @@ fn token_bounds_at_cursor(input: &str, cursor: usize) -> (usize, usize) {
 }
 
 pub(crate) fn find_inline_slash_dispatch_command(input: &str) -> Option<SlashCommandOccurrence> {
-    slash_command_occurrences(input)
-        .into_iter()
-        .find(|occurrence| {
-            !input[..occurrence.start].trim().is_empty() && occurrence.command.supports_inline_use()
-        })
+    let mut cursor = 0;
+    while let Some(occurrence) = next_slash_command_occurrence(input, &mut cursor) {
+        if !input[..occurrence.start].trim().is_empty() && occurrence.command.supports_inline_use()
+        {
+            return Some(occurrence);
+        }
+    }
+    None
 }
 
 pub(crate) fn slash_command_ranges(input: &str) -> Vec<(usize, usize)> {
-    slash_command_occurrences(input)
-        .into_iter()
-        .filter(|occurrence| {
-            input[..occurrence.start].trim().is_empty() || occurrence.command.supports_inline_use()
-        })
-        .map(|occurrence| (occurrence.start, occurrence.end))
-        .collect()
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(occurrence) = next_slash_command_occurrence(input, &mut cursor) {
+        if input[..occurrence.start].trim().is_empty() || occurrence.command.supports_inline_use() {
+            ranges.push((occurrence.start, occurrence.end));
+        }
+    }
+    ranges
 }
 
-fn slash_command_occurrences(input: &str) -> Vec<SlashCommandOccurrence> {
-    let mut occurrences = Vec::new();
-    let mut cursor = 0;
-    while cursor < input.len() {
-        let Some((relative_start, _)) = input[cursor..]
+fn next_slash_command_occurrence(
+    input: &str,
+    cursor: &mut usize,
+) -> Option<SlashCommandOccurrence> {
+    while *cursor < input.len() {
+        let Some((relative_start, _)) = input[*cursor..]
             .char_indices()
             .find(|(_, ch)| !ch.is_whitespace())
         else {
-            break;
+            *cursor = input.len();
+            return None;
         };
-        let start = cursor + relative_start;
+        let start = *cursor + relative_start;
         let end = input[start..]
             .char_indices()
             .find(|(_, ch)| ch.is_whitespace())
             .map(|(index, _)| start + index)
             .unwrap_or(input.len());
+        *cursor = end;
         let token = &input[start..end];
         if let Some(command) = SLASH_COMMANDS
             .iter()
             .copied()
             .find(|command| command.name == token)
         {
-            occurrences.push(SlashCommandOccurrence {
+            return Some(SlashCommandOccurrence {
                 start,
                 end,
                 command,
             });
         }
-        cursor = end;
     }
-    occurrences
+    None
 }
 
 pub(crate) fn clamp_slash_menu_index(app: &mut TuiApp) {
-    let count = slash_suggestions_for_app(app).len();
+    let count = slash_suggestion_count_for_app(app);
     if count == 0 {
         app.slash_menu_index = 0;
     } else if app.slash_menu_index >= count {
@@ -1007,7 +1040,7 @@ pub(crate) fn clamp_slash_menu_index(app: &mut TuiApp) {
 }
 
 pub(crate) fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) -> bool {
-    let count = slash_suggestions_for_app(app).len();
+    let count = slash_suggestion_count_for_app(app);
     if count == 0 {
         return false;
     }

@@ -293,7 +293,7 @@ pub fn load_tasks(tasks_dir: &Path) -> Result<Vec<TaskSpec>> {
     paths.retain(|path| path.extension().is_some_and(|ext| ext == "toml"));
     paths.sort();
 
-    let mut tasks = Vec::new();
+    let mut tasks = Vec::with_capacity(paths.len());
     for path in paths {
         let content = fs::read_to_string(&path)?;
         let task = toml::from_str::<TaskSpec>(&content).map_err(|err| {
@@ -312,7 +312,7 @@ pub async fn run_harness(config: HarnessConfig) -> Result<Vec<TaskResult>> {
     } else {
         config.runners
     };
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(tasks.len() * runners.len());
 
     for task in &tasks {
         for runner in &runners {
@@ -666,6 +666,7 @@ async fn run_agent_with_config(
             | AgentEvent::RequestUserInputRequested { .. }
             | AgentEvent::ContextCompacted { .. }
             | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentActivity { .. }
             | AgentEvent::SubagentCompleted { .. }
             | AgentEvent::SubagentFailed { .. }
             | AgentEvent::SubagentRejected { .. }
@@ -739,15 +740,12 @@ impl LlmProvider for ScriptedProvider {
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
         self.prompt_bytes
             .fetch_add(request_prompt_bytes(&request), Ordering::Relaxed);
-        let events = self
-            .events
-            .lock()
-            .expect("scripted events")
-            .drain(..)
-            .map(trace_to_llm_event)
-            .collect::<Vec<_>>();
+        let events = {
+            let mut guard = self.events.lock().expect("scripted events");
+            std::mem::take(&mut *guard)
+        };
         let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
-            Box::pin(stream::iter(events));
+            Box::pin(stream::iter(events.into_iter().map(trace_to_llm_event)));
         stream
     }
 }
@@ -1050,7 +1048,9 @@ fn path_matches(pattern: &str, path: &str) -> bool {
         return true;
     }
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        return path.ends_with(&format!(".{suffix}"));
+        return path
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'));
     }
     let normalized = pattern.trim_start_matches('/');
     if path == normalized {

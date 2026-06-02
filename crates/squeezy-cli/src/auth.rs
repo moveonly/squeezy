@@ -919,7 +919,7 @@ pub(crate) fn handle_auth_status_with_env(
     sources: &SeparatedSources,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> squeezy_core::Result<()> {
-    let providers = match &args.provider {
+    let rows: Vec<StatusRow> = match &args.provider {
         Some(provider) => {
             let section = provider_section_for(provider)?;
             if section.is_empty() {
@@ -938,14 +938,14 @@ pub(crate) fn handle_auth_status_with_env(
                         provider, section
                     ))
                 })?;
-            vec![known]
+            vec![compute_status_row(known, sources, env_lookup)]
         }
-        None => KNOWN_PROVIDERS.to_vec(),
+        None => KNOWN_PROVIDERS
+            .iter()
+            .copied()
+            .map(|p| compute_status_row(p, sources, env_lookup))
+            .collect(),
     };
-    let rows: Vec<StatusRow> = providers
-        .into_iter()
-        .map(|p| compute_status_row(p, sources, env_lookup))
-        .collect();
     if args.json {
         let json =
             serde_json::to_string_pretty(&rows.iter().map(StatusRow::to_json).collect::<Vec<_>>())
@@ -1038,26 +1038,37 @@ fn extract_inline_keys_from_doc(doc: &toml_edit::DocumentMut) -> BTreeMap<String
     for (section_name, item) in providers.iter() {
         // A provider section may be a [providers.foo] table or an inline
         // `foo = { api_key = "..." }` table value; treat both shapes.
-        let api_key_str: Option<String> = match item {
-            toml_edit::Item::Table(t) => match t.get("api_key") {
-                Some(toml_edit::Item::Value(toml_edit::Value::String(s))) => {
-                    Some(s.value().to_string())
-                }
-                _ => None,
-            },
-            toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => match t.get("api_key") {
-                Some(toml_edit::Value::String(s)) => Some(s.value().to_string()),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(value) = api_key_str
+        if let Some(value) = inline_api_key_value(item)
             && !value.trim().is_empty()
         {
-            out.insert(section_name.to_string(), value);
+            out.insert(section_name.to_string(), value.to_string());
         }
     }
     out
+}
+
+fn inline_api_key_value(item: &toml_edit::Item) -> Option<&str> {
+    match item {
+        toml_edit::Item::Table(t) => match t.get("api_key") {
+            Some(toml_edit::Item::Value(toml_edit::Value::String(s))) => Some(s.value()),
+            _ => None,
+        },
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => match t.get("api_key") {
+            Some(toml_edit::Value::String(s)) => Some(s.value()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn doc_has_inline_key(doc: &toml_edit::DocumentMut, section: &str) -> bool {
+    let Some(toml_edit::Item::Table(providers)) = doc.as_table().get("providers") else {
+        return false;
+    };
+    providers
+        .get(section)
+        .and_then(inline_api_key_value)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn tier_has_inline_key(path: &Path, section: &str) -> bool {
@@ -1067,7 +1078,7 @@ fn tier_has_inline_key(path: &Path, section: &str) -> bool {
     let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
         return false;
     };
-    extract_inline_keys_from_doc(&doc).contains_key(section)
+    doc_has_inline_key(&doc, section)
 }
 
 fn redact_secret(value: &str) -> String {
@@ -1176,7 +1187,7 @@ fn compute_status_row(
     let mut inline_path = None;
     for (tier, label) in tiers {
         let Some(tier) = tier else { continue };
-        if extract_inline_keys_from_doc(&tier.doc).contains_key(provider.section) {
+        if doc_has_inline_key(&tier.doc, provider.section) {
             inline_tier = Some(label);
             inline_path = Some(tier.path.clone());
             break;

@@ -63,6 +63,37 @@ fn text_matches_concatenation() {
 }
 
 #[test]
+fn segment_writer_matches_text_without_requiring_concat() {
+    let mut c = StreamingController::new();
+    c.push_delta("alpha\n");
+    c.push_delta("```rust\nlet x = 1;\n");
+    c.push_delta("tail");
+
+    let mut out = String::new();
+    c.write_to(&mut out).expect("write to string");
+    assert_eq!(out, c.text());
+    assert_eq!(
+        c.segments().collect::<Vec<_>>(),
+        vec!["alpha\n", "```rust\nlet x = 1;\n", "tail"]
+    );
+}
+
+#[test]
+fn segmented_hash_matches_full_text_hash() {
+    use std::hash::{Hash, Hasher};
+
+    let mut c = StreamingController::new();
+    c.push_delta("alpha\n");
+    c.push_delta("beta");
+
+    let mut segmented = std::collections::hash_map::DefaultHasher::new();
+    c.hash_text(&mut segmented);
+    let mut concatenated = std::collections::hash_map::DefaultHasher::new();
+    c.text().hash(&mut concatenated);
+    assert_eq!(segmented.finish(), concatenated.finish());
+}
+
+#[test]
 fn empty_delta_is_noop() {
     let mut c = StreamingController::new();
     assert_eq!(c.push_delta(""), StreamingMutation::NoOp);

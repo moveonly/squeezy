@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -334,6 +334,26 @@ fn invalid_glob_in_policy_surfaces_as_config_error() {
 }
 
 #[test]
+fn path_normalization_preserves_slash_compatibility() {
+    assert_eq!(normalize_path("./src/lib.rs", false), "src/lib.rs");
+    assert_eq!(normalize_path(".\\src\\lib.rs", false), "src/lib.rs");
+    assert_eq!(
+        normalize_path("./.\\vendor\\allowed", true),
+        "vendor/allowed/"
+    );
+
+    let root = Path::new("/workspace");
+    assert_eq!(
+        relative_path(root, Path::new("/workspace/src/lib.rs")).unwrap(),
+        "src/lib.rs"
+    );
+    assert_eq!(
+        relative_path(root, Path::new("/workspace/src\\lib.rs")).unwrap(),
+        "src/lib.rs"
+    );
+}
+
+#[test]
 fn indexing_policy_prunes_common_language_layouts_at_top_dir() {
     for (layout_dir, layout_file, expected_dir) in [
         ("rust/target/debug", "lib.rs", "rust/target"),
@@ -621,6 +641,29 @@ fn crawler_uses_project_majority_for_ambiguous_c_headers() {
 }
 
 #[test]
+fn crawler_prefers_c_header_sibling_over_cpp_project_majority() {
+    let root = temp_root("crawler_prefers_c_header_sibling_over_cpp_project_majority");
+    fs::write(root.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+    fs::write(root.join("widget.cpp"), "int widget() { return 1; }\n").unwrap();
+    fs::write(root.join("api.c"), "int api(void) { return 2; }\n").unwrap();
+    fs::write(root.join("api.h"), "int api(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "api.h")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+}
+
+#[test]
 fn crawler_classifies_go_files() {
     let root = temp_root("crawler_classifies_go_files");
     fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();
@@ -833,6 +876,29 @@ fn common_vcs_markers_are_indexing_signals() {
 }
 
 #[test]
+fn ancestor_vcs_scan_stops_at_cached_home_boundary() {
+    let parent = temp_root("ancestor_vcs_scan_stops_at_cached_home_boundary");
+    let home = parent.join("home");
+    let project = home.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(parent.join(".git")).unwrap();
+
+    let home = fs::canonicalize(home).unwrap();
+    let project = fs::canonicalize(project).unwrap();
+    let context = IndexingDecisionContext {
+        canonical_home: Some(home),
+    };
+
+    assert_eq!(vcs_marker_signal(&project, &context), None);
+
+    fs::create_dir_all(project.join(".git")).unwrap();
+    assert_eq!(
+        vcs_marker_signal(&project, &context),
+        Some("VCS marker .git at workspace root".to_string())
+    );
+}
+
+#[test]
 fn git_worktree_file_is_an_indexing_signal() {
     let root = temp_root("git_worktree_file_is_an_indexing_signal");
     fs::write(
@@ -863,6 +929,35 @@ fn common_project_config_is_an_indexing_signal() {
             .indexing_decision
             .positive_signals
             .contains(&"project marker package.json".to_string())
+    );
+}
+
+#[test]
+fn indexing_signal_scan_preserves_positive_signal_order() {
+    let root = temp_root("indexing_signal_scan_preserves_positive_signal_order");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("README.md"), "# project\n").unwrap();
+    fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(root.join("App.csproj"), "<Project />\n").unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("app").join("index.ts"), "export {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot.indexing_decision.positive_signals,
+        vec![
+            "VCS marker .git at workspace root",
+            "README at workspace root",
+            "project marker Cargo.toml",
+            "project marker App.csproj",
+            "shallow Rust source",
+            "shallow TypeScript source",
+            "code directory app contains source",
+        ]
     );
 }
 

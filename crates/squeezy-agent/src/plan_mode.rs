@@ -73,7 +73,10 @@ pub(crate) fn instructions_for_mode(
 ) -> String {
     match mode {
         SessionMode::Plan => {
-            let mut out = format!("{base}\n\n{PLAN_MODE_INSTRUCTIONS}");
+            let mut out = String::with_capacity(base.len() + 2 + PLAN_MODE_INSTRUCTIONS.len());
+            out.push_str(base);
+            out.push_str("\n\n");
+            out.push_str(PLAN_MODE_INSTRUCTIONS);
             if let Some(plan_path) = latest_plan_path(workspace_root, session_id) {
                 out.push_str(&refinement_hint(&plan_path));
             }

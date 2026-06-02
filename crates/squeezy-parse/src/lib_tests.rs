@@ -75,6 +75,28 @@ fn helper() {}
 }
 
 #[test]
+fn language_parser_initializes_parsers_on_demand() {
+    let mut parser = LanguageParser::new().unwrap();
+    assert!(parser.parsers.parsers.is_empty());
+
+    let rust_source = "pub fn run() {}\n";
+    let rust_record = record("src/lib.rs", rust_source);
+    parser
+        .parse_source(&rust_record, rust_source.to_string())
+        .unwrap();
+    assert!(parser.parsers.parsers.contains_key(&LanguageKind::Rust));
+    assert_eq!(parser.parsers.parsers.len(), 1);
+
+    let python_source = "def run():\n    return None\n";
+    let python_record = python_record("src/app.py", python_source);
+    parser
+        .parse_source(&python_record, python_source.to_string())
+        .unwrap();
+    assert!(parser.parsers.parsers.contains_key(&LanguageKind::Python));
+    assert_eq!(parser.parsers.parsers.len(), 2);
+}
+
+#[test]
 fn parser_extracts_python_symbols_imports_calls_and_references() {
     let source = r#"
 from services.greeter import Greeter as GreeterAlias
@@ -1263,6 +1285,27 @@ fn parser_reports_changed_ranges_for_cached_file() {
     let updated = parser.parse_source(&record, second.to_string()).unwrap();
     assert!(!updated.changed_ranges.is_empty());
     assert!(updated.calls.iter().any(|call| call.name == "beta"));
+}
+
+#[test]
+fn input_edit_reports_multiline_points() {
+    let old = "fn one() {\n    alpha();\n}\n";
+    let new = "fn one() {\n    beta();\n    gamma();\n}\n";
+
+    let edit = input_edit(old, new);
+
+    assert_eq!(
+        edit.start_position,
+        slow_point_for_byte(old, edit.start_byte)
+    );
+    assert_eq!(
+        edit.old_end_position,
+        slow_point_for_byte(old, edit.old_end_byte)
+    );
+    assert_eq!(
+        edit.new_end_position,
+        slow_point_for_byte(new, edit.new_end_byte)
+    );
 }
 
 #[test]
@@ -2882,6 +2925,20 @@ fn tsx_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Tsx;
     record
+}
+
+fn slow_point_for_byte(source: &str, byte: usize) -> Point {
+    let mut row = 0;
+    let mut column = 0;
+    for current in source.as_bytes().iter().take(byte) {
+        if *current == b'\n' {
+            row += 1;
+            column = 0;
+        } else {
+            column += 1;
+        }
+    }
+    Point { row, column }
 }
 
 fn ts_record(relative_path: &str, source: &str) -> FileRecord {

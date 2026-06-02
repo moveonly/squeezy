@@ -3,6 +3,8 @@ use squeezy_core::{
     resolve_model_alias,
 };
 
+use super::{estimate_json_tokens, estimate_text_tokens, model_info_for};
+
 #[test]
 fn resolve_opus_alias_for_anthropic() {
     assert_eq!(
@@ -70,5 +72,42 @@ fn resolve_alias_for_bedrock_and_google() {
     assert_eq!(
         resolve_model_alias("google", "haiku"),
         Some("gemini-2.5-flash-lite")
+    );
+}
+
+#[test]
+fn unknown_model_fallback_metadata_is_memoized() {
+    let first = model_info_for("openai", "custom-unlisted-model").expect("fallback model info");
+    let second = model_info_for("openai", "custom-unlisted-model").expect("fallback model info");
+    let other = model_info_for("openai", "another-custom-model").expect("fallback model info");
+
+    assert!(
+        std::ptr::eq(first, second),
+        "repeated unknown model lookups must reuse one fallback allocation"
+    );
+    assert!(!std::ptr::eq(first, other));
+    assert_eq!(first.metadata_source, "fallback");
+    assert_eq!(first.provider, "openai");
+    assert_eq!(first.id, "custom-unlisted-model");
+}
+
+#[test]
+fn json_token_estimate_matches_serialized_byte_count() {
+    let value = serde_json::json!({
+        "name": "tool",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "limit": { "type": "integer" }
+            }
+        }
+    });
+    let serialized = serde_json::to_string(&value).expect("serialize json");
+
+    assert_eq!(
+        estimate_json_tokens(&value, 4.0),
+        estimate_text_tokens(&serialized, 4.0),
+        "counting writer must preserve the old byte-based estimate"
     );
 }

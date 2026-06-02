@@ -1,4 +1,4 @@
-use super::score;
+use super::{PreparedQuery, score, score_prepared};
 
 #[test]
 fn empty_query_scores_zero_against_anything() {
@@ -40,4 +40,22 @@ fn penalises_gaps_and_is_case_insensitive() {
     // Lowercasing happens before the walk so an uppercase query
     // produces the same score as its lowercase form.
     assert_eq!(score("/attach", "/ATC"), score("/attach", "/atc"));
+}
+
+#[test]
+fn prepared_query_scores_match_string_query_scores() {
+    for (candidate, query) in [
+        ("/attach", "/ATC"),
+        ("/compact", "/cmp"),
+        ("crates/squeezy-graph/src/lib.rs", "gh/lib"),
+        ("lib.rs", ""),
+        ("abc", "ba"),
+    ] {
+        let prepared = PreparedQuery::new(query);
+        assert_eq!(
+            score_prepared(candidate, &prepared),
+            score(candidate, query),
+            "{candidate:?} vs {query:?}"
+        );
+    }
 }

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -236,15 +236,24 @@ impl SessionStore {
         if !path.exists() {
             return Vec::new();
         }
-        let Ok(text) = fs::read_to_string(&path) else {
+        let Ok(file) = fs::File::open(&path) else {
             return Vec::new();
         };
         let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-        for line in text.lines() {
-            if line.trim().is_empty() {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return Vec::new(),
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(line) else {
+            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
                 continue;
             };
             match by_id.get(&entry.session_id) {
@@ -348,10 +357,10 @@ impl SessionStore {
                 .has_first_user_task
                 .store(metadata.first_user_task.is_some(), Ordering::Relaxed);
         }
-        if let Ok(tape) = self.replay_tape(&session_id) {
-            counters
-                .replay_count
-                .store(tape.events.len() as u64, Ordering::Relaxed);
+        if let Ok((replay_count, _warnings)) =
+            count_replay_jsonl(&self.locate_session_dir(&session_id).join("replay.jsonl"))
+        {
+            counters.replay_count.store(replay_count, Ordering::Relaxed);
         }
         let dir = self.session_dir(&session_id);
         let writer = SessionLogWriter::spawn(self.clone(), dir);
@@ -548,6 +557,21 @@ impl SessionStore {
     }
 
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
+        self.read_session_record(session_id, true)
+    }
+
+    pub(crate) fn show_without_context_attachments(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRecord> {
+        self.read_session_record(session_id, false)
+    }
+
+    fn read_session_record(
+        &self,
+        session_id: &str,
+        load_context_attachments: bool,
+    ) -> Result<SessionRecord> {
         let dir = self.locate_session_dir(session_id);
         let metadata_path = dir.join("metadata.json");
         // Lazy materialisation means a session can exist in memory (held by
@@ -565,7 +589,11 @@ impl SessionStore {
         let metadata = read_session_metadata(&metadata_path)?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
-        let attachments = read_context_attachments(&dir.join("attachments"))?;
+        let attachments = if load_context_attachments {
+            read_context_attachments(&dir.join("attachments"))?
+        } else {
+            Vec::new()
+        };
         let replay = self.replay_tape(session_id).ok();
         Ok(SessionRecord {
             metadata,
@@ -3049,18 +3077,25 @@ fn apply_event_to_replay(
 }
 
 fn read_jsonl(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => return Err(error.into()),
     };
     let mut events = Vec::new();
     let mut warnings = 0;
-    for line in text.lines() {
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<SessionEvent>(line) {
+        match serde_json::from_str::<SessionEvent>(trimmed) {
             Ok(event) => events.push(event),
             Err(_) => warnings += 1,
         }
@@ -3069,34 +3104,81 @@ fn read_jsonl(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {
 }
 
 fn read_replay_jsonl(path: &Path) -> Result<(Vec<SessionReplayEvent>, u64)> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => return Err(error.into()),
     };
     let mut events = Vec::new();
     let mut warnings = 0;
-    for line in text.lines() {
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<SessionReplayEvent>(line) {
-            Ok(event)
-                if event.schema_version == SESSION_REPLAY_SCHEMA_VERSION
-                    && event.payload_sha256 == replay_payload_sha256(&event.payload) =>
-            {
-                events.push(event)
-            }
-            Ok(_) | Err(_) => warnings += 1,
+        match parse_replay_jsonl_line(trimmed) {
+            Some(event) => events.push(event),
+            None => warnings += 1,
         }
     }
     Ok((events, warnings))
 }
 
+fn count_replay_jsonl(path: &Path) -> Result<(u64, u64)> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut events = 0;
+    let mut warnings = 0;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if parse_replay_jsonl_line(trimmed).is_some() {
+            events += 1;
+        } else {
+            warnings += 1;
+        }
+    }
+    Ok((events, warnings))
+}
+
+fn parse_replay_jsonl_line(line: &str) -> Option<SessionReplayEvent> {
+    let event = serde_json::from_str::<SessionReplayEvent>(line).ok()?;
+    if event.schema_version == SESSION_REPLAY_SCHEMA_VERSION
+        && event.payload_sha256 == replay_payload_sha256(&event.payload)
+    {
+        Some(event)
+    } else {
+        None
+    }
+}
+
 fn replay_payload_sha256(payload: &Value) -> String {
+    use std::fmt::Write as _;
+
     let bytes = serde_json::to_vec(payload).unwrap_or_default();
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn now_ms() -> u64 {
