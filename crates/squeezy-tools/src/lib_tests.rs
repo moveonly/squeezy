@@ -2998,6 +2998,54 @@ async fn apply_patch_recovers_from_curly_quote_drift() {
 }
 
 #[tokio::test]
+async fn apply_patch_quote_fallback_counts_self_overlapping_match_once() {
+    // Issue #274: the quote-normalize fallback counted matches with an
+    // overlapping scan, so a self-overlapping search (`''`) against three
+    // curly apostrophes was seen as two matches and rejected. The exact path
+    // uses non-overlapping `match_indices` semantics; the fallback must agree.
+    // Content `\u{2019}\u{2019}\u{2019}` normalizes to `'''`; `match_indices("''")`
+    // on `'''` is exactly one, so this single edit must apply.
+    let root = temp_workspace("apply_patch_quote_overlap");
+    let initial = "\u{2019}\u{2019}\u{2019}\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_quote_overlap".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "''",
+                        "replace": "X",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-quote-overlap".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "quote_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_does_not_levenshtein_match() {
     // Audit F14-cc anti-pattern guard: the quote-normalize fallback must be
     // narrow. A 3-character-different search (no quote drift, just a typo)

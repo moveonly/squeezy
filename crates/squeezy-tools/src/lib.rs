@@ -5829,7 +5829,11 @@ fn find_with_quote_normalization(content: &str, search: &str) -> Option<(usize, 
         let n_start = scan_from + rel;
         let n_end = n_start + normalized_search.len();
         matches.push((n_start, n_end));
-        scan_from = n_start + 1;
+        // Advance past the whole match so self-overlapping searches (e.g. `''`)
+        // are counted non-overlapping, matching the exact path's
+        // `match_indices` semantics; `normalized_search.is_empty()` is rejected
+        // above, so `n_end > n_start` and this always makes progress.
+        scan_from = n_end;
     }
     if matches.is_empty() {
         return None;
@@ -5976,12 +5980,19 @@ fn find_with_unicode_normalization(content: &str, search: &str) -> Option<(usize
     while let Some(rel) = normalized[scan_from..].find(normalized_search.as_str()) {
         let n_start = scan_from + rel;
         let n_end = n_start + normalized_search.len();
-        scan_from = n_start + 1;
         let orig_start = *byte_map.get(n_start)?;
         let orig_end = *byte_map.get(n_end)?;
         let (verify, _) = unicode_normalize_with_byte_map(&content[orig_start..orig_end]);
         if verify == normalized_search {
             clean.push((orig_start, orig_end));
+            // Clean match: advance past it so self-overlapping searches (e.g.
+            // `--`) are counted non-overlapping like the exact `match_indices`
+            // path. `normalized_search` is non-empty, so `n_end > n_start`.
+            scan_from = n_end;
+        } else {
+            // Rejected candidate (partial-character slice): step by one byte so
+            // a later legitimate, character-aligned match is not skipped.
+            scan_from = n_start + 1;
         }
     }
     if clean.is_empty() {
