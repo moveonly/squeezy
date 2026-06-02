@@ -8024,6 +8024,14 @@ fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
     ));
 }
 
+#[test]
+fn assistant_text_has_unresolved_intent_handles_multibyte_tail() {
+    // A multibyte char straddling the `tail_start + 40` byte offset must not
+    // panic: `é` lands at byte 44/45, exactly the slice end for `"i'll "`.
+    let text = format!("I'll {}é and continue", "x".repeat(39));
+    let _ = assistant_text_has_unresolved_intent(&text);
+}
+
 // F17-dispatch-command-completeness: each typed `DispatchCommand`
 // variant lands in `Agent::dispatch_command` with a deterministic
 // outcome. Variants whose effect lives in the TUI return `TuiOnly`;

@@ -9786,7 +9786,10 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
     for intent in INTENT_PATTERNS {
         if let Some(idx) = lower.find(intent) {
             let tail_start = idx + intent.len();
-            let tail_end = (tail_start + 40).min(lower.len());
+            let mut tail_end = (tail_start + 40).min(lower.len());
+            while tail_end > tail_start && !lower.is_char_boundary(tail_end) {
+                tail_end -= 1;
+            }
             let tail = &lower[tail_start..tail_end];
             if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
                 return true;
