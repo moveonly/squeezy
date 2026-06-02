@@ -79,7 +79,7 @@ pub use contribution::{
 };
 pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
-    delete_api_key, resolve_api_key, resolve_api_key_with_inline,
+    delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_with_inline,
     resolve_api_key_with_inline_optional, static_api_key_source,
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};

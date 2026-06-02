@@ -7,14 +7,28 @@ use std::sync::Mutex;
 // runner does not let them race.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Point `SQUEEZY_CREDENTIALS_FILE` at a guaranteed-absent path so the
+/// credentials.json tier returns None and the developer's real
+/// `~/.squeezy/credentials.json` cannot shadow the env tier under test.
+fn isolate_credentials_file() {
+    unsafe {
+        env::set_var(
+            "SQUEEZY_CREDENTIALS_FILE",
+            std::env::temp_dir().join("squeezy-doctor-no-such-creds.json"),
+        );
+        env::remove_var("SQUEEZY_CREDENTIALS_JSON");
+    }
+}
+
 #[test]
-fn env_check_reports_ok_when_var_set() {
+fn credential_check_reports_ok_when_env_set() {
     let _guard = ENV_LOCK.lock().expect("env lock");
+    isolate_credentials_file();
     // SAFETY: the lock above serializes mutations to the process env.
     unsafe {
         env::set_var("SQUEEZY_DOCTOR_TEST_KEY", "1");
     }
-    let (status, detail) = env_check("SQUEEZY_DOCTOR_TEST_KEY");
+    let (status, detail) = credential_check(None, "SQUEEZY_DOCTOR_TEST_KEY");
     unsafe {
         env::remove_var("SQUEEZY_DOCTOR_TEST_KEY");
     }
@@ -23,13 +37,45 @@ fn env_check_reports_ok_when_var_set() {
 }
 
 #[test]
-fn env_check_warns_when_unset() {
+fn credential_check_warns_when_unresolved() {
     let _guard = ENV_LOCK.lock().expect("env lock");
+    isolate_credentials_file();
     unsafe {
         env::remove_var("SQUEEZY_DOCTOR_TEST_MISSING");
     }
-    let (status, _) = env_check("SQUEEZY_DOCTOR_TEST_MISSING");
+    let (status, _) = credential_check(None, "SQUEEZY_DOCTOR_TEST_MISSING");
     assert_eq!(status, Status::Warn);
+}
+
+#[test]
+fn credential_check_ok_for_inline_key() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    isolate_credentials_file();
+    unsafe {
+        env::remove_var("SQUEEZY_DOCTOR_TEST_INLINE_KEY");
+    }
+    let (status, detail) = credential_check(Some("sk-inline"), "SQUEEZY_DOCTOR_TEST_INLINE_KEY");
+    assert_eq!(status, Status::Ok);
+    assert!(detail.contains("inline"), "detail: {detail}");
+}
+
+// Regression for #255: with the squeezy-prefixed env var unset but the
+// conventional vendor fallback (OPENAI_API_KEY) set, the active-provider
+// row must resolve Ok and name the fallback source instead of warning.
+#[test]
+fn credential_check_ok_via_fallback_env_var() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    isolate_credentials_file();
+    unsafe {
+        env::remove_var("SQUEEZY_OPENAI_KEY");
+        env::set_var("OPENAI_API_KEY", "sk-from-vendor");
+    }
+    let (status, detail) = credential_check(None, "SQUEEZY_OPENAI_KEY");
+    unsafe {
+        env::remove_var("OPENAI_API_KEY");
+    }
+    assert_eq!(status, Status::Ok, "detail: {detail}");
+    assert!(detail.contains("OPENAI_API_KEY"), "detail: {detail}");
 }
 
 #[test]

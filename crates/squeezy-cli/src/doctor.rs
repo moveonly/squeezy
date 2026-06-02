@@ -6,6 +6,7 @@ use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
     SettingsFile, default_settings_path,
 };
+use squeezy_llm::{KeySource, fallback_env_var, resolve_api_key_with_inline};
 use squeezy_store::{SessionStore, SqueezyStore, ensure_repo_profile};
 
 use crate::update::{self, UpdateStatus};
@@ -203,10 +204,22 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {
     match provider {
-        ProviderConfig::OpenAi(c) => ("openai", env_check(&c.api_key_env)),
-        ProviderConfig::Anthropic(c) => ("anthropic", env_check(&c.api_key_env)),
-        ProviderConfig::Google(c) => ("google", env_check(&c.api_key_env)),
-        ProviderConfig::AzureOpenAi(c) => ("azure_openai", env_check(&c.api_key_env)),
+        ProviderConfig::OpenAi(c) => (
+            "openai",
+            credential_check(c.api_key.as_deref(), &c.api_key_env),
+        ),
+        ProviderConfig::Anthropic(c) => (
+            "anthropic",
+            credential_check(c.api_key.as_deref(), &c.api_key_env),
+        ),
+        ProviderConfig::Google(c) => (
+            "google",
+            credential_check(c.api_key.as_deref(), &c.api_key_env),
+        ),
+        ProviderConfig::AzureOpenAi(c) => (
+            "azure_openai",
+            credential_check(c.api_key.as_deref(), &c.api_key_env),
+        ),
         ProviderConfig::Bedrock(c) => (
             "bedrock",
             (
@@ -222,7 +235,10 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
             ),
         ),
         ProviderConfig::OpenAiCodex(_) => ("openai_codex", openai_codex_auth_check()),
-        ProviderConfig::OpenAiCompatible(c) => (c.preset.as_str(), env_check(&c.api_key_env)),
+        ProviderConfig::OpenAiCompatible(c) => (
+            c.preset.as_str(),
+            credential_check(c.api_key.as_deref(), &c.api_key_env),
+        ),
         ProviderConfig::Faux(_) => (
             "faux",
             (
@@ -260,17 +276,44 @@ fn openai_codex_auth_check() -> (Status, String) {
     }
 }
 
-fn env_check(env_name: &str) -> (Status, String) {
-    if env::var(env_name).is_ok() {
-        return (Status::Ok, format!("{env_name} is set"));
-    }
-    (
-        Status::Warn,
-        format!(
-            "{env_name} not set; export it, set [providers.<name>] api_key = \"…\" in \
-             ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
+/// Resolve the active provider's credential through the same chain the
+/// runtime uses (`resolve_api_key_with_inline`: inline TOML key,
+/// `credentials.json`, `api_key_env`, the conventional fallback env var,
+/// then `SQUEEZY_CREDENTIALS_JSON`) so doctor agrees with what an actual
+/// session would find. Reporting only `env::var(api_key_env)` warned on
+/// perfectly working inline-key, `credentials.json`, and fallback-env
+/// (e.g. `OPENAI_API_KEY`) setups.
+fn credential_check(inline: Option<&str>, env_name: &str) -> (Status, String) {
+    match resolve_api_key_with_inline(inline, env_name) {
+        Ok(resolved) => (
+            Status::Ok,
+            format!(
+                "resolved via {}",
+                key_source_label(resolved.source, env_name)
+            ),
         ),
-    )
+        Err(_) => (
+            Status::Warn,
+            format!(
+                "{env_name} not set; export it, set [providers.<name>] api_key = \"…\" in \
+                 ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
+            ),
+        ),
+    }
+}
+
+/// Human-readable name for where a resolved key came from, mirroring the
+/// resolution chain so the user knows which source doctor honored.
+fn key_source_label(source: KeySource, env_name: &str) -> String {
+    match source {
+        KeySource::Inline => "inline [providers.<name>] api_key".to_string(),
+        KeySource::File => "credentials.json".to_string(),
+        KeySource::Env => format!("{env_name} env var"),
+        KeySource::FallbackEnv => fallback_env_var(env_name)
+            .map(|name| format!("{name} env var"))
+            .unwrap_or_else(|| "fallback env var".to_string()),
+        KeySource::JsonEnv => "SQUEEZY_CREDENTIALS_JSON".to_string(),
+    }
 }
 
 fn session_store_check(config: &AppConfig) -> Check {
@@ -543,18 +586,21 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
     };
     match provider {
         ProviderConfig::OpenAi(c) => {
-            probe_openai_compatible(&client, &c.base_url, env::var(&c.api_key_env).ok(), None).await
+            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
+            probe_openai_compatible(&client, &c.base_url, key, None).await
         }
         ProviderConfig::Anthropic(c) => {
             // Anthropic added `GET /v1/models` in 2024; reuse the same shape
             // as OpenAI-compatible, but with the `x-api-key` header.
-            probe_anthropic(&client, &c.base_url, env::var(&c.api_key_env).ok()).await
+            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
+            probe_anthropic(&client, &c.base_url, key).await
         }
         ProviderConfig::Google(c) => {
-            probe_google(&client, &c.base_url, env::var(&c.api_key_env).ok()).await
+            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
+            probe_google(&client, &c.base_url, key).await
         }
         ProviderConfig::AzureOpenAi(c) => {
-            let key = env::var(&c.api_key_env).ok();
+            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
             probe_azure_openai(&client, &c.base_url, &c.api_version, key).await
         }
         ProviderConfig::Bedrock(_) => (
@@ -578,15 +624,20 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
             for (key, value) in &c.extra_headers {
                 extra.push((key.as_str(), value.as_str()));
             }
-            probe_openai_compatible(
-                &client,
-                &c.base_url,
-                env::var(&c.api_key_env).ok(),
-                Some(extra),
-            )
-            .await
+            let key = resolve_probe_key(c.api_key.as_deref(), &c.api_key_env);
+            probe_openai_compatible(&client, &c.base_url, key, Some(extra)).await
         }
     }
+}
+
+/// Resolve the credential for a live probe through the runtime chain so
+/// inline-key, `credentials.json`, and fallback-env (e.g. `OPENAI_API_KEY`)
+/// setups actually get probed instead of being skipped as "API key env var
+/// is unset". `None` keeps the existing skip path when nothing resolves.
+fn resolve_probe_key(inline: Option<&str>, env_name: &str) -> Option<String> {
+    resolve_api_key_with_inline(inline, env_name)
+        .ok()
+        .map(|resolved| resolved.value)
 }
 
 async fn probe_openai_compatible(
