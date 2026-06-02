@@ -139,6 +139,56 @@ fn save_codex_token_writes_with_0600_perms() {
     assert_eq!(loaded.expires_at_unix_ms, 1_700_000_000_000);
 }
 
+#[cfg(unix)]
+#[test]
+fn save_codex_token_overwrites_atomically_via_tmp_sibling() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = tmp_path("atomic");
+    // Pre-create the target with a sentinel to model overwriting a
+    // live token file on a silent refresh.
+    std::fs::write(&path, b"SENTINEL").expect("pre-create");
+    let original_ino = std::fs::metadata(&path).expect("stat sentinel").ino();
+
+    let token = OpenAiCodexTokenSet {
+        access_token: make_jwt_with_account("acct_atomic"),
+        refresh_token: "refresh-atomic".to_string(),
+        expires_at_unix_ms: 1_700_000_000_000,
+        account_id: "acct_atomic".to_string(),
+    };
+    save_codex_token(&path, &token).expect("save");
+
+    // The sentinel must be fully replaced (no truncation/partial write).
+    let loaded = load_codex_token(&path).expect("load").expect("present");
+    assert_eq!(loaded.refresh_token, "refresh-atomic");
+
+    // An atomic rename swaps in a freshly created tmp file, so the live
+    // path's inode changes — an in-place write would reuse the original
+    // inode and expose a truncation window mid-write.
+    let meta = std::fs::metadata(&path).expect("stat");
+    assert_ne!(
+        meta.ino(),
+        original_ino,
+        "save should rename a fresh file into place, not overwrite in place"
+    );
+
+    // The final file inherits the tmp sibling's 0o600 mode, and the tmp
+    // sibling is renamed away (never left behind).
+    let mode = meta.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "token file should be chmod 600, got {:o}",
+        mode
+    );
+    let tmp = path.with_extension("tmp");
+    assert!(
+        !tmp.exists(),
+        "tmp sibling {} should not be left behind",
+        tmp.display()
+    );
+}
+
 #[test]
 fn load_codex_token_returns_none_when_missing() {
     let path = tmp_path("missing");

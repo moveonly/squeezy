@@ -158,10 +158,10 @@ pub fn load_codex_token(path: &Path) -> Result<Option<OpenAiCodexTokenSet>> {
     Ok(Some(token))
 }
 
-/// Persist the token set with `chmod 600` on Unix. The parent
-/// directory is created with `0o700`; on Windows we fall back to the
-/// default permission set (the AGENTS guidance notes Windows sandbox
-/// is best-effort).
+/// Persist the token set atomically via a `0o600` tmp sibling that is
+/// renamed into place on Unix. The parent directory is created with
+/// `0o700`; on Windows we fall back to the default permission set (the
+/// AGENTS guidance notes Windows sandbox is best-effort).
 pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
@@ -182,31 +182,36 @@ pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> 
     }
     let json = serde_json::to_string_pretty(token)
         .map_err(|err| SqueezyError::Config(format!("could not serialize codex token: {err}")))?;
-    std::fs::write(path, json).map_err(|err| {
+    // Write to a sibling tmp file, narrow its mode to 0o600 before any
+    // bytes land at the final path, then atomically rename into place.
+    // This keeps the secret out of a world/group-readable window on
+    // first create and prevents a crash mid-write from truncating a
+    // previously valid token file, matching the Anthropic/Copilot
+    // persisters.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json).map_err(|err| {
         SqueezyError::Config(format!(
             "could not write codex auth file {}: {err}",
-            path.display()
+            tmp.display()
         ))
     })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)
-            .map_err(|err| {
-                SqueezyError::Config(format!(
-                    "could not stat codex auth file {}: {err}",
-                    path.display()
-                ))
-            })?
-            .permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms).map_err(|err| {
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
             SqueezyError::Config(format!(
                 "could not chmod 600 codex auth file {}: {err}",
-                path.display()
+                tmp.display()
             ))
         })?;
     }
+    std::fs::rename(&tmp, path).map_err(|err| {
+        SqueezyError::Config(format!(
+            "could not rename {} to codex auth file {}: {err}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
