@@ -3495,3 +3495,44 @@ fn replay_resume_state_hydrates_tool_result_cards() {
     assert_eq!(replayed.transcript[0].role, squeezy_core::Role::User);
     assert_eq!(replayed.transcript[1].role, squeezy_core::Role::Assistant);
 }
+
+#[test]
+fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
+    let root = temp_root("write-json-atomic");
+    let path = root.join("metadata.json");
+
+    // Seed a valid file, then a regular rewrite.
+    write_json(&path, &json!({ "k": "first" })).expect("seed write");
+    write_json(&path, &json!({ "k": "second" })).expect("rewrite");
+
+    // The final file deserializes to the latest value...
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read target")).expect("valid json");
+    assert_eq!(value.get("k").and_then(|v| v.as_str()), Some("second"));
+
+    // ...and no temp sibling is left behind on the happy path. The write
+    // routes through a sibling temp + rename rather than truncating the
+    // target in place, so a reader only ever sees a complete file.
+    let leftover: Vec<PathBuf> = fs::read_dir(&root)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".tmp"))
+        })
+        .collect();
+    assert!(leftover.is_empty(), "stale temp file(s) left: {leftover:?}");
+
+    // A pre-existing stale temp sibling (e.g. from a crashed prior write)
+    // does not corrupt or block the next write: the good target survives
+    // and is replaced atomically.
+    let stale_tmp = root.join(format!(".metadata.json.{}.tmp", std::process::id()));
+    fs::write(&stale_tmp, b"{ this is not valid json").expect("seed stale tmp");
+    write_json(&path, &json!({ "k": "third" })).expect("rewrite over stale tmp");
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read target")).expect("valid json");
+    assert_eq!(value.get("k").and_then(|v| v.as_str()), Some("third"));
+
+    let _ = fs::remove_dir_all(&root);
+}

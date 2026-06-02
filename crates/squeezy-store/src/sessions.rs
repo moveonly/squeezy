@@ -2747,12 +2747,38 @@ fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
     Ok(buf[0] == b'\n')
 }
 
+/// Serialize `value` to `path` atomically: write to a sibling temp file,
+/// `sync_all`, then `fs::rename` over the target. A reader (and a crash)
+/// therefore only ever observes the previous complete file or the new
+/// complete file, never a truncated/torn one. This matters because
+/// `metadata.json` is rewritten on essentially every turn; a non-atomic
+/// in-place write left a torn metadata file that silently hid an
+/// otherwise-recoverable session from `list()`/`resume()`. Mirrors the
+/// tmp + `sync_all` + `rename` pattern in [`rewrite_global_index`].
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    fs::write(path, bytes)?;
+    // Per-pid temp name so concurrent writers to the same path don't
+    // clobber each other's in-flight temp file before the rename.
+    let tmp = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
+        None => path.with_extension("tmp"),
+    };
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
