@@ -7056,6 +7056,24 @@ fn web_helpers_extract_hosts_and_classify_text_content() {
 }
 
 #[test]
+fn decode_body_honors_declared_charset() {
+    // ISO-8859-1: 0xE9 is `é`, which is not valid standalone UTF-8.
+    assert_eq!(decode_body(&[0xE9], "text/html; charset=ISO-8859-1"), "é");
+    // windows-1252: 0x92 is a curly apostrophe in the C1 range.
+    assert_eq!(
+        decode_body(&[0x92], "text/html; charset=windows-1252"),
+        "\u{2019}"
+    );
+    // No charset declared: high bytes decode lossily as before.
+    assert_eq!(decode_body(&[0xE9], "text/html"), "\u{FFFD}");
+    // Declared UTF-8 round-trips multibyte sequences.
+    assert_eq!(
+        decode_body("café".as_bytes(), "text/plain; charset=utf-8"),
+        "café"
+    );
+}
+
+#[test]
 fn web_cache_receipt_status_marks_stale_entries() {
     let retrieved_at = 1_000_u128;
     let stale_after = web_cache_stale_after_unix_ms(retrieved_at);

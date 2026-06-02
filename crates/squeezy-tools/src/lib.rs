@@ -135,8 +135,8 @@ use truncate::truncate_middle_bytes;
 pub use web::{DEFAULT_PARALLEL_MCP_URL, WebSearchProvider};
 #[cfg(test)]
 pub(crate) use web::{
-    MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, extract_http_urls, html_to_text,
-    is_textual_content_type, parse_mcp_websearch_response, web_cache_receipt_status,
+    MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, decode_body, extract_http_urls,
+    html_to_text, is_textual_content_type, parse_mcp_websearch_response, web_cache_receipt_status,
     web_cache_stale_after_unix_ms, web_stable_output_sha256,
 };
 use web::{
