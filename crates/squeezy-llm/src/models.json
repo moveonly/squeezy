@@ -361,6 +361,36 @@
   },
   {
     "provider": "bedrock",
+    "id": "anthropic.claude-sonnet-4-6",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 3000000,
+      "output_usd_micros_per_mtok": 15000000,
+      "cache_read_usd_micros_per_mtok": 300000,
+      "cache_write_usd_micros_per_mtok": 3750000
+    },
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html"
+  },
+  {
+    "provider": "bedrock",
     "id": "anthropic.claude-haiku-4-5-20251001-v1:0",
     "profile": "cheap",
     "capabilities": {

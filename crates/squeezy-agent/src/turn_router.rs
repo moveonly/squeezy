@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use squeezy_core::{AppConfig, CostSnapshot, ReasoningEffort, RoutingConfig};
+use squeezy_core::{AppConfig, CostSnapshot, RoutingConfig, SessionMode};
 use squeezy_llm::{CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
 
@@ -50,6 +50,8 @@ pub(crate) enum EscalationReason {
     ToolCallCeiling,
     ErrorThreshold,
     RefusalPhrase,
+    ProviderError,
+    ToolDiversity,
 }
 
 impl EscalationReason {
@@ -58,6 +60,8 @@ impl EscalationReason {
             Self::ToolCallCeiling => "tool_call_ceiling",
             Self::ErrorThreshold => "error_threshold",
             Self::RefusalPhrase => "refusal_phrase",
+            Self::ProviderError => "provider_error",
+            Self::ToolDiversity => "tool_diversity",
         }
     }
 }
@@ -163,30 +167,17 @@ const AMBIGUITY_MARKERS: &[&str] = &[
     "any file",
     "any files",
     "the one that",
+    "carefully",
+    "thoroughly",
+    "safely",
+    "without breaking",
+    "be careful",
+    "make sure not",
 ];
 
 const LEADING_FILLER: &[&str] = &[
     "please", "can", "could", "would", "you", "kindly", "now", "just", "quick", "quickly", "hey",
     "hi", "hello",
-];
-
-/// Conjunctions and connector phrases that signal a compound, multi-step
-/// request when they sit between two verb-shaped clauses. We reject if
-/// any appear after the imperative verb because the cheap tier handles
-/// single mechanical asks much more reliably than compound ones (e.g.
-/// "rename foo to bar, then check if any test fails, then update README"
-/// is a classic borderline case the cheap model gets wrong).
-const COMPOUND_CONNECTORS: &[&str] = &[
-    ", then",
-    " then ",
-    "; then",
-    "; and",
-    "and check",
-    "and update",
-    "and verify",
-    "and confirm",
-    "and ensure",
-    "and make sure",
 ];
 
 /// Strict prompt-shape limits for the heuristic prefilter. Anything
@@ -200,13 +191,14 @@ const HEURISTIC_MAX_SENTENCES: usize = 1;
 const REFUSAL_PHRASES: &[&str] = &[
     "i'm not sure",
     "i am not sure",
-    "this is complex",
+    "i need more context",
     "need more context",
-    "i can't",
-    "i cannot",
-    "unable to",
-    "let me think",
+    "i don't have enough context",
+    "i do not have enough context",
+    "i cannot proceed",
+    "i can't proceed",
 ];
+const REFUSAL_TAIL_CHARS: usize = 96;
 
 /// Heuristic prefilter — pure function. Returns the matched rule name
 /// when the prompt is a slam-dunk for cheap routing, otherwise `None`.
@@ -224,7 +216,7 @@ pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Opti
     if trimmed.is_empty() {
         return None;
     }
-    if (trimmed.len() as u32) > cfg.heuristic_max_chars {
+    if (trimmed.chars().count() as u32) > cfg.heuristic_max_chars {
         return None;
     }
     if trimmed.contains("\n\n") {
@@ -237,10 +229,7 @@ pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Opti
     {
         return None;
     }
-    if COMPOUND_CONNECTORS
-        .iter()
-        .any(|connector| lower.contains(connector))
-    {
+    if has_compound_signal(&lower) {
         return None;
     }
     if count_words(&lower) > HEURISTIC_MAX_WORDS {
@@ -280,6 +269,45 @@ fn count_words(lower: &str) -> usize {
         .count()
 }
 
+fn normalized_words(lower: &str) -> Vec<&str> {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn has_compound_signal(lower: &str) -> bool {
+    let words = normalized_words(lower);
+    if words.is_empty() {
+        return false;
+    }
+    if words.contains(&"then") || lower.contains(';') {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "check"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "update"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "verify"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "confirm"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "ensure"]) {
+        return true;
+    }
+    if words
+        .windows(3)
+        .any(|triple| triple == ["and", "make", "sure"])
+    {
+        return true;
+    }
+    false
+}
+
 fn count_sentences(text: &str) -> usize {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -289,11 +317,21 @@ fn count_sentences(text: &str) -> usize {
     // bare-comma compound asks as already filtered by COMPOUND_CONNECTORS
     // above so we don't have to teach this function about clause shape.
     let mut sentences = 0usize;
-    let mut iter = trimmed.chars().peekable();
-    while let Some(ch) = iter.next() {
+    let lower = trimmed.to_ascii_lowercase();
+    let mut iter = trimmed.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
         if matches!(ch, '.' | '!' | '?') {
+            let next_is_uppercase = iter
+                .clone()
+                .find(|(_, next)| !next.is_whitespace())
+                .is_some_and(|(_, next)| next.is_ascii_uppercase());
+            if ch == '.' && period_is_abbreviation(&lower, idx) && !next_is_uppercase {
+                continue;
+            }
             match iter.peek() {
-                Some(next) if next.is_whitespace() => sentences += 1,
+                Some((_, next)) if next.is_whitespace() || next.is_ascii_uppercase() => {
+                    sentences += 1;
+                }
                 None => sentences += 1,
                 _ => {}
             }
@@ -312,6 +350,17 @@ fn count_sentences(text: &str) -> usize {
     }
 }
 
+fn period_is_abbreviation(lower: &str, period_idx: usize) -> bool {
+    const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "etc."];
+    let end = period_idx + 1;
+    ABBREVIATIONS.iter().any(|abbr| {
+        let Some(start) = end.checked_sub(abbr.len()) else {
+            return false;
+        };
+        lower.get(start..end) == Some(*abbr)
+    })
+}
+
 /// True iff `text` contains any low-confidence phrase from the
 /// assistant stream — used by the escalation detector.
 pub(crate) fn contains_refusal_phrase(text: &str) -> bool {
@@ -319,7 +368,27 @@ pub(crate) fn contains_refusal_phrase(text: &str) -> bool {
         return false;
     }
     let lower = text.to_ascii_lowercase();
-    REFUSAL_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    REFUSAL_PHRASES
+        .iter()
+        .any(|phrase| phrase_occurs_at_clause_start(&lower, phrase))
+}
+
+fn phrase_occurs_at_clause_start(text: &str, phrase: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(offset) = text[search_from..].find(phrase) {
+        let start = search_from + offset;
+        let before = &text[..start];
+        if before
+            .chars()
+            .rev()
+            .find(|ch| !ch.is_whitespace())
+            .is_none_or(|ch| matches!(ch, '.' | '!' | '?' | '\n' | '\r' | ':' | ';' | ','))
+        {
+            return true;
+        }
+        search_from = start.saturating_add(phrase.len());
+    }
+    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +405,10 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub parent_model: &'a str,
     pub config: &'a AppConfig,
     pub has_image_input: bool,
+    pub has_large_attachment: bool,
+    pub turn_index: u64,
+    pub prior_turn_was_hard: bool,
+    pub session_mode: SessionMode,
     pub overrides: RoutingOverride,
     pub sticky: bool,
 }
@@ -381,12 +454,6 @@ pub(crate) async fn classify_turn(
     if auto_disabled && !inputs.overrides.force_cheap {
         return ClassifyResult::parent();
     }
-    if inputs.sticky {
-        return ClassifyResult::parent();
-    }
-    if inputs.has_image_input && cfg.bypass_for_images {
-        return ClassifyResult::parent();
-    }
 
     let Some(cheap) = cheap_model_for(inputs.provider_name, inputs.config) else {
         return ClassifyResult::parent();
@@ -398,8 +465,27 @@ pub(crate) async fn classify_turn(
     }
     let cheap: Arc<str> = Arc::from(cheap);
 
+    if inputs.session_mode == SessionMode::Plan {
+        return ClassifyResult::parent();
+    }
+    if inputs.has_image_input && cfg.bypass_for_images {
+        return ClassifyResult::parent();
+    }
+    if inputs.has_large_attachment {
+        return ClassifyResult::parent();
+    }
+
     if inputs.overrides.force_cheap {
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    if inputs.turn_index > 0 && inputs.prior_turn_was_hard && is_deictic_followup(inputs.user_input)
+    {
+        return ClassifyResult::parent();
+    }
+
+    if inputs.sticky {
+        return ClassifyResult::parent();
     }
 
     if let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg) {
@@ -413,10 +499,11 @@ pub(crate) async fn classify_turn(
     if prompt_chars == 0 || prompt_chars > cfg.judge_max_chars {
         return ClassifyResult::parent();
     }
+    let judge_model = judge_model_for(inputs.provider_name, inputs.config, &cheap);
     let (verdict, judge_cost) = run_judge(
         inputs.provider,
         inputs.provider_name,
-        &cheap,
+        &judge_model,
         inputs.user_input,
         cancel,
     )
@@ -436,6 +523,17 @@ pub(crate) async fn classify_turn(
     }
 }
 
+fn judge_model_for(provider: &str, config: &AppConfig, cheap_model: &Arc<str>) -> Arc<str> {
+    let Some(model) = config.routing.judge_model.clone() else {
+        return cheap_model.clone();
+    };
+    Arc::from(
+        squeezy_core::resolve_model_alias(provider, &model)
+            .unwrap_or(&model)
+            .to_string(),
+    )
+}
+
 /// Estimate the savings of running this turn on the cheap tier
 /// instead of the parent model. Re-prices the actual provider-reported
 /// `cost` (token counts) at the parent's per-Mtok rate via the same
@@ -447,13 +545,27 @@ pub(crate) fn estimate_routing_savings(
     parent_model: &str,
     actual_cheap_cost: &CostSnapshot,
 ) -> u64 {
+    estimate_routing_net_savings(provider, parent_model, actual_cheap_cost, 0)
+        .max(0)
+        .try_into()
+        .unwrap_or(0)
+}
+
+pub(crate) fn estimate_routing_net_savings(
+    provider: &str,
+    parent_model: &str,
+    actual_cheap_cost: &CostSnapshot,
+    judge_cost_usd_micros: u64,
+) -> i64 {
     let Some(parent_estimate) =
         squeezy_llm::estimate_cost(provider, parent_model, actual_cheap_cost)
     else {
         return 0;
     };
     let actual = actual_cheap_cost.estimated_usd_micros.unwrap_or(0);
-    parent_estimate.saturating_sub(actual)
+    (parent_estimate.min(i64::MAX as u64) as i64)
+        .saturating_sub(actual.min(i64::MAX as u64) as i64)
+        .saturating_sub(judge_cost_usd_micros.min(i64::MAX as u64) as i64)
 }
 
 // Per-provider judge prompts. All three carry the same routing
@@ -512,34 +624,29 @@ fn judge_instructions_for(provider_name: &str) -> &'static str {
 }
 
 const JUDGE_TIMEOUT_MS: u64 = 10_000;
-const JUDGE_MAX_OUTPUT_TOKENS: u32 = 80;
+const JUDGE_MAX_OUTPUT_TOKENS: u32 = 512;
 
 async fn run_judge(
     provider: &Arc<dyn LlmProvider>,
     provider_name: &str,
-    cheap_model: &Arc<str>,
+    judge_model: &Arc<str>,
     user_input: &str,
     cancel: CancellationToken,
 ) -> (Option<bool>, CostSnapshot) {
-    // The judge's system prompt is static, so we mark the request for
-    // long-retention provider prompt caching keyed by the provider's
-    // short name. Anthropic plants a `cache_control` block on the
-    // system prompt, OpenAI Responses forwards `prompt_cache_key` +
-    // `prompt_cache_retention: 24h`, Bedrock plants a typed
-    // `CachePoint` block — the routing-judge prefix becomes a cache
-    // hit on every subsequent borderline turn within the retention
-    // window, which is the bulk of the judge's cost.
+    // The judge prompt is intentionally short. It sits below hosted
+    // providers' useful prompt-cache minimums, so leave caching off
+    // instead of surfacing misleading cache telemetry.
     let cache = CacheSpec {
-        key: Some(format!("routing-judge-v1:{provider_name}")),
-        retention: CacheRetention::Long,
+        key: None,
+        retention: CacheRetention::None,
     };
     let request = LlmRequest {
-        model: cheap_model.clone(),
+        model: judge_model.clone(),
         instructions: Arc::from(judge_instructions_for(provider_name)),
         input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
         max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
         response_verbosity: None,
-        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
         cache,
@@ -570,7 +677,7 @@ async fn run_judge(
         }
         (Some(text), cost)
     };
-    let (raw, cost) = tokio::select! {
+    let (raw, mut cost) = tokio::select! {
         biased;
         _ = cancel.cancelled() => return (None, CostSnapshot::default()),
         _ = tokio::time::sleep(Duration::from_millis(JUDGE_TIMEOUT_MS)) => {
@@ -578,8 +685,34 @@ async fn run_judge(
         }
         result = fetch => result,
     };
+    if cost.estimated_usd_micros.is_none() {
+        cost.estimated_usd_micros = squeezy_llm::estimate_cost(provider_name, judge_model, &cost);
+    }
     let verdict = raw.and_then(|text| parse_judge_reply(&text));
     (verdict, cost)
+}
+
+fn is_deictic_followup(user_input: &str) -> bool {
+    let lower = user_input.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const DEICTIC_MARKERS: &[&str] = &[
+        "same",
+        "keep going",
+        "continue",
+        "now do",
+        "do that",
+        "do the same",
+        "again",
+        "that one",
+        "this one",
+        "like that",
+        "similar",
+    ];
+    DEICTIC_MARKERS
+        .iter()
+        .any(|marker| lower == *marker || lower.starts_with(&format!("{marker} ")))
 }
 
 fn parse_judge_reply(raw: &str) -> Option<bool> {
@@ -607,6 +740,7 @@ fn parse_judge_reply(raw: &str) -> Option<bool> {
 #[derive(Debug, Default)]
 pub(crate) struct EscalationState {
     pub triggered: Option<EscalationReason>,
+    refusal_tail: String,
 }
 
 impl EscalationState {
@@ -624,7 +758,7 @@ impl EscalationState {
         tool_calls: u64,
         tool_errors: u64,
         budget_denials: u64,
-        recent_assistant_text: &str,
+        assistant_text_delta: &str,
         on_cheap_turn: bool,
         cfg: &RoutingConfig,
         max_tool_calls_per_turn: u64,
@@ -642,11 +776,31 @@ impl EscalationState {
             self.triggered = Some(EscalationReason::ErrorThreshold);
             return self.triggered;
         }
-        if contains_refusal_phrase(recent_assistant_text) {
+        if self.observes_refusal_phrase(assistant_text_delta) {
             self.triggered = Some(EscalationReason::RefusalPhrase);
             return self.triggered;
         }
         None
+    }
+
+    fn observes_refusal_phrase(&mut self, assistant_text_delta: &str) -> bool {
+        if assistant_text_delta.is_empty() {
+            return false;
+        }
+        let mut window =
+            String::with_capacity(self.refusal_tail.len() + assistant_text_delta.len());
+        window.push_str(&self.refusal_tail);
+        window.push_str(assistant_text_delta);
+        let matched = contains_refusal_phrase(&window);
+        self.refusal_tail = window
+            .chars()
+            .rev()
+            .take(REFUSAL_TAIL_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        matched
     }
 }
 

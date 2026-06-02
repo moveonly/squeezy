@@ -196,6 +196,10 @@ pub(crate) fn accent() -> Color {
     color(token::PALETTE_ACCENT)
 }
 
+pub(crate) fn brand_accent() -> Color {
+    builtin_theme(DEFAULT_TUI_THEME_NAME).color(token::PALETTE_ACCENT)
+}
+
 pub(crate) fn secondary() -> Color {
     color(token::PALETTE_SECONDARY)
 }

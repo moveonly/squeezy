@@ -18,7 +18,9 @@ use std::{
 use futures_core::Stream;
 use futures_util::stream;
 use squeezy_agent::{Agent, AgentEvent};
-use squeezy_core::{AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, Result};
+use squeezy_core::{
+    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, Result, SessionMode, SqueezyError,
+};
 use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream};
 use tokio_util::sync::CancellationToken;
 
@@ -179,6 +181,44 @@ async fn heuristic_slam_dunk_dispatches_on_cheap_model() {
 }
 
 #[tokio::test]
+async fn cheap_model_override_alias_resolves_before_dispatch() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok, on it.")]));
+    let mut config = config_with_routing();
+    config.small_fast_model = Some("haiku".to_string());
+    let agent = Agent::new(config, provider.clone());
+    let _events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+}
+
+#[tokio::test]
+async fn plan_mode_turns_stay_on_parent_model() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("plan")]));
+    let mut config = config_with_routing();
+    config.session_mode = SessionMode::Plan;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, PARENT_MODEL);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "plan-mode parent bias must not emit cheap-route event"
+    );
+}
+
+#[tokio::test]
 async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
     // The prompt does not match the heuristic ("explain how...") so the
     // router calls the judge. Judge votes "cheap" so the next request is
@@ -205,13 +245,11 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
         "routed turn also dispatches on the cheap tier"
     );
     assert!(
-        requests[0]
-            .cache
-            .key
-            .as_deref()
-            .is_some_and(|key| key.starts_with("routing-judge-v1:")),
-        "judge request must carry the prompt-cache key"
+        requests[0].cache.key.is_none(),
+        "short judge prompt must not request provider prompt caching"
     );
+    assert_eq!(requests[0].max_output_tokens, Some(512));
+    assert_eq!(requests[0].reasoning_effort, None);
 
     let reason = events
         .iter()
@@ -221,6 +259,27 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
         })
         .expect("must emit TurnRouted with judge reason");
     assert_eq!(reason, "llm_judge");
+}
+
+#[tokio::test]
+async fn configured_judge_model_dispatches_judge_only() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply("cheap"),
+        end_turn_reply("here you go"),
+    ]));
+    let mut config = config_with_routing();
+    config.routing.judge_model = Some("sonnet".to_string());
+    let agent = Agent::new(config, provider.clone());
+    let _events = drain_until_terminal(agent.start_turn(
+        "explain how the cost broker tracks budgets".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&*requests[0].model, "claude-sonnet-4-6");
+    assert_eq!(&*requests[1].model, CHEAP_MODEL);
 }
 
 #[tokio::test]
@@ -328,6 +387,88 @@ async fn force_cheap_override_dispatches_on_cheap_tier() {
 }
 
 #[tokio::test]
+async fn force_cheap_override_wins_inside_sticky_window() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        end_turn_reply("I'm not sure how to proceed."),
+        end_turn_reply("forced cheap"),
+    ]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let _first = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    agent.request_routing_force_cheap();
+    let events = drain_until_terminal(agent.start_turn(
+        "explain the routing classifier in detail".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+    assert_eq!(&*requests[1].model, CHEAP_MODEL);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { reason, .. } if reason == "user_explicit"
+        )),
+        "explicit cheap override must not be consumed by sticky parent routing"
+    );
+}
+
+#[tokio::test]
+async fn force_cheap_override_does_not_bypass_plan_mode() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("plan")]));
+    let mut config = config_with_routing();
+    config.session_mode = SessionMode::Plan;
+    let agent = Agent::new(config, provider.clone());
+    agent.request_routing_force_cheap();
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, PARENT_MODEL);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "plan mode remains a hard parent-model gate"
+    );
+}
+
+#[tokio::test]
+async fn force_cheap_override_does_not_bypass_large_attachment() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("parent")]));
+    let mut config = config_with_routing();
+    config.routing.large_attachment_bypass_bytes = 1;
+    let agent = Agent::new(config, provider.clone());
+    agent
+        .attach_pasted_context("large pasted context".to_string())
+        .await
+        .expect("attach context");
+    agent.request_routing_force_cheap();
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, PARENT_MODEL);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "large pasted context remains a hard parent-model gate"
+    );
+}
+
+#[tokio::test]
 async fn session_disabled_blocks_implicit_routing() {
     // `set_routing_session_disabled(true)` mirrors the `/router off`
     // command. The slam-dunk prompt is still routed on parent because
@@ -347,6 +488,40 @@ async fn session_disabled_blocks_implicit_routing() {
             .iter()
             .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
         "session toggle off must suppress implicit routing"
+    );
+}
+
+#[tokio::test]
+async fn cheap_provider_error_retries_once_on_parent() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![Err(SqueezyError::ProviderStream(
+            "cheap model not found".to_string(),
+        ))],
+        end_turn_reply("parent recovered"),
+    ]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+    assert_eq!(&*requests[1].model, PARENT_MODEL);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Completed { .. })),
+        "parent retry should complete the turn"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { reason, .. }
+                if reason == "escalated_provider_error"
+        )),
+        "provider error must emit an escalation routing event"
     );
 }
 

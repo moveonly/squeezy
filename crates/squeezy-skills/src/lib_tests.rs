@@ -12,6 +12,8 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
 
+static LOG_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn bundled_skills_load_with_valid_metadata() {
     let bundled = bundled_skills();
@@ -2029,6 +2031,7 @@ impl io::Write for SharedLogWrite {
 }
 
 fn capture_discover_logs(workspace: &Path, config: &SkillsConfig) -> (SkillCatalog, String) {
+    let _guard = LOG_CAPTURE_LOCK.lock().expect("log capture lock");
     let writer = SharedLogWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)

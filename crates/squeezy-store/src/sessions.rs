@@ -1596,6 +1596,8 @@ impl SessionHandle {
                     context_attachments: self.context_attachments().unwrap_or_default(),
                     context_compaction: ContextCompactionState::default(),
                     routing_sticky_remaining_turns: 0,
+                    routing_session_disabled: false,
+                    routing_prior_turn_was_hard: false,
                 });
             }
         }
@@ -1617,6 +1619,8 @@ impl SessionHandle {
             context_attachments: self.context_attachments().unwrap_or_default(),
             context_compaction: ContextCompactionState::default(),
             routing_sticky_remaining_turns: 0,
+            routing_session_disabled: false,
+            routing_prior_turn_was_hard: false,
         })
     }
 
@@ -2467,6 +2471,17 @@ pub struct SessionResumeState {
     /// anyway).
     #[serde(default)]
     pub routing_sticky_remaining_turns: u8,
+    /// Session-level `/router off` state. Unlike force-cheap and
+    /// force-parent, this is intentionally sticky for the session and
+    /// must survive `/resume`; missing means older sessions predate the
+    /// router toggle persistence and should resume with routing enabled
+    /// according to config.
+    #[serde(default)]
+    pub routing_session_disabled: bool,
+    /// Whether the previous persisted turn was hard enough that
+    /// deictic follow-ups should bias back to the parent model.
+    #[serde(default)]
+    pub routing_prior_turn_was_hard: bool,
 }
 
 /// One entry the TUI knows how to push into its transcript on

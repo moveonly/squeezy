@@ -22,7 +22,7 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     StopReason,
 };
-use squeezy_tools::{ToolCall, ToolStatus, sha256_hex};
+use squeezy_tools::{ToolCall, ToolCostHint, ToolReceipt, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
@@ -539,6 +539,73 @@ async fn turn_stream_reports_provider_error() {
     }
 
     assert!(saw_error);
+}
+
+#[test]
+fn routing_session_disabled_persists_resume_snapshot() {
+    let root = temp_workspace("routing-disabled-resume");
+    let config = AppConfig {
+        workspace_root: root,
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config.clone(), Arc::new(MockProvider::new(Vec::new())));
+    let session_id = agent.session_id().expect("session id");
+
+    agent.set_routing_session_disabled(true);
+
+    let store = squeezy_store::SessionStore::open(&config);
+    let resume = store
+        .open_session(session_id)
+        .read_resume_state()
+        .expect("resume state");
+    assert!(resume.routing_session_disabled);
+}
+
+#[tokio::test]
+async fn routing_session_disabled_persists_after_busy_state_lock() {
+    let root = temp_workspace("routing-disabled-busy-resume");
+    let config = AppConfig {
+        workspace_root: root,
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config.clone(), Arc::new(MockProvider::new(Vec::new())));
+    let session_id = agent.session_id().expect("session id");
+
+    let guard = agent.conversation_state.lock().await;
+    agent.set_routing_session_disabled(true);
+    assert!(!guard.routing_session_disabled());
+    drop(guard);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if agent
+                .conversation_state
+                .lock()
+                .await
+                .routing_session_disabled()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background resume update");
+
+    let store = squeezy_store::SessionStore::open(&config);
+    let resume = store
+        .open_session(session_id)
+        .read_resume_state()
+        .expect("resume state");
+    assert!(resume.routing_session_disabled);
 }
 
 #[tokio::test]
@@ -5088,6 +5155,16 @@ fn subagent_kind_role_does_not_overlay_delegate() {
     );
 }
 
+#[test]
+fn explore_model_alias_resolves_before_subagent_dispatch() {
+    let mut config = AppConfig::default();
+    config.subagents.explore_model = Some("haiku".to_string());
+
+    let model = subagent_model_for_kind("anthropic", &config, SubagentKind::Explore);
+
+    assert_eq!(model, "claude-haiku-4-5-20251001");
+}
+
 /// Parent tool advertisement that mixes typical read/search tools with a
 /// representative mutating tool for every non-read capability. The mutating
 /// names cover the audit's named risks (`write_file`, `shell`, `apply_patch`)
@@ -8784,6 +8861,142 @@ fn attachment_shape_excludes_removed_stored_bytes() {
     assert_eq!(shape.active, 1);
     assert_eq!(shape.removed, 1);
     assert_eq!(shape.total, 2);
+}
+
+#[test]
+fn large_non_image_attachment_threshold_ignores_images_and_removed_items() {
+    fn make(
+        id: &str,
+        kind: ContextAttachmentKind,
+        status: ContextAttachmentStatus,
+        bytes: usize,
+    ) -> ContextAttachment {
+        ContextAttachment {
+            id: id.to_string(),
+            source: ContextAttachmentSource::Paste,
+            kind,
+            status,
+            label: id.to_string(),
+            path: None,
+            original_sha256: String::new(),
+            redacted_sha256: None,
+            original_bytes: bytes,
+            stored_bytes: bytes,
+            preview_bytes: 0,
+            redactions: 0,
+            preview: String::new(),
+            truncated: false,
+            image_media_type: None,
+            image_data_base64: None,
+        }
+    }
+
+    let attachments = vec![
+        make(
+            "text",
+            ContextAttachmentKind::Text,
+            ContextAttachmentStatus::Attached,
+            4096,
+        ),
+        make(
+            "image",
+            ContextAttachmentKind::Image,
+            ContextAttachmentStatus::Attached,
+            100_000,
+        ),
+        make(
+            "removed",
+            ContextAttachmentKind::Log,
+            ContextAttachmentStatus::Removed,
+            100_000,
+        ),
+    ];
+
+    assert!(has_large_non_image_attachment(&attachments, 4096));
+    assert!(!has_large_non_image_attachment(&attachments, 4097));
+    assert!(!has_large_non_image_attachment(&attachments, 0));
+}
+
+#[test]
+fn tool_round_path_collector_counts_distinct_path_like_values() {
+    let calls = vec![ToolCall {
+        call_id: "call-1".to_string(),
+        name: "grep".to_string(),
+        arguments: json!({
+            "paths": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"],
+        }),
+    }];
+    let result = squeezy_tools::ToolResult {
+        call_id: "call-1".to_string(),
+        tool_name: "grep".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "matches": [
+                {"path": "src/e.rs"},
+                {"path": "src/f.rs"},
+                {"path": "src/g.rs"},
+                {"path": "src/h.rs"}
+            ]
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let pending = SeenToolOutputs::default().prepare_results(vec![result]);
+    let mut paths = BTreeSet::new();
+
+    let observed = collect_tool_round_paths(&calls, &pending, 3, &mut paths);
+
+    assert_eq!(observed, 1);
+    assert_eq!(paths.len(), ROUTING_DIVERSITY_DISTINCT_PATHS);
+}
+
+#[test]
+fn tool_round_path_collector_ignores_dotted_non_path_tokens() {
+    let calls = vec![ToolCall {
+        call_id: "call-1".to_string(),
+        name: "grep".to_string(),
+        arguments: json!({
+            "pattern": "example.com",
+            "version": "3.14",
+            "symbol": "foo.bar",
+        }),
+    }];
+    let result = squeezy_tools::ToolResult {
+        call_id: "call-1".to_string(),
+        tool_name: "grep".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "matches": [
+                {"text": "example.com"},
+                {"text": "3.14"},
+                {"text": "foo.bar"},
+                {"text": "v1.2.3"},
+                {"path": "lib.rs"},
+                {"path": "src/main.rs"}
+            ],
+            "summary": "saw 3.14 and example.com in foo.bar"
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let pending = SeenToolOutputs::default().prepare_results(vec![result]);
+    let mut paths = BTreeSet::new();
+
+    let observed = collect_tool_round_paths(&calls, &pending, 3, &mut paths);
+
+    assert_eq!(observed, 1);
+    assert_eq!(
+        paths,
+        BTreeSet::from(["lib.rs".to_string(), "src/main.rs".to_string()])
+    );
 }
 
 #[test]

@@ -35,7 +35,7 @@ pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
-pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
+pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-sonnet-4-6";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 /// Synthetic model id for the in-process faux provider. The faux
@@ -55,6 +55,7 @@ pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
 pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERTEX_SMALL_FAST_MODEL: &str = "google/gemini-2.5-flash";
 
 /// Returns the built-in small-fast-model id for `provider`. `provider` is the
 /// canonical short name (`provider_kind`/`LlmProvider::name`). Returns `None`
@@ -71,6 +72,7 @@ pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
         "openrouter" => Some(OPENROUTER_SMALL_FAST_MODEL),
         "vercel" => Some(VERCEL_SMALL_FAST_MODEL),
         "portkey" => Some(PORTKEY_SMALL_FAST_MODEL),
+        "vertex" => Some(VERTEX_SMALL_FAST_MODEL),
         _ => None,
     }
 }
@@ -157,7 +159,7 @@ pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> 
         ("openai" | "azure_openai", "best") => Some(DEFAULT_OPENAI_MODEL),
         ("bedrock", "opus" | "best") => Some(DEFAULT_BEDROCK_MODEL),
         ("bedrock", "sonnet") => Some(DEFAULT_BEDROCK_MODEL),
-        ("bedrock", "haiku") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "haiku") => Some(BEDROCK_SMALL_FAST_MODEL),
         ("google", "opus" | "best") => Some(DEFAULT_GOOGLE_MODEL),
         ("google", "sonnet") => Some("gemini-2.5-flash"),
         ("google", "haiku") => Some("gemini-2.5-flash-lite"),
@@ -240,6 +242,7 @@ pub const DEFAULT_ROUTING_AUTO_CHEAP_LLM_JUDGE: bool = true;
 pub const DEFAULT_ROUTING_CHEAP_ESCALATION_ERROR_THRESHOLD: u8 = 2;
 pub const DEFAULT_ROUTING_ESCALATION_STICKY_TURNS: u8 = 3;
 pub const DEFAULT_ROUTING_BYPASS_FOR_IMAGES: bool = true;
+pub const DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES: u32 = 4_096;
 /// Char-budget gate for the heuristic prefilter. Prompts longer than
 /// this skip the slam-dunk path and fall through to the borderline
 /// judge (or `Parent`). Sized at ~400 tokens of English at 5 chars/tok.
@@ -1354,6 +1357,10 @@ impl AppConfig {
             self.routing.bypass_for_images
         ));
         output.push_str(&format!(
+            "large_attachment_bypass_bytes = {}\n",
+            self.routing.large_attachment_bypass_bytes
+        ));
+        output.push_str(&format!(
             "heuristic_max_chars = {}\n",
             self.routing.heuristic_max_chars
         ));
@@ -1361,6 +1368,11 @@ impl AppConfig {
             "judge_max_chars = {}\n",
             self.routing.judge_max_chars
         ));
+        if let Some(judge_model) = &self.routing.judge_model {
+            output.push_str(&format!("judge_model = {}\n", toml_string(judge_model)));
+        } else {
+            output.push_str("# judge_model = unset  # defaults to the cheap tier\n");
+        }
         if self.routing.extra_heuristic_verbs.is_empty() {
             output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
         } else {
@@ -3321,8 +3333,10 @@ pub struct RoutingConfig {
     pub cheap_escalation_error_threshold: u8,
     pub escalation_sticky_turns: u8,
     pub bypass_for_images: bool,
+    pub large_attachment_bypass_bytes: u32,
     pub heuristic_max_chars: u32,
     pub judge_max_chars: u32,
+    pub judge_model: Option<String>,
     /// User-extended heuristic verb whitelist. The built-in whitelist
     /// is deliberately narrow because false positives bypass the LLM
     /// judge — adding an entry here widens the heuristic surface but
@@ -3376,6 +3390,11 @@ impl RoutingConfig {
                         .bypass_for_images
                         .unwrap_or(DEFAULT_ROUTING_BYPASS_FOR_IMAGES),
                 ),
+            large_attachment_bypass_bytes: get_var("SQUEEZY_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .or(settings.large_attachment_bypass_bytes)
+                .unwrap_or(DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES),
             heuristic_max_chars: get_var("SQUEEZY_ROUTING_HEURISTIC_MAX_CHARS")
                 .as_deref()
                 .and_then(|raw| raw.parse::<u32>().ok())
@@ -3386,6 +3405,7 @@ impl RoutingConfig {
                 .and_then(|raw| raw.parse::<u32>().ok())
                 .or(settings.judge_max_chars)
                 .unwrap_or(DEFAULT_ROUTING_JUDGE_MAX_CHARS),
+            judge_model: get_var("SQUEEZY_ROUTING_JUDGE_MODEL").or(settings.judge_model),
             extra_heuristic_verbs: get_var("SQUEEZY_ROUTING_EXTRA_HEURISTIC_VERBS")
                 .map(|raw| {
                     raw.split(',')
@@ -3420,8 +3440,10 @@ pub struct RoutingSettings {
     pub cheap_escalation_error_threshold: Option<u8>,
     pub escalation_sticky_turns: Option<u8>,
     pub bypass_for_images: Option<bool>,
+    pub large_attachment_bypass_bytes: Option<u32>,
     pub heuristic_max_chars: Option<u32>,
     pub judge_max_chars: Option<u32>,
+    pub judge_model: Option<String>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
 }
 
@@ -3436,8 +3458,10 @@ impl RoutingSettings {
                 "cheap_escalation_error_threshold",
                 "escalation_sticky_turns",
                 "bypass_for_images",
+                "large_attachment_bypass_bytes",
                 "heuristic_max_chars",
                 "judge_max_chars",
+                "judge_model",
                 "extra_heuristic_verbs",
             ],
             source,
@@ -3475,6 +3499,12 @@ impl RoutingSettings {
                 source,
                 &field(path, "bypass_for_images"),
             )?,
+            large_attachment_bypass_bytes: u32_value(
+                table,
+                "large_attachment_bypass_bytes",
+                source,
+                &field(path, "large_attachment_bypass_bytes"),
+            )?,
             heuristic_max_chars: u32_value(
                 table,
                 "heuristic_max_chars",
@@ -3487,6 +3517,7 @@ impl RoutingSettings {
                 source,
                 &field(path, "judge_max_chars"),
             )?,
+            judge_model: string_value(table, "judge_model", source, &field(path, "judge_model"))?,
             extra_heuristic_verbs: string_array_value(
                 table,
                 "extra_heuristic_verbs",
@@ -3512,8 +3543,13 @@ impl RoutingSettings {
             next.escalation_sticky_turns,
         );
         replace_if_some(&mut self.bypass_for_images, next.bypass_for_images);
+        replace_if_some(
+            &mut self.large_attachment_bypass_bytes,
+            next.large_attachment_bypass_bytes,
+        );
         replace_if_some(&mut self.heuristic_max_chars, next.heuristic_max_chars);
         replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
+        replace_if_some(&mut self.judge_model, next.judge_model);
         merge_string_lists(&mut self.extra_heuristic_verbs, next.extra_heuristic_verbs);
     }
 }
@@ -11001,6 +11037,11 @@ pub struct SessionMetrics {
     /// the parent model.
     #[serde(default)]
     pub routing_estimated_savings_usd_micros: u64,
+    /// Cumulative net routing savings. Unlike
+    /// `routing_estimated_savings_usd_micros`, this signed value can
+    /// show tiny net-negative routed turns.
+    #[serde(default)]
+    pub routing_estimated_net_savings_usd_micros: i64,
 }
 
 impl SessionMetrics {
@@ -11046,6 +11087,9 @@ impl SessionMetrics {
         self.routing_estimated_savings_usd_micros = self
             .routing_estimated_savings_usd_micros
             .saturating_add(turn.routing_estimated_savings_usd_micros);
+        self.routing_estimated_net_savings_usd_micros = self
+            .routing_estimated_net_savings_usd_micros
+            .saturating_add(turn.routing_estimated_net_savings_usd_micros);
     }
 }
 
@@ -11085,6 +11129,12 @@ pub struct TurnMetrics {
     /// heuristic fired (no judge call) or routing was disabled.
     #[serde(default)]
     pub routing_judge_usd_micros: u64,
+    /// Provider usage from the cheap-tier main turn only. Excludes the
+    /// routing judge and any parent-model work after escalation so
+    /// routing savings can be estimated from the tokens that actually
+    /// benefited from cheap dispatch.
+    #[serde(default)]
+    pub routing_cheap_main_provider: CostSnapshot,
     /// True when the turn's first LLM round dispatched on the cheap
     /// tier rather than the user's configured parent model.
     #[serde(default)]
@@ -11100,6 +11150,11 @@ pub struct TurnMetrics {
     /// model registry has no pricing for either side.
     #[serde(default)]
     pub routing_estimated_savings_usd_micros: u64,
+    /// Signed net routing savings for this turn. Positive means the
+    /// cheap path saved money versus the parent estimate; negative
+    /// means judge/cheap overhead exceeded the estimated parent cost.
+    #[serde(default)]
+    pub routing_estimated_net_savings_usd_micros: i64,
 }
 
 impl TurnMetrics {

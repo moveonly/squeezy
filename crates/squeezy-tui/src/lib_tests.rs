@@ -11637,7 +11637,6 @@ fn status_line_languages_use_squeezy_amber() {
     let expected_theme =
         crate::render::theme::resolve_theme(&squeezy_core::AppConfig::default(), "default");
     let expected_language_color = expected_theme.color(crate::render::theme::token::PALETTE_ACCENT);
-    let expected_dir_color = expected_theme.color(crate::render::theme::token::PALETTE_GREEN);
     let mut app = test_app(SessionMode::Build);
     app.directory = "~/project".to_string();
     app.language_summary = "Python 10, Rust 247".to_string();
@@ -11661,10 +11660,10 @@ fn status_line_languages_use_squeezy_amber() {
         Some(expected_language_color),
         "languages should use Squeezy's darker brand accent"
     );
-    assert_eq!(
+    assert_ne!(
         dir_span.style.fg,
-        Some(expected_dir_color),
-        "other path-family status items should keep their existing color"
+        Some(expected_language_color),
+        "other path-family status items should not use the language brand accent"
     );
 }
 

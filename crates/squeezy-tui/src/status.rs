@@ -330,7 +330,7 @@ pub(crate) fn render_status_detail_line(
         }
         let mut style = if use_theme_colors {
             let color = if matches!(*item, StatusLineItem::Languages) {
-                crate::render::theme::accent()
+                crate::render::theme::brand_accent()
             } else {
                 StatusLineAccent::for_item(*item).fallback_color()
             };

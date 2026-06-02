@@ -18,15 +18,16 @@ use futures_util::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
-    ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
-    ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL,
-    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionPolicyMode,
-    PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
-    StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig,
-    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
-    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
+    ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
+    ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot,
+    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE,
+    PermissionAction, PermissionCapability, PermissionPolicyMode, PermissionRequest,
+    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
+    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
+    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
+    default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
@@ -195,6 +196,8 @@ struct ConversationState {
     /// router's cross-turn state without a parallel plumbing change.
     /// Read back into the live router on `Agent::resume`.
     routing_sticky_remaining_turns: u8,
+    routing_session_disabled: bool,
+    routing_prior_turn_was_hard: bool,
 }
 
 impl ConversationState {
@@ -214,6 +217,8 @@ impl ConversationState {
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
+            routing_session_disabled: state.routing_session_disabled,
+            routing_prior_turn_was_hard: state.routing_prior_turn_was_hard,
         }
     }
 
@@ -223,6 +228,22 @@ impl ConversationState {
 
     fn set_routing_sticky_remaining_turns(&mut self, value: u8) {
         self.routing_sticky_remaining_turns = value;
+    }
+
+    fn routing_session_disabled(&self) -> bool {
+        self.routing_session_disabled
+    }
+
+    fn set_routing_session_disabled(&mut self, disabled: bool) {
+        self.routing_session_disabled = disabled;
+    }
+
+    fn routing_prior_turn_was_hard(&self) -> bool {
+        self.routing_prior_turn_was_hard
+    }
+
+    fn set_routing_prior_turn_was_hard(&mut self, hard: bool) {
+        self.routing_prior_turn_was_hard = hard;
     }
 
     fn to_resume_state(&self) -> SessionResumeState {
@@ -247,6 +268,8 @@ impl ConversationState {
             context_attachments: self.context_attachments.clone(),
             context_compaction: self.context_compaction.clone(),
             routing_sticky_remaining_turns: self.routing_sticky_remaining_turns,
+            routing_session_disabled: self.routing_session_disabled,
+            routing_prior_turn_was_hard: self.routing_prior_turn_was_hard,
         }
     }
 }
@@ -1337,6 +1360,7 @@ impl Agent {
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
         let routing_sticky_remaining = conversation_state.routing_sticky_remaining_turns();
+        let routing_session_disabled = conversation_state.routing_session_disabled();
         let agent = Self::build(
             config,
             provider,
@@ -1344,12 +1368,15 @@ impl Agent {
             conversation_state,
             None,
         );
-        if routing_sticky_remaining > 0 {
+        if routing_sticky_remaining > 0 || routing_session_disabled {
             // Honour the persisted sticky window so a follow-up
             // prompt on a resumed mid-hard-task session continues to
-            // skip the per-turn router until the window expires.
+            // skip the per-turn router until the window expires. Also
+            // honour `/router off`, which is session state rather than
+            // a one-shot override.
             let mut state = agent.routing_state.lock().expect("routing state lock");
             state.sticky.remaining_turns = routing_sticky_remaining;
+            state.pending_override.session_disabled = routing_session_disabled;
         }
         let _ = handle.update_metadata(|metadata| {
             metadata.status = SessionStatus::Running;
@@ -1686,6 +1713,26 @@ impl Agent {
     pub fn set_routing_session_disabled(&self, disabled: bool) {
         let mut state = self.routing_state.lock().expect("routing state lock");
         state.pending_override.session_disabled = disabled;
+        drop(state);
+        if let Ok(mut conversation_state) = self.conversation_state.try_lock() {
+            conversation_state.set_routing_session_disabled(disabled);
+            if let Some(session) = &self.session_log {
+                let _ = session.write_resume_state(&conversation_state.to_resume_state());
+            }
+            return;
+        }
+        let conversation_state = self.conversation_state.clone();
+        let session_log = self.session_log.clone();
+        tokio::spawn(async move {
+            let resume = {
+                let mut conversation_state = conversation_state.lock().await;
+                conversation_state.set_routing_session_disabled(disabled);
+                conversation_state.to_resume_state()
+            };
+            if let Some(session) = session_log {
+                let _ = session.write_resume_state(&resume);
+            }
+        });
     }
 
     /// Test-only handle to the subagent registry so callers can
@@ -5303,6 +5350,13 @@ impl TurnRuntime {
                 parent_model: &parent_model_str,
                 config: &self.config,
                 has_image_input: !image_items.is_empty(),
+                has_large_attachment: has_large_non_image_attachment(
+                    &active_attachments,
+                    self.config.routing.large_attachment_bypass_bytes,
+                ),
+                turn_index: self.turn_id.get(),
+                prior_turn_was_hard: prior_state.routing_prior_turn_was_hard(),
+                session_mode: active_mode,
                 overrides: routing_override,
                 sticky: sticky_active,
             },
@@ -5353,6 +5407,9 @@ impl TurnRuntime {
             }
         }
         let mut escalation_state = turn_router::EscalationState::default();
+        let mut cheap_provider_error_retry_used = false;
+        let mut routing_diversity_results_seen = 0u64;
+        let mut routing_diversity_paths = BTreeSet::new();
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -5377,12 +5434,12 @@ impl TurnRuntime {
                 let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
                 let projected_output_tokens = CostBroker::projected_output_tokens(
                     self.config.max_output_tokens,
-                    squeezy_llm::model_info_for(self.provider.name(), &self.config.model)
+                    squeezy_llm::model_info_for(self.provider.name(), &current_model)
                         .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
                 );
                 broker.projected_session_cap_overrun(
                     self.provider.name(),
-                    &self.config.model,
+                    &current_model,
                     projected_input_tokens,
                     projected_output_tokens,
                 )
@@ -5444,7 +5501,7 @@ impl TurnRuntime {
                     broker.metrics.tool_calls,
                     broker.metrics.tool_errors,
                     broker.metrics.budget_denials,
-                    &assistant_message,
+                    "",
                     on_cheap_turn,
                     &self.config.routing,
                     self.config.max_tool_calls_per_turn,
@@ -5536,10 +5593,23 @@ impl TurnRuntime {
             // zero.
             let mut round_output_bytes: u64 = 0;
 
-            while let Some(event) =
-                next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
-                    .await?
-            {
+            let mut provider_stream_error = None;
+            loop {
+                let Some(event) = (match next_llm_stream_event(
+                    &mut stream,
+                    &self.cancel,
+                    self.config.stream_idle_timeout,
+                )
+                .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        provider_stream_error = Some(error);
+                        break;
+                    }
+                }) else {
+                    break;
+                };
                 if self.cancel.is_cancelled() {
                     if let Some(tail) = self
                         .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
@@ -5634,13 +5704,14 @@ impl TurnRuntime {
                             }
                         }
                         round_text_started = true;
-                        self.record_replay_model_text_delta(&chunk.text);
-                        assistant_message.push_str(&chunk.text);
+                        let delta = chunk.text;
+                        self.record_replay_model_text_delta(&delta);
+                        assistant_message.push_str(&delta);
                         if self
                             .tx
                             .send(AgentEvent::AssistantDelta {
                                 turn_id: self.turn_id,
-                                delta: chunk.text,
+                                delta: delta.clone(),
                             })
                             .await
                             .is_err()
@@ -5648,15 +5719,14 @@ impl TurnRuntime {
                             return Ok(());
                         }
                         // Mid-stream escalation: a refusal phrase in
-                        // the assistant text flips the router to the
-                        // parent model *immediately* instead of
+                        // the new assistant text flips the router to
+                        // the parent model *immediately* instead of
                         // waiting for the next round's preflight
-                        // check. The detector latches on first
-                        // trigger so polling every delta cannot
-                        // double-emit, and the input is the full
-                        // accumulated `assistant_message` so a
-                        // phrase straddling two deltas still
-                        // matches. Tool-call ceiling and error
+                        // check. The detector carries a short tail so
+                        // a phrase straddling two deltas still
+                        // matches without rescanning the full
+                        // accumulated assistant buffer. Tool-call
+                        // ceiling and error
                         // threshold are also re-evaluated here for
                         // free; they only flip when the round-end
                         // accounting would have caught them anyway,
@@ -5666,7 +5736,7 @@ impl TurnRuntime {
                                 broker.metrics.tool_calls,
                                 broker.metrics.tool_errors,
                                 broker.metrics.budget_denials,
-                                &assistant_message,
+                                &delta,
                                 on_cheap_turn,
                                 &self.config.routing,
                                 self.config.max_tool_calls_per_turn,
@@ -5779,6 +5849,11 @@ impl TurnRuntime {
                                 estimate_cost(self.provider.name(), &request_model, &cost);
                         }
                         let warning = broker.record_provider_cost(&cost);
+                        if broker.metrics.routed_to_cheap
+                            && request_model.as_ref() != parent_model_str.as_str()
+                        {
+                            merge_cost(&mut broker.metrics.routing_cheap_main_provider, &cost);
+                        }
                         broker.calibration.record_sample(
                             self.provider.name(),
                             request_input_bytes,
@@ -5837,6 +5912,46 @@ impl TurnRuntime {
                     }
                     LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
                 }
+            }
+
+            if let Some(error) = provider_stream_error {
+                if on_cheap_turn
+                    && !cheap_provider_error_retry_used
+                    && round_output_bytes == 0
+                    && tool_calls.is_empty()
+                    && !round_text_started
+                {
+                    cheap_provider_error_retry_used = true;
+                    let reason = turn_router::EscalationReason::ProviderError;
+                    let from_model = current_model.to_string();
+                    current_model = parent_model.clone();
+                    on_cheap_turn = false;
+                    broker.metrics.escalated_to_parent = true;
+                    let sticky_remaining = {
+                        let mut state = self.routing_state.lock().expect("routing state lock");
+                        state
+                            .sticky
+                            .engage(self.config.routing.escalation_sticky_turns);
+                        state.sticky.remaining_turns
+                    };
+                    self.conversation_state
+                        .lock()
+                        .await
+                        .set_routing_sticky_remaining_turns(sticky_remaining);
+                    self.telemetry
+                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::TurnRouted {
+                            turn_id: self.turn_id,
+                            from: from_model,
+                            to: parent_model_str.clone(),
+                            reason: format!("escalated_{}", reason.as_str()),
+                        })
+                        .await;
+                    continue;
+                }
+                return Err(error);
             }
 
             if !completed {
@@ -6208,6 +6323,45 @@ impl TurnRuntime {
                 broker.record_model_result(&pending.result);
             }
             seen_tool_outputs.remember_results(&results);
+            if on_cheap_turn && routing_diversity_results_seen < ROUTING_DIVERSITY_RESULT_WINDOW {
+                let observed = collect_tool_round_paths(
+                    &tool_calls,
+                    &results,
+                    ROUTING_DIVERSITY_RESULT_WINDOW - routing_diversity_results_seen,
+                    &mut routing_diversity_paths,
+                );
+                routing_diversity_results_seen =
+                    routing_diversity_results_seen.saturating_add(observed);
+                if routing_diversity_paths.len() >= ROUTING_DIVERSITY_DISTINCT_PATHS {
+                    let reason = turn_router::EscalationReason::ToolDiversity;
+                    let from_model = current_model.to_string();
+                    current_model = parent_model.clone();
+                    on_cheap_turn = false;
+                    broker.metrics.escalated_to_parent = true;
+                    let sticky_remaining = {
+                        let mut state = self.routing_state.lock().expect("routing state lock");
+                        state
+                            .sticky
+                            .engage(self.config.routing.escalation_sticky_turns);
+                        state.sticky.remaining_turns
+                    };
+                    self.conversation_state
+                        .lock()
+                        .await
+                        .set_routing_sticky_remaining_turns(sticky_remaining);
+                    self.telemetry
+                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::TurnRouted {
+                            turn_id: self.turn_id,
+                            from: from_model,
+                            to: parent_model_str.clone(),
+                            reason: format!("escalated_{}", reason.as_str()),
+                        })
+                        .await;
+                }
+            }
 
             // Capture each tool result's terminal status alongside its
             // model-visible output so the post-commit `PostTool` hook
@@ -6466,10 +6620,17 @@ impl TurnRuntime {
         if !metrics.routed_to_cheap {
             return;
         }
+        let net = turn_router::estimate_routing_net_savings(
+            self.provider.name(),
+            &self.config.model,
+            &metrics.routing_cheap_main_provider,
+            metrics.routing_judge_usd_micros,
+        );
+        metrics.routing_estimated_net_savings_usd_micros = net;
         metrics.routing_estimated_savings_usd_micros = turn_router::estimate_routing_savings(
             self.provider.name(),
             &self.config.model,
-            &metrics.provider,
+            &metrics.routing_cheap_main_provider,
         );
     }
 
@@ -6580,6 +6741,9 @@ impl TurnRuntime {
             state.metrics.merge_turn(metrics);
             state.redactions += metrics.redactions;
             state.token_calibration = token_calibration.clone();
+            state.set_routing_prior_turn_was_hard(
+                metrics.escalated_to_parent || !metrics.routed_to_cheap,
+            );
             if let Some(session) = &self.session_log {
                 let _ = session.write_resume_state(&state.to_resume_state());
                 let calibration_for_metadata = state.token_calibration.clone();
@@ -8954,6 +9118,111 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+// Predictive escalation watches the first few tool results for one
+// broad result that spans many files, not a long sequence of
+// one-file reads. The normal tool-call ceiling handles sequential
+// call sprawl.
+const ROUTING_DIVERSITY_RESULT_WINDOW: u64 = 3;
+const ROUTING_DIVERSITY_DISTINCT_PATHS: usize = 8;
+
+fn collect_tool_round_paths(
+    calls: &[ToolCall],
+    results: &[PendingToolResult],
+    remaining_window: u64,
+    paths: &mut BTreeSet<String>,
+) -> u64 {
+    let mut observed = 0u64;
+    for pending in results {
+        if observed >= remaining_window {
+            break;
+        }
+        if let Some(call) = calls
+            .iter()
+            .find(|call| call.call_id == pending.result.call_id)
+        {
+            collect_path_like_values(&call.arguments, paths);
+        }
+        collect_path_like_values(&pending.result.content, paths);
+        observed += 1;
+    }
+    observed
+}
+
+fn collect_path_like_values(value: &Value, paths: &mut BTreeSet<String>) {
+    collect_path_like_values_with_key(None, value, paths);
+}
+
+fn collect_path_like_values_with_key(
+    parent_key: Option<&str>,
+    value: &Value,
+    paths: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::String(text) if looks_path_like(text, parent_key.is_some_and(is_path_key)) => {
+            paths.insert(text.to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_path_like_values_with_key(parent_key, item, paths);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                collect_path_like_values_with_key(Some(key.as_str()), value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_path_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "path"
+            | "paths"
+            | "filepath"
+            | "filepaths"
+            | "filename"
+            | "filenames"
+            | "file"
+            | "files"
+            | "sourcepath"
+            | "targetpath"
+            | "oldpath"
+            | "newpath"
+            | "frompath"
+            | "topath"
+            | "relativepath"
+            | "absolutepath"
+            | "workspacepath"
+    )
+}
+
+fn looks_path_like(text: &str, allow_bare_file: bool) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 3 || trimmed.contains('\n') {
+        return false;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return false;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    if allow_bare_file
+        && (trimmed.starts_with('.') || Path::new(trimmed).extension().is_some())
+        && !trimmed.chars().any(char::is_whitespace)
+    {
+        return true;
+    }
+    false
+}
+
 fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> String {
     match kind {
         SubagentKind::Delegate => {
@@ -8993,11 +9262,12 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         .map(|role| role_config(role).model_policy)
         .unwrap_or(RoleModelPolicy::Parent);
     match (kind, policy) {
-        (SubagentKind::Explore, _) => {
-            config.subagents.explore_model.clone().unwrap_or_else(|| {
-                cheap_model_for(provider, config).unwrap_or(parent_model.clone())
-            })
-        }
+        (SubagentKind::Explore, _) => config
+            .subagents
+            .explore_model
+            .clone()
+            .map(|model| resolve_model_alias_owned(provider, model))
+            .unwrap_or_else(|| cheap_model_for(provider, config).unwrap_or(parent_model.clone())),
         (SubagentKind::DocHelp, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
@@ -9014,15 +9284,21 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
 /// cheap tier exists.
 pub(crate) fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
     if let Some(model) = config.small_fast_model.clone() {
-        return Some(model);
+        return Some(resolve_model_alias_owned(provider, model));
     }
     if let Some(model) = squeezy_core::small_fast_model_for_provider(provider) {
-        return Some(model.to_string());
+        return Some(resolve_model_alias_owned(provider, model.to_string()));
     }
     match provider {
         "ollama" => Some(DEFAULT_OLLAMA_MODEL.to_string()),
         _ => None,
     }
+}
+
+fn resolve_model_alias_owned(provider: &str, model: String) -> String {
+    squeezy_core::resolve_model_alias(provider, &model)
+        .unwrap_or(&model)
+        .to_string()
 }
 
 const DELEGATE_SUBAGENT_TOOL_NAMES: &[&str] = &[
@@ -12782,6 +13058,19 @@ fn image_input_items_for_attachments(attachments: &[ContextAttachment]) -> Vec<L
         });
     }
     items
+}
+
+fn has_large_non_image_attachment(attachments: &[ContextAttachment], threshold: u32) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    attachments
+        .iter()
+        .filter(|attachment| attachment.is_active())
+        .filter(|attachment| attachment.kind != ContextAttachmentKind::Image)
+        .map(|attachment| attachment.original_bytes as u64)
+        .sum::<u64>()
+        >= u64::from(threshold)
 }
 
 fn format_user_text_with_context(input: &str, attachments: &[ContextAttachment]) -> String {

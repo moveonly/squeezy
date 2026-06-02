@@ -295,9 +295,6 @@ impl CostBroker {
         {
             self.metrics.negative_receipt_hits += 1;
         }
-        if is_budget_denied(result) {
-            self.metrics.budget_denials += 1;
-        }
     }
 }
 

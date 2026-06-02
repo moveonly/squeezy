@@ -5,7 +5,7 @@ use squeezy_core::{
 
 use super::{
     CheapReason, EscalationReason, EscalationState, contains_refusal_phrase,
-    estimate_routing_savings,
+    estimate_routing_net_savings, estimate_routing_savings,
 };
 
 /// Test-only wrapper that keeps the previous `Option<&'static str>`
@@ -28,8 +28,10 @@ fn default_routing_config() -> RoutingConfig {
         cheap_escalation_error_threshold: 2,
         escalation_sticky_turns: 3,
         bypass_for_images: true,
+        large_attachment_bypass_bytes: squeezy_core::DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES,
         heuristic_max_chars: DEFAULT_ROUTING_HEURISTIC_MAX_CHARS,
         judge_max_chars: DEFAULT_ROUTING_JUDGE_MAX_CHARS,
+        judge_model: None,
         extra_heuristic_verbs: Vec::new(),
     }
 }
@@ -110,6 +112,13 @@ fn heuristic_rejects_long_prompts_over_char_budget() {
 }
 
 #[test]
+fn heuristic_length_budget_counts_chars_not_bytes() {
+    let mut cfg = default_routing_config();
+    cfg.heuristic_max_chars = 5;
+    assert_eq!(heuristic_slam_dunk("run \u{00e9}", &cfg), Some("run"));
+}
+
+#[test]
 fn heuristic_rejects_too_many_words() {
     let cfg = default_routing_config();
     let wordy =
@@ -152,6 +161,31 @@ fn heuristic_rejects_compound_then_clauses() {
         None,
         "and-verify compound must defer"
     );
+    assert_eq!(
+        heuristic_slam_dunk("rename foo,then run cargo test", &cfg),
+        None,
+        "comma-then without whitespace must defer"
+    );
+    assert_eq!(
+        heuristic_slam_dunk("checkout main; deploy prod", &cfg),
+        None,
+        "semicolon compound with second step verb must defer"
+    );
+    assert_eq!(
+        heuristic_slam_dunk("run test.Then commit.Then push", &cfg),
+        None,
+        "sentence chain without whitespace must defer"
+    );
+}
+
+#[test]
+fn heuristic_does_not_match_compound_connector_inside_words() {
+    let cfg = default_routing_config();
+    assert_eq!(
+        heuristic_slam_dunk("run the command checker", &cfg),
+        Some("run"),
+        "connector words must be token-aware"
+    );
 }
 
 #[test]
@@ -170,6 +204,20 @@ fn heuristic_rejects_ambiguous_scope_targets() {
     // "legacy" implies cross-file reasoning even though the imperative is clean.
     assert_eq!(
         heuristic_slam_dunk("delete the legacy auth module", &cfg),
+        None
+    );
+}
+
+#[test]
+fn heuristic_rejects_care_and_effort_cues() {
+    let cfg = default_routing_config();
+    assert_eq!(
+        heuristic_slam_dunk("rename foo to bar carefully", &cfg),
+        None
+    );
+    assert_eq!(heuristic_slam_dunk("run cargo test safely", &cfg), None);
+    assert_eq!(
+        heuristic_slam_dunk("checkout main without breaking local changes", &cfg),
         None
     );
 }
@@ -207,12 +255,37 @@ fn heuristic_rejects_unknown_imperative() {
 #[test]
 fn refusal_phrases_detected_case_insensitively() {
     assert!(contains_refusal_phrase("Hmm, I'm not sure how to proceed."));
-    assert!(contains_refusal_phrase("This is complex, let me think."));
     assert!(contains_refusal_phrase(
-        "I cannot resolve this without more context."
+        "I cannot proceed without more context."
+    ));
+    assert!(contains_refusal_phrase(
+        "Need more context before I continue."
     ));
     assert!(!contains_refusal_phrase("Running cargo test now."));
+    assert!(!contains_refusal_phrase(
+        "The linker is unable to find libfoo."
+    ));
+    assert!(!contains_refusal_phrase(
+        "I can't reproduce the panic, so the fix is good."
+    ));
+    assert!(!contains_refusal_phrase(
+        "This is complex, so I checked the call graph."
+    ));
     assert!(!contains_refusal_phrase(""));
+}
+
+#[test]
+fn refusal_detector_handles_phrases_split_across_deltas() {
+    let cfg = default_routing_config();
+    let mut state = EscalationState::default();
+    assert_eq!(
+        state.maybe_trigger(0, 0, 0, "I'm not", true, &cfg, 10_000),
+        None
+    );
+    assert_eq!(
+        state.maybe_trigger(0, 0, 0, " sure how to continue.", true, &cfg, 10_000),
+        Some(EscalationReason::RefusalPhrase)
+    );
 }
 
 // -- Escalation detector ---------------------------------------------------
@@ -291,6 +364,16 @@ fn parse_judge_reply_rejects_garbage() {
         super::parse_judge_reply(r#"{"route":"unknown","reason":"-"}"#),
         None
     );
+}
+
+#[test]
+fn deictic_followup_detector_matches_short_followups() {
+    assert!(super::is_deictic_followup(
+        "now do the same for the websocket client"
+    ));
+    assert!(super::is_deictic_followup("keep going"));
+    assert!(super::is_deictic_followup("continue"));
+    assert!(!super::is_deictic_followup("run cargo test"));
 }
 
 // -- Cheap-escalation derived ceiling --------------------------------------
@@ -402,6 +485,10 @@ fn count_sentences_handles_terminators() {
     assert_eq!(super::count_sentences("run cargo test"), 1);
     assert_eq!(super::count_sentences("run cargo test."), 1);
     assert_eq!(super::count_sentences("run cargo test. then commit."), 2);
+    assert_eq!(super::count_sentences("run test.Then commit.Then push"), 3);
+    assert_eq!(super::count_sentences("run e.g. cargo test"), 1);
+    assert_eq!(super::count_sentences("run i.e. only the focused test"), 1);
+    assert_eq!(super::count_sentences("run cargo test etc. Then push."), 2);
     assert_eq!(super::count_sentences("first. second. third."), 3);
     assert_eq!(super::count_sentences("first? then second!"), 2);
 }
@@ -568,4 +655,17 @@ fn estimate_routing_savings_zero_when_actual_already_above_parent_estimate() {
     cheap_cost.estimated_usd_micros = Some(u64::MAX); // pretend cheap cost is enormous
     let savings = estimate_routing_savings("anthropic", "claude-opus-4-7", &cheap_cost);
     assert_eq!(savings, 0);
+    let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 0);
+    assert!(net < 0);
+}
+
+#[test]
+fn estimate_routing_net_savings_subtracts_judge_cost() {
+    let cheap_cost = cost_with(10_000, 1_000);
+    let gross = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 0);
+    assert!(gross > 100);
+
+    let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 100);
+
+    assert_eq!(net, gross - 100);
 }

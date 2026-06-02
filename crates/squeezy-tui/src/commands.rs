@@ -350,14 +350,14 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     if snapshot.metrics.routed_to_cheap_turns > 0
         || snapshot.metrics.escalated_to_parent_turns > 0
         || snapshot.metrics.routing_judge_usd_micros > 0
-        || snapshot.metrics.routing_estimated_savings_usd_micros > 0
+        || snapshot.metrics.routing_estimated_net_savings_usd_micros != 0
     {
         out.push_str(&format!(
-            "  routing routed_turns={} escalated={} judge=${:.6} savings=${:.6}\n",
+            "  routing routed_turns={} escalated={} judge=${:.6} net_savings=${:.6}\n",
             snapshot.metrics.routed_to_cheap_turns,
             snapshot.metrics.escalated_to_parent_turns,
             snapshot.metrics.routing_judge_usd_micros as f64 / 1_000_000.0,
-            snapshot.metrics.routing_estimated_savings_usd_micros as f64 / 1_000_000.0,
+            snapshot.metrics.routing_estimated_net_savings_usd_micros as f64 / 1_000_000.0,
         ));
     }
 

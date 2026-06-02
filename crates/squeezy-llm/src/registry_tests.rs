@@ -62,8 +62,12 @@ fn resolve_alias_for_bedrock_and_google() {
         Some(DEFAULT_BEDROCK_MODEL)
     );
     assert_eq!(
-        resolve_model_alias("bedrock", "haiku"),
+        resolve_model_alias("bedrock", "sonnet"),
         Some(DEFAULT_BEDROCK_MODEL)
+    );
+    assert_eq!(
+        resolve_model_alias("bedrock", "haiku"),
+        Some(squeezy_core::BEDROCK_SMALL_FAST_MODEL)
     );
     assert_eq!(
         resolve_model_alias("google", "opus"),

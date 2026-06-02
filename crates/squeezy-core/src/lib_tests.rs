@@ -3523,6 +3523,7 @@ fn small_fast_model_resolves_per_provider_default() {
         small_fast_model_for_provider("bedrock"),
         Some(BEDROCK_SMALL_FAST_MODEL)
     );
+    assert_ne!(DEFAULT_BEDROCK_MODEL, BEDROCK_SMALL_FAST_MODEL);
     assert_eq!(
         small_fast_model_for_provider("azure_openai"),
         Some(AZURE_OPENAI_SMALL_FAST_MODEL)
@@ -3530,6 +3531,10 @@ fn small_fast_model_resolves_per_provider_default() {
     assert_eq!(
         small_fast_model_for_provider("openrouter"),
         Some(OPENROUTER_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("vertex"),
+        Some(VERTEX_SMALL_FAST_MODEL)
     );
     // Ollama serves a single local model; no separate cheap tier.
     assert_eq!(small_fast_model_for_provider("ollama"), None);
@@ -3593,6 +3598,24 @@ small_fast_model = "claude-haiku-from-toml"
         config.small_fast_model.as_deref(),
         Some("claude-haiku-from-toml")
     );
+}
+
+#[test]
+fn routing_judge_model_reads_toml_and_env_override() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[routing]
+judge_model = "sonnet"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_ROUTING_JUDGE_MODEL" => Some("haiku".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(config.routing.judge_model.as_deref(), Some("haiku"));
 }
 
 #[test]
