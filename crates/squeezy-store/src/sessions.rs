@@ -1109,15 +1109,21 @@ fn run_session_log_writer(
     let path = dir.join("events.jsonl");
     let mut current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
     let mut terminal_failure: Option<String> = None;
+    let mut truncated = false;
     for command in rx {
         match command {
             SessionLogCmd::Append(append) => {
                 if terminal_failure.is_some() {
                     continue;
                 }
-                if let Err(error) =
-                    write_session_log_append(&store, &dir, &path, &mut current_size, append)
-                {
+                if let Err(error) = write_session_log_append(
+                    &store,
+                    &dir,
+                    &path,
+                    &mut current_size,
+                    &mut truncated,
+                    append,
+                ) {
                     let message = error.to_string();
                     if let Some(writer) = writer.upgrade() {
                         writer.record_failure(&message);
@@ -1148,16 +1154,24 @@ fn write_session_log_append(
     dir: &Path,
     path: &Path,
     current_size: &mut usize,
+    truncated: &mut bool,
     append: SessionLogAppend,
 ) -> Result<()> {
     fs::create_dir_all(dir)?;
     if current_size.saturating_add(append.payload.len()) > store.max_session_bytes {
-        update_metadata_file(dir, |metadata| {
-            metadata.status = SessionStatus::Truncated;
-            metadata.resume_available = false;
-            metadata.resume_unavailable_reason =
-                Some("session exceeded max_session_bytes".to_string());
-        })?;
+        // Record the truncation transition exactly once. `current_size` only
+        // ever grows, so every later append would otherwise re-enter this
+        // branch and rewrite byte-identical metadata.json for the rest of the
+        // session.
+        if !*truncated {
+            update_metadata_file(dir, |metadata| {
+                metadata.status = SessionStatus::Truncated;
+                metadata.resume_available = false;
+                metadata.resume_unavailable_reason =
+                    Some("session exceeded max_session_bytes".to_string());
+            })?;
+            *truncated = true;
+        }
         return Ok(());
     }
     append_payload_with_recovery(path, &append.payload, current_size)?;

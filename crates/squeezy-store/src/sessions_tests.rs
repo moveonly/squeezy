@@ -626,6 +626,70 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
 }
 
 #[test]
+fn over_cap_appends_rewrite_metadata_only_once() {
+    let root = temp_root("metadata-truncate-write-amplification");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            // A few bytes: the first substantive event already crosses the
+            // cap, so every later append takes the over-cap branch.
+            max_session_bytes: 4,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let metadata_path = store.root().join(handle.session_id()).join("metadata.json");
+
+    // Cross the cap once, then flush so the writer thread has flipped
+    // metadata.json to the `Truncated` state on disk.
+    handle
+        .append_event(SessionEvent::new(
+            "tool_call",
+            Some("1".to_string()),
+            Some("tool 0".to_string()),
+            json!({"index": 0}),
+        ))
+        .expect("append over-cap event");
+    handle.flush_events().expect("flush events");
+    let truncated = handle.metadata().expect("read metadata");
+    assert_eq!(truncated.status, SessionStatus::Truncated);
+
+    // Plant a sentinel directly on disk: a `Running` status that the writer
+    // would never produce. The truncation closure only ever writes
+    // `Truncated`, so if a later over-cap append re-runs it, this sentinel
+    // gets clobbered. If the writer short-circuits after recording the
+    // transition once, the sentinel survives. This is a content check rather
+    // than an mtime check because many filesystems have second-granularity
+    // mtimes that a fast test cannot race.
+    let mut sentinel = read_session_metadata(&metadata_path).expect("read metadata");
+    sentinel.status = SessionStatus::Running;
+    write_json(&metadata_path, &sentinel).expect("write sentinel metadata");
+
+    for index in 1..20 {
+        handle
+            .append_event(SessionEvent::new(
+                "tool_call",
+                Some("1".to_string()),
+                Some(format!("tool {index}")),
+                json!({"index": index}),
+            ))
+            .expect("append over-cap event");
+    }
+    handle.flush_events().expect("flush events");
+
+    let after = read_session_metadata(&metadata_path).expect("read metadata after further appends");
+    assert_eq!(
+        after.status,
+        SessionStatus::Running,
+        "over-cap appends must not rewrite metadata.json after truncation is recorded",
+    );
+}
+
+#[test]
 fn session_log_writer_flushes_concurrent_events() {
     let root = temp_root("async-session-log-concurrent");
     let config = AppConfig {
