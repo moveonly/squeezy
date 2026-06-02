@@ -170,25 +170,6 @@ const LEADING_FILLER: &[&str] = &[
     "hi", "hello",
 ];
 
-/// Conjunctions and connector phrases that signal a compound, multi-step
-/// request when they sit between two verb-shaped clauses. We reject if
-/// any appear after the imperative verb because the cheap tier handles
-/// single mechanical asks much more reliably than compound ones (e.g.
-/// "rename foo to bar, then check if any test fails, then update README"
-/// is a classic borderline case the cheap model gets wrong).
-const COMPOUND_CONNECTORS: &[&str] = &[
-    ", then",
-    " then ",
-    "; then",
-    "; and",
-    "and check",
-    "and update",
-    "and verify",
-    "and confirm",
-    "and ensure",
-    "and make sure",
-];
-
 /// Strict prompt-shape limits for the heuristic prefilter. Anything
 /// outside these bounds falls through to the LLM judge (or `Parent`
 /// when the judge is disabled), never directly to "cheap" — the goal
@@ -238,10 +219,7 @@ pub(crate) fn heuristic_slam_dunk(user_input: &str, cfg: &RoutingConfig) -> Opti
     {
         return None;
     }
-    if COMPOUND_CONNECTORS
-        .iter()
-        .any(|connector| lower.contains(connector))
-    {
+    if has_compound_signal(&lower) {
         return None;
     }
     if count_words(&lower) > HEURISTIC_MAX_WORDS {
@@ -281,6 +259,45 @@ fn count_words(lower: &str) -> usize {
         .count()
 }
 
+fn normalized_words(lower: &str) -> Vec<&str> {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn has_compound_signal(lower: &str) -> bool {
+    let words = normalized_words(lower);
+    if words.is_empty() {
+        return false;
+    }
+    if words.contains(&"then") || lower.contains(';') {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "check"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "update"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "verify"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "confirm"]) {
+        return true;
+    }
+    if words.windows(2).any(|pair| pair == ["and", "ensure"]) {
+        return true;
+    }
+    if words
+        .windows(3)
+        .any(|triple| triple == ["and", "make", "sure"])
+    {
+        return true;
+    }
+    false
+}
+
 fn count_sentences(text: &str) -> usize {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -294,7 +311,7 @@ fn count_sentences(text: &str) -> usize {
     while let Some(ch) = iter.next() {
         if matches!(ch, '.' | '!' | '?') {
             match iter.peek() {
-                Some(next) if next.is_whitespace() => sentences += 1,
+                Some(next) if next.is_whitespace() || next.is_ascii_uppercase() => sentences += 1,
                 None => sentences += 1,
                 _ => {}
             }

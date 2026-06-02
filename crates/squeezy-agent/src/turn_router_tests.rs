@@ -152,6 +152,21 @@ fn heuristic_rejects_compound_then_clauses() {
         None,
         "and-verify compound must defer"
     );
+    assert_eq!(
+        heuristic_slam_dunk("rename foo,then run cargo test", &cfg),
+        None,
+        "comma-then without whitespace must defer"
+    );
+    assert_eq!(
+        heuristic_slam_dunk("checkout main; deploy prod", &cfg),
+        None,
+        "semicolon compound with second step verb must defer"
+    );
+    assert_eq!(
+        heuristic_slam_dunk("run test.Then commit.Then push", &cfg),
+        None,
+        "sentence chain without whitespace must defer"
+    );
 }
 
 #[test]
@@ -427,6 +442,7 @@ fn count_sentences_handles_terminators() {
     assert_eq!(super::count_sentences("run cargo test"), 1);
     assert_eq!(super::count_sentences("run cargo test."), 1);
     assert_eq!(super::count_sentences("run cargo test. then commit."), 2);
+    assert_eq!(super::count_sentences("run test.Then commit.Then push"), 3);
     assert_eq!(super::count_sentences("first. second. third."), 3);
     assert_eq!(super::count_sentences("first? then second!"), 2);
 }
