@@ -851,7 +851,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
             if let Some(reasoning_done) = drain_reasoning(&mut state) {
                 yield reasoning_done;
             }
-            if !state.saw_visible_output && !state.completed_emitted {
+            // Only blame a cut connection when the upstream gave no terminal
+            // `finish_reason`. A `length`/`content_filter`/`stop` finish is a
+            // clean provider-reported stop whose own notice already explains
+            // the empty output, so this fallback would otherwise contradict it.
+            if !state.saw_visible_output
+                && !state.completed_emitted
+                && state.finish_reason.is_none()
+            {
                 yield LlmEvent::TextDelta(
                     "\n[squeezy] stream ended without producing any content or tool call. The provider may have cut the connection mid-response; retry the turn.\n".to_string(),
                 );
