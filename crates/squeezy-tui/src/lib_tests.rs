@@ -10663,6 +10663,56 @@ fn input_batch_prioritizes_key_before_transcript_drag_flood() {
     );
 }
 
+#[tokio::test]
+async fn dispatch_input_events_applies_every_key_in_one_batch() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+    ];
+
+    let quit = dispatch_input_events(&mut app, &mut agent, events)
+        .await
+        .expect("dispatch batch");
+
+    assert!(!quit, "typing must not quit");
+    assert_eq!(
+        app.input, "abc",
+        "all three keys read in one poll window must reach the composer",
+    );
+}
+
+#[tokio::test]
+async fn dispatch_input_events_opens_overlay_for_chord_in_one_batch() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let events = vec![
+        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+    ];
+
+    dispatch_input_events(&mut app, &mut agent, events)
+        .await
+        .expect("dispatch chord batch");
+
+    assert!(
+        app.pending_chord.is_none(),
+        "chord must clear once the follow-up key is processed",
+    );
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "Ctrl+X then Q landing in one poll window must open the queue overlay",
+    );
+    assert!(
+        app.input.is_empty(),
+        "the chord follow-up must not leak into the composer",
+    );
+}
+
 #[test]
 fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
     let mut app = test_app(SessionMode::Build);

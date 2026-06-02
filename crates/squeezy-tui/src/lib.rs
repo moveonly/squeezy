@@ -1341,17 +1341,31 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
     {
         events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
     }
-    if let Some(key_event) = take_priority_key_event_for_dispatch(app, &mut events) {
-        return handle_input_event(app, agent, key_event).await;
+    dispatch_input_events(app, agent, events).await
+}
+
+/// Dispatch every event read in a single poll window. Each event already
+/// pulled out of crossterm's queue must be handled here — returning after
+/// the first key would silently drop the already-read tail (held-key
+/// autorepeat, fast typing, paste bursts, and the `Ctrl+X` → `Q` chord
+/// follow-up). The main loop coalesces the resulting state into one redraw.
+async fn dispatch_input_events(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    mut events: Vec<Event>,
+) -> Result<bool> {
+    // While the transcript overlay holds mouse-drag capture, handle a key
+    // ahead of the drag repaint flood, then fall through to drain the rest
+    // of the batch (the key is removed from `events`, so it is not replayed).
+    if let Some(key_event) = take_priority_key_event_for_dispatch(app, &mut events)
+        && handle_input_event(app, agent, key_event).await?
+    {
+        return Ok(true);
     }
     let events = coalesce_input_events_for_dispatch(app, events);
     for input_event in events {
-        let is_key = matches!(input_event, Event::Key(_));
         if handle_input_event(app, agent, input_event).await? {
             return Ok(true);
-        }
-        if is_key {
-            return Ok(false);
         }
     }
     Ok(false)
