@@ -2043,21 +2043,26 @@ fn read_slice_target(
     ))
 }
 
-/// Prefix each line of `content` with its 1-based absolute line number in
-/// cat -n format (right-aligned 6-char number, tab, line text). The
-/// in-line `\n` separators are preserved so the model sees one prefixed
-/// row per source line. The first line of the returned string maps to
-/// `start_line`, the second to `start_line + 1`, and so on. Trailing
-/// content without a final `\n` is emitted as a final unterminated row.
+/// Prefix each line of `content` with its 1-based absolute line number,
+/// followed by a tab. Earlier this used cat -n's 6-char right-aligned
+/// format (`     1\t<line>`), which lined up nicely visually but cost
+/// 7 bytes/line of overhead regardless of how many digits the line
+/// number actually had. Per-trace cost analysis on mini-ruby showed
+/// the prefix accounted for 20–25 % of read_file payload bytes; the
+/// model never branches on the padding, only the line number itself.
+/// Compact form (`1\t<line>`) gives the same parsing affordance at
+/// 2–3 bytes/line for typical files. `start_line` carries the first
+/// line's absolute number on the result envelope so the model still
+/// has the anchor without counting newlines.
 pub(crate) fn prefix_lines_with_numbers(content: &str, start_line: u32) -> String {
     if content.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(content.len() + content.len() / 8);
+    let mut out = String::with_capacity(content.len() + content.len() / 12);
     let mut line_no = start_line;
     for piece in content.split_inclusive('\n') {
         use std::fmt::Write as _;
-        let _ = write!(out, "{line_no:>6}\t{piece}");
+        let _ = write!(out, "{line_no}\t{piece}");
         line_no = line_no.saturating_add(1);
     }
     out
