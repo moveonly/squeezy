@@ -49,20 +49,27 @@ fn shared_client_returns_handles_with_same_underlying_pool() {
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
 }
 
-/// T-62: simulate a DNS rebinding attack. The static resolver returns a
-/// benign address on the first call and `169.254.169.254` (AWS IMDS)
-/// on the second; the second request must fail with the metadata-block
-/// error rather than connecting. Without the
-/// [`MetadataBlockingResolver`] wrapper a TTL=0 rebind would let
+/// T-62: simulate a true DNS rebinding attack against a *single*
+/// client. One [`StaticResolver`] backs the client for both requests;
+/// its address list is mutated between them so the same hostname
+/// resolves to a benign address on lookup #1 and `169.254.169.254`
+/// (AWS IMDS) on lookup #2. The second request must be refused by the
+/// [`MetadataBlockingResolver`] wrapper rather than connecting. This
+/// exercises the re-resolution path (reqwest re-runs the resolver per
+/// fresh connection): without the wrapper a TTL=0 rebind would let
 /// attacker DNS steer the validated hostname at AWS IMDS at request
-/// time.
+/// time, after the config-load URL check has already passed.
 #[tokio::test]
 async fn dns_rebinding_resolved_metadata_address_is_refused() {
-    let mailbox: Arc<Mutex<Vec<IpAddr>>> =
-        Arc::new(Mutex::new(vec!["192.0.2.10".parse().unwrap()]));
-    let inner = Arc::new(StaticResolver(Mutex::new(mailbox.lock().unwrap().clone())))
-        as Arc<dyn reqwest::dns::Resolve>;
-    let resolver = MetadataBlockingResolver::wrapping(inner.clone());
+    // Keep a typed handle to the resolver so the test can swap the
+    // address list between requests; the same `Arc` is wrapped into the
+    // single client, so both lookups hit this one resolver.
+    let static_resolver = Arc::new(StaticResolver(Mutex::new(vec![
+        "192.0.2.10".parse::<IpAddr>().unwrap(),
+    ])));
+    let resolver = MetadataBlockingResolver::wrapping(
+        static_resolver.clone() as Arc<dyn reqwest::dns::Resolve>
+    );
     let client = build_client_with_resolver(&ProviderTransportConfig::default(), resolver);
 
     // First request: benign address resolves cleanly. The connection
@@ -80,17 +87,17 @@ async fn dns_rebinding_resolved_metadata_address_is_refused() {
         "first request must not be refused by the resolver: {first_msg}"
     );
 
-    // Simulate the rebind: the same hostname now resolves to AWS IMDS.
-    // We rebuild the resolver chain because reqwest caches the resolver
-    // handle; mutate the StaticResolver's address list to model the
-    // mid-stream DNS swap.
+    // Simulate the rebind on the *same* resolver: the validated hostname
+    // now answers with AWS IMDS. reqwest re-runs the resolver for the
+    // next fresh connection, so this models a mid-session TTL=0 swap
+    // rather than two independently-built clients.
     let imds: IpAddr = "169.254.169.254".parse().unwrap();
-    let rebound_inner =
-        Arc::new(StaticResolver(Mutex::new(vec![imds]))) as Arc<dyn reqwest::dns::Resolve>;
-    let rebound_resolver = MetadataBlockingResolver::wrapping(rebound_inner);
-    let rebound_client =
-        build_client_with_resolver(&ProviderTransportConfig::default(), rebound_resolver);
-    let second = rebound_client
+    {
+        let mut addrs = static_resolver.0.lock().expect("resolver mutex poisoned");
+        addrs.clear();
+        addrs.push(imds);
+    }
+    let second = client
         .get("http://target.example.com/v1")
         .send()
         .await
@@ -107,13 +114,20 @@ async fn dns_rebinding_resolved_metadata_address_is_refused() {
 }
 
 #[test]
-fn build_client_applies_connect_timeout_and_tcp_keepalive() {
-    // Smoke test: the builder must accept the connect_timeout +
-    // tcp_keepalive knobs at every config the public surface exposes.
-    // If reqwest ever rejects these (or our `Duration` overflows), the
-    // build would panic via the `expect` inside `build_client`. We
-    // exercise the extremes (default + heavily customized) to catch
-    // any interaction with the pool knobs the same builder also sets.
+fn build_client_builder_accepts_connect_timeout_and_keepalive_knobs() {
+    // Honest scope: this is a *no-panic builder smoke test*, NOT an
+    // assertion that the connect_timeout/tcp_keepalive values take
+    // effect. reqwest's `Client` Debug renders only
+    // {accepts, proxies, referer, default_headers}, so a `contains
+    // ("Client")` check cannot observe the connect_timeout or
+    // tcp_keepalive knobs — deleting them from `build_client` would
+    // still pass here. What this test *does* guarantee: the builder
+    // accepts those knobs (plus the custom DNS resolver + redirect
+    // policy) at the config extremes without tripping the `expect`
+    // inside `build_client` (e.g. a `Duration` overflow or a backend
+    // that rejects the combination). The behavioral connect-time
+    // refusal is covered by `dns_rebinding_resolved_metadata_address_is_refused`,
+    // which drives a real request through the resolver chain.
     let client = build_client(&ProviderTransportConfig::default());
     assert!(format!("{client:?}").contains("Client"));
 

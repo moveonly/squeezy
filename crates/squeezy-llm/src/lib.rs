@@ -677,6 +677,11 @@ pub struct LlmToolSpec {
 /// a URL plus optional title and inclusive byte offsets into the
 /// running text buffer. Every field is optional because providers
 /// disagree on which dimensions they surface.
+///
+/// Reserved / forward-declared: no provider currently produces this
+/// type and no consumer reads it. It is published now so the
+/// citation-streaming shape is part of the stable public API surface
+/// ahead of the provider lowering that will emit it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CitationSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -721,8 +726,12 @@ pub enum StopReason {
     /// Anthropic Messages API `pause_turn`: the model voluntarily
     /// paused mid-turn (typically when a hosted tool is still
     /// processing) and expects the caller to re-issue the request
-    /// with the partial state. Distinct from `EndTurn` so the agent
-    /// can branch the recovery path.
+    /// with the partial state. Kept distinct from `EndTurn` so the
+    /// signal is surfaced and categorized honestly rather than
+    /// masquerading as a clean end of turn. True re-issue-with-partial-
+    /// state recovery is not yet wired; for now the agent falls through
+    /// to end-of-turn handling (the dedicated recovery branch is being
+    /// added separately).
     PauseTurn,
     /// Google Gemini `MALFORMED_FUNCTION_CALL`: the model emitted a
     /// tool call whose arguments JSON the upstream parser rejected.
@@ -833,6 +842,11 @@ pub enum LlmEvent {
     /// alongside text. `text_index` is the byte offset into the
     /// running text buffer the citation refers to; the agent /
     /// transcript records the source for later display.
+    ///
+    /// Reserved / forward-declared: no provider stream currently emits
+    /// this variant and no consumer matches it. It is part of the
+    /// public event enum now so the citation-streaming contract is
+    /// stable ahead of the provider lowering that will produce it.
     Citation {
         text_index: u32,
         source: CitationSource,

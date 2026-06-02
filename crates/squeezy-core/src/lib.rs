@@ -126,6 +126,11 @@ pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 // keeps the placeholder syntax behaves the same as the bundled default.
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL: &str =
     "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
+// C-11 (deferred, product decision): Cloudflare now also exposes a REST-style
+// route alongside this `/compat` OpenAI-compatibility surface. We intentionally
+// keep `/compat` as the default — flipping every existing CF user's endpoint
+// blind would break live configs and needs the verified CF REST URL first. Do
+// not change this value without that confirmation.
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL: &str =
     "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
@@ -849,6 +854,24 @@ impl AppConfig {
                         reasoning-model budgets count thinking tokens against \
                         the limit on v2."
                     .to_string(),
+            });
+        }
+        // M-64: the `Custom` preset carries no URL allow-list and accepts
+        // whatever `base_url` the (possibly project-local) config supplies,
+        // making it a credential-exfil primitive. `build_openai_compatible_config`
+        // already emits a `tracing::warn!`, but mirror the M-58 path and also
+        // push a structured `ConfigWarning` so the warning reaches the
+        // operator-facing channel even when tracing is unconfigured.
+        if let ProviderConfig::OpenAiCompatible(compatible) = &provider
+            && compatible.preset == OpenAiCompatiblePreset::Custom
+        {
+            config_warnings.push(ConfigWarning {
+                source: "providers.custom".to_string(),
+                field: format!(
+                    "Custom preset bypasses the URL allow-list; verify base_url={} \
+                     is trusted before credentials are sent to it.",
+                    compatible.base_url
+                ),
             });
         }
         let tool_choice = get_var("SQUEEZY_TOOL_CHOICE")
@@ -2057,6 +2080,10 @@ pub enum ProviderConfig {
 /// **Vercel AI Gateway (VL-2)**: `VERCEL_OIDC_TOKEN` (12h TTL,
 /// auto-injected into every Vercel function runtime) flows in as
 /// `api_key_env` when no explicit `AI_GATEWAY_API_KEY` is set.
+///
+/// M-63: redaction applies to the serde `Serialize` path only; the derived
+/// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
+/// `OpenAiCompatibleConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
     pub preset: OpenAiCompatiblePreset,
@@ -2343,28 +2370,11 @@ impl OpenAiCompatiblePreset {
             // gateway-level token (`cf-aig-authorization`) is configured
             // separately via `CF_AIG_TOKEN` and injected as an extra header.
             // Vendor-canonical alias `CLOUDFLARE_API_TOKEN` is exposed via
-            // [`Self::default_api_key_env_aliases`].
+            // the free fn [`preset_api_key_env_aliases`] (the single source
+            // of truth for fallback env-var names).
             Self::CloudflareWorkersAi => "CLOUDFLARE_API_KEY",
             Self::CloudflareAiGateway => "CLOUDFLARE_API_KEY",
             Self::Custom => "",
-        }
-    }
-
-    /// Vendor-canonical alternate env vars the caller may fall back to when
-    /// the primary [`Self::default_api_key_env`] is unset. The list is in
-    /// preference order (primary first is implied — only aliases are
-    /// returned). Empty for presets with no documented alias.
-    pub const fn default_api_key_env_aliases(self) -> &'static [&'static str] {
-        match self {
-            // Cloudflare's cURL + AI Gateway docs use CLOUDFLARE_API_TOKEN;
-            // only the JS SDK uses CLOUDFLARE_API_KEY. Both are valid.
-            Self::CloudflareWorkersAi | Self::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
-            // DeepInfra's vendor docs use DEEPINFRA_TOKEN in every code
-            // sample; LangChain uses DEEPINFRA_API_TOKEN; only the Vercel
-            // AI SDK uses DEEPINFRA_API_KEY. Accept all three so users
-            // who copy from DeepInfra's docs are not bounced.
-            Self::DeepInfra => &["DEEPINFRA_TOKEN", "DEEPINFRA_API_TOKEN"],
-            _ => &[],
         }
     }
 
@@ -2511,6 +2521,9 @@ pub struct GoogleConfig {
     pub transport: ProviderTransportConfig,
 }
 
+// M-63: redaction applies to the serde `Serialize` path only; the derived
+// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
+// `AzureOpenAiConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureOpenAiConfig {
     pub api_key_env: String,
@@ -3074,6 +3087,10 @@ impl HardeningConfig {
     }
 }
 
+// M-63: redaction lives on the serde `Serialize` path only (see
+// `redact_secret_opt` below). The derived `Debug` is NOT redacted — the
+// inline `api_key` prints verbatim under `{:?}`. Never `{:?}`-log a
+// `ProviderSettings`; serialize it (or its fields individually) instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub api_key_env: Option<String>,
@@ -9268,7 +9285,12 @@ pub fn is_metadata_or_link_local_ip(ip: &std::net::IpAddr) -> bool {
                 return is_metadata_or_link_local_ip(&std::net::IpAddr::V4(v4));
             }
             let segments = v6.segments();
-            (segments[0] & 0xffc0) == 0xfe80 || segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            // `fe80::/10` link-local, plus the entire `fc00::/7` IPv6
+            // unique-local range (ULA). The AWS IPv6 IMDS sentinel
+            // `fd00:ec2::254` sits inside `fc00::/7`, so the broad ULA test
+            // subsumes it; without the range check a ULA-addressed internal
+            // metadata/admin endpoint would slip past the narrow literal.
+            (segments[0] & 0xffc0) == 0xfe80 || (segments[0] & 0xfe00) == 0xfc00
         }
     }
 }

@@ -768,3 +768,132 @@ fn llm_input_item_image_round_trips_through_serde() {
     let decoded: LlmInputItem = serde_json::from_str(&json).expect("deserialize image item");
     assert_eq!(original, decoded);
 }
+
+#[test]
+fn function_call_output_defaults_missing_optional_fields() {
+    // A persisted/checkpoint payload written before the structured
+    // tool-result extensions landed omits both `content_parts` and
+    // `is_error`. Deserialization must default them (None / false) so
+    // old transcripts stay loadable.
+    let legacy = r#"{
+        "type": "function_call_output",
+        "data": { "call_id": "call_1", "output": "result text" }
+    }"#;
+    let decoded: LlmInputItem =
+        serde_json::from_str(legacy).expect("legacy function_call_output must deserialize");
+    match decoded {
+        LlmInputItem::FunctionCallOutput {
+            call_id,
+            output,
+            content_parts,
+            is_error,
+        } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(output, "result text");
+            assert!(
+                content_parts.is_none(),
+                "missing content_parts must default to None"
+            );
+            assert!(!is_error, "missing is_error must default to false");
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn document_round_trips_bytes_as_base64_and_preserves_metadata() {
+    let original = LlmInputItem::Document {
+        media_type: "application/pdf".to_string(),
+        name: "report.pdf".to_string(),
+        bytes: Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+    };
+    let json = serde_json::to_string(&original).expect("serialize document item");
+    // Bytes ride the wire as a compact base64 string, never a JSON byte
+    // array; the human-facing `name` and MIME type stay intact.
+    assert!(
+        json.contains("\"AQIDBAUGBwg=\""),
+        "document bytes must serialize as base64: {json}"
+    );
+    assert!(
+        json.contains("\"report.pdf\""),
+        "document name must survive: {json}"
+    );
+    assert!(
+        json.contains("\"application/pdf\""),
+        "document media_type must survive: {json}"
+    );
+    let decoded: LlmInputItem = serde_json::from_str(&json).expect("deserialize document item");
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn tool_result_part_maps_text_and_image_tags() {
+    let text = ToolResultPart::Text {
+        text: "ok".to_string(),
+    };
+    let text_json = serde_json::to_string(&text).expect("serialize text part");
+    assert!(
+        text_json.contains("\"type\":\"text\""),
+        "Text part must use snake_case `text` tag: {text_json}"
+    );
+    assert_eq!(
+        text,
+        serde_json::from_str::<ToolResultPart>(&text_json).expect("deserialize text part")
+    );
+
+    let image = ToolResultPart::Image {
+        media_type: "image/png".to_string(),
+        bytes: Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+    };
+    let image_json = serde_json::to_string(&image).expect("serialize image part");
+    assert!(
+        image_json.contains("\"type\":\"image\""),
+        "Image part must use snake_case `image` tag: {image_json}"
+    );
+    assert!(
+        image_json.contains("\"AQIDBAUGBwg=\""),
+        "Image part bytes must serialize as base64: {image_json}"
+    );
+    assert_eq!(
+        image,
+        serde_json::from_str::<ToolResultPart>(&image_json).expect("deserialize image part")
+    );
+}
+
+#[test]
+fn llm_hosted_tool_variants_use_snake_case_tags() {
+    let web = LlmHostedTool::WebSearch { filters: None };
+    let web_json = serde_json::to_string(&web).expect("serialize web search");
+    assert!(
+        web_json.contains("\"type\":\"web_search\""),
+        "WebSearch must use snake_case tag: {web_json}"
+    );
+    assert_eq!(
+        web,
+        serde_json::from_str::<LlmHostedTool>(&web_json).expect("deserialize web search")
+    );
+
+    let file = LlmHostedTool::FileSearch {
+        vector_store_ids: vec!["vs_1".to_string()],
+    };
+    let file_json = serde_json::to_string(&file).expect("serialize file search");
+    assert!(
+        file_json.contains("\"type\":\"file_search\""),
+        "FileSearch must use snake_case tag: {file_json}"
+    );
+    assert_eq!(
+        file,
+        serde_json::from_str::<LlmHostedTool>(&file_json).expect("deserialize file search")
+    );
+
+    let computer = LlmHostedTool::ComputerUse;
+    let computer_json = serde_json::to_string(&computer).expect("serialize computer use");
+    assert!(
+        computer_json.contains("\"type\":\"computer_use\""),
+        "ComputerUse must use snake_case tag: {computer_json}"
+    );
+    assert_eq!(
+        computer,
+        serde_json::from_str::<LlmHostedTool>(&computer_json).expect("deserialize computer use")
+    );
+}

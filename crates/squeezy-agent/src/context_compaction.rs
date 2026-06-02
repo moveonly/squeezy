@@ -461,18 +461,62 @@ pub(crate) fn strip_media_for_compaction(items: &[LlmInputItem]) -> Vec<LlmInput
                 content_parts,
                 is_error,
             } => {
-                if output.len() < STRIP_MEDIA_MIN_LEN {
+                // A `ToolResultPart::Image` carries raw image bytes that
+                // `strip_media_data_uris` (which scans the text `output`)
+                // never sees, so an unstripped array slot would smuggle a
+                // full screenshot into the compaction payload. Replace each
+                // image part with a short text placeholder; this mirrors the
+                // `[image]` data-URI substitution and keeps the slot count
+                // stable. Text parts are scrubbed for inline data URIs too.
+                let stripped_parts = content_parts
+                    .as_ref()
+                    .map(|parts| strip_media_content_parts(parts));
+                // Skip the text scan only when both the `output` string is
+                // too short to hold a data URI *and* there were no parts to
+                // shrink; otherwise rebuild the item with the cleaned parts.
+                if output.len() < STRIP_MEDIA_MIN_LEN && stripped_parts.is_none() {
                     item.clone()
                 } else {
                     LlmInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
-                        output: strip_media_data_uris(output),
-                        content_parts: content_parts.clone(),
+                        output: if output.len() < STRIP_MEDIA_MIN_LEN {
+                            output.clone()
+                        } else {
+                            strip_media_data_uris(output)
+                        },
+                        content_parts: stripped_parts,
                         is_error: *is_error,
                     }
                 }
             }
             _ => item.clone(),
+        })
+        .collect()
+}
+
+/// Placeholder substituted for a stripped `ToolResultPart::Image` so the
+/// summarizer still sees that a tool returned an image without carrying the
+/// raw bytes through compaction.
+const IMAGE_PART_PLACEHOLDER: &str = "[image]";
+
+/// Shrink a structured tool-result array for compaction: drop each
+/// `ToolResultPart::Image`'s raw bytes (replacing it with a short text
+/// placeholder) and scrub inline data URIs out of every text part. The
+/// input is borrowed; a fresh `Vec` is returned. Empty inputs collapse to
+/// an empty `Vec`, preserving the `Some(_)` shape so the caller's slot
+/// rebuild stays unconditional.
+fn strip_media_content_parts(
+    parts: &[squeezy_llm::ToolResultPart],
+) -> Vec<squeezy_llm::ToolResultPart> {
+    parts
+        .iter()
+        .map(|part| match part {
+            squeezy_llm::ToolResultPart::Text { text } => squeezy_llm::ToolResultPart::Text {
+                text: strip_media_data_uris(text),
+            },
+            squeezy_llm::ToolResultPart::Image { .. } => squeezy_llm::ToolResultPart::Text {
+                text: IMAGE_PART_PLACEHOLDER.to_string(),
+            },
         })
         .collect()
 }
@@ -586,8 +630,31 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
             arguments,
         } => call_id.len() + name.len() + arguments.to_string().len(),
         LlmInputItem::FunctionCallOutput {
-            call_id, output, ..
-        } => call_id.len() + output.len(),
+            call_id,
+            output,
+            content_parts,
+            ..
+        } => {
+            // Bill the structured-result array too: a `Text` part's chars and
+            // an `Image` part's raw bytes are on-the-wire payload that the
+            // bare `output` string never accounts for, so without this they
+            // stay invisible to the context-pressure signal.
+            let parts_bytes = content_parts
+                .as_ref()
+                .map(|parts| {
+                    parts.iter().fold(0usize, |acc, part| {
+                        let part_len = match part {
+                            squeezy_llm::ToolResultPart::Text { text } => text.len(),
+                            squeezy_llm::ToolResultPart::Image { media_type, bytes } => {
+                                media_type.len() + bytes.len()
+                            }
+                        };
+                        acc.saturating_add(part_len)
+                    })
+                })
+                .unwrap_or(0);
+            call_id.len() + output.len() + parts_bytes
+        }
         LlmInputItem::Reasoning(payload) => payload.display_text().len(),
         // Image bytes don't consume model context tokens directly (the
         // provider's vision encoder charges its own per-image token

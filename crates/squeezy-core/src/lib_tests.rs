@@ -2895,17 +2895,53 @@ fn cerebras_preset_emits_max_completion_tokens_migration_warning() {
 
 #[test]
 fn cerebras_preset_without_explicit_max_output_tokens_skips_warning() {
-    // `DEFAULT_MAX_OUTPUT_TOKENS` may be `Some(...)` even without a
-    // user-set cap, so the warning fires whenever the resolved
-    // value is non-None on Cerebras. (Operators who want to suppress
-    // the warning entirely can leave the default and accept the v2
-    // wire-key switch.) This test pins the contract so a future
-    // refactor of `DEFAULT_MAX_OUTPUT_TOKENS = None` flips a silent
-    // expectation rather than reintroducing a warning-storm
-    // regression.
+    // The v2-cutover warning is gated on the *resolved* `max_output_tokens`
+    // being `Some(..)`. Because `DEFAULT_MAX_OUTPUT_TOKENS` is `None`, a
+    // Cerebras config that sets no explicit cap resolves to `None` and must
+    // stay silent — otherwise every default-budget Cerebras user would eat a
+    // warning-storm. This pins that contract directly on a real Cerebras
+    // config; if a future refactor flips `DEFAULT_MAX_OUTPUT_TOKENS` to
+    // `Some(..)`, this test will fail loudly rather than the regression
+    // shipping silently.
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cerebras".to_string(),
+        ProviderSettings {
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        // No `model_settings.max_output_tokens`: leave the resolved value at
+        // the `DEFAULT_MAX_OUTPUT_TOKENS` (`None`) so the warning gate stays
+        // closed.
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("cerebras"), |name| match name {
+            "CEREBRAS_API_KEY" => Some("cb-key".to_string()),
+            _ => None,
+        })
+        .expect("cerebras config builds without an explicit max_output_tokens");
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .all(|w| w.source != "providers.cerebras"),
+        "cerebras with no resolved max_output_tokens must not surface the v2-cutover warning",
+    );
+}
+
+#[test]
+fn non_cerebras_preset_never_emits_cerebras_warning() {
+    // Control for `cerebras_preset_emits_max_completion_tokens_migration_warning`:
+    // the `providers.cerebras` warning is provider-scoped, so a non-Cerebras
+    // provider must never emit it even when an explicit `max_output_tokens`
+    // would have tripped the gate on Cerebras.
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("openrouter".to_string()),
         "OPENROUTER_API_KEY" => Some("or-key".to_string()),
+        "SQUEEZY_MAX_OUTPUT_TOKENS" => Some("4096".to_string()),
         _ => None,
     });
     assert!(
@@ -4284,12 +4320,26 @@ base_url = "https://internal.example.com/v1"
 api_key_env = "FAKE_KEY"
 "#;
     let settings = SettingsFile::from_toml_str(toml, "test").expect("settings parse");
-    let _config = tracing::subscriber::with_default(subscriber.clone(), || {
+    let config = tracing::subscriber::with_default(subscriber.clone(), || {
         AppConfig::try_from_settings_and_env_vars(settings, None, |name| {
             (name == "FAKE_KEY").then(|| "k".to_string())
         })
     })
     .expect("Custom preset must build with explicit base_url + api_key_env");
+
+    // M-64: besides the tracing WARN, the same advisory must surface as a
+    // structured `ConfigWarning` (mirroring the M-58 Cerebras path) so it
+    // reaches the operator even when tracing is unconfigured.
+    assert!(
+        config.config_warnings.iter().any(|w| {
+            w.source == "providers.custom"
+                && w.field.contains("https://internal.example.com/v1")
+                && w.field.contains("bypasses")
+        }),
+        "Custom preset must push a structured ConfigWarning naming the base_url; \
+         got: {:?}",
+        config.config_warnings
+    );
 
     let captured: Vec<(String, String)> =
         std::mem::take(&mut *subscriber.events.lock().expect("events lock poisoned"));
@@ -4694,6 +4744,11 @@ fn config_rejects_imds_and_metadata_hosts_regardless_of_scheme() {
         ("https://[fe80::1]/v1", "fe80::1"),
         // AWS IPv6 IMDS ULA address.
         ("https://[fd00:ec2::254]/latest/", "fd00:ec2::254"),
+        // F1: any `fc00::/7` IPv6 unique-local address (ULA), not just the
+        // AWS IMDS literal. `fd12:3456:789a:1::1` and the `fc00::` low half
+        // of the range both name internal-only endpoints and must be refused.
+        ("https://[fd12:3456:789a:1::1]/v1", "fd12"),
+        ("https://[fc00::1]/v1", "fc00"),
         // IPv4-mapped IPv6 form of the IMDS sentinel — a standard SSRF
         // evasion. Must be canonicalized to 169.254.169.254 and rejected.
         ("https://[::ffff:169.254.169.254]/latest/", "169.254"),

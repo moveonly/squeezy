@@ -5702,6 +5702,38 @@ impl TurnRuntime {
                                 .await;
                         }
                     }
+                    LlmEvent::Refusal { content } => {
+                        // OpenAI Responses streams the safety-refusal text on
+                        // a dedicated `response.refusal.delta` channel rather
+                        // than as `TextDelta`. Without an explicit arm the
+                        // refusal prose is dropped and only the generic
+                        // `StopReason::Refusal` failure surfaces, so the user
+                        // never sees *why* the model declined. Route the
+                        // content through the same redactor stream + assistant
+                        // buffer + `AssistantDelta` path as ordinary text so
+                        // the verbatim refusal lands in the live view and the
+                        // stored transcript. The terminal `StopReason::Refusal`
+                        // arm below still fires for the canonical failure.
+                        round_output_bytes =
+                            round_output_bytes.saturating_add(content.len() as u64);
+                        let chunk = assistant_stream.push(&content);
+                        if chunk.text.is_empty() {
+                            continue;
+                        }
+                        self.record_replay_model_text_delta(&chunk.text);
+                        assistant_message.push_str(&chunk.text);
+                        if self
+                            .tx
+                            .send(AgentEvent::AssistantDelta {
+                                turn_id: self.turn_id,
+                                delta: chunk.text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
                     LlmEvent::ReasoningDelta { text, .. } => {
                         round_output_bytes = round_output_bytes.saturating_add(text.len() as u64);
                         if self
@@ -5837,6 +5869,15 @@ impl TurnRuntime {
                         return Ok(());
                     }
                     LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
+                    // Known additive variants the main loop intentionally
+                    // does not act on yet. `Citation` (OpenAI annotations /
+                    // xAI Live Search sources) has no transcript recording
+                    // sink wired up here, and `ToolCallDelta` is a
+                    // progressive-args hint superseded by the canonical
+                    // `ToolCall` event the loop already consumes. Naming
+                    // them explicitly keeps the wildcard reserved for
+                    // genuinely unknown future variants.
+                    LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
                     // `LlmEvent` is `#[non_exhaustive]`; unknown future
                     // variants flow past without disturbing the turn — they
                     // get a dedicated arm once consumers are taught about
@@ -5991,6 +6032,50 @@ impl TurnRuntime {
                         .await;
                     self.finish_turn(&broker.metrics).await;
                     return Ok(());
+                }
+                Some(StopReason::PauseTurn) => {
+                    // Anthropic `pause_turn`: the model voluntarily paused
+                    // mid-turn (typically a hosted tool still processing) and
+                    // expects the caller to re-issue with the partial state.
+                    // Full re-issue-with-partial-state handling is deferred —
+                    // wiring it risks an unbounded re-issue loop without a
+                    // dedicated guard. For now, when the pause carried tool
+                    // calls we fall through to the normal tool-execution path
+                    // below (results feed the next round, the closest safe
+                    // approximation of re-issue). When it carried nothing
+                    // actionable we surface an explicit failure rather than
+                    // letting it masquerade as a clean `EndTurn`, so the user
+                    // is not left staring at a silently truncated turn.
+                    // TODO: implement true pause_turn re-issue with a bounded
+                    // retry guard once the partial-state replay path lands.
+                    if tool_calls.is_empty() {
+                        if let Some(tail) = self
+                            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                            .await
+                        {
+                            self.record_replay_model_text_delta(&tail);
+                        }
+                        self.stamp_routing_savings(&mut broker.metrics);
+                        self.publish_terminal_task_state(
+                            TaskStateStatus::Failed,
+                            Some("model paused the turn".to_string()),
+                            &task_title,
+                        )
+                        .await;
+                        let _ = self
+                            .tx
+                            .send(AgentEvent::Failed {
+                                turn_id: self.turn_id,
+                                error: SqueezyError::Agent(
+                                    "model paused the turn (pause_turn) without an actionable continuation; re-issue handling is not yet implemented — retry the turn".to_string(),
+                                ),
+                            })
+                            .await;
+                        self.finish_turn(&broker.metrics).await;
+                        return Ok(());
+                    }
+                    // Tool calls present: fall through to the existing
+                    // tool-execution / re-entry logic below.
                 }
                 _ => {}
             }
@@ -8337,6 +8422,15 @@ async fn run_subagent_rounds(
                     };
                 }
                 LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
+                // Known additive variants the subagent loop does not act on:
+                // `Refusal` text and `Citation` sources have no sink here
+                // (the subagent only accumulates assistant text + tool
+                // calls), and `ToolCallDelta` is superseded by the canonical
+                // `ToolCall` event. Named explicitly so the wildcard stays
+                // reserved for genuinely unknown future variants.
+                LlmEvent::Refusal { .. }
+                | LlmEvent::Citation { .. }
+                | LlmEvent::ToolCallDelta { .. } => {}
                 // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
                 // are silently passed over in the subagent loop until a
                 // dedicated arm exists.
@@ -11442,6 +11536,13 @@ Working target: {:?}",
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // The classifier verdict is parsed from `TextDelta` only; the
+            // refusal/citation/tool-args-delta additive variants carry
+            // nothing the verdict parser reads. Named explicitly so the
+            // wildcard stays reserved for unknown future variants.
+            LlmEvent::Refusal { .. }
+            | LlmEvent::Citation { .. }
+            | LlmEvent::ToolCallDelta { .. } => {}
             // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
             // contribute nothing to the classifier verdict text.
             _ => { /* future variant */ }
@@ -12318,7 +12419,25 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
         } => LlmInputItem::FunctionCallOutput {
             call_id,
             output: redactor.redact(&output).text,
-            content_parts,
+            // No producer populates `content_parts` yet, but redact each
+            // text part defensively so a future structured-tool-result
+            // path can't slip a secret past the redactor through the array
+            // shape. `Image` bytes are raw binary (secret detection runs on
+            // text, not pixels) so they pass through unchanged, mirroring
+            // the `LlmInputItem::Image` arm below.
+            content_parts: content_parts.map(|parts| {
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        squeezy_llm::ToolResultPart::Text { text } => {
+                            squeezy_llm::ToolResultPart::Text {
+                                text: redactor.redact(&text).text,
+                            }
+                        }
+                        image @ squeezy_llm::ToolResultPart::Image { .. } => image,
+                    })
+                    .collect()
+            }),
             is_error,
         },
         // Reasoning payloads are model-signed blobs. Redacting the opaque
@@ -12920,6 +13039,20 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
         LlmInputItem::Image { media_type, bytes } => ResumeItem::Image {
             media_type,
             data_base64: BASE64_STANDARD.encode(bytes.as_ref()),
+        },
+        // `ResumeItem` has no `Document` variant yet (the resume schema
+        // lives in `squeezy-store` and bumping it is a separate change).
+        // Until it gains one, persist a descriptive placeholder that names
+        // the attachment and its type instead of letting the catch-all
+        // silently flatten a fully-defined document into an empty
+        // `UserText` (data loss). The original bytes are dropped on resume,
+        // but the user/model at least sees that a document was attached.
+        // TODO: add a `ResumeItem::Document { media_type, name, data_base64 }`
+        // variant to `squeezy-store` and round-trip the bytes like `Image`.
+        LlmInputItem::Document {
+            media_type, name, ..
+        } => ResumeItem::UserText {
+            text: format!("[document attachment dropped on resume: {name} ({media_type})]"),
         },
         // `LlmInputItem` is `#[non_exhaustive]`; unknown future variants
         // round-trip through an empty user text marker until the resume

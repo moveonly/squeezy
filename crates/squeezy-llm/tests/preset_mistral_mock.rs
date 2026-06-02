@@ -3,15 +3,17 @@
 //!
 //! Tickets pinned by this file (per `.audit/TICKETS.md` §6):
 //!
-//! * **T-67 / MIS-3 / H-56** — `prompt_cache_retention` is unconditionally
-//!   emitted by the shared chat-completions adapter; Mistral's schema
-//!   rejects unknown top-level fields with `extra_forbidden` 422. This
-//!   test pins the current emission so the per-preset gate (planned
-//!   under MIS-3) lands with a test the moment the body shape changes.
-//! * **T-67 / MIS-2 / H-55** — `reasoning_effort` + `reasoning: { effort }`
-//!   both emit on the wire; Mistral accepts only `reasoning_effort` and
-//!   422s on the nested object. Pinned as a snapshot test the gating
-//!   fix can flip in one diff.
+//! * **T-67 / MIS-3 / H-56** — `prompt_cache_retention` used to be
+//!   unconditionally emitted by the shared chat-completions adapter, but
+//!   Mistral's schema rejects unknown top-level fields with
+//!   `extra_forbidden` 422. The shipped per-preset gate drops the field
+//!   for Mistral; this test asserts the field is absent and guards the
+//!   gate against regression.
+//! * **T-67 / MIS-2 / H-55** — the adapter used to emit both
+//!   `reasoning_effort` and the nested `reasoning: { effort }`; Mistral
+//!   accepts only `reasoning_effort` and 422s on the nested object. The
+//!   shipped fix gates off the nested object for Mistral; this test
+//!   asserts only the flat field survives and guards against regression.
 //! * **MIS-6 / MS-1** — `tool_choice = "any"` and `tool_choice = "required"`
 //!   are both accepted by Mistral's June-2026 schema and pass through
 //!   the shared adapter verbatim. This is the resolved-by-vendor case
@@ -231,15 +233,15 @@ async fn drain_stream(provider: &OpenAiCompatibleProvider, request: LlmRequest) 
         .expect("stream must complete");
 }
 
-/// MIS-2 / H-55 baseline pin: today the shared adapter emits BOTH the
-/// top-level `reasoning_effort` AND the nested `reasoning: { effort }`
-/// object when `request.reasoning_effort` is `Some(_)`. Mistral rejects
-/// the nested object with `extra_forbidden`. The test pins the current
-/// shape so the planned per-preset gate (drop `reasoning` for Mistral)
-/// flips two assertions in one diff. Marked `#[ignore]` once the gate
-/// ships so the pin doesn't keep the regression in place.
+/// MIS-2 / H-55 (shipped): the shared adapter emits the top-level
+/// `reasoning_effort` verbatim but gates off the nested
+/// `reasoning: { effort }` object for the Mistral preset, since Mistral
+/// 422s on the nested form with `extra_forbidden`. This test asserts the
+/// post-fix shape — `reasoning_effort == "high"` with no nested
+/// `reasoning.effort` — and guards against a regression that reintroduces
+/// the nested object.
 #[tokio::test]
-async fn mistral_reasoning_effort_emits_both_shapes_today() {
+async fn mistral_drops_nested_reasoning_effort() {
     let captured = CapturedRequest::default();
     let addr = spawn_server(SSE_HELLO_DONE, 200, "text/event-stream", captured.clone()).await;
     let provider = provider_for(addr, "test-key");
@@ -269,13 +271,13 @@ async fn mistral_reasoning_effort_emits_both_shapes_today() {
     );
 }
 
-/// MIS-3 / H-56: today the shared adapter emits `prompt_cache_retention: "24h"`
-/// for any `CacheRetention::Long` request, regardless of preset.
-/// Mistral 422s on the unknown field. Pin the current emission so the
-/// per-preset gate (drop the field for Mistral) lands with an
-/// observable test signal.
+/// MIS-3 / H-56 (shipped): the shared adapter no longer emits
+/// `prompt_cache_retention` for the Mistral preset, since Mistral 422s on
+/// the unknown top-level field. This test asserts the post-fix shape —
+/// `prompt_cache_retention` absent while `prompt_cache_key` still flows
+/// through — and guards against a regression that reintroduces the field.
 #[tokio::test]
-async fn mistral_emits_prompt_cache_retention_today() {
+async fn mistral_drops_prompt_cache_retention() {
     let captured = CapturedRequest::default();
     let addr = spawn_server(SSE_HELLO_DONE, 200, "text/event-stream", captured.clone()).await;
     let provider = provider_for(addr, "test-key");

@@ -25,8 +25,13 @@ use crate::{
 /// Default `options.num_ctx` stamped on every native `/api/chat` request.
 /// Ollama's server default is 4096, which silently truncates agent prompts.
 /// 32k is the upper bound of opencode's recommended 16k–32k tool-calling
-/// safe range. Agents that have probed the model's true window via
-/// `fetch_ollama_context_window` can override at a higher layer.
+/// safe range.
+///
+/// NOTE: this value is currently stamped unconditionally — there is no
+/// plumbed override path, so a probed `fetch_ollama_context_window` result
+/// cannot yet flow through to the request body. Wiring an override parameter
+/// through `request_body_with` (and its call sites) is deferred to the same
+/// follow-up that grows `OllamaConfig` with the relevant field.
 pub(crate) const DEFAULT_NUM_CTX: u64 = 32_768;
 
 // TODO(audit C-06): `DEFAULT_OLLAMA_BASE_URL` in `squeezy-core` still bakes in
@@ -129,9 +134,10 @@ impl OllamaProvider {
         // history, and tool outputs blow through it instantly and Ollama
         // silently drops the oldest messages. Tool-calling reliability
         // collapses below ~16k. Stamp 32k by default so every native
-        // chat request gets a workable window. Callers that have probed
-        // the model's true `model_info.*.context_length` via
-        // `fetch_ollama_context_window` can override at the agent layer.
+        // chat request gets a workable window. A probed value from
+        // `fetch_ollama_context_window` cannot yet override this — no
+        // override path is wired through `request_body_with` (see the
+        // `DEFAULT_NUM_CTX` doc comment).
         // Reference: opencode providers docs (Ollama), Ollama FAQ.
         let mut options = json!({ "num_ctx": DEFAULT_NUM_CTX });
         if let Some(max_output_tokens) = request.max_output_tokens {

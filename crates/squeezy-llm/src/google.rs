@@ -695,12 +695,18 @@ fn parse_google_event(
     if let Some(error) = value.get("error") {
         // Google's standard error envelope is
         // `{error:{code,message,status,details}}`. The previous code
-        // only surfaced `message`, which made
-        // `retry.rs::is_terminal_quota_error` miss Gemini billing
-        // exhaustion (status == "RESOURCE_EXHAUSTED") and the full
-        // retry budget burned on each 429. Concatenate status + code
-        // + message so the downstream classifier sees the salient
-        // tokens. Reference: https://cloud.google.com/apis/design/errors
+        // only surfaced `message`, dropping the `status` /`code` tokens
+        // that name the failure (e.g. "RESOURCE_EXHAUSTED"). Concatenate
+        // status + code + message so the error text the caller sees is
+        // self-describing. Reference:
+        // https://cloud.google.com/apis/design/errors
+        //
+        // Note: this enrichment is purely cosmetic for retry decisions on
+        // the stream path. `retry.rs::is_terminal_quota_error` only runs on
+        // the *non-OK HTTP body* path, and its substring list does not even
+        // include "RESOURCE_EXHAUSTED" — it never sees these in-stream SSE
+        // error frames. Stream-path terminality is decided here instead, by
+        // stamping the NON_RETRYABLE_MARKER onto the envelope below.
         let message = error
             .get("message")
             .and_then(Value::as_str)

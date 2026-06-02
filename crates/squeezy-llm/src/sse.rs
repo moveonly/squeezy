@@ -10,6 +10,13 @@
 /// need stream-phase disambiguation can switch to
 /// [`SseDecoder::push_with_events`] / [`SseDecoder::finish_with_events`]
 /// without another decoder refactor (L3).
+///
+/// Note: the `event:` parsing here is forward-looking scaffolding, not
+/// the mechanism behind C-01 (mid-stream provider errors). Anthropic's
+/// mid-stream error surfaces through the *JSON* `"type":"error"` branch
+/// of the per-provider `data:` parser fed by [`SseDecoder::push`]; it
+/// does not depend on the SSE `event:` line at all. No production caller
+/// reads this field today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SseEvent {
     pub data: String,
@@ -114,6 +121,14 @@ fn decode_sse_event(bytes: &[u8]) -> Vec<SseEvent> {
     // L3: SSE allows an `event: <name>` line per event. Capture the
     // last such name in the frame; it applies to every payload that
     // the frame surfaces (including any post-`[DONE]` split).
+    //
+    // Caveat: this is *last-wins per frame* and is stamped onto every
+    // payload from the frame at flush time — including any `data:`
+    // line that physically preceded the `event:` line within the same
+    // frame. A strict per-event reader would tie each name only to the
+    // payload it introduces. The field is unused in production (see the
+    // module-level note), so the simplification is harmless; tighten it
+    // to per-event association before any consumer relies on the name.
     let mut event_name: Option<String> = None;
     let push_pending =
         |events: &mut Vec<SseEvent>, pending: &mut Vec<&str>, name: &Option<String>| {
@@ -140,6 +155,17 @@ fn decode_sse_event(bytes: &[u8]) -> Vec<SseEvent> {
             // stream. Drop empties; also tolerate trailing whitespace
             // around the `[DONE]` sentinel (some providers send
             // `data: [DONE] \n`).
+            //
+            // Spec deviation: WHATWG EventSource §9.2 strips only a
+            // single leading space after the colon (`data: x` -> `x`,
+            // but `data:  x` -> ` x`) and never touches the trailing
+            // edge. We `trim()` both ends instead. This is benign for
+            // every current consumer because each parses the payload as
+            // JSON or compares it against the `[DONE]` sentinel — both
+            // of which ignore surrounding ASCII whitespace. If a future
+            // consumer needs whitespace-significant payloads, narrow
+            // this to `data.strip_prefix(' ').unwrap_or(data)` (single
+            // leading space, no trailing strip) to match the spec.
             let payload = data.trim();
             if payload.is_empty() {
                 continue;

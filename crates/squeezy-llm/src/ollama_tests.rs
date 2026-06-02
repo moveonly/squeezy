@@ -577,6 +577,34 @@ fn host_root_normalizes_all_input_shapes() {
         ollama_host_root("http://localhost:11434/v1/"),
         "http://localhost:11434"
     );
+    // IPv6 literal hosts keep their bracketed authority intact; only the
+    // trailing `/api` segment is stripped.
+    assert_eq!(
+        ollama_host_root("http://[::1]:11434/api"),
+        "http://[::1]:11434"
+    );
+    // Path-prefixed bases (reverse-proxied Ollama under a sub-path) keep
+    // the prefix; only the trailing `/api` segment is peeled off.
+    assert_eq!(
+        ollama_host_root("http://host/ollama/api"),
+        "http://host/ollama"
+    );
+}
+
+#[test]
+fn api_endpoint_url_preserves_ipv6_and_path_prefixed_bases() {
+    // IPv6 literal: the bracketed authority survives and `/api/<endpoint>`
+    // is joined onto the recovered host root.
+    assert_eq!(
+        api_endpoint_url("http://[::1]:11434/api", "chat"),
+        "http://[::1]:11434/api/chat"
+    );
+    // Path-prefixed base: the sub-path prefix is retained ahead of the
+    // canonical `/api/<endpoint>` join.
+    assert_eq!(
+        api_endpoint_url("http://host/ollama/api", "show"),
+        "http://host/ollama/api/show"
+    );
 }
 
 #[test]
@@ -635,10 +663,16 @@ fn route_style_compat_builds_lmstudio_delegate() {
         route_style: squeezy_core::OllamaRoute::OpenAiCompatible,
         transport: squeezy_core::ProviderTransportConfig::default(),
     });
-    assert!(
-        provider.compat.is_some(),
-        "OpenAiCompatible route must instantiate the LM Studio delegate",
-    );
+    let compat = provider
+        .compat
+        .as_ref()
+        .expect("OpenAiCompatible route must instantiate the LM Studio delegate");
+    // The delegate must point at the `/v1`-normalized root (the `/api`
+    // suffix is swapped for `/v1`), carry the LM Studio preset, and merge
+    // no extra headers (the preset has no defaults).
+    assert_eq!(compat.base_url(), "http://localhost:11434/v1");
+    assert_eq!(compat.preset(), OpenAiCompatiblePreset::LMStudio);
+    assert!(compat.extra_headers().is_empty());
 }
 
 #[test]

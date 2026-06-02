@@ -9,21 +9,18 @@
 //!
 //! * **T-13 / C-02** — `response.refusal.delta` produces a typed
 //!   `LlmEvent::Refusal` and terminates the stream with
-//!   `StopReason::Refusal`. Marked `#[ignore]` on this worktree because
-//!   the parser does not yet branch on the refusal event family; the
-//!   ignore tag is the regression hook for the C-02 fix.
+//!   `StopReason::Refusal`.
 //! * **T-14 / H-06** — `response.failed` with each known `error.code`
 //!   (`context_length_exceeded`, `rate_limit_exceeded`,
 //!   `insufficient_quota`) surfaces as
 //!   [`squeezy_core::SqueezyError::ProviderStream`] carrying the
 //!   upstream message.
 //! * **T-15 / H-07** — `response.function_call_arguments.delta` produces
-//!   incremental `LlmEvent::ToolCallDelta` events. Marked `#[ignore]`
-//!   until the variant lands (Phase 1 added it on `audit-fixes`; this
-//!   worktree is rebased onto an earlier point in history).
+//!   incremental `LlmEvent::ToolCallDelta` events carrying the call_id
+//!   and the name pre-registered by `response.output_item.added`.
 //! * **T-16 / H-08** — `response.output_text.done` reconciles against
-//!   the running text buffer. Ignored on this worktree until the
-//!   `output_text.done` handler is added.
+//!   the running text buffer, emitting a corrective `TextDelta` for any
+//!   suffix the cumulative deltas dropped.
 //! * **T-17 / M-05** — A stale `previous_response_id` surfaces a
 //!   `previous_response_not_found` signal in the upstream error message
 //!   so the agent layer can detect it without a SqueezyError schema
@@ -85,6 +82,42 @@ const SSE_INCOMPLETE_MAX_TOKENS: &str = concat!(
 const SSE_FAILED_PREVIOUS_RESPONSE_NOT_FOUND: &str = concat!(
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_4\"}}\n\n",
     "data: {\"type\":\"response.failed\",\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"previous_response_id resp_x not found\"},\"response\":{\"id\":\"resp_4\"}}\n\n",
+);
+
+/// C-02: a safety refusal streams through `response.refusal.delta`
+/// chunks and terminates with a `response.completed` carrying no
+/// `incomplete_details`. The parser must emit a typed
+/// `LlmEvent::Refusal` per delta and latch the terminal stop reason to
+/// `StopReason::Refusal`.
+const SSE_REFUSAL: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_5\",\"model\":\"gpt-test\"}}\n\n",
+    "data: {\"type\":\"response.refusal.delta\",\"delta\":\"I can't \"}\n\n",
+    "data: {\"type\":\"response.refusal.delta\",\"delta\":\"help with that.\"}\n\n",
+    "data: {\"type\":\"response.refusal.done\",\"refusal\":\"I can't help with that.\"}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_5\",\"usage\":{\"input_tokens\":4,\"output_tokens\":6}}}\n\n",
+);
+
+/// H-07: a function call streams its arguments incrementally. The
+/// `response.output_item.added` event pre-registers the call_id → name
+/// mapping; each `response.function_call_arguments.delta` then surfaces
+/// an incremental `LlmEvent::ToolCallDelta` carrying that name.
+const SSE_FUNCTION_CALL_ARGUMENTS: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_6\",\"model\":\"gpt-test\"}}\n\n",
+    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"call_1\",\"name\":\"get_weather\"}}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":\"{\\\"city\\\":\"}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"delta\":\"\\\"Paris\\\"}\"}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_6\",\"usage\":{\"input_tokens\":5,\"output_tokens\":8}}}\n\n",
+);
+
+/// H-08: the running delta buffer drops a suffix (simulating a delta
+/// lost mid-stream); the authoritative `response.output_text.done`
+/// string is longer than the accumulated buffer, so the parser must
+/// emit a corrective `LlmEvent::TextDelta` for the missing suffix.
+const SSE_OUTPUT_TEXT_DONE_SUFFIX: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_7\",\"model\":\"gpt-test\"}}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \"}\n\n",
+    "data: {\"type\":\"response.output_text.done\",\"text\":\"hello world\"}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_7\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
 );
 
 /// Per-request capture so the test can read inbound headers (e.g.
@@ -351,32 +384,121 @@ async fn response_incomplete_max_tokens_completes_with_stop_reason() {
 }
 
 /// T-13 / C-02: `response.refusal.delta` must produce a typed
-/// [`LlmEvent::Refusal`] and the terminal `response.completed` must
-/// stamp `StopReason::Refusal`. Ignored on this worktree because the
-/// parser does not yet branch on the refusal family — the variant
-/// (`LlmEvent::Refusal`) lands later in Phase 1.
+/// [`LlmEvent::Refusal`] per chunk and the terminal `response.completed`
+/// — which arrives without `incomplete_details` because the refusal text
+/// IS the completion — must stamp `StopReason::Refusal`.
 #[tokio::test]
-#[ignore = "C-02 LlmEvent::Refusal not present on this worktree"]
 async fn response_refusal_delta_emits_refusal_event() {
-    // Intentionally empty: the test body lives on the audit-fixes
-    // branch once the variant + parser branch land. Keeping the test
-    // shell here gives the regression a stable handle.
+    let captured = CapturedHeaders::default();
+    let addr = spawn_responses_server(SSE_REFUSAL, captured.clone()).await;
+    let provider = provider_for(addr, addr.port());
+
+    let events: Vec<LlmEvent> = collect_events(&provider)
+        .await
+        .into_iter()
+        .map(|res| res.expect("refusal stream must not surface error"))
+        .collect();
+
+    let refusal: String = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::Refusal { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refusal, "I can't help with that.");
+
+    let stop_reason = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed expected")
+        .expect("stop_reason populated");
+    assert!(
+        matches!(stop_reason, squeezy_llm::StopReason::Refusal),
+        "refusal latch overrides EndTurn: {stop_reason:?}"
+    );
 }
 
 /// T-15 / H-07: `response.function_call_arguments.delta` must produce
-/// incremental [`LlmEvent::ToolCallDelta`] events. Ignored on this
-/// worktree because the variant lands later in Phase 1.
+/// incremental [`LlmEvent::ToolCallDelta`] events carrying the call_id,
+/// the name pre-registered by `response.output_item.added`, and the
+/// argument chunk.
 #[tokio::test]
-#[ignore = "H-07 LlmEvent::ToolCallDelta not present on this worktree"]
 async fn response_function_call_arguments_delta_emits_tool_call_delta() {
-    // Intentionally empty pending C-06 on the audit-fixes branch.
+    let captured = CapturedHeaders::default();
+    let addr = spawn_responses_server(SSE_FUNCTION_CALL_ARGUMENTS, captured.clone()).await;
+    let provider = provider_for(addr, addr.port());
+
+    let events: Vec<LlmEvent> = collect_events(&provider)
+        .await
+        .into_iter()
+        .map(|res| res.expect("tool-call-delta stream must not surface error"))
+        .collect();
+
+    let deltas: Vec<(&str, &str, &str)> = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::ToolCallDelta {
+                call_id,
+                name,
+                arguments_chunk,
+            } => Some((call_id.as_str(), name.as_str(), arguments_chunk.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        deltas,
+        vec![
+            ("call_1", "get_weather", "{\"city\":"),
+            ("call_1", "get_weather", "\"Paris\"}"),
+        ],
+        "each chunk surfaces a named ToolCallDelta: {deltas:?}"
+    );
 }
 
-/// T-16 / H-08: `response.output_text.done` must reconcile a missing
-/// suffix against the cumulative delta buffer. Ignored on this worktree
-/// because the `output_text.done` handler is added later in Phase 1.
+/// T-16 / H-08: when the cumulative delta buffer is missing a suffix the
+/// authoritative `response.output_text.done` string carries, the parser
+/// must emit a corrective [`LlmEvent::TextDelta`] for the missing suffix
+/// so the persisted transcript matches what the model produced.
 #[tokio::test]
-#[ignore = "H-08 output_text.done reconcile not present on this worktree"]
 async fn response_output_text_done_reconciles_suffix() {
-    // Intentionally empty pending H-08 on the audit-fixes branch.
+    let captured = CapturedHeaders::default();
+    let addr = spawn_responses_server(SSE_OUTPUT_TEXT_DONE_SUFFIX, captured.clone()).await;
+    let provider = provider_for(addr, addr.port());
+
+    let events: Vec<LlmEvent> = collect_events(&provider)
+        .await
+        .into_iter()
+        .map(|res| res.expect("output_text.done stream must not surface error"))
+        .collect();
+
+    // The streamed delta ("hello ") plus the corrective suffix ("world")
+    // recovered from `.done` must reconstruct the authoritative string.
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::TextDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hello world", "missing suffix reconciled from .done");
+
+    // The corrective delta is emitted as a distinct TextDelta carrying
+    // only the missing suffix, not a re-send of the whole string.
+    let text_deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::TextDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text_deltas,
+        vec!["hello ", "world"],
+        "corrective TextDelta carries only the suffix: {text_deltas:?}"
+    );
 }

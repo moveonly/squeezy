@@ -988,7 +988,7 @@ fn parse_chat_event_handles_done_sentinel() {
 
 #[test]
 fn finish_reason_stop_followed_by_trailing_usage_chunk_captures_cost() {
-    // C-10: Groq, OpenRouter-via-Groq, and native OpenAI ship the
+    // C-10: Groq and OpenRouter-via-Groq ship the
     // final `usage` envelope in a chunk *after* the one carrying
     // `finish_reason: "stop"` and before the terminal `[DONE]`. If
     // the stop handler latches `completed_emitted = true`, the outer
@@ -1840,6 +1840,14 @@ fn compat_table_prefixes_are_lowercase() {
 
 #[test]
 fn preset_full_tier_matches_documented_set() {
+    // This pin is intentionally near-tautological: it re-derives the
+    // set straight from `is_full_tier()` and freezes the exact
+    // membership against a hand-maintained list. Its value is as a
+    // change-detector — adding/removing a preset or flipping a
+    // preset's `is_full_tier()` flag fails here, forcing the author
+    // to update the documented full-tier set (and the curated
+    // models.json coverage that goes with it) deliberately rather
+    // than by accident.
     let full: Vec<_> = OpenAiCompatiblePreset::all()
         .iter()
         .copied()
@@ -2270,6 +2278,15 @@ fn resolve_provider_segment_maps_known_model_prefixes_to_upstream_path() {
         resolve_provider_segment(base, "openai/gpt-5.5"),
         "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/openai/v1",
     );
+    // F1: Cloudflare's REST upstream slug for Google AI Studio is
+    // `google-ai-studio`, not the bare `google` namespace prefix.
+    // The slug map must rewrite it so the path resolves to a real
+    // upstream rather than 404ing on `/google`.
+    assert_eq!(
+        resolve_provider_segment(base, "google/gemini-2.5-pro"),
+        "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/google-ai-studio/v1",
+        "google/ prefix must map to Cloudflare's google-ai-studio slug"
+    );
     assert_eq!(
         resolve_provider_segment(base, "@cf/meta/llama-3.3-70b"),
         "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/workers-ai/v1",
@@ -2561,14 +2578,17 @@ fn portkey_canonical_auth_opt_in_does_not_clobber_user_supplied_header() {
 fn cloudflare_ai_gateway_emits_cf_aig_gateway_id_header() {
     // H-40: gateway selection moves from URL segment to the
     // `cf-aig-gateway-id` HEADER under the new REST API. Emit it
-    // whenever the config carries a gateway id so the right
-    // gateway is selected regardless of which URL template the
-    // operator left in place.
+    // whenever the config carries a gateway id and the resolved URL
+    // does NOT already encode it in the path — i.e. the REST shape,
+    // which routes by upstream provider rather than gateway.
     let gateway = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
         preset: OpenAiCompatiblePreset::CloudflareAiGateway,
         api_key_env: "CLOUDFLARE_API_KEY".to_string(),
         api_key: Some("cf-token".to_string()),
-        base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+        // REST shape: gateway id is NOT in the path, so the header is
+        // the only place the gateway can be selected.
+        base_url: "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/{provider}/v1"
+            .to_string(),
         extra_headers: BTreeMap::new(),
         transport: ProviderTransportConfig::default(),
         account_id: Some("acct".to_string()),
@@ -2585,8 +2605,45 @@ fn cloudflare_ai_gateway_emits_cf_aig_gateway_id_header() {
             k.eq_ignore_ascii_case("cf-aig-gateway-id")
                 .then(|| v.clone())
         })
-        .expect("cf-aig-gateway-id must be emitted");
+        .expect("cf-aig-gateway-id must be emitted on the REST URL shape");
     assert_eq!(gateway_header, "my-gateway");
+}
+
+#[test]
+fn cloudflare_ai_gateway_omits_cf_aig_gateway_id_header_on_compat_path() {
+    // F2: the default `/compat` URL already encodes the gateway id in
+    // its path (`.../v1/{account_id}/{gateway_id}/compat`). Emitting
+    // `cf-aig-gateway-id` there is redundant, so the header is
+    // suppressed when the resolved base URL already carries the
+    // gateway segment. (The REST shape, which lacks the segment, still
+    // gets the header — see the sibling test above.)
+    let gateway = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("cf-token".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct".to_string()),
+        gateway_id: Some("my-gateway".to_string()),
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
+    })
+    .expect("provider builds");
+    assert!(
+        !gateway
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("cf-aig-gateway-id")),
+        "cf-aig-gateway-id is redundant on the /compat path that already \
+         encodes the gateway id, so it must be suppressed"
+    );
+    // The gateway is still selected — via the path segment.
+    assert!(
+        gateway.base_url().contains("/my-gateway/compat"),
+        "the /compat URL must carry the gateway id in its path"
+    );
 }
 
 #[test]

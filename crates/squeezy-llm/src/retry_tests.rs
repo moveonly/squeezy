@@ -407,6 +407,84 @@ async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
     );
 }
 
+/// F1: the retry layer forwards additive `#[non_exhaustive]` variants
+/// it does not track (here `Refusal`) verbatim through the `SkipCursor`
+/// wildcard arm. This documents the current contract — these variants
+/// pass through unchanged — for variants whose prefix a reconnect would
+/// not replay.
+#[tokio::test]
+async fn untracked_additive_variant_passes_through_unchanged() {
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        mock_full_stream(vec![
+            LlmEvent::Started,
+            LlmEvent::Refusal {
+                content: "I can't help with that.".to_string(),
+            },
+            LlmEvent::completed(Some("resp_1".to_string()), CostSnapshot::default()),
+        ])
+    });
+
+    let collected: Vec<LlmEvent> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .expect("clean stream");
+
+    let saw_refusal = collected
+        .iter()
+        .any(|event| matches!(event, LlmEvent::Refusal { content } if content == "I can't help with that."));
+    assert!(
+        saw_refusal,
+        "untracked additive variant must pass through unchanged"
+    );
+}
+
+/// F1: `ToolCallDelta` carries an incremental prefix that a mid-stream
+/// reconnect would replay, and `SkipCursor` has no per-`call_id`
+/// accounting for it yet. The wildcard arm therefore trips a
+/// `debug_assert` to gate any future adoption of `with_stream_retry` on
+/// a `ToolCallDelta`-emitting provider. Lock that gate in: routing a
+/// `ToolCallDelta` through the retry layer must panic in a debug/test
+/// build rather than silently risk a double-emit.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "ToolCallDelta")]
+async fn tool_call_delta_trips_skip_accounting_gate() {
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        mock_full_stream(vec![
+            LlmEvent::Started,
+            LlmEvent::ToolCallDelta {
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments_chunk: "{\"q\":".to_string(),
+            },
+        ])
+    });
+
+    let _ = stream.collect::<Vec<_>>().await;
+}
+
 #[test]
 fn apply_jitter_stays_within_bounds() {
     let base = Duration::from_millis(1_000);

@@ -764,29 +764,40 @@ fn optional_resolver_prefers_inline_over_env() {
 }
 
 #[test]
-fn optional_resolver_propagates_non_missing_errors() {
-    // Only `ProviderNotConfigured` collapses to empty. Tests of the
-    // contract: if a future failure mode in the strict resolver
-    // emits a different error variant, the optional wrapper must
-    // forward it untouched so callers can still surface that
-    // (e.g. malformed credentials file, IO error). We approximate
-    // by leveraging the only other guarantee in the surface: any
-    // non-missing path returns a populated string. There is no
-    // direct way to provoke another error today; the unit test
-    // pins the behavior by exercising the missing path repeatedly
-    // and trusting the cargo doctest on the function signature.
+fn optional_resolver_degrades_to_empty_on_malformed_credentials_file() {
+    // Honest scope (was `optional_resolver_propagates_non_missing_errors`):
+    // the optional wrapper's `Err(err) => Err(err)` arm forwards any
+    // *non*-`ProviderNotConfigured` error, but `resolve_api_key_with_inline`
+    // is structurally incapable of producing one today — every failure
+    // mode in the chain (malformed JSON, bad mode bits, I/O error on the
+    // credentials file) `warn_once`s and returns `None`, so resolution
+    // keeps walking and ultimately the *only* `Err` it can emit is
+    // `ProviderNotConfigured`. The old test name promised a propagation
+    // assertion it never made: it just exercised the missing path twice,
+    // so it would have passed even if the forwarding arm collapsed every
+    // error to `Ok("")`.
+    //
+    // Rather than assert against an unreachable variant, pin the contract
+    // that *is* reachable and that the original test failed to cover: a
+    // malformed credentials file does not surface as an error through the
+    // optional wrapper — it degrades to the empty-string short-circuit,
+    // exactly like the strict resolver degrades it to
+    // `ProviderNotConfigured`. This drives the malformed-file branch
+    // through `resolve_api_key_with_inline_optional`, which no other test
+    // here does.
     let _guard = creds_lock();
-    let scratch = scratch("optional-non-missing");
+    let scratch = scratch("optional-malformed-file");
+    write_creds(&scratch.file, "{ this is not JSON");
     point_creds_at(&scratch.file);
-    let first =
-        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_OPTIONAL_REPEAT_1")
-            .expect("first");
-    let second =
-        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_OPTIONAL_REPEAT_2")
-            .expect("second");
+    let resolved =
+        resolve_api_key_with_inline_optional(None, "SQUEEZY_RESOLVER_TEST_OPTIONAL_MALFORMED")
+            .expect("malformed file must degrade to empty, not error");
     clear_creds_pointer();
-    assert!(first.value.is_empty());
-    assert!(second.value.is_empty());
+    assert!(
+        resolved.value.is_empty(),
+        "malformed credentials file should degrade to empty, not propagate an error"
+    );
+    assert_eq!(resolved.source, KeySource::Env);
 }
 
 // --- H-46: empty key must not feed bearer_auth -----------------------------

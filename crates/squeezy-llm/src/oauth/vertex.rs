@@ -19,11 +19,22 @@
 //! falls back to the cached user credentials laid down by `gcloud
 //! auth application-default login` (the documented ADC chain).
 //!
-//! This module deliberately does **not** wire itself into the Vertex
-//! preset. The preset's `from_config` path still calls
-//! `static_api_key_source`; switching it over is Phase 4I's scope.
-//! Until that lands the type lives here as a building block so
-//! Phase 4I can drop the source in without rewriting the call site.
+//! Status: NOT-YET-WIRED building block. This module deliberately
+//! does **not** wire itself into the Vertex preset — the preset's
+//! `from_config` path still calls `static_api_key_source`
+//! (`compatible.rs:227`). Switching the preset over is a product
+//! decision deferred to Phase 4I, not a review fix, so the type lives
+//! here ready to be dropped in without rewriting the call site.
+//!
+//! Because nothing internal calls [`VertexOAuthSource`] yet, the only
+//! reason it isn't flagged as dead code is that it (and
+//! [`DEFAULT_GCLOUD_COMMAND`] / [`GCLOUD_PRINT_TOKEN_ARGS`]) are `pub`
+//! and re-exported from `oauth.rs`, which counts as a use. That
+//! re-export is intentional: it keeps the building block on the public
+//! surface (and exercised by `vertex_tests.rs`) until Phase 4I wires it
+//! in. Do not add a `#[allow(dead_code)]` to silence a warning here —
+//! if one appears, the correct move is to wire the source in, not to
+//! suppress it.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -44,6 +55,14 @@ const TOKEN_TTL: Duration = Duration::from_secs(55 * 60);
 
 /// Default executable name. Vendored as a const so a test or unusual
 /// install can point the source elsewhere via [`VertexOAuthSource::with_command`].
+///
+/// Security note: this is a bare command name, so [`run_gcloud`] resolves
+/// it through the process `$PATH`. We trust `$PATH` here for the same
+/// reason the rest of the CLI does — the user already controls their own
+/// shell environment, and `gcloud` is the canonical, expected binary. A
+/// caller who needs to defend against a hijacked `$PATH` (e.g. running
+/// under an untrusted environment) can pin an absolute path via
+/// [`VertexOAuthSource::with_command`].
 pub const DEFAULT_GCLOUD_COMMAND: &str = "gcloud";
 
 /// Arguments the source passes to `gcloud` to mint a fresh ADC access
@@ -236,6 +255,19 @@ impl ApiKeySource for VertexOAuthSource {
 /// stdout. Translates every failure mode into a `SqueezyError` whose
 /// message hints the user toward the missing prerequisite (the
 /// `gcloud` CLI, ADC login).
+///
+/// `$PATH` trust: when `command` is a bare name (the default
+/// [`DEFAULT_GCLOUD_COMMAND`]) the OS resolves it through the process
+/// `$PATH`. That is an intentional, documented assumption — see
+/// [`DEFAULT_GCLOUD_COMMAND`]. Callers who need a hardened lookup can
+/// pass an absolute path through [`VertexOAuthSource::with_command`],
+/// which flows straight through to `command` here.
+///
+/// Logging: the returned `Ok` value is the access token and must
+/// **never** be logged (we already keep it off every error path). The
+/// error path on a non-zero exit embeds `gcloud`'s stderr to keep the
+/// failure diagnosable; call sites should surface that error at
+/// `debug` level only, since stderr can carry account/project hints.
 async fn run_gcloud(command: &str, args: &[String], timeout: Duration) -> Result<String> {
     let mut cmd = Command::new(command);
     cmd.args(args)
@@ -277,7 +309,25 @@ async fn run_gcloud(command: &str, args: &[String], timeout: Duration) -> Result
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The embedded stderr makes the failure diagnosable, but it can
+        // carry account/project hints, so call sites should log this
+        // error at `debug` level only. We also bound the length here so
+        // a pathological `gcloud` can't blow up the error message; the
+        // first chunk is where the human-readable reason lives.
+        const MAX_STDERR: usize = 512;
+        let raw = String::from_utf8_lossy(&output.stderr);
+        let trimmed = raw.trim();
+        let stderr: String = if trimmed.len() > MAX_STDERR {
+            // Back off to the nearest UTF-8 char boundary so the slice
+            // can't panic on a multi-byte character straddling the cut.
+            let mut end = MAX_STDERR;
+            while !trimmed.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}… (truncated)", &trimmed[..end])
+        } else {
+            trimmed.to_string()
+        };
         return Err(SqueezyError::ProviderNotConfigured(format!(
             "`{command} {args}` failed (exit {status}): {stderr}",
             args = args.join(" "),
@@ -286,7 +336,6 @@ async fn run_gcloud(command: &str, args: &[String], timeout: Duration) -> Result
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".to_string()),
-            stderr = stderr.trim(),
         )));
     }
 

@@ -203,6 +203,15 @@ fn provider_for(
 /// token + per-project base URL that the loopback harness cannot
 /// simulate. The Custom preset is also skipped because `from_config`
 /// rejects an empty `default_base_url` without operator input.
+///
+/// F4: note that `CloudflareAiGateway` is built here via
+/// `with_api_key_source` (see `provider_for`), which means this
+/// matrix exercises the *streaming/parse* path only — it does NOT
+/// route through `from_config` and therefore does NOT guard the C-11
+/// dual-auth split (`cf-aig-authorization` vs `Authorization: Bearer`)
+/// or the `/compat`-vs-REST URL resolution. That coverage lives in
+/// `compatible_tests.rs` (e.g. `cloudflare_ai_gateway_*`); readers
+/// should not assume this matrix pins the CF auth/URL behavior.
 fn matrix_presets() -> &'static [OpenAiCompatiblePreset] {
     &[
         OpenAiCompatiblePreset::OpenRouter,

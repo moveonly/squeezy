@@ -380,9 +380,15 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         && seconds >= 0.0
     {
         // Clamp to ms precision and saturate on absurd values so a buggy
-        // header cannot overflow `Duration::from_millis`. The outer
-        // `policy.max_retry_delay` cap still applies.
-        let millis = (seconds * 1_000.0).clamp(0.0, u64::MAX as f64) as u64;
+        // header cannot overflow `Duration::from_millis`. An integer too
+        // large for the `u64` branch above (e.g. `99999999999999999999`)
+        // lands here and would otherwise become ~1e23 ms; we pin it to a
+        // one-day sentinel so the reported Duration is itself sane rather
+        // than astronomical. The outer `policy.max_retry_delay` cap still
+        // bounds the actual sleep, so this clamp only keeps the
+        // intermediate value honest for logging / tests.
+        const MAX_RETRY_AFTER_MS: f64 = 24.0 * 60.0 * 60.0 * 1_000.0;
+        let millis = (seconds * 1_000.0).clamp(0.0, MAX_RETRY_AFTER_MS) as u64;
         return Some(Duration::from_millis(millis));
     }
     let target = httpdate::parse_http_date(text).ok()?;
@@ -437,6 +443,18 @@ impl StreamSkipState {
             // (incremental tool-args, refusal/citation deltas) don't
             // change retry skip accounting until the canonical
             // materialized event lands, so we no-op here.
+            //
+            // CONSTRAINT (paired with the wildcard arm in
+            // `SkipCursor::filter`): these variants carry *incremental*
+            // payloads that `SkipCursor::filter` forwards verbatim
+            // without per-`call_id` cursor accounting. A mid-stream
+            // reconnect on a provider that emits e.g.
+            // `LlmEvent::ToolCallDelta` would therefore re-stream the
+            // already-observed delta prefix. No provider wired through
+            // `with_stream_retry` emits `ToolCallDelta` today; adopting
+            // it on such a provider requires extending both wildcard
+            // arms with real skip accounting first. The `debug_assert`
+            // in `SkipCursor::filter` gates that adoption.
             _ => {}
         }
     }
@@ -525,7 +543,29 @@ impl SkipCursor {
             // through unchanged because the retry layer doesn't track
             // them yet. Downstream consumers wildcard-skip on the same
             // grounds.
-            other => Some(other),
+            //
+            // CONSTRAINT (paired with the wildcard arm in
+            // `StreamSkipState::observe_yielded`): forwarding these
+            // verbatim is only safe while no `with_stream_retry`
+            // provider emits an *incremental* variant whose prefix a
+            // reconnect would replay. `ToolCallDelta` is exactly such a
+            // variant — a mid-stream reconnect would double-emit the
+            // already-streamed argument chunks because there is no
+            // per-`call_id` cursor here yet. The assert turns "someone
+            // adopted `with_stream_retry` on a `ToolCallDelta`-emitting
+            // provider" into a loud test/dev failure instead of a
+            // silent duplicate-delta bug; building out the accounting in
+            // both wildcard arms is the fix when that day comes.
+            other => {
+                debug_assert!(
+                    !matches!(other, LlmEvent::ToolCallDelta { .. }),
+                    "with_stream_retry forwards ToolCallDelta without per-call_id skip \
+                     accounting; a reconnect would replay its prefix. Extend SkipCursor / \
+                     StreamSkipState before routing a ToolCallDelta-emitting provider through \
+                     with_stream_retry.",
+                );
+                Some(other)
+            }
         }
     }
 }
@@ -665,6 +705,16 @@ where
 /// Strip-and-check the marker before classifying so a marked
 /// `ProviderRequest`/`ProviderStream` returns `false` and short-circuits
 /// the reconnect loop straight to the caller.
+///
+/// Security note: keying on a string *prefix* is spoofable in theory —
+/// an upstream that emitted a body literally starting with the marker
+/// text could suppress our retries. The blast radius is bounded though:
+/// the only outcome of a (mis)classification as non-retryable is "stop
+/// reconnecting and surface the error to the caller", never an escalated
+/// privilege or an extra request. A typed non-retryable field on
+/// `SqueezyError` would remove the ambiguity entirely, but that refactor
+/// is out of scope here; the prefix marker is set by our own normaliser
+/// (`anthropic_error`) on a path the upstream body never controls.
 pub(crate) fn is_retryable_stream_error(err: &SqueezyError) -> bool {
     let message = match err {
         SqueezyError::ProviderStream(msg) | SqueezyError::ProviderRequest(msg) => msg.as_str(),

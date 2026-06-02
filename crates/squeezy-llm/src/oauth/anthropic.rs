@@ -577,13 +577,28 @@ impl AnthropicOAuthSource {
             Ok(response) => response,
             Err(err) => {
                 // Keep `dirty=true` so the next caller still sees the
-                // stale token as needing refresh, and cache the error
-                // string so concurrent / repeat callers don't re-fire
-                // the failed POST until an explicit `invalidate()`
-                // wipes the flag (the operator-triggered re-login
-                // path).
+                // stale token as needing refresh. Only *permanent*
+                // failures (the refresh token is revoked / rejected:
+                // token-endpoint HTTP 400/401/403 or an `invalid_grant`
+                // body) latch into `last_refresh_err` so concurrent /
+                // repeat callers don't re-fire a POST that can only
+                // fail the same way until an explicit `invalidate()`
+                // (the operator-triggered re-login path) wipes it.
+                //
+                // Transient failures — network errors ("POST failed" /
+                // "body read failed"), 5xx, timeouts, or a malformed
+                // body from a flaky proxy — are deliberately NOT
+                // cached: latching them would permanently wedge the
+                // source for the process lifetime, because the only
+                // caller that ever reaches `invalidate()` is the
+                // messages-endpoint 401/403 path, which `current_key()`
+                // short-circuits before any request is sent. Letting
+                // them fall through means the next `current_key()`
+                // simply retries the refresh.
                 let message = err.to_string();
-                guard.last_refresh_err = Some(message);
+                if refresh_error_is_permanent(&message) {
+                    guard.last_refresh_err = Some(message);
+                }
                 return Err(err);
             }
         };
@@ -680,6 +695,53 @@ fn access_token_is_stale(tokens: &PersistedTokens) -> bool {
         Some(threshold) => threshold <= now,
         None => true,
     }
+}
+
+/// Classify a [`refresh_anthropic_token`] failure as permanent (the
+/// refresh token will never succeed again without a re-login) versus
+/// transient (a retry on the next `current_key()` has a real chance of
+/// succeeding).
+///
+/// The error is stringly-typed (`SqueezyError::ProviderRequest` carries
+/// only a message), so we match on the shapes [`post_token_request`]
+/// produces:
+///
+/// * `"Anthropic OAuth token endpoint returned {status}: {body}"` —
+///   permanent for HTTP 400/401/403 or any body mentioning
+///   `invalid_grant` (the platform's signal that the refresh token is
+///   revoked/expired); a 5xx from this same shape is transient.
+/// * `"Anthropic OAuth POST failed: ..."` / `"... body read failed: ..."`
+///   — transport-level (DNS, connect, timeout, reset); transient.
+/// * `"Anthropic OAuth token response was not valid JSON: ..."` — a
+///   flaky proxy or partial body; transient.
+///
+/// Only permanent failures latch into `last_refresh_err`; anything we
+/// can't positively classify as permanent is treated as transient so a
+/// single hiccup never wedges the source for the process lifetime.
+fn refresh_error_is_permanent(message: &str) -> bool {
+    // An explicit `invalid_grant` anywhere in the surfaced body is the
+    // canonical "this refresh token is dead" signal regardless of the
+    // HTTP status the platform paired it with.
+    if message.contains("invalid_grant") {
+        return true;
+    }
+    // Otherwise only the HTTP-status error shape can be permanent, and
+    // only for the auth-class 4xx codes. A 5xx (or any other status)
+    // is transient.
+    if let Some(rest) = message.strip_prefix("Anthropic OAuth token endpoint returned ") {
+        let status = rest
+            .split_once(':')
+            .map(|(status, _)| status.trim())
+            .unwrap_or_else(|| rest.trim());
+        // `status` is the `Display` of `reqwest::StatusCode`, e.g.
+        // "400 Bad Request"; the leading numeric code is enough.
+        let code = status
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse::<u16>().ok());
+        return matches!(code, Some(400) | Some(401) | Some(403));
+    }
+    false
 }
 
 fn current_unix_ms() -> u64 {

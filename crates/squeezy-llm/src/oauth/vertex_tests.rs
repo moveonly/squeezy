@@ -151,6 +151,33 @@ async fn nonzero_exit_surfaces_stderr_in_error_message() {
 }
 
 #[tokio::test]
+async fn nonzero_exit_truncates_oversized_stderr() {
+    // A pathological gcloud could dump a huge stderr; the error message
+    // bounds it so it stays diagnosable without blowing up. Emit far
+    // more than the 512-byte cap and assert the truncation marker.
+    let source = VertexOAuthSource::with_command(
+        "/bin/sh",
+        vec![
+            "-c".to_string(),
+            // 2000 'x' bytes to stderr, then a non-zero exit.
+            "yes x | head -c 2000 | tr -d '\\n' 1>&2; exit 1".to_string(),
+        ],
+    );
+    let err = source
+        .current_key()
+        .await
+        .expect_err("nonzero exit must propagate");
+    let msg = err.to_string();
+    assert!(msg.contains("(truncated)"), "stderr must be truncated");
+    // The full 2000-byte payload must not survive into the message.
+    assert!(
+        msg.len() < 1000,
+        "truncated message should be bounded, got {} bytes",
+        msg.len()
+    );
+}
+
+#[tokio::test]
 async fn empty_stdout_surfaces_provider_not_configured() {
     // A successful exit with an empty token usually means the user
     // ran `print-access-token` with no ADC at all. Surface the same

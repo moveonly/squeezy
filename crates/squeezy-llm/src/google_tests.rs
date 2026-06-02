@@ -576,6 +576,43 @@ fn explicit_reasoning_effort_emits_thinking_config_with_budget() {
 }
 
 #[test]
+fn reasoning_effort_clamps_thinking_budget_to_model_max() {
+    // XHigh's raw budget (60_000) exceeds every Gemini 2.5 maximum, so
+    // request_body must run it through clamp_thinking_budget against the
+    // per-model registry caps. Assert the clamped *value* (not just "is a
+    // number") so the test fails if the clamp ever gets bypassed.
+    use squeezy_core::ReasoningEffort;
+
+    // gemini-2.5-pro: thinking_budget_max == 32_768 (models.json).
+    let pro = LlmRequest {
+        model: "gemini-2.5-pro".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        reasoning_effort: Some(ReasoningEffort::XHigh),
+        ..LlmRequest::default()
+    };
+    let pro_body = GoogleProvider::request_body(&pro);
+    assert_eq!(
+        pro_body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 32_768,
+        "XHigh on gemini-2.5-pro must clamp to the Pro maximum"
+    );
+
+    // gemini-2.5-flash: thinking_budget_max == 24_576 (models.json).
+    let flash = LlmRequest {
+        model: "gemini-2.5-flash".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        reasoning_effort: Some(ReasoningEffort::XHigh),
+        ..LlmRequest::default()
+    };
+    let flash_body = GoogleProvider::request_body(&flash);
+    assert_eq!(
+        flash_body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 24_576,
+        "XHigh on gemini-2.5-flash must clamp to the Flash maximum"
+    );
+}
+
+#[test]
 fn image_with_unknown_mime_falls_back_to_inferred_type() {
     // PNG magic bytes shipped with a wrong media_type. google_contents
     // should infer from the bytes and ship `image/png` over the wire.

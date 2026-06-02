@@ -43,6 +43,14 @@ use crate::{
 /// the lower limit is the safe default.
 const BEDROCK_IMAGE_MAX_BYTES: usize = 3_932_160; // 3.75 * 1024 * 1024
 
+/// Bedrock's per-document byte limit on Converse — ~4.5 MB. The
+/// Converse `DocumentBlock` source caps inline document payloads at
+/// 4.5 MB (see the `LlmInputItem::Document` doc-comment in `lib.rs`);
+/// the SDK surfaces the overflow as an opaque `ValidationException`,
+/// so we guard up-front with a structured error naming the offending
+/// document and the limit, mirroring `BEDROCK_IMAGE_MAX_BYTES`.
+const BEDROCK_DOCUMENT_MAX_BYTES: usize = 4_718_592; // 4.5 * 1024 * 1024
+
 /// Anthropic's hard floor for `thinking.budget_tokens` on Bedrock —
 /// the API rejects any request below this with
 /// `invalid_request_error`. Matches the Anthropic-native floor
@@ -132,6 +140,18 @@ async fn load_aws_config(region: String, base_url: Option<String>) -> SdkConfig 
     // chain itself is whatever the AWS SDK ships as best practice.
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
     if let Some(url) = base_url {
+        // SECURITY (out-of-scope gap, documented): a custom Bedrock
+        // `endpoint_url` is dispatched by the AWS SDK's own
+        // `aws-smithy-runtime` hyper transport, NOT squeezy's hardened
+        // `shared_client` resolver that blocks link-local / cloud-
+        // metadata hosts (see the "Bedrock gap" note in
+        // `transport.rs`). An operator who points `base_url` at an
+        // internal/metadata address therefore bypasses the SSRF guard
+        // the other providers get for free. Centralizing this would
+        // require swapping the smithy `HttpConnector`, which is out of
+        // scope here; the config is operator-supplied (not model- or
+        // request-derived), so the trust boundary is the operator's
+        // config file, the same as `AWS_PROFILE` / `~/.aws/config`.
         loader = loader.endpoint_url(url);
     }
     loader.load().await
@@ -290,6 +310,14 @@ fn bedrock_stream_attempt(
         // `_guard = span.entered()` pattern because the resulting
         // `Entered<'_>` is `!Send` and breaks crossing `.await`.
         let attempt_span = attempt_span;
+        // NIT: each cancellation arm below yields `LlmEvent::Cancelled`
+        // and returns. The outer `with_stream_retry` harness also
+        // observes the same `CancellationToken` and may emit its own
+        // `Cancelled` after this attempt ends, so a consumer can see at
+        // most one duplicate `Cancelled` on a cancelled turn. That is
+        // harmless — downstream treats `Cancelled` as idempotent (it
+        // tears the turn down on the first one) — so we keep the inner
+        // yields for prompt local teardown rather than suppressing them.
         let client_result = tokio::select! {
             _ = cancel.cancelled() => {
                 yield LlmEvent::Cancelled;
@@ -1232,6 +1260,11 @@ pub(crate) fn conversation_messages(
                 bytes,
             } => {
                 let document = bedrock_document_block(media_type, name, bytes)?;
+                // Documents lower as a `User` turn, matching `Image`
+                // handling. Bedrock attaches inline document content to
+                // the user side of the conversation; the common case is
+                // a user attachment, so the role is fixed rather than
+                // inferred from surrounding turns.
                 push_message(
                     &mut messages,
                     ConversationRole::User,
@@ -1532,6 +1565,14 @@ pub(crate) fn bedrock_document_block(
             )));
         }
     };
+    if bytes.len() > BEDROCK_DOCUMENT_MAX_BYTES {
+        return Err(SqueezyError::ProviderRequest(format!(
+            "document `{name}` is {} bytes; exceeds Bedrock's {} byte Converse document limit. \
+             Split or compress the document before attaching",
+            bytes.len(),
+            BEDROCK_DOCUMENT_MAX_BYTES,
+        )));
+    }
     let canonical_name = sanitize_bedrock_document_name(name);
     DocumentBlock::builder()
         .format(format)

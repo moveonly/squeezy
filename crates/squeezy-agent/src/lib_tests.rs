@@ -1042,6 +1042,123 @@ async fn assistant_text_is_redacted_in_streamed_deltas_and_completed_message() {
 }
 
 #[tokio::test]
+async fn refusal_event_surfaces_text_to_assistant_stream_and_message() {
+    // OpenAI Responses streams safety-refusal prose on a dedicated
+    // `LlmEvent::Refusal` channel. The main turn loop must route that text
+    // through the assistant stream + `AssistantDelta` + completed message,
+    // not drop it (F1) — otherwise the user only sees the generic
+    // `StopReason::Refusal` failure with no explanation.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Refusal {
+            content: "I can't help with that request.".to_string(),
+        }),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_refusal".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut deltas: Vec<String> = Vec::new();
+    let mut completed_message = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::AssistantDelta { delta, .. } => deltas.push(delta),
+            AgentEvent::Completed { message, .. } => {
+                completed_message = Some(message.content);
+            }
+            _ => {}
+        }
+    }
+
+    let combined = deltas.join("");
+    assert!(
+        combined.contains("I can't help with that request."),
+        "refusal text must reach the live assistant stream"
+    );
+    let message = completed_message.expect("completed");
+    assert!(
+        message.contains("I can't help with that request."),
+        "refusal text must land in the persisted assistant message"
+    );
+    // Live deltas and the stored message agree, same invariant as ordinary
+    // text deltas.
+    assert_eq!(combined, message);
+}
+
+#[test]
+fn document_resume_item_preserves_descriptive_placeholder() {
+    // `ResumeItem` has no `Document` variant, so a checkpoint round-trip
+    // can't carry the bytes. The catch-all used to flatten a fully-defined
+    // document into an *empty* `UserText` (silent data loss, F2). Confirm
+    // the explicit arm now emits a descriptive, non-empty placeholder that
+    // names the attachment and its media type.
+    let doc = LlmInputItem::document("application/pdf", "spec.pdf", vec![1u8, 2, 3]);
+    let resume = llm_input_to_resume_item(doc);
+    match resume {
+        ResumeItem::UserText { text } => {
+            assert!(!text.is_empty(), "document placeholder must not be empty");
+            assert!(text.contains("spec.pdf"), "placeholder names the document");
+            assert!(
+                text.contains("application/pdf"),
+                "placeholder names the media type"
+            );
+        }
+        other => panic!("expected UserText placeholder, got {other:?}"),
+    }
+}
+
+#[test]
+fn content_parts_text_is_redacted_in_redact_input_item() {
+    // No producer populates `content_parts` yet, but `redact_input_item`
+    // must redact each text part defensively so a future structured
+    // tool-result path can't slip a secret past the redactor (F5). Image
+    // parts pass through untouched.
+    let redactor = Redactor::default();
+    let item = LlmInputItem::FunctionCallOutput {
+        call_id: "call_1".to_string(),
+        output: "ok".to_string(),
+        content_parts: Some(vec![
+            squeezy_llm::ToolResultPart::Text {
+                text: "token sk-abcdefghijklmnopqrstuvwxyz".to_string(),
+            },
+            squeezy_llm::ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                bytes: Arc::from(vec![0u8, 1, 2].into_boxed_slice()),
+            },
+        ]),
+        is_error: false,
+    };
+    let redacted = redact_input_item(item, &redactor);
+    match redacted {
+        LlmInputItem::FunctionCallOutput { content_parts, .. } => {
+            let parts = content_parts.expect("content_parts retained");
+            match &parts[0] {
+                squeezy_llm::ToolResultPart::Text { text } => {
+                    assert!(
+                        !text.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+                        "secret in a text content part must be redacted"
+                    );
+                    assert!(text.contains("<redacted:"));
+                }
+                other => panic!("expected text part, got {other:?}"),
+            }
+            match &parts[1] {
+                squeezy_llm::ToolResultPart::Image { bytes, .. } => {
+                    assert_eq!(bytes.as_ref(), &[0u8, 1, 2], "image bytes pass through");
+                }
+                other => panic!("expected image part, got {other:?}"),
+            }
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
     let root = temp_workspace("agent_approval_redaction");
     let provider = Arc::new(MockProvider::new(vec![vec![

@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use squeezy_core::{OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig};
+use squeezy_core::{
+    OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig, SqueezyError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -146,10 +148,15 @@ fn xai_classify_route_covers_new_grok_families_c09() {
 /// `response.completed` event with usage carries the stream past the
 /// terminator without any deltas. Mirrors the minimum surface the
 /// dispatcher needs to validate which route received the request.
+///
+/// NOTE: the Responses API does NOT emit a `[DONE]` sentinel (unlike
+/// Chat Completions); the stream ends after `response.completed`.
+/// Appending one makes `parse_openai_event` fail with "invalid SSE
+/// JSON", which the `.expect("…must not error")` mapping in the H-21
+/// routing tests would surface as a panic.
 const RESPONSES_SSE_BODY: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_xai_dispatch\",\"model\":\"grok-4.3\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
-    "data: [DONE]\n\n",
 );
 
 /// Minimum chat-completions SSE that ends cleanly: one `stop` finish
@@ -339,10 +346,23 @@ async fn xai_dispatcher_routes_grok_4_3_to_responses_h21() {
         .expect("XaiProvider builds against mock server");
 
     let stream = provider.stream_response(dispatcher_request("grok-4.3"), CancellationToken::new());
-    let _events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
-        .await
-        .expect("dispatcher stream must complete within timeout");
+    let events: Vec<LlmEvent> =
+        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("dispatcher stream must complete within timeout")
+            .into_iter()
+            .map(|res| res.expect("Responses route stream must not error"))
+            .collect();
 
+    // A parse error on the routed stream must not slip past: surface it
+    // via `.expect` above and prove the parser carried the SSE through
+    // to a single terminal `Completed`.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Completed { .. })),
+        "Responses route must yield an LlmEvent::Completed"
+    );
     assert_eq!(recorder.requests.load(Ordering::SeqCst), 1);
     let path = recorder.first_path().await.expect("recorder captured path");
     assert_eq!(path, "/v1/responses", "grok-4.3 must reach /v1/responses");
@@ -360,15 +380,69 @@ async fn xai_dispatcher_routes_grok_2_to_chat_completions_h21() {
         .expect("XaiProvider builds against mock server");
 
     let stream = provider.stream_response(dispatcher_request("grok-2"), CancellationToken::new());
-    let _events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
-        .await
-        .expect("dispatcher stream must complete within timeout");
+    let events: Vec<LlmEvent> =
+        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("dispatcher stream must complete within timeout")
+            .into_iter()
+            .map(|res| res.expect("Chat route stream must not error"))
+            .collect();
 
+    // A parse error on the routed stream must not slip past: surface it
+    // via `.expect` above and prove the parser carried the SSE through
+    // to a single terminal `Completed`.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Completed { .. })),
+        "Chat route must yield an LlmEvent::Completed"
+    );
     assert_eq!(recorder.requests.load(Ordering::SeqCst), 1);
     let path = recorder.first_path().await.expect("recorder captured path");
     assert_eq!(
         path, "/v1/chat/completions",
         "grok-2 must reach /v1/chat/completions"
+    );
+}
+
+#[tokio::test]
+async fn xai_dispatcher_rejects_grok_imagine_without_request_m33() {
+    // M-33: `grok-imagine-*` is image-only and lives on
+    // `/v1/images/generations`, which neither sub-provider knows. The
+    // dispatcher must short-circuit with a structured
+    // `ProviderNotConfigured` error *before* touching the wire, so the
+    // recorder must observe zero requests. Without this the request
+    // would fall through to a sub-provider and 404 in production.
+    let recorder = DispatcherRecorder::new();
+    let addr = spawn_xai_dispatcher_server(recorder.clone(), RouteBodies::defaults()).await;
+    let provider = XaiProvider::from_config(&dispatcher_xai_config(addr))
+        .expect("XaiProvider builds against mock server");
+
+    let stream =
+        provider.stream_response(dispatcher_request("grok-imagine"), CancellationToken::new());
+    let events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .expect("image-rejection stream must complete within timeout");
+
+    assert_eq!(
+        events.len(),
+        1,
+        "grok-imagine must yield exactly one terminal event"
+    );
+    match &events[0] {
+        Err(SqueezyError::ProviderNotConfigured(msg)) => {
+            assert!(
+                msg.contains("/v1/images/generations") && msg.contains("M-33"),
+                "rejection must cite the unrouted image endpoint (M-33): {msg}"
+            );
+        }
+        other => panic!("expected ProviderNotConfigured rejection, got {other:?}"),
+    }
+
+    assert_eq!(
+        recorder.requests.load(Ordering::SeqCst),
+        0,
+        "image-only model must be rejected before any wire request"
     );
 }
 
@@ -640,6 +714,14 @@ async fn xai_chat_top_level_cached_tokens_gap_marker_m31() {
     // `.audit/providers/xai.md` (M-31); once `compatible.rs` learns
     // the third fallback, flip this expectation to `Some(42)` to
     // guard against losing the fix.
+    //
+    // M-31 STATUS: OPEN. This `== None` assertion is a tracked
+    // placeholder for an out-of-scope fix that lives in
+    // `compatible.rs` (the `parse_chat_usage` top-level
+    // `usage.cached_tokens` fallback). It is intentionally left as-is
+    // here: when that fallback lands, this assertion MUST flip to
+    // `Some(42)` in the same change so the test guards the fix rather
+    // than the gap.
     let recorder = DispatcherRecorder::new();
     let bodies = RouteBodies {
         responses: RESPONSES_SSE_BODY,

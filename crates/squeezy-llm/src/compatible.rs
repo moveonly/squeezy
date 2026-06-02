@@ -164,12 +164,21 @@ impl OpenAiCompatibleProvider {
         // the config carries a gateway id so the gateway is
         // selected correctly regardless of which URL template the
         // user has in place; user-supplied headers still win.
+        //
+        // F2: skip the header on the default `/compat` URL shape,
+        // which already encodes the gateway id in its path
+        // (`.../v1/{account_id}/{gateway_id}/compat`). Sending it
+        // there is redundant; restricting the header to the REST
+        // shape keeps the wire request minimal and avoids implying
+        // the path-encoded gateway can be overridden by a header.
         if config.preset == OpenAiCompatiblePreset::CloudflareAiGateway
             && let Some(gateway_id) = config
                 .gateway_id
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+            && !resolved_base_url.contains(&format!("/{gateway_id}/"))
+            && !resolved_base_url.ends_with(&format!("/{gateway_id}"))
             && !headers
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case("cf-aig-gateway-id"))
@@ -1041,7 +1050,7 @@ pub(crate) fn resolve_provider_segment(base_url: &str, model: &str) -> String {
     if !base_url.contains("{provider}") {
         return base_url.to_string();
     }
-    let provider = if let Some(entry) = compat_entry(model) {
+    let namespace = if let Some(entry) = compat_entry(model) {
         // Strip the trailing slash to land on the segment name.
         entry.model_prefix.trim_end_matches('/').to_string()
     } else if model.starts_with("@cf/") {
@@ -1054,7 +1063,23 @@ pub(crate) fn resolve_provider_segment(base_url: &str, model: &str) -> String {
         // upstream when the segment is `compat`.
         "compat".to_string()
     };
-    base_url.replace("{provider}", &provider)
+    let provider = cf_upstream_slug(&namespace);
+    base_url.replace("{provider}", provider)
+}
+
+/// Map a model-id namespace prefix to Cloudflare's REST upstream
+/// slug. The two namespaces mostly coincide (e.g. `anthropic`,
+/// `openai`, `xai`, `perplexity`), but a few of Cloudflare's REST
+/// path segments diverge from the conventional prefix — Google AI
+/// Studio is exposed as `google-ai-studio`, not `google`. Keep this
+/// table small and explicit: an unknown namespace passes through
+/// unchanged so any new Cloudflare upstream whose slug already
+/// matches its prefix keeps working without a code change.
+fn cf_upstream_slug(namespace: &str) -> &str {
+    match namespace {
+        "google" => "google-ai-studio",
+        other => other,
+    }
 }
 
 fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
@@ -2007,8 +2032,8 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                         events.extend(state.drain_tool_calls()?);
                         // INVARIANT (C-10): do NOT flip
                         // `state.completed_emitted` inside this arm.
-                        // Groq + OpenRouter-via-Groq + native OpenAI
-                        // ship a trailing usage chunk *after* the
+                        // Groq + OpenRouter-via-Groq ship a trailing
+                        // usage chunk *after* the
                         // `finish_reason: stop` chunk and before the
                         // terminal `[DONE]`. The outer loop short-
                         // circuits as soon as `completed_emitted`

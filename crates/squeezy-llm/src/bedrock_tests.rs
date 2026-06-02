@@ -1274,6 +1274,40 @@ fn bedrock_document_block_rejects_unknown_mime() {
 }
 
 #[test]
+fn bedrock_document_block_rejects_documents_over_4_5_mib() {
+    // Bedrock's Converse `DocumentBlock` caps inline document payloads
+    // at ~4.5 MB and rejects larger ones with an opaque
+    // `ValidationException`. The local guard surfaces a structured
+    // error naming the offending document and the limit, mirroring the
+    // image-size guard.
+    let oversized: Arc<[u8]> = Arc::from(vec![0u8; 4_718_593]);
+    let err = bedrock_document_block("application/pdf", "huge.pdf", &oversized)
+        .expect_err("oversized document must surface an explicit ProviderRequest error");
+    let message = err.to_string();
+    assert!(
+        message.contains("4718592"),
+        "error must mention the byte limit; got `{message}`",
+    );
+    assert!(
+        message.contains("4718593"),
+        "error must mention the actual byte size; got `{message}`",
+    );
+    assert!(
+        message.contains("huge.pdf"),
+        "error must name the offending document; got `{message}`",
+    );
+}
+
+#[test]
+fn bedrock_document_block_accepts_document_at_4_5_mib_boundary() {
+    // The boundary itself is allowed — `>` not `>=` — so a document
+    // that is exactly the documented cap still ships.
+    let on_boundary: Arc<[u8]> = Arc::from(vec![0u8; 4_718_592]);
+    bedrock_document_block("application/pdf", "boundary.pdf", &on_boundary)
+        .expect("boundary-size document must build cleanly");
+}
+
+#[test]
 fn sanitize_bedrock_document_name_canonicalises_input() {
     // Allow-list: alphanumerics + single space + hyphen + ()/[]. Runs
     // of disallowed characters collapse to a single hyphen so the
