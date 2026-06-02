@@ -358,7 +358,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For inheritance queries in C#, Java, Kotlin, Scala, Rust, Swift, Ruby, PHP, or Dart pass `attribute=\"base:<TypeName>\"`; do not embed `base:` in `query`. Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. For inheritance queries in C#, Java, Kotlin, Scala, Rust, Swift, Ruby, PHP, or Dart pass `attribute=\"base:<TypeName>\"`; do not embed `base:` in `query`. One decl_search returns the whole matching declaration set at once — strongly prefer it over multiple greps when you're enumerating \"every X that does Y\". Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -404,7 +404,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when one was returned by a prior graph call.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when one was returned by a prior graph call. One reference_search returns every callsite at once — strongly prefer it over issuing N greps for the same symbol name.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -472,7 +472,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`. When the prompt asks about every method (or every field/variant) of one class, call `hierarchy(symbol_id=<class>)` first to fix the member set before reading bodies — a single class-body slice does not enumerate members.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementors use `decl_search` with `attribute=\"base:<TypeName>\"`. When the prompt asks about every method (or every field/variant) of one class, call `hierarchy(symbol_id=<class>)` first to fix the member set before reading bodies — one hierarchy call enumerates every member, replacing a sequence of file reads or member-by-member greps.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
