@@ -349,6 +349,38 @@ async fn force_cheap_override_dispatches_on_cheap_tier() {
 }
 
 #[tokio::test]
+async fn force_cheap_override_wins_inside_sticky_window() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        end_turn_reply("I'm not sure how to proceed."),
+        end_turn_reply("forced cheap"),
+    ]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let _first = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    agent.request_routing_force_cheap();
+    let events = drain_until_terminal(agent.start_turn(
+        "explain the routing classifier in detail".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+    assert_eq!(&*requests[1].model, CHEAP_MODEL);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { reason, .. } if reason == "user_explicit"
+        )),
+        "explicit cheap override must not be consumed by sticky parent routing"
+    );
+}
+
+#[tokio::test]
 async fn session_disabled_blocks_implicit_routing() {
     // `set_routing_session_disabled(true)` mirrors the `/router off`
     // command. The slam-dunk prompt is still routed on parent because

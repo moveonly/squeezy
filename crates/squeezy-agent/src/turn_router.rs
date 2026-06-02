@@ -421,12 +421,6 @@ pub(crate) async fn classify_turn(
     if auto_disabled && !inputs.overrides.force_cheap {
         return ClassifyResult::parent();
     }
-    if inputs.sticky {
-        return ClassifyResult::parent();
-    }
-    if inputs.has_image_input && cfg.bypass_for_images {
-        return ClassifyResult::parent();
-    }
 
     let Some(cheap) = cheap_model_for(inputs.provider_name, inputs.config) else {
         return ClassifyResult::parent();
@@ -440,6 +434,13 @@ pub(crate) async fn classify_turn(
 
     if inputs.overrides.force_cheap {
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    if inputs.sticky {
+        return ClassifyResult::parent();
+    }
+    if inputs.has_image_input && cfg.bypass_for_images {
+        return ClassifyResult::parent();
     }
 
     if let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg) {
