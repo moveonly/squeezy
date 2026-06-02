@@ -200,13 +200,14 @@ const HEURISTIC_MAX_SENTENCES: usize = 1;
 const REFUSAL_PHRASES: &[&str] = &[
     "i'm not sure",
     "i am not sure",
-    "this is complex",
+    "i need more context",
     "need more context",
-    "i can't",
-    "i cannot",
-    "unable to",
-    "let me think",
+    "i don't have enough context",
+    "i do not have enough context",
+    "i cannot proceed",
+    "i can't proceed",
 ];
+const REFUSAL_TAIL_CHARS: usize = 96;
 
 /// Heuristic prefilter — pure function. Returns the matched rule name
 /// when the prompt is a slam-dunk for cheap routing, otherwise `None`.
@@ -319,7 +320,27 @@ pub(crate) fn contains_refusal_phrase(text: &str) -> bool {
         return false;
     }
     let lower = text.to_ascii_lowercase();
-    REFUSAL_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    REFUSAL_PHRASES
+        .iter()
+        .any(|phrase| phrase_occurs_at_clause_start(&lower, phrase))
+}
+
+fn phrase_occurs_at_clause_start(text: &str, phrase: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(offset) = text[search_from..].find(phrase) {
+        let start = search_from + offset;
+        let before = &text[..start];
+        if before
+            .chars()
+            .rev()
+            .find(|ch| !ch.is_whitespace())
+            .is_none_or(|ch| matches!(ch, '.' | '!' | '?' | '\n' | '\r' | ':' | ';' | ','))
+        {
+            return true;
+        }
+        search_from = start.saturating_add(phrase.len());
+    }
+    false
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,6 +631,7 @@ fn parse_judge_reply(raw: &str) -> Option<bool> {
 #[derive(Debug, Default)]
 pub(crate) struct EscalationState {
     pub triggered: Option<EscalationReason>,
+    refusal_tail: String,
 }
 
 impl EscalationState {
@@ -627,7 +649,7 @@ impl EscalationState {
         tool_calls: u64,
         tool_errors: u64,
         budget_denials: u64,
-        recent_assistant_text: &str,
+        assistant_text_delta: &str,
         on_cheap_turn: bool,
         cfg: &RoutingConfig,
         max_tool_calls_per_turn: u64,
@@ -645,11 +667,31 @@ impl EscalationState {
             self.triggered = Some(EscalationReason::ErrorThreshold);
             return self.triggered;
         }
-        if contains_refusal_phrase(recent_assistant_text) {
+        if self.observes_refusal_phrase(assistant_text_delta) {
             self.triggered = Some(EscalationReason::RefusalPhrase);
             return self.triggered;
         }
         None
+    }
+
+    fn observes_refusal_phrase(&mut self, assistant_text_delta: &str) -> bool {
+        if assistant_text_delta.is_empty() {
+            return false;
+        }
+        let mut window =
+            String::with_capacity(self.refusal_tail.len() + assistant_text_delta.len());
+        window.push_str(&self.refusal_tail);
+        window.push_str(assistant_text_delta);
+        let matched = contains_refusal_phrase(&window);
+        self.refusal_tail = window
+            .chars()
+            .rev()
+            .take(REFUSAL_TAIL_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        matched
     }
 }
 

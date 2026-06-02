@@ -207,12 +207,37 @@ fn heuristic_rejects_unknown_imperative() {
 #[test]
 fn refusal_phrases_detected_case_insensitively() {
     assert!(contains_refusal_phrase("Hmm, I'm not sure how to proceed."));
-    assert!(contains_refusal_phrase("This is complex, let me think."));
     assert!(contains_refusal_phrase(
-        "I cannot resolve this without more context."
+        "I cannot proceed without more context."
+    ));
+    assert!(contains_refusal_phrase(
+        "Need more context before I continue."
     ));
     assert!(!contains_refusal_phrase("Running cargo test now."));
+    assert!(!contains_refusal_phrase(
+        "The linker is unable to find libfoo."
+    ));
+    assert!(!contains_refusal_phrase(
+        "I can't reproduce the panic, so the fix is good."
+    ));
+    assert!(!contains_refusal_phrase(
+        "This is complex, so I checked the call graph."
+    ));
     assert!(!contains_refusal_phrase(""));
+}
+
+#[test]
+fn refusal_detector_handles_phrases_split_across_deltas() {
+    let cfg = default_routing_config();
+    let mut state = EscalationState::default();
+    assert_eq!(
+        state.maybe_trigger(0, 0, 0, "I'm not", true, &cfg, 10_000),
+        None
+    );
+    assert_eq!(
+        state.maybe_trigger(0, 0, 0, " sure how to continue.", true, &cfg, 10_000),
+        Some(EscalationReason::RefusalPhrase)
+    );
 }
 
 // -- Escalation detector ---------------------------------------------------

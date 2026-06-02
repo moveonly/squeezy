@@ -5441,7 +5441,7 @@ impl TurnRuntime {
                     broker.metrics.tool_calls,
                     broker.metrics.tool_errors,
                     broker.metrics.budget_denials,
-                    &assistant_message,
+                    "",
                     on_cheap_turn,
                     &self.config.routing,
                     self.config.max_tool_calls_per_turn,
@@ -5631,13 +5631,14 @@ impl TurnRuntime {
                             }
                         }
                         round_text_started = true;
-                        self.record_replay_model_text_delta(&chunk.text);
-                        assistant_message.push_str(&chunk.text);
+                        let delta = chunk.text;
+                        self.record_replay_model_text_delta(&delta);
+                        assistant_message.push_str(&delta);
                         if self
                             .tx
                             .send(AgentEvent::AssistantDelta {
                                 turn_id: self.turn_id,
-                                delta: chunk.text,
+                                delta: delta.clone(),
                             })
                             .await
                             .is_err()
@@ -5645,15 +5646,14 @@ impl TurnRuntime {
                             return Ok(());
                         }
                         // Mid-stream escalation: a refusal phrase in
-                        // the assistant text flips the router to the
-                        // parent model *immediately* instead of
+                        // the new assistant text flips the router to
+                        // the parent model *immediately* instead of
                         // waiting for the next round's preflight
-                        // check. The detector latches on first
-                        // trigger so polling every delta cannot
-                        // double-emit, and the input is the full
-                        // accumulated `assistant_message` so a
-                        // phrase straddling two deltas still
-                        // matches. Tool-call ceiling and error
+                        // check. The detector carries a short tail so
+                        // a phrase straddling two deltas still
+                        // matches without rescanning the full
+                        // accumulated assistant buffer. Tool-call
+                        // ceiling and error
                         // threshold are also re-evaluated here for
                         // free; they only flip when the round-end
                         // accounting would have caught them anyway,
@@ -5663,7 +5663,7 @@ impl TurnRuntime {
                                 broker.metrics.tool_calls,
                                 broker.metrics.tool_errors,
                                 broker.metrics.budget_denials,
-                                &assistant_message,
+                                &delta,
                                 on_cheap_turn,
                                 &self.config.routing,
                                 self.config.max_tool_calls_per_turn,
