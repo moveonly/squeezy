@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    net::IpAddr,
     pin::Pin,
     sync::LazyLock,
     time::{Duration, SystemTime},
@@ -417,6 +418,7 @@ impl ToolRegistry {
 
         let fetch = async {
             for redirect_count in 0..=MAX_WEB_REDIRECTS {
+                ensure_url_allowed(&url).await?;
                 let response = self.http.get(url.clone(), max_response_bytes).await?;
                 if response.is_redirection() {
                     let next = redirect_url(&url, &response)?;
@@ -859,6 +861,62 @@ fn parse_http_url(raw: &str) -> std::result::Result<Url, String> {
     }
 }
 
+/// True for addresses that must never be reached by `webfetch`: loopback,
+/// unspecified, link-local (incl. cloud IMDS `169.254.169.254` and IPv6
+/// `fe80::/10`), and private / unique-local ranges (RFC1918, `fc00::/7`).
+/// This blocks SSRF to internal hosts and instance-metadata endpoints.
+fn ip_is_blocked(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_private()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local fc00::/7 (`is_unique_local` is unstable).
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped (::ffff:a.b.c.d) reuses the IPv4 ruling.
+                || v6.to_ipv4_mapped().map(|m| ip_is_blocked(&IpAddr::V4(m))) == Some(true)
+        }
+    }
+}
+
+/// Rejects `webfetch` targets that resolve to internal addresses. Literal-IP
+/// hosts are checked directly; hostnames (including `localhost`) are resolved
+/// and rejected if *any* resolved address is internal, defeating DNS rebinding.
+/// Re-run on every redirect hop, since the host can change between hops.
+async fn ensure_url_allowed(url: &Url) -> std::result::Result<(), String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let blocked = "refusing to fetch internal address (loopback/link-local/private)".to_string();
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if ip_is_blocked(&ip) {
+            Err(blocked)
+        } else {
+            Ok(())
+        };
+    }
+
+    let port = url.port_or_known_default().unwrap_or(0);
+    let mut resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("failed to resolve host: {err}"))?
+        .peekable();
+    if resolved.peek().is_none() {
+        return Err("failed to resolve host".to_string());
+    }
+    for addr in resolved {
+        if ip_is_blocked(&addr.ip()) {
+            return Err(blocked);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn web_url_host(raw: &str) -> std::result::Result<String, String> {
     parse_http_url(raw).and_then(|url| {
         url.host_str()
@@ -1066,3 +1124,7 @@ enum WebFetchOutcome {
         bytes: Vec<u8>,
     },
 }
+
+#[cfg(test)]
+#[path = "web_tests.rs"]
+mod tests;

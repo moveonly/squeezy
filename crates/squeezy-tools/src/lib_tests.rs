@@ -7397,6 +7397,42 @@ async fn webfetch_strips_html_scripts_and_styles() {
 }
 
 #[tokio::test]
+async fn webfetch_refuses_private_ip_target() {
+    let root = temp_workspace("webfetch_ssrf");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/plain", b"secrets"));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("internal address")
+    );
+    // The SSRF guard must short-circuit before any HTTP request is issued.
+    assert!(http.get_requests.lock().expect("get requests").is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn webfetch_quote_limit_is_enforced_after_redaction() {
     let root = temp_workspace("webfetch_redacted_quote_limit");
     let body = format!("API_TOKEN=super-secret-value {}", "a".repeat(200));
