@@ -5350,6 +5350,7 @@ impl TurnRuntime {
             }
         }
         let mut escalation_state = turn_router::EscalationState::default();
+        let mut cheap_provider_error_retry_used = false;
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -5533,10 +5534,23 @@ impl TurnRuntime {
             // zero.
             let mut round_output_bytes: u64 = 0;
 
-            while let Some(event) =
-                next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
-                    .await?
-            {
+            let mut provider_stream_error = None;
+            loop {
+                let Some(event) = (match next_llm_stream_event(
+                    &mut stream,
+                    &self.cancel,
+                    self.config.stream_idle_timeout,
+                )
+                .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        provider_stream_error = Some(error);
+                        break;
+                    }
+                }) else {
+                    break;
+                };
                 if self.cancel.is_cancelled() {
                     if let Some(tail) = self
                         .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
@@ -5834,6 +5848,46 @@ impl TurnRuntime {
                     }
                     LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
                 }
+            }
+
+            if let Some(error) = provider_stream_error {
+                if on_cheap_turn
+                    && !cheap_provider_error_retry_used
+                    && round_output_bytes == 0
+                    && tool_calls.is_empty()
+                    && !round_text_started
+                {
+                    cheap_provider_error_retry_used = true;
+                    let reason = turn_router::EscalationReason::ProviderError;
+                    let from_model = current_model.to_string();
+                    current_model = parent_model.clone();
+                    on_cheap_turn = false;
+                    broker.metrics.escalated_to_parent = true;
+                    let sticky_remaining = {
+                        let mut state = self.routing_state.lock().expect("routing state lock");
+                        state
+                            .sticky
+                            .engage(self.config.routing.escalation_sticky_turns);
+                        state.sticky.remaining_turns
+                    };
+                    self.conversation_state
+                        .lock()
+                        .await
+                        .set_routing_sticky_remaining_turns(sticky_remaining);
+                    self.telemetry
+                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::TurnRouted {
+                            turn_id: self.turn_id,
+                            from: from_model,
+                            to: parent_model_str.clone(),
+                            reason: format!("escalated_{}", reason.as_str()),
+                        })
+                        .await;
+                    continue;
+                }
+                return Err(error);
             }
 
             if !completed {
@@ -8934,11 +8988,12 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         .map(|role| role_config(role).model_policy)
         .unwrap_or(RoleModelPolicy::Parent);
     match (kind, policy) {
-        (SubagentKind::Explore, _) => {
-            config.subagents.explore_model.clone().unwrap_or_else(|| {
-                cheap_model_for(provider, config).unwrap_or(parent_model.clone())
-            })
-        }
+        (SubagentKind::Explore, _) => config
+            .subagents
+            .explore_model
+            .clone()
+            .map(|model| resolve_model_alias_owned(provider, model))
+            .unwrap_or_else(|| cheap_model_for(provider, config).unwrap_or(parent_model.clone())),
         (SubagentKind::DocHelp, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
@@ -8955,15 +9010,21 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
 /// cheap tier exists.
 pub(crate) fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
     if let Some(model) = config.small_fast_model.clone() {
-        return Some(model);
+        return Some(resolve_model_alias_owned(provider, model));
     }
     if let Some(model) = squeezy_core::small_fast_model_for_provider(provider) {
-        return Some(model.to_string());
+        return Some(resolve_model_alias_owned(provider, model.to_string()));
     }
     match provider {
         "ollama" => Some(DEFAULT_OLLAMA_MODEL.to_string()),
         _ => None,
     }
+}
+
+fn resolve_model_alias_owned(provider: &str, model: String) -> String {
+    squeezy_core::resolve_model_alias(provider, &model)
+        .unwrap_or(&model)
+        .to_string()
 }
 
 const DELEGATE_SUBAGENT_TOOL_NAMES: &[&str] = &[

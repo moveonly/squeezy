@@ -20,6 +20,7 @@ use futures_util::stream;
 use squeezy_agent::{Agent, AgentEvent};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, ReasoningEffort, Result,
+    SqueezyError,
 };
 use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream};
 use tokio_util::sync::CancellationToken;
@@ -178,6 +179,22 @@ async fn heuristic_slam_dunk_dispatches_on_cheap_model() {
     assert_eq!(routed.0, PARENT_MODEL);
     assert_eq!(routed.1, CHEAP_MODEL);
     assert_eq!(routed.2, "checkout");
+}
+
+#[tokio::test]
+async fn cheap_model_override_alias_resolves_before_dispatch() {
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok, on it.")]));
+    let mut config = config_with_routing();
+    config.small_fast_model = Some("haiku".to_string());
+    let agent = Agent::new(config, provider.clone());
+    let _events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
 }
 
 #[tokio::test]
@@ -351,6 +368,40 @@ async fn session_disabled_blocks_implicit_routing() {
             .iter()
             .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
         "session toggle off must suppress implicit routing"
+    );
+}
+
+#[tokio::test]
+async fn cheap_provider_error_retries_once_on_parent() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![Err(SqueezyError::ProviderStream(
+            "cheap model not found".to_string(),
+        ))],
+        end_turn_reply("parent recovered"),
+    ]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+    assert_eq!(&*requests[1].model, PARENT_MODEL);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Completed { .. })),
+        "parent retry should complete the turn"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { reason, .. }
+                if reason == "escalated_provider_error"
+        )),
+        "provider error must emit an escalation routing event"
     );
 }
 

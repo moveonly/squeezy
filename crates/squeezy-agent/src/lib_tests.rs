@@ -5093,6 +5093,16 @@ fn subagent_kind_role_does_not_overlay_delegate() {
     );
 }
 
+#[test]
+fn explore_model_alias_resolves_before_subagent_dispatch() {
+    let mut config = AppConfig::default();
+    config.subagents.explore_model = Some("haiku".to_string());
+
+    let model = subagent_model_for_kind("anthropic", &config, SubagentKind::Explore);
+
+    assert_eq!(model, "claude-haiku-4-5-20251001");
+}
+
 /// Parent tool advertisement that mixes typical read/search tools with a
 /// representative mutating tool for every non-read capability. The mutating
 /// names cover the audit's named risks (`write_file`, `shell`, `apply_patch`)
