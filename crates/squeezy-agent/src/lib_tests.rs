@@ -5894,6 +5894,60 @@ async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_ti
     );
 }
 
+#[tokio::test]
+async fn manual_compact_does_not_hold_conversation_lock_across_model_assisted_call() {
+    // `compact_context_manual` runs the (possibly slow) model-assisted
+    // provider round-trip. It must release the `conversation_state`
+    // mutex before that await so concurrent snapshot readers — the TUI's
+    // per-frame context/cost reads — keep making progress. A
+    // `HangingProvider` keeps the model-assisted request in flight for
+    // the full timeout; if the guard were held across the await, the
+    // snapshot read below would block for that entire window instead of
+    // returning at once.
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            // Long enough that holding the lock would block the snapshot
+            // far beyond the assertion timeout below.
+            model_assisted_timeout_secs: 30,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let provider = Arc::new(HangingProvider::new());
+    let agent = Arc::new(Agent::new(config, provider.clone()));
+    agent.conversation_state.lock().await.conversation = mid_turn_test_conversation();
+
+    let compact_agent = agent.clone();
+    let compact = tokio::spawn(async move { compact_agent.compact_context_manual().await });
+
+    // Wait until the model-assisted provider request is actually in
+    // flight (and thus the hanging await is pending).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("model-assisted compaction request should be issued");
+
+    // The lock must be free while compaction is in flight: a concurrent
+    // snapshot read returns promptly instead of queueing behind the held
+    // guard for the 30s timeout window.
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        agent.context_estimate_snapshot(),
+    )
+    .await
+    .expect("snapshot read must not block on the in-flight model-assisted compaction");
+
+    compact.abort();
+}
+
 #[test]
 fn compaction_summary_includes_recent_observations() {
     use squeezy_store::{Observation, ObservationKind, SqueezyStore};

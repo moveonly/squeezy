@@ -2615,10 +2615,21 @@ impl Agent {
     pub async fn compact_context_manual(
         &self,
     ) -> squeezy_core::Result<Option<ContextCompactionReport>> {
-        let mut state = self.conversation_state.lock().await;
-        let mut conversation = state.conversation.clone();
-        let mut context_compaction = state.context_compaction.clone();
-        let attachments = state.context_attachments.clone();
+        // Clone the inputs and release the async mutex before the
+        // (potentially long-running) model-assisted compaction await.
+        // `compact_conversation_with_strategy` only touches these local
+        // clones, so holding `conversation_state` across its network
+        // round-trip would needlessly block every concurrent reader
+        // (the TUI's per-frame context/cost snapshots) for up to
+        // `model_assisted_timeout_secs`.
+        let (mut conversation, mut context_compaction, attachments) = {
+            let state = self.conversation_state.lock().await;
+            (
+                state.conversation.clone(),
+                state.context_compaction.clone(),
+                state.context_attachments.clone(),
+            )
+        };
         let Some(report) = compact_conversation_with_strategy(
             &mut conversation,
             &mut context_compaction,
@@ -2640,6 +2651,8 @@ impl Agent {
             // surface a graceful "nothing to compact" message.
             return Ok(None);
         };
+        // Re-acquire the mutex to commit the compacted state.
+        let mut state = self.conversation_state.lock().await;
         state.conversation = conversation;
         state.context_compaction = context_compaction;
         state.previous_response_id = None;
