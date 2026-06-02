@@ -937,6 +937,35 @@ func Use() {
 }
 
 #[test]
+fn go_parser_keeps_unicode_named_functions_and_types() {
+    let source = r#"
+package p
+
+func Σ() {}
+
+type Δ struct{}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("p/unicode.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Σ" && symbol.kind == SymbolKind::Function),
+        "Unicode-named Go function must appear in the symbol graph"
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Δ" && symbol.kind == SymbolKind::Struct),
+        "Unicode-named Go type must appear in the symbol graph"
+    );
+}
+
+#[test]
 fn python_class_bases_filter_out_keyword_arguments() {
     let bases = python_class_bases("class Foo(Bar, metaclass=Meta, total=False)");
     assert_eq!(bases, vec!["Bar".to_string()]);
