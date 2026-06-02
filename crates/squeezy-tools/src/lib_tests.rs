@@ -7697,6 +7697,43 @@ async fn webfetch_reports_cross_host_redirect_without_following() {
 }
 
 #[tokio::test]
+async fn webfetch_reports_scheme_downgrade_redirect_without_following() {
+    let root = temp_workspace("webfetch_redirect_downgrade");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(redirect_response("http://example.com/next"));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/start"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["redirect_url"], "http://example.com/next");
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("redirect to another host")
+    );
+    let requests = http.get_requests.lock().expect("get requests");
+    assert_eq!(*requests, vec!["https://example.com/start".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn webfetch_reports_redirects_without_location() {
     let root = temp_workspace("webfetch_redirect_no_location");
     let http = Arc::new(MockWebHttpClient::default());

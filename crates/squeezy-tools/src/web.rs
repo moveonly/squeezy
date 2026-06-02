@@ -422,7 +422,7 @@ impl ToolRegistry {
                 let response = self.http.get(url.clone(), max_response_bytes).await?;
                 if response.is_redirection() {
                     let next = redirect_url(&url, &response)?;
-                    if next.host_str() != original_url.host_str() {
+                    if next.origin() != original_url.origin() {
                         return Ok(WebFetchOutcome::Redirect {
                             status: response.status,
                             original_url: original_url.to_string(),
