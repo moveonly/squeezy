@@ -1,3 +1,9 @@
+// Vertex OAuth tests stub `gcloud` via `/bin/sh -c`, which isn't
+// available on Windows. Gate compilation to Unix so the Windows test
+// run stays clean; the production path uses the real `gcloud` binary
+// which Windows users invoke separately.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
