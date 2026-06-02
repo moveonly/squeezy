@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use squeezy_core::{AppConfig, CostSnapshot, ReasoningEffort, RoutingConfig, SessionMode};
+use squeezy_core::{AppConfig, CostSnapshot, RoutingConfig, SessionMode};
 use squeezy_llm::{CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
 
@@ -645,7 +645,7 @@ async fn run_judge(
         input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
         max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
         response_verbosity: None,
-        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
         cache,

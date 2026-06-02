@@ -19,8 +19,7 @@ use futures_core::Stream;
 use futures_util::stream;
 use squeezy_agent::{Agent, AgentEvent};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, ReasoningEffort, Result,
-    SessionMode, SqueezyError,
+    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, Result, SessionMode, SqueezyError,
 };
 use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream};
 use tokio_util::sync::CancellationToken;
@@ -250,7 +249,7 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
         "short judge prompt must not request provider prompt caching"
     );
     assert_eq!(requests[0].max_output_tokens, Some(512));
-    assert_eq!(requests[0].reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(requests[0].reasoning_effort, None);
 
     let reason = events
         .iter()
