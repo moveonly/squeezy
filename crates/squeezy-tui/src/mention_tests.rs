@@ -139,8 +139,12 @@ fn apply_inserts_path_and_returns_new_cursor() {
         end: 10,
         query: "gra".to_string(),
     };
-    let popup =
-        MentionPopup::from_query(q, vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")], 1);
+    let popup = MentionPopup::from_query(
+        q,
+        vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")],
+        1,
+        false,
+    );
     let (new_input, cursor) = popup.apply("hello @gra").expect("apply");
     assert_eq!(new_input, "hello crates/squeezy-graph/src/lib.rs ");
     assert_eq!(cursor, new_input.len());
@@ -174,7 +178,8 @@ fn popup_navigation_clamps_at_bounds() {
         end: 4,
         query: "a".to_string(),
     };
-    let mut popup = MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")], 2);
+    let mut popup =
+        MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")], 2, false);
     popup.move_up();
     assert_eq!(popup.selected, 0);
     popup.move_down();
@@ -234,6 +239,16 @@ fn workspace_cache_files_includes_walked_paths() {
         .collect();
     assert!(names.iter().any(|n| n == "alpha.rs"), "got: {names:?}");
     assert!(names.iter().any(|n| n == "beta.rs"), "got: {names:?}");
+}
+
+#[test]
+fn workspace_walk_under_cap_is_not_truncated() {
+    let tmp = TempRoot::new("untruncated");
+    fs::write(tmp.path().join("a.rs"), "fn a() {}").unwrap();
+    let (files, truncated) = load_workspace_files(tmp.path());
+    assert!(!truncated, "a small workspace must not report truncation");
+    assert!(!files.is_empty());
+    assert!(!WorkspaceFileCache::build(tmp.path()).is_truncated());
 }
 
 #[test]

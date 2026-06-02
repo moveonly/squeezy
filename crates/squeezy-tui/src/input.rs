@@ -424,6 +424,10 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         });
         app.pending_mention_walk = Some(rx);
     }
+    let truncated = app
+        .workspace_file_cache
+        .as_ref()
+        .is_some_and(|cache| cache.is_truncated());
     let (matches, total) = app
         .workspace_file_cache
         .as_ref()
@@ -433,7 +437,9 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     }
-    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches, total));
+    app.mention_popup = Some(mention::MentionPopup::from_query(
+        query, matches, total, truncated,
+    ));
 }
 
 pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {

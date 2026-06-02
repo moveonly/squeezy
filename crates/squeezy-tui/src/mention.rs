@@ -92,8 +92,14 @@ fn parse_mention_token(input: &str, bytes: &[u8], after_at: usize) -> (usize, St
 /// Walk the workspace rooted at `root` (respecting .gitignore via the
 /// `ignore` crate) and return up to `MAX_WORKSPACE_FILES` file paths
 /// relative to `root`. Used as the candidate set for the popup.
-pub(crate) fn load_workspace_files(root: &Path) -> Vec<PathBuf> {
+///
+/// The second return value is `true` when the walk hit the
+/// `MAX_WORKSPACE_FILES` cap and stopped early, so callers can warn the
+/// user that the candidate set is incomplete rather than silently
+/// dropping the remaining files.
+pub(crate) fn load_workspace_files(root: &Path) -> (Vec<PathBuf>, bool) {
     let mut files = Vec::new();
+    let mut truncated = false;
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
@@ -109,10 +115,11 @@ pub(crate) fn load_workspace_files(root: &Path) -> Vec<PathBuf> {
         let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
         files.push(rel);
         if files.len() >= MAX_WORKSPACE_FILES {
+            truncated = true;
             break;
         }
     }
-    files
+    (files, truncated)
 }
 
 /// Cached workspace file list with an `.git/index` mtime poll and a 5 s
@@ -126,6 +133,7 @@ pub(crate) fn load_workspace_files(root: &Path) -> Vec<PathBuf> {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceFileCache {
     files: Arc<Vec<PathBuf>>,
+    truncated: bool,
     built_at: Instant,
     git_index_mtime: Option<SystemTime>,
 }
@@ -133,10 +141,11 @@ pub(crate) struct WorkspaceFileCache {
 impl WorkspaceFileCache {
     /// Walk `root` once and snapshot the `.git/index` mtime.
     pub(crate) fn build(root: &Path) -> Self {
-        let files = Arc::new(load_workspace_files(root));
+        let (files, truncated) = load_workspace_files(root);
         let git_index_mtime = git_index_mtime(root);
         Self {
-            files,
+            files: Arc::new(files),
+            truncated,
             built_at: Instant::now(),
             git_index_mtime,
         }
@@ -145,6 +154,12 @@ impl WorkspaceFileCache {
     /// Shared handle to the cached file list. Cheap to clone via `Arc`.
     pub(crate) fn files(&self) -> &Arc<Vec<PathBuf>> {
         &self.files
+    }
+
+    /// `true` when the walk hit `MAX_WORKSPACE_FILES` and the candidate
+    /// set excludes some workspace files.
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Returns `true` when the cache should be rebuilt: the `.git/index`
@@ -170,6 +185,19 @@ impl WorkspaceFileCache {
     pub(crate) fn from_paths_for_tests(files: Vec<PathBuf>) -> Self {
         Self {
             files: Arc::new(files),
+            truncated: false,
+            built_at: Instant::now(),
+            git_index_mtime: None,
+        }
+    }
+
+    /// Test-only constructor that seeds the cache and marks it truncated,
+    /// so the footer hint can be exercised without a 5000-file walk.
+    #[cfg(test)]
+    pub(crate) fn from_truncated_paths_for_tests(files: Vec<PathBuf>) -> Self {
+        Self {
+            files: Arc::new(files),
+            truncated: true,
             built_at: Instant::now(),
             git_index_mtime: None,
         }
@@ -271,10 +299,19 @@ pub(crate) struct MentionPopup {
     /// `MAX_MATCHES`. Drives the `(idx/total)` footer so the user can
     /// see when more matches exist than the popup shows.
     pub total: usize,
+    /// `true` when the workspace walk hit `MAX_WORKSPACE_FILES`, so the
+    /// candidate set excludes some files. Drives a footer hint warning
+    /// the user that results are incomplete.
+    pub truncated: bool,
 }
 
 impl MentionPopup {
-    pub(crate) fn from_query(q: MentionQuery, matches: Vec<PathBuf>, total: usize) -> Self {
+    pub(crate) fn from_query(
+        q: MentionQuery,
+        matches: Vec<PathBuf>,
+        total: usize,
+        truncated: bool,
+    ) -> Self {
         Self {
             query: q.query,
             start: q.start,
@@ -282,6 +319,7 @@ impl MentionPopup {
             matches,
             selected: 0,
             total,
+            truncated,
         }
     }
 

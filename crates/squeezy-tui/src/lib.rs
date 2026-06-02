@@ -12061,9 +12061,19 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .collect();
     // `(idx/total)` footer. `total` is the pre-truncation candidate
     // count so the user can see when more matches exist beyond the
-    // displayed window (capped at `MAX_MATCHES`).
+    // displayed window (capped at `MAX_MATCHES`). When the workspace walk
+    // itself was capped, append a hint that the candidate set is
+    // incomplete so a missing match isn't read as "no such file".
     let total = popup.total.max(popup.matches.len());
-    let footer = format!("  {}/{}", popup.selected + 1, total);
+    let footer = if popup.truncated {
+        format!(
+            "  {}/{}  (+ more files not shown — refine query)",
+            popup.selected + 1,
+            total
+        )
+    } else {
+        format!("  {}/{}", popup.selected + 1, total)
+    };
     lines.push(Line::from(Span::styled(
         footer,
         Style::default()

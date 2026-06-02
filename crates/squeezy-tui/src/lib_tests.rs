@@ -9781,6 +9781,58 @@ async fn mention_popup_inserts_path_on_enter() {
     assert_eq!(app.input, "crates/squeezy-graph/src/lib.rs ");
 }
 
+#[test]
+fn mention_popup_footer_warns_when_workspace_walk_truncated() {
+    let mut app = test_app(SessionMode::Build);
+    // A cache flagged truncated stands in for a workspace that exceeded
+    // MAX_WORKSPACE_FILES without paying for a 5000-file walk.
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_truncated_paths_for_tests(
+        vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")],
+    ));
+
+    insert_input_text(&mut app, "@graph");
+    assert!(
+        app.mention_popup
+            .as_ref()
+            .expect("popup should open")
+            .truncated,
+        "popup must carry the truncation flag from the cache"
+    );
+
+    let footer = mention_popup_lines(&app)
+        .last()
+        .expect("footer line")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        footer.contains("more files not shown"),
+        "footer should warn about truncated candidates, got: {footer:?}"
+    );
+}
+
+#[test]
+fn mention_popup_footer_has_no_hint_when_not_truncated() {
+    let mut app = test_app(SessionMode::Build);
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+    ]));
+
+    insert_input_text(&mut app, "@graph");
+    let footer = mention_popup_lines(&app)
+        .last()
+        .expect("footer line")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        !footer.contains("more files not shown"),
+        "untruncated popup must not show the hint, got: {footer:?}"
+    );
+}
+
 #[tokio::test]
 async fn mention_popup_escapes_on_esc() {
     let mut agent = test_agent(SessionMode::Build);
