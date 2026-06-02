@@ -7600,6 +7600,77 @@ fn progress_snapshot_returns_none_before_any_calls() {
     assert!(broker.progress_snapshot_if_due(3).is_none());
 }
 
+/// Regression for #259: when the routing LLM-judge's billed spend is the call
+/// that pushes the session across `cost_warn_percent`, the one-shot
+/// `CostWarning` must still surface. The judge fold records the judge cost into
+/// the same broker the main turn uses; dropping the warning status it returns
+/// would latch `warn_emitted` and silently suppress the user-facing notice.
+#[tokio::test]
+async fn routing_judge_spend_crossing_warn_threshold_still_surfaces_cost_warning() {
+    // First popped response = the judge call; its `Completed` cost crosses the
+    // warn threshold (9_000 >= 80% of 10_000) but stays under the cap. Second
+    // popped response = the main turn, billed nothing more.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("judge".to_string()),
+            cost: CostSnapshot {
+                estimated_usd_micros: Some(9_000),
+                input_tokens: Some(100),
+                output_tokens: Some(10),
+                ..CostSnapshot::default()
+            },
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })],
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("main".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })],
+    ]));
+    let config = AppConfig {
+        model: "parent-model".to_string(),
+        // Distinct cheap model so the classifier doesn't short-circuit, and
+        // the judge actually dispatches.
+        small_fast_model: Some("cheap-model".to_string()),
+        routing: squeezy_core::RoutingConfig {
+            auto_cheap: true,
+            auto_cheap_llm_judge: true,
+            ..AppConfig::default().routing
+        },
+        max_session_cost_usd_micros: Some(10_000),
+        cost_warn_percent: 80,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    // A non-slam-dunk, non-deictic prompt so `classify_turn` falls through to
+    // the LLM judge rather than the heuristic.
+    let mut rx = agent.start_turn(
+        "Investigate why the build pipeline keeps failing intermittently".to_string(),
+        CancellationToken::new(),
+    );
+    let mut warnings = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::CostWarning { status, .. } = event {
+            warnings.push(status);
+        }
+    }
+
+    assert_eq!(
+        warnings.len(),
+        1,
+        "judge-driven threshold crossing must surface exactly one CostWarning"
+    );
+    assert_eq!(warnings[0].cap_usd_micros, 10_000);
+    assert!(
+        warnings[0].spent_usd_micros >= 8_000,
+        "warning must report spend at/above the 80% threshold; got {}",
+        warnings[0].spent_usd_micros
+    );
+}
+
 /// Repro for bd ticket squeezy-xt2o: with a $0.01 cap and a fresh broker the
 /// pre-flight gate must refuse to dispatch a turn whose projected input/output
 /// pricing already exceeds the cap, so the broker trips *before* the over-cap

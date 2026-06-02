@@ -5397,15 +5397,25 @@ impl TurnRuntime {
         // already sent over the wire. Stamp the same number into
         // `routing_judge_usd_micros` so the audit field shows the
         // judge's share separately from the main turn's request.
-        // `record_provider_cost` may return a warning status; we
-        // discard it here so the routing layer never emits the
-        // session-cap warning event itself — the main turn's later
-        // `record_provider_cost` will fire the warning if applicable.
+        // `record_provider_cost` consumes the one-shot warn latch when the
+        // session crosses `cost_warn_percent`. If the judge's spend is the
+        // call that crosses it, we must emit the warning here: the main
+        // turn's later `record_provider_cost` would see `warn_emitted` and
+        // return `None`, so dropping the status would lose the user-facing
+        // heads-up entirely.
         if judge_cost.estimated_usd_micros.is_some()
             || judge_cost.input_tokens.is_some()
             || judge_cost.output_tokens.is_some()
         {
-            let _ = broker.record_provider_cost(&judge_cost);
+            if let Some(status) = broker.record_provider_cost(&judge_cost) {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::CostWarning {
+                        turn_id: self.turn_id,
+                        status,
+                    })
+                    .await;
+            }
             broker.metrics.routing_judge_usd_micros = judge_cost
                 .estimated_usd_micros
                 .unwrap_or(0)
