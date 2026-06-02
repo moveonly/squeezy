@@ -726,6 +726,7 @@ impl McpClientRegistry {
             elicitation_policy: self.elicitation_policy.clone(),
             elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
+            resource_reads: self.resource_reads.clone(),
         };
         let entry = match server.transport {
             McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
@@ -768,6 +769,40 @@ impl McpClientRegistry {
     pub fn insert_cached_tool_for_test(&self, tool: ExternalMcpTool) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(tool.model_name.clone(), tool);
+        }
+    }
+
+    #[cfg(test)]
+    fn seed_resource_read_for_test(&self, server: &str, uri: &str, value: Value) {
+        if let Ok(mut cache) = self.resource_reads.lock() {
+            cache.insert(
+                (server.to_string(), uri.to_string()),
+                CachedResourceRead {
+                    value,
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_resource_read_for_test(&self, server: &str, uri: &str) -> Option<Value> {
+        self.resource_reads.lock().ok().and_then(|cache| {
+            cache
+                .get(&(server.to_string(), uri.to_string()))
+                .map(|c| c.value.clone())
+        })
+    }
+
+    #[cfg(test)]
+    fn client_handler_for_test(&self, server_name: &str) -> SqueezyMcpClientHandler {
+        SqueezyMcpClientHandler {
+            server_name: server_name.to_string(),
+            elicitation_handler: self.elicitation_handler.clone(),
+            elicitation_policy: self.elicitation_policy.clone(),
+            elicitation_audit: self.elicitation_audit.clone(),
+            pause_state: self.pause_state.clone(),
+            resource_reads: self.resource_reads.clone(),
         }
     }
 
@@ -1010,6 +1045,28 @@ struct SqueezyMcpClientHandler {
     elicitation_policy: Arc<Mutex<PermissionMode>>,
     elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
+    /// Shared with `McpClientRegistry` so resource-change notifications can
+    /// evict stale cached reads before their TTL lapses.
+    resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
+}
+
+impl SqueezyMcpClientHandler {
+    /// Drop the cached `read_resource` entry for `uri` so the next read
+    /// re-fetches instead of serving content the server just signalled as
+    /// changed (otherwise it would stay cached until the TTL lapses).
+    fn evict_resource_read(&self, uri: &str) {
+        if let Ok(mut cache) = self.resource_reads.lock() {
+            cache.remove(&(self.server_name.clone(), uri.to_string()));
+        }
+    }
+
+    /// Drop every cached `read_resource` entry for this server. Used when the
+    /// resource list changes, which can invalidate any prior read.
+    fn evict_server_resource_reads(&self) {
+        if let Ok(mut cache) = self.resource_reads.lock() {
+            cache.retain(|(server, _), _| server != &self.server_name);
+        }
+    }
 }
 
 impl ClientHandler for SqueezyMcpClientHandler {
@@ -1168,6 +1225,7 @@ impl ClientHandler for SqueezyMcpClientHandler {
         params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
+        self.evict_resource_read(&params.uri);
         tracing::info!(
             target: "squeezy::mcp",
             server = %self.server_name,
@@ -1177,6 +1235,7 @@ impl ClientHandler for SqueezyMcpClientHandler {
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.evict_server_resource_reads();
         tracing::info!(
             target: "squeezy::mcp",
             server = %self.server_name,
