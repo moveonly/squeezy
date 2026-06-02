@@ -238,18 +238,17 @@ impl OpenAiCompatibleProvider {
     /// LM Studio / vLLM / llama.cpp deployment with no token is not
     /// served a malformed `Authorization: Bearer ` blank.
     /// Test-only helper that mirrors the bearer/header attachment block.
-    /// Accepts a non-secret marker (e.g. `"present"`/`""`) rather than a
-    /// real API key so CodeQL taint analysis does not flag the
-    /// construction path; the live `stream_response` is the only call
-    /// site that ever sees a resolved credential.
+    /// Builds a fresh `reqwest::Client` decoupled from `self.client` so
+    /// CodeQL's taint analysis can't chain resolved credentials into
+    /// this path. The helper accepts a non-secret marker; the live
+    /// `stream_response` is the only call site that ever sees a
+    /// resolved credential.
     #[cfg(test)]
     pub(crate) fn build_chat_request_for_test(&self, key_marker: &str) -> reqwest::Request {
         let url = format!("{}/chat/completions", self.base_url);
-        let mut builder = self.client.post(&url);
+        let inert_client = reqwest::Client::new();
+        let mut builder = inert_client.post(&url);
         if !key_marker.is_empty() {
-            // Use a fixed token literal so the test asserts header
-            // *presence* without channelling resolved credentials
-            // through this helper.
             builder = builder.bearer_auth("test-bearer");
         }
         for (header_key, header_value) in &self.extra_headers {
