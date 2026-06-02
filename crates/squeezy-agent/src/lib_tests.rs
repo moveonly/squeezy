@@ -401,6 +401,63 @@ async fn cancel_preserves_partial_assistant_text_in_conversation_state() {
 }
 
 #[tokio::test]
+async fn terminal_stream_error_preserves_partial_assistant_text_in_conversation_state() {
+    // Terminal provider-stream error (retries-exhausted idle timeout): the
+    // model streams a few text deltas, then the stream yields a terminal
+    // `ProviderStream` error instead of `Completed`/`Cancelled`. The turn
+    // ends as `AgentEvent::Failed`, but — exactly like the cancel paths —
+    // the partial assistant text already streamed to the TUI must be
+    // preserved in `conversation_state.conversation`/`transcript` instead
+    // of being silently dropped, so resume keeps what the model produced.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("partial ".to_string())),
+        Ok(LlmEvent::TextDelta("answer".to_string())),
+        Err(SqueezyError::ProviderStream(
+            "stream idle timeout".to_string(),
+        )),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("answer me".to_string(), CancellationToken::new());
+    let mut saw_failed = false;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            saw_failed = error.to_string().contains("stream idle timeout");
+        }
+    }
+    assert!(
+        saw_failed,
+        "terminal stream error must still surface AgentEvent::Failed"
+    );
+
+    let state = agent.conversation_state.lock().await;
+    let partial = "partial answer";
+
+    let assistant_in_conversation = state
+        .conversation
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_in_conversation,
+        vec![partial],
+        "partial assistant text streamed before a terminal stream error must be pushed onto \
+         `conversation_state.conversation`, not discarded like a hard failure"
+    );
+
+    let assistant = state
+        .transcript
+        .iter()
+        .find(|item| item.role == squeezy_core::Role::Assistant)
+        .expect("transcript must record the partial assistant turn");
+    assert_eq!(assistant.content, partial);
+}
+
+#[tokio::test]
 async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let root = temp_workspace("task_state_session");
     let provider = Arc::new(MockProvider::new(vec![

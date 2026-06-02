@@ -6001,6 +6001,39 @@ impl TurnRuntime {
                         .await;
                     continue;
                 }
+                // Terminal stream error after retries are exhausted (most
+                // realistically a stream idle timeout). Mirror the cancel
+                // paths' partial preservation before propagating: flush the
+                // redactor tail, push the partial assistant text into the
+                // conversation/transcript, and fold the partial spend the
+                // provider already billed. Without this the bytes already
+                // streamed to the TUI are dropped from persisted state and
+                // the session cost under-reports the work. The error is
+                // still returned so `run`'s caller surfaces `Failed`.
+                if let Some(tail) = self
+                    .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await
+                {
+                    self.record_replay_model_text_delta(&tail);
+                }
+                broker.metrics.redactions += assistant_stream.total_redactions();
+                let partial = std::mem::take(&mut assistant_message);
+                self.preserve_partial_assistant_on_cancel(
+                    partial,
+                    &mut conversation,
+                    user_transcript.clone(),
+                    context_compaction.clone(),
+                )
+                .await;
+                self.fold_partial_cancel_cost(
+                    &mut total_cost,
+                    &mut broker,
+                    request_model.as_ref(),
+                    request_input_bytes,
+                    round_output_bytes,
+                )
+                .await;
+                self.stamp_routing_savings(&mut broker.metrics);
                 return Err(error);
             }
 
