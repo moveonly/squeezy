@@ -1,4 +1,6 @@
 use super::*;
+use serde_json::json;
+use squeezy_tools::{ToolCostHint, ToolReceipt};
 
 fn sample_status() -> CostCapStatus {
     CostCapStatus {
@@ -70,4 +72,29 @@ fn warn_threshold_notice_includes_next_step_guidance() {
         notice.contains("(96%)"),
         "warn notice must cite the percent; got: {notice}"
     );
+}
+
+#[test]
+fn budget_denied_result_counts_once_across_accounting_paths() {
+    let mut broker = CostBroker::new(&AppConfig::default());
+    let result = ToolResult {
+        call_id: "call-1".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Denied,
+        content: json!({
+            "budget_denied": true,
+            "error": "budget exhausted",
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "sha".to_string(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+
+    broker.record_executed_result(&result);
+    broker.record_model_result(&result);
+
+    assert_eq!(broker.metrics.budget_denials, 1);
 }
