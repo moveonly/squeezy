@@ -33,9 +33,9 @@ pub(crate) use keys::{handle_key, handle_paste};
 pub(crate) use render::render;
 pub(crate) use save::{
     clear_scope_override, clear_scope_override_silent, discard_all_session_writes, perform_reset,
-    save_field, save_field_silent, save_inline_provider_api_key, save_theme_color,
-    save_theme_delete, save_theme_rename, save_theme_selection, save_theme_snapshot,
-    undo_last_write, unset_theme_color,
+    permission_detail_read_path, save_field, save_field_silent, save_inline_provider_api_key,
+    save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
+    save_theme_snapshot, undo_last_write, unset_theme_color,
 };
 
 /// Synthetic row index in the Models section that exposes the API-key
@@ -496,7 +496,12 @@ impl ConfigScreenState {
             ConfigScope::Repo => self.sources.project.as_ref(),
             ConfigScope::Local => self.sources.repo.as_ref(),
         }?;
-        Some(tier.contains_path(field.toml_path))
+        // The granular permission fields live under `[permissions.custom]`;
+        // count ownership there too, or Space-cycle on Repo/Local can never
+        // advance past the first option for a value this tier actually set.
+        let owns = tier.contains_path(field.toml_path)
+            || permission_detail_read_path(field).is_some_and(|p| tier.contains_path(p));
+        Some(owns)
     }
 
     pub(crate) fn displayed_value_and_source(
@@ -634,15 +639,36 @@ pub(crate) struct ResetPreviewEntry {
     pub after_source: FieldSource,
 }
 
-/// Parse the `FieldValue` for `field.toml_path` out of a tier's
-/// `DocumentMut`. Returns `None` when the path is unset in this tier or
-/// when the leaf type can't be represented in the current schema (e.g.
-/// `TableArray` / `ProviderSubTabs`).
+/// Parse the `FieldValue` for `field` out of a tier's `DocumentMut`.
+/// Returns `None` when the field is unset in this tier or when the leaf
+/// type can't be represented in the current schema (e.g. `TableArray` /
+/// `ProviderSubTabs`).
+///
+/// The ten granular permission fields are written to (and so read back
+/// from) `[permissions.custom].<field>`; probe that location first and
+/// only fall back to the legacy top-level `field.toml_path` so files
+/// authored before the `custom` subtable existed still display.
 fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Option<FieldValue> {
-    if field.toml_path.is_empty() {
+    if let Some(custom_path) = permission_detail_read_path(field)
+        && let Some(val) = tier_value_at_explicit_path(tier, custom_path, field.kind)
+    {
+        return Some(val);
+    }
+    tier_value_at_explicit_path(tier, field.toml_path, field.kind)
+}
+
+/// Parse the `FieldValue` at an explicit TOML `path` out of a tier's
+/// `DocumentMut`, interpreting the leaf under `kind`. Returns `None` when
+/// the path is unset or the leaf type isn't representable in the schema.
+fn tier_value_at_explicit_path(
+    tier: &squeezy_core::TierSource,
+    path: &[&str],
+    kind: FieldKind,
+) -> Option<FieldValue> {
+    if path.is_empty() {
         return None;
     }
-    let (leaf, parents) = field.toml_path.split_last().unwrap();
+    let (leaf, parents) = path.split_last().unwrap();
     let mut node: &toml_edit::Item = tier.doc.as_item();
     for seg in parents {
         node = match node {
@@ -664,7 +690,7 @@ fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Opt
         _ => return None,
     };
     let value = item.as_value()?;
-    match field.kind {
+    match kind {
         FieldKind::Bool => value.as_bool().map(FieldValue::Bool),
         FieldKind::Integer { .. } => value.as_integer().map(FieldValue::Integer),
         FieldKind::OptionalInteger { .. } => value

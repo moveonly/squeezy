@@ -1472,6 +1472,50 @@ async fn immediate_tier_permission_save_propagates_to_agent() {
     );
 }
 
+#[test]
+fn granular_permission_read_back_uses_custom_subtable() {
+    use squeezy_core::{
+        TierSource,
+        config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId},
+    };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Permissions));
+    let perm_edit = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "edit")
+        .unwrap();
+
+    // The screen writes granular permissions to `[permissions.custom]`;
+    // synthesize a Local tier in that modern shape with `edit = "deny"`.
+    let toml_text = "[permissions]\nmode = \"custom\"\n\n[permissions.custom]\nedit = \"deny\"\n";
+    let tier = TierSource {
+        path: std::path::PathBuf::from("/virtual/local.toml"),
+        doc: toml_text.parse().expect("valid toml"),
+    };
+    state.sources.repo = Some(tier);
+
+    // Read-back on the Local tab must reflect the saved `deny`, not the
+    // stale top-level default `allow`.
+    state.scope = ConfigScope::Local;
+    let (value, _src) = state.displayed_value_and_source(perm_edit);
+    assert_eq!(
+        value,
+        FieldValue::Enum("deny"),
+        "displayed value must read the `[permissions.custom]` write location"
+    );
+
+    // The tier owns the field, so Repo/Local Space-cycle can advance past
+    // the first option instead of perpetually re-applying `allow`.
+    assert_eq!(
+        state.scope_owns_field(perm_edit),
+        Some(true),
+        "scope_owns_field must count the `[permissions.custom]` location"
+    );
+}
+
 #[tokio::test]
 async fn next_prompt_tier_save_arms_pending_swap() {
     use squeezy_core::config_schema::ApplyTier;

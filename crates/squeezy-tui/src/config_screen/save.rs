@@ -767,8 +767,24 @@ fn field_write_path(field: &'static FieldMeta) -> &'static [&'static str] {
     permission_detail_write_path(field).unwrap_or(field.toml_path)
 }
 
+/// The `[permissions.custom].<field>` location the screen both writes to
+/// and reads back from for the ten granular permission fields. `None` for
+/// every other field. The read paths (`tier_value_at_path`,
+/// `scope_owns_field`) must probe this before the legacy top-level
+/// `field.toml_path`, or saved values never re-display.
+///
+/// Keyed off `field.toml_path` (itself `'static`), so it works for a
+/// borrowed `&FieldMeta` and not just `&'static FieldMeta`.
+pub(crate) fn permission_detail_read_path(field: &FieldMeta) -> Option<&'static [&'static str]> {
+    permission_detail_path(field.toml_path)
+}
+
 fn permission_detail_write_path(field: &'static FieldMeta) -> Option<&'static [&'static str]> {
-    match field.toml_path {
+    permission_detail_path(field.toml_path)
+}
+
+fn permission_detail_path(toml_path: &[&str]) -> Option<&'static [&'static str]> {
+    match toml_path {
         ["permissions", "read"] => Some(&["permissions", "custom", "read"]),
         ["permissions", "search"] => Some(&["permissions", "custom", "search"]),
         ["permissions", "edit"] => Some(&["permissions", "custom", "edit"]),
