@@ -26,6 +26,7 @@ fn make_request(model: &str, input: &str) -> LlmRequest {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: Arc::from(Vec::new()),
+        ..LlmRequest::default()
     }
 }
 

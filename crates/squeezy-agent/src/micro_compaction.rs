@@ -110,7 +110,9 @@ pub(crate) fn maybe_micro_compact_mid_turn(
     let mut cleared_call_ids = Vec::with_capacity(clear_targets.len());
     let mut bytes_saved: usize = 0;
     for item in conversation.iter_mut() {
-        if let LlmInputItem::FunctionCallOutput { call_id, output } = item
+        if let LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } = item
             && let Some(tool_name) = clear_targets.get(call_id.as_str())
             && !is_already_cleared(output)
         {

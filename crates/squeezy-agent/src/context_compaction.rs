@@ -409,29 +409,17 @@ pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmI
         })
         .collect();
     let mut repaired = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            LlmInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } => {
-                let missing_output = !answered.contains(call_id.as_str());
-                let output_call_id = missing_output.then(|| call_id.clone());
-                repaired.push(LlmInputItem::FunctionCall {
-                    call_id,
-                    name,
-                    arguments,
-                });
-                if let Some(call_id) = output_call_id {
-                    repaired.push(LlmInputItem::FunctionCallOutput {
-                        call_id,
-                        output: "{\"error\":\"tool call interrupted\",\"is_error\":true}"
-                            .to_string(),
-                    });
-                }
-            }
-            item => repaired.push(item),
+    for item in items.iter() {
+        repaired.push(item.clone());
+        if let LlmInputItem::FunctionCall { call_id, .. } = item
+            && !answered.contains(call_id.as_str())
+        {
+            repaired.push(LlmInputItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
+                content_parts: None,
+                is_error: true,
+            });
         }
     }
     repaired
@@ -467,17 +455,68 @@ pub(crate) fn strip_media_for_compaction(items: &[LlmInputItem]) -> Vec<LlmInput
     items
         .iter()
         .map(|item| match item {
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
-                if output.len() < STRIP_MEDIA_MIN_LEN {
+            LlmInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                content_parts,
+                is_error,
+            } => {
+                // A `ToolResultPart::Image` carries raw image bytes that
+                // `strip_media_data_uris` (which scans the text `output`)
+                // never sees, so an unstripped array slot would smuggle a
+                // full screenshot into the compaction payload. Replace each
+                // image part with a short text placeholder; this mirrors the
+                // `[image]` data-URI substitution and keeps the slot count
+                // stable. Text parts are scrubbed for inline data URIs too.
+                let stripped_parts = content_parts
+                    .as_ref()
+                    .map(|parts| strip_media_content_parts(parts));
+                // Skip the text scan only when both the `output` string is
+                // too short to hold a data URI *and* there were no parts to
+                // shrink; otherwise rebuild the item with the cleaned parts.
+                if output.len() < STRIP_MEDIA_MIN_LEN && stripped_parts.is_none() {
                     item.clone()
                 } else {
                     LlmInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
-                        output: strip_media_data_uris(output),
+                        output: if output.len() < STRIP_MEDIA_MIN_LEN {
+                            output.clone()
+                        } else {
+                            strip_media_data_uris(output)
+                        },
+                        content_parts: stripped_parts,
+                        is_error: *is_error,
                     }
                 }
             }
             _ => item.clone(),
+        })
+        .collect()
+}
+
+/// Placeholder substituted for a stripped `ToolResultPart::Image` so the
+/// summarizer still sees that a tool returned an image without carrying the
+/// raw bytes through compaction.
+const IMAGE_PART_PLACEHOLDER: &str = "[image]";
+
+/// Shrink a structured tool-result array for compaction: drop each
+/// `ToolResultPart::Image`'s raw bytes (replacing it with a short text
+/// placeholder) and scrub inline data URIs out of every text part. The
+/// input is borrowed; a fresh `Vec` is returned. Empty inputs collapse to
+/// an empty `Vec`, preserving the `Some(_)` shape so the caller's slot
+/// rebuild stays unconditional.
+fn strip_media_content_parts(
+    parts: &[squeezy_llm::ToolResultPart],
+) -> Vec<squeezy_llm::ToolResultPart> {
+    parts
+        .iter()
+        .map(|part| match part {
+            squeezy_llm::ToolResultPart::Text { text } => squeezy_llm::ToolResultPart::Text {
+                text: strip_media_data_uris(text),
+            },
+            squeezy_llm::ToolResultPart::Image { .. } => squeezy_llm::ToolResultPart::Text {
+                text: IMAGE_PART_PLACEHOLDER.to_string(),
+            },
         })
         .collect()
 }
@@ -590,13 +629,46 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
             name,
             arguments,
         } => call_id.len() + name.len() + arguments.to_string().len(),
-        LlmInputItem::FunctionCallOutput { call_id, output } => call_id.len() + output.len(),
+        LlmInputItem::FunctionCallOutput {
+            call_id,
+            output,
+            content_parts,
+            ..
+        } => {
+            // Bill the structured-result array too: a `Text` part's chars and
+            // an `Image` part's raw bytes are on-the-wire payload that the
+            // bare `output` string never accounts for, so without this they
+            // stay invisible to the context-pressure signal.
+            let parts_bytes = content_parts
+                .as_ref()
+                .map(|parts| {
+                    parts.iter().fold(0usize, |acc, part| {
+                        let part_len = match part {
+                            squeezy_llm::ToolResultPart::Text { text } => text.len(),
+                            squeezy_llm::ToolResultPart::Image { media_type, bytes } => {
+                                media_type.len() + bytes.len()
+                            }
+                        };
+                        acc.saturating_add(part_len)
+                    })
+                })
+                .unwrap_or(0);
+            call_id.len() + output.len() + parts_bytes
+        }
         LlmInputItem::Reasoning(payload) => payload.display_text().len(),
         // Image bytes don't consume model context tokens directly (the
         // provider's vision encoder charges its own per-image token
         // budget). Bill the raw byte count here so compaction's "context
         // pressure" signal still reflects payload size on the wire.
         LlmInputItem::Image { bytes, .. } => bytes.len(),
+        // Documents follow the same wire-billing rule as images: count
+        // the raw payload bytes so compaction sees pressure when the
+        // user attaches a large PDF.
+        LlmInputItem::Document { bytes, .. } => bytes.len(),
+        // `LlmInputItem` is `#[non_exhaustive]`; an unknown future variant
+        // contributes zero bytes to the heuristic until a dedicated arm
+        // exists. Compaction will still fire on the items it understands.
+        _ => 0,
     }
 }
 
@@ -699,6 +771,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let cancel = CancellationToken::new();
     let mut stream = provider.stream_response(request, cancel);
@@ -1228,7 +1301,9 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
                 "- tool call {name} args={}",
                 compact_text(&arguments.to_string(), COMPACTION_TOOL_ARGS_MAX_CHARS)
             )),
-            LlmInputItem::FunctionCallOutput { call_id, output } => Some(format!(
+            LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => Some(format!(
                 "- tool output {call_id}: {}",
                 compact_text(output, COMPACTION_TOOL_OUTPUT_MAX_CHARS)
             )),
@@ -1240,6 +1315,16 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
             // MIME type so the summary preserves a hint that an image was
             // shown but skip the raw bytes.
             LlmInputItem::Image { media_type, .. } => Some(format!("- user image: {media_type}")),
+            // Document attachments are similar: keep a one-line hint
+            // (filename + MIME) so the summary records the upload, drop
+            // the raw bytes.
+            LlmInputItem::Document {
+                name, media_type, ..
+            } => Some(format!("- user document {name}: {media_type}")),
+            // Unknown future variants contribute nothing to the durable
+            // summary — preserves forward compatibility without polluting
+            // the summary with an opaque placeholder.
+            _ => None,
         })
         .take(COMPACTION_DURABLE_LINES_LIMIT)
         .collect()

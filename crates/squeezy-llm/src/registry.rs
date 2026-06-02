@@ -6,7 +6,9 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::Value;
-use squeezy_core::{CostSnapshot, ModelProfile, OpenAiCompatiblePreset, ProviderConfig, Result};
+use squeezy_core::{
+    CostSnapshot, ModelProfile, OpenAiCompatiblePreset, ProviderConfig, ReasoningEffort, Result,
+};
 
 use crate::{
     AnthropicProvider, BedrockProvider, FauxProvider, GoogleProvider, LlmInputItem, LlmProvider,
@@ -26,6 +28,24 @@ pub struct ModelCapabilities {
     pub text_verbosity: bool,
     #[serde(default)]
     pub prompt_caching: bool,
+    /// Default `reasoning_effort` the provider should apply when the
+    /// caller leaves [`LlmRequest::reasoning_effort`] unset. `None`
+    /// preserves the historical behavior of "let the provider pick";
+    /// `Some(...)` lets the Phase 3 catalog encode model-recommended
+    /// defaults (e.g. GPT-5 high vs medium baseline). Per-provider
+    /// consumption lands in Phase 4.
+    #[serde(default)]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// Minimum thinking budget the provider supports for the model.
+    /// `None` leaves the provider default in place. Per-provider
+    /// consumption lands in Phase 4.
+    #[serde(default)]
+    pub thinking_budget_min: Option<u32>,
+    /// Maximum thinking budget the provider supports for the model.
+    /// `None` leaves the provider default in place. Per-provider
+    /// consumption lands in Phase 4.
+    #[serde(default)]
+    pub thinking_budget_max: Option<u32>,
 }
 
 impl ModelCapabilities {
@@ -39,6 +59,9 @@ impl ModelCapabilities {
         reasoning_effort: false,
         text_verbosity: false,
         prompt_caching: false,
+        default_reasoning_effort: None,
+        thinking_budget_min: None,
+        thinking_budget_max: None,
     };
 }
 
@@ -495,11 +518,11 @@ fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 
             .saturating_add(estimate_text_tokens(name, bytes_per_token))
             .saturating_add(estimate_json_tokens(arguments, bytes_per_token))
             .saturating_add(12),
-        LlmInputItem::FunctionCallOutput { call_id, output } => {
-            estimate_text_tokens(call_id, bytes_per_token)
-                .saturating_add(estimate_text_tokens(output, bytes_per_token))
-                .saturating_add(12)
-        }
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => estimate_text_tokens(call_id, bytes_per_token)
+            .saturating_add(estimate_text_tokens(output, bytes_per_token))
+            .saturating_add(12),
         LlmInputItem::Reasoning(payload) => {
             let text = payload.display_text();
             estimate_text_tokens(&text, bytes_per_token).saturating_add(8)
@@ -513,6 +536,15 @@ fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 
         // attached image, low enough that text-heavy turns are
         // unaffected.
         LlmInputItem::Image { bytes, .. } => {
+            let wire_bytes = (bytes.len() as f64 * 4.0 / 3.0).ceil();
+            let wire_tokens = (wire_bytes / bytes_per_token.max(0.1)).ceil() as u64;
+            wire_tokens.saturating_add(1024)
+        }
+        // Documents lower to bytes on the wire too; charge the same
+        // base64 overhead estimate as `Image`. Providers that don't
+        // accept documents will drop the item at build time, but the
+        // budget keeps headroom symmetric until then.
+        LlmInputItem::Document { bytes, .. } => {
             let wire_bytes = (bytes.len() as f64 * 4.0 / 3.0).ceil();
             let wire_tokens = (wire_bytes / bytes_per_token.max(0.1)).ceil() as u64;
             wire_tokens.saturating_add(1024)

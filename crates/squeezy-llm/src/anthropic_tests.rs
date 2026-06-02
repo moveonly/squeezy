@@ -35,6 +35,7 @@ fn request_body_uses_messages_streaming_shape() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -86,6 +87,7 @@ fn request_body_preserves_function_tool_order() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -112,6 +114,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -134,6 +137,8 @@ fn request_body_maps_tool_roundtrip_messages() {
             LlmInputItem::FunctionCallOutput {
                 call_id: "toolu_1".to_string(),
                 output: "model = 'haiku'".to_string(),
+                content_parts: None,
+                is_error: false,
             },
         ]),
         max_output_tokens: Some(32),
@@ -148,6 +153,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -196,6 +202,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -260,6 +267,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -323,6 +331,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -375,6 +384,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -410,6 +420,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -460,6 +471,7 @@ fn request_body_emits_one_hour_ttl_marker_for_long_retention() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -513,6 +525,7 @@ fn request_body_omits_ttl_for_short_retention_via_legacy_cache_key() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -541,6 +554,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -581,6 +595,7 @@ fn request_body_omits_thinking_when_max_output_tokens_below_1024_floor() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -619,6 +634,7 @@ fn request_body_emits_thinking_clamped_to_max_output_minus_reply_headroom() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -667,6 +683,46 @@ fn model_uses_adaptive_thinking_covers_4_6_and_later_opus_and_sonnet() {
     }
 }
 
+/// H-04: the detection heuristic must not fire for non-Claude model
+/// ids that happen to contain the `opus-N-M` / `sonnet-N-M` substring
+/// (a custom proxy literal like `opus-4-7`, a third-party model named
+/// `myorg/opus-4-7`, or any future aggregator that uses the same
+/// family tag for a non-Anthropic model). Aggregator routes that DO
+/// wrap a real Claude model (Vertex region tag `@001`, OpenRouter
+/// route tag `:nitro`, OpenRouter prefix `anthropic/`) must still
+/// activate adaptive thinking so the OAuth quota path keeps working.
+#[test]
+fn model_uses_adaptive_thinking_requires_claude_prefix_and_anchors_version_segment() {
+    // Non-Claude proxies and lookalikes: must NOT activate adaptive
+    // thinking.
+    for model in [
+        "opus-4-7",
+        "opus-4-7-instruct",
+        "myorg/opus-4-7",
+        "sonnet-5-0",
+        "anthropic/opus-4-7",
+        "vertex/anthropic/opus-4-7",
+    ] {
+        assert!(
+            !model_uses_adaptive_thinking(model),
+            "non-Claude id `{model}` must not activate adaptive thinking",
+        );
+    }
+
+    // Aggregator wrappers around real Claude models: MUST activate.
+    for model in [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-opus-4-7:nitro",
+        "vertex/anthropic/claude-opus-4-7@001",
+        "openrouter/anthropic/claude-sonnet-4-6:beta",
+    ] {
+        assert!(
+            model_uses_adaptive_thinking(model),
+            "aggregator wrapper `{model}` must still activate adaptive thinking",
+        );
+    }
+}
+
 #[test]
 fn request_body_uses_adaptive_thinking_for_claude_4_6_and_4_7() {
     use squeezy_core::ReasoningEffort;
@@ -692,6 +748,7 @@ fn request_body_uses_adaptive_thinking_for_claude_4_6_and_4_7() {
             output_schema: None,
             parallel_tool_calls: None,
             beta_headers: std::sync::Arc::from(Vec::new()),
+            ..LlmRequest::default()
         };
 
         let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -725,6 +782,7 @@ fn request_body_keeps_enabled_thinking_for_legacy_anthropic_models() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
@@ -909,7 +967,121 @@ fn parser_surfaces_error_events() {
     )
     .expect_err("stream error");
 
+    // Default (unknown) error type stays on the ProviderStream
+    // path so the retry layer still attempts a reconnect for
+    // genuinely transient transport shapes.
+    assert!(matches!(err, squeezy_core::SqueezyError::ProviderStream(_)));
     assert!(err.to_string().contains("bad request"));
+    // No overflow signal latched for an unrecognised error shape.
+    assert!(state.pending_overflow_signal.is_none());
+}
+
+/// C-01: a mid-stream `event: error` carrying
+/// `model_context_window_exceeded` must (a) latch an additive
+/// `ContextOverflow` signal on the stream state and (b) surface
+/// as a non-retryable `ProviderRequest` so the retry layer doesn't
+/// reconnect against an immutable failure.
+#[test]
+fn parser_classifies_mid_stream_context_window_exceeded_as_non_retryable() {
+    let mut state = AnthropicStreamState::default();
+    let err = parse_anthropic_event(
+        r#"{
+          "type":"error",
+          "error":{
+            "type":"model_context_window_exceeded",
+            "message":"prompt is too long for this model"
+          }
+        }"#,
+        &mut state,
+    )
+    .expect_err("error event surfaces error");
+    assert!(
+        matches!(err, squeezy_core::SqueezyError::ProviderRequest(_)),
+        "context-window errors must surface as ProviderRequest, got {err:?}",
+    );
+    assert!(
+        err.to_string()
+            .contains(crate::anthropic_error::NON_RETRYABLE_MARKER),
+        "context-window errors must carry the non-retryable marker, got {}",
+        err
+    );
+    let signal = state
+        .pending_overflow_signal
+        .take()
+        .expect("overflow signal must be latched for context-window errors");
+    assert!(matches!(
+        signal,
+        crate::overflow::OverflowSignal::ErrorPattern(_)
+    ));
+}
+
+/// C-01: `overloaded_error` and `rate_limit_error` mid-stream errors
+/// must surface as `ProviderRequest` (so the pre/post-200 paths use the
+/// same shape), without latching an overflow signal.
+#[test]
+fn parser_classifies_mid_stream_overloaded_as_provider_request() {
+    for (raw, want_type) in [
+        (
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#,
+            "overloaded",
+        ),
+        (
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+            "slow down",
+        ),
+        (
+            r#"{"type":"error","error":{"type":"api_error","message":"generic 5xx"}}"#,
+            "generic 5xx",
+        ),
+    ] {
+        let mut state = AnthropicStreamState::default();
+        let err = parse_anthropic_event(raw, &mut state).expect_err("stream error");
+        assert!(
+            matches!(err, squeezy_core::SqueezyError::ProviderRequest(_)),
+            "transient errors must surface as ProviderRequest, got {err:?} for {raw}",
+        );
+        assert!(
+            err.to_string().contains(want_type),
+            "error message must round-trip the upstream prose, got {err} for {raw}",
+        );
+        assert!(
+            !err.to_string()
+                .contains(crate::anthropic_error::NON_RETRYABLE_MARKER),
+            "transient errors must not carry the non-retryable marker: {err}",
+        );
+        assert!(
+            state.pending_overflow_signal.is_none(),
+            "transient errors must not latch an overflow signal",
+        );
+    }
+}
+
+/// C-01: `invalid_request_error` (e.g. budget_tokens too small) must
+/// surface non-retryable so the retry layer can short-circuit instead
+/// of replaying the identical bad request five times.
+#[test]
+fn parser_classifies_mid_stream_invalid_request_as_non_retryable() {
+    let mut state = AnthropicStreamState::default();
+    let err = parse_anthropic_event(
+        r#"{
+          "type":"error",
+          "error":{
+            "type":"invalid_request_error",
+            "message":"thinking.enabled.budget_tokens must be >= 1024"
+          }
+        }"#,
+        &mut state,
+    )
+    .expect_err("invalid request surfaces error");
+    assert!(matches!(
+        err,
+        squeezy_core::SqueezyError::ProviderRequest(_)
+    ));
+    assert!(
+        err.to_string()
+            .contains(crate::anthropic_error::NON_RETRYABLE_MARKER),
+    );
+    assert!(state.pending_overflow_signal.is_none());
 }
 
 #[test]
@@ -1017,6 +1189,217 @@ fn parser_accumulates_thinking_block_with_signature() {
     }
 }
 
+/// H-03: an `end_turn` finish with no visible text/tool output and a
+/// populated reasoning buffer is the canonical "thinking-only" turn
+/// the agent loop should retry. The streamer must set
+/// `reasoning_only_stop=true` so the agent's retry branch fires.
+#[test]
+fn parser_marks_reasoning_only_stop_when_endturn_after_thinking_with_no_output() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state).expect("stop");
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("message_delta");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed {
+                reasoning_only_stop,
+                stop_reason,
+                ..
+            } => Some((reasoning_only_stop, stop_reason.clone())),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed.1, Some(crate::StopReason::EndTurn));
+    assert!(
+        *completed.0,
+        "reasoning-only EndTurn with non-empty thinking buffer must set the flag",
+    );
+}
+
+/// H-03 happy path: an `end_turn` finish with visible text output
+/// must keep `reasoning_only_stop=false` even when the model
+/// previously emitted reasoning.
+#[test]
+fn parser_does_not_mark_reasoning_only_stop_when_visible_text_was_emitted() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        &mut state,
+    )
+    .expect("thinking start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh"}}"#,
+        &mut state,
+    )
+    .expect("thinking delta");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state)
+        .expect("thinking stop");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}"#,
+        &mut state,
+    )
+    .expect("text delta");
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("message_delta");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let reasoning_only = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed {
+                reasoning_only_stop,
+                ..
+            } => Some(*reasoning_only_stop),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert!(
+        !reasoning_only,
+        "visible text output must clear reasoning_only_stop",
+    );
+}
+
+/// H-03 negative case: an `end_turn` finish with no thinking and no
+/// visible output must NOT mark `reasoning_only_stop` (the model
+/// just produced an empty turn — distinct from the thinking-only
+/// pattern the flag targets).
+#[test]
+fn parser_does_not_mark_reasoning_only_stop_when_no_thinking_was_seen() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("message_delta");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let reasoning_only = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed {
+                reasoning_only_stop,
+                ..
+            } => Some(*reasoning_only_stop),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert!(
+        !reasoning_only,
+        "empty-thinking buffer must not trip reasoning_only_stop",
+    );
+}
+
+/// H-02: Anthropic streams a redacted-thinking block's encrypted
+/// payload over `signature_delta` frames (the `content_block_start`
+/// frame's `data` field is empty until those land). Accumulate them
+/// into `block.data` so the multi-turn round-trip ships the full
+/// blob; otherwise Anthropic rejects the continuation with
+/// `invalid_request_error` or silently breaks reasoning continuity.
+#[test]
+fn parser_accumulates_redacted_thinking_data_via_signature_delta() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":""}}"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"REDACTED_"}}"#,
+        &mut state,
+    )
+    .expect("delta-1");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"BLOB"}}"#,
+        &mut state,
+    )
+    .expect("delta-2");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state).expect("stop");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let payload = match events.first() {
+        Some(LlmEvent::ReasoningDone(payload)) => payload.clone(),
+        other => panic!("expected ReasoningDone first, got {other:?}"),
+    };
+    match payload {
+        crate::ReasoningPayload::Anthropic { blocks } => {
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].kind, crate::AnthropicThinkingKind::Redacted);
+            assert_eq!(
+                blocks[0].data.as_deref(),
+                Some("REDACTED_BLOB"),
+                "signature_delta deltas must accumulate into `data` for redacted blocks",
+            );
+            assert!(blocks[0].signature.is_none());
+        }
+        other => panic!("expected Anthropic payload, got {other:?}"),
+    }
+}
+
+/// H-02 replay: when a redacted block's encrypted blob lives in
+/// `block.data`, the wire JSON must emit it under `data`. When it
+/// instead lives in `block.signature` (e.g. a future provider build
+/// that decides to route the field there), the round-trip helper
+/// must still populate `data` so Anthropic accepts the continuation.
+#[test]
+fn anthropic_messages_redacted_thinking_populates_data_from_either_field() {
+    use crate::AnthropicThinkingBlock;
+    // Canonical: `data` populated.
+    let payload = crate::ReasoningPayload::Anthropic {
+        blocks: vec![AnthropicThinkingBlock {
+            kind: crate::AnthropicThinkingKind::Redacted,
+            text: String::new(),
+            signature: None,
+            data: Some("ENCRYPTED".to_string()),
+        }],
+    };
+    let messages = anthropic_messages(
+        &[LlmInputItem::Reasoning(payload)],
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let arr = messages.as_array().expect("array");
+    assert_eq!(arr[0]["content"][0]["type"], "redacted_thinking");
+    assert_eq!(arr[0]["content"][0]["data"], "ENCRYPTED");
+
+    // Fallback: only `signature` populated (e.g. older parser path
+    // where the streamer accumulated into signature). The replay
+    // helper falls back to it so the data field still ships
+    // populated.
+    let payload = crate::ReasoningPayload::Anthropic {
+        blocks: vec![AnthropicThinkingBlock {
+            kind: crate::AnthropicThinkingKind::Redacted,
+            text: String::new(),
+            signature: Some("FALLBACK_ENC".to_string()),
+            data: None,
+        }],
+    };
+    let messages = anthropic_messages(
+        &[LlmInputItem::Reasoning(payload)],
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let arr = messages.as_array().expect("array");
+    assert_eq!(arr[0]["content"][0]["type"], "redacted_thinking");
+    assert_eq!(arr[0]["content"][0]["data"], "FALLBACK_ENC");
+}
+
 #[test]
 fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
     let payload = crate::ReasoningPayload::Anthropic {
@@ -1080,6 +1463,7 @@ fn beta_headers_route_into_http_header() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: betas,
+        ..LlmRequest::default()
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert!(
@@ -1143,6 +1527,7 @@ fn oauth_auth_scheme_prepends_claude_code_identity_to_system() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::Oauth);
     let system = body.get("system").expect("system block must be present");
@@ -1187,6 +1572,7 @@ fn api_key_auth_scheme_keeps_system_string_unchanged() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert_eq!(body["system"], "user-supplied instructions");
@@ -1235,6 +1621,259 @@ fn merge_oauth_beta_header_returns_none_for_api_key_without_caller() {
     );
 }
 
+/// LOW Q6: beta token dedup must be case-insensitive — Anthropic
+/// treats `Claude-code-20250219` and `claude-code-20250219` as the
+/// same opt-in, so shipping both burns header space and signals
+/// confusion to the platform.
+#[test]
+fn merge_oauth_beta_header_dedups_case_insensitively() {
+    let merged = super::merge_oauth_beta_header(
+        Some("Claude-Code-20250219,Context-1M-2025-08-07"),
+        AnthropicAuthScheme::Oauth,
+    )
+    .expect("oauth scheme produces a header");
+    // The oauth marker (lowercase `claude-code-20250219`) wins
+    // priority since it is processed first; the caller's
+    // case-variant is dropped, so the merged header contains only
+    // one entry for the marker.
+    let pieces: Vec<&str> = merged.split(',').collect();
+    let lower_pieces: Vec<String> = pieces.iter().map(|p| p.to_ascii_lowercase()).collect();
+    let mut dedup = lower_pieces.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(
+        lower_pieces.len(),
+        dedup.len(),
+        "merged header must not contain case-variant duplicates",
+    );
+    assert!(
+        lower_pieces.contains(&"context-1m-2025-08-07".to_string()),
+        "caller-supplied beta must still ride on the wire",
+    );
+}
+
+/// LOW Q4: `tool_choice` must lower into Anthropic's `{type, name?}`
+/// shape so tool-shy models can be forced to call a specific tool.
+#[test]
+fn request_body_lowers_tool_choice_into_anthropic_shape() {
+    use std::sync::Arc as StdArc;
+    let mk = |hint: Option<&str>| -> serde_json::Value {
+        let request = LlmRequest {
+            model: "claude-test".to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+            max_output_tokens: Some(32),
+            response_verbosity: None,
+            reasoning_effort: None,
+            previous_response_id: None,
+            cache_key: None,
+            cache: CacheSpec::default(),
+            tools: Arc::from(vec![
+                LlmToolSpec {
+                    name: "read_file".to_string(),
+                    description: "Read".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: false,
+                }
+                .into(),
+            ]),
+            store: false,
+            tool_choice: hint.map(str::to_string),
+            output_schema: None,
+            parallel_tool_calls: None,
+            beta_headers: StdArc::from(Vec::new()),
+            ..LlmRequest::default()
+        };
+        AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey)
+    };
+
+    // `auto` → `{type:auto}`.
+    let body = mk(Some("auto"));
+    assert_eq!(body["tool_choice"]["type"], "auto");
+
+    // `required` → `{type:any}` (Anthropic's name for "must call a tool").
+    let body = mk(Some("required"));
+    assert_eq!(body["tool_choice"]["type"], "any");
+
+    // `tool:NAME` → `{type:tool, name}`.
+    let body = mk(Some("tool:read_file"));
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "read_file");
+
+    // Unrecognised or absent: field omitted so Anthropic's default
+    // (auto) applies.
+    let body = mk(None);
+    assert!(body.get("tool_choice").is_none());
+    let body = mk(Some("nonsense"));
+    assert!(body.get("tool_choice").is_none());
+}
+
+/// MEDIUM #5: `max_tokens` must clamp against the registry-known
+/// per-model maximum so a user who copied an OpenAI value doesn't
+/// 400 on every Anthropic turn.
+#[test]
+fn request_body_clamps_max_tokens_against_registry_max() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(128_000),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    let max_tokens = body["max_tokens"].as_u64().expect("u64");
+    assert!(
+        max_tokens <= 64_000,
+        "registry max_output_tokens for the default Anthropic model is 64k; \
+         caller 128k must clamp to 64k or lower, got {max_tokens}",
+    );
+}
+
+/// MEDIUM #6: when the first `input_json_delta` arrives, the parser
+/// must drop any seed the `content_block_start` frame populated so a
+/// future server build that ships a complete initial input doesn't
+/// produce `{}{"a":1}` after the delta is appended.
+#[test]
+fn parser_drops_initial_tool_use_input_seed_when_delta_arrives() {
+    let mut state = AnthropicStreamState::default();
+    // Simulate a future server build that ships a non-empty initial
+    // `input` (today's Anthropic is benign — always sends `{}`). The
+    // first delta must reset the accumulator so the resulting JSON
+    // parses cleanly.
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"old"}}}"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"new"}}"#,
+        &mut state,
+    )
+    .expect("delta-1");
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"}"}}"#,
+        &mut state,
+    )
+    .expect("delta-2");
+    let event = parse_anthropic_event(r#"{"type":"content_block_stop","index":1}"#, &mut state)
+        .expect("stop");
+    assert_eq!(
+        event,
+        vec![LlmEvent::ToolCall(LlmToolCall {
+            call_id: "toolu_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": "new" }),
+        })],
+        "first delta must reset the accumulator so initial seed cannot corrupt the parse"
+    );
+}
+
+/// LOW Q4 negative: when no tools are advertised, `tool_choice` is
+/// not emitted regardless of the caller hint — Anthropic rejects
+/// `tool_choice` without `tools`.
+#[test]
+fn request_body_omits_tool_choice_when_no_tools_are_advertised() {
+    let request = LlmRequest {
+        model: "claude-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: Some("required".to_string()),
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert!(body.get("tool_choice").is_none());
+}
+
+/// H-01: the 4-slot allocator must consume in tools → system →
+/// messages order so a future caller marker only ever displaces the
+/// most-volatile slot. Today's auto-3 policy fits comfortably under
+/// the cap; once exhausted, additional consume calls drop+warn.
+#[test]
+fn breakpoint_budget_allocates_within_cap_and_drops_overflow() {
+    let mut budget = super::BreakpointBudget::new();
+    assert!(budget.consume("tools"));
+    assert!(budget.consume("system"));
+    assert!(budget.consume("messages"));
+    assert_eq!(budget.remaining, 1);
+    assert!(budget.consume("future-marker"));
+    assert_eq!(budget.remaining, 0);
+    assert!(!budget.consume("overflow-1"));
+    assert!(!budget.consume("overflow-2"));
+    assert_eq!(budget.dropped, 2);
+}
+
+/// H-01 regression guard: the auto-3 policy still emits markers on
+/// system / last user block / last stable tool — the 4-slot allocator
+/// must not regress the happy path.
+#[test]
+fn request_body_marks_all_three_auto_breakpoints_within_budget() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    let tools = body["tools"].as_array().expect("tools");
+    assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
+    let last_user = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .expect("user message");
+    let last_block = last_user["content"]
+        .as_array()
+        .expect("content")
+        .last()
+        .expect("last block");
+    assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+}
+
 #[test]
 fn request_body_encodes_image_as_base64_content_block() {
     // Synthetic 8-byte PNG-magic prefix; the bytes here don't have to be
@@ -1263,6 +1902,7 @@ fn request_body_encodes_image_as_base64_content_block() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);

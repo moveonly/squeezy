@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -207,6 +207,160 @@ async fn mock_transport_stops_retrying_once_stream_max_retries_is_exhausted() {
     assert!(matches!(err, SqueezyError::ProviderStream(_)));
 }
 
+/// X-18: a mid-stream error already classified as terminal by the
+/// Anthropic error normaliser (or any provider that opts into the
+/// `[non-retryable]` marker contract) must short-circuit the reconnect
+/// loop. The factory must run exactly once and the marked error must
+/// bubble up untouched so the upstream prose reaches the caller.
+#[tokio::test]
+async fn non_retryable_marker_short_circuits_stream_retry() {
+    use crate::anthropic_error::NON_RETRYABLE_MARKER;
+
+    let policy = RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+    let marked = format!(
+        "{NON_RETRYABLE_MARKER}Anthropic rejected request (invalid_request_error): bad input",
+    );
+    let marked_for_factory = marked.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        *factory_attempts.lock().expect("lock") += 1;
+        let payload = marked_for_factory.clone();
+        let inner = try_stream! {
+            yield LlmEvent::Started;
+            Err::<LlmEvent, SqueezyError>(SqueezyError::ProviderStream(payload))?;
+            unreachable!("error returned above");
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let collected = stream.collect::<Vec<_>>().await;
+    let final_attempts = *attempts.lock().expect("lock");
+    assert_eq!(
+        final_attempts, 1,
+        "non-retryable marker must skip the reconnect loop entirely",
+    );
+
+    let last = collected
+        .last()
+        .expect("at least one yielded result")
+        .as_ref();
+    let err = last.expect_err("final yield must be the terminal error");
+    match err {
+        SqueezyError::ProviderStream(message) => {
+            assert!(
+                message.starts_with(NON_RETRYABLE_MARKER),
+                "marked message must propagate verbatim to the caller (saw: {message:?})",
+            );
+            assert!(
+                message.contains("invalid_request_error"),
+                "upstream prose must survive the short-circuit",
+            );
+        }
+        other => panic!("expected ProviderStream, saw {other:?}"),
+    }
+}
+
+/// Sanity-check the marker contract on `ProviderRequest` errors too:
+/// providers like Anthropic format their pre-stream HTTP errors with
+/// the same prefix, so the stream-retry classifier must respect it for
+/// both variants.
+#[tokio::test]
+async fn non_retryable_marker_short_circuits_on_provider_request_variant() {
+    use crate::anthropic_error::NON_RETRYABLE_MARKER;
+
+    let policy = RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+    let marked = format!(
+        "{NON_RETRYABLE_MARKER}Anthropic rejected request (authentication_error): invalid key",
+    );
+    let marked_for_factory = marked.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        *factory_attempts.lock().expect("lock") += 1;
+        let payload = marked_for_factory.clone();
+        let inner = try_stream! {
+            if false {
+                yield LlmEvent::Started;
+            }
+            Err(SqueezyError::ProviderRequest(payload))?;
+            unreachable!("error returned above");
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let collected = stream.collect::<Vec<_>>().await;
+    let final_attempts = *attempts.lock().expect("lock");
+    assert_eq!(
+        final_attempts, 1,
+        "marked ProviderRequest must also skip the reconnect loop",
+    );
+
+    let err = collected
+        .last()
+        .expect("at least one yielded result")
+        .as_ref()
+        .expect_err("final yield must be the terminal error");
+    assert!(matches!(err, SqueezyError::ProviderRequest(_)));
+}
+
+/// Plain (unmarked) `ProviderStream` errors must still retry so the
+/// fix does not widen the non-retryable window beyond the marker
+/// contract. Pairs with the two short-circuit tests above.
+#[tokio::test]
+async fn unmarked_provider_stream_error_still_retries() {
+    let policy = RetryPolicy {
+        max_retries: 1,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        *factory_attempts.lock().expect("lock") += 1;
+        let inner = try_stream! {
+            if false {
+                yield LlmEvent::Started;
+            }
+            Err(SqueezyError::ProviderStream(
+                "connection reset".to_string(),
+            ))?;
+            unreachable!("error returned above");
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let _ = stream.collect::<Vec<_>>().await;
+    let final_attempts = *attempts.lock().expect("lock");
+    assert_eq!(
+        final_attempts, 2,
+        "unmarked transient errors must still trigger the reconnect path",
+    );
+}
+
 #[tokio::test]
 async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
     let policy = RetryPolicy {
@@ -251,6 +405,84 @@ async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
         text, "hello world",
         "skip-prefix must avoid double-emitting replayed tokens"
     );
+}
+
+/// F1: the retry layer forwards additive `#[non_exhaustive]` variants
+/// it does not track (here `Refusal`) verbatim through the `SkipCursor`
+/// wildcard arm. This documents the current contract — these variants
+/// pass through unchanged — for variants whose prefix a reconnect would
+/// not replay.
+#[tokio::test]
+async fn untracked_additive_variant_passes_through_unchanged() {
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        mock_full_stream(vec![
+            LlmEvent::Started,
+            LlmEvent::Refusal {
+                content: "I can't help with that.".to_string(),
+            },
+            LlmEvent::completed(Some("resp_1".to_string()), CostSnapshot::default()),
+        ])
+    });
+
+    let collected: Vec<LlmEvent> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .expect("clean stream");
+
+    let saw_refusal = collected
+        .iter()
+        .any(|event| matches!(event, LlmEvent::Refusal { content } if content == "I can't help with that."));
+    assert!(
+        saw_refusal,
+        "untracked additive variant must pass through unchanged"
+    );
+}
+
+/// F1: `ToolCallDelta` carries an incremental prefix that a mid-stream
+/// reconnect would replay, and `SkipCursor` has no per-`call_id`
+/// accounting for it yet. The wildcard arm therefore trips a
+/// `debug_assert` to gate any future adoption of `with_stream_retry` on
+/// a `ToolCallDelta`-emitting provider. Lock that gate in: routing a
+/// `ToolCallDelta` through the retry layer must panic in a debug/test
+/// build rather than silently risk a double-emit.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "ToolCallDelta")]
+async fn tool_call_delta_trips_skip_accounting_gate() {
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        mock_full_stream(vec![
+            LlmEvent::Started,
+            LlmEvent::ToolCallDelta {
+                call_id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments_chunk: "{\"q\":".to_string(),
+            },
+        ])
+    });
+
+    let _ = stream.collect::<Vec<_>>().await;
 }
 
 #[test]
@@ -408,6 +640,105 @@ fn retry_after_returns_none_when_no_headers_present() {
 }
 
 #[test]
+fn parse_retry_after_handles_float_seconds() {
+    // OpenAI's Responses endpoint occasionally returns sub-second
+    // throttles as `Retry-After: 0.5`. The parser must keep the
+    // fractional precision (rounded to milliseconds) instead of
+    // returning `None` and collapsing to the zero-jitter exponential
+    // backoff.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "0.5".parse().expect("header value"),
+    );
+    assert_eq!(
+        parse_retry_after(&headers),
+        Some(Duration::from_millis(500))
+    );
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "1.25".parse().expect("header value"),
+    );
+    assert_eq!(
+        parse_retry_after(&headers),
+        Some(Duration::from_millis(1_250)),
+    );
+}
+
+#[test]
+fn parse_retry_after_rejects_negative_and_nan_floats() {
+    // A negative or NaN float must fall through to `None` rather than
+    // wrap around to a giant Duration. The outer policy clamp would
+    // still defend us, but failing fast keeps the breadcrumb honest.
+    for input in ["-1", "-0.5", "NaN", "inf"] {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            input.parse().expect("header value"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers),
+            None,
+            "input {input:?} must not parse to a Duration",
+        );
+    }
+}
+
+#[test]
+fn parse_retry_after_handles_http_date() {
+    // RFC 7231 permits an HTTP-date in `Retry-After`. CDN gateways and
+    // some Vertex / Bedrock proxies forward the upstream's date string
+    // verbatim. Construct a target ~5s in the future, format it with
+    // `httpdate::fmt_http_date`, and assert the parser produces a
+    // Duration in the [0s, 6s] window around that target (HTTP-date is
+    // second-granularity so the elapsed-since-construction noise stays
+    // sub-second).
+    let target = SystemTime::now() + Duration::from_secs(5);
+    let formatted = httpdate::fmt_http_date(target);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        formatted.parse().expect("header value"),
+    );
+    let parsed = parse_retry_after(&headers).expect("http-date must parse");
+    assert!(
+        parsed <= Duration::from_secs(6),
+        "expected ~5s remaining, saw {parsed:?}",
+    );
+}
+
+#[test]
+fn parse_retry_after_clamps_past_http_date_to_zero() {
+    // A date already in the past (clock skew, slow request, etc.)
+    // must clamp to zero rather than panic on the negative
+    // `duration_since`. The retry then runs immediately, which is the
+    // intended semantics for "wait until <past>".
+    let target = SystemTime::now() - Duration::from_secs(120);
+    let formatted = httpdate::fmt_http_date(target);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        formatted.parse().expect("header value"),
+    );
+    assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+}
+
+#[test]
+fn parse_retry_after_returns_none_on_unparseable_garbage() {
+    // Junk values must fall through to `None` so `send_with_retry`
+    // picks the exponential backoff schedule instead of treating the
+    // header as a literal zero.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "soon-ish".parse().expect("header value"),
+    );
+    assert_eq!(parse_retry_after(&headers), None);
+}
+
+#[test]
 fn malicious_retry_after_header_is_clamped_to_policy_cap() {
     // A hostile upstream asking for ~11.5 days of cooldown must not
     // be able to park the agent: the default cap (60s) bounds the
@@ -504,22 +835,34 @@ async fn send_with_retry_uses_exponential_backoff_when_no_retry_after_headers() 
 /// Test ApiKeySource that hands out a deterministic sequence of keys
 /// and counts how many times the retry layer touched it. Drives the
 /// `send_with_auth_retry` assertions below without spinning up the
-/// full OAuth flow.
+/// full OAuth flow. `can_rotate` is parameterised so the same harness
+/// covers both the OAuth-style refresh path (`true`) and the static-key
+/// short-circuit (`false`).
 #[derive(Debug)]
 struct TestKeySource {
     label: String,
     keys: AsyncMutex<Vec<String>>,
     current_key_calls: AtomicUsize,
     invalidate_calls: AtomicUsize,
+    can_rotate: bool,
 }
 
 impl TestKeySource {
-    fn new(label: &str, keys: Vec<String>) -> Arc<Self> {
+    fn rotatable(label: &str, keys: Vec<String>) -> Arc<Self> {
+        Self::with_rotation(label, keys, true)
+    }
+
+    fn static_key(label: &str, keys: Vec<String>) -> Arc<Self> {
+        Self::with_rotation(label, keys, false)
+    }
+
+    fn with_rotation(label: &str, keys: Vec<String>, can_rotate: bool) -> Arc<Self> {
         Arc::new(Self {
             label: label.to_string(),
             keys: AsyncMutex::new(keys.into_iter().rev().collect()),
             current_key_calls: AtomicUsize::new(0),
             invalidate_calls: AtomicUsize::new(0),
+            can_rotate,
         })
     }
 
@@ -550,6 +893,10 @@ impl ApiKeySource for TestKeySource {
 
     fn provider_label(&self) -> &str {
         &self.label
+    }
+
+    fn can_rotate(&self) -> bool {
+        self.can_rotate
     }
 }
 
@@ -617,7 +964,7 @@ fn auth_retry_policy() -> RetryPolicy {
 #[tokio::test]
 async fn send_with_auth_retry_passes_through_on_2xx() {
     let (addr, attempts) = spawn_status_server(vec![200]).await;
-    let source = TestKeySource::new("test", vec!["good-key".to_string()]);
+    let source = TestKeySource::rotatable("test", vec!["good-key".to_string()]);
     let source_dyn: Arc<dyn ApiKeySource> = source.clone();
     let client = reqwest::Client::new();
     let cancel = CancellationToken::new();
@@ -646,7 +993,7 @@ async fn send_with_auth_retry_passes_through_on_2xx() {
 #[tokio::test]
 async fn send_with_auth_retry_refreshes_once_on_401() {
     let (addr, attempts) = spawn_status_server(vec![401, 200]).await;
-    let source = TestKeySource::new(
+    let source = TestKeySource::rotatable(
         "test",
         vec!["stale-key".to_string(), "fresh-key".to_string()],
     );
@@ -678,7 +1025,7 @@ async fn send_with_auth_retry_refreshes_once_on_401() {
 #[tokio::test]
 async fn send_with_auth_retry_refreshes_once_on_403() {
     let (addr, attempts) = spawn_status_server(vec![403, 200]).await;
-    let source = TestKeySource::new(
+    let source = TestKeySource::rotatable(
         "test",
         vec!["stale-key".to_string(), "fresh-key".to_string()],
     );
@@ -705,7 +1052,7 @@ async fn send_with_auth_retry_bubbles_up_persistent_401() {
     // unchanged so the provider's existing error formatter reports
     // an honest auth failure instead of looping forever.
     let (addr, attempts) = spawn_status_server(vec![401, 401]).await;
-    let source = TestKeySource::new(
+    let source = TestKeySource::rotatable(
         "test",
         vec!["stale-key".to_string(), "still-stale".to_string()],
     );
@@ -735,6 +1082,71 @@ async fn send_with_auth_retry_bubbles_up_persistent_401() {
         1,
         "invalidate fires exactly once even when the refresh did not help"
     );
+}
+
+/// H-05: a `StaticApiKey`-backed source (or any source where
+/// `can_rotate()` reports `false`) has no fresh credential to fall back
+/// to. The auth-retry layer must surface the original 401 response
+/// untouched so the provider's existing error formatter renders an
+/// honest "credential rejected" message instead of looping us into a
+/// second guaranteed rejection.
+#[tokio::test]
+async fn auth_retry_skipped_for_static_key() {
+    let (addr, attempts) = spawn_status_server(vec![401, 200]).await;
+    let source = TestKeySource::static_key("test", vec!["only-key".to_string()]);
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(
+        response.status().as_u16(),
+        401,
+        "static-key source must surface the original 401 without retrying",
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no second HTTP attempt: there's no fresh credential to rotate to",
+    );
+    assert_eq!(
+        source.current_key_calls(),
+        1,
+        "current_key must run exactly once for the first attempt",
+    );
+    assert_eq!(
+        source.invalidate_calls(),
+        0,
+        "invalidate is meaningless on a static key — skip it entirely",
+    );
+}
+
+/// Same short-circuit on 403: the trait contract says `can_rotate()`
+/// governs both auth-failure status codes, not just 401.
+#[tokio::test]
+async fn auth_retry_skipped_on_403_for_static_key() {
+    let (addr, attempts) = spawn_status_server(vec![403, 200]).await;
+    let source = TestKeySource::static_key("test", vec!["only-key".to_string()]);
+    let source_dyn: Arc<dyn ApiKeySource> = source.clone();
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let response = send_with_auth_retry(&source_dyn, auth_retry_policy(), &cancel, |key| {
+        client.post(&url).bearer_auth(key)
+    })
+    .await
+    .expect("send");
+
+    assert_eq!(response.status().as_u16(), 403);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(source.invalidate_calls(), 0);
 }
 
 // --- terminal quota classifier -------------------------------------------

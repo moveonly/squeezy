@@ -56,6 +56,7 @@ async fn google_gemini_streaming_costly() -> Result<()> {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let stream = provider.stream_response(request, CancellationToken::new());
     let output = common::collect_text(stream, "Google Gemini").await?;

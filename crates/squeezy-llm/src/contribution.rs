@@ -296,6 +296,9 @@ impl ProviderContribution for OpenAiContribution {
             api_key_env: config.api_key_env,
             api_key: config.api_key,
             base_url: config.base_url,
+            organization: None,
+            project: None,
+            service_tier: None,
             transport: config.transport,
         };
         Ok(Box::new(OpenAiProvider::from_config(&core)?))

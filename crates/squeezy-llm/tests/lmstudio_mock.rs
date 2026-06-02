@@ -1,15 +1,20 @@
-//! End-to-end test for `LMStudioProvider` against a loopback TCP server
+//! End-to-end test for the LM Studio preset against a loopback TCP server
 //! that emulates LM Studio's OpenAI-compatible `/v1/chat/completions`
-//! streaming endpoint.
+//! streaming endpoint. Uses [`OpenAiCompatibleProvider`] under the
+//! `LMStudio` preset — the standalone `LMStudioProvider` was deleted and
+//! the LM Studio wire shape is now served by the shared chat-completions
+//! client.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use squeezy_core::ProviderTransportConfig;
+use squeezy_core::{OpenAiCompatiblePreset, ProviderTransportConfig};
 use squeezy_llm::{
-    CacheSpec, LMStudioConfig, LMStudioProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
+    CacheSpec, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiCompatibleProvider,
+    static_api_key_source,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -79,22 +84,29 @@ fn build_request(model: &str) -> LlmRequest {
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
+        ..LlmRequest::default()
     }
 }
 
 #[tokio::test]
 async fn lmstudio_streaming_completion_against_mock_server() {
     let addr = spawn_chat_server(SSE_BODY).await;
-    let provider = LMStudioProvider::from_config(&LMStudioConfig {
-        base_url: format!("http://{addr}/v1"),
-        api_key: None,
-        transport: ProviderTransportConfig {
+    // LM Studio's local server does not authenticate by default; the
+    // shared chat-completions client supports this by constructing
+    // against `with_api_key_source` with an empty static key (matching
+    // how the ollama-compat delegate wires the same preset).
+    let provider = OpenAiCompatibleProvider::with_api_key_source(
+        OpenAiCompatiblePreset::LMStudio,
+        static_api_key_source(String::new(), OpenAiCompatiblePreset::LMStudio.as_str()),
+        format!("http://{addr}/v1"),
+        BTreeMap::new(),
+        ProviderTransportConfig {
             request_max_retries: 0,
             stream_max_retries: 0,
             stream_idle_timeout_ms: 5_000,
             ..ProviderTransportConfig::default()
         },
-    });
+    );
 
     let stream = provider.stream_response(
         build_request("openai/gpt-oss-20b"),

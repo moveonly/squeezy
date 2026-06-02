@@ -170,11 +170,13 @@ fn is_lock_contention(err: &std::io::Error) -> bool {
 
 pub async fn fetch_remote(base_url: &str, api_key: Option<&str>) -> Result<Vec<DiscoveredModel>> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(DEFAULT_FETCH_TIMEOUT)
-        .build()
-        .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
-    let mut request = client.get(&url);
+    // Route through the shared hardened client so this discovery request —
+    // which ships the provider Bearer key to a user/env-controlled base_url —
+    // inherits the MetadataBlockingResolver (SSRF/DNS-rebind guard), connect
+    // timeout, and User-Agent like every other secret-bearing path. The
+    // per-request timeout preserves the discovery deadline.
+    let client = crate::transport::shared_client(&squeezy_core::ProviderTransportConfig::default());
+    let mut request = client.get(&url).timeout(DEFAULT_FETCH_TIMEOUT);
     if let Some(key) = api_key
         && !key.is_empty()
     {
@@ -319,6 +321,9 @@ pub const CONSERVATIVE_FALLBACK_CAPABILITIES: ModelCapabilities = ModelCapabilit
     reasoning_effort: false,
     text_verbosity: false,
     prompt_caching: false,
+    default_reasoning_effort: None,
+    thinking_budget_min: None,
+    thinking_budget_max: None,
 };
 
 /// Where the resolved `ModelCapabilities` came from.

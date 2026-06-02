@@ -50,7 +50,6 @@ mod contribution;
 mod credentials;
 mod faux;
 mod google;
-mod lmstudio;
 pub mod model_discovery;
 pub mod models_dev;
 pub mod oauth;
@@ -80,13 +79,11 @@ pub use contribution::{
 };
 pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
-    delete_api_key, resolve_api_key, resolve_api_key_with_inline, static_api_key_source,
+    delete_api_key, resolve_api_key, resolve_api_key_with_inline,
+    resolve_api_key_with_inline_optional, static_api_key_source,
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
-pub use lmstudio::{
-    DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
-};
 pub use model_discovery::{
     CONSERVATIVE_FALLBACK_CAPABILITIES, CapabilitySource, ResolvedCapabilities,
     resolve_capabilities, resolve_capabilities_with,
@@ -126,7 +123,7 @@ pub use xai::XaiProvider;
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub model: Arc<str>,
     pub instructions: Arc<str>,
@@ -173,6 +170,100 @@ pub struct LlmRequest {
     /// providers ignore the field.
     #[serde(default = "empty_beta_headers")]
     pub beta_headers: Arc<[Arc<str>]>,
+    /// Sampling temperature. `None` leaves the provider's default in
+    /// place (matches squeezy's historical behavior). Per-provider
+    /// lowering to the wire body lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Nucleus-sampling cutoff. `None` leaves the provider's default
+    /// in place. Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Deterministic seed forwarded where the provider supports it
+    /// (OpenAI Chat-Completions / Responses, Bedrock Converse `seed`,
+    /// Ollama `options.seed`). `None` keeps generation
+    /// non-deterministic. Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Stop-sequence list (Anthropic `stop_sequences`, OpenAI `stop`,
+    /// Google `stopSequences`, Bedrock `stopSequences`). Empty leaves
+    /// the provider default. Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    /// OpenAI-style `frequency_penalty`. `None` keeps the default.
+    /// Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// OpenAI-style `presence_penalty`. `None` keeps the default.
+    /// Per-provider lowering lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Provider-hosted tool registry. xAI Live Search (H-23),
+    /// OpenAI's hosted web/file search, and Anthropic's computer-use
+    /// tool live here so we can advertise them alongside the
+    /// agent-defined [`LlmToolSpec`] list. Per-provider lowering
+    /// lands in Phase 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_tools: Vec<Arc<LlmHostedTool>>,
+}
+
+/// Provider-hosted tool specification. Unlike [`LlmToolSpec`] (a
+/// caller-defined function the agent will execute locally), these
+/// describe tools the model invokes server-side: xAI Live Search,
+/// OpenAI hosted web/file search, Anthropic computer-use, etc.
+///
+/// `#[non_exhaustive]` so future hosted tools (image-gen, code
+/// interpreter, …) can land without breaking downstream `match`
+/// statements.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmHostedTool {
+    /// xAI Live Search / OpenAI `web_search_preview` style hosted
+    /// search. `filters` carries provider-specific tuning
+    /// (`allowed_domains`, `recency`, etc.) as opaque JSON.
+    WebSearch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filters: Option<Value>,
+    },
+    /// OpenAI Responses `file_search` over a managed vector store.
+    /// `vector_store_ids` lists the stores the model may search.
+    FileSearch {
+        #[serde(default)]
+        vector_store_ids: Vec<String>,
+    },
+    /// Anthropic computer-use / OpenAI `computer_use_preview`. No
+    /// parameters; presence advertises the capability.
+    ComputerUse,
+}
+
+impl Default for LlmRequest {
+    fn default() -> Self {
+        Self {
+            model: Arc::from(""),
+            instructions: Arc::from(""),
+            input: Arc::from(Vec::new()),
+            max_output_tokens: None,
+            response_verbosity: None,
+            reasoning_effort: None,
+            previous_response_id: None,
+            cache_key: None,
+            cache: CacheSpec::default(),
+            tools: Arc::from(Vec::new()),
+            store: false,
+            tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: None,
+            beta_headers: empty_beta_headers(),
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: Vec::new(),
+            frequency_penalty: None,
+            presence_penalty: None,
+            hosted_tools: Vec::new(),
+        }
+    }
 }
 
 fn empty_beta_headers() -> Arc<[Arc<str>]> {
@@ -191,17 +282,7 @@ impl LlmRequest {
             instructions: Arc::from(instructions),
             input: Arc::from(vec![LlmInputItem::UserText(input)]),
             max_output_tokens,
-            response_verbosity: None,
-            reasoning_effort: None,
-            previous_response_id: None,
-            cache_key: None,
-            cache: CacheSpec::default(),
-            tools: Arc::from(Vec::new()),
-            store: false,
-            tool_choice: None,
-            output_schema: None,
-            parallel_tool_calls: None,
-            beta_headers: empty_beta_headers(),
+            ..Self::default()
         }
     }
 
@@ -261,6 +342,7 @@ pub struct LlmOutputSchema {
     pub strict: bool,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmInputItem {
@@ -271,9 +353,34 @@ pub enum LlmInputItem {
         name: String,
         arguments: Value,
     },
+    /// Tool result returned to the model after a `FunctionCall`.
+    ///
+    /// `output` carries the canonical string form callers have always
+    /// used (JSON-stringified output, terminal text, etc.) so existing
+    /// providers and persistence stay byte-compatible. Two optional
+    /// extensions land structured tool results without breaking the
+    /// string contract:
+    ///
+    /// - `content_parts`: when `Some`, providers that support
+    ///   structured tool results (Anthropic `tool_result.content`
+    ///   arrays, Bedrock Converse `toolResult.content`, OpenAI
+    ///   Responses image blocks) ship the part list directly instead
+    ///   of round-tripping a base64-stringified image through
+    ///   `output`. Each `ToolResultPart::Image` carries the raw bytes
+    ///   as an `Arc<[u8]>` so a 110k-token base64 PNG never lands in
+    ///   the wire body. Providers that don't support arrays fall back
+    ///   to `output`.
+    /// - `is_error`: Gemini's `functionResponse.response` switches its
+    ///   shape between `{output}` and `{error}` based on whether the
+    ///   tool failed; the flag carries that signal without forcing the
+    ///   agent to embed a sentinel in `output`.
     FunctionCallOutput {
         call_id: String,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_parts: Option<Vec<ToolResultPart>>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
     },
     Reasoning(ReasoningPayload),
     /// Inline image attached to a user turn. `media_type` is an
@@ -288,6 +395,47 @@ pub enum LlmInputItem {
         #[serde(deserialize_with = "deserialize_image_bytes_b64")]
         bytes: Arc<[u8]>,
     },
+    /// Document attachment — PDF, DOCX, CSV, XLSX, etc. Bedrock
+    /// Converse accepts document content blocks up to ~4.5 MB with a
+    /// caller-supplied `name` and a MIME-typed payload. Anthropic
+    /// Claude PDFs ride a similar `document` content block. Other
+    /// providers route this item to a debug log + skip until a Phase 4
+    /// lowering lands. `media_type` follows the same MIME convention
+    /// as `Image`; `name` is the human-facing filename (Bedrock
+    /// requires it, other providers persist it in transcript metadata).
+    /// `bytes` round-trips as base64 like `Image::bytes`.
+    Document {
+        media_type: String,
+        name: String,
+        #[serde(serialize_with = "serialize_image_bytes_b64")]
+        #[serde(deserialize_with = "deserialize_image_bytes_b64")]
+        bytes: Arc<[u8]>,
+    },
+}
+
+/// Structured content block carried inside
+/// [`LlmInputItem::FunctionCallOutput::content_parts`].
+///
+/// Providers that accept array-shaped tool results (Anthropic, Bedrock
+/// Converse, OpenAI Responses for image returns) lower this list
+/// directly; providers that only accept a string `output` skip the
+/// array and fall back to the `output` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultPart {
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        #[serde(serialize_with = "serialize_image_bytes_b64")]
+        #[serde(deserialize_with = "deserialize_image_bytes_b64")]
+        bytes: Arc<[u8]>,
+    },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl LlmInputItem {
@@ -300,10 +448,46 @@ impl LlmInputItem {
         }
     }
 
+    /// Construct a `FunctionCallOutput` from a call id and string
+    /// output, leaving `content_parts` empty and `is_error` false.
+    /// Most callers want this shape — agents that stringify tool
+    /// output into the legacy `output` slot, replay paths, and tests
+    /// that only care about the call-id/output pair.
+    pub fn function_output(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        Self::FunctionCallOutput {
+            call_id: call_id.into(),
+            output: output.into(),
+            content_parts: None,
+            is_error: false,
+        }
+    }
+
+    /// Construct a `Document` item from a MIME-typed payload and a
+    /// human-facing filename. Mirrors [`Self::image`]'s shape;
+    /// Bedrock's Converse API uses `name` directly while other
+    /// providers stash it in transcript metadata.
+    pub fn document(
+        media_type: impl Into<String>,
+        name: impl Into<String>,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self::Document {
+            media_type: media_type.into(),
+            name: name.into(),
+            bytes: bytes.into(),
+        }
+    }
+
     /// `true` for the `Image` variant. Used by the per-provider request
     /// builders and the vision-capability check below.
     pub fn is_image(&self) -> bool {
         matches!(self, Self::Image { .. })
+    }
+
+    /// `true` for the `Document` variant. Used by per-provider request
+    /// builders to gate Bedrock's document content block path.
+    pub fn is_document(&self) -> bool {
+        matches!(self, Self::Document { .. })
     }
 }
 
@@ -430,7 +614,12 @@ pub(crate) fn normalize_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmIn
                     arguments: arguments.clone(),
                 });
             }
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
+            LlmInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                content_parts,
+                is_error,
+            } => {
                 let already_seen = id_map.contains_key(call_id);
                 let canonical = canonicalize_call_id(call_id, &mut id_map, &mut next_index);
                 if !already_seen {
@@ -450,6 +639,8 @@ pub(crate) fn normalize_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmIn
                 out.push(LlmInputItem::FunctionCallOutput {
                     call_id: canonical,
                     output: output.clone(),
+                    content_parts: content_parts.clone(),
+                    is_error: *is_error,
                 });
             }
             other => out.push(other.clone()),
@@ -481,6 +672,28 @@ pub struct LlmToolSpec {
     pub strict: bool,
 }
 
+/// Citation reference carried inside [`LlmEvent::Citation`]. Mirrors
+/// the shape OpenAI Responses annotations and xAI Live Search emit:
+/// a URL plus optional title and inclusive byte offsets into the
+/// running text buffer. Every field is optional because providers
+/// disagree on which dimensions they surface.
+///
+/// Reserved / forward-declared: no provider currently produces this
+/// type and no consumer reads it. It is published now so the
+/// citation-streaming shape is part of the stable public API surface
+/// ahead of the provider lowering that will emit it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CitationSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_index: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmToolCall {
     pub call_id: String,
@@ -500,6 +713,7 @@ pub struct LlmToolCall {
 /// provider error; `StopSequence` and `Refusal` carry the remaining
 /// semantically distinct cases; `Other` keeps provider-specific strings
 /// reachable without forcing the registry to enumerate every value.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum StopReason {
@@ -509,6 +723,21 @@ pub enum StopReason {
     ContextWindowExceeded,
     StopSequence,
     Refusal,
+    /// Anthropic Messages API `pause_turn`: the model voluntarily
+    /// paused mid-turn (typically when a hosted tool is still
+    /// processing) and expects the caller to re-issue the request
+    /// with the partial state. Kept distinct from `EndTurn` so the
+    /// signal is surfaced and categorized honestly rather than
+    /// masquerading as a clean end of turn. True re-issue-with-partial-
+    /// state recovery is not yet wired; for now the agent falls through
+    /// to end-of-turn handling (the dedicated recovery branch is being
+    /// added separately).
+    PauseTurn,
+    /// Google Gemini `MALFORMED_FUNCTION_CALL`: the model emitted a
+    /// tool call whose arguments JSON the upstream parser rejected.
+    /// Distinct from `Refusal` (safety) and `Other` so the agent can
+    /// retry with stricter `tool_choice` shaping.
+    MalformedFunctionCall,
     Other(String),
 }
 
@@ -522,6 +751,7 @@ impl StopReason {
             "model_context_window_exceeded" => Self::ContextWindowExceeded,
             "stop_sequence" => Self::StopSequence,
             "refusal" => Self::Refusal,
+            "pause_turn" => Self::PauseTurn,
             other => Self::Other(other.to_string()),
         }
     }
@@ -542,6 +772,7 @@ impl StopReason {
             "MAX_TOKENS" => Self::MaxTokens,
             "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY"
             | "LANGUAGE" | "RECITATION" => Self::Refusal,
+            "MALFORMED_FUNCTION_CALL" => Self::MalformedFunctionCall,
             other => Self::Other(other.to_string()),
         }
     }
@@ -569,6 +800,7 @@ impl StopReason {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmEvent {
@@ -580,6 +812,45 @@ pub enum LlmEvent {
     },
     ReasoningDone(ReasoningPayload),
     ToolCall(LlmToolCall),
+    /// Incremental tool-arguments delta. Some providers stream tool
+    /// arguments token-by-token before the full call materializes:
+    /// OpenAI Responses' `response.function_call_arguments.delta`
+    /// (H-07) and Anthropic-style incremental tool-args. Emitted
+    /// additively while the call buffers; downstream consumers may
+    /// display a progressive "calling tool …" hint or ignore it. The
+    /// canonical `ToolCall` event still fires once the full call is
+    /// known, so consumers that only care about the materialized call
+    /// can wildcard-skip this variant.
+    ToolCallDelta {
+        call_id: String,
+        name: String,
+        arguments_chunk: String,
+    },
+    /// OpenAI safety-refusal text delta. The Responses API emits a
+    /// dedicated `response.refusal.delta` stream when the model
+    /// declines to answer; surfacing the running text lets the TUI
+    /// show the refusal verbatim. The terminal `Completed` event
+    /// still carries `stop_reason: Refusal` for the canonical signal.
+    /// Consumers that only care about the canonical event stream can
+    /// wildcard-skip this variant.
+    Refusal {
+        content: String,
+    },
+    /// Source citation attached to a span of streamed text. OpenAI
+    /// Responses emits `annotations` blocks pointing at retrieval
+    /// matches; xAI Live Search (H-23) similarly streams citations
+    /// alongside text. `text_index` is the byte offset into the
+    /// running text buffer the citation refers to; the agent /
+    /// transcript records the source for later display.
+    ///
+    /// Reserved / forward-declared: no provider stream currently emits
+    /// this variant and no consumer matches it. It is part of the
+    /// public event enum now so the citation-streaming contract is
+    /// stable ahead of the provider lowering that will produce it.
+    Citation {
+        text_index: u32,
+        source: CitationSource,
+    },
     /// Triple-path overflow detector classified this turn's terminal
     /// shape as a context-window overflow. See
     /// [`crate::overflow::classify_terminal`] for the three shapes the

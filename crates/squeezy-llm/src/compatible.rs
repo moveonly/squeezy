@@ -22,12 +22,18 @@ use squeezy_core::{
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
+    anthropic_error::NON_RETRYABLE_MARKER,
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
-    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    credentials::{
+        ApiKeySource, resolve_api_key_with_inline, resolve_api_key_with_inline_optional,
+        static_api_key_source,
+    },
     openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
@@ -79,14 +85,143 @@ impl OpenAiCompatibleProvider {
             config.account_id.as_deref(),
             config.gateway_id.as_deref(),
         )?;
-        let api_key =
-            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        // X-17: local-hosted presets (LM Studio, vLLM, llama.cpp) ship
+        // without authentication by default and the squeezy-invented
+        // env-var names (`LMSTUDIO_API_KEY`, etc.) are not vendor
+        // conventions — nobody sets them. Walk the credential chain via
+        // the optional variant so an empty resolution flows as `""`
+        // instead of `ProviderNotConfigured`. The `Authorization: Bearer`
+        // header is short-circuited downstream when the resolved value
+        // is empty so reqwest does not panic on `bearer_auth("")`. Every
+        // other preset stays on the strict variant — Groq/OpenRouter/etc.
+        // without a key is a real misconfiguration and the error tells
+        // the user which env var to set.
+        let api_key = if is_local_preset(config.preset) {
+            resolve_api_key_with_inline_optional(config.api_key.as_deref(), &config.api_key_env)?
+                .value
+        } else {
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value
+        };
         let mut headers = preset_default_headers(config.preset);
         // User-supplied headers override preset defaults so deployments can
         // attach their own HTTP-Referer / X-Title / x-portkey-* values.
         for (key, value) in &config.extra_headers {
             headers.insert(key.clone(), value.clone());
         }
+        // C-11: Cloudflare AI Gateway dual-auth inversion. The /compat
+        // (and the new REST) endpoint expects the *upstream provider's*
+        // key in `Authorization: Bearer` (so OpenAI/Anthropic/etc. see a
+        // valid key from their own envelope) and the Cloudflare gateway
+        // token in `cf-aig-authorization`. squeezy-core resolves
+        // `CLOUDFLARE_API_KEY` into `config.api_key{_env}` and lets
+        // `CF_AIG_TOKEN` populate `cf-aig-authorization` via
+        // `extra_headers`. Without the swap below the upstream sees the
+        // Cloudflare key (401) and the gateway sees either no key or the
+        // Cloudflare key in both slots. opencode's `cloudflare.ts:42-51`
+        // models the correct split; we mirror it here.
+        //
+        // Source-of-truth for the upstream key (in priority order):
+        //   1. `CF_UPSTREAM_KEY` env var (operator opt-in)
+        //   2. `extra_headers["upstream-api-key"]` (TOML escape hatch
+        //      for callers that prefer not to set the env)
+        //   3. fallthrough: leave the Bearer slot pointing at the
+        //      Cloudflare key for backwards compatibility with
+        //      Workers AI-only gateways that were intentionally wired
+        //      up under the old (broken) scheme.
+        // H-59: PortKey's canonical auth path uses the
+        // `x-portkey-api-key` header rather than
+        // `Authorization: Bearer`. The Bearer slot is then free to
+        // carry the upstream provider's credential (BYO-key mode).
+        // The opt-in is a magic `use_x_portkey_api_key = "true"`
+        // entry in the user's `[providers.portkey.headers]` table.
+        // Lift the resolved api_key into `x-portkey-api-key` and
+        // strip both the magic flag and the original Bearer path
+        // (the bearer_auth call in `stream_response` will suppress
+        // itself when it sees `x-portkey-api-key` set; see the
+        // P12 sibling for the symmetric `Authorization` handling).
+        let portkey_canonical_auth = config.preset == OpenAiCompatiblePreset::PortKey
+            && headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("use_x_portkey_api_key") && v == "true");
+        if portkey_canonical_auth {
+            // Strip the magic flag — it is not a wire header.
+            headers.retain(|key, _| !key.eq_ignore_ascii_case("use_x_portkey_api_key"));
+            // Lift the resolved Cloudflare-flavored key into the
+            // `x-portkey-api-key` slot, leaving the Bearer slot
+            // for whatever the user supplies on the upstream
+            // request. User-supplied `x-portkey-api-key`
+            // overrides win.
+            let has_canonical = headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("x-portkey-api-key"));
+            if !has_canonical && !api_key.is_empty() {
+                headers.insert("x-portkey-api-key".to_string(), api_key.clone());
+            }
+        }
+        // H-40: when the CF AI Gateway preset migrates to the new
+        // REST URL shape, gateway selection moves from the URL
+        // path to a `cf-aig-gateway-id` header. Emit it here when
+        // the config carries a gateway id so the gateway is
+        // selected correctly regardless of which URL template the
+        // user has in place; user-supplied headers still win.
+        //
+        // F2: skip the header on the default `/compat` URL shape,
+        // which already encodes the gateway id in its path
+        // (`.../v1/{account_id}/{gateway_id}/compat`). Sending it
+        // there is redundant; restricting the header to the REST
+        // shape keeps the wire request minimal and avoids implying
+        // the path-encoded gateway can be overridden by a header.
+        if config.preset == OpenAiCompatiblePreset::CloudflareAiGateway
+            && let Some(gateway_id) = config
+                .gateway_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            && !resolved_base_url.contains(&format!("/{gateway_id}/"))
+            && !resolved_base_url.ends_with(&format!("/{gateway_id}"))
+            && !headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("cf-aig-gateway-id"))
+        {
+            headers.insert("cf-aig-gateway-id".to_string(), gateway_id.to_string());
+        }
+        let api_key = if config.preset == OpenAiCompatiblePreset::CloudflareAiGateway {
+            let upstream_key = std::env::var("CF_UPSTREAM_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    headers.iter().find_map(|(key, value)| {
+                        key.eq_ignore_ascii_case("upstream-api-key")
+                            .then(|| value.clone())
+                    })
+                });
+            // Strip the `upstream-api-key` TOML escape hatch once we've
+            // lifted it into the Bearer slot — it is not a real wire
+            // header and would otherwise be sent verbatim.
+            headers.retain(|key, _| !key.eq_ignore_ascii_case("upstream-api-key"));
+            // Lift the Cloudflare gateway token into
+            // `cf-aig-authorization` when the user has not already set
+            // it via TOML / `CF_AIG_TOKEN` (squeezy-core handles the env
+            // → header lift). User-supplied headers win to preserve
+            // manual overrides; the empty-key case is left to the
+            // upstream to reject.
+            let has_aig_header = headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("cf-aig-authorization"));
+            if !has_aig_header && !api_key.is_empty() {
+                headers.insert(
+                    "cf-aig-authorization".to_string(),
+                    format!("Bearer {api_key}"),
+                );
+            }
+            match upstream_key {
+                Some(key) => key,
+                None => api_key,
+            }
+        } else {
+            api_key
+        };
         Ok(Self::with_api_key_source(
             config.preset,
             static_api_key_source(api_key, config.preset.as_str()),
@@ -99,6 +234,21 @@ impl OpenAiCompatibleProvider {
     #[cfg(test)]
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Test-only mirror of the bearer/header attachment block inside
+    /// [`Self::stream_response`]. Given a resolved key string (which may
+    /// be empty for unauthenticated local presets — see X-17 / H-46),
+    /// stamp the same headers a live request would carry, then return a
+    /// built `reqwest::Request` callers can inspect without standing up
+    /// a mock server. The conditional `bearer_auth` gate is what H-46
+    /// pins: when `key` is empty the `Authorization` header must be
+    /// absent so `bearer_auth("")` never panics inside reqwest and an
+    /// LM Studio / vLLM / llama.cpp deployment with no token is not
+    /// served a malformed `Authorization: Bearer ` blank.
+    #[cfg(test)]
+    pub(crate) fn api_key_source(&self) -> Arc<dyn ApiKeySource> {
+        self.api_key.clone()
     }
 
     /// Construct the provider against an already-built credential
@@ -130,7 +280,23 @@ impl OpenAiCompatibleProvider {
         &self.extra_headers
     }
 
+    #[cfg(test)]
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        Self::request_body_for_preset(request, OpenAiCompatiblePreset::Custom)
+    }
+
+    /// Variant of [`request_body`] that takes a [`OpenAiCompatiblePreset`]
+    /// so per-preset wire-shape branches (reasoning emission, body
+    /// gates) can fork without spreading another substring test
+    /// across the codebase. Production code (`stream_response`)
+    /// always calls this overload with the constructed provider's
+    /// preset; the legacy `request_body` is retained for tests that
+    /// don't care about preset-specific quirks and for the
+    /// non-Cloudflare path that historically did not branch.
+    pub(crate) fn request_body_for_preset(
+        request: &LlmRequest,
+        preset: OpenAiCompatiblePreset,
+    ) -> Value {
         // Anthropic-via-aggregator routes accept the same ephemeral
         // cache_control markers as the native Anthropic API. We attach them
         // when the caller has supplied a cache_key and the destination model
@@ -207,19 +373,36 @@ impl OpenAiCompatibleProvider {
             "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true },
+            // H-24: pin `n: 1` so an upstream default of `n: 2` (rare
+            // but legal under Chat Completions) cannot silently double-
+            // bill. The streamed parser only honours `choices[0]`; any
+            // additional choices would be dropped, including their
+            // tool calls. Emitting the field explicitly guarantees the
+            // server-side count matches what we read.
+            "n": 1,
         });
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        // X-05: forward `output_schema` as the chat-completions
+        // `response_format: { type: "json_schema", json_schema: { ... } }`
+        // shape so providers that honour structured outputs
+        // (OpenAI through any aggregator, Together, Mistral, Groq)
+        // see the JSON schema. The OpenAI Responses provider has
+        // already emitted this via `text.format` on its native
+        // path; the chat-completions path was a silent gap.
+        if let Some(schema) = request.output_schema.as_ref() {
+            body["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.name,
+                    "schema": schema.schema,
+                    "strict": schema.strict,
+                }
+            });
+        }
         if let Some(effort) = request.reasoning_effort {
-            // OpenRouter, xAI, and most OpenAI-compatible endpoints accept the
-            // top-level legacy form. OpenRouter's docs now recommend the
-            // nested `reasoning: { effort: ... }` form; send both so we
-            // cover both shapes without per-preset branching. Aggregators
-            // ignore unknown fields; non-reasoning models ignore the hint.
-            let effort_str = effort.as_str();
-            body["reasoning_effort"] = json!(effort_str);
-            body["reasoning"] = json!({ "effort": effort_str });
+            emit_reasoning_hints(&mut body, preset, &request.model, effort);
         }
         if let Some(key) = cache_spec.key.as_deref() {
             // OpenAI's Chat Completions / Responses APIs honor a top-level
@@ -229,18 +412,33 @@ impl OpenAiCompatibleProvider {
             // unknown body fields, so emitting it unconditionally costs
             // nothing and recovers cached-input billing for OpenAI-via-
             // OpenRouter traffic that the Anthropic-only `cache_control`
-            // path above does not cover. Clamp to the 64-codepoint limit
-            // OpenAI silently enforces (long keys are dropped server-side
-            // with no error, eating every cache hit).
-            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+            // path above does not cover.
+            //
+            // H-33: callers that derive the affinity key from a full
+            // path hash (or similar) hit the 64-codepoint limit
+            // OpenAI silently enforces. Truncation collides those
+            // keys (`abc/path/very/long/one` and
+            // `abc/path/very/long/two` clamp to the same prefix),
+            // mixing the cache across distinct sessions. Hash long
+            // keys via SHA-256 → first 32 hex chars instead;
+            // collision risk is negligible and the cache stays
+            // partitioned by the caller's intent. Short keys round-
+            // trip unchanged so existing callers keep their human-
+            // readable identifiers.
+            body["prompt_cache_key"] = json!(stable_prompt_cache_key(key));
         }
-        if cache_retention == CacheRetention::Long {
+        if cache_retention == CacheRetention::Long && !preset_rejects_prompt_cache_retention(preset)
+        {
             // Mirror the OpenAI native provider's extended-retention opt-in
             // so OpenAI-hosted models proxied via an aggregator (OpenRouter
             // `openai/*`, Vercel AI Gateway, etc.) still get the 24h
             // window. Anthropic-hosted aggregator routes have already
             // emitted the `ttl: "1h"` marker above; OpenAI ignores
             // `prompt_cache_retention` from non-OpenAI flavors.
+            //
+            // H-56: Mistral 422s on any unknown body field, so
+            // `prompt_cache_retention` would break every request that
+            // flips the Long-retention knob on a Mistral preset.
             body["prompt_cache_retention"] = json!("24h");
         }
         if !request.tools.is_empty() {
@@ -289,7 +487,17 @@ impl OpenAiCompatibleProvider {
             // calling at least one tool per turn by passing the field
             // through verbatim.
             if let Some(choice) = request.tool_choice.as_deref() {
-                body["tool_choice"] = json!(choice);
+                body["tool_choice"] = normalize_tool_choice(preset, choice);
+            }
+            // H-32: forward `parallel_tool_calls` when the caller
+            // explicitly set it. OpenAI's Responses provider already
+            // honors this; aggregator routes that proxy to OpenAI
+            // (OpenRouter, Vercel, PortKey) accept it and translate;
+            // routes that don't recognize the field ignore it. The
+            // field is `None` by default so we don't pin a per-route
+            // policy.
+            if let Some(parallel) = request.parallel_tool_calls {
+                body["parallel_tool_calls"] = json!(parallel);
             }
         }
         body
@@ -447,7 +655,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
-        let url = format!("{}/chat/completions", self.base_url);
+        // C-12 follow-up: resolve any `{provider}` placeholder that
+        // survived construction (left for the AI Gateway preset's
+        // per-request upstream routing) before appending the
+        // chat-completions suffix. `resolve_provider_segment` is a
+        // no-op when the URL contains no placeholder, so non-CF
+        // routes pay nothing for this hop.
+        let resolved_base = resolve_provider_segment(&self.base_url, &request.model);
+        let url = format!("{resolved_base}/chat/completions");
         let extra_headers = self.extra_headers.clone();
         let preset = self.preset;
         // We previously auto-injected `x-portkey-provider` from a
@@ -461,8 +676,24 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // where a deployment really does want a config/virtual-key
         // header.
         let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
-        let body = Self::request_body(&request);
+        // H-54: llamacpp's chat-completions endpoint requires the
+        // server to have been started with `--jinja` to honour the
+        // tool-call schema. Without the flag the server 500s on
+        // any request that carries `tools: [...]` with no
+        // actionable error text. We attach a hint downstream.
+        let llamacpp_tools_attempt =
+            matches!(preset, OpenAiCompatiblePreset::LlamaCpp) && !request.tools.is_empty();
+        let body = Self::request_body_for_preset(&request, preset);
         let provider_label = self.preset.display_name();
+        // H-59: when the user opted into the PortKey canonical
+        // `x-portkey-api-key` auth path (via the magic flag in
+        // extra_headers, lifted in `from_config`), suppress the
+        // Bearer header so the wire carries the PortKey key in
+        // the header slot only. The Bearer slot is freed for
+        // BYO-upstream-key flows.
+        let suppress_bearer = extra_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-portkey-api-key"));
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -470,7 +701,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 RetryPolicy::provider_requests(transport),
                 &cancel,
                 |key| {
-                    let mut builder = client.post(&url).bearer_auth(key);
+                    let mut builder = client.post(&url);
+                    // X-17: skip `bearer_auth(key)` when the resolved
+                    // key is empty (local LM Studio / vLLM / llama.cpp
+                    // unauthenticated presets — reqwest panics on
+                    // `bearer_auth("")`).
+                    // H-59: also skip when the PortKey canonical-auth
+                    // path opted into `x-portkey-api-key`, so the
+                    // Bearer slot stays free for a BYO upstream key.
+                    if !key.is_empty() && !suppress_bearer {
+                        builder = builder.bearer_auth(key);
+                    }
                     for (header_key, header_value) in &extra_headers {
                         builder = builder.header(header_key.as_str(), header_value.as_str());
                     }
@@ -518,8 +759,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
                          providers.portkey.headers (x-portkey-config / x-portkey-virtual-key / \
                          x-portkey-provider). Set one of those and retry."
                     }
+                } else if llamacpp_tools_attempt
+                    && status.is_server_error()
+                {
+                    // H-54: llamacpp's chat-completions surface 500s on
+                    // any tool-call request when the server is not
+                    // started with `--jinja`. Surface the actionable
+                    // hint so users don't have to grep upstream logs
+                    // to discover the flag.
+                    " — hint: llama.cpp requires `--jinja` on the server command line \
+                     to honour OpenAI-style `tools` payloads. Restart `llama-server` \
+                     with `--jinja --chat-template-file /path/to/template.jinja` (or \
+                     the bundled `chatml` template) and retry."
                 } else {
-                    ""
+                    local_jit_load_hint(preset, status, &message)
                 };
                 Err(SqueezyError::ProviderRequest(format!(
                     "{provider_label} {status}: {message}{hint}"
@@ -530,7 +783,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
             yield LlmEvent::Started;
 
             let mut decoder = SseDecoder::default();
-            let mut state = StreamState::default();
+            let mut state = StreamState {
+                // H-43: opt into inline `<think>` extraction for CF
+                // Workers AI (DeepSeek-R1-distill / Kimi K2.6 /
+                // Gemma 4 ship reasoning that way on Cloudflare's
+                // OpenAI-compat path because no `reasoning_content`
+                // field is exposed).
+                extract_inline_think: matches!(preset, OpenAiCompatiblePreset::CloudflareWorkersAi),
+                ..StreamState::default()
+            };
             let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
 
@@ -655,7 +916,9 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
                 }
             }],
         }),
-        LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+        LlmInputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => json!({
             "role": "tool",
             "tool_call_id": call_id,
             "content": output,
@@ -675,6 +938,17 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
         // Chat Completions has no signed reasoning replay format. Reasoning
         // items are rendered in the UI but skipped when replaying.
         LlmInputItem::Reasoning(_) => return None,
+        // Chat Completions has no first-class document content block;
+        // Phase 4 may inline as a `file` part where the route supports
+        // it. For now we skip with a debug log.
+        LlmInputItem::Document { name, .. } => {
+            tracing::debug!(
+                target: "squeezy_llm::compatible",
+                name = name.as_str(),
+                "chat-completions document content block not yet implemented; skipping",
+            );
+            return None;
+        }
     })
 }
 
@@ -740,7 +1014,72 @@ pub(crate) fn substitute_url_placeholders(
         };
         resolved = resolved.replace(placeholder, value);
     }
+    // C-12 follow-up: the new CF AI Gateway REST URL shape
+    // (`api.cloudflare.com/.../ai/v1/{provider}/v1/chat/completions`)
+    // routes by the upstream provider in the URL path, but the
+    // provider is a *per-request* property (derived from the model's
+    // namespace prefix). Leave any `{provider}` placeholder in the
+    // string untouched at construction time so the request-time
+    // resolver in `stream_response` can substitute the right value
+    // per turn (e.g. `openai/gpt-5.5` -> `openai`). Other presets
+    // don't accept the placeholder — surface an explicit error so a
+    // typo in `[providers.custom.base_url]` doesn't escape as a
+    // literal `{provider}` segment.
+    if resolved.contains("{provider}") && preset != OpenAiCompatiblePreset::CloudflareAiGateway {
+        return Err(SqueezyError::ProviderNotConfigured(format!(
+            "providers.{section}.base_url contains the {{provider}} \
+             placeholder but the {preset_label} preset does not support \
+             per-request upstream routing; remove the placeholder or \
+             switch to the cloudflare_ai_gateway preset"
+        )));
+    }
     Ok(resolved)
+}
+
+/// Resolve any `{provider}` placeholder that survived construction
+/// (left in place by [`substitute_url_placeholders`] for the AI
+/// Gateway preset) by deriving the upstream provider from the
+/// model id's namespace prefix. Used at request build time so each
+/// turn can route through the correct upstream without rebuilding
+/// the provider.
+///
+/// Falls back to `workers-ai` for unprefixed models because that is
+/// the only Cloudflare-direct upstream that the AI Gateway exposes
+/// for Workers AI checkpoints (model ids like `@cf/meta/...`).
+pub(crate) fn resolve_provider_segment(base_url: &str, model: &str) -> String {
+    if !base_url.contains("{provider}") {
+        return base_url.to_string();
+    }
+    let namespace = if let Some(entry) = compat_entry(model) {
+        // Strip the trailing slash to land on the segment name.
+        entry.model_prefix.trim_end_matches('/').to_string()
+    } else if model.starts_with("@cf/") {
+        "workers-ai".to_string()
+    } else if let Some((prefix, _)) = model.split_once('/') {
+        prefix.to_ascii_lowercase()
+    } else {
+        // Default upstream for legacy callers that pass an
+        // unprefixed model id. Cloudflare auto-discovers the
+        // upstream when the segment is `compat`.
+        "compat".to_string()
+    };
+    let provider = cf_upstream_slug(&namespace);
+    base_url.replace("{provider}", provider)
+}
+
+/// Map a model-id namespace prefix to Cloudflare's REST upstream
+/// slug. The two namespaces mostly coincide (e.g. `anthropic`,
+/// `openai`, `xai`, `perplexity`), but a few of Cloudflare's REST
+/// path segments diverge from the conventional prefix — Google AI
+/// Studio is exposed as `google-ai-studio`, not `google`. Keep this
+/// table small and explicit: an unknown namespace passes through
+/// unchanged so any new Cloudflare upstream whose slug already
+/// matches its prefix keeps working without a code change.
+fn cf_upstream_slug(namespace: &str) -> &str {
+    match namespace {
+        "google" => "google-ai-studio",
+        other => other,
+    }
 }
 
 fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
@@ -777,7 +1116,37 @@ fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, St
 struct StreamState {
     response_id: Option<String>,
     cost: CostSnapshot,
-    tool_calls: BTreeMap<usize, PartialToolCall>,
+    /// H-43: when `true`, the parser scans content deltas for
+    /// inline `<think>...</think>` blocks (CF Workers AI's
+    /// DeepSeek-R1-distill / Kimi K2.6 / Gemma 4 ship reasoning
+    /// inline on the OpenAI-compat path because no
+    /// `reasoning_content` field is available). Tags that arrive
+    /// split across chunks are stitched together via
+    /// `think_tag_buf` and routed to `ReasoningDelta`.
+    extract_inline_think: bool,
+    /// Whether we are currently inside a `<think>...</think>`
+    /// block. Driven by [`split_inline_think`].
+    inside_think: bool,
+    /// Buffers a partial `<think>` or `</think>` opening/closing
+    /// tag that arrived split across delta chunks.
+    think_tag_buf: String,
+    /// Tool-call accumulator partitioned by `(choice_index,
+    /// tool_index)`. H-24: aggregators that relay multi-choice
+    /// streams (rare today since we pin `n: 1` but legal under
+    /// Chat Completions) and providers that occasionally omit the
+    /// `index` field on continuation deltas (some Anthropic-via-
+    /// aggregator relays of `content_block_delta`) would otherwise
+    /// collapse the second call's args into the first. The
+    /// `(choice_index, tool_index)` key separates choices and the
+    /// `latest_tool_index_per_choice` map covers the missing-index
+    /// case by treating it as a continuation of the most recent
+    /// active index on that choice.
+    tool_calls: BTreeMap<(usize, usize), PartialToolCall>,
+    /// Tracks the highest-seen `tool_calls[].index` value per
+    /// choice so a continuation delta whose `index` field is
+    /// missing routes to the matching accumulator instead of
+    /// silently appending to `index=0`.
+    latest_tool_index_per_choice: BTreeMap<usize, usize>,
     completed_emitted: bool,
     /// Captured OpenAI chat-completions `finish_reason` from the last
     /// streamed choice, so the agent's turn loop sees a normalized
@@ -819,16 +1188,63 @@ struct StreamState {
     server_model: Option<String>,
 }
 
+/// Upper bound on the accumulated tool-call arguments string for a
+/// single call. H-25: a misbehaving upstream that keeps streaming
+/// `function.arguments` deltas without ever sending a
+/// `finish_reason` could grow the buffer to gigabytes before the
+/// idle timeout fires. 1 MiB is well above any real tool's
+/// argument payload (OpenAI documents 8 KiB as the practical limit)
+/// while still leaving ample headroom for adversarial inputs to
+/// fall harmlessly into the invalid-arguments path.
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
 struct PartialToolCall {
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
+    /// Latches `true` the first time an arguments delta is dropped
+    /// because the accumulator would have exceeded
+    /// [`MAX_TOOL_ARGUMENTS_BYTES`]. `drain_tool_calls` consults
+    /// this to surface an `INVALID_TOOL_ARGUMENTS_*` envelope
+    /// instead of pretending the call succeeded with truncated
+    /// args.
+    arguments_overflow: bool,
 }
 
 impl StreamState {
-    fn accumulate_tool_call(&mut self, index: usize, delta: &Value) {
-        let entry = self.tool_calls.entry(index).or_default();
+    /// Accumulate a streamed `tool_calls[]` delta from `choice_index`
+    /// into the per-`(choice, tool)` partition.
+    ///
+    /// `tool_index` is `None` when the upstream omitted the `index`
+    /// field on a continuation delta — Anthropic-via-aggregator
+    /// relays of `content_block_delta` and some PortKey upstreams
+    /// drop the field after the first chunk. H-24: route those to
+    /// the most-recently-seen active index on the same choice
+    /// instead of silently defaulting to `0`, which would
+    /// concatenate a second parallel call's arguments into the
+    /// first call's accumulator.
+    fn accumulate_tool_call(
+        &mut self,
+        choice_index: usize,
+        tool_index: Option<usize>,
+        delta: &Value,
+    ) {
+        let resolved_tool_index = match tool_index {
+            Some(idx) => {
+                self.latest_tool_index_per_choice
+                    .entry(choice_index)
+                    .and_modify(|current| *current = (*current).max(idx))
+                    .or_insert(idx);
+                idx
+            }
+            None => *self
+                .latest_tool_index_per_choice
+                .get(&choice_index)
+                .unwrap_or(&0),
+        };
+        let key = (choice_index, resolved_tool_index);
+        let entry = self.tool_calls.entry(key).or_default();
         if let Some(id) = delta.get("id").and_then(Value::as_str) {
             entry.call_id = Some(id.to_string());
         }
@@ -844,7 +1260,30 @@ impl StreamState {
                 self.saw_visible_output = true;
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                entry.arguments.push_str(arguments);
+                // H-25: cap the accumulator so a pathological
+                // stream that keeps shipping arguments deltas
+                // without ever sending finish_reason cannot grow
+                // the buffer to gigabytes. Once we cross the
+                // ceiling we keep parsing the rest of the stream
+                // (so finish_reason / [DONE] still land) but stop
+                // appending — `drain_tool_calls` will surface the
+                // INVALID_TOOL_ARGUMENTS envelope so the agent
+                // loop can decide to retry or abort.
+                if entry.arguments.len().saturating_add(arguments.len()) > MAX_TOOL_ARGUMENTS_BYTES
+                {
+                    if !entry.arguments_overflow {
+                        tracing::warn!(
+                            target: "squeezy_llm::compatible",
+                            choice_index,
+                            tool_index = resolved_tool_index,
+                            cap_bytes = MAX_TOOL_ARGUMENTS_BYTES,
+                            "tool-call arguments accumulator hit cap; further deltas dropped"
+                        );
+                    }
+                    entry.arguments_overflow = true;
+                } else {
+                    entry.arguments.push_str(arguments);
+                }
             }
         }
     }
@@ -852,8 +1291,20 @@ impl StreamState {
     fn drain_tool_calls(&mut self) -> Result<Vec<LlmEvent>> {
         let mut events = Vec::new();
         let drained = std::mem::take(&mut self.tool_calls);
-        for (index, partial) in drained {
-            let call_id = partial.call_id.unwrap_or_else(|| format!("call_{index}"));
+        self.latest_tool_index_per_choice.clear();
+        for ((choice_index, index), partial) in drained {
+            // Fold the choice index into the synthetic id so two different
+            // choices surfacing a tool call at the same tool index (possible
+            // if an aggregator relays multi-choice traffic despite the `n: 1`
+            // pin) cannot alias to the same `call_<index>` and collide in
+            // downstream tool dispatch.
+            let call_id = partial.call_id.unwrap_or_else(|| {
+                if choice_index == 0 {
+                    format!("call_{index}")
+                } else {
+                    format!("call_{choice_index}_{index}")
+                }
+            });
             // Skip incomplete tool calls (no function.name accumulated)
             // instead of erroring the whole stream. PortKey / OpenRouter /
             // Qwen sometimes ship a tool-call delta whose name chunk goes
@@ -881,17 +1332,46 @@ impl StreamState {
                 );
                 continue;
             };
+            // M-29: empty `function.arguments` means the model intends a
+            // zero-arg call; emit `Value::Null` instead of fabricating an
+            // empty object. The tool dispatch layer can disambiguate
+            // "model sent no arguments" from "model sent `{}`" and a few
+            // tool implementations (notably ones that gate on
+            // `value.is_null()`) need that signal. The parse-failure
+            // branch still applies to genuinely non-empty malformed JSON
+            // so the existing `INVALID_TOOL_ARGUMENTS_*` markers continue
+            // to flow through.
             let arguments = if partial.arguments.is_empty() {
-                Value::Object(Default::default())
+                // M-29 (Phase 4FH-AB): an empty arguments string from
+                // a zero-arg tool call surfaces as `Value::Null` so the
+                // dispatcher can distinguish "model sent no arguments"
+                // from "model sent `{}`". H-25 cap does not apply here
+                // because the cap only latches when *deltas* arrive.
+                Value::Null
+            } else if partial.arguments_overflow {
+                // H-25: if the accumulator hit the byte cap mid-stream
+                // the args we have are necessarily truncated. Surface
+                // the synthetic invalid-arguments envelope so the
+                // agent loop can decide what to do (retry / abort)
+                // instead of feeding the model a half-JSON blob that
+                // would parse-fail later in the tool dispatcher.
+                let arguments_text = partial.arguments;
+                json!({
+                    INVALID_TOOL_ARGUMENTS_KEY: true,
+                    INVALID_TOOL_ARGUMENTS_ERROR_KEY: format!(
+                        "tool-call arguments exceeded {MAX_TOOL_ARGUMENTS_BYTES} bytes; truncated"
+                    ),
+                    INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
+                })
             } else {
-                match serde_json::from_str::<Value>(&partial.arguments) {
-                    Ok(arguments) => arguments,
-                    Err(err) => json!({
+                let arguments_text = partial.arguments;
+                serde_json::from_str::<Value>(&arguments_text).unwrap_or_else(|err| {
+                    json!({
                         INVALID_TOOL_ARGUMENTS_KEY: true,
                         INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
-                        INVALID_TOOL_ARGUMENTS_RAW_KEY: partial.arguments,
-                    }),
-                }
+                        INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
+                    })
+                })
             };
             events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id,
@@ -986,6 +1466,328 @@ fn collect_reasoning_delta(delta: &Value) -> Option<Cow<'_, str>> {
     }
 }
 
+/// True for the OpenAI-compatible presets that target a server running
+/// on the user's own machine (LM Studio, vLLM, llama.cpp). These presets
+/// (1) run unauthenticated by default, so credential resolution must
+/// tolerate the "no key configured" terminal (see X-17 in
+/// [`OpenAiCompatibleProvider::from_config`]), and (2) JIT-load
+/// checkpoints on demand, so a `400 Bad Request` with a "not loaded"
+/// message wants a provider-specific load-CLI hint
+/// (see [`local_jit_load_hint`]).
+fn is_local_preset(preset: OpenAiCompatiblePreset) -> bool {
+    matches!(
+        preset,
+        OpenAiCompatiblePreset::LMStudio
+            | OpenAiCompatiblePreset::VLlm
+            | OpenAiCompatiblePreset::LlamaCpp
+    )
+}
+
+/// Append a JIT-load hint to a 400 error body from a local OpenAI-compatible
+/// server (LM Studio, vLLM, llama.cpp). All three return `400 Bad Request`
+/// with a message containing "not loaded" / "model not loaded" / "no models
+/// loaded" when the user pointed `model = "<id>"` at a checkpoint the server
+/// hasn't loaded into memory yet. Returns an inline hint string the caller
+/// concatenates onto the surfaced error message; returns `""` when the
+/// preset / status / message combination does not match. The hint points
+/// the user at the provider-appropriate fix (`lms load`, `vllm serve`,
+/// `llama-server -m`) instead of the bare upstream complaint.
+fn local_jit_load_hint(
+    preset: OpenAiCompatiblePreset,
+    status: StatusCode,
+    message: &str,
+) -> &'static str {
+    if status != StatusCode::BAD_REQUEST || !is_local_preset(preset) {
+        return "";
+    }
+    let lower = message.to_ascii_lowercase();
+    if !(lower.contains("not loaded")
+        || lower.contains("no models loaded")
+        || lower.contains("model is not loaded"))
+    {
+        return "";
+    }
+    match preset {
+        OpenAiCompatiblePreset::LMStudio => {
+            " — hint: LM Studio rejected the request because the requested model is not loaded. \
+             Open the LM Studio app, switch to the Developer tab, and load the checkpoint, or run \
+             `lms load <model>` from the LM Studio CLI before retrying."
+        }
+        OpenAiCompatiblePreset::VLlm => {
+            " — hint: the vLLM server is running but the requested model is not loaded. \
+             Restart `vllm serve` with `--model <id>` pointing at the checkpoint you want to call, \
+             or pick a model id that matches what the server already advertises via `GET /v1/models`."
+        }
+        OpenAiCompatiblePreset::LlamaCpp => {
+            " — hint: llama.cpp server has no model loaded. Start it with `llama-server -m <path>` \
+             pointing at the GGUF file you want to serve, then retry."
+        }
+        _ => "",
+    }
+}
+
+/// X-04: per-preset normalization for `tool_choice`. Most
+/// aggregators accept the OpenAI shape verbatim
+/// (`"auto" / "none" / "required" / {type, function}`). Mistral
+/// renamed `required` to `any` and 422s on the OpenAI value; map
+/// it client-side so user-facing configs stay uniform.
+fn normalize_tool_choice(preset: OpenAiCompatiblePreset, choice: &str) -> Value {
+    if matches!(preset, OpenAiCompatiblePreset::Mistral) && choice.eq_ignore_ascii_case("required")
+    {
+        return json!("any");
+    }
+    json!(choice)
+}
+
+/// H-39 / H-49 / H-52 / H-55 / H-62 / H-65: per-preset reasoning-
+/// hint emission. The vendors diverge on how to enable thinking
+/// mode and on the field names; one centralized branch keeps the
+/// matrix reviewable.
+///
+/// The legacy default emits both `reasoning_effort` and
+/// `reasoning: { effort }` because the historical comment was that
+/// aggregators ignore unknown fields. May 2026 verification shows
+/// that's true for OpenRouter / xAI / generic upstreams, but
+/// Mistral, Vercel, Vertex, DeepSeek-V4, Baseten/vLLM/llamacpp,
+/// and Groq all want different shapes; emitting the OpenAI legacy
+/// form on those breaks the request (Mistral 422) or silently
+/// drops the hint (Vercel/Vertex/DeepSeek/Baseten/vLLM/llamacpp).
+fn emit_reasoning_hints(
+    body: &mut Value,
+    preset: OpenAiCompatiblePreset,
+    model: &str,
+    effort: squeezy_core::ReasoningEffort,
+) {
+    let effort_str = effort.as_str();
+    match preset {
+        OpenAiCompatiblePreset::Mistral => {
+            // H-55: Mistral 422s on the nested `reasoning` form and
+            // only honors a top-level `reasoning_effort` clamped to
+            // its enum `none | high`. Map intermediate effort values
+            // to `high` so a `Low`/`Medium` setting still flips
+            // thinking on (the only other option is to drop the
+            // hint, which is worse — silently disables thinking).
+            body["reasoning_effort"] = json!("high");
+        }
+        OpenAiCompatiblePreset::Vercel => {
+            // H-62: Vercel rejects squeezy's top-level
+            // `reasoning_effort` outright; the hint must ride under
+            // `providerOptions.{anthropic|openai}` keyed off the
+            // upstream the gateway is dialing. Pick the shape from
+            // the model id's namespace prefix; fall back to the
+            // OpenAI shape for unrecognized prefixes.
+            let provider_opts = body
+                .as_object_mut()
+                .expect("body is a JSON object")
+                .entry("providerOptions".to_string())
+                .or_insert_with(|| json!({}));
+            let lower = model.to_ascii_lowercase();
+            if lower.starts_with("anthropic/") {
+                let budget = match effort {
+                    squeezy_core::ReasoningEffort::Low => 4096,
+                    squeezy_core::ReasoningEffort::Medium => 8192,
+                    squeezy_core::ReasoningEffort::High => 16384,
+                    squeezy_core::ReasoningEffort::XHigh => 32768,
+                };
+                provider_opts["anthropic"] = json!({ "thinkingBudget": budget });
+            } else {
+                // OpenAI-on-Vercel shape — both Camel-case fields
+                // match Vercel's documented Responses API surface.
+                provider_opts["openai"] = json!({
+                    "reasoningEffort": effort_str,
+                    "reasoningSummary": "auto",
+                });
+            }
+        }
+        OpenAiCompatiblePreset::Vertex => {
+            // H-65: Vertex's OpenAI-compat layer translates
+            // Gemini-thinking via `extra_body.google.thinking_config.thinking_budget`.
+            // The top-level OpenAI `reasoning_effort` is silently
+            // dropped today. Map effort to the documented budget
+            // tokens.
+            let budget = match effort {
+                squeezy_core::ReasoningEffort::Low => 4096,
+                squeezy_core::ReasoningEffort::Medium => 8192,
+                squeezy_core::ReasoningEffort::High => 16384,
+                squeezy_core::ReasoningEffort::XHigh => 32768,
+            };
+            let extra = body
+                .as_object_mut()
+                .expect("body is a JSON object")
+                .entry("extra_body".to_string())
+                .or_insert_with(|| json!({}));
+            extra["google"] = json!({
+                "thinking_config": {
+                    "thinking_budget": budget,
+                }
+            });
+        }
+        OpenAiCompatiblePreset::DeepSeek => {
+            // H-49: DeepSeek V4 controls thinking via the
+            // `thinking` body field, not via `reasoning_effort`.
+            // Map effort to the documented budget modes.
+            let budget = match effort {
+                squeezy_core::ReasoningEffort::Low => 2048,
+                squeezy_core::ReasoningEffort::Medium => 8192,
+                squeezy_core::ReasoningEffort::High => 16384,
+                squeezy_core::ReasoningEffort::XHigh => 32768,
+            };
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+        OpenAiCompatiblePreset::Groq => {
+            // H-52: Groq controls reasoning per model family. The
+            // gpt-oss-* family wants `include_reasoning: true`; Qwen
+            // and DeepSeek-R1 derivatives want a string
+            // `reasoning_format` enum. The two are mutually
+            // exclusive (Groq rejects both together).
+            let lower = model.to_ascii_lowercase();
+            if lower.contains("gpt-oss") {
+                body["include_reasoning"] = json!(true);
+            } else if lower.contains("qwen") || lower.contains("deepseek") {
+                body["reasoning_format"] = json!("parsed");
+            } else {
+                // Fall back to the OpenAI legacy shape for unknown
+                // Groq models (e.g. Llama-3.x).
+                body["reasoning_effort"] = json!(effort_str);
+            }
+        }
+        OpenAiCompatiblePreset::Baseten
+        | OpenAiCompatiblePreset::VLlm
+        | OpenAiCompatiblePreset::LlamaCpp => {
+            // H-39: Baseten + vLLM + llamacpp enable thinking via
+            // a `chat_template_args.enable_thinking` flag the
+            // jinja template consumes. The OpenAI-style
+            // `reasoning_effort` does nothing on these servers
+            // unless the template branches on it explicitly.
+            let chat_template_args = body
+                .as_object_mut()
+                .expect("body is a JSON object")
+                .entry("chat_template_args".to_string())
+                .or_insert_with(|| json!({}));
+            chat_template_args["enable_thinking"] = json!(true);
+        }
+        _ => {
+            // OpenRouter / xAI / generic: emit both shapes — the
+            // legacy top-level + the newer nested form. Aggregators
+            // ignore unknown fields.
+            body["reasoning_effort"] = json!(effort_str);
+            body["reasoning"] = json!({ "effort": effort_str });
+        }
+    }
+}
+
+/// H-56: Mistral 422s on any unknown body field, including
+/// `prompt_cache_retention`. The retention knob has no Mistral
+/// equivalent today (Mistral cache TTL is server-managed), so the
+/// safest path is to suppress the field on the Mistral preset
+/// entirely. Other presets keep the OpenAI-compat opt-in.
+fn preset_rejects_prompt_cache_retention(preset: OpenAiCompatiblePreset) -> bool {
+    matches!(preset, OpenAiCompatiblePreset::Mistral)
+}
+
+/// H-33: derive a stable, collision-safe `prompt_cache_key` that
+/// respects OpenAI's silent 64-codepoint limit. Short keys (≤64
+/// chars) round-trip verbatim so existing callers keep their
+/// human-readable identifiers (and the test fixtures continue to
+/// match exact strings). Long keys hash via SHA-256 → first 32 hex
+/// chars (well under the 64 limit, collision rate is 2^-128). The
+/// existing `clamp_prompt_cache_key` helper still backs the
+/// final truncation so the OpenAI native provider and this
+/// adapter agree on the codepoint cap.
+fn stable_prompt_cache_key(key: &str) -> String {
+    if key.chars().count() <= 64 {
+        return clamp_prompt_cache_key(key).to_string();
+    }
+    let digest = Sha256::digest(key.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}")).expect("hex write");
+    }
+    hex
+}
+
+/// H-27: classify an inline mid-stream `{"error":...}` envelope as
+/// retryable vs terminal. Retryable shapes (`rate_limit_*`,
+/// `server_error`, `overloaded`, `timeout`, HTTP 408/429/5xx) are
+/// returned as plain `ProviderStream` errors so the existing
+/// transport retry policy can take another swing. Terminal shapes
+/// (auth, invalid request, context overflow, content filter)
+/// surface with the [`NON_RETRYABLE_MARKER`] prefix so the agent
+/// loop drops the turn instead of looping the same broken
+/// request.
+fn is_inline_error_retryable(value: &Value) -> bool {
+    let error = value.get("error");
+    let kind = error
+        .and_then(|err| err.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let code = error
+        .and_then(|err| err.get("code"))
+        .and_then(|c| {
+            c.as_str()
+                .map(str::to_ascii_lowercase)
+                .or_else(|| c.as_i64().map(|n| n.to_string()))
+        })
+        .unwrap_or_default();
+    if let Some(kind) = kind.as_deref() {
+        if kind.contains("rate_limit")
+            || kind.contains("overloaded")
+            || kind.contains("server_error")
+            || kind.contains("api_error")
+            || kind.contains("timeout")
+            || kind.contains("transient")
+            || kind.contains("internal")
+        {
+            return true;
+        }
+        if kind.contains("auth")
+            || kind.contains("permission")
+            || kind.contains("invalid_request")
+            || kind.contains("not_found")
+            || kind.contains("content_filter")
+            || kind.contains("context_length")
+            || kind.contains("quota")
+        {
+            return false;
+        }
+    }
+    // Code-based classification covers providers that only ship a
+    // `code` field (OpenRouter, some PortKey upstreams) without a
+    // `type`. Common retryable codes: `rate_limit_exceeded`,
+    // `service_unavailable`, numeric HTTP statuses 408/429/5xx.
+    if !code.is_empty() {
+        if code.contains("rate_limit")
+            || code.contains("server_error")
+            || code.contains("overloaded")
+            || code.contains("service_unavailable")
+            || code.contains("timeout")
+            || code.contains("transient")
+            || code == "408"
+            || code == "429"
+            || (code.starts_with('5') && code.chars().all(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+        if code.contains("invalid")
+            || code.contains("auth")
+            || code.contains("permission")
+            || code.contains("context_length")
+            || code.contains("not_found")
+            || code.contains("insufficient_quota")
+            || code.contains("content_filter")
+        {
+            return false;
+        }
+    }
+    // Default: retryable. The stream-retry policy still bails after
+    // the configured attempt count, so a falsely-retryable
+    // classification can't loop forever. A falsely-terminal
+    // classification, on the other hand, would drop turns on
+    // brand-new error shapes the catalog doesn't yet know about —
+    // worse user experience.
+    true
+}
+
 /// Format a Chat-Completions `{ "error": { message, type, code, … } }` envelope
 /// into a single human-readable string. Surfaces `type` and `code` (Anthropic's
 /// `rate_limit_error`, OpenAI's `invalid_request_error` / `context_length_exceeded`,
@@ -1016,6 +1818,75 @@ fn format_chat_error(value: &Value, default_message: &str) -> String {
     }
 }
 
+/// H-43: split a content delta into reasoning + visible content
+/// spans by scanning for inline `<think>` / `</think>` tags.
+/// Tags split across chunks are stitched via `state.think_tag_buf`.
+/// Returns (reasoning_text, visible_text); either may be empty.
+fn split_inline_think(state: &mut StreamState, mut content: String) -> (String, String) {
+    if !state.extract_inline_think {
+        return (String::new(), content);
+    }
+    // Stitch a partial tag from the previous chunk back onto the
+    // front of this chunk so the scan sees the full token.
+    if !state.think_tag_buf.is_empty() {
+        let mut combined = std::mem::take(&mut state.think_tag_buf);
+        combined.push_str(&content);
+        content = combined;
+    }
+    let mut reasoning = String::new();
+    let mut visible = String::new();
+    let bytes = content.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let remaining = &content[cursor..];
+        if state.inside_think {
+            // Look for the closing tag.
+            if let Some(idx) = remaining.find("</think>") {
+                reasoning.push_str(&remaining[..idx]);
+                cursor += idx + "</think>".len();
+                state.inside_think = false;
+            } else if let Some(stub) = trailing_partial_tag(remaining, "</think>") {
+                reasoning.push_str(&remaining[..remaining.len() - stub.len()]);
+                state.think_tag_buf = stub.to_string();
+                cursor = content.len();
+            } else {
+                reasoning.push_str(remaining);
+                cursor = content.len();
+            }
+        } else {
+            // Look for the opening tag.
+            if let Some(idx) = remaining.find("<think>") {
+                visible.push_str(&remaining[..idx]);
+                cursor += idx + "<think>".len();
+                state.inside_think = true;
+            } else if let Some(stub) = trailing_partial_tag(remaining, "<think>") {
+                visible.push_str(&remaining[..remaining.len() - stub.len()]);
+                state.think_tag_buf = stub.to_string();
+                cursor = content.len();
+            } else {
+                visible.push_str(remaining);
+                cursor = content.len();
+            }
+        }
+    }
+    (reasoning, visible)
+}
+
+/// Returns the trailing partial-tag stub at the end of `slice` if
+/// the tail is a prefix of `tag` (longer than zero, shorter than
+/// the full tag). Used to buffer split-across-chunk tag tokens.
+fn trailing_partial_tag<'a>(slice: &'a str, tag: &str) -> Option<&'a str> {
+    let mut len = (tag.len() - 1).min(slice.len());
+    while len > 0 {
+        let tail = &slice[slice.len() - len..];
+        if tag.starts_with(tail) {
+            return Some(tail);
+        }
+        len -= 1;
+    }
+    None
+}
+
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
@@ -1039,10 +1910,23 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
 
     if value.get("error").is_some() {
-        return Err(SqueezyError::ProviderStream(format_chat_error(
-            &value,
-            "chat completions stream error",
-        )));
+        // H-27: inline mid-stream `error` JSON. Classify so the
+        // outer retry policy can distinguish "retryable transport
+        // hiccup" (rate-limited, 5xx upstream, network blip) from
+        // "request-shape bug / auth fail" (invalid api key, model
+        // gone, schema violation). Retryable shapes stay as
+        // `ProviderStream` (the existing stream-retry policy is
+        // already permissive about that); terminal shapes get the
+        // `[non-retryable]` marker prepended so the agent loop +
+        // TUI mirror the same suppression behavior they apply to
+        // POST-time errors.
+        let formatted = format_chat_error(&value, "chat completions stream error");
+        let message = if is_inline_error_retryable(&value) {
+            formatted
+        } else {
+            format!("{NON_RETRYABLE_MARKER}{formatted}")
+        };
+        return Err(SqueezyError::ProviderStream(message));
     }
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
@@ -1068,6 +1952,13 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     let choices = value.get("choices").and_then(Value::as_array);
     if let Some(choices) = choices {
         for choice in choices {
+            // H-24: chat-completions choices carry an `index` field
+            // when `n > 1`. We pin `n: 1` in `request_body` so this
+            // is normally `0`, but multi-choice traffic surfaces
+            // through aggregator routes that mirror the upstream
+            // verbatim. Track the choice index so the tool-call
+            // accumulator partitions correctly across choices.
+            let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             if let Some(delta) = choice.get("delta") {
                 if let Some(reasoning) = collect_reasoning_delta(delta) {
                     state.reasoning_buf.push_str(&reasoning);
@@ -1077,14 +1968,57 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                     });
                 }
                 if let Some(content) = collect_delta_text(delta.get("content")) {
-                    state.saw_visible_output = true;
-                    events.push(LlmEvent::TextDelta(content.into_owned()));
+                    // H-43: when the preset is CF Workers AI (or
+                    // another upstream we know inlines reasoning
+                    // via `<think>...</think>` tags on the
+                    // OpenAI-compat path), split the content into
+                    // reasoning + visible spans before emitting.
+                    // The reasoning span lands as a
+                    // `ReasoningDelta` so the TUI promotes it to
+                    // the thinking pane and downstream cost /
+                    // event consumers see the right kind of
+                    // signal.
+                    let (reasoning_span, visible_span) =
+                        split_inline_think(state, content.into_owned());
+                    if !reasoning_span.is_empty() {
+                        state.reasoning_buf.push_str(&reasoning_span);
+                        events.push(LlmEvent::ReasoningDelta {
+                            text: reasoning_span,
+                            kind: ReasoningKind::Summary,
+                        });
+                    }
+                    if !visible_span.is_empty() {
+                        // H-50: DeepSeek V4 and other interleaved-
+                        // reasoning models stream
+                        // `reasoning → content → reasoning → content`
+                        // segments within a single turn. Flush the
+                        // accumulated reasoning into a
+                        // `ReasoningDone` when the first content
+                        // delta arrives so the transcript renders
+                        // thinking BEFORE its matching answer
+                        // segment (not concatenated at end-of-turn
+                        // and out of position).
+                        if !state.reasoning_buf.trim().is_empty()
+                            && let Some(reasoning_done) = drain_reasoning(state)
+                        {
+                            events.push(reasoning_done);
+                        }
+                        state.saw_visible_output = true;
+                        events.push(LlmEvent::TextDelta(visible_span));
+                    }
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tool_call in tool_calls {
-                        let index =
-                            tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        state.accumulate_tool_call(index, tool_call);
+                        // Missing `index` on a continuation delta
+                        // routes to the most-recent active index on
+                        // this choice (H-24). `None` is *not*
+                        // collapsed to `0` here — accumulate_tool_call
+                        // decides the right slot.
+                        let tool_index = tool_call
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize);
+                        state.accumulate_tool_call(choice_index, tool_index, tool_call);
                     }
                 }
             }
@@ -1096,6 +2030,20 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                     }
                     "stop" => {
                         events.extend(state.drain_tool_calls()?);
+                        // INVARIANT (C-10): do NOT flip
+                        // `state.completed_emitted` inside this arm.
+                        // Groq + OpenRouter-via-Groq ship a trailing
+                        // usage chunk *after* the
+                        // `finish_reason: stop` chunk and before the
+                        // terminal `[DONE]`. The outer loop short-
+                        // circuits as soon as `completed_emitted`
+                        // flips, so latching it here would discard the
+                        // usage chunk and report zero cost. The
+                        // terminal `Completed` event is emitted from
+                        // the `[DONE]` arm only — see
+                        // `parse_chat_event` at the top of this
+                        // function.
+                        //
                         // Reasoning-mode models (Qwen3, DeepSeek-R1 via
                         // aggregator, etc.) sometimes emit only reasoning
                         // and finish cleanly with `stop` — no content, no
@@ -1113,15 +2061,35 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                             // Otherwise this is "model said nothing at
                             // all", which is a different (and rarer)
                             // failure mode.
-                            if !state.reasoning_buf.trim().is_empty() {
+                            let has_reasoning = !state.reasoning_buf.trim().is_empty();
+                            if has_reasoning {
                                 state.reasoning_only_stop = true;
                             }
                             if let Some(reasoning_done) = drain_reasoning(state) {
                                 events.push(reasoning_done);
                             }
-                            events.push(LlmEvent::TextDelta(
-                                "\n[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt, lower reasoning_effort, or set [model].tool_choice = \"required\" to force a tool call.\n".to_string(),
-                            ));
+                            // H-31: DeepSeek `deepseek-reasoner` (and other
+                            // reasoning-only modes that finish a thinking
+                            // turn with `stop` and no content) ship a
+                            // legitimate completion in this shape. The
+                            // notice text references `reasoning_effort` (V4
+                            // ignores it; see DS-4) and
+                            // `tool_choice = "required"` (nonsensical on a
+                            // text-only reasoning turn), so the user reads
+                            // a confused apology mid-transcript instead of
+                            // the model's normal end-of-thinking signal.
+                            // Suppress when reasoning surfaced — the
+                            // `reasoning_only_stop` flag latched above
+                            // still lets the agent loop decide what to do
+                            // (re-prompt for a visible response).
+                            // Genuinely-empty stops (no reasoning, no
+                            // content, no tool call) keep the notice so
+                            // the user gets *some* breadcrumb.
+                            if !has_reasoning {
+                                events.push(LlmEvent::TextDelta(
+                                    "\n[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt, lower reasoning_effort, or set [model].tool_choice = \"required\" to force a tool call.\n".to_string(),
+                                ));
+                            }
                         }
                     }
                     "length" => {

@@ -656,6 +656,7 @@ async fn run_judge(
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let mut stream = provider.stream_response(request, cancel.clone());
     let fetch = async {

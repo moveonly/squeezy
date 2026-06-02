@@ -1524,7 +1524,13 @@ fn stop_reason_label(reason: Option<&squeezy_llm::StopReason>) -> Option<String>
         squeezy_llm::StopReason::ContextWindowExceeded => "context_window_exceeded".to_string(),
         squeezy_llm::StopReason::StopSequence => "stop_sequence".to_string(),
         squeezy_llm::StopReason::Refusal => "refusal".to_string(),
+        squeezy_llm::StopReason::PauseTurn => "pause_turn".to_string(),
+        squeezy_llm::StopReason::MalformedFunctionCall => "malformed_function_call".to_string(),
         squeezy_llm::StopReason::Other(other) => other.clone(),
+        // `StopReason` is `#[non_exhaustive]`; unknown future variants
+        // collapse to the canonical "other" label until findings rules
+        // grow dedicated arms for them.
+        _ => "other".to_string(),
     })
 }
 

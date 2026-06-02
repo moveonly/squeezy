@@ -32,7 +32,12 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-pro";
 pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
-pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
+// C-13: the Azure provider targets the Responses endpoint
+// (`/openai/v1/responses?api-version=…`), which Azure serves only under the
+// `preview` api-version; `v1` returns a 4xx there. Default to `preview` so a
+// bare `AZURE_OPENAI_*` config works out of the box. Operators can still pin a
+// dated version (e.g. `2024-10-21`) via `providers.azure_openai.api_version`.
+pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "preview";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-sonnet-4-6";
@@ -53,7 +58,7 @@ pub const GOOGLE_SMALL_FAST_MODEL: &str = "gemini-2.5-flash-lite";
 pub const BEDROCK_SMALL_FAST_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
 pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
-pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4.5";
 pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
 pub const VERTEX_SMALL_FAST_MODEL: &str = "google/gemini-2.5-flash";
 
@@ -81,34 +86,34 @@ pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
 pub const DEFAULT_VERCEL_AI_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
-pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4.7";
 pub const DEFAULT_PORTKEY_BASE_URL: &str = "https://api.portkey.ai/v1";
 pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-opus-4-7";
 // OpenAI-compatible single-vendor (full preset tier).
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const DEFAULT_GROQ_MODEL: &str = "llama-3.3-70b-versatile";
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
-pub const DEFAULT_XAI_MODEL: &str = "grok-4";
+pub const DEFAULT_XAI_MODEL: &str = "grok-4.3";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
-pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 // Google Cloud Vertex AI's OpenAI-compatible endpoint. The base URL is
 // per-project + per-region, so users must set `vertex_project` and
 // `vertex_location` (or override `base_url` directly).
 pub const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
-pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-2.5-pro";
+pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-3.1-pro-preview";
 // OpenAI-compatible single-vendor (light preset tier — no curated models, no dedicated costly test).
 pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
-pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-latest";
+pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-2512";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_TOGETHER_MODEL: &str = "meta-llama/Llama-3.3-70B-Instruct-Turbo";
 pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
-pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v3p3-70b-instruct";
+pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v4-scout-instruct";
 pub const DEFAULT_CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
-pub const DEFAULT_CEREBRAS_MODEL: &str = "llama-3.3-70b";
+pub const DEFAULT_CEREBRAS_MODEL: &str = "gpt-oss-120b";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
-pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Llama-4-Scout-17B-128E-Instruct";
 pub const DEFAULT_BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
-pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_BASETEN_MODEL: &str = "moonshotai/kimi-k2.6-instruct";
 // OpenAI-compatible local self-hosted (light preset tier — loopback default,
 // auth optional, model id depends on whatever the local server has loaded).
 pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
@@ -123,6 +128,11 @@ pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 // keeps the placeholder syntax behaves the same as the bundled default.
 pub const DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL: &str =
     "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1";
+// C-11 (deferred, product decision): Cloudflare now also exposes a REST-style
+// route alongside this `/compat` OpenAI-compatibility surface. We intentionally
+// keep `/compat` as the default — flipping every existing CF user's endpoint
+// blind would break live configs and needs the verified CF REST URL first. Do
+// not change this value without that confirmation.
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL: &str =
     "https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat";
 pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
@@ -132,10 +142,26 @@ pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-in
 /// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
 /// regional URL that names the project. Returns the resolved base URL for a
 /// `(project, location)` pair, ready for `/chat/completions` to be appended.
+///
+/// The `global` location lives at the bare host `aiplatform.googleapis.com`
+/// (no `{location}-` prefix) because Google does not run a regional Anycast
+/// frontend named `global`. Gemini 3.x is GA only via this location, so a
+/// caller passing `location = "global"` builds the correct host instead of
+/// a `https://global-aiplatform.googleapis.com/...` URL that DNS-fails.
+/// Other locations (regional like `us-central1`, plus the continental
+/// pseudo-regions `us`/`eu`) keep the historical `{location}-aiplatform`
+/// shape so production deployments are unchanged.
 pub fn vertex_base_url(project: &str, location: &str) -> String {
-    format!(
-        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi"
-    )
+    let trimmed = location.trim();
+    if trimmed.eq_ignore_ascii_case("global") {
+        format!(
+            "https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/endpoints/openapi"
+        )
+    } else {
+        format!(
+            "https://{trimmed}-aiplatform.googleapis.com/v1/projects/{project}/locations/{trimmed}/endpoints/openapi"
+        )
+    }
 }
 
 /// Resolve a bare-name model alias (e.g. `opus`, `sonnet`, `haiku`) to the
@@ -588,7 +614,7 @@ impl AppConfig {
     fn try_from_settings_and_env_vars_with_sources_and_warnings(
         settings: SettingsFile,
         mut sources: Vec<String>,
-        config_warnings: Vec<ConfigWarning>,
+        mut config_warnings: Vec<ConfigWarning>,
         cli_provider: Option<&str>,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
@@ -635,6 +661,22 @@ impl AppConfig {
                 transport: provider_transport_settings(&providers, &["google"]),
             }),
             "azure" | "azure-openai" | "azure_openai" => {
+                // Entra ID opt-in is layered: either an explicit
+                // `use_entra_id = true` in TOML, or the operator pre-populated
+                // `AZURE_OPENAI_BEARER_TOKEN` and wants squeezy to honor it
+                // without separately flipping the bool. The presence of a
+                // bearer in the env is sufficient signal: callers that
+                // truly want the api-key path leave that env var unset.
+                let entra_bearer_token = get_var("AZURE_OPENAI_BEARER_TOKEN")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let use_entra_id = provider_setting_bool_any(
+                    &providers,
+                    &["azure_openai", "azure"],
+                    "use_entra_id",
+                )
+                .unwrap_or(false)
+                    || entra_bearer_token.is_some();
                 ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
                     api_key_env: get_var("AZURE_OPENAI_API_KEY_ENV")
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_key_env"))
@@ -654,6 +696,13 @@ impl AppConfig {
                         &providers,
                         &["azure_openai", "azure"],
                     ),
+                    extra_headers: provider_setting_headers_any(
+                        &providers,
+                        &["azure_openai", "azure"],
+                    )
+                    .unwrap_or_default(),
+                    use_entra_id,
+                    entra_bearer_token,
                     transport: provider_transport_settings(&providers, &["azure_openai", "azure"]),
                 })
             }
@@ -698,6 +747,24 @@ impl AppConfig {
                 base_url: get_var("OPENAI_BASE_URL")
                     .or_else(|| provider_setting(&providers, "openai", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+                // OPENAI_ORG_ID is the canonical env name in OpenAI's own
+                // SDKs; OPENAI_ORGANIZATION is the long-form alias they
+                // accept too. Honor both so users porting from other
+                // tooling don't get surprised.
+                organization: get_var("OPENAI_ORG_ID")
+                    .or_else(|| get_var("OPENAI_ORGANIZATION"))
+                    .or_else(|| provider_setting(&providers, "openai", "organization"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                project: get_var("OPENAI_PROJECT_ID")
+                    .or_else(|| get_var("OPENAI_PROJECT"))
+                    .or_else(|| provider_setting(&providers, "openai", "project"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                service_tier: get_var("OPENAI_SERVICE_TIER")
+                    .or_else(|| provider_setting(&providers, "openai", "service_tier"))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
                 transport: provider_transport_settings(&providers, &["openai"]),
             }),
             "openai-codex" | "openai_codex" | "chatgpt" => {
@@ -793,6 +860,46 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
             .or(DEFAULT_MAX_OUTPUT_TOKENS);
+        // M-58: Cerebras chat-completions v1 accepts `max_tokens` as an
+        // alias today, but the v2 default-switchover (2026-07-21)
+        // tightens schema validation to require `max_completion_tokens`.
+        // Surface a soft warning at config-build time so operators
+        // shipping pre-cutoff configs know they need to update before
+        // the date rolls in; squeezy-llm's Cerebras path is responsible
+        // for emitting `max_completion_tokens` on the wire from this
+        // same `max_output_tokens`.
+        if let ProviderConfig::OpenAiCompatible(compatible) = &provider
+            && compatible.preset == OpenAiCompatiblePreset::Cerebras
+            && max_output_tokens.is_some()
+        {
+            config_warnings.push(ConfigWarning {
+                source: "providers.cerebras".to_string(),
+                field: "model.max_output_tokens emits `max_tokens` today; \
+                        Cerebras v2 (default 2026-07-21) requires `max_completion_tokens`. \
+                        squeezy-llm will switch wire keys automatically, but \
+                        reasoning-model budgets count thinking tokens against \
+                        the limit on v2."
+                    .to_string(),
+            });
+        }
+        // M-64: the `Custom` preset carries no URL allow-list and accepts
+        // whatever `base_url` the (possibly project-local) config supplies,
+        // making it a credential-exfil primitive. `build_openai_compatible_config`
+        // already emits a `tracing::warn!`, but mirror the M-58 path and also
+        // push a structured `ConfigWarning` so the warning reaches the
+        // operator-facing channel even when tracing is unconfigured.
+        if let ProviderConfig::OpenAiCompatible(compatible) = &provider
+            && compatible.preset == OpenAiCompatiblePreset::Custom
+        {
+            config_warnings.push(ConfigWarning {
+                source: "providers.custom".to_string(),
+                field: format!(
+                    "Custom preset bypasses the URL allow-list; verify base_url={} \
+                     is trusted before credentials are sent to it.",
+                    compatible.base_url
+                ),
+            });
+        }
         let tool_choice = get_var("SQUEEZY_TOOL_CHOICE")
             .map(|raw| raw.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -1968,6 +2075,54 @@ pub enum ProviderConfig {
     Faux(FauxConfig),
 }
 
+/// OpenAI Chat-Completions–style providers (one struct, many presets).
+///
+/// # Per-preset notes
+///
+/// **Fireworks (M-71)**: Fireworks ships three distinct API surfaces:
+/// 1. `/v1/chat/completions` — the OpenAI-compatible chat shape that
+///    this preset targets, supports the full Fireworks model catalog.
+/// 2. `/v1/responses` — Fireworks' own Responses API with hosted MCP
+///    tool support (not reachable via squeezy's `Fireworks` preset
+///    today; users wanting MCP tools can wire the `Custom` preset to
+///    `/v1/responses` and emit `OpenAI-Beta: responses=v1`).
+/// 3. `/v1/messages` — Anthropic-compatible Messages API surface, used
+///    by Pi for its 13 curated models. Reachable via the `Anthropic`
+///    provider with a custom `base_url`.
+///
+/// **Cerebras (M-58)**: chat-completions v2 (default-switchover
+/// 2026-07-21) tightens schema validation to require
+/// `max_completion_tokens` instead of `max_tokens`. The squeezy-llm
+/// Cerebras path emits the new key on the wire; squeezy-core surfaces
+/// a `ConfigWarning` at build time when `model.max_output_tokens` is
+/// set so operators can plan their cutover.
+///
+/// **Baseten (H-38)**: dedicated deployments live behind
+/// per-deployment hosts (`https://model-{deployment_id}.api.baseten.co/...`).
+/// Setting [`Self::deployment_id`] (or `BASETEN_DEPLOYMENT_ID`)
+/// substitutes the placeholder before the request fires; the
+/// `Baseten` preset still owns the `BASETEN_API_KEY` autoload and
+/// the `baseten` registry namespace.
+///
+/// **Cloudflare AI Gateway (H-41)**: typed `cf-aig-*` knobs ride on
+/// [`Self::cf_ai_gateway`]. User-supplied entries in
+/// [`Self::extra_headers`] always win over the projected
+/// `cf-aig-*` headers, matching the precedence for
+/// `cf-aig-authorization`.
+///
+/// **Vertex (H-28, VX-A/B)**: opt in to OAuth-sourced bearer tokens
+/// via [`Self::use_oauth`] (TOML `use_oauth = true` or implied by
+/// `GOOGLE_APPLICATION_CREDENTIALS` without `VERTEX_ACCESS_TOKEN`).
+/// The `global` location resolves to bare `aiplatform.googleapis.com`,
+/// matching Google's only-via-global Gemini 3 routing.
+///
+/// **Vercel AI Gateway (VL-2)**: `VERCEL_OIDC_TOKEN` (12h TTL,
+/// auto-injected into every Vercel function runtime) flows in as
+/// `api_key_env` when no explicit `AI_GATEWAY_API_KEY` is set.
+///
+/// M-63: redaction applies to the serde `Serialize` path only; the derived
+/// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
+/// `OpenAiCompatibleConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
     pub preset: OpenAiCompatiblePreset,
@@ -1978,6 +2133,7 @@ pub struct OpenAiCompatibleConfig {
     #[serde(serialize_with = "redact_secret_opt")]
     pub api_key: Option<String>,
     pub base_url: String,
+    #[serde(serialize_with = "redact_secret_map")]
     pub extra_headers: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
     /// Cloudflare account id. Populated for the Workers AI / AI Gateway
@@ -1992,6 +2148,93 @@ pub struct OpenAiCompatibleConfig {
     /// for the Workers AI preset and every non-Cloudflare preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_id: Option<String>,
+    /// Baseten dedicated-deployment id. When set together with a
+    /// `base_url` that carries `{deployment_id}` (or the per-deployment
+    /// shape `https://model-{deployment_id}.api.baseten.co/environments/production/sync/v1`),
+    /// the LLM client substitutes the placeholder before requests fire.
+    /// Lets users pin SLA-bound or bring-your-own-checkpoint models
+    /// without downgrading to the `Custom` preset and losing
+    /// `BASETEN_API_KEY` autoload, the `baseten` provider label, and
+    /// the `baseten` model-alias namespace. `None` keeps the existing
+    /// shared-endpoint contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    /// Cloudflare AI Gateway typed knobs forwarded as `cf-aig-*`
+    /// request headers. Populated when the active preset is
+    /// [`OpenAiCompatiblePreset::CloudflareAiGateway`]; `None` for
+    /// every other preset (so the schema cost is zero for them).
+    /// User-supplied entries in [`Self::extra_headers`] always win
+    /// over the values projected from this struct, matching the
+    /// existing precedence for `cf-aig-authorization`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_ai_gateway: Option<CloudflareAiGatewayConfig>,
+    /// Vertex AI: opt in to a refreshing OAuth source instead of the
+    /// static `VERTEX_ACCESS_TOKEN` snapshot. The LLM client decides
+    /// how to source tokens (squeezy-core does not depend on
+    /// `squeezy-llm`'s oauth module); it can construct
+    /// `VertexOAuthSource` from `GOOGLE_APPLICATION_CREDENTIALS` or
+    /// `gcloud auth application-default print-access-token`. Default
+    /// is `false`, preserving the historical static-snapshot
+    /// behavior.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub use_oauth: bool,
+}
+
+/// Typed `cf-aig-*` knob surface for the Cloudflare AI Gateway preset.
+/// Each field maps 1:1 to a documented request header that the LLM
+/// client emits at request time (header emission itself lives in
+/// `squeezy-llm::compatible` so the schema layer stays
+/// transport-agnostic). All fields are optional — leaving them unset
+/// preserves the gateway's defaults. See Cloudflare's "AI Gateway
+/// configuration headers" reference for the live list; squeezy
+/// exposes the stable subset that covers caching, observability, and
+/// per-request cost overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflareAiGatewayConfig {
+    /// `cf-aig-cache-ttl` — overrides the gateway-configured cache
+    /// TTL (seconds). Values are clamped by Cloudflare's bounds
+    /// (60s – 1mo); squeezy passes the integer through so a new
+    /// upper bound lands without a client release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<u32>,
+    /// `cf-aig-skip-cache: true` — bypasses the gateway cache for
+    /// this request. Useful for refresh probes and load tests.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub skip_cache: bool,
+    /// `cf-aig-event-id` — correlates this request with an upstream
+    /// event in the operator's tracing system. Free-form string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// `cf-aig-step` — names the pipeline step (e.g. `"plan"` /
+    /// `"act"`) so multi-step workflows can be filtered in the
+    /// AI Gateway log explorer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `cf-aig-collect-log: true` — opts into the gateway's
+    /// per-request log capture. Default is the gateway's
+    /// configured policy.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub collect_log: bool,
+    /// `cf-aig-skip-log: true` — opts the request out of logging
+    /// (e.g. for PII-bearing inputs). Wins over [`Self::collect_log`]
+    /// when both are set; Cloudflare also enforces this precedence.
+    #[serde(default, skip_serializing_if = "is_default_bool")]
+    pub skip_log: bool,
+    /// `cf-aig-metadata` — JSON-stringified blob attached to the
+    /// gateway log entry. Carry-through string; squeezy does not
+    /// validate JSON syntax so newly-added fields land without
+    /// migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    /// `cf-aig-cache-key` — overrides the cache key derivation so
+    /// callers can dedupe requests across cosmetically-different
+    /// prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+}
+
+fn is_default_bool(value: &bool) -> bool {
+    !*value
 }
 
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
@@ -2066,7 +2309,7 @@ impl OpenAiCompatiblePreset {
             Self::XAi => "xAI",
             Self::DeepSeek => "DeepSeek",
             Self::Vertex => "Google Vertex AI",
-            Self::Mistral => "Mistral La Plateforme",
+            Self::Mistral => "Mistral AI",
             Self::Together => "Together AI",
             Self::Fireworks => "Fireworks AI",
             Self::Cerebras => "Cerebras",
@@ -2085,11 +2328,14 @@ impl OpenAiCompatiblePreset {
     /// integration test ships in `crates/squeezy-llm/tests/`. Light presets
     /// return `false` and fall back to generic context-window estimates.
     pub const fn is_full_tier(self) -> bool {
+        // PortKey was historically full-tier but has no dedicated costly
+        // integration test and routes via user-defined virtual keys /
+        // integration slugs (see preset-portkey.md PK-3). Treat as a light
+        // preset until a costly test ships.
         matches!(
             self,
             Self::OpenRouter
                 | Self::Vercel
-                | Self::PortKey
                 | Self::Groq
                 | Self::XAi
                 | Self::DeepSeek
@@ -2162,6 +2408,9 @@ impl OpenAiCompatiblePreset {
             // upstream bearer when routing through AI Gateway. The optional
             // gateway-level token (`cf-aig-authorization`) is configured
             // separately via `CF_AIG_TOKEN` and injected as an extra header.
+            // Vendor-canonical alias `CLOUDFLARE_API_TOKEN` is exposed via
+            // the free fn [`preset_api_key_env_aliases`] (the single source
+            // of truth for fallback env-var names).
             Self::CloudflareWorkersAi => "CLOUDFLARE_API_KEY",
             Self::CloudflareAiGateway => "CLOUDFLARE_API_KEY",
             Self::Custom => "",
@@ -2259,6 +2508,24 @@ pub struct OpenAiConfig {
     #[serde(serialize_with = "redact_secret_opt")]
     pub api_key: Option<String>,
     pub base_url: String,
+    /// Pay-As-You-Go org slug forwarded as the `OpenAI-Organization`
+    /// header so spend attributes against the right billing org when
+    /// the API key has access to multiple. `None` keeps the legacy
+    /// behavior of letting OpenAI pick the user's default org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Project id forwarded as `OpenAI-Project` so multi-project orgs
+    /// attribute usage to the right project rather than the org's
+    /// fallback project. Reads `OPENAI_PROJECT_ID` env / `project` TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Service tier forwarded as the `service_tier` body field on
+    /// `/responses` and chat-completions calls. Accepts `"auto"`,
+    /// `"default"`, `"flex"`, `"priority"`, and `"scale"`; the
+    /// provider passes the string through so newly-added tiers do
+    /// not require a client release. `None` lets OpenAI pick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -2293,6 +2560,9 @@ pub struct GoogleConfig {
     pub transport: ProviderTransportConfig,
 }
 
+// M-63: redaction applies to the serde `Serialize` path only; the derived
+// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
+// `AzureOpenAiConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureOpenAiConfig {
     pub api_key_env: String,
@@ -2310,6 +2580,38 @@ pub struct AzureOpenAiConfig {
     /// "deployment id is the model id" behavior.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub deployment_name_map: BTreeMap<String, String>,
+    /// Operator-controlled HTTP headers forwarded on every Azure OpenAI
+    /// request. Lets users wire `Apim-Subscription-Key` for API Management
+    /// fronted deployments, `x-ms-client-request-id` for correlation,
+    /// `x-ms-region` pinning, or an explicit `Authorization: Bearer …`
+    /// that overrides the default `api-key` header (Entra ID / managed
+    /// identity flows resolved out-of-band). User-supplied headers always
+    /// win over the provider's defaults so an override is honored
+    /// verbatim. Keyed via the standard `[providers.azure_openai.headers]`
+    /// TOML table, matching the OpenAI-compatible preset shape.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "redact_secret_map"
+    )]
+    pub extra_headers: BTreeMap<String, String>,
+    /// Switches the provider away from the default `api-key: …` header
+    /// to `Authorization: Bearer …` so Microsoft Entra ID / managed
+    /// identity flows can authenticate against Azure OpenAI. The actual
+    /// bearer is sourced from `AZURE_OPENAI_BEARER_TOKEN` (an external
+    /// refresher — `az account get-access-token`, IMDS, or a sidecar —
+    /// keeps the env var current). Defaults to `false`, preserving the
+    /// historical API-key behavior.
+    #[serde(default)]
+    pub use_entra_id: bool,
+    /// Bearer token resolved from the environment when `use_entra_id`
+    /// is set. Snapshot at config build time; treat as short-lived and
+    /// arrange for the supplying process to refresh the env var before
+    /// expiry. `None` means no token was available — the provider
+    /// then surfaces an explicit error rather than silently falling
+    /// back to the api-key path.
+    #[serde(default, serialize_with = "redact_secret_opt")]
+    pub entra_bearer_token: Option<String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -2824,6 +3126,10 @@ impl HardeningConfig {
     }
 }
 
+// M-63: redaction lives on the serde `Serialize` path only (see
+// `redact_secret_opt` below). The derived `Debug` is NOT redacted — the
+// inline `api_key` prints verbatim under `{:?}`. Never `{:?}`-log a
+// `ProviderSettings`; serialize it (or its fields individually) instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub api_key_env: Option<String>,
@@ -2845,6 +3151,17 @@ pub struct ProviderSettings {
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
+    /// `[providers.<section>.headers]` carries `extra_headers` that
+    /// reach the upstream verbatim. The Custom-preset workaround for
+    /// non-Bearer auth (LiteLLM `x-litellm-key`, PortKey
+    /// `x-portkey-api-key`, vLLM bearer, corporate proxies that want
+    /// `api-key` / `x-api-key`) routes the actual secret through here,
+    /// so M-63 masks each value as `"<redacted>"` on the Serialize
+    /// side. The *names* of the headers stay visible so operators can
+    /// see which keys are wired without leaking the values; the
+    /// Deserialize side is untouched so loaded TOML still binds to the
+    /// real values at request time.
+    #[serde(serialize_with = "redact_secret_map_opt")]
     pub headers: Option<BTreeMap<String, String>>,
     /// Bedrock only: operator-defined cost-allocation tags threaded into
     /// every ConverseStream request via `set_request_metadata` so AWS
@@ -2863,6 +3180,36 @@ pub struct ProviderSettings {
     /// Faux-only: path to a TOML script file consumed by the in-process
     /// faux provider. Other providers ignore this field.
     pub script: Option<String>,
+    /// Azure-only: opt in to the Entra ID / managed-identity bearer auth
+    /// path. When `Some(true)` the provider emits `Authorization: Bearer`
+    /// sourced from `AZURE_OPENAI_BEARER_TOKEN` instead of the default
+    /// `api-key` header. Tri-state (`None`) so the higher-precedence
+    /// layer can leave the value untouched during settings merge.
+    pub use_entra_id: Option<bool>,
+    /// OpenAI-only: PayG org slug forwarded as `OpenAI-Organization`.
+    /// Ignored by every other provider.
+    pub organization: Option<String>,
+    /// OpenAI-only: project id forwarded as `OpenAI-Project`. Ignored by
+    /// every other provider.
+    pub project: Option<String>,
+    /// OpenAI-only: `service_tier` body field (`flex`, `priority`,
+    /// `default`, `auto`, `scale`). Pass-through string so new tiers
+    /// land without a client release. Ignored by every other provider.
+    pub service_tier: Option<String>,
+    /// Baseten-only: dedicated-deployment id used to substitute
+    /// `{deployment_id}` in the resolved `base_url`. Ignored by every
+    /// other preset.
+    pub deployment_id: Option<String>,
+    /// Cloudflare AI Gateway only: typed `cf-aig-*` knob surface.
+    /// Stored as a tri-state nested table — `None` means the TOML
+    /// section omitted the `[providers.cloudflare_ai_gateway.cf_ai_gateway]`
+    /// block entirely, so the higher-precedence layer's value (if any)
+    /// remains in effect during merge.
+    pub cf_ai_gateway: Option<CloudflareAiGatewayConfig>,
+    /// Vertex-only: opt in to OAuth-sourced bearer tokens. Tri-state
+    /// (`None` to preserve the higher-precedence layer during merge,
+    /// `Some(false)` to explicitly disable, `Some(true)` to enable).
+    pub use_oauth: Option<bool>,
 }
 
 impl ProviderSettings {
@@ -2889,6 +3236,13 @@ impl ProviderSettings {
                 "deployment_name_map",
                 "route_style",
                 "script",
+                "use_entra_id",
+                "organization",
+                "project",
+                "service_tier",
+                "deployment_id",
+                "cf_ai_gateway",
+                "use_oauth",
             ],
             source,
             path,
@@ -2905,6 +3259,27 @@ impl ProviderSettings {
                         )));
                     };
                     let resolved = resolve_shell_escape(value.clone(), source, &header_path)?;
+                    // M-65: reject CR/LF (and any other non-`HeaderValue`
+                    // byte) at config-load. `http::HeaderValue` already
+                    // refuses anything outside `[0x20..0x7E] ∪ {0x09}`
+                    // at request time, but the failure mode there is a
+                    // deferred reqwest builder error ("invalid HTTP
+                    // header value") with no field name — the operator
+                    // sees the error mid-stream and has to guess which
+                    // header tripped it. Failing here points at the
+                    // exact TOML path and notes that CR/LF are forbidden
+                    // so a copy-paste-from-curl mishap surfaces with a
+                    // usable hint. Header *names* are not validated
+                    // here: `reqwest` already rejects bad names at
+                    // request-construction time and the audit (M-65)
+                    // explicitly scopes this check to values only.
+                    if http::HeaderValue::from_str(&resolved).is_err() {
+                        return Err(SqueezyError::Config(format!(
+                            "{source}: {header_path} contains bytes that cannot be sent as an \
+                             HTTP header value (CR/LF and other control characters are \
+                             forbidden); strip them or escape them out of band"
+                        )));
+                    }
                     map.insert(key.clone(), resolved);
                 }
                 Some(map)
@@ -2935,6 +3310,90 @@ impl ProviderSettings {
                 return Err(SqueezyError::Config(format!(
                     "{source}: {} must be a TOML table of string deployment names",
                     field(path, "deployment_name_map"),
+                )));
+            }
+        };
+        let cf_ai_gateway = match table.get("cf_ai_gateway") {
+            None => None,
+            Some(toml::Value::Table(inner)) => {
+                let inner_path = field(path, "cf_ai_gateway");
+                reject_unknown_keys(
+                    inner,
+                    &[
+                        "cache_ttl",
+                        "skip_cache",
+                        "event_id",
+                        "step",
+                        "collect_log",
+                        "skip_log",
+                        "metadata",
+                        "cache_key",
+                    ],
+                    source,
+                    &inner_path,
+                )?;
+                Some(CloudflareAiGatewayConfig {
+                    cache_ttl: match u64_nonnegative_value(
+                        inner,
+                        "cache_ttl",
+                        source,
+                        &field(&inner_path, "cache_ttl"),
+                    )? {
+                        None => None,
+                        Some(value) if value <= u32::MAX as u64 => Some(value as u32),
+                        Some(value) => {
+                            return Err(SqueezyError::Config(format!(
+                                "{source}: {}: expected an integer fitting in u32 (got {value})",
+                                field(&inner_path, "cache_ttl"),
+                            )));
+                        }
+                    },
+                    skip_cache: bool_value(
+                        inner,
+                        "skip_cache",
+                        source,
+                        &field(&inner_path, "skip_cache"),
+                    )?
+                    .unwrap_or(false),
+                    event_id: string_value(
+                        inner,
+                        "event_id",
+                        source,
+                        &field(&inner_path, "event_id"),
+                    )?,
+                    step: string_value(inner, "step", source, &field(&inner_path, "step"))?,
+                    collect_log: bool_value(
+                        inner,
+                        "collect_log",
+                        source,
+                        &field(&inner_path, "collect_log"),
+                    )?
+                    .unwrap_or(false),
+                    skip_log: bool_value(
+                        inner,
+                        "skip_log",
+                        source,
+                        &field(&inner_path, "skip_log"),
+                    )?
+                    .unwrap_or(false),
+                    metadata: string_value(
+                        inner,
+                        "metadata",
+                        source,
+                        &field(&inner_path, "metadata"),
+                    )?,
+                    cache_key: string_value(
+                        inner,
+                        "cache_key",
+                        source,
+                        &field(&inner_path, "cache_key"),
+                    )?,
+                })
+            }
+            Some(_) => {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} must be a TOML table of cf-aig-* knobs",
+                    field(path, "cf_ai_gateway"),
                 )));
             }
         };
@@ -2998,6 +3457,28 @@ impl ProviderSettings {
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
             script: string_value(table, "script", source, &field(path, "script"))?,
+            use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
+            organization: string_value(
+                table,
+                "organization",
+                source,
+                &field(path, "organization"),
+            )?,
+            project: string_value(table, "project", source, &field(path, "project"))?,
+            service_tier: string_value(
+                table,
+                "service_tier",
+                source,
+                &field(path, "service_tier"),
+            )?,
+            deployment_id: string_value(
+                table,
+                "deployment_id",
+                source,
+                &field(path, "deployment_id"),
+            )?,
+            cf_ai_gateway,
+            use_oauth: bool_value(table, "use_oauth", source, &field(path, "use_oauth"))?,
         })
     }
 
@@ -3022,6 +3503,13 @@ impl ProviderSettings {
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
         replace_if_some(&mut self.script, next.script);
+        replace_if_some(&mut self.use_entra_id, next.use_entra_id);
+        replace_if_some(&mut self.organization, next.organization);
+        replace_if_some(&mut self.project, next.project);
+        replace_if_some(&mut self.service_tier, next.service_tier);
+        replace_if_some(&mut self.deployment_id, next.deployment_id);
+        replace_if_some(&mut self.cf_ai_gateway, next.cf_ai_gateway);
+        replace_if_some(&mut self.use_oauth, next.use_oauth);
     }
 }
 
@@ -3040,6 +3528,59 @@ where
         Some(_) => serializer.serialize_some("<redacted>"),
         None => serializer.serialize_none(),
     }
+}
+
+/// Serialize-side redactor for header maps. M-63: a `Custom`-preset
+/// workaround for non-Bearer auth is to smuggle the secret through
+/// `[providers.openai_compatible.headers] x-api-key = "..."`, but
+/// `ProviderSettings::headers` would otherwise serialize verbatim and
+/// leak the value into any serde-Serialize path that touches the
+/// settings struct (bug reports, `--diagnostics`, panic envelopes, the
+/// effective-config dump). Mirror the
+/// [`redact_secret_opt`] contract — preserve the *shape* of the field
+/// (`None` stays `None`, empty map stays empty, populated keys stay
+/// visible so operators can tell which headers are set) but mask every
+/// *value* as `"<redacted>"`. Header names are not secrets on their
+/// own; the actual credential always lives in the value half.
+fn redact_secret_map_opt<S>(
+    value: &Option<BTreeMap<String, String>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    match value {
+        Some(map) => {
+            let mut entries = serializer.serialize_map(Some(map.len()))?;
+            for key in map.keys() {
+                entries.serialize_entry(key, "<redacted>")?;
+            }
+            entries.end()
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Serialize a `BTreeMap` header table with every value masked to
+/// `"<redacted>"` while keeping the keys visible. Header *values* on resolved
+/// provider configs can carry credentials (`Authorization: Bearer …`,
+/// `Apim-Subscription-Key`, `cf-aig-authorization`), so any serde-Serialize of
+/// the config (diagnostics, panic envelopes, effective-config dumps) must not
+/// leak them. Mirrors [`redact_secret_map_opt`] for non-`Option` fields.
+fn redact_secret_map<S>(
+    value: &BTreeMap<String, String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut entries = serializer.serialize_map(Some(value.len()))?;
+    for key in value.keys() {
+        entries.serialize_entry(key, "<redacted>")?;
+    }
+    entries.end()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -8596,6 +9137,10 @@ fn provider_setting(
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         "script" => settings.script.as_ref(),
+        "organization" => settings.organization.as_ref(),
+        "project" => settings.project.as_ref(),
+        "service_tier" => settings.service_tier.as_ref(),
+        "deployment_id" => settings.deployment_id.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -8606,6 +9151,52 @@ fn provider_setting_headers(
     provider: &str,
 ) -> Option<BTreeMap<String, String>> {
     providers.get(provider)?.headers.clone()
+}
+
+/// Resolve a `[providers.<section>.headers]` table from the first section
+/// in `sections` that defines a non-empty map. Lets providers that accept
+/// multiple TOML section aliases (e.g. Azure's `azure_openai` / `azure`)
+/// share one header table without duplicating the lookup at every call
+/// site.
+fn provider_setting_headers_any(
+    providers: &BTreeMap<String, ProviderSettings>,
+    sections: &[&str],
+) -> Option<BTreeMap<String, String>> {
+    for section in sections {
+        if let Some(headers) = providers
+            .get(*section)
+            .and_then(|settings| settings.headers.as_ref())
+            && !headers.is_empty()
+        {
+            return Some(headers.clone());
+        }
+    }
+    None
+}
+
+/// Resolve a typed boolean setting (currently `use_entra_id`) from the
+/// first section in `sections` that defines it. Returns the first
+/// non-`None` value so the higher-precedence alias wins when both
+/// sections set the flag.
+fn provider_setting_bool_any(
+    providers: &BTreeMap<String, ProviderSettings>,
+    sections: &[&str],
+    key: &str,
+) -> Option<bool> {
+    for section in sections {
+        let Some(settings) = providers.get(*section) else {
+            continue;
+        };
+        let value = match key {
+            "use_entra_id" => settings.use_entra_id,
+            "use_oauth" => settings.use_oauth,
+            _ => None,
+        };
+        if value.is_some() {
+            return value;
+        }
+    }
+    None
 }
 
 /// Resolve the Azure `deployment_name_map` from the first section in
@@ -8660,13 +9251,46 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
 /// (`localhost`, `127.0.0.0/8`, or `[::1]`). Anything else (LAN IPs, public
 /// hostnames) must use HTTPS so a misconfigured config file cannot silently
 /// exfiltrate API keys + prompt content to an attacker-controlled origin.
+/// Independently of scheme, refuses any host that is a cloud-metadata
+/// sentinel or IPv4/IPv6 link-local address. `https://169.254.169.254/...`,
+/// `https://metadata.google.internal/...`, and `https://[fe80::1]/...`
+/// would otherwise sail through the http-only filter and ship the Bearer
+/// token to AWS IMDS / GCP metadata / Azure IMDS / a link-local
+/// adversary on the LAN.
 fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
     let trimmed = base_url.trim();
-    let Some(rest) = trimmed.strip_prefix("http://") else {
+    // Extract the host irrespective of scheme so the metadata-sentinel
+    // check fires for `https://` too (the original http-only filter
+    // shipped Bearer tokens to AWS IMDS over TLS without complaint).
+    let host_only = extract_host_only(trimmed);
+    if let Some(host) = host_only.as_deref()
+        && is_metadata_or_link_local_host(host)
+    {
+        return Err(SqueezyError::Config(format!(
+            "providers.{section}.base_url host {host:?} resolves to a cloud-metadata or \
+             link-local address (got {trimmed:?}); refusing to ship API keys or prompt \
+             content to IMDS / metadata endpoints"
+        )));
+    }
+    let Some(_rest) = trimmed.strip_prefix("http://") else {
         // Empty, https://, or any non-http scheme: the existing emptiness +
         // reachability checks elsewhere handle these. We only police http.
         return Ok(());
     };
+    if host_only.as_deref().is_some_and(is_loopback_host) {
+        return Ok(());
+    }
+    Err(SqueezyError::Config(format!(
+        "providers.{section}.base_url must use https:// for non-loopback hosts (got {trimmed:?}); \
+         API keys and prompt content would otherwise transit in cleartext"
+    )))
+}
+
+/// Parse the host component out of a `base_url` string irrespective of
+/// scheme. Returns `None` when the input lacks an `://` separator (we
+/// only have a path) or is empty after the separator.
+fn extract_host_only(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, rest)| rest)?;
     let host = rest
         .split('/')
         .next()
@@ -8674,18 +9298,19 @@ fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
         .rsplit('@')
         .next()
         .unwrap_or("");
-    let host_only = host
+    if host.is_empty() {
+        return None;
+    }
+    let stripped = host
         .strip_prefix('[')
         .and_then(|s| s.split_once(']'))
-        .map(|(h, _)| h)
-        .unwrap_or_else(|| host.split(':').next().unwrap_or(""));
-    if is_loopback_host(host_only) {
-        return Ok(());
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| host.split(':').next().unwrap_or("").to_string());
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
     }
-    Err(SqueezyError::Config(format!(
-        "providers.{section}.base_url must use https:// for non-loopback hosts (got {trimmed:?}); \
-         API keys and prompt content would otherwise transit in cleartext"
-    )))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -8698,13 +9323,93 @@ fn is_loopback_host(host: &str) -> bool {
     false
 }
 
+/// Secondary env-var names accepted as fallbacks when the preset's
+/// canonical `default_api_key_env` is empty. Lets squeezy honor the
+/// out-of-band conventions mainstream platforms inject.
+fn preset_api_key_env_aliases(preset: OpenAiCompatiblePreset) -> &'static [&'static str] {
+    match preset {
+        OpenAiCompatiblePreset::Vercel => &["VERCEL_OIDC_TOKEN"],
+        OpenAiCompatiblePreset::CloudflareWorkersAi
+        | OpenAiCompatiblePreset::CloudflareAiGateway => &["CLOUDFLARE_API_TOKEN"],
+        OpenAiCompatiblePreset::DeepInfra => &["DEEPINFRA_TOKEN"],
+        _ => &[],
+    }
+}
+
+/// `true` when the literal host (no DNS resolution) names a cloud-metadata
+/// sentinel or sits in an IPv4/IPv6 link-local range.
+pub fn is_metadata_or_link_local_host(host: &str) -> bool {
+    const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata", "metadata.google"];
+    for needle in METADATA_HOSTS {
+        if host.eq_ignore_ascii_case(needle) {
+            return true;
+        }
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_metadata_or_link_local_ip(&ip);
+    }
+    false
+}
+
+/// IP-address half of the metadata / link-local filter.
+pub fn is_metadata_or_link_local_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            // Canonicalize IPv4-mapped addresses (e.g. `::ffff:169.254.169.254`)
+            // and apply the IPv4 rules to the embedded address. Without this a
+            // mapped IMDS/link-local literal slips past the narrow v6 checks
+            // below — a well-known SSRF evasion that would otherwise re-open the
+            // credential-exfiltration vector this filter exists to close.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_metadata_or_link_local_ip(&std::net::IpAddr::V4(v4));
+            }
+            let segments = v6.segments();
+            // `fe80::/10` link-local, plus the entire `fc00::/7` IPv6
+            // unique-local range (ULA). The AWS IPv6 IMDS sentinel
+            // `fd00:ec2::254` sits inside `fc00::/7`, so the broad ULA test
+            // subsumes it; without the range check a ULA-addressed internal
+            // metadata/admin endpoint would slip past the narrow literal.
+            (segments[0] & 0xffc0) == 0xfe80 || (segments[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 fn build_openai_compatible_config(
     preset: OpenAiCompatiblePreset,
     providers: &BTreeMap<String, ProviderSettings>,
     get_var: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<ProviderConfig> {
     let section = preset.as_str();
+    // Some presets ship secondary env-var names that mainstream tooling
+    // honors out-of-band (Vercel injects `VERCEL_OIDC_TOKEN` into
+    // every function runtime; Cloudflare's API token historically
+    // shipped as both `CLOUDFLARE_API_KEY` and `CLOUDFLARE_API_TOKEN`;
+    // DeepInfra docs reference both `DEEPINFRA_API_KEY` and
+    // `DEEPINFRA_TOKEN`). When the user hasn't explicitly named an
+    // `api_key_env` AND the preset's default env is empty in this
+    // process, fall back to the first non-empty alias so an
+    // out-of-the-box session works without per-shell env juggling.
     let api_key_env = provider_setting(providers, section, "api_key_env")
+        .or_else(|| {
+            let candidate = preset.default_api_key_env();
+            if !candidate.is_empty()
+                && get_var(candidate)
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                preset_api_key_env_aliases(preset)
+                    .iter()
+                    .find(|alias| {
+                        get_var(alias)
+                            .map(|value| !value.trim().is_empty())
+                            .unwrap_or(false)
+                    })
+                    .map(|alias| (*alias).to_string())
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             let candidate = preset.default_api_key_env();
             if candidate.is_empty() {
@@ -8803,15 +9508,93 @@ fn build_openai_compatible_config(
         if !has_gateway_header && let Some(token) = get_var("CF_AIG_TOKEN") {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
-                extra_headers.insert(
-                    "cf-aig-authorization".to_string(),
-                    format!("Bearer {trimmed}"),
-                );
+                let value = format!("Bearer {trimmed}");
+                // M-65 parity: the TOML `[headers]` path validates CR/LF at
+                // config-load, but this env-sourced header bypassed that check
+                // and only `trim()`s — an embedded CR/LF would survive to a
+                // field-less reqwest error mid-stream. Validate here too.
+                if http::HeaderValue::from_str(&value).is_err() {
+                    return Err(SqueezyError::Config(
+                        "CF_AIG_TOKEN contains bytes that cannot be sent as an HTTP header \
+                         value (CR/LF and other control characters are forbidden); strip them"
+                            .to_string(),
+                    ));
+                }
+                extra_headers.insert("cf-aig-authorization".to_string(), value);
             }
         }
     }
     let transport = provider_transport_settings(providers, &[section]);
     let api_key = provider_setting(providers, section, "api_key");
+    // Baseten dedicated deployments live behind per-deployment hosts
+    // (`https://model-{deployment_id}.api.baseten.co/...`). The
+    // placeholder substitution lives in the LLM client; here we just
+    // collect the id so the runtime path has it. Reading from BOTH
+    // `BASETEN_DEPLOYMENT_ID` env and TOML lets repo configs name a
+    // sane default while operators per-shell override the deployment
+    // they're testing.
+    let deployment_id = if matches!(preset, OpenAiCompatiblePreset::Baseten) {
+        get_var("BASETEN_DEPLOYMENT_ID")
+            .or_else(|| provider_setting(providers, section, "deployment_id"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    // The cf-aig-* knob surface only lights up for the AI Gateway preset.
+    // Workers AI talks to Cloudflare directly and has no gateway between
+    // squeezy and the model, so forwarding the same knobs there would
+    // produce silent-no-op headers.
+    let cf_ai_gateway = if matches!(preset, OpenAiCompatiblePreset::CloudflareAiGateway) {
+        providers
+            .get(section)
+            .and_then(|settings| settings.cf_ai_gateway.clone())
+    } else {
+        None
+    };
+    // Vertex OAuth opt-in: explicit `use_oauth = true` in TOML wins;
+    // otherwise infer from the environment — when `VERTEX_USE_OAUTH=1`
+    // is set, or when the user supplied
+    // `GOOGLE_APPLICATION_CREDENTIALS` (an ADC-style refresher) but no
+    // static `VERTEX_ACCESS_TOKEN`. The LLM client is responsible for
+    // actually wiring a `VertexOAuthSource` — squeezy-core only
+    // surfaces the intent.
+    let use_oauth = if matches!(preset, OpenAiCompatiblePreset::Vertex) {
+        if let Some(value) =
+            provider_setting_bool_any(providers, &[section, "vertex_ai"], "use_oauth")
+        {
+            value
+        } else if let Some(flag) = get_var("VERTEX_USE_OAUTH") {
+            matches!(
+                flag.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        } else {
+            get_var("GOOGLE_APPLICATION_CREDENTIALS").is_some()
+                && get_var("VERTEX_ACCESS_TOKEN").is_none()
+        }
+    } else {
+        false
+    };
+    // M-64: the `Custom` preset is the documented escape hatch for
+    // self-hosted LiteLLM, vLLM, FastChat, and internal model gateways
+    // (CT-3 in the shared audit). It carries no URL allow-list — every
+    // other preset has a curated `default_base_url` that operators can
+    // recognize at a glance, but Custom accepts whatever the user
+    // supplies. A malicious project-local `./squeezy.toml` with
+    // `model.provider = "openai_compatible"` + `base_url =
+    // "https://attacker/v1"` + `api_key_env = "OPENAI_API_KEY"` is a
+    // one-line credential-exfil primitive. Emit a startup warning so
+    // operators see the resolved host before traffic flows; this is
+    // explicitly *lightweight* (no interactive prompting, no refusal)
+    // because the threat shape is project-config drift, not a
+    // capability we need to gate.
+    if matches!(preset, OpenAiCompatiblePreset::Custom) {
+        tracing::warn!(
+            target: "squeezy_core::config",
+            "Custom preset bypasses URL allow-list; verify base_url={base_url} is trusted"
+        );
+    }
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,
@@ -8821,6 +9604,9 @@ fn build_openai_compatible_config(
         transport,
         account_id,
         gateway_id,
+        deployment_id,
+        cf_ai_gateway,
+        use_oauth,
     }))
 }
 

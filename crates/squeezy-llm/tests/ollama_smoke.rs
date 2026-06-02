@@ -66,6 +66,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());
@@ -90,6 +91,9 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // are ignored by the smoke harness.
+            _ => { /* future variant */ }
         }
     }
 

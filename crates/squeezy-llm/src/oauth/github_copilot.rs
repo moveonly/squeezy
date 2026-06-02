@@ -767,7 +767,7 @@ pub async fn login_github_copilot_interactive(
 ) -> Result<GitHubCopilotLoginOutcome> {
     let domain = enterprise_domain.unwrap_or(DEFAULT_DOMAIN);
     let urls = GitHubCopilotUrls::for_domain(domain);
-    let client = reqwest::Client::new();
+    let client = crate::transport::shared_client(&ProviderTransportConfig::default());
 
     let device = start_device_flow(&client, &urls).await?;
     (hooks.on_device_code)(&device);
@@ -855,7 +855,7 @@ impl GitHubCopilotOAuthSource {
             })),
             auth_path,
             urls,
-            http_client: reqwest::Client::new(),
+            http_client: crate::transport::shared_client(&ProviderTransportConfig::default()),
             label: "github_copilot".to_string(),
         }
     }
@@ -883,7 +883,7 @@ impl GitHubCopilotOAuthSource {
             })),
             auth_path,
             urls,
-            http_client: reqwest::Client::new(),
+            http_client: crate::transport::shared_client(&ProviderTransportConfig::default()),
             label: "github_copilot".to_string(),
         }
     }
@@ -996,6 +996,10 @@ impl ApiKeySource for GitHubCopilotOAuthSource {
 
     fn provider_label(&self) -> &str {
         &self.label
+    }
+
+    fn can_rotate(&self) -> bool {
+        true
     }
 }
 

@@ -866,6 +866,10 @@ impl ApiKeySource for OpenAiCodexOAuthSource {
     fn provider_label(&self) -> &str {
         &self.label
     }
+
+    fn can_rotate(&self) -> bool {
+        true
+    }
 }
 
 // ─── Codex provider client ─────────────────────────────────────────────────

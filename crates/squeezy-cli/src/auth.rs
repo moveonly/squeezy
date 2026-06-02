@@ -114,6 +114,18 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
         env: "SQUEEZY_CEREBRAS_KEY",
         fallback_env: Some("CEREBRAS_API_KEY"),
     },
+    // Match the core runtime resolver, which treats `DEEPINFRA_API_KEY` as the
+    // canonical primary (`default_api_key_env`) and `DEEPINFRA_TOKEN` as the
+    // alias consulted only when the primary is empty
+    // (`preset_api_key_env_aliases`). Keeping the CLI status table in the same
+    // order avoids `squeezy auth status` reporting a different effective
+    // credential than the one a request actually authenticates with.
+    KnownProvider {
+        section: "deepinfra",
+        cli: "deepinfra",
+        env: "DEEPINFRA_API_KEY",
+        fallback_env: Some("DEEPINFRA_TOKEN"),
+    },
     // Local self-hosted OpenAI-compatible servers. They typically run without
     // authentication on a loopback port; the inline-key slot exists so users
     // can stand up a reverse proxy that requires a bearer token.
@@ -760,6 +772,7 @@ fn static_section_name(provider: &str) -> &'static str {
         "together" => "together",
         "fireworks" => "fireworks",
         "cerebras" => "cerebras",
+        "deepinfra" => "deepinfra",
         "lmstudio" => "lmstudio",
         "vllm" => "vllm",
         "llamacpp" => "llamacpp",

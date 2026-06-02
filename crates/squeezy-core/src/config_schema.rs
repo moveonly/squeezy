@@ -1606,11 +1606,13 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     };
     use crate::{
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
-        DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL, DEFAULT_BEDROCK_REGION,
-        DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL,
-        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_ORIGINATOR, FauxConfig, GoogleConfig,
-        OllamaConfig, OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset,
-        OpenAiConfig, ProviderTransportConfig,
+        DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL,
+        DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL, DEFAULT_BEDROCK_REGION,
+        DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL, DEFAULT_OLLAMA_BASE_URL,
+        DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
+        DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR, DEFAULT_OPENAI_MODEL,
+        FauxConfig, GoogleConfig, OllamaConfig, OpenAiCodexConfig, OpenAiCompatibleConfig,
+        OpenAiCompatiblePreset, OpenAiConfig, ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     let (provider, default_model) = match s {
@@ -1619,6 +1621,9 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
                 api_key: None,
                 base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+                organization: None,
+                project: None,
+                service_tier: None,
                 transport,
             }),
             DEFAULT_OPENAI_MODEL,
@@ -1656,6 +1661,9 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
                 api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
                 deployment_name_map: BTreeMap::new(),
+                extra_headers: BTreeMap::new(),
+                use_entra_id: false,
+                entra_bearer_token: None,
                 transport,
             }),
             DEFAULT_AZURE_OPENAI_MODEL,
@@ -1699,6 +1707,9 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                     transport,
                     account_id: None,
                     gateway_id: None,
+                    deployment_id: None,
+                    cf_ai_gateway: None,
+                    use_oauth: false,
                 }),
                 default_model,
             )

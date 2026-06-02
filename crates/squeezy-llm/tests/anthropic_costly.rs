@@ -50,6 +50,7 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());
@@ -74,6 +75,9 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // are ignored by the costly smoke test.
+            _ => { /* future variant */ }
         }
     }
 

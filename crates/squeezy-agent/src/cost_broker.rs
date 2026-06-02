@@ -311,8 +311,17 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
             LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => text.len() as u64,
             LlmInputItem::FunctionCallOutput { output, .. } => output.len() as u64,
             LlmInputItem::Image { bytes, .. } => bytes.len() as u64,
+            // Document payloads (PDF/CSV/…) are transmitted on the wire
+            // (Bedrock/Anthropic document blocks), so count their bytes for the
+            // bytes→tokens calibration EMA — matching context_compaction's
+            // accounting. Omitting them biased the ratio for document turns.
+            LlmInputItem::Document { bytes, .. } => bytes.len() as u64,
             LlmInputItem::FunctionCall { arguments, .. } => serialized_json_len(arguments),
             LlmInputItem::Reasoning(payload) => payload.display_text().len() as u64,
+            // `LlmInputItem` is `#[non_exhaustive]`; unknown future variants
+            // contribute zero bytes to the calibration EMA until a
+            // dedicated arm exists.
+            _ => 0,
         });
     }
     for spec in request.tools.iter() {

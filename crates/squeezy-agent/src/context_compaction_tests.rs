@@ -3,8 +3,8 @@ use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
 
 use super::{
-    build_compaction_summary, build_structured_compaction_prompt, is_structured_compaction_summary,
-    strip_media_for_compaction,
+    build_compaction_summary, build_structured_compaction_prompt, estimate_context,
+    is_structured_compaction_summary, strip_media_for_compaction,
 };
 
 fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {
@@ -27,6 +27,8 @@ fn function_call_output(call_id: &str, output: &str) -> LlmInputItem {
     LlmInputItem::FunctionCallOutput {
         call_id: call_id.to_string(),
         output: output.to_string(),
+        content_parts: None,
+        is_error: false,
     }
 }
 
@@ -624,4 +626,120 @@ fn compaction_summary_dedups_repeated_file_touches() {
 
     let body = lineage_block(&summary, "read-files").expect("<read-files> block missing");
     assert_eq!(body, "crates/squeezy-core/src/lib.rs");
+}
+
+#[test]
+fn strip_replaces_image_content_part_with_placeholder() {
+    // A structured-result `Image` part carries raw bytes that the text
+    // `output` scan never touches. Compaction must drop those bytes,
+    // leaving a short placeholder, while preserving text parts (with their
+    // inline data URIs scrubbed).
+    let payload = long_base64_payload();
+    let items = vec![LlmInputItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: "short".to_string(),
+        content_parts: Some(vec![
+            squeezy_llm::ToolResultPart::Text {
+                text: format!("see data:image/png;base64,{payload} done"),
+            },
+            squeezy_llm::ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                bytes: vec![0u8; 4096].into(),
+            },
+        ]),
+        is_error: false,
+    }];
+
+    let stripped = strip_media_for_compaction(&items);
+    let LlmInputItem::FunctionCallOutput { content_parts, .. } = &stripped[0] else {
+        panic!("expected FunctionCallOutput");
+    };
+    let parts = content_parts.as_ref().expect("content_parts retained");
+    assert_eq!(parts.len(), 2, "part count changed; got {parts:?}");
+
+    match &parts[0] {
+        squeezy_llm::ToolResultPart::Text { text } => {
+            assert!(
+                text.contains("[image]"),
+                "data URI not scrubbed; got {text:?}"
+            );
+            assert!(
+                !text.contains(payload.as_str()),
+                "base64 payload leaked through text part; got {text:?}"
+            );
+        }
+        other => panic!("expected text part, got {other:?}"),
+    }
+    match &parts[1] {
+        squeezy_llm::ToolResultPart::Text { text } => {
+            assert_eq!(text, "[image]", "image part not replaced; got {text:?}");
+        }
+        squeezy_llm::ToolResultPart::Image { .. } => {
+            panic!("image bytes survived compaction")
+        }
+    }
+}
+
+#[test]
+fn strip_rebuilds_parts_even_when_output_is_short() {
+    // Output below STRIP_MEDIA_MIN_LEN would normally clone through, but a
+    // populated `content_parts` must still be shrunk; the short `output`
+    // string itself is preserved verbatim.
+    let items = vec![LlmInputItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: "tiny".to_string(),
+        content_parts: Some(vec![squeezy_llm::ToolResultPart::Image {
+            media_type: "image/png".to_string(),
+            bytes: vec![1u8; 2048].into(),
+        }]),
+        is_error: false,
+    }];
+
+    let stripped = strip_media_for_compaction(&items);
+    let LlmInputItem::FunctionCallOutput {
+        output,
+        content_parts,
+        ..
+    } = &stripped[0]
+    else {
+        panic!("expected FunctionCallOutput");
+    };
+    assert_eq!(output, "tiny", "short output should pass through unchanged");
+    let parts = content_parts.as_ref().expect("content_parts retained");
+    assert!(
+        matches!(&parts[0], squeezy_llm::ToolResultPart::Text { text } if text == "[image]"),
+        "image part not stripped; got {parts:?}"
+    );
+}
+
+#[test]
+fn estimate_context_counts_content_parts_bytes() {
+    // Image bytes living only in `content_parts` must register as context
+    // pressure; counting `output.len()` alone would render a multi-KB
+    // screenshot invisible to compaction.
+    let image_bytes = 8192usize;
+    let with_parts = vec![LlmInputItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: "ok".to_string(),
+        content_parts: Some(vec![squeezy_llm::ToolResultPart::Image {
+            media_type: "image/png".to_string(),
+            bytes: vec![0u8; image_bytes].into(),
+        }]),
+        is_error: false,
+    }];
+    let without_parts = vec![LlmInputItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: "ok".to_string(),
+        content_parts: None,
+        is_error: false,
+    }];
+
+    let with = estimate_context(&with_parts);
+    let without = estimate_context(&without_parts);
+    assert!(
+        with.bytes >= without.bytes + image_bytes,
+        "content_parts bytes not billed: with={} without={}",
+        with.bytes,
+        without.bytes
+    );
 }

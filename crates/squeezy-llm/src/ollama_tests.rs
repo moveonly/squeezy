@@ -30,6 +30,7 @@ fn request_body_uses_chat_stream_shape() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -39,7 +40,79 @@ fn request_body_uses_chat_stream_shape() {
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][1]["role"], "user");
     assert_eq!(body["options"]["num_predict"], 16);
+    assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
     assert_eq!(body["tools"][0]["function"]["name"], "grep");
+}
+
+#[test]
+fn request_body_emits_keep_alive_when_set() {
+    let request = LlmRequest {
+        model: "qwen3".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
+    };
+
+    let with_value = OllamaProvider::request_body_with(&request, Some("24h"));
+    assert_eq!(with_value["keep_alive"], "24h");
+
+    let without_value = OllamaProvider::request_body_with(&request, None);
+    assert!(without_value.get("keep_alive").is_none());
+}
+
+#[test]
+fn with_keep_alive_sets_field_for_plumbing() {
+    let provider = OllamaProvider::from_config(&squeezy_core::OllamaConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: squeezy_core::OllamaRoute::Native,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    })
+    .with_keep_alive("-1")
+    .with_api_key("secret-token");
+    assert_eq!(provider.keep_alive.as_deref(), Some("-1"));
+    assert_eq!(provider.api_key.as_deref(), Some("secret-token"));
+}
+
+#[test]
+fn request_body_always_sets_num_ctx_default() {
+    let request = LlmRequest {
+        model: "qwen3".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
+    };
+
+    let body = OllamaProvider::request_body(&request);
+
+    // Ollama's server default `num_ctx` is 4096, which silently truncates
+    // agent prompts. The provider must stamp the explicit default on
+    // every request, even when the caller asked for nothing else.
+    assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
+    assert!(body["options"]["num_predict"].is_null());
 }
 
 #[test]
@@ -75,6 +148,7 @@ fn request_body_preserves_function_tool_order() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -127,15 +201,205 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn request_body_sets_think_true_for_reasoning_effort() {
+    let request = LlmRequest {
+        model: "qwen3:8b".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::Medium),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
+    };
+    let body = OllamaProvider::request_body(&request);
+    assert_eq!(body["think"], true);
+}
+
+#[test]
+fn request_body_sets_think_string_for_gpt_oss() {
+    let request = LlmRequest {
+        model: "gpt-oss:20b".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
+    };
+    let body = OllamaProvider::request_body(&request);
+    assert_eq!(body["think"], "high");
+}
+
+#[test]
+fn request_body_skips_think_for_non_reasoning_models() {
+    let request = LlmRequest {
+        model: "llama3.3:70b".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
+    };
+    let body = OllamaProvider::request_body(&request);
+    assert!(body.get("think").is_none());
+}
+
+#[test]
+fn parser_emits_reasoning_delta_from_message_thinking() {
+    let mut server_model_slot: Option<String> = None;
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3:8b","message":{"thinking":"let me ponder","content":""}}"#,
+        &mut server_model_slot,
+    )
+    .expect("thinking chunk parses");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0],
+        LlmEvent::ReasoningDelta {
+            text: "let me ponder".to_string(),
+            kind: crate::ReasoningKind::Text,
+        }
+    );
+}
+
+#[test]
+fn parser_decodes_string_encoded_tool_arguments() {
+    let mut server_model_slot: Option<String> = None;
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":"{\"pattern\":\"needle\"}"}}]}}"#,
+        &mut server_model_slot,
+    )
+    .expect("string arguments parse");
+    assert_eq!(
+        events[0],
+        LlmEvent::ToolCall(LlmToolCall {
+            call_id: "ollama_call_0".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "needle"}),
+        })
+    );
+}
+
+#[test]
+fn parser_marks_invalid_string_encoded_tool_arguments() {
+    let mut server_model_slot: Option<String> = None;
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":"{not-json"}}]}}"#,
+        &mut server_model_slot,
+    )
+    .expect("unparseable string still surfaces a call");
+    let LlmEvent::ToolCall(call) = &events[0] else {
+        panic!("expected ToolCall event, got {events:?}");
+    };
+    let obj = call.arguments.as_object().expect("marker is an object");
+    assert_eq!(obj[crate::INVALID_TOOL_ARGUMENTS_KEY], true);
+    assert_eq!(obj[crate::INVALID_TOOL_ARGUMENTS_RAW_KEY], "{not-json");
+    assert!(obj.contains_key(crate::INVALID_TOOL_ARGUMENTS_ERROR_KEY));
+}
+
+#[test]
+fn ndjson_decoder_caps_line_size_at_one_megabyte() {
+    let mut decoder = JsonLineDecoder::default();
+    // 1.5 MB of newline-less bytes with no terminating `\n`.
+    let oversized = vec![b'a'; MAX_NDJSON_LINE_BYTES + (MAX_NDJSON_LINE_BYTES / 2)];
+    let err = decoder
+        .push(&oversized)
+        .expect_err("oversized line surfaces error");
+    let SqueezyError::ProviderStream(message) = err else {
+        panic!("expected ProviderStream, got {err:?}");
+    };
+    assert!(
+        message.contains("exceeded"),
+        "expected size cap message, got {message}"
+    );
+}
+
+#[test]
+fn parser_treats_load_and_unload_done_reasons_as_noop() {
+    // Ollama emits `{"done":true,"done_reason":"load"}` and `"unload"`
+    // housekeeping frames around model lifecycle. They are not turn
+    // terminals; the actual generation chunks follow. The parser must
+    // swallow them so the stream loop keeps polling instead of closing
+    // the turn with zero tokens.
+    for reason in ["load", "unload"] {
+        let mut server_model_slot: Option<String> = None;
+        let line = format!(r#"{{"model":"qwen3:0.6b","done":true,"done_reason":"{reason}"}}"#);
+        let events =
+            parse_ollama_line(&line, &mut server_model_slot).expect("housekeeping frame parses");
+        assert!(
+            events.is_empty(),
+            "expected no events for done_reason={reason}, got {events:?}",
+        );
+    }
+
+    // Following the housekeeping frame, real content chunks must still
+    // surface a TextDelta plus the genuine terminal Completed event.
+    let mut server_model_slot: Option<String> = None;
+    let text_events = parse_ollama_line(
+        r#"{"model":"qwen3:0.6b","message":{"content":"after-load"}}"#,
+        &mut server_model_slot,
+    )
+    .expect("content chunk parses");
+    assert_eq!(text_events.len(), 1);
+    assert_eq!(
+        text_events[0],
+        LlmEvent::TextDelta("after-load".to_string())
+    );
+
+    let terminal_events = parse_ollama_line(
+        r#"{"model":"qwen3:0.6b","done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":4}"#,
+        &mut server_model_slot,
+    )
+    .expect("terminal stop frame parses");
+    assert!(matches!(
+        terminal_events.last(),
+        Some(LlmEvent::Completed {
+            stop_reason: Some(crate::StopReason::EndTurn),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn json_line_decoder_splits_lines_without_dropping_tail() {
     let mut decoder = JsonLineDecoder::default();
-    let lines = decoder.push(b" {\"a\":1}\n\n{\"b\"");
+    let lines = decoder.push(b" {\"a\":1}\n\n{\"b\"").expect("ok");
     assert_eq!(lines, vec![r#"{"a":1}"#.to_string()]);
-    let lines = decoder.push(
-        br#":2}
+    let lines = decoder
+        .push(
+            br#":2}
 {"c":3}
 "#,
-    );
+        )
+        .expect("ok");
     assert_eq!(
         lines,
         vec![r#"{"b":2}"#.to_string(), r#"{"c":3}"#.to_string()],
@@ -146,7 +410,7 @@ fn json_line_decoder_splits_lines_without_dropping_tail() {
 #[test]
 fn json_line_decoder_finish_flushes_unterminated_line() {
     let mut decoder = JsonLineDecoder::default();
-    assert!(decoder.push(b"{\"a\"").is_empty());
+    assert!(decoder.push(b"{\"a\"").expect("ok").is_empty());
     assert_eq!(decoder.finish(), vec![r#"{"a""#.to_string()]);
 }
 
@@ -169,6 +433,42 @@ fn show_metadata_extracts_context_window_from_parameters_fallback() {
     });
 
     assert_eq!(ollama_context_window_from_show(&value), Some(8_192));
+}
+
+#[test]
+fn show_metadata_parses_quoted_num_ctx_fallback() {
+    // Some Modelfile parameter strings quote the value (`num_ctx "8192"`)
+    // — the fallback must strip the quotes before parsing.
+    let value = json!({
+        "parameters": "temperature 0.7\nnum_ctx \"16384\"\n"
+    });
+    assert_eq!(ollama_context_window_from_show(&value), Some(16_384));
+
+    let value = json!({
+        "parameters": "num_ctx '4096'\n"
+    });
+    assert_eq!(ollama_context_window_from_show(&value), Some(4_096));
+}
+
+#[test]
+fn show_metadata_extracts_capabilities_array() {
+    let value = json!({
+        "capabilities": ["completion", "tools", "thinking", "vision"]
+    });
+    assert_eq!(
+        ollama_capabilities_from_show(&value),
+        Some(vec![
+            "completion".to_string(),
+            "tools".to_string(),
+            "thinking".to_string(),
+            "vision".to_string(),
+        ])
+    );
+
+    // Missing capabilities field: helper returns `None` so callers treat as
+    // "unknown" rather than "no capabilities".
+    let value = json!({});
+    assert_eq!(ollama_capabilities_from_show(&value), None);
 }
 
 #[test]
@@ -252,6 +552,87 @@ fn pull_parser_rejects_invalid_json() {
 }
 
 #[test]
+fn host_root_normalizes_all_input_shapes() {
+    assert_eq!(
+        ollama_host_root("http://localhost:11434"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/api"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/api/"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/v1"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        ollama_host_root("http://localhost:11434/v1/"),
+        "http://localhost:11434"
+    );
+    // IPv6 literal hosts keep their bracketed authority intact; only the
+    // trailing `/api` segment is stripped.
+    assert_eq!(
+        ollama_host_root("http://[::1]:11434/api"),
+        "http://[::1]:11434"
+    );
+    // Path-prefixed bases (reverse-proxied Ollama under a sub-path) keep
+    // the prefix; only the trailing `/api` segment is peeled off.
+    assert_eq!(
+        ollama_host_root("http://host/ollama/api"),
+        "http://host/ollama"
+    );
+}
+
+#[test]
+fn api_endpoint_url_preserves_ipv6_and_path_prefixed_bases() {
+    // IPv6 literal: the bracketed authority survives and `/api/<endpoint>`
+    // is joined onto the recovered host root.
+    assert_eq!(
+        api_endpoint_url("http://[::1]:11434/api", "chat"),
+        "http://[::1]:11434/api/chat"
+    );
+    // Path-prefixed base: the sub-path prefix is retained ahead of the
+    // canonical `/api/<endpoint>` join.
+    assert_eq!(
+        api_endpoint_url("http://host/ollama/api", "show"),
+        "http://host/ollama/api/show"
+    );
+}
+
+#[test]
+fn api_endpoint_url_always_includes_api_segment() {
+    for base in [
+        "http://localhost:11434",
+        "http://localhost:11434/",
+        "http://localhost:11434/api",
+        "http://localhost:11434/api/",
+        "http://localhost:11434/v1",
+        "http://localhost:11434/v1/",
+    ] {
+        for endpoint in ["chat", "show", "pull", "tags"] {
+            assert_eq!(
+                api_endpoint_url(base, endpoint),
+                format!("http://localhost:11434/api/{endpoint}"),
+                "base={base} endpoint={endpoint}",
+            );
+            assert_eq!(
+                api_endpoint_url(base, &format!("/{endpoint}")),
+                format!("http://localhost:11434/api/{endpoint}"),
+                "leading-slash endpoint, base={base}",
+            );
+        }
+    }
+}
+
+#[test]
 fn openai_compat_base_url_swaps_api_for_v1() {
     assert_eq!(
         openai_compat_base_url("http://localhost:11434/api"),
@@ -282,10 +663,16 @@ fn route_style_compat_builds_lmstudio_delegate() {
         route_style: squeezy_core::OllamaRoute::OpenAiCompatible,
         transport: squeezy_core::ProviderTransportConfig::default(),
     });
-    assert!(
-        provider.compat.is_some(),
-        "OpenAiCompatible route must instantiate the LM Studio delegate",
-    );
+    let compat = provider
+        .compat
+        .as_ref()
+        .expect("OpenAiCompatible route must instantiate the LM Studio delegate");
+    // The delegate must point at the `/v1`-normalized root (the `/api`
+    // suffix is swapped for `/v1`), carry the LM Studio preset, and merge
+    // no extra headers (the preset has no defaults).
+    assert_eq!(compat.base_url(), "http://localhost:11434/v1");
+    assert_eq!(compat.preset(), OpenAiCompatiblePreset::LMStudio);
+    assert!(compat.extra_headers().is_empty());
 }
 
 #[test]
@@ -342,22 +729,57 @@ fn request_body_emits_image_in_native_images_array() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
 
     let body = OllamaProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");
-    // system + user text + user image
-    assert_eq!(messages.len(), 3);
-    // Native Ollama puts images on the message itself, not in a content
-    // block array.
-    let image_msg = &messages[2];
-    assert_eq!(image_msg["role"], "user");
-    assert_eq!(image_msg["content"], "");
-    let images = image_msg["images"].as_array().expect("images array");
+    // system + user(text + image) — image attaches to the preceding
+    // user-text turn so vision models pair them as the same prompt.
+    assert_eq!(messages.len(), 2);
+    let prompt_msg = &messages[1];
+    assert_eq!(prompt_msg["role"], "user");
+    assert_eq!(prompt_msg["content"], "what is this?");
+    let images = prompt_msg["images"].as_array().expect("images array");
     assert_eq!(images.len(), 1);
     use base64::Engine as _;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(images[0].as_str().expect("base64 string"))
         .expect("valid base64");
     assert_eq!(decoded.as_slice(), bytes.as_ref());
+}
+
+#[test]
+fn request_body_image_first_falls_back_to_standalone_user_message() {
+    // When there is no preceding user-text message to attach the image
+    // to, the helper still emits a standalone image-only user turn so
+    // bare-image inputs round-trip.
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G']);
+    let request = LlmRequest {
+        model: "llava".to_string().into(),
+        instructions: String::new().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes,
+        }]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..Default::default()
+    };
+    let body = OllamaProvider::request_body(&request);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "");
+    assert!(messages[0]["images"].is_array());
 }

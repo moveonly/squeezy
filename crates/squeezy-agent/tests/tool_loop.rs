@@ -3838,7 +3838,10 @@ fn function_outputs(request: &LlmRequest) -> Vec<(&str, Value)> {
         .input
         .iter()
         .filter_map(|item| {
-            let LlmInputItem::FunctionCallOutput { call_id, output } = item else {
+            let LlmInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } = item
+            else {
                 return None;
             };
             Some((

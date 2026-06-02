@@ -79,6 +79,7 @@ pub fn echo_request(model: &str, prompt: &str) -> LlmRequest {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     }
 }
 
@@ -104,6 +105,9 @@ pub async fn collect_text(mut stream: LlmStream, label: &str) -> Result<String> 
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // are ignored by the echo smoke harness.
+            _ => { /* future variant */ }
         }
     }
     Ok(output)

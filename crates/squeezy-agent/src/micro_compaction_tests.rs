@@ -15,6 +15,8 @@ fn read_file_pair(n: usize, body_len: usize) -> Vec<LlmInputItem> {
         LlmInputItem::FunctionCallOutput {
             call_id,
             output: body,
+            content_parts: None,
+            is_error: false,
         },
     ]
 }
@@ -187,6 +189,8 @@ fn micro_compact_skips_non_compactable_tools() {
         conversation.push(LlmInputItem::FunctionCallOutput {
             call_id,
             output: body,
+            content_parts: None,
+            is_error: false,
         });
     }
     let report = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000));

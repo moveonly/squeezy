@@ -6,7 +6,7 @@ use std::env;
 use squeezy_core::{
     OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig, Result,
 };
-use squeezy_llm::OpenAiCompatibleProvider;
+use squeezy_llm::XaiProvider;
 
 const PRESET: OpenAiCompatiblePreset = OpenAiCompatiblePreset::XAi;
 const API_KEY_ENV: &str = "XAI_API_KEY";
@@ -15,12 +15,17 @@ const DEFAULT_MODEL: &str = "grok-4-fast-non-reasoning";
 
 #[tokio::test]
 #[ignore = "costly: requires --features costly-tests, SQUEEZY_RUN_COSTLY_TESTS=1, and XAI_API_KEY"]
-async fn xai_chat_completions_streaming_costly() -> Result<()> {
+async fn xai_streaming_costly() -> Result<()> {
+    // H-21: rebuild the costly smoke on `XaiProvider::from_config` so the
+    // dual-route dispatcher (`is_responses_capable` → Responses vs Chat
+    // Completions) is exercised on the hot path. The previous shape
+    // constructed `OpenAiCompatibleProvider` directly and missed every
+    // Responses-route regression for Grok 4+ models.
     common::require_cargo_feature(common::COSTLY_FEATURE, cfg!(feature = "costly-tests"))?;
     common::require_env_flag(common::COSTLY_FLAG)?;
     common::require_env_key(API_KEY_ENV)?;
 
-    let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+    let provider = XaiProvider::from_config(&OpenAiCompatibleConfig {
         preset: PRESET,
         api_key_env: API_KEY_ENV.to_string(),
         api_key: None,
@@ -30,6 +35,9 @@ async fn xai_chat_completions_streaming_costly() -> Result<()> {
         transport: ProviderTransportConfig::default(),
         account_id: None,
         gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: false,
     })?;
     let model = env::var(MODEL_ENV)
         .or_else(|_| env::var("SQUEEZY_COSTLY_MODEL"))

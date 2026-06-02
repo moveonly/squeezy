@@ -478,6 +478,7 @@ fn codex_request_body_forces_store_false_and_encrypted_content() {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let body = OpenAiCodexProvider::build_codex_request_body(&request);
     assert_eq!(body["store"], serde_json::Value::Bool(false));

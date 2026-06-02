@@ -25,6 +25,7 @@ fn request_with_cache_key(model: &str, cache_key: Option<&str>) -> LlmRequest {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: Arc::from(Vec::new()),
+        ..LlmRequest::default()
     }
 }
 
@@ -45,6 +46,7 @@ fn request_with_cache(model: &str, cache: CacheSpec) -> LlmRequest {
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: Arc::from(Vec::new()),
+        ..LlmRequest::default()
     }
 }
 

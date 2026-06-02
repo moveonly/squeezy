@@ -177,6 +177,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         output_schema: None,
         parallel_tool_calls: None,
         beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
     let response = match tokio::time::timeout(
@@ -329,6 +330,9 @@ async fn collect_reviewer_text(
             | LlmEvent::ReasoningDone(_)
             | LlmEvent::ContextOverflow { .. }
             | LlmEvent::ServerModel(_) => {}
+            // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
+            // contribute nothing to the reviewer's collected text.
+            _ => { /* future variant */ }
         }
     }
     Ok(text)

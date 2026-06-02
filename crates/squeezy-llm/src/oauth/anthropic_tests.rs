@@ -297,6 +297,278 @@ fn challenge_matches_verifier_round_trip() {
     assert_eq!(codes.challenge, challenge_for(&codes.verifier));
 }
 
+/// H-05: when the token endpoint returns an auth error, the source
+/// must (a) propagate the error to the current caller, (b) keep
+/// `dirty=true` so the cached token is still considered stale, and
+/// (c) short-circuit subsequent `current_key`/`force_refresh` calls
+/// with the cached error rather than re-firing the same failed POST
+/// against a revoked refresh token. `invalidate()` then clears the
+/// cached error so an operator-triggered re-login can retry.
+#[tokio::test]
+async fn force_refresh_caches_error_and_short_circuits_subsequent_calls() {
+    let token_url = spawn_token_mock_with_status(vec![
+        (
+            401,
+            json!({"error": "invalid_grant", "description": "refresh token revoked"}),
+        ),
+        // A second body that would only be served if the source
+        // re-fires the request: the test fails if we ever see it.
+        (
+            200,
+            json!({"access_token": "must-not-be-served", "refresh_token": "x", "expires_in": 3600}),
+        ),
+    ])
+    .await;
+
+    let path = temp_token_path("refresh-err");
+    let config = AnthropicLoginConfig {
+        token_url,
+        ..AnthropicLoginConfig::default()
+    };
+    let source = AnthropicOAuthSource::with_parts(
+        expired_persisted_tokens("err"),
+        path,
+        config,
+        reqwest::Client::new(),
+    );
+
+    // First call: the network round-trip fails and surfaces the
+    // platform error to the caller.
+    let err = source
+        .current_key()
+        .await
+        .expect_err("revoked refresh token must surface as an error");
+    let first_msg = err.to_string();
+    assert!(
+        first_msg.contains("invalid_grant"),
+        "first call must surface the platform error, got {first_msg}",
+    );
+    assert!(
+        source.needs_refresh().await,
+        "dirty must stay true on refresh error so a subsequent retry can fire",
+    );
+
+    // Second call: the cached error short-circuits — no new request
+    // hits the mock (we'd see `must-not-be-served` if it did).
+    let again = source
+        .current_key()
+        .await
+        .expect_err("cached error must short-circuit second attempt");
+    assert!(
+        again.to_string().contains("invalid_grant"),
+        "cached error must round-trip the original platform message, got {again}",
+    );
+
+    // invalidate() wipes the cached error so a fresh attempt can be
+    // made — the next call advances the queue and now sees the
+    // 200 response.
+    source.invalidate().await.expect("invalidate");
+    let ok = source
+        .current_key()
+        .await
+        .expect("post-invalidate retry must reach the next queued response");
+    assert_eq!(ok, "must-not-be-served");
+}
+
+/// F1: a *transient* refresh failure (5xx, timeout, network reset)
+/// must NOT latch into `last_refresh_err`. If it did, the source would
+/// be wedged for the process lifetime, because the only path that
+/// reaches `invalidate()` (the messages-endpoint 401/403) is itself
+/// short-circuited by `current_key()` before any request is sent. So a
+/// later `current_key()` must re-attempt the refresh and recover once
+/// the endpoint is healthy again — without any intervening
+/// `invalidate()`.
+#[tokio::test]
+async fn transient_refresh_failure_does_not_permanently_wedge_source() {
+    let token_url = spawn_token_mock_with_status(vec![
+        // First attempt: a 503 — a classic transient platform blip.
+        (503, json!({"error": "service unavailable"})),
+        // Second attempt: the endpoint has recovered and issues a
+        // fresh token. This is only reached if the transient error was
+        // NOT cached.
+        (
+            200,
+            json!({
+                "access_token": "sk-ant-oat-recovered",
+                "refresh_token": "sk-ant-rfr-recovered",
+                "expires_in": 3600,
+            }),
+        ),
+    ])
+    .await;
+
+    let path = temp_token_path("transient-refresh");
+    let config = AnthropicLoginConfig {
+        token_url,
+        ..AnthropicLoginConfig::default()
+    };
+    let source = AnthropicOAuthSource::with_parts(
+        expired_persisted_tokens("transient"),
+        path,
+        config,
+        reqwest::Client::new(),
+    );
+
+    // First call: the transient 5xx surfaces as an error.
+    let err = source
+        .current_key()
+        .await
+        .expect_err("transient 503 must surface as an error");
+    assert!(
+        err.to_string().contains("503"),
+        "first call must surface the transient platform error, got {err}",
+    );
+    assert!(
+        source.needs_refresh().await,
+        "dirty must stay true so a later current_key can retry",
+    );
+
+    // Second call WITHOUT any invalidate(): the transient error was
+    // not cached, so the refresh re-fires and now reaches the queued
+    // 200 response.
+    let recovered = source
+        .current_key()
+        .await
+        .expect("transient failure must not wedge the source; retry should recover");
+    assert_eq!(recovered, "sk-ant-oat-recovered");
+}
+
+/// F1 (unit): the permanent/transient classifier latches only on
+/// revoked-token shapes (auth-class 4xx or an `invalid_grant` body) and
+/// lets every transient shape fall through.
+#[test]
+fn refresh_error_classifier_latches_only_permanent_failures() {
+    // Permanent: auth-class 4xx and explicit invalid_grant.
+    assert!(refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 400 Bad Request: {}"
+    ));
+    assert!(refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 401 Unauthorized: {}"
+    ));
+    assert!(refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 403 Forbidden: {}"
+    ));
+    assert!(refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 200 OK: {\"error\":\"invalid_grant\"}"
+    ));
+
+    // Transient: 5xx, transport errors, body-read errors, malformed
+    // JSON, and 429 rate limits all fall through.
+    assert!(!refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 503 Service Unavailable: {}"
+    ));
+    assert!(!refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 500 Internal Server Error: {}"
+    ));
+    assert!(!refresh_error_is_permanent(
+        "Anthropic OAuth token endpoint returned 429 Too Many Requests: {}"
+    ));
+    assert!(!refresh_error_is_permanent(
+        "Anthropic OAuth POST failed: error sending request"
+    ));
+    assert!(!refresh_error_is_permanent(
+        "Anthropic OAuth body read failed: connection reset"
+    ));
+    assert!(!refresh_error_is_permanent(
+        "Anthropic OAuth token response was not valid JSON: expected value; body="
+    ));
+}
+
+/// Tiny HTTP/1.1 mock that returns each `(status, json_body)` in
+/// order. Used by [`force_refresh_caches_error_and_short_circuits_subsequent_calls`]
+/// so the first call sees a 4xx (refresh failure) and the second
+/// would normally see a 200 (success). When the cached-error
+/// short-circuit kicks in, the second response is never served.
+/// Map an HTTP status code to a reason phrase for the mock's status
+/// line so a 401 reads `HTTP/1.1 401 Unauthorized` rather than the
+/// nonsensical `HTTP/1.1 401 OK`. Falls back to a generic phrase for
+/// codes the mock doesn't explicitly model.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        s if (100..200).contains(&s) => "Informational",
+        s if (200..300).contains(&s) => "Success",
+        s if (300..400).contains(&s) => "Redirection",
+        s if (400..500).contains(&s) => "Client Error",
+        _ => "Server Error",
+    }
+}
+
+async fn spawn_token_mock_with_status(responses: Vec<(u16, serde_json::Value)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("local_addr");
+    let queue = Arc::new(Mutex::new(responses.into_iter().collect::<Vec<_>>()));
+    let queue_for_loop = queue.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let queue = queue_for_loop.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(&mut socket);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).await.is_err() {
+                    return;
+                }
+                let mut content_length: usize = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                        && let Ok(len) = rest.trim().parse::<usize>()
+                    {
+                        content_length = len;
+                    }
+                }
+                if content_length > 0 {
+                    let mut buf = vec![0u8; content_length];
+                    if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let next = {
+                    let mut guard = queue.lock().await;
+                    if guard.is_empty() {
+                        None
+                    } else {
+                        Some(guard.remove(0))
+                    }
+                };
+                let (status, body) = match next {
+                    Some((status, value)) => (status, value.to_string()),
+                    None => (500_u16, json!({"error": "mock exhausted"}).to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    status = status,
+                    reason = reason_phrase(status),
+                    len = body.len(),
+                    body = body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{}/v1/oauth/token", addr)
+}
+
 // ---------- mock token server ---------------------------------------------
 
 /// Tiny HTTP/1.1 mock for the platform OAuth token endpoint. Returns

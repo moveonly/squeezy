@@ -466,6 +466,13 @@ struct InnerState {
     /// successful refresh — forces `current_key` to refresh even when
     /// the cached expiry would otherwise pass the lead-time gate.
     dirty: bool,
+    /// Last error surfaced by [`AnthropicOAuthSource::force_refresh`].
+    /// When populated, the next [`ApiKeySource::current_key`] call
+    /// short-circuits and returns the cached error string rather than
+    /// re-firing the same failed network round-trip. `invalidate()`
+    /// clears the flag so an operator-triggered re-login can retry
+    /// the refresh. See `.audit/providers/anthropic.md` HIGH #5.
+    last_refresh_err: Option<String>,
 }
 
 impl AnthropicOAuthSource {
@@ -493,6 +500,7 @@ impl AnthropicOAuthSource {
             state: Arc::new(RwLock::new(InnerState {
                 tokens,
                 dirty: false,
+                last_refresh_err: None,
             })),
             storage_path,
             config,
@@ -554,8 +562,46 @@ impl AnthropicOAuthSource {
         if !guard.dirty && !access_token_is_stale(&guard.tokens) {
             return Ok(guard.tokens.clone());
         }
+        // Short-circuit when a prior refresh failed and `invalidate()`
+        // has not been called since: re-firing the same network
+        // round-trip against a revoked refresh token would just burn
+        // quota and slow the auth error to surface. Operators clear
+        // the cached error by calling `invalidate()` (e.g. after
+        // `squeezy auth anthropic login`).
+        if let Some(cached) = guard.last_refresh_err.as_deref() {
+            return Err(SqueezyError::ProviderRequest(cached.to_string()));
+        }
         let refresh_token = guard.tokens.refresh_token.clone();
-        let response = refresh_anthropic_token(&self.http, &self.config, &refresh_token).await?;
+        let response = match refresh_anthropic_token(&self.http, &self.config, &refresh_token).await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                // Keep `dirty=true` so the next caller still sees the
+                // stale token as needing refresh. Only *permanent*
+                // failures (the refresh token is revoked / rejected:
+                // token-endpoint HTTP 400/401/403 or an `invalid_grant`
+                // body) latch into `last_refresh_err` so concurrent /
+                // repeat callers don't re-fire a POST that can only
+                // fail the same way until an explicit `invalidate()`
+                // (the operator-triggered re-login path) wipes it.
+                //
+                // Transient failures — network errors ("POST failed" /
+                // "body read failed"), 5xx, timeouts, or a malformed
+                // body from a flaky proxy — are deliberately NOT
+                // cached: latching them would permanently wedge the
+                // source for the process lifetime, because the only
+                // caller that ever reaches `invalidate()` is the
+                // messages-endpoint 401/403 path, which `current_key()`
+                // short-circuits before any request is sent. Letting
+                // them fall through means the next `current_key()`
+                // simply retries the refresh.
+                let message = err.to_string();
+                if refresh_error_is_permanent(&message) {
+                    guard.last_refresh_err = Some(message);
+                }
+                return Err(err);
+            }
+        };
         let now_ms = current_unix_ms();
         let tokens = PersistedTokens::from_token_response(&response, now_ms);
         // Persistence first; if the rename fails we still hold the
@@ -570,6 +616,7 @@ impl AnthropicOAuthSource {
         }
         guard.tokens = tokens.clone();
         guard.dirty = false;
+        guard.last_refresh_err = None;
         Ok(tokens)
     }
 
@@ -612,6 +659,11 @@ impl ApiKeySource for AnthropicOAuthSource {
         Box::pin(async move {
             let mut guard = self.state.write().await;
             guard.dirty = true;
+            // Wipe the cached refresh error so the operator-triggered
+            // re-invalidate path (e.g. after a fresh `squeezy auth
+            // anthropic login`) can fire the refresh again instead of
+            // forever returning the stale error.
+            guard.last_refresh_err = None;
             Ok(())
         })
     }
@@ -619,19 +671,77 @@ impl ApiKeySource for AnthropicOAuthSource {
     fn provider_label(&self) -> &str {
         &self.label
     }
+
+    fn can_rotate(&self) -> bool {
+        true
+    }
 }
 
 fn access_token_is_stale(tokens: &PersistedTokens) -> bool {
     let expires_at = UNIX_EPOCH + Duration::from_millis(tokens.expires_at_unix_ms);
     let now = SystemTime::now();
-    // Refresh proactively when there's less than 60 s of life left;
-    // a streaming response can run for tens of seconds and we'd
-    // rather pay one extra refresh than die mid-stream.
-    let lead = Duration::from_secs(60);
-    match expires_at.checked_sub(lead) {
+    // Refresh proactively when there's less than 60 s of life left
+    // *relative to the already-shifted expiry stamp*.
+    // `tokens.expires_at_unix_ms` is the issuer-reported absolute
+    // expiry minus [`REFRESH_LEAD_TIME`] (5 minutes) — see
+    // [`PersistedTokens::from_token_response`]. So the effective
+    // refresh fires roughly 6 minutes ahead of the real platform
+    // expiry, which is intentional: a streaming response can run for
+    // tens of seconds and we'd rather pay one extra refresh than die
+    // mid-stream. Total cushion = 5m persisted + 60s runtime gate.
+    // See `.audit/providers/anthropic.md` MEDIUM #8.
+    let runtime_gate = Duration::from_secs(60);
+    match expires_at.checked_sub(runtime_gate) {
         Some(threshold) => threshold <= now,
         None => true,
     }
+}
+
+/// Classify a [`refresh_anthropic_token`] failure as permanent (the
+/// refresh token will never succeed again without a re-login) versus
+/// transient (a retry on the next `current_key()` has a real chance of
+/// succeeding).
+///
+/// The error is stringly-typed (`SqueezyError::ProviderRequest` carries
+/// only a message), so we match on the shapes [`post_token_request`]
+/// produces:
+///
+/// * `"Anthropic OAuth token endpoint returned {status}: {body}"` —
+///   permanent for HTTP 400/401/403 or any body mentioning
+///   `invalid_grant` (the platform's signal that the refresh token is
+///   revoked/expired); a 5xx from this same shape is transient.
+/// * `"Anthropic OAuth POST failed: ..."` / `"... body read failed: ..."`
+///   — transport-level (DNS, connect, timeout, reset); transient.
+/// * `"Anthropic OAuth token response was not valid JSON: ..."` — a
+///   flaky proxy or partial body; transient.
+///
+/// Only permanent failures latch into `last_refresh_err`; anything we
+/// can't positively classify as permanent is treated as transient so a
+/// single hiccup never wedges the source for the process lifetime.
+fn refresh_error_is_permanent(message: &str) -> bool {
+    // An explicit `invalid_grant` anywhere in the surfaced body is the
+    // canonical "this refresh token is dead" signal regardless of the
+    // HTTP status the platform paired it with.
+    if message.contains("invalid_grant") {
+        return true;
+    }
+    // Otherwise only the HTTP-status error shape can be permanent, and
+    // only for the auth-class 4xx codes. A 5xx (or any other status)
+    // is transient.
+    if let Some(rest) = message.strip_prefix("Anthropic OAuth token endpoint returned ") {
+        let status = rest
+            .split_once(':')
+            .map(|(status, _)| status.trim())
+            .unwrap_or_else(|| rest.trim());
+        // `status` is the `Display` of `reqwest::StatusCode`, e.g.
+        // "400 Bad Request"; the leading numeric code is enough.
+        let code = status
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse::<u16>().ok());
+        return matches!(code, Some(400) | Some(401) | Some(403));
+    }
+    false
 }
 
 fn current_unix_ms() -> u64 {
