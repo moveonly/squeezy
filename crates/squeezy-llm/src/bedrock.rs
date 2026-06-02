@@ -549,7 +549,15 @@ fn classify_stream_sdk_error(
     let inner = err.into_service_error();
     match inner {
         ConverseStreamOutputError::ValidationException(e) => {
-            SqueezyError::ProviderRequest(format!("Bedrock event stream ValidationException: {e}"))
+            // Deterministic 4xx: a bad tool schema / malformed image / oversized
+            // payload fails identically on every resend. Stamp the
+            // non-retryable marker so `is_retryable_stream_error` (retry.rs)
+            // short-circuits instead of burning the whole reconnect budget on
+            // a guaranteed-to-fail request.
+            SqueezyError::ProviderRequest(format!(
+                "{}Bedrock event stream ValidationException: {e}",
+                crate::anthropic_error::NON_RETRYABLE_MARKER
+            ))
         }
         ConverseStreamOutputError::ThrottlingException(e) => {
             SqueezyError::ProviderStream(format!("Bedrock event stream ThrottlingException: {e}"))
@@ -735,8 +743,12 @@ fn handle_bedrock_event(
                 Value::Object(Default::default())
             } else {
                 serde_json::from_str(&tool.input_json).map_err(|err| {
+                    // Re-parsing the identical bytes can never succeed, so mark
+                    // this terminal rather than letting the stream-retry harness
+                    // reconnect and re-stream the same malformed tool args.
                     SqueezyError::ProviderStream(format!(
-                        "invalid Bedrock toolUse input JSON: {err}"
+                        "{}invalid Bedrock toolUse input JSON: {err}",
+                        crate::anthropic_error::NON_RETRYABLE_MARKER
                     ))
                 })?
             };

@@ -32,7 +32,12 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-pro";
 pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
-pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
+// C-13: the Azure provider targets the Responses endpoint
+// (`/openai/v1/responses?api-version=…`), which Azure serves only under the
+// `preview` api-version; `v1` returns a 4xx there. Default to `preview` so a
+// bare `AZURE_OPENAI_*` config works out of the box. Operators can still pin a
+// dated version (e.g. `2024-10-21`) via `providers.azure_openai.api_version`.
+pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "preview";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
@@ -2062,6 +2067,7 @@ pub struct OpenAiCompatibleConfig {
     #[serde(serialize_with = "redact_secret_opt")]
     pub api_key: Option<String>,
     pub base_url: String,
+    #[serde(serialize_with = "redact_secret_map")]
     pub extra_headers: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
     /// Cloudflare account id. Populated for the Workers AI / AI Gateway
@@ -2531,7 +2537,11 @@ pub struct AzureOpenAiConfig {
     /// win over the provider's defaults so an override is honored
     /// verbatim. Keyed via the standard `[providers.azure_openai.headers]`
     /// TOML table, matching the OpenAI-compatible preset shape.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "redact_secret_map"
+    )]
     pub extra_headers: BTreeMap<String, String>,
     /// Switches the provider away from the default `api-key: …` header
     /// to `Authorization: Bearer …` so Microsoft Entra ID / managed
@@ -3494,6 +3504,27 @@ where
         }
         None => serializer.serialize_none(),
     }
+}
+
+/// Serialize a `BTreeMap` header table with every value masked to
+/// `"<redacted>"` while keeping the keys visible. Header *values* on resolved
+/// provider configs can carry credentials (`Authorization: Bearer …`,
+/// `Apim-Subscription-Key`, `cf-aig-authorization`), so any serde-Serialize of
+/// the config (diagnostics, panic envelopes, effective-config dumps) must not
+/// leak them. Mirrors [`redact_secret_map_opt`] for non-`Option` fields.
+fn redact_secret_map<S>(
+    value: &BTreeMap<String, String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut entries = serializer.serialize_map(Some(value.len()))?;
+    for key in value.keys() {
+        entries.serialize_entry(key, "<redacted>")?;
+    }
+    entries.end()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -9228,6 +9259,14 @@ pub fn is_metadata_or_link_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
+            // Canonicalize IPv4-mapped addresses (e.g. `::ffff:169.254.169.254`)
+            // and apply the IPv4 rules to the embedded address. Without this a
+            // mapped IMDS/link-local literal slips past the narrow v6 checks
+            // below — a well-known SSRF evasion that would otherwise re-open the
+            // credential-exfiltration vector this filter exists to close.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_metadata_or_link_local_ip(&std::net::IpAddr::V4(v4));
+            }
             let segments = v6.segments();
             (segments[0] & 0xffc0) == 0xfe80 || segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
         }
@@ -9367,10 +9406,19 @@ fn build_openai_compatible_config(
         if !has_gateway_header && let Some(token) = get_var("CF_AIG_TOKEN") {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
-                extra_headers.insert(
-                    "cf-aig-authorization".to_string(),
-                    format!("Bearer {trimmed}"),
-                );
+                let value = format!("Bearer {trimmed}");
+                // M-65 parity: the TOML `[headers]` path validates CR/LF at
+                // config-load, but this env-sourced header bypassed that check
+                // and only `trim()`s — an embedded CR/LF would survive to a
+                // field-less reqwest error mid-stream. Validate here too.
+                if http::HeaderValue::from_str(&value).is_err() {
+                    return Err(SqueezyError::Config(
+                        "CF_AIG_TOKEN contains bytes that cannot be sent as an HTTP header \
+                         value (CR/LF and other control characters are forbidden); strip them"
+                            .to_string(),
+                    ));
+                }
+                extra_headers.insert("cf-aig-authorization".to_string(), value);
             }
         }
     }

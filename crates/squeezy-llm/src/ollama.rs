@@ -219,13 +219,11 @@ pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<
     // 250 ms was fine on localhost but too tight for any remote / Tailscale /
     // Docker-networked Ollama. 1 s keeps the probe snappy on healthy boxes
     // while letting cold-cache or slow-link servers actually answer.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .ok()?;
+    let client = shared_client(&ProviderTransportConfig::default());
     let url = api_endpoint_url(base_url, "show");
     let value: Value = client
         .post(url)
+        .timeout(Duration::from_secs(1))
         .json(&json!({ "model": model }))
         .send()
         .await
@@ -246,20 +244,22 @@ pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<
 // until that re-export lands.
 #[allow(dead_code)]
 pub async fn probe_server(base_url: &str) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .map_err(|err| SqueezyError::ProviderRequest(format!("ollama probe client: {err}")))?;
+    let client = shared_client(&ProviderTransportConfig::default());
     let url = api_endpoint_url(base_url, "version");
-    let response = client.get(url).send().await.map_err(|err| {
-        if err.is_connect() {
-            SqueezyError::ProviderRequest(format!(
-                "could not reach Ollama at {base_url} — is `ollama serve` running? ({err})"
-            ))
-        } else {
-            SqueezyError::ProviderRequest(format!("ollama probe failed: {err}"))
-        }
-    })?;
+    let response = client
+        .get(url)
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await
+        .map_err(|err| {
+            if err.is_connect() {
+                SqueezyError::ProviderRequest(format!(
+                    "could not reach Ollama at {base_url} — is `ollama serve` running? ({err})"
+                ))
+            } else {
+                SqueezyError::ProviderRequest(format!("ollama probe failed: {err}"))
+            }
+        })?;
     if !response.status().is_success() {
         return Err(SqueezyError::ProviderRequest(format!(
             "ollama probe {} at {base_url}",
@@ -299,13 +299,11 @@ pub async fn probe_server(base_url: &str) -> Result<String> {
 // dead-code lint trips even though we want the symbol public.
 #[allow(dead_code)]
 pub async fn fetch_ollama_capabilities(base_url: &str, model: &str) -> Option<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .ok()?;
+    let client = shared_client(&ProviderTransportConfig::default());
     let url = api_endpoint_url(base_url, "show");
     let value: Value = client
         .post(url)
+        .timeout(Duration::from_secs(1))
         .json(&json!({ "model": model }))
         .send()
         .await
@@ -328,15 +326,9 @@ pub(crate) fn ollama_capabilities_from_show(value: &Value) -> Option<Vec<String>
 }
 
 pub async fn fetch_ollama_model_names(base_url: &str) -> Vec<String> {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return Vec::new(),
-    };
+    let client = shared_client(&ProviderTransportConfig::default());
     let url = api_endpoint_url(base_url, "tags");
-    let value: Value = match client.get(url).send().await {
+    let value: Value = match client.get(url).timeout(Duration::from_secs(1)).send().await {
         Ok(response) => match response.json().await {
             Ok(value) => value,
             Err(_) => return Vec::new(),

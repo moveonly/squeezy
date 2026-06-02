@@ -73,15 +73,11 @@ impl OpenAiProvider {
             ));
         }
         // C-13: this provider concatenates `?api-version={config.api_version}`
-        // onto every `/responses` URL. The DEFAULT_AZURE_OPENAI_API_VERSION
-        // constant in squeezy-core (`crates/squeezy-core/src/lib.rs:35`)
-        // is currently `"v1"`, which is wrong for the `/responses`
-        // endpoint (Azure requires `"preview"` against `/openai/v1/responses`).
-        // The constant lives outside Phase 4B scope; fixing it is queued
-        // for Phase 4I. The URL-build path below honors whatever the
-        // caller hands in, so setting `[providers.azure_openai].api_version = "preview"`
-        // works correctly today.
-        // TODO(Phase 4I): change DEFAULT_AZURE_OPENAI_API_VERSION to "preview".
+        // onto every `/responses` URL. DEFAULT_AZURE_OPENAI_API_VERSION now
+        // defaults to `"preview"` (the only api-version Azure serves the
+        // Responses endpoint under), so a bare `AZURE_OPENAI_*` config works
+        // out of the box. Operators can still pin a dated version via
+        // `[providers.azure_openai].api_version`.
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         // H-36: detect the classic `/openai/deployments/{deployment}` URL
@@ -390,12 +386,30 @@ fn build_responses_url(base_url: &str, api_version: Option<&str>, _classic_azure
     // already. Held in the signature so a future per-shape divergence
     // (e.g. `/responses` vs `/responses?api-version=…` dating per
     // Azure quickstart) doesn't break the call-site contract.
-    let mut url = format!("{base_url}/responses");
+    // If the base already carries a query string (e.g. an Azure base_url with
+    // `?subscription-key=…`), `/responses` must be appended to the PATH, not
+    // concatenated onto the query value — otherwise the path segment lands
+    // inside the query and the request hits the wrong endpoint. Split any
+    // existing query off, append the path segment, then re-attach the existing
+    // query params plus `api-version`.
+    let (path, existing_query) = match base_url.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base_url, None),
+    };
+    let mut url = format!("{path}/responses");
+    let mut query_parts: Vec<String> = Vec::new();
+    if let Some(query) = existing_query.filter(|q| !q.is_empty()) {
+        query_parts.push(query.to_string());
+    }
     if let Some(api_version) = api_version {
-        let sep = if url.contains('?') { '&' } else { '?' };
-        url.push(sep);
-        url.push_str("api-version=");
-        url.push_str(&percent_encode_query_component(api_version));
+        query_parts.push(format!(
+            "api-version={}",
+            percent_encode_query_component(api_version)
+        ));
+    }
+    if !query_parts.is_empty() {
+        url.push('?');
+        url.push_str(&query_parts.join("&"));
     }
     url
 }

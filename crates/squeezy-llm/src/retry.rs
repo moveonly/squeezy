@@ -665,7 +665,7 @@ where
 /// Strip-and-check the marker before classifying so a marked
 /// `ProviderRequest`/`ProviderStream` returns `false` and short-circuits
 /// the reconnect loop straight to the caller.
-fn is_retryable_stream_error(err: &SqueezyError) -> bool {
+pub(crate) fn is_retryable_stream_error(err: &SqueezyError) -> bool {
     let message = match err {
         SqueezyError::ProviderStream(msg) | SqueezyError::ProviderRequest(msg) => msg.as_str(),
         _ => return false,

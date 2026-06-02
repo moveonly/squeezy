@@ -1691,9 +1691,12 @@ fn build_responses_url_percent_encodes_api_version_typos() {
 }
 
 #[test]
-fn build_responses_url_uses_ampersand_when_base_already_has_query_string() {
+fn build_responses_url_appends_path_before_existing_query_string() {
     // AZ-M4: when the user's `base_url` already carries a query string,
-    // `api-version` joins with `&` instead of producing two `?`s.
+    // `/responses` must be inserted into the PATH (before the `?`), and
+    // `api-version` joined onto the existing query with `&`. A naive
+    // concatenation would bury `/responses` inside the query value and hit
+    // the wrong endpoint.
     let url = super::build_responses_url(
         "https://resource.openai.azure.com/openai/v1?subscription-key=abc",
         Some("preview"),
@@ -1701,8 +1704,8 @@ fn build_responses_url_uses_ampersand_when_base_already_has_query_string() {
     );
     assert_eq!(
         url,
-        "https://resource.openai.azure.com/openai/v1?subscription-key=abc/responses&api-version=preview",
-        "ampersand separator must join the second query parameter"
+        "https://resource.openai.azure.com/openai/v1/responses?subscription-key=abc&api-version=preview",
+        "/responses must land in the path and api-version must join the existing query with &"
     );
 }
 

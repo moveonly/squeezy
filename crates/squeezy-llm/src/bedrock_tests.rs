@@ -1666,6 +1666,14 @@ fn classify_stream_sdk_error_routes_validation_to_provider_request() {
         message.contains("ValidationException"),
         "error must mention the SDK variant: {message}",
     );
+    // The whole point of routing ValidationException to a terminal classification
+    // is that the stream-retry harness must NOT reconnect on it. Drive the
+    // classified error through the actual predicate the harness uses, so the
+    // end-to-end no-retry invariant is guarded (not just the envelope type).
+    assert!(
+        !crate::retry::is_retryable_stream_error(&err),
+        "ValidationException must be non-retryable so with_stream_retry stops reconnecting: {message}",
+    );
 }
 
 #[test]

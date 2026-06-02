@@ -153,13 +153,14 @@ pub async fn refresh_models(cache_path: &Path) -> Result<ModelsDevCatalog> {
     }
 
     let url = source_url();
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .user_agent(user_agent())
-        .build()
-        .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
+    // Route through the shared hardened client so the metadata-blocking
+    // resolver applies even when the source URL is overridden via env. The
+    // catalog-specific User-Agent and fetch deadline are set per-request.
+    let client = crate::transport::shared_client(&squeezy_core::ProviderTransportConfig::default());
     let response = client
         .get(&url)
+        .timeout(FETCH_TIMEOUT)
+        .header(reqwest::header::USER_AGENT, user_agent())
         .send()
         .await
         .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;

@@ -1267,8 +1267,19 @@ impl StreamState {
         let mut events = Vec::new();
         let drained = std::mem::take(&mut self.tool_calls);
         self.latest_tool_index_per_choice.clear();
-        for ((_choice_index, index), partial) in drained {
-            let call_id = partial.call_id.unwrap_or_else(|| format!("call_{index}"));
+        for ((choice_index, index), partial) in drained {
+            // Fold the choice index into the synthetic id so two different
+            // choices surfacing a tool call at the same tool index (possible
+            // if an aggregator relays multi-choice traffic despite the `n: 1`
+            // pin) cannot alias to the same `call_<index>` and collide in
+            // downstream tool dispatch.
+            let call_id = partial.call_id.unwrap_or_else(|| {
+                if choice_index == 0 {
+                    format!("call_{index}")
+                } else {
+                    format!("call_{choice_index}_{index}")
+                }
+            });
             // Skip incomplete tool calls (no function.name accumulated)
             // instead of erroring the whole stream. PortKey / OpenRouter /
             // Qwen sometimes ship a tool-call delta whose name chunk goes
@@ -1728,7 +1739,7 @@ fn is_inline_error_retryable(value: &Value) -> bool {
             || code.contains("transient")
             || code == "408"
             || code == "429"
-            || code.starts_with("5")
+            || (code.starts_with('5') && code.chars().all(|c| c.is_ascii_digit()))
         {
             return true;
         }

@@ -707,7 +707,24 @@ fn parse_google_event(
             .unwrap_or("Google stream error");
         let status = error.get("status").and_then(Value::as_str);
         let code = error.get("code").and_then(Value::as_i64);
+        // Deterministic provider-side rejections fail identically on resend;
+        // stamp the non-retryable marker so the stream-retry harness does not
+        // burn its whole reconnect budget re-sending an identical request.
+        let terminal = matches!(
+            status,
+            Some(
+                "RESOURCE_EXHAUSTED"
+                    | "INVALID_ARGUMENT"
+                    | "PERMISSION_DENIED"
+                    | "FAILED_PRECONDITION"
+                    | "UNAUTHENTICATED"
+                    | "NOT_FOUND"
+            )
+        );
         let mut text = String::new();
+        if terminal {
+            text.push_str(crate::anthropic_error::NON_RETRYABLE_MARKER);
+        }
         if let Some(status) = status {
             text.push_str(status);
             text.push_str(": ");
@@ -730,8 +747,11 @@ fn parse_google_event(
         .and_then(|fb| fb.get("blockReason"))
         .and_then(Value::as_str)
     {
+        // A prompt-level content-policy block is deterministic: the same
+        // prompt will be blocked on every resend, so mark it non-retryable.
         return Err(SqueezyError::ProviderStream(format!(
-            "Google blocked prompt: {block_reason}"
+            "{}Google blocked prompt: {block_reason}",
+            crate::anthropic_error::NON_RETRYABLE_MARKER
         )));
     }
     if server_model_slot.is_none()

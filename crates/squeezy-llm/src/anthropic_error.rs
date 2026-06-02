@@ -147,7 +147,11 @@ fn is_retryable(status: u16, error_type: &str) -> bool {
     }
     !matches!(
         error_type,
-        "invalid_request_error" | "not_found_error" | "authentication_error" | "permission_error"
+        "invalid_request_error"
+            | "not_found_error"
+            | "authentication_error"
+            | "permission_error"
+            | "model_context_window_exceeded"
     )
 }
 

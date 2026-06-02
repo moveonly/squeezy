@@ -1082,7 +1082,7 @@
     "pricing": {
       "input_usd_micros_per_mtok": 140000,
       "output_usd_micros_per_mtok": 280000,
-      "cache_read_usd_micros_per_mtok": 2800,
+      "cache_read_usd_micros_per_mtok": 14000,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
@@ -1112,7 +1112,7 @@
     "pricing": {
       "input_usd_micros_per_mtok": 280000,
       "output_usd_micros_per_mtok": 560000,
-      "cache_read_usd_micros_per_mtok": 5600,
+      "cache_read_usd_micros_per_mtok": 28000,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
@@ -1142,7 +1142,7 @@
     "pricing": {
       "input_usd_micros_per_mtok": 1740000,
       "output_usd_micros_per_mtok": 3480000,
-      "cache_read_usd_micros_per_mtok": 14500,
+      "cache_read_usd_micros_per_mtok": 174000,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {
@@ -1682,7 +1682,7 @@
     "pricing": {
       "input_usd_micros_per_mtok": 1740000,
       "output_usd_micros_per_mtok": 3480000,
-      "cache_read_usd_micros_per_mtok": 14500,
+      "cache_read_usd_micros_per_mtok": 174000,
       "cache_write_usd_micros_per_mtok": null
     },
     "limits": {

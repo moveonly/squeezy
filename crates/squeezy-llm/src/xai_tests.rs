@@ -387,7 +387,9 @@ const RESPONSES_REASONING_SSE_BODY: &str = concat!(
     "data: {\"type\":\"response.output_text.delta\",\"delta\":\" xai\"}\n\n",
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_xai_m30\",\"model\":\"grok-4.3\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":3,\"output_tokens_details\":{\"reasoning_tokens\":5},\"total_tokens\":15}}}\n\n",
-    "data: [DONE]\n\n",
+    // NOTE: the Responses API does NOT emit a `[DONE]` sentinel (unlike Chat
+    // Completions); the stream ends after `response.completed`. Appending one
+    // here previously made parse_openai_event fail with "invalid SSE JSON".
 );
 
 /// Chat-completions SSE with text deltas and a `usage` block that
@@ -405,7 +407,6 @@ const CHAT_REASONING_SSE_BODY: &str = concat!(
 );
 
 #[tokio::test]
-#[ignore = "TODO(audit M-30): SSE parser regression after Phase 2B event-field preservation; revisit fixture or parser flow"]
 async fn xai_responses_sse_replay_surfaces_text_and_reasoning_cost_m30() {
     // M-30: replay the Responses SSE through `XaiProvider` and verify
     // (a) text deltas arrive in order, (b) `LlmEvent::Completed` lands

@@ -4694,6 +4694,9 @@ fn config_rejects_imds_and_metadata_hosts_regardless_of_scheme() {
         ("https://[fe80::1]/v1", "fe80::1"),
         // AWS IPv6 IMDS ULA address.
         ("https://[fd00:ec2::254]/latest/", "fd00:ec2::254"),
+        // IPv4-mapped IPv6 form of the IMDS sentinel — a standard SSRF
+        // evasion. Must be canonicalized to 169.254.169.254 and rejected.
+        ("https://[::ffff:169.254.169.254]/latest/", "169.254"),
     ];
     for (url, host_fragment) in cases {
         let toml = format!(

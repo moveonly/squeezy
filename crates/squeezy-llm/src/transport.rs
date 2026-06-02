@@ -60,7 +60,9 @@ use std::time::Duration;
 
 use lru::LruCache;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use squeezy_core::{ProviderTransportConfig, is_metadata_or_link_local_ip};
+use squeezy_core::{
+    ProviderTransportConfig, is_metadata_or_link_local_host, is_metadata_or_link_local_ip,
+};
 
 /// Upper bound on the number of distinct [`ProviderTransportConfig`]
 /// values whose [`reqwest::Client`]s are kept warm in the shared cache.
@@ -151,6 +153,11 @@ pub(crate) fn build_client_with_resolver(
         // Probes idle sockets so a pool entry silently killed by a
         // NAT/firewall is detected on the next reuse.
         .tcp_keepalive(Duration::from_secs(60))
+        // Re-validate every redirect hop. The custom DNS resolver only fires
+        // when reqwest performs a DNS lookup, so a 30x `Location` pointing at
+        // a literal metadata/link-local IP would otherwise be followed without
+        // ever passing through the resolver. This closes that SSRF hop.
+        .redirect(metadata_blocking_redirect_policy())
         .dns_resolver(Arc::new(resolver));
     builder = if config.pool_idle_timeout_ms == 0 {
         // `None` keeps idle sockets parked indefinitely — a
@@ -163,6 +170,36 @@ pub(crate) fn build_client_with_resolver(
     builder
         .build()
         .expect("reqwest::Client builder must succeed with default TLS backend")
+}
+
+/// Redirect policy that refuses any hop whose host is a cloud-metadata
+/// sentinel or link-local IP literal, while preserving reqwest's default
+/// 10-hop cap. Complements [`MetadataBlockingResolver`]: the resolver guards
+/// DNS-resolved hosts, this guards literal-IP `Location` targets the resolver
+/// never sees.
+fn metadata_blocking_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // `host_str()` keeps the brackets on an IPv6 literal; strip them so the
+        // address parses the same way the config-layer check does. Own the
+        // string so the borrow on `attempt` ends before `attempt.error(..)`
+        // moves it.
+        let host = attempt
+            .url()
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        if is_metadata_or_link_local_host(&host) {
+            return attempt.error(format!(
+                "refusing redirect to metadata/link-local host: {host}"
+            ));
+        }
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        attempt.follow()
+    })
 }
 
 /// reqwest [`Resolve`] adapter that refuses any DNS lookup resolving to

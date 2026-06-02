@@ -114,15 +114,17 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
         env: "SQUEEZY_CEREBRAS_KEY",
         fallback_env: Some("CEREBRAS_API_KEY"),
     },
-    // DeepInfra documents `DEEPINFRA_TOKEN` as the canonical name in
-    // their CLI / SDK quickstarts. We honor that as the primary env
-    // var; `DEEPINFRA_API_KEY` is kept as the fallback to match
-    // Vercel AI SDK conventions for users coming from that surface.
+    // Match the core runtime resolver, which treats `DEEPINFRA_API_KEY` as the
+    // canonical primary (`default_api_key_env`) and `DEEPINFRA_TOKEN` as the
+    // alias consulted only when the primary is empty
+    // (`preset_api_key_env_aliases`). Keeping the CLI status table in the same
+    // order avoids `squeezy auth status` reporting a different effective
+    // credential than the one a request actually authenticates with.
     KnownProvider {
         section: "deepinfra",
         cli: "deepinfra",
-        env: "DEEPINFRA_TOKEN",
-        fallback_env: Some("DEEPINFRA_API_KEY"),
+        env: "DEEPINFRA_API_KEY",
+        fallback_env: Some("DEEPINFRA_TOKEN"),
     },
     // Local self-hosted OpenAI-compatible servers. They typically run without
     // authentication on a loopback port; the inline-key slot exists so users
