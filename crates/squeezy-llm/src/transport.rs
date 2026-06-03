@@ -159,6 +159,16 @@ pub(crate) fn build_client_with_resolver(
         // ever passing through the resolver. This closes that SSRF hop.
         .redirect(metadata_blocking_redirect_policy())
         .dns_resolver(Arc::new(resolver));
+    // Some network paths (corporate proxies, certain middleboxes) reset the
+    // HTTP/2 streams reqwest negotiates by default mid-response while leaving
+    // HTTP/1.1 untouched, which surfaces as repeated `provider stream`
+    // reconnects. `SQUEEZY_FORCE_HTTP1=1` pins the client to HTTP/1.1 as an
+    // escape hatch for those environments.
+    if std::env::var("SQUEEZY_FORCE_HTTP1")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+    {
+        builder = builder.http1_only();
+    }
     builder = if config.pool_idle_timeout_ms == 0 {
         // `None` keeps idle sockets parked indefinitely — a
         // `pool_idle_timeout_ms = 0` config explicitly disables

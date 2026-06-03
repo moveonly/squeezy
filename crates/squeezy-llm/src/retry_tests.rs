@@ -367,6 +367,102 @@ async fn unmarked_provider_stream_error_still_retries() {
     );
 }
 
+/// A reconnect that diverges *before any visible output is committed* — the
+/// stream drops mid-reasoning and the regenerated reasoning differs — must
+/// recover by restarting the stream from scratch rather than failing the whole
+/// turn. Before this fix a flaky transport that reset early sampled a divergent
+/// continuation on every reconnect and surfaced "stream reconnect diverged",
+/// turning the turn into a $0 failure; that is the dominant variance/$0 source
+/// under load.
+#[tokio::test]
+async fn early_reconnect_divergence_restarts_instead_of_failing() {
+    let policy = RetryPolicy {
+        max_retries: 5,
+        base_delay: Duration::from_millis(1),
+        retry_429: false,
+        retry_5xx: false,
+        retry_transport: true,
+        max_retry_delay: Duration::from_secs(60),
+    };
+    let cancel = CancellationToken::new();
+    let attempts = Arc::new(Mutex::new(0u32));
+    let factory_attempts = attempts.clone();
+
+    let stream = with_stream_retry("mock", policy, cancel, move || {
+        let which = {
+            let mut n = factory_attempts.lock().expect("lock");
+            *n += 1;
+            *n
+        };
+        let inner = try_stream! {
+            match which {
+                1 => {
+                    // Drops mid-reasoning, nothing visible committed.
+                    yield LlmEvent::Started;
+                    yield LlmEvent::ReasoningDelta {
+                        text: "Thinking variant A".to_string(),
+                        kind: crate::ReasoningKind::Text,
+                    };
+                    Err(SqueezyError::ProviderStream("connection reset".to_string()))?;
+                }
+                2 => {
+                    // Reconnect samples *different* reasoning -> divergence.
+                    yield LlmEvent::Started;
+                    yield LlmEvent::ReasoningDelta {
+                        text: "Completely different B".to_string(),
+                        kind: crate::ReasoningKind::Text,
+                    };
+                    Err(SqueezyError::ProviderStream("connection reset".to_string()))?;
+                }
+                _ => {
+                    // Clean restart finally lands a full response.
+                    yield LlmEvent::Started;
+                    yield LlmEvent::ReasoningDelta {
+                        text: "Final reasoning C".to_string(),
+                        kind: crate::ReasoningKind::Text,
+                    };
+                    yield LlmEvent::TextDelta("the answer".to_string());
+                    yield LlmEvent::completed(Some("resp".to_string()), CostSnapshot::default());
+                }
+            }
+        };
+        Box::pin(inner) as LlmStream
+    });
+
+    let collected: Vec<LlmEvent> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .expect("early divergence must recover via a clean restart, not surface an error");
+
+    let mut text = String::new();
+    let mut completed = 0;
+    let mut started = 0;
+    for event in &collected {
+        match event {
+            LlmEvent::TextDelta(delta) => text.push_str(delta),
+            LlmEvent::Completed { .. } => completed += 1,
+            LlmEvent::Started => started += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        text, "the answer",
+        "the successful restart's text must reach the caller"
+    );
+    assert_eq!(completed, 1, "exactly one completion reaches the caller");
+    assert_eq!(
+        started, 1,
+        "Started is a one-shot latch even across restarts"
+    );
+    assert_eq!(
+        *attempts.lock().expect("lock"),
+        3,
+        "two drops then a clean third attempt"
+    );
+}
+
 #[tokio::test]
 async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
     let policy = RetryPolicy {
