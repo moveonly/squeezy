@@ -2135,6 +2135,7 @@ impl Agent {
             },
             cache_key: None,
             cache: self.session_prompt_cache_key().into(),
+            disable_prompt_cache: self.config.disable_prompt_cache,
             tools: Arc::from(request_tool_specs(
                 &all_tool_specs,
                 mode,

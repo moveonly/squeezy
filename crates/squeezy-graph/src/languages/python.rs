@@ -191,6 +191,27 @@ impl SemanticGraph {
         method_name: &str,
         depth: usize,
     ) -> Option<SymbolId> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(class_id.clone());
+        self.python_method_in_bases_visited(class_id, method_name, depth, &mut visited)
+    }
+
+    /// Walk the `base:` attribute chain looking for `method_name`, deduping
+    /// ancestors via a visited-set. Each `base:` name resolves to a fan-out of
+    /// global class candidates, and on a wide diamond hierarchy with many
+    /// identically-named classes (a framework's `Model`/`Controller`/`Builder`
+    /// trees) the recursion re-expands shared ancestors along every path —
+    /// combinatorial blow-up that dominated the cold build's call resolution.
+    /// The visited-set only prunes redundant re-traversal: an ancestor's
+    /// subtree is identical no matter how it is reached, so the first match in
+    /// declaration order is unchanged and resolution stays correct.
+    fn python_method_in_bases_visited(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        depth: usize,
+        visited: &mut std::collections::HashSet<SymbolId>,
+    ) -> Option<SymbolId> {
         if depth > 8 {
             return None;
         }
@@ -202,10 +223,14 @@ impl SemanticGraph {
         {
             let base_ids = self.python_class_candidates_for_name_in_file(&class.file_id, base);
             for base_id in base_ids {
+                if !visited.insert(base_id.clone()) {
+                    continue;
+                }
                 if let Some(method) = self.python_method_on_class(&base_id, method_name) {
                     return Some(method);
                 }
-                if let Some(method) = self.python_method_in_bases(&base_id, method_name, depth + 1)
+                if let Some(method) =
+                    self.python_method_in_bases_visited(&base_id, method_name, depth + 1, visited)
                 {
                     return Some(method);
                 }

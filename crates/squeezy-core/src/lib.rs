@@ -485,6 +485,12 @@ pub struct AppConfig {
     pub max_search_files_per_turn: u64,
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: u8,
+    /// Suppress all prompt caching for this session (env
+    /// `SQUEEZY_DISABLE_PROMPT_CACHE`). Threads into every `LlmRequest` so
+    /// each turn is billed at full input price with no cache_control markers
+    /// and an OpenAI cache-busting nonce — used for deterministic,
+    /// cache-independent cost comparisons.
+    pub disable_prompt_cache: bool,
     pub routing: RoutingConfig,
     pub telemetry: TelemetryConfig,
     pub feedback: FeedbackConfig,
@@ -1016,6 +1022,10 @@ impl AppConfig {
             .filter(|value| (1..=100).contains(value))
             .or(budgets.cost_warn_percent)
             .unwrap_or(DEFAULT_COST_WARN_PERCENT);
+        let disable_prompt_cache = get_var("SQUEEZY_DISABLE_PROMPT_CACHE")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(false);
         let routing = RoutingConfig::from_settings_and_env(
             settings.routing.unwrap_or_default(),
             &mut get_var,
@@ -1132,6 +1142,7 @@ impl AppConfig {
             max_search_files_per_turn,
             max_session_cost_usd_micros,
             cost_warn_percent,
+            disable_prompt_cache,
             routing,
             telemetry,
             feedback,

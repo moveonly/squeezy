@@ -472,6 +472,39 @@ impl StreamSkipState {
             _ => {}
         }
     }
+
+    /// True when nothing the consumer must keep has been committed yet — only
+    /// `Started`, a `ServerModel` echo, and/or reasoning deltas have reached
+    /// it. Reasoning is ephemeral live-display content, so a fresh restart
+    /// that re-streams it is cosmetic; visible `TextDelta` or a `ToolCall`,
+    /// by contrast, the consumer has already folded into the committed turn
+    /// and cannot un-see.
+    fn is_uncommitted(&self) -> bool {
+        self.emitted_text.is_empty() && self.emitted_tool_call_ids.is_empty()
+    }
+
+    /// Discard the tracked content prefix so the next attempt streams from
+    /// scratch, while keeping the one-shot `started`/`server_model` latches so
+    /// the consumer doesn't see a duplicate turn-start or model echo. Used to
+    /// recover an early reconnect divergence as a clean restart instead of a
+    /// fatal turn error. Only sound when [`Self::is_uncommitted`] holds.
+    fn reset_content_for_restart(&mut self) {
+        self.emitted_text.clear();
+        self.emitted_reasoning.clear();
+        self.emitted_reasoning_done = 0;
+        self.emitted_tool_call_ids.clear();
+    }
+}
+
+/// True when `err` is a splice-divergence raised by the reconnect cursor (the
+/// regenerated text/reasoning/tool-call did not reproduce the already-emitted
+/// prefix), as opposed to an ordinary transport-level stream drop. These are
+/// the only errors a clean restart can recover.
+fn is_reconnect_divergence(err: &SqueezyError) -> bool {
+    matches!(
+        err,
+        SqueezyError::ProviderStream(msg) if msg.contains("stream reconnect diverged")
+    )
 }
 
 /// Per-attempt cursor that tracks how much of the already-emitted prefix the
@@ -691,7 +724,16 @@ fn skip_validated_prefix(text: String, prefix: &str, seen: &mut usize) -> Result
                 .collect::<String>(),
         )));
     }
-    *seen += consumed;
+    // Advance `seen` by the *whole* delta, not just the re-validated
+    // `consumed` prefix. The forwarded suffix is appended to
+    // `skip.emitted_reasoning`/`emitted_text` by the caller's
+    // `observe_yielded`, so on the next delta `prefix.chars().count()`
+    // grows by exactly that suffix length. If `seen` only tracked the
+    // re-validated portion it would fall behind the recorded prefix, and
+    // the *next* fresh delta of the same attempt would be re-validated
+    // against content it just emitted — a spurious "stream reconnect
+    // diverged" error on the very first (non-reconnecting) attempt.
+    *seen += consumed + forwarded.map_or(0, |suffix| suffix.chars().count());
     Ok(forwarded.map(str::to_string))
 }
 
@@ -731,14 +773,39 @@ where
                     Some(Ok(event)) => {
                         let was_completed = matches!(event, LlmEvent::Completed { .. });
                         // A divergent reconnect (different wording or tool-call id)
-                        // surfaces as an error here rather than splicing two
-                        // independently-sampled generations into one turn.
-                        if was_completed {
-                            cursor.check_complete()?;
+                        // can't be spliced onto the already-emitted prefix. When
+                        // nothing visible has been committed yet (only Started /
+                        // reasoning reached the consumer — the common case for a
+                        // stream that drops early), recover by discarding the
+                        // partial and restarting the stream from scratch instead
+                        // of failing the whole turn to $0. Only a late divergence,
+                        // after real text or a tool-call the consumer already
+                        // folded in, stays fatal.
+                        if was_completed
+                            && let Err(err) = cursor.check_complete()
+                        {
+                            if is_reconnect_divergence(&err) && skip.is_uncommitted() {
+                                skip.reset_content_for_restart();
+                                transient_error = Some(err);
+                                break 'inner;
+                            }
+                            Err(err)?;
                         }
-                        if let Some(forwarded) = cursor.filter(event, &skip)? {
-                            skip.observe_yielded(&forwarded);
-                            yield forwarded;
+                        match cursor.filter(event, &skip) {
+                            Ok(maybe_forwarded) => {
+                                if let Some(forwarded) = maybe_forwarded {
+                                    skip.observe_yielded(&forwarded);
+                                    yield forwarded;
+                                }
+                            }
+                            Err(err) => {
+                                if is_reconnect_divergence(&err) && skip.is_uncommitted() {
+                                    skip.reset_content_for_restart();
+                                    transient_error = Some(err);
+                                    break 'inner;
+                                }
+                                Err(err)?;
+                            }
                         }
                         if was_completed {
                             completed = true;

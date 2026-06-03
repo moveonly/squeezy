@@ -21,9 +21,9 @@ use squeezy_workspace::ExclusionReason;
 
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
-    GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, GRAPH_READY_WAIT, MAX_GRAPH_MAX_DEPTH,
-    MAX_GRAPH_MAX_RESULTS, MAX_READ_LIMIT, POLICY_PREFIX_BYTES, ToolCall, ToolCostHint,
-    ToolRegistry, ToolResult, ToolStatus, diff_mode_str, diff_path_set, diff_status_str, file_len,
+    GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
+    MAX_READ_LIMIT, POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
+    ToolStatus, diff_mode_str, diff_path_set, diff_status_str, file_len, graph_ready_wait,
     is_secret_path, make_result, read_prefix, read_range, sha256_file, tool_arg_error, tool_error,
     workspace_path,
 };
@@ -2105,16 +2105,22 @@ fn read_slice_byte_window(
 }
 
 /// Targeted total span (in lines) the read_slice line-range mode auto-widens
-/// toward when the caller passes a tight window. Picked to comfortably contain
-/// a typical Rust `impl Trait for Foo { fn name() … }` block (~10 lines) plus
-/// enough surrounding context that a single fetch covers the enclosing
-/// function/impl in most languages — without forcing a second read when the
-/// model only knew the method's body span.
-const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 80;
+/// toward when the caller passes a tight window. Sized to cover a typical
+/// function/method body plus a few lines of surrounding context in one fetch.
+/// The caller's requested `[start_line, end_line]` is always fully included,
+/// so this padding only ever adds context — it can never drop a requested
+/// line, and recall cannot regress if it's tight. Kept modest because
+/// read_slice is the single highest-volume tool and most callers request a
+/// far narrower window (Haiku's median line read is ~20 lines); over-padding
+/// every such read toward a large target inflates input tokens on the
+/// dominant cost driver for no recall benefit.
+const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 48;
 /// Threshold below which a caller-supplied line range is treated as "too
 /// tight" and gets auto-widened up to `READ_SLICE_AUTO_WIDEN_TARGET_LINES`.
-/// Ranges already at or above this size are left exactly as the caller asked.
-const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 60;
+/// Ranges already at or above this size are left exactly as the caller asked
+/// — a caller that deliberately requested a wide window already has its
+/// context and should not be padded further.
+const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 40;
 
 fn line_window(
     text: &str,
@@ -2244,7 +2250,7 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -3470,7 +3476,7 @@ impl ToolRegistry {
         max_symbols_per_file: usize,
         max_references: usize,
     ) -> Value {
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),

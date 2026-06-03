@@ -1095,22 +1095,23 @@ impl SemanticGraph {
         method_name: &str,
         exclude: Option<&SymbolId>,
     ) -> Option<SymbolId> {
-        let parent_ids = self
-            .symbols
-            .values()
-            .filter(|symbol| {
-                symbol.id == parent.id
-                    || (symbol.language_identity.is_some()
-                        && symbol.language_identity == parent.language_identity
-                        && is_class_like_kind(symbol.kind))
-            })
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        single_symbol(parent_ids.iter().flat_map(|parent_id| {
-            self.children_by_parent
-                .get(parent_id)
-                .into_iter()
-                .flatten()
+        // The "partials" of a class are the other class-like declarations that
+        // share its `language_identity` (Rust `impl` blocks, C# `partial`
+        // classes, Dart `part`-file siblings). `symbols_by_language_identity`
+        // groups exactly those, so we look up that bucket instead of scanning
+        // every symbol in the workspace per call — the scan made cold-build
+        // call resolution quadratic in the symbol count on large repos. The
+        // bucket only holds class-like kinds, so include `parent.id` itself
+        // explicitly to preserve the original behavior for kinds outside
+        // `is_class_like_kind` (e.g. Rust `Impl`, `Union`).
+        let partials = parent
+            .language_identity
+            .as_ref()
+            .and_then(|identity| self.symbols_by_language_identity.get(identity));
+        let parent_ids = std::iter::once(&parent.id).chain(partials.into_iter().flatten());
+        single_symbol(
+            parent_ids
+                .flat_map(|parent_id| self.children_by_parent.get(parent_id).into_iter().flatten())
                 .filter_map(|child_id| self.symbols.get(child_id))
                 .filter(move |symbol| {
                     matches!(
@@ -1119,8 +1120,8 @@ impl SemanticGraph {
                     ) && symbol.name == method_name
                         && exclude.map(|id| id != &symbol.id).unwrap_or(true)
                 })
-                .map(|symbol| symbol.id.clone())
-        }))
+                .map(|symbol| symbol.id.clone()),
+        )
     }
 
     /// Order a `CandidateSet` for a call so the most-likely callee comes first.

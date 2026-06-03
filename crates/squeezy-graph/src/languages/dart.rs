@@ -71,12 +71,33 @@ impl SemanticGraph {
     }
 
     /// Walk the Dart ancestor chain (mixin -> extends -> implements -> on)
-    /// looking for a method named `method_name`. Caps at depth 8 (§4b).
+    /// looking for a method named `method_name`. Caps at depth 8 (§4b) and
+    /// dedupes ancestors via a visited-set: on a wide diamond hierarchy with
+    /// many same-named classes (Flutter's `State`/`Widget`/`Element` trees),
+    /// every ancestor name resolves to a fan-out of global candidates, and
+    /// without dedup the recursion re-expands shared ancestors along every
+    /// path — combinatorial blow-up that made the initial graph build on a
+    /// large Dart workspace run for minutes and never finish. The visited-set
+    /// only prunes redundant re-traversal; an ancestor's subtree is identical
+    /// regardless of the path that reaches it, so the first match in Dart's
+    /// resolution order is unchanged and resolution stays correct.
     pub(crate) fn dart_method_in_ancestors(
         &self,
         class_id: &SymbolId,
         method_name: &str,
         depth: usize,
+    ) -> Option<SymbolId> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(class_id.clone());
+        self.dart_method_in_ancestors_visited(class_id, method_name, depth, &mut visited)
+    }
+
+    fn dart_method_in_ancestors_visited(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        depth: usize,
+        visited: &mut std::collections::HashSet<SymbolId>,
     ) -> Option<SymbolId> {
         if depth >= DART_ANCESTOR_DEPTH_CAP {
             return None;
@@ -93,12 +114,21 @@ impl SemanticGraph {
             .chain(ons.iter())
         {
             for candidate_class_id in self.dart_class_symbols_by_name(name) {
+                // Skip ancestors already expanded on another path: their
+                // subtree is identical no matter how we reach them, so a
+                // re-walk only burns time (exponentially, on a diamond).
+                if !visited.insert(candidate_class_id.clone()) {
+                    continue;
+                }
                 if let Some(method) = self.dart_method_on_class(&candidate_class_id, method_name) {
                     return Some(method);
                 }
-                if let Some(method) =
-                    self.dart_method_in_ancestors(&candidate_class_id, method_name, depth + 1)
-                {
+                if let Some(method) = self.dart_method_in_ancestors_visited(
+                    &candidate_class_id,
+                    method_name,
+                    depth + 1,
+                    visited,
+                ) {
                     return Some(method);
                 }
             }

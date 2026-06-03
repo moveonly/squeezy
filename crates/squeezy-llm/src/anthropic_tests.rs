@@ -235,6 +235,34 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
 }
 
 #[test]
+fn request_body_omits_all_cache_control_when_prompt_cache_disabled() {
+    // Identical setup to the marker-insertion test (real model + cache_key,
+    // which normally force ephemeral markers), but with the hard off-switch
+    // set: not a single cache_control marker may appear anywhere in the body.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("first turn".to_string()),
+            LlmInputItem::AssistantText("ack".to_string()),
+            LlmInputItem::UserText("second turn".to_string()),
+        ]),
+        max_output_tokens: Some(32),
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        disable_prompt_cache: true,
+        ..LlmRequest::default()
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    let serialized = serde_json::to_string(&body).expect("serialize");
+    assert!(
+        !serialized.contains("cache_control"),
+        "disable_prompt_cache must suppress every cache_control marker: {serialized}"
+    );
+}
+
+#[test]
 fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
     let request = LlmRequest {
         model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),

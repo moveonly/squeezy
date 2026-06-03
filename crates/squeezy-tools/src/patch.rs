@@ -37,12 +37,11 @@ use similar::TextDiff;
 use squeezy_vcs::{DiffMode, DiffOptions};
 
 use crate::{
-    GRAPH_READY_WAIT, MAX_GRAPH_MAX_RESULTS, StagedApply, StagedOp, ToolCall, ToolCostHint,
-    ToolRegistry, ToolResult, ToolStatus, diff_file_json, diff_mode_str,
-    graph_tools::graph_payload, graph_tools::reference_json,
-    graph_tools::resolve_definition_candidates, graph_tools::symbol_json,
-    graph_tools::symbol_summary_json, is_secret_path, make_result, safety, sha256_hex,
-    tool_arg_error, tool_error, unix_timestamp_millis,
+    MAX_GRAPH_MAX_RESULTS, StagedApply, StagedOp, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
+    ToolStatus, diff_file_json, diff_mode_str, graph_ready_wait, graph_tools::graph_payload,
+    graph_tools::reference_json, graph_tools::resolve_definition_candidates,
+    graph_tools::symbol_json, graph_tools::symbol_summary_json, is_secret_path, make_result,
+    safety, sha256_hex, tool_arg_error, tool_error, unix_timestamp_millis,
 };
 
 pub(crate) const DEFAULT_PATCH_MAX_SYMBOLS: usize = 8;
@@ -505,7 +504,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_PATCH_MAX_RELATED)
             .clamp(1, MAX_GRAPH_MAX_RESULTS);
         let candidate_paths = normalized_path_set(args.candidate_paths.as_deref().unwrap_or(&[]));
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {

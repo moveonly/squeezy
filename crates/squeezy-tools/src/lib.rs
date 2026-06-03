@@ -160,15 +160,28 @@ pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// Upper bound a graph tool waits for the deferred
 /// `GraphManager::open_with_store` background task to finish before it
-/// falls back to `graph_unavailable_result`. Tuned to be short enough
-/// that a slow cold-open on a large monorepo (akka/akka, ~4.7k files)
-/// doesn't strand every graph tool call behind a multi-second wait —
-/// once the bg task finishes the condvar fires and subsequent calls
-/// return instantly, so the model only pays this wait on the very first
-/// graph tool of a session. Most projects open in well under this
-/// window; slow-opening ones surface `graph_indexing` quickly and the
-/// model falls back to grep without burning a wall-time budget waiting.
-pub(crate) const GRAPH_READY_WAIT: Duration = Duration::from_secs(5);
+/// falls back to `graph_unavailable_result`. The condvar fires the instant
+/// the background open completes, so the model only ever pays this wait on
+/// the very first graph tool call of a session and small/medium projects
+/// pay almost none of it. The bound is generous on purpose: a too-short
+/// wait silently strands a large cold monorepo (e.g. laravel ~2.8k files,
+/// akka ~4.7k) on `graph_unavailable`/`graph_indexing` for the whole
+/// session and degrades it to grep — which is both less accurate and often
+/// more expensive — even though the index becomes ready a second or two
+/// later. Buying correct navigation for the cost of one bounded first-call
+/// wait is the better trade. Override with `SQUEEZY_GRAPH_READY_WAIT_MS`
+/// for unusually large or unusually latency-sensitive workspaces.
+pub(crate) fn graph_ready_wait() -> Duration {
+    use std::sync::OnceLock;
+    static WAIT: OnceLock<Duration> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("SQUEEZY_GRAPH_READY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30))
+    })
+}
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
 pub(crate) const DEFAULT_GRAPH_MAX_RESULTS: usize = 50;
 pub(crate) const MAX_GRAPH_MAX_RESULTS: usize = 100;
@@ -2933,7 +2946,7 @@ impl ToolRegistry {
             captured_unix_millis: unix_millis(),
         };
 
-        let graph_ready = self.wait_for_graph_ready(GRAPH_READY_WAIT);
+        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
         let report = {
             let mut graph = match self.graph.lock() {
                 Ok(graph) => graph,

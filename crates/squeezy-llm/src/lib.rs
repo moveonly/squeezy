@@ -145,6 +145,16 @@ pub struct LlmRequest {
     /// provider defaults; `None` disables caching entirely.
     #[serde(default)]
     pub cache: CacheSpec,
+    /// Hard off-switch for all prompt caching. When `true`,
+    /// [`LlmRequest::effective_cache_retention`] reports
+    /// [`CacheRetention::None`] regardless of `cache`/`cache_key`, so no
+    /// provider emits `cache_control`/`cachePoint` markers or a
+    /// `prompt_cache_retention` window, and the OpenAI provider injects a
+    /// per-request nonce to bust its automatic prefix cache. Used when every
+    /// turn must be billed at full input price for a deterministic,
+    /// cache-independent cost comparison.
+    #[serde(default)]
+    pub disable_prompt_cache: bool,
     pub tools: Arc<[Arc<LlmToolSpec>]>,
     pub store: bool,
     /// Optional `tool_choice` hint to forward to the provider when tools are
@@ -249,6 +259,7 @@ impl Default for LlmRequest {
             previous_response_id: None,
             cache_key: None,
             cache: CacheSpec::default(),
+            disable_prompt_cache: false,
             tools: Arc::from(Vec::new()),
             store: false,
             tool_choice: None,
@@ -319,6 +330,9 @@ impl LlmRequest {
     /// `cache.retention` wins, and a legacy `cache_key` lifts an otherwise
     /// disabled retention to [`CacheRetention::Short`].
     pub fn effective_cache_retention(&self) -> CacheRetention {
+        if self.disable_prompt_cache {
+            return CacheRetention::None;
+        }
         if self.cache.retention != CacheRetention::None {
             self.cache.retention
         } else if self.cache_key.is_some() {
