@@ -5956,12 +5956,19 @@ fn task_panel_height(app: &TuiApp) -> u16 {
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    // A subagent's live work threads its rail in magenta, matching the
+    // settled subagent nodes; the main agent's stays dim.
+    let live_chrome = if active_subagent_record(app).is_some() {
+        crate::render::theme::magenta()
+    } else {
+        rail::dim()
+    };
     let mut lines = if turn_in_progress(app) {
         let mut working = working_line(app);
         let detail = working_detail_line(app);
         // The active tool is the live rail node (its spinner star is the
         // marker); close the rail here unless a queued-tail row follows.
-        rail::set_elbow(&mut working, detail.is_none());
+        rail::set_elbow(&mut working, detail.is_none(), live_chrome);
         let mut rows = vec![working];
         if let Some(mut detail) = detail {
             rail::apply_gutter(
@@ -5978,7 +5985,7 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         vec![compact_task_state_line(snapshot)]
     } else {
         let mut working = working_line(app);
-        rail::set_elbow(&mut working, true);
+        rail::set_elbow(&mut working, true, live_chrome);
         vec![working]
     };
     if lines.len() < area.height as usize {
@@ -6726,6 +6733,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
     let mut prev_work = false;
+    let subagent_view = active_subagent_record(app).is_some();
     for (index, entry) in entries.iter().enumerate() {
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -6739,7 +6747,12 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                         selected_entry == Some(index),
                         extras,
                     );
-                    push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&entry.kind, subagent_view),
+                    );
                 }
                 continue;
             }
@@ -6759,7 +6772,12 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                     width,
                     ToolCardSurface::Plain,
                 );
-                push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&entry.kind, subagent_view),
+                );
                 continue;
             }
             None => {}
@@ -6775,7 +6793,12 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             true,
         );
         if is_rail_work_node(&entry.kind) {
-            push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&entry.kind, subagent_view),
+            );
         } else {
             lines.append(&mut block);
             prev_work = false;
@@ -7040,16 +7063,36 @@ fn active_conversation_title(app: &TuiApp) -> Option<Line<'static>> {
 /// tool results, plans). Messages, diffs, logs and slash echoes flow at the
 /// normal margin, off the rail.
 fn is_rail_work_node(kind: &TranscriptEntryKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         TranscriptEntryKind::ToolResult(_)
-            | TranscriptEntryKind::PlanCard(_)
-            | TranscriptEntryKind::Reasoning(_)
-    )
+        | TranscriptEntryKind::PlanCard(_)
+        | TranscriptEntryKind::Reasoning(_) => true,
+        // Subagent breadcrumbs thread on the rail; other logs flow off it.
+        TranscriptEntryKind::Log(entry) => entry.kind == LogKind::Subagent,
+        _ => false,
+    }
 }
 
 fn line_is_blank(line: &Line<'_>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
+/// The gutter tint that gives a rail node its identity at a glance: plans glow
+/// amber (a decision to read), reasoning runs cool blue (thinking, set apart
+/// from the work), and everything in a subagent's transcript turns magenta so
+/// the delegated context is unmistakable. Plain tool work stays dim.
+fn rail_chrome(kind: &TranscriptEntryKind, subagent_view: bool) -> Color {
+    if subagent_view {
+        return crate::render::theme::magenta();
+    }
+    match kind {
+        TranscriptEntryKind::PlanCard(_) => crate::render::theme::accent(),
+        TranscriptEntryKind::Reasoning(_) => crate::render::theme::blue(),
+        TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Subagent => {
+            crate::render::theme::magenta()
+        }
+        _ => rail::dim(),
+    }
 }
 
 /// Append a settled work-entry block to the transcript on the Quiet Rail: trim
@@ -7060,6 +7103,7 @@ fn push_rail_work_block(
     lines: &mut Vec<Line<'static>>,
     block: &mut Vec<Line<'static>>,
     prev_work: &mut bool,
+    chrome: Color,
 ) {
     while block.last().is_some_and(line_is_blank) {
         block.pop();
@@ -7068,9 +7112,9 @@ fn push_rail_work_block(
         return;
     }
     if *prev_work {
-        lines.push(rail::connector_line());
+        lines.push(rail::connector_line(chrome));
     }
-    rail::apply_block_gutter(block, false);
+    rail::apply_block_gutter(block, false, chrome);
     lines.append(block);
     *prev_work = true;
 }
@@ -7092,6 +7136,7 @@ fn transcript_lines_for_render(
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
     let mut prev_work = false;
+    let subagent_view = active_subagent_record(app).is_some();
     for (index, item) in entries.iter().enumerate() {
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -7105,7 +7150,12 @@ fn transcript_lines_for_render(
                         selected_entry == Some(index),
                         extras,
                     );
-                    push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&item.kind, subagent_view),
+                    );
                 }
                 continue;
             }
@@ -7123,7 +7173,12 @@ fn transcript_lines_for_render(
                     width,
                     ToolCardSurface::Tinted,
                 );
-                push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&item.kind, subagent_view),
+                );
                 continue;
             }
             None => {}
@@ -7139,7 +7194,12 @@ fn transcript_lines_for_render(
             false,
         );
         if is_rail_work_node(&item.kind) {
-            push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, subagent_view),
+            );
         } else {
             lines.append(&mut block);
             prev_work = false;
@@ -8744,8 +8804,22 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
             Span::styled(preview, style),
         ])];
     }
-    if entry.kind == LogKind::Info {
-        return detail_text_lines(selected, crate::render::theme::cyan(), message);
+    if entry.kind == LogKind::Subagent {
+        // Subagent breadcrumb: a single magenta `◆` node (pairs with the
+        // plan's hollow `◇`). The gutter pass turns the leading margin into
+        // `├─`/`╰─` in magenta, so the whole node reads as delegated work.
+        let marker = if selected { "> " } else { "  " };
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled(
+                "◆ ",
+                Style::default()
+                    .fg(crate::render::theme::magenta())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
+        ])];
     }
     if entry.kind == LogKind::Warn {
         // `⚠ message` rendering for warnings so the user can spot
@@ -8909,9 +8983,15 @@ pub(crate) mod rail {
         }
     }
 
-    /// Dim style for the rail's structural connectors (`│ ├ ╰ ─`).
-    fn chrome_style() -> Style {
-        Style::default().fg(crate::render::theme::quiet())
+    /// Style for the rail's structural connectors (`│ ├ ╰ ─`). Normally dim
+    /// `quiet`; callers pass an accent (a lit-up plan) or the subagent tint to
+    /// give whole runs special treatment.
+    fn chrome_style(color: Color) -> Style {
+        Style::default().fg(color)
+    }
+
+    pub(crate) fn dim() -> Color {
+        crate::render::theme::quiet()
     }
 
     /// The two spans opening a node's header line: the tee/close elbow (dim) and
@@ -8921,7 +9001,7 @@ pub(crate) mod rail {
         let elbow = if is_last { "╰─" } else { "├─" };
         let (glyph, color) = marker.glyph_and_color();
         vec![
-            Span::styled(elbow.to_string(), chrome_style()),
+            Span::styled(elbow.to_string(), chrome_style(dim())),
             Span::styled(
                 format!("{glyph} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -8930,14 +9010,14 @@ pub(crate) mod rail {
     }
 
     /// The body/continuation prefix that keeps a node's wrapped lines aligned
-    /// under its header content: a single dim connector, four cells (`│   `).
-    pub(crate) fn body_span() -> Span<'static> {
-        Span::styled("│   ".to_string(), chrome_style())
+    /// under its header content: a single connector, four cells (`│   `).
+    pub(crate) fn body_span(chrome: Color) -> Span<'static> {
+        Span::styled("│   ".to_string(), chrome_style(chrome))
     }
 
     /// A standalone connector row drawn on the gutter between rail nodes.
-    pub(crate) fn connector_line() -> Line<'static> {
-        Line::from(Span::styled("│".to_string(), chrome_style()))
+    pub(crate) fn connector_line(chrome: Color) -> Line<'static> {
+        Line::from(Span::styled("│".to_string(), chrome_style(chrome)))
     }
 
     /// Replace a line's leading two-cell margin with just the tree elbow
@@ -8948,10 +9028,10 @@ pub(crate) mod rail {
         matches!(span.content.as_ref(), "  " | "> ")
     }
 
-    pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool) {
+    pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool, chrome: Color) {
         let elbow = Span::styled(
             if is_last { "╰─" } else { "├─" }.to_string(),
-            chrome_style(),
+            chrome_style(chrome),
         );
         // Replace a leading two-cell margin where one exists (tool/live rows),
         // otherwise prepend (reasoning rows embed their own marker, no margin).
@@ -8969,14 +9049,14 @@ pub(crate) mod rail {
     /// every body row gets the dim `│` connector. A body row's existing margin
     /// and `│ ` detail bar are collapsed into the gutter so it never doubles.
     /// No-op on an empty block (reasoning-off leaves no orphan connector).
-    pub(crate) fn apply_block_gutter(lines: &mut [Line<'static>], is_last: bool) {
+    pub(crate) fn apply_block_gutter(lines: &mut [Line<'static>], is_last: bool, chrome: Color) {
         let Some((first, rest)) = lines.split_first_mut() else {
             return;
         };
-        set_elbow(first, is_last);
+        set_elbow(first, is_last, chrome);
         for line in rest {
             if line.spans.is_empty() {
-                line.spans = vec![body_span()];
+                line.spans = vec![body_span(chrome)];
                 continue;
             }
             let mut drop = 0;
@@ -8991,9 +9071,9 @@ pub(crate) mod rail {
                 drop += 1;
             }
             if drop == 0 {
-                line.spans.insert(0, body_span());
+                line.spans.insert(0, body_span(chrome));
             } else {
-                line.spans.splice(0..drop, vec![body_span()]);
+                line.spans.splice(0..drop, vec![body_span(chrome)]);
             }
         }
     }
@@ -9009,7 +9089,7 @@ pub(crate) mod rail {
         };
         splice_prefix(first, head_spans(&marker, is_last));
         for line in rest {
-            splice_prefix(line, vec![body_span()]);
+            splice_prefix(line, vec![body_span(dim())]);
         }
     }
 
@@ -14462,12 +14542,14 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
-    pub(crate) fn push_info(&mut self, message: String) {
+    /// Push a subagent lifecycle breadcrumb (started / completed) — a magenta
+    /// `◆` node on the rail so delegated work stands out from the main flow.
+    pub(crate) fn push_subagent_note(&mut self, message: String) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::log_with_kind(
             id,
             message,
-            LogKind::Info,
+            LogKind::Subagent,
             self.transcript_default,
         ));
     }
@@ -15019,9 +15101,6 @@ fn system_message_can_collapse(item: &TranscriptItem) -> bool {
 pub(crate) enum LogKind {
     /// Standard log line — rendered with `└` and a status-color marker.
     Normal,
-    /// Non-error operational event with useful payload. Rendered neutral and
-    /// left untruncated so lifecycle details stay inspectable.
-    Info,
     /// Operational chrome (turn-complete markers, compaction notices,
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.
@@ -15029,6 +15108,10 @@ pub(crate) enum LogKind {
     /// Warning chrome — turn cancellations, turn failures. Rendered with
     /// a `⚠ ` prefix so the user can spot turn-ending events at a glance.
     Warn,
+    /// A subagent lifecycle breadcrumb (delegate started / completed).
+    /// Rendered as a magenta `◆` rail node so delegated work is
+    /// unmistakable in the main flow and threads on the gutter.
+    Subagent,
 }
 
 #[derive(Debug, Clone)]
@@ -15834,7 +15917,12 @@ fn inline_history_lines_for_flush(
                         false,
                         extras,
                     );
-                    push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&item.kind, false),
+                    );
                 }
                 continue;
             }
@@ -15852,7 +15940,12 @@ fn inline_history_lines_for_flush(
                     Some(width),
                     ToolCardSurface::Tinted,
                 );
-                push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&item.kind, false),
+                );
                 continue;
             }
             None => {}
@@ -15866,7 +15959,12 @@ fn inline_history_lines_for_flush(
             app.show_reasoning_usage,
         );
         if is_rail_work_node(&item.kind) {
-            push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, false),
+            );
         } else {
             lines.append(&mut block);
             prev_work = false;

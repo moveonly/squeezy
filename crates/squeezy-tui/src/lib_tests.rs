@@ -753,7 +753,7 @@ fn subagent_row_shows_lifecycle_word_for_accessibility() {
 }
 
 #[tokio::test]
-async fn subagent_lifecycle_logs_are_neutral_and_compact() {
+async fn subagent_lifecycle_logs_are_distinct_and_compact() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
@@ -802,16 +802,16 @@ async fn subagent_lifecycle_logs_are_neutral_and_compact() {
         .collect::<Vec<_>>();
     assert_eq!(lifecycle_logs.len(), 2);
 
-    // Neutral (Info/cyan), never an alarming colour.
+    // Distinct subagent identity: a magenta `◆` node (never an alarming red),
+    // so delegated work is recognisable on the rail.
     for log in &lifecycle_logs {
-        assert_eq!(log.kind, LogKind::Info);
+        assert_eq!(log.kind, LogKind::Subagent);
         let lines = format_log_entry(log, true, false);
+        let marker = lines.first().and_then(|line| line.spans.get(1));
+        assert_eq!(marker.map(|span| span.content.as_ref()), Some("◆ "));
         assert_eq!(
-            lines
-                .first()
-                .and_then(|line| line.spans.get(1))
-                .and_then(|span| span.style.fg),
-            Some(crate::render::theme::cyan())
+            marker.and_then(|span| span.style.fg),
+            Some(crate::render::theme::magenta())
         );
     }
 
@@ -820,6 +820,15 @@ async fn subagent_lifecycle_logs_are_neutral_and_compact() {
     let main_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
     assert!(
         main_view.contains("subagent completed · 51 tools"),
+        "{main_view}"
+    );
+    // Threaded on the rail with the magenta `◆` subagent marker.
+    assert!(
+        main_view.contains("◆ delegate subagent started"),
+        "{main_view}"
+    );
+    assert!(
+        main_view.contains("◆ delegate subagent completed"),
         "{main_view}"
     );
     assert!(!main_view.contains(summary_tail), "{main_view}");
@@ -12939,4 +12948,26 @@ fn rail_apply_gutter_last_node_uses_the_close_elbow() {
     rail::apply_gutter(&mut lines, rail::RailMarker::Settled, true);
     assert_eq!(lines[0].spans[0].content.as_ref(), "╰─");
     assert_eq!(lines[0].spans[1].content.as_ref(), "◦ ");
+}
+
+#[test]
+fn rail_chrome_lights_special_nodes() {
+    use crate::render::theme;
+    let subagent = TranscriptEntryKind::Log(LogEntry {
+        message: "delegate subagent started: x".to_string(),
+        kind: LogKind::Subagent,
+    });
+    let plain = TranscriptEntryKind::Log(LogEntry {
+        message: "note".to_string(),
+        kind: LogKind::Normal,
+    });
+    // Plain work is dim; a subagent breadcrumb glows magenta; a normal log is
+    // not a rail node at all, but if asked it stays dim.
+    assert_eq!(rail_chrome(&subagent, false), theme::magenta());
+    assert_eq!(rail_chrome(&plain, false), rail::dim());
+    // Inside a subagent's own transcript the whole rail turns magenta.
+    assert_eq!(rail_chrome(&plain, true), theme::magenta());
+    // Only subagent logs thread the rail; other logs flow off it.
+    assert!(is_rail_work_node(&subagent));
+    assert!(!is_rail_work_node(&plain));
 }

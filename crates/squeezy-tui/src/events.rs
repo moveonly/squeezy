@@ -226,7 +226,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // Keep the main transcript to a one-liner; the full prompt
                     // is the seed message of the subagent's own conversation
                     // (open it with Down / Enter to read it untruncated).
-                    app.push_info(format!(
+                    app.push_subagent_note(format!(
                         "{agent} subagent started: {}",
                         crate::compact_text(&prompt, 140)
                     ));
@@ -253,7 +253,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // One-liner in the main transcript. The full summary is
                     // stored as the final message of the subagent's own
                     // conversation (open it with Down / Enter for details).
-                    app.push_info(format!(
+                    app.push_subagent_note(format!(
                         "{agent} subagent completed · {} tools · {}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
                         crate::compact_text(&summary, 140)
