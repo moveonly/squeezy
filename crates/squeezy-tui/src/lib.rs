@@ -10344,22 +10344,8 @@ fn expanded_shell_detail_lines(
             format!("exit {exit_code}"),
         ));
     }
-    if tool.result.status != ToolStatus::Success {
-        lines.extend(output_block_lines(
-            "stdout",
-            string_arg(&tool.result.content, "stdout")
-                .as_deref()
-                .unwrap_or(""),
-            verbosity,
-        ));
-        lines.extend(output_block_lines(
-            "stderr",
-            string_arg(&tool.result.content, "stderr")
-                .as_deref()
-                .unwrap_or(""),
-            verbosity,
-        ));
-    }
+    // stdout and stderr already appear once, merged, in the combined block
+    // above — there are no separate per-stream blocks.
     if lines.is_empty() {
         lines.extend(expanded_generic_tool_detail_lines(tool, verbosity));
     }

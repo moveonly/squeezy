@@ -4728,6 +4728,32 @@ fn failed_tool_rows_show_actionable_error_detail() {
 }
 
 #[test]
+fn failed_shell_stderr_renders_once_not_duplicated() {
+    // Regression: a failed shell command rendered its stderr twice — once in
+    // the combined stdout+stderr block and again under a separate "stderr"
+    // header. The auto-expanded error must appear exactly once.
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "rustfmt --check src/cli.rs",
+        "workdir": ".",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "Diff in src/cli.rs:5: UNIQUE_FMT_MARKER_XYZ",
+    });
+    app.push_tool_result(result);
+    assert!(!app.transcript[0].collapsed, "failure auto-expands");
+
+    let output = render_to_string(&app, 140, 30);
+    assert_eq!(
+        output.matches("UNIQUE_FMT_MARKER_XYZ").count(),
+        1,
+        "stderr should render exactly once, not duplicated: {output}"
+    );
+}
+
+#[test]
 fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("shell", "");
