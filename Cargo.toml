@@ -49,7 +49,7 @@ globset = "0.4"
 http = "1"
 ignore = "0.4"
 libc = "0.2"
-lru = "0.16"
+lru = "0.18"
 pulldown-cmark = "0.13.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
@@ -59,7 +59,7 @@ rmcp = { version = "1.7", default-features = false, features = ["client", "trans
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.11"
-similar = "2"
+similar = "3"
 supports-color = "3.0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -112,7 +112,7 @@ tree-sitter-toml-updated = "0.20"
 tree-sitter-typescript = "0.23"
 tree-sitter-yaml = "0.7"
 which = "8"
-windows-sys = "0.59"
+windows-sys = "0.61"
 
 squeezy-agent = { path = "crates/squeezy-agent", version = "=0.1.0" }
 squeezy-core = { path = "crates/squeezy-core", version = "=0.1.0" }
