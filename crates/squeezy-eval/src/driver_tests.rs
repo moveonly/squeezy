@@ -41,3 +41,103 @@ fn allow_permission_mode_covers_read_capability_so_read_tool_output_auto_approve
     assert_eq!(config.permissions.web, PermissionMode::Allow);
     assert_eq!(config.permissions.mcp, PermissionMode::Allow);
 }
+
+/// Minimal scenario + workspace + options for exercising `build_manifest`
+/// in isolation (no provider, no real run).
+fn manifest_fixtures() -> (Scenario, RunOptions, crate::workspace::ProvisionedWorkspace) {
+    let scenario: Scenario = toml::from_str(
+        r#"
+            id = "cost-rollup"
+            title = "cost rollup"
+            [workspace]
+            local = "."
+        "#,
+    )
+    .expect("parse minimal scenario");
+    let options = RunOptions {
+        scenario_path: PathBuf::from("/tmp/cost-rollup.toml"),
+        out_root: PathBuf::from("/tmp"),
+        run_triage: false,
+        emit_github: false,
+        gh_repo: None,
+        live: false,
+    };
+    let workspace = crate::workspace::ProvisionedWorkspace {
+        path: PathBuf::from("/tmp"),
+        source: crate::workspace::WorkspaceSource::Local(PathBuf::from("/tmp")),
+        cleanup: None,
+    };
+    (scenario, options, workspace)
+}
+
+/// A run that delegated must report a headline cost that INCLUDES the
+/// subagent spend — i.e. >= the parent-only cost, and exactly parent +
+/// subagent. This is the measurement-integrity guarantee: delegating
+/// languages (python / dart) would otherwise undercount the scoreboard.
+#[test]
+fn manifest_headline_cost_includes_subagent_spend() {
+    let (scenario, options, workspace) = manifest_fixtures();
+    let parent = 400_000u64;
+    let subagent = 150_000u64;
+
+    let manifest = build_manifest(
+        &scenario,
+        &options,
+        &workspace,
+        0,
+        0,
+        &[],
+        ManifestCost {
+            total_micro_usd: parent + subagent,
+            parent_micro_usd: parent,
+            subagent_micro_usd: subagent,
+        },
+        &[],
+        "anthropic",
+        "claude",
+    );
+
+    let totals = &manifest["totals"];
+    // Headline cost is parent + subagent, and never below the parent-only
+    // figure.
+    assert_eq!(totals["cost_micro_usd"], parent + subagent);
+    assert!(totals["cost_micro_usd"].as_u64().unwrap() >= parent);
+    // Explicit breakdown is preserved so consumers can recover either side.
+    assert_eq!(
+        totals["total_cost_with_subagents_micro_usd"],
+        parent + subagent
+    );
+    assert_eq!(totals["parent_cost_micro_usd"], parent);
+    assert_eq!(totals["subagent_cost_micro_usd"], subagent);
+}
+
+/// A run that never delegated reports a headline equal to the parent
+/// cost (the subagent fold is a no-op), so the change is invisible to
+/// non-delegating scenarios.
+#[test]
+fn manifest_headline_cost_equals_parent_when_no_subagent() {
+    let (scenario, options, workspace) = manifest_fixtures();
+    let parent = 250_000u64;
+
+    let manifest = build_manifest(
+        &scenario,
+        &options,
+        &workspace,
+        0,
+        0,
+        &[],
+        ManifestCost {
+            total_micro_usd: parent,
+            parent_micro_usd: parent,
+            subagent_micro_usd: 0,
+        },
+        &[],
+        "anthropic",
+        "claude",
+    );
+
+    let totals = &manifest["totals"];
+    assert_eq!(totals["cost_micro_usd"], parent);
+    assert_eq!(totals["parent_cost_micro_usd"], parent);
+    assert_eq!(totals["subagent_cost_micro_usd"], 0);
+}

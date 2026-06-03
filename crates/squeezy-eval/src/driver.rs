@@ -42,7 +42,14 @@ pub struct RunOutcome {
     pub frame_count: u64,
     pub ticket_count: u64,
     pub findings: Vec<String>,
+    /// Headline run cost: parent-model spend PLUS delegate/subagent spend.
+    /// This is the value the scoreboard ranks on, so it must include
+    /// subagents or delegating runs are undercounted.
     pub cost_micro_usd: u64,
+    /// The delegate/subagent portion of `cost_micro_usd`, surfaced so a
+    /// caller can recover the parent-only spend (`cost_micro_usd -
+    /// subagent_cost_micro_usd`). Zero for runs that never delegated.
+    pub subagent_cost_micro_usd: u64,
     /// Sum of provider-reported input tokens across every turn in the run.
     /// Surfaced so the CI byte/token regression gate can compare a run
     /// against a stored per-scenario baseline (see `ci::InputRegression`).
@@ -226,6 +233,7 @@ pub async fn run_scenario(
         model: model.clone(),
         session_id: session_id.clone(),
         total_cost_micro_usd: TokioMutex::new(0),
+        total_subagent_cost_micro_usd: TokioMutex::new(0),
         live_printer: live_printer.clone(),
         last_stop_reason: TokioMutex::new(None),
         observed_tool_calls: TokioMutex::new(Vec::new()),
@@ -278,7 +286,13 @@ pub async fn run_scenario(
     // 5. Write the run manifest.
     let trace_event_count = read_line_count(&capture.path())?;
     let frame_count = read_line_count(&frames.path())?;
-    let total_cost_micro_usd = *driver.total_cost_micro_usd.lock().await;
+    let parent_cost_micro_usd = *driver.total_cost_micro_usd.lock().await;
+    let subagent_cost_micro_usd = *driver.total_subagent_cost_micro_usd.lock().await;
+    // Headline cost the scoreboard / diff key on: parent model spend PLUS
+    // any delegate/subagent spend. The agent tracks subagent spend in a
+    // separate bucket, so without this fold a delegating run (python /
+    // dart) reports only its parent cost and undercounts the scoreboard.
+    let total_cost_micro_usd = parent_cost_micro_usd.saturating_add(subagent_cost_micro_usd);
     let total_input_tokens = *driver.total_input_tokens.lock().await;
     let per_turn_costs = read_per_turn_costs(&frames.path())?;
     let manifest = build_manifest(
@@ -288,7 +302,11 @@ pub async fn run_scenario(
         trace_event_count,
         frame_count,
         &legacy_findings,
-        total_cost_micro_usd,
+        ManifestCost {
+            total_micro_usd: total_cost_micro_usd,
+            parent_micro_usd: parent_cost_micro_usd,
+            subagent_micro_usd: subagent_cost_micro_usd,
+        },
         &per_turn_costs,
         driver.provider_name,
         &driver.model,
@@ -352,6 +370,7 @@ pub async fn run_scenario(
         ticket_count,
         findings: legacy_findings,
         cost_micro_usd: total_cost_micro_usd,
+        subagent_cost_micro_usd,
         input_tokens: total_input_tokens,
     })
 }
@@ -394,6 +413,18 @@ fn summarize_first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(80).collect()
 }
 
+/// Cost breakdown handed to [`build_manifest`]. Keeps the parent / subagent
+/// split explicit so the manifest can report both the parent-only spend and
+/// the headline total without a pile of positional `u64` arguments.
+struct ManifestCost {
+    /// Headline spend: parent + subagent. The value the scoreboard ranks on.
+    total_micro_usd: u64,
+    /// Parent-model-only spend (the historical `cost_micro_usd`).
+    parent_micro_usd: u64,
+    /// Delegate/subagent spend folded into `total_micro_usd`.
+    subagent_micro_usd: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_manifest(
     scenario: &Scenario,
@@ -402,7 +433,7 @@ fn build_manifest(
     trace_event_count: u64,
     frame_count: u64,
     findings: &[String],
-    total_cost_micro_usd: u64,
+    cost: ManifestCost,
     per_turn_costs: &[(String, u64)],
     provider_name: &str,
     model: &str,
@@ -437,8 +468,16 @@ fn build_manifest(
             "trace_events": trace_event_count,
             "frames": frame_count,
             "findings": findings.len(),
-            "cost_micro_usd": total_cost_micro_usd,
-            "cost_display": crate::frames::format_cost_micro_usd(total_cost_micro_usd),
+            // Headline cost the scoreboard / diff key on: parent + subagent.
+            "cost_micro_usd": cost.total_micro_usd,
+            "cost_display": crate::frames::format_cost_micro_usd(cost.total_micro_usd),
+            // Explicit breakdown so consumers can recover either side. The
+            // `*_with_subagents` alias spells out that the headline includes
+            // delegate spend; `parent_cost_micro_usd` is the historical
+            // parent-only figure.
+            "total_cost_with_subagents_micro_usd": cost.total_micro_usd,
+            "parent_cost_micro_usd": cost.parent_micro_usd,
+            "subagent_cost_micro_usd": cost.subagent_micro_usd,
         },
         "per_turn_costs": per_turn_costs
             .iter()
@@ -740,6 +779,13 @@ struct Driver {
     #[allow(dead_code)]
     session_id: String,
     total_cost_micro_usd: TokioMutex<u64>,
+    /// Cumulative estimated cost of all delegate/subagent work across the
+    /// run, priced from each turn's `TurnMetrics.subagent_provider`. Held
+    /// apart from `total_cost_micro_usd` (parent-model only) so the run
+    /// manifest can report both the parent-only spend and the headline
+    /// parent+subagent spend. Without this, runs that delegate (python /
+    /// dart and any delegating language) silently under-report cost.
+    total_subagent_cost_micro_usd: TokioMutex<u64>,
     live_printer: Arc<crate::live::LivePrinter>,
     /// Stop reason of the most recently completed turn. Drives the
     /// Phase 2 `Assertion::StopReason` evaluator.
@@ -2490,6 +2536,21 @@ impl Driver {
                     frame.cost_display = crate::frames::format_cost_micro_usd(cost_micro);
                     *self.total_input_tokens.lock().await += frame.input_tokens;
                     *self.total_cost_micro_usd.lock().await += cost_micro;
+                    // Delegate/subagent spend is accumulated by the agent into
+                    // a SEPARATE `subagent_provider` bucket, so it never shows
+                    // up in the parent turn's `cost`. Price it the same way as
+                    // the parent (from the merged token counts) and fold it
+                    // into the run's subagent total so the headline cost
+                    // reflects parent + subagent spend instead of silently
+                    // under-counting delegating runs.
+                    let subagent_cost_micro = squeezy_llm::estimate_cost(
+                        self.provider_name,
+                        &self.model,
+                        &metrics.subagent_provider,
+                    )
+                    .unwrap_or(0);
+                    frame.subagent_cost_micro_usd = subagent_cost_micro;
+                    *self.total_subagent_cost_micro_usd.lock().await += subagent_cost_micro;
                     let metrics_v = serde_json::to_value(&metrics).unwrap_or(Value::Null);
                     let cost_v = serde_json::to_value(&cost).unwrap_or(Value::Null);
                     let message_v = serde_json::to_value(&message).ok();
@@ -2523,7 +2584,7 @@ impl Driver {
                 AgentEvent::Cancelled {
                     turn_id,
                     cost,
-                    metrics: _,
+                    metrics,
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
@@ -2548,6 +2609,17 @@ impl Driver {
                     frame.cost_display = crate::frames::format_cost_micro_usd(cost_micro);
                     *self.total_input_tokens.lock().await += frame.input_tokens;
                     *self.total_cost_micro_usd.lock().await += cost_micro;
+                    // Fold in any delegate/subagent spend that resolved before
+                    // the cancel, mirroring the `Completed` arm so cancelled
+                    // delegating turns are not under-counted.
+                    let subagent_cost_micro = squeezy_llm::estimate_cost(
+                        self.provider_name,
+                        &self.model,
+                        &metrics.subagent_provider,
+                    )
+                    .unwrap_or(0);
+                    frame.subagent_cost_micro_usd = subagent_cost_micro;
+                    *self.total_subagent_cost_micro_usd.lock().await += subagent_cost_micro;
                     frame.finish = FrameFinish::Cancelled;
                     self.capture
                         .record(Some(turn_str), EvalEventKind::TurnCancelled)?;

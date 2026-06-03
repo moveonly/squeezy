@@ -35,6 +35,13 @@ pub struct FrameRecord {
     /// when no pricing data is available for the model.
     #[serde(default)]
     pub cost_micro_usd: u64,
+    /// Estimated cost in USD microdollars of any delegate/subagent work
+    /// spawned during this turn, priced from `TurnMetrics.subagent_provider`.
+    /// Tracked separately from `cost_micro_usd` (which is parent-model only)
+    /// so the run total can surface both the parent-only spend and the true
+    /// parent+subagent spend. Zero for turns that spawned no subagent.
+    #[serde(default)]
+    pub subagent_cost_micro_usd: u64,
     /// Human-readable rendering of `cost_micro_usd`, e.g. `"$0.0123"`.
     #[serde(default)]
     pub cost_display: String,
