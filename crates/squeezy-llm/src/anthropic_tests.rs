@@ -1398,6 +1398,7 @@ fn anthropic_messages_redacted_thinking_populates_data_from_either_field() {
     let messages = anthropic_messages(
         &[LlmInputItem::Reasoning(payload)],
         false,
+        false,
         CachePolicy::AUTO,
         crate::CacheRetention::None,
     );
@@ -1419,6 +1420,7 @@ fn anthropic_messages_redacted_thinking_populates_data_from_either_field() {
     };
     let messages = anthropic_messages(
         &[LlmInputItem::Reasoning(payload)],
+        false,
         false,
         CachePolicy::AUTO,
         crate::CacheRetention::None,
@@ -1444,6 +1446,7 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
     ];
     let messages = anthropic_messages(
         &input,
+        false,
         false,
         CachePolicy::AUTO,
         crate::CacheRetention::None,
@@ -1994,5 +1997,236 @@ fn request_body_ignores_parallel_tool_calls_for_unsupported_provider() {
             body.get("parallel_tool_calls").is_none(),
             "Anthropic body must never carry parallel_tool_calls (value={value:?}): {body}"
         );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Stable-tail anchor (4th cache_control breakpoint) tests.
+// ----------------------------------------------------------------------
+
+/// Recursively count every `cache_control` key anywhere in a JSON value.
+/// Anthropic 400s above four breakpoints per request, so the wire body must
+/// never carry more than four no matter how the markers are placed.
+fn count_cache_controls(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            let here = usize::from(map.contains_key("cache_control"));
+            here + map.values().map(count_cache_controls).sum::<usize>()
+        }
+        Value::Array(items) => items.iter().map(count_cache_controls).sum(),
+        _ => 0,
+    }
+}
+
+/// Build a synthetic agent loop with `rounds` user/assistant/tool turns.
+/// Each round is: user text → assistant tool_call → user tool_result.
+/// `FunctionCallOutput` lowers to a user-role `tool_result` block, so a long
+/// loop yields many user-role messages — exactly the shape that lets the
+/// stationary anchor sit several user turns behind the moving breakpoint.
+fn synthetic_agent_loop(rounds: usize) -> Vec<LlmInputItem> {
+    let mut input = Vec::new();
+    for round in 0..rounds {
+        input.push(LlmInputItem::UserText(format!("user turn {round}")));
+        input.push(LlmInputItem::FunctionCall {
+            call_id: format!("call_{round}"),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": format!("file_{round}.rs") }),
+        });
+        input.push(LlmInputItem::FunctionCallOutput {
+            call_id: format!("call_{round}"),
+            output: format!("contents of file_{round}.rs"),
+            content_parts: None,
+            is_error: false,
+        });
+    }
+    input
+}
+
+/// Collect, in message order, the indices of messages whose last content
+/// block carries a `cache_control` marker.
+fn marked_message_indices(messages: &[Value]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            let marked = msg["content"]
+                .as_array()
+                .and_then(|c| c.last())
+                .and_then(Value::as_object)
+                .is_some_and(|block| block.contains_key("cache_control"));
+            marked.then_some(idx)
+        })
+        .collect()
+}
+
+#[test]
+fn stable_anchor_sits_backoff_user_turns_behind_moving_breakpoint() {
+    // Long conversation: with the stable anchor enabled the messages array
+    // must carry exactly two breakpoints (moving latest-user + stationary
+    // anchor) and the anchor must sit STABLE_ANCHOR_BACKOFF user turns
+    // behind the moving one, on a different message.
+    let input = synthetic_agent_loop(6);
+    let messages = anthropic_messages(
+        &input,
+        true,
+        true,
+        CachePolicy::AUTO,
+        crate::CacheRetention::Short,
+    );
+    let arr = messages.as_array().expect("messages array");
+
+    let marked = marked_message_indices(arr);
+    assert_eq!(
+        marked.len(),
+        2,
+        "long conversation must carry the moving + anchor breakpoints only: {marked:?}"
+    );
+
+    // The moving breakpoint is on the last user-role message.
+    let last_user_idx = arr
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m["role"] == "user")
+        .map(|(idx, _)| idx)
+        .expect("a user message");
+    assert!(
+        marked.contains(&last_user_idx),
+        "moving breakpoint must mark the latest user message (idx {last_user_idx}): {marked:?}"
+    );
+
+    // The anchor is on the user message STABLE_ANCHOR_BACKOFF user turns back.
+    let backoff = crate::cache_policy::STABLE_ANCHOR_BACKOFF;
+    let mut user_indices: Vec<usize> = arr
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "user")
+        .map(|(idx, _)| idx)
+        .collect();
+    user_indices.reverse();
+    let expected_anchor_idx = user_indices[backoff];
+    assert!(
+        marked.contains(&expected_anchor_idx),
+        "anchor must mark the user turn {backoff} back (idx {expected_anchor_idx}): {marked:?}"
+    );
+
+    // The two markers are on distinct messages — never a double marker.
+    assert_ne!(
+        last_user_idx, expected_anchor_idx,
+        "moving breakpoint and anchor must not share a message"
+    );
+}
+
+#[test]
+fn stable_anchor_is_noop_on_short_conversation() {
+    // A single round has only one user-text turn and one tool-result turn.
+    // mark_last_user_block lands on the tool_result (the latest user-role
+    // message); the anchor would need STABLE_ANCHOR_BACKOFF + 1 user turns
+    // behind it, which do not exist, so it must place nothing and the
+    // conversation behaves exactly as it did before the 4th breakpoint.
+    let input = synthetic_agent_loop(1);
+    let with_anchor = anthropic_messages(
+        &input,
+        true,
+        true,
+        CachePolicy::AUTO,
+        crate::CacheRetention::Short,
+    );
+    let without_anchor = anthropic_messages(
+        &input,
+        true,
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::Short,
+    );
+    assert_eq!(
+        with_anchor, without_anchor,
+        "short conversation must be byte-identical with and without the anchor slot"
+    );
+
+    let arr = with_anchor.as_array().expect("messages array");
+    assert_eq!(
+        marked_message_indices(arr).len(),
+        1,
+        "short conversation carries only the single moving breakpoint"
+    );
+}
+
+#[test]
+fn request_body_never_emits_more_than_four_cache_controls() {
+    // End-to-end through request_body with tools + system + a long agent
+    // loop: tools(1) + system(1) + moving(1) + anchor(1) = 4, the hard cap.
+    // The recursive count guards against any path that would push past it.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(synthetic_agent_loop(8)),
+        max_output_tokens: Some(64),
+        cache_key: Some("squeezy::session-anchor".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+                strict: true,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+                strict: true,
+            }
+            .into(),
+        ]),
+        ..LlmRequest::default()
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    let total = count_cache_controls(&body);
+    assert_eq!(
+        total, 4,
+        "long loop must use all four breakpoints (tools+system+moving+anchor): {body}"
+    );
+    assert!(
+        total <= 4,
+        "Anthropic 400s above four cache_control breakpoints: {body}"
+    );
+
+    // The two message breakpoints must be on different messages (no block
+    // carries two cache_control markers).
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(
+        marked_message_indices(messages).len(),
+        2,
+        "exactly the moving + anchor breakpoints in the messages array: {body}"
+    );
+}
+
+#[test]
+fn stable_anchor_breakpoints_use_matching_retention_shape() {
+    // The anchor must reuse the exact cache_control shape the moving
+    // breakpoint emits: Long retention carries the 1h ttl, Short omits it.
+    let input = synthetic_agent_loop(6);
+    for (retention, expect_ttl) in [
+        (crate::CacheRetention::Short, false),
+        (crate::CacheRetention::Long, true),
+    ] {
+        let messages = anthropic_messages(&input, true, true, CachePolicy::AUTO, retention);
+        let arr = messages.as_array().expect("messages array");
+        for idx in marked_message_indices(arr) {
+            let cc = arr[idx]["content"]
+                .as_array()
+                .and_then(|c| c.last())
+                .map(|b| &b["cache_control"])
+                .expect("marked block");
+            assert_eq!(cc["type"], "ephemeral");
+            assert_eq!(
+                cc.get("ttl").is_some(),
+                expect_ttl,
+                "ttl presence must match retention {retention:?} on message {idx}"
+            );
+        }
     }
 }

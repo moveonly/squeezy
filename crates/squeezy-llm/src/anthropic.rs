@@ -202,6 +202,17 @@ impl AnthropicProvider {
             prompt_caching && policy.tools && !request.tools.is_empty() && budget.consume("tools");
         let system_marker = prompt_caching && policy.system && budget.consume("system");
         let messages_marker = prompt_caching && budget.consume("messages");
+        // Spend the 4th (historically idle) breakpoint on a stationary
+        // "stable-tail anchor" a fixed distance behind the moving
+        // latest-user breakpoint. Without it the single moving breakpoint
+        // hops onto each freshly appended tool-result batch, leaving the
+        // just-settled prefix without a cache boundary so it gets re-billed
+        // at the 1.25x cache-write rate instead of the 0.1x read rate. This
+        // takes the last available slot, so it is the FIRST marker dropped
+        // (silently, via `budget.consume`) if a future caller-supplied
+        // marker needs the room — never pushing the request past the
+        // 4-breakpoint cap that would earn an Anthropic 400.
+        let stable_anchor_marker = prompt_caching && budget.consume("stable_anchor");
         let mut body = json!({
             "model": request.model,
             "system": anthropic_system(
@@ -210,7 +221,13 @@ impl AnthropicProvider {
                 auth,
                 retention,
             ),
-            "messages": anthropic_messages(&normalized_input, messages_marker, policy, retention),
+            "messages": anthropic_messages(
+                &normalized_input,
+                messages_marker,
+                stable_anchor_marker,
+                policy,
+                retention,
+            ),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -469,6 +486,7 @@ fn anthropic_system(
 fn anthropic_messages(
     input: &[LlmInputItem],
     prompt_caching: bool,
+    stable_anchor: bool,
     policy: CachePolicy,
     retention: CacheRetention,
 ) -> Value {
@@ -588,6 +606,20 @@ fn anthropic_messages(
             crate::cache_policy::MessageStrategy::LatestUserMessage => {
                 json_markers::mark_last_user_block(&mut messages, retention);
             }
+        }
+        // Place the stationary stable-tail anchor only when its slot
+        // survived the breakpoint budget. It lands STABLE_ANCHOR_BACKOFF
+        // user turns behind the moving breakpoint, on a different message,
+        // and is a no-op on conversations too short to have a settled
+        // prefix — so short conversations keep their original single
+        // message breakpoint and the total never exceeds the 4-breakpoint
+        // cap (tools + system + moving + anchor).
+        if stable_anchor {
+            json_markers::mark_stable_anchor_block(
+                &mut messages,
+                crate::cache_policy::STABLE_ANCHOR_BACKOFF,
+                retention,
+            );
         }
     }
     Value::Array(messages)
