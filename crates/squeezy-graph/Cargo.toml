@@ -22,5 +22,5 @@ squeezy-workspace.workspace = true
 # Cross-platform file-system watcher: FSEvents on macOS, inotify on
 # Linux, ReadDirectoryChangesW on Windows, plus the debouncer that lets
 # us batch rapid edits before invalidating the graph.
-notify-debouncer-full = "0.5"
+notify-debouncer-full = "0.7"
 tracing = "0.1"
