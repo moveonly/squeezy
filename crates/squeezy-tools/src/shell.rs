@@ -20,8 +20,8 @@ use std::os::fd::FromRawFd;
 use serde::Deserialize;
 use serde_json::json;
 use squeezy_core::{
-    PermissionCapability, PermissionRisk, ShellSandboxConfig, ShellSandboxMode,
-    sensitive_pattern_base,
+    PermissionCapability, PermissionRisk, Redactor, ShellSandboxConfig, ShellSandboxMode,
+    StreamRedactor, sensitive_pattern_base,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -45,7 +45,7 @@ use crate::shell_sandbox::{
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_runtime_unavailable,
     shell_sandbox_status_metadata,
 };
-use crate::shell_spillover::ShellSpilloverInfo;
+use crate::shell_spillover::{RawSidecar, ShellSpilloverInfo};
 #[cfg(windows)]
 use crate::win_job::ShellJob;
 use crate::{
@@ -63,6 +63,10 @@ pub(crate) struct ShellRunOutcome {
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_bytes: Vec<u8>,
     pub(crate) stderr_truncated: bool,
+    /// Full pre-cap, redacted output streamed to a `{call_id}-raw.txt`
+    /// sidecar when the hard byte cap dropped bytes the in-memory capture
+    /// could not keep. `None` when output stayed under the cap.
+    pub(crate) raw_spillover: Option<ShellSpilloverInfo>,
 }
 
 struct ShellRunRequest<'a> {
@@ -389,6 +393,7 @@ impl ToolRegistry {
             stdout_truncated,
             stderr_bytes,
             stderr_truncated,
+            raw_spillover,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -508,6 +513,18 @@ impl ToolRegistry {
                 shell_spillover_metadata(spill),
             );
         }
+        // The capped `spillover` above mirrors only the bytes that survived
+        // the in-memory hard cap; `raw_spillover` carries the *full* pre-cap
+        // output streamed straight from the pipe, so a long build log or
+        // stack trace can be recovered in its entirety. Present only when the
+        // cap actually dropped bytes.
+        if let Some(raw_spill) = raw_spillover.as_ref() {
+            insert_content_field(
+                &mut raw_content,
+                "raw_spillover",
+                shell_spillover_metadata(raw_spill),
+            );
+        }
         if let Some(checkpoint_before) = checkpoint_before.as_ref() {
             let coverage_warnings = shell_coverage_warnings(&args.command);
             self.append_checkpoint_to_content(
@@ -527,7 +544,8 @@ impl ToolRegistry {
         }
 
         let shaped = shape_shell_output(&args.command, &stdout, &stderr, truncated, exit_code);
-        let shaped_stdout = append_spillover_footer(&shaped.stdout, spillover.as_ref());
+        let shaped_stdout =
+            append_spillover_footer(&shaped.stdout, spillover.as_ref(), raw_spillover.as_ref());
         let mut content = raw_content;
         if let Some(object) = content.as_object_mut() {
             object.insert("stdout".to_string(), json!(shaped_stdout));
@@ -662,23 +680,37 @@ impl ToolRegistry {
 
         let stdout_capture = ShellStreamCapture::default();
         let stderr_capture = ShellStreamCapture::default();
+        // One sidecar per shell call, shared by the stdout/stderr readers, so
+        // the pre-cap bytes the hard cap would discard land in a single
+        // `{call_id}-raw.txt` the model can recover via `read_tool_output`.
+        // The handle is cheap to mint and writes nothing until a stream
+        // overflows the cap; cloning it across both readers keeps the file
+        // append-only-shared. Each reader redacts with its own
+        // `StreamRedactor`, so secret/PEM state never crosses streams.
+        let raw_sidecar = self.shell_spillover.open_raw_sidecar(&call.call_id);
         let stdout_task = if let Some(master) = pty_master {
             tokio::spawn(read_limited_pipe(
                 Some(tokio::fs::File::from_std(master)),
                 output_cap,
                 stdout_capture.clone(),
+                raw_sidecar.clone(),
+                Arc::clone(&self.redactor),
             ))
         } else {
             tokio::spawn(read_limited_pipe(
                 child.stdout.take(),
                 output_cap,
                 stdout_capture.clone(),
+                raw_sidecar.clone(),
+                Arc::clone(&self.redactor),
             ))
         };
         let stderr_task = tokio::spawn(read_limited_pipe(
             child.stderr.take(),
             output_cap,
             stderr_capture.clone(),
+            raw_sidecar.clone(),
+            Arc::clone(&self.redactor),
         ));
 
         let status = tokio::select! {
@@ -726,6 +758,15 @@ impl ToolRegistry {
         );
         drop(ask_server);
 
+        // Both readers have exited (completed or aborted on drain timeout),
+        // so the last remaining clone can flush + report the sidecar. It
+        // returns `None` when the stream stayed under the cap and nothing was
+        // written — the zero-cost path.
+        let raw_spillover = match raw_sidecar {
+            Some(sidecar) => sidecar.finalize().await,
+            None => None,
+        };
+
         Ok(ShellRunOutcome {
             exit_status,
             timed_out,
@@ -733,6 +774,7 @@ impl ToolRegistry {
             stdout_truncated,
             stderr_bytes,
             stderr_truncated,
+            raw_spillover,
         })
     }
 }
@@ -834,15 +876,33 @@ pub(crate) fn shell_spillover_metadata(info: &ShellSpilloverInfo) -> serde_json:
 pub(crate) fn append_spillover_footer(
     shaped_stdout: &str,
     spillover: Option<&ShellSpilloverInfo>,
+    raw_spillover: Option<&ShellSpilloverInfo>,
 ) -> String {
-    let Some(spill) = spillover else {
+    let mut footer = String::new();
+    // The capped spillover mirrors the bytes that survived the in-memory cap.
+    if let Some(spill) = spillover {
+        let path = spill.path.display();
+        let bytes = spill.bytes;
+        footer.push_str(&format!(
+            "[truncated; full output: {path} ({bytes} bytes); recover via read_tool_output {{\"path\": \"{path}\"}}]"
+        ));
+    }
+    // The raw sidecar carries the *complete* pre-cap output (the bytes the
+    // hard cap discarded). It is a strict superset of the capped spillover,
+    // so name it on its own line as the way to recover everything.
+    if let Some(raw) = raw_spillover {
+        let path = raw.path.display();
+        let bytes = raw.bytes;
+        if !footer.is_empty() {
+            footer.push('\n');
+        }
+        footer.push_str(&format!(
+            "[full pre-cap output: {path} ({bytes} bytes); recover via read_tool_output {{\"path\": \"{path}\"}}]"
+        ));
+    }
+    if footer.is_empty() {
         return shaped_stdout.to_string();
-    };
-    let path = spill.path.display();
-    let bytes = spill.bytes;
-    let footer = format!(
-        "[truncated; full output: {path} ({bytes} bytes); recover via read_tool_output {{\"path\": \"{path}\"}}]"
-    );
+    }
     if shaped_stdout.is_empty() {
         return footer;
     }
@@ -1389,6 +1449,8 @@ async fn read_limited_pipe<R>(
     mut reader: Option<R>,
     cap: usize,
     capture: ShellStreamCapture,
+    raw_sidecar: Option<RawSidecar>,
+    redactor: Arc<Redactor>,
 ) -> std::result::Result<(), std::io::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1397,6 +1459,14 @@ where
         return Ok(());
     };
     let mut buffer = vec![0u8; 8192];
+    // The in-memory `capture` keeps at most `cap` bytes; everything past it
+    // is dropped from the live result. When a sidecar is wired, mirror the
+    // *full* redacted stream into it so a later `read_tool_output` can
+    // recover the pre-cap bytes. The sidecar stays empty until the stream
+    // actually overflows the cap (zero cost for in-budget output): redacted
+    // text accumulates in `pending` and is only flushed to disk once the
+    // raw byte total crosses `cap`.
+    let mut sidecar = raw_sidecar.map(|sink| RawStreamMirror::new(sink, redactor));
 
     loop {
         let count = match reader.read(&mut buffer).await {
@@ -1407,10 +1477,70 @@ where
         if count == 0 {
             break;
         }
+        if let Some(sidecar) = sidecar.as_mut() {
+            sidecar.ingest(&buffer[..count], cap).await;
+        }
         capture.append(&buffer[..count], cap).await;
     }
 
+    if let Some(sidecar) = sidecar.as_mut() {
+        sidecar.finish(cap).await;
+    }
+
     Ok(())
+}
+
+/// Streams the full redacted pipe output into a [`RawSidecar`], deferring
+/// any disk write until the raw byte total exceeds the in-memory cap.
+struct RawStreamMirror {
+    sink: RawSidecar,
+    redactor: StreamRedactor,
+    /// Redacted text produced before the cap was crossed, held in memory
+    /// (bounded by ~`cap`) so a stream that never overflows writes nothing.
+    pending: String,
+    raw_bytes: usize,
+    overflowed: bool,
+}
+
+impl RawStreamMirror {
+    fn new(sink: RawSidecar, redactor: Arc<Redactor>) -> Self {
+        Self {
+            sink,
+            redactor: StreamRedactor::new(redactor),
+            pending: String::new(),
+            raw_bytes: 0,
+            overflowed: false,
+        }
+    }
+
+    async fn ingest(&mut self, chunk: &[u8], cap: usize) {
+        self.raw_bytes = self.raw_bytes.saturating_add(chunk.len());
+        let emitted = self.redactor.push(&String::from_utf8_lossy(chunk)).text;
+        if self.overflowed {
+            self.sink.write_chunk(&emitted).await;
+            return;
+        }
+        self.pending.push_str(&emitted);
+        if self.raw_bytes > cap {
+            // First overflow: persist the redacted prefix accumulated so far,
+            // then switch to streaming each subsequent chunk straight to disk.
+            self.overflowed = true;
+            let pending = std::mem::take(&mut self.pending);
+            self.sink.write_chunk(&pending).await;
+        }
+    }
+
+    async fn finish(&mut self, cap: usize) {
+        let tail = self.redactor.finish().text;
+        if self.overflowed || self.raw_bytes > cap {
+            if !self.overflowed {
+                let pending = std::mem::take(&mut self.pending);
+                self.sink.write_chunk(&pending).await;
+                self.overflowed = true;
+            }
+            self.sink.write_chunk(&tail).await;
+        }
+    }
 }
 
 async fn drain_or_abort(

@@ -20,10 +20,16 @@
 
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::sha256_hex;
 
@@ -76,6 +82,112 @@ pub(crate) struct ShellSpilloverReadResult {
     pub sha256: String,
     pub truncated: bool,
     pub content: String,
+}
+
+/// Mutable state shared by a [`RawSidecar`]'s clones (the stdout and
+/// stderr pipe readers each hold one). Guards the single append-only file
+/// handle and the running byte total so both streams write the same
+/// `{call_id}-raw.txt` race-free.
+#[derive(Default)]
+struct RawSidecarState {
+    /// `None` until the first chunk is written (lazy file creation keeps
+    /// zero-cost behavior when output stays under the cap), `Some(Err(()))`
+    /// once a write or budget failure latches the sidecar shut.
+    file: Option<std::result::Result<fs::File, ()>>,
+    bytes_written: u64,
+}
+
+/// Streaming handle that persists the raw, pre-cap shell bytes to a
+/// per-call `{call_id}-raw.txt` sidecar under the session directory.
+///
+/// Cheaply cloned so the concurrent stdout and stderr pipe readers append
+/// to the same file; the inner [`AsyncMutex`] serializes their writes.
+/// Each clone is fed already-redacted text (the callers own independent
+/// `StreamRedactor`s, so PEM/secret state never crosses streams), and
+/// every appended byte is charged against the store's 100 MB session
+/// budget — once that is exhausted the sidecar stops growing but keeps the
+/// bytes already written.
+#[derive(Clone)]
+pub(crate) struct RawSidecar {
+    store: Arc<ShellSpilloverStore>,
+    path: PathBuf,
+    state: Arc<AsyncMutex<RawSidecarState>>,
+}
+
+impl RawSidecar {
+    /// Append already-redacted `text` to the sidecar, charging the session
+    /// budget. The file is created on the first non-empty write so a stream
+    /// that never overflows leaves no sidecar behind. Budget exhaustion or
+    /// an I/O error latches the sidecar shut for the rest of the call
+    /// without disturbing the live shell result.
+    pub(crate) async fn write_chunk(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        if matches!(state.file, Some(Err(()))) {
+            return;
+        }
+        let grant = self.store.reserve_up_to(text.len() as u64);
+        if grant == 0 {
+            state.file = Some(Err(()));
+            return;
+        }
+        let writable = grant as usize;
+        // The 100 MB session budget is shared with the capped spillover; on
+        // the rare boundary where it can only admit part of a chunk, write a
+        // UTF-8-safe prefix so the recovered text never ends mid-codepoint,
+        // then latch shut.
+        let partial = writable < text.len();
+        let slice = if partial {
+            let mut end = writable;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.store.release(grant - end as u64);
+            &text[..end]
+        } else {
+            text
+        };
+        if state.file.is_none() {
+            state.file = Some(fs::File::create(&self.path).map_err(|_| ()));
+        }
+        let Some(Ok(file)) = state.file.as_mut() else {
+            self.store.release(slice.len() as u64);
+            state.file = Some(Err(()));
+            return;
+        };
+        if file.write_all(slice.as_bytes()).is_err() {
+            self.store.release(slice.len() as u64);
+            state.file = Some(Err(()));
+            return;
+        }
+        state.bytes_written += slice.len() as u64;
+        if partial {
+            state.file = Some(Err(()));
+        }
+    }
+
+    /// Flush the sidecar and return its path + byte count, or `None` when
+    /// nothing was ever written (output stayed under the cap, or every
+    /// write failed). The bytes already charged to the budget stay charged
+    /// so the file on disk and the accounting agree.
+    pub(crate) async fn finalize(self) -> Option<ShellSpilloverInfo> {
+        let mut state = self.state.lock().await;
+        if let Some(Ok(file)) = state.file.as_mut() {
+            let _ = file.flush();
+        }
+        if state.bytes_written == 0 {
+            // Nothing durable landed — drop any empty file we may have
+            // created so a no-op call leaves the session dir clean.
+            let _ = fs::remove_file(&self.path);
+            return None;
+        }
+        Some(ShellSpilloverInfo {
+            path: self.path.clone(),
+            bytes: state.bytes_written,
+        })
+    }
 }
 
 impl ShellSpilloverStore {
@@ -143,6 +255,55 @@ impl ShellSpilloverStore {
             return None;
         }
         Some(ShellSpilloverInfo { path, bytes: size })
+    }
+
+    /// Open a streaming raw sidecar for `call_id` and return a handle the
+    /// shell stdout/stderr pipe readers share to persist the *pre-cap*
+    /// bytes a long build log or stack trace would otherwise lose to the
+    /// hard byte cap.
+    ///
+    /// The capped [`spill`] path can only ever store the bytes that
+    /// survived in-memory truncation; this sidecar is filled directly from
+    /// the pipe stream *before* the cap drops anything, so a later
+    /// `read_tool_output { path }` can recover the full output. Returns
+    /// `None` when the session directory cannot be created — callers treat
+    /// that as "no raw recovery available" and fall back to the capped
+    /// spillover only.
+    ///
+    /// [`spill`]: ShellSpilloverStore::spill
+    pub(crate) fn open_raw_sidecar(self: &Arc<Self>, call_id: &str) -> Option<RawSidecar> {
+        if fs::create_dir_all(&self.session_dir).is_err() {
+            return None;
+        }
+        let sanitized = sanitize_call_id(call_id);
+        let path = self.session_dir.join(format!("{sanitized}-raw.txt"));
+        Some(RawSidecar {
+            store: Arc::clone(self),
+            path,
+            state: Arc::new(AsyncMutex::new(RawSidecarState::default())),
+        })
+    }
+
+    /// Charge `size` bytes against the session budget without rolling the
+    /// reservation back. Used by the streaming raw sidecar, which appends
+    /// incrementally and keeps every byte it manages to write. Returns the
+    /// number of bytes actually granted (0 once the budget is exhausted).
+    fn reserve_up_to(&self, size: u64) -> u64 {
+        loop {
+            let used = self.bytes_used.load(Ordering::Acquire);
+            let remaining = self.budget_bytes.saturating_sub(used);
+            if remaining == 0 {
+                return 0;
+            }
+            let grant = size.min(remaining);
+            if self
+                .bytes_used
+                .compare_exchange(used, used + grant, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return grant;
+            }
+        }
     }
 
     /// Read a bounded byte window from a spillover path the model
