@@ -18,7 +18,7 @@ use squeezy_core::{
 };
 use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
-use squeezy_store::SqueezyStore;
+use squeezy_store::{GraphStore, SqueezyStore};
 use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
@@ -182,7 +182,7 @@ async fn wait_for_persisted_graph_partition(root: &Path, file_id: &str) -> serde
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_error = "partition not checked yet".to_string();
     while Instant::now() < deadline {
-        match SqueezyStore::open(root, None) {
+        match GraphStore::open(root, None) {
             Ok(store) => match store.graph_partition(&squeezy_core::FileId::new(file_id)) {
                 Ok(Some(partition)) => return partition,
                 Ok(None) => last_error = "partition absent".to_string(),
@@ -1806,15 +1806,12 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
 }
 
 #[tokio::test]
-async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
+async fn agent_lazily_opens_graph_store_for_graph_persistence() {
     // Regression for an earlier draft of the persistence change in which the
-    // agent and the tool registry each opened their own `SqueezyStore` on
-    // the workspace. redb forbids a second `Database` handle on the same
-    // file, so the registry's open quietly failed and graph persistence
-    // never ran. Asserting that the shared state store contains a graph
-    // partition entry after one agent turn pins the contract that both
-    // layers reuse the agent's `Arc<SqueezyStore>`.
-    let root = temp_workspace("agent_shared_state_store");
+    // Pins the split-cache contract: the agent opens `state.redb`
+    // synchronously, while the registry's deferred graph task opens
+    // `graph.redb` and persists graph partitions there.
+    let root = temp_workspace("agent_lazy_graph_store");
     fs::create_dir_all(root.join("src")).expect("create src");
     fs::write(
         root.join("Cargo.toml"),
@@ -1840,7 +1837,7 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
     // its store handle, so re-opening below would otherwise race startup.
     wait_for_agent_graph(&agent).await;
     // Join the agent's tracked background tasks before dropping it so their
-    // `Arc<SqueezyStore>` clones are released too.
+    // `Arc<GraphStore>` clones are released too.
     agent.shutdown().await;
     drop(agent);
 
@@ -1849,6 +1846,36 @@ async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
         !partition.is_null(),
         "agent must persist graph partitions through the shared state store",
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn agent_startup_does_not_open_graph_store_synchronously() {
+    let root = temp_workspace("agent_startup_graph_store_lazy");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'lazy-graph-demo'\nversion = '0.1.0'\nedition = '2024'\n",
+    )
+    .expect("write cargo");
+    fs::write(root.join("src/lib.rs"), "pub fn lazy_graph_demo() {}\n").expect("write lib");
+
+    let _graph_lock = GraphStore::open(&root, None).expect("open graph store lock");
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    let started = Instant::now();
+    let agent = Agent::new(config_for(root.clone()), provider);
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Agent::new should not wait for graph.redb to open"
+    );
+    assert!(
+        agent.session_id().is_some(),
+        "agent should still construct while graph.redb is locked"
+    );
+    agent.shutdown().await;
+    drop(agent);
 
     let _ = fs::remove_dir_all(root);
 }

@@ -508,6 +508,9 @@ fn apply_overlay(
     if let Some(instructions) = &overlay.instructions {
         config.instructions = instructions.clone();
     }
+    if let Some(cache_root) = &overlay.cache_root {
+        config.cache.root = Some(cache_root.clone());
+    }
     if let Some(max) = overlay.max_output_tokens {
         config.max_output_tokens = Some(max);
     }

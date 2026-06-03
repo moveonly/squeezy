@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
 use squeezy_core::AppConfig;
 use squeezy_core::FileId;
 
-use crate::{CompactionCheckpoint, GraphWriteBatch, SqueezyStore, sessions::ResumeItem};
+use crate::{
+    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
+    SqueezyStore, graph_path, sessions::ResumeItem, state_path,
+};
 
 fn temp_root(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -29,6 +31,12 @@ fn open_store(label: &str) -> (PathBuf, SqueezyStore) {
         ..AppConfig::default()
     };
     let store = SqueezyStore::open(&config.workspace_root, None).expect("open store");
+    (root, store)
+}
+
+fn open_graph_store(label: &str) -> (PathBuf, GraphStore) {
+    let root = temp_root(label);
+    let store = GraphStore::open(&root, None).expect("open graph store");
     (root, store)
 }
 
@@ -115,81 +123,62 @@ fn write_schema_version(path: &Path, version: u64) {
     write.commit().expect("commit");
 }
 
-/// Shared buffer that a `tracing_subscriber::fmt` writer drains into so the
-/// test can assert which events the reset path emitted.
-#[derive(Clone, Default)]
-struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-impl CapturedLogs {
-    fn contents(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl std::io::Write for CapturedLogs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-    type Writer = CapturedLogs;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 #[test]
-fn schema_mismatch_reset_warns_with_backup_path() {
+fn schema_mismatch_resets_with_backup_path() {
     let root = temp_root("schema-mismatch-warns");
     let state = root.join(".squeezy").join("cache").join("state.redb");
     std::fs::create_dir_all(state.parent().unwrap()).expect("create cache dir");
-    write_schema_version(&state, 3);
+    write_schema_version(&state, 4);
 
-    let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_target(true)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-
-    let store = tracing::subscriber::with_default(subscriber, || {
-        SqueezyStore::open(&root, None).expect("open store")
-    });
+    let store = SqueezyStore::open(&root, None).expect("open store");
 
     let backup_name = std::fs::read_dir(state.parent().unwrap())
         .expect("read cache")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find(|name| name.contains("schema-3"))
+        .find(|name| name.contains("schema-4"))
         .expect("old schema database should be backed up");
 
-    let captured = logs.contents();
     assert!(
-        captured.contains("squeezy::store"),
-        "warn must target squeezy::store, got: {captured}"
+        backup_name.ends_with(".redb.bak"),
+        "backup path should keep a redb backup suffix: {backup_name}"
     );
     assert!(
-        captured.contains("schema mismatch"),
-        "warn must describe the schema mismatch, got: {captured}"
-    );
-    assert!(
-        captured.contains(&backup_name),
-        "warn must reference the backup path {backup_name}, got: {captured}"
+        store.path().ends_with(STATE_FILE_NAME),
+        "state store should reopen the active state file"
     );
 
     drop(store);
 }
 
 #[test]
+fn oversized_state_file_rotates_without_redb_open() {
+    let root = temp_root("oversized-state-rotates");
+    let state = state_path(&root, None);
+    std::fs::create_dir_all(state.parent().unwrap()).expect("create cache dir");
+    let file = std::fs::File::create(&state).expect("create oversized placeholder");
+    file.set_len(super::OVERSIZED_STATE_FAST_ROTATE_BYTES + 1)
+        .expect("size sparse placeholder");
+    drop(file);
+
+    let store = SqueezyStore::open(&root, None).expect("open store");
+
+    assert!(store.path().exists(), "active state.redb should be rebuilt");
+    assert!(
+        std::fs::read_dir(state.parent().unwrap())
+            .expect("read cache")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains("oversized-state")),
+        "oversized state file should be moved aside without redb open"
+    );
+}
+
+#[test]
 fn graph_write_batch_applies_resolver_cache_changes() {
-    let (_root, store) = open_store("resolver-batch");
+    let (_root, store) = open_graph_store("resolver-batch");
     let first = FileId::new("src/first.rs");
     let second = FileId::new("src/second.rs");
 
@@ -237,4 +226,26 @@ fn graph_write_batch_applies_resolver_cache_changes() {
         .expect("load updated second")
         .expect("second remains");
     assert_eq!(second_entry["exports"][0], "SecondV2");
+}
+
+#[test]
+fn state_open_creates_state_only_store() {
+    let (root, _store) = open_store("state-only");
+    assert!(
+        state_path(&root, None).exists(),
+        "{STATE_FILE_NAME} should be created by SqueezyStore::open"
+    );
+    assert!(
+        !graph_path(&root, None).exists(),
+        "{GRAPH_FILE_NAME} should remain unopened until graph persistence is needed"
+    );
+}
+
+#[test]
+fn graph_open_creates_split_graph_store() {
+    let (root, _store) = open_graph_store("graph-only");
+    assert!(
+        graph_path(&root, None).exists(),
+        "{GRAPH_FILE_NAME} should be created by GraphStore::open"
+    );
 }

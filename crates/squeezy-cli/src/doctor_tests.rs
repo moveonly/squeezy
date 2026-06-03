@@ -248,6 +248,57 @@ fn state_store_check_opens_redb_in_tempdir() {
     assert!(check.detail.contains("opened"));
 }
 
+#[test]
+fn cache_check_warns_about_redb_backups() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-warn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    fs::write(cache_dir.join("schema-2-test.redb.bak"), b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = cache_check(&config, false);
+
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(check.detail.contains("backups=1"));
+    assert!(check.detail.contains("--prune-cache"));
+}
+
+#[test]
+fn cache_check_prunes_redb_backups() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-prune-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let backup = cache_dir.join("schema-2-test.redb.bak");
+    fs::write(&backup, b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = cache_check(&config, true);
+
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("pruned 1 backups"));
+    assert!(!backup.exists(), "backup should be removed");
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[cfg(unix)]
 #[test]
 fn state_store_check_fails_when_path_unwritable() {

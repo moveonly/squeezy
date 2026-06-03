@@ -6,8 +6,8 @@ use std::{
 use squeezy_core::Result;
 
 use crate::migrations::{
-    InitializeStoreSchemaV1, Migration, MigrationRegistry, V2AddResolverTables, default_registry,
-    run_registry,
+    InitializeStoreSchemaV1, Migration, MigrationRegistry, V2AddResolverTables, V3SplitGraphCache,
+    default_registry, run_registry,
 };
 
 fn temp_workspace(label: &str) -> PathBuf {
@@ -124,4 +124,5 @@ fn default_registry_target_version_matches_schema_constant() {
 fn v1_and_v2_migrations_are_distinct() {
     assert_eq!(InitializeStoreSchemaV1.version(), 1);
     assert_eq!(V2AddResolverTables.version(), 2);
+    assert_eq!(V3SplitGraphCache.version(), 3);
 }

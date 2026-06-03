@@ -10,7 +10,7 @@ use squeezy_core::{
 };
 
 use crate::{
-    BugReportOptions, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
+    BugReportOptions, GraphStore, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
     StoredReadSnapshot, StoredToolReceipt,
 };
 
@@ -890,9 +890,10 @@ fn cleanup_excluding_skips_protected_session() {
 }
 
 #[test]
-fn state_store_round_trips_graph_receipts_and_observations() {
+fn state_and_graph_stores_round_trip_split_cache_data() {
     let root = temp_root("state-round-trip");
     let store = SqueezyStore::open(&root, None).expect("open store");
+    let graph_store = GraphStore::open(&root, None).expect("open graph store");
 
     let metadata = GraphStoreMetadata {
         workspace_root: root.display().to_string(),
@@ -900,14 +901,19 @@ fn state_store_round_trips_graph_receipts_and_observations() {
         language_registry_version: "langs".to_string(),
         graph_format_version: 1,
     };
-    store.set_graph_metadata(&metadata).expect("set metadata");
-    assert_eq!(store.graph_metadata().expect("metadata"), Some(metadata));
+    graph_store
+        .set_graph_metadata(&metadata)
+        .expect("set metadata");
+    assert_eq!(
+        graph_store.graph_metadata().expect("metadata"),
+        Some(metadata)
+    );
 
     let file_id = FileId::new("src/lib.rs");
-    store
+    graph_store
         .put_graph_partition(&file_id, &serde_json::json!({"hash": "abc"}))
         .expect("put partition");
-    let partition: serde_json::Value = store
+    let partition: serde_json::Value = graph_store
         .graph_partition(&file_id)
         .expect("partition")
         .expect("partition exists");
@@ -1055,11 +1061,9 @@ fn state_store_schema_mismatch_backs_up_old_database_without_data_loss() {
 
     let store = SqueezyStore::open(&root, None).expect("open store");
     assert_eq!(
-        store
-            .graph_metadata()
-            .expect("metadata")
-            .map(|metadata| metadata.graph_format_version),
-        None
+        store.tool_receipts().expect("receipts"),
+        Vec::<StoredToolReceipt>::new(),
+        "new state store should open after the old schema is backed up"
     );
     assert!(
         fs::read_dir(state.parent().unwrap())

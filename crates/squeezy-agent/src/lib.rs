@@ -1532,12 +1532,10 @@ impl Agent {
                 .redactor()
                 .expect("validated redaction config must compile"),
         );
-        // Open the persistent state store exactly once and share the handle
-        // with the tool registry. redb only allows a single live `Database`
-        // per file (see `state_store_open_rejects_a_second_handle_on_the_same_file`),
-        // so the registry's graph manager must reuse this handle instead of
-        // opening its own — otherwise the second open would fail silently
-        // and graph partitions would never be persisted.
+        // Open only the small session-side state store synchronously. The
+        // graph cache lives in `graph.redb` and is opened by the registry's
+        // deferred graph task so a large semantic cache cannot block prompt
+        // entry during session startup.
         let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
             .ok()
             .map(Arc::new);
@@ -1558,7 +1556,11 @@ impl Agent {
                 );
             }
         }
-        let registry_runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
+        let registry_runtime = ToolRegistryRuntime::new_with_graph_cache_root(
+            store.clone(),
+            redactor.clone(),
+            config.cache.root.clone(),
+        );
         let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
             ToolRuntimeConfig {

@@ -1,0 +1,54 @@
+id = "cache-split-lazy-open"
+title = "Cache split lazy open startup"
+description = """
+Offline startup guard for split cache persistence. The fixture points
+Squeezy at a tracked cache directory that already contains a legacy redb
+backup, then drives the live TUI through first prompt entry with a mock
+provider. A regression that synchronously opens or prunes graph cache state
+before prompt handling would surface as a slow or stuck first turn.
+"""
+
+[workspace]
+local = "crates/squeezy-eval/fixtures/workspaces/cache-split-lazy-open"
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+cache_root = "cache-fixture"
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 40
+
+[[steps]]
+kind = "prompt"
+text = "confirm startup is interactive"
+wait_for = "turn_completed"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "cache split ready"
+
+[expect]
+max_wall_clock_seconds = 30
+max_tools_per_turn = 0
+no_tool_errors = true
+max_input_tokens = 5000
+
+[mock]
+default_text = "cache split ready"
+
+[[mock.turns]]
+text = "cache split ready"
+input_tokens = 8
+output_tokens = 3
+
+[triage]
+enabled = false
