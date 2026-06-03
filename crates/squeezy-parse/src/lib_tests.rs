@@ -3067,6 +3067,86 @@ public final class Repo {
     );
 }
 
+/// `signature_span` must cover the declaration header only: from the symbol
+/// start up to where the body begins. A slice taken over it has to contain the
+/// signature text but exclude the body marker. Covers Rust + a brace language
+/// (Java) + a non-brace, indentation-delimited language (Python) so the
+/// boundary is validated across the three body-shape families.
+#[test]
+fn signature_span_excludes_body_across_languages() {
+    fn assert_header_excludes_body(
+        source: &str,
+        record: &FileRecord,
+        symbol_name: &str,
+        body_marker: &str,
+    ) {
+        let mut parser = LanguageParser::new().unwrap();
+        let parsed = parser
+            .parse_source(record, source.to_string())
+            .unwrap_or_else(|err| panic!("parse {} failed: {err:?}", record.relative_path));
+        let symbol = parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == symbol_name)
+            .unwrap_or_else(|| panic!("missing symbol {symbol_name} in {}", record.relative_path));
+
+        let sig_span = symbol.signature_span.unwrap_or_else(|| {
+            panic!(
+                "{symbol_name} ({}) has no signature_span",
+                record.relative_path
+            )
+        });
+        let body_span = symbol
+            .body_span
+            .unwrap_or_else(|| panic!("{symbol_name} has no body_span"));
+
+        // Header starts at the symbol and stops no later than the body.
+        assert_eq!(
+            sig_span.start_byte, symbol.span.start_byte,
+            "{symbol_name}: signature must start at the symbol start"
+        );
+        assert!(
+            sig_span.end_byte <= body_span.start_byte,
+            "{symbol_name}: signature must end at or before the body start"
+        );
+        assert!(
+            sig_span.end_byte < symbol.span.end_byte,
+            "{symbol_name}: signature must be a strict prefix of the full span"
+        );
+
+        let header = &source[sig_span.start_byte as usize..sig_span.end_byte as usize];
+        assert!(
+            header.contains(symbol_name),
+            "{symbol_name}: header {header:?} should contain the symbol name"
+        );
+        assert!(
+            !header.contains(body_marker),
+            "{symbol_name}: header {header:?} must not contain body marker {body_marker:?}"
+        );
+    }
+
+    let rust_source = "pub fn add(a: i32, b: i32) -> i32 {\n    let total = a + b;\n    total\n}\n";
+    assert_header_excludes_body(
+        rust_source,
+        &record("src/lib.rs", rust_source),
+        "add",
+        "total",
+    );
+
+    let java_source = "class Calc {\n    int square(int n) {\n        return n * n;\n    }\n}\n";
+    let mut java = record("Calc.java", java_source);
+    java.language = LanguageKind::Java;
+    assert_header_excludes_body(java_source, &java, "square", "return");
+
+    let python_source = "def greet(name):\n    message = \"hi \" + name\n    return message\n";
+    assert_header_excludes_body(
+        python_source,
+        &python_record("greet.py", python_source),
+        "greet",
+        "message",
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);

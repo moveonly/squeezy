@@ -60,6 +60,39 @@ fn helper() {}
     assert!(graph.call_chain(&run.id, &helper.id, 3).is_some());
 }
 
+/// `signature_span` must survive the `ParsedSymbol -> GraphSymbol` conversion
+/// and still point at the declaration header, so a `read_slice` signature read
+/// off the graph slices only the header and not the body. Mirrors the
+/// parse-side coverage one layer up, where `read_slice` actually consumes it.
+#[test]
+fn signature_span_survives_graph_and_excludes_body() {
+    let source = "pub fn add(a: i32, b: i32) -> i32 {\n    let total = a + b;\n    total\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let add = graph.find_symbol_by_name("add").pop().unwrap();
+    let sig = add
+        .signature_span
+        .expect("function symbol must carry a signature_span through the graph");
+    let body = add
+        .body_span
+        .expect("function symbol must carry a body_span");
+
+    assert_eq!(sig.start_byte, add.span.start_byte);
+    assert!(sig.end_byte <= body.start_byte);
+    let header = &source[sig.start_byte as usize..sig.end_byte as usize];
+    assert!(
+        header.contains("add"),
+        "header {header:?} keeps the signature"
+    );
+    assert!(
+        !header.contains("total"),
+        "header {header:?} must exclude the body"
+    );
+}
+
 #[test]
 fn cargo_compiler_facts_attach_diagnostics_and_track_staleness() {
     let source = "pub fn bad() -> i32 {\n    \"nope\"\n}\n";
