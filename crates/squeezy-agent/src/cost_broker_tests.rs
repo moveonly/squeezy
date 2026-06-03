@@ -160,6 +160,147 @@ fn cap_unenforceable_notice_names_provider_model_and_setting() {
 }
 
 #[test]
+fn round_input_gate_off_when_limit_unset() {
+    // Default-off: with `max_round_input_tokens == None` the gate returns
+    // `None` no matter how large the estimate, so the round dispatches
+    // unchanged.
+    let status = round_input_gate_status(
+        None,
+        10_000_000,
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        4_096,
+    );
+    assert!(status.is_none(), "an unset limit must never gate a round");
+}
+
+#[test]
+fn round_input_gate_passes_when_under_or_at_limit() {
+    // At or under the ceiling the gate stays quiet (the estimate is the
+    // *projected* size, and the limit is inclusive).
+    assert!(
+        round_input_gate_status(
+            Some(1_000),
+            999,
+            "anthropic",
+            squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+            4_096,
+        )
+        .is_none(),
+        "an under-limit estimate must not gate"
+    );
+    assert!(
+        round_input_gate_status(
+            Some(1_000),
+            1_000,
+            "anthropic",
+            squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+            4_096,
+        )
+        .is_none(),
+        "an estimate exactly at the limit must not gate"
+    );
+}
+
+#[test]
+fn round_input_gate_fires_with_priced_round_when_over_limit() {
+    // Over the ceiling the gate fires and, because the model has registry
+    // pricing, carries a non-zero dollar projection computed with the same
+    // `estimate_cost` the session-cost cap uses.
+    let status = round_input_gate_status(
+        Some(1_000),
+        50_000,
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        4_096,
+    )
+    .expect("an over-limit estimate must gate");
+    assert_eq!(status.estimated_input_tokens, 50_000);
+    assert_eq!(status.limit_tokens, 1_000);
+    let priced = status
+        .estimated_usd_micros
+        .expect("a priced model must yield a dollar projection");
+    assert!(priced > 0, "the projected round must cost something");
+    // The dollar figure must match a direct `estimate_cost` on the same
+    // projection so the gate doesn't carry an independent cost model.
+    let direct = estimate_cost(
+        "anthropic",
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        &CostSnapshot {
+            input_tokens: Some(50_000),
+            output_tokens: Some(4_096),
+            ..Default::default()
+        },
+    )
+    .expect("priced model");
+    assert_eq!(
+        priced, direct,
+        "gate dollar figure must equal estimate_cost"
+    );
+}
+
+#[test]
+fn round_input_gate_fires_unpriced_when_model_unknown() {
+    // Over the ceiling on a model with no registry pricing: the token gate
+    // still fires (so an oversized round is still caught) but the dollar
+    // field is `None` rather than a fabricated number.
+    let status = round_input_gate_status(
+        Some(1_000),
+        50_000,
+        "no-such-provider",
+        "no-such-model",
+        4_096,
+    )
+    .expect("the token gate fires regardless of pricing");
+    assert_eq!(status.estimated_input_tokens, 50_000);
+    assert!(
+        status.estimated_usd_micros.is_none(),
+        "an unpriced model must not invent a dollar figure"
+    );
+}
+
+#[test]
+fn round_input_gate_reason_states_overage_cost_and_setting() {
+    let status = RoundInputGateStatus {
+        estimated_input_tokens: 50_000,
+        limit_tokens: 1_000,
+        estimated_usd_micros: Some(123_456),
+    };
+    let msg = format_round_input_gate_reason(status);
+    assert!(
+        msg.contains("50000") && msg.contains("1000"),
+        "message must cite estimate and ceiling; got: {msg}"
+    );
+    assert!(
+        msg.contains("$0.1235"),
+        "message must quote the projected round cost; got: {msg}"
+    );
+    assert!(
+        msg.contains("max_round_input_tokens"),
+        "message must name the setting; got: {msg}"
+    );
+    assert!(
+        msg.contains("SQUEEZY_MAX_ROUND_INPUT_TOKENS"),
+        "message must cite the env override; got: {msg}"
+    );
+
+    // Unpriced rounds omit the dollar clause but keep the gate guidance.
+    let unpriced = format_round_input_gate_reason(RoundInputGateStatus {
+        estimated_input_tokens: 50_000,
+        limit_tokens: 1_000,
+        estimated_usd_micros: None,
+    });
+    assert!(
+        !unpriced.contains('$'),
+        "an unpriced gate must not quote a dollar figure; got: {unpriced}"
+    );
+    assert!(
+        unpriced.contains("max_round_input_tokens"),
+        "an unpriced gate still names the setting; got: {unpriced}"
+    );
+}
+
+#[test]
 fn budget_denied_result_counts_once_across_accounting_paths() {
     let mut broker = CostBroker::new(&AppConfig::default());
     let result = ToolResult {

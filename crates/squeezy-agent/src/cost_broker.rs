@@ -29,6 +29,54 @@ pub struct CostCapStatus {
     pub percent: u8,
 }
 
+/// Pre-flight snapshot of a single round's projected input size against the
+/// configured `max_round_input_tokens` ceiling. Mirrors [`CostCapStatus`]'s
+/// style so the agent can render a clear gate notice in the same shape as the
+/// session-cost cap. `estimated_input_tokens` is the `estimate_context`
+/// projection for the assembled request; `limit_tokens` is the configured
+/// ceiling; `estimated_usd_micros` is the registry-priced dollar value of the
+/// projected round (`None` when the active `(provider, model)` has no pricing).
+#[derive(Debug, Clone, Copy)]
+pub struct RoundInputGateStatus {
+    pub estimated_input_tokens: u64,
+    pub limit_tokens: u64,
+    pub estimated_usd_micros: Option<u64>,
+}
+
+/// Pre-flight gate decision. Returns `Some(status)` when a round whose
+/// assembled request is estimated at `estimated_input_tokens` would exceed the
+/// configured `max_round_input_tokens` ceiling, so the caller can compact (or
+/// gate) *before* paying for the oversized round. Returns `None` when the gate
+/// is unset (`None`) or the estimate is at/under the ceiling — i.e. the default
+/// path is a single `Option` check with no behaviour change.
+///
+/// The dollar figure is computed with the same `estimate_cost` + registry
+/// pricing the session-cost cap uses, so the gate notice can quote "$X for this
+/// round" without a second cost model. It is best-effort: an unpriced model
+/// yields `None` for the dollar field but the token gate still fires.
+pub(crate) fn round_input_gate_status(
+    max_round_input_tokens: Option<u64>,
+    estimated_input_tokens: u64,
+    provider: &str,
+    model: &str,
+    projected_output_tokens: u64,
+) -> Option<RoundInputGateStatus> {
+    let limit_tokens = max_round_input_tokens?;
+    if estimated_input_tokens <= limit_tokens {
+        return None;
+    }
+    let projection = CostSnapshot {
+        input_tokens: Some(estimated_input_tokens),
+        output_tokens: Some(projected_output_tokens),
+        ..Default::default()
+    };
+    Some(RoundInputGateStatus {
+        estimated_input_tokens,
+        limit_tokens,
+        estimated_usd_micros: estimate_cost(provider, model, &projection),
+    })
+}
+
 /// Per-turn running cost+tool-count snapshot emitted via
 /// `AgentEvent::CostUpdate` so a user watching a live transcript can see
 /// expense accumulating before the turn footer arrives.
@@ -379,6 +427,25 @@ fn serialized_json_len<T: Serialize>(value: &T) -> u64 {
     serde_json::to_writer(&mut counter, value)
         .map(|()| counter.bytes)
         .unwrap_or(0)
+}
+
+/// Render the pre-flight round-input gate notice. Fired when an assembled
+/// request's estimated input tokens exceed `max_round_input_tokens` even after
+/// the mid-turn compaction attempt. Mirrors `format_cap_reached_reason`'s
+/// shape: states the overage, quotes the registry-priced round cost when
+/// available, and points at the knob to raise.
+pub(crate) fn format_round_input_gate_reason(status: RoundInputGateStatus) -> String {
+    let cost = match status.estimated_usd_micros {
+        Some(micros) => format!(" (~${:.4} this round)", micros as f64 / 1_000_000.0),
+        None => String::new(),
+    };
+    format!(
+        "pre-flight round-input gate: estimated {} input tokens exceeds the \
+         max_round_input_tokens ceiling of {}{}, and mid-turn compaction could \
+         not bring it under. Run /config to raise `max_round_input_tokens` \
+         (or set SQUEEZY_MAX_ROUND_INPUT_TOKENS), or /compact and retry.",
+        status.estimated_input_tokens, status.limit_tokens, cost,
+    )
 }
 
 pub(crate) fn format_cap_reached_reason(status: CostCapStatus) -> String {

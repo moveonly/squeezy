@@ -977,6 +977,24 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 env_override: None,
                 secret: false,
             },
+            FieldMeta {
+                label: "max_round_input_tokens",
+                toml_path: &["budgets", "max_round_input_tokens"],
+                kind: FieldKind::OptionalInteger {
+                    min: 1,
+                    max: 100_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::Immediate,
+                get: get_max_round_input_tokens,
+                set: set_max_round_input_tokens,
+                default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Pre-flight ceiling on estimated input tokens per LLM round. \
+                       Over it the agent compacts first, then gates. Unset means off.",
+                env_override: None,
+                secret: false,
+            },
         ],
     },
     ConfigSectionMeta {
@@ -2212,6 +2230,23 @@ fn set_cost_warn_percent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &
         return Err("must be 1..=100");
     }
     cfg.cost_warn_percent = v as u8;
+    Ok(())
+}
+
+fn get_max_round_input_tokens(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(cfg.max_round_input_tokens.map(|v| v as i64))
+}
+fn set_max_round_input_tokens(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.max_round_input_tokens = match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => None,
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if v < 1 {
+                return Err("must be >= 1");
+            }
+            Some(v as u64)
+        }
+        _ => return Err("expects integer"),
+    };
     Ok(())
 }
 

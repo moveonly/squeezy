@@ -92,7 +92,10 @@ use context_compaction::{
 };
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
-use cost_broker::{CostBroker, format_cap_reached_reason, llm_request_input_bytes};
+use cost_broker::{
+    CostBroker, format_cap_reached_reason, format_round_input_gate_reason, llm_request_input_bytes,
+    round_input_gate_status,
+};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use micro_compaction::maybe_micro_compact_mid_turn;
 use permission_persist::persist_permission_rule;
@@ -5544,6 +5547,123 @@ impl TurnRuntime {
                     .await;
                 self.finish_turn(&broker.metrics).await;
                 return Ok(());
+            }
+            // Pre-flight round-input gate (idea G5). Default-off: when
+            // `max_round_input_tokens` is unset this whole block is a single
+            // `Option` check that returns `None`, so behaviour is unchanged.
+            // When set, estimate the assembled request's input tokens with the
+            // same `estimate_context` the cap check and compaction use; if the
+            // round is over the ceiling, take the cheaper action *first* —
+            // force a mid-turn compaction — and only gate the dispatch if the
+            // round is *still* over. This converts the existing reactive
+            // overflow handling into a proactive one for the round we're about
+            // to pay for.
+            if let Some(initial_gate) = round_input_gate_status(
+                self.config.max_round_input_tokens,
+                estimate_context(&conversation).estimated_tokens,
+                self.provider.name(),
+                &current_model,
+                CostBroker::projected_output_tokens(
+                    self.config.max_output_tokens,
+                    squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                ),
+            ) {
+                self.dispatch_pre_compact(initial_gate.estimated_input_tokens);
+                // Force compaction regardless of the standard compaction
+                // thresholds: the gate's own ceiling is the trigger here, so
+                // `force = true` makes the extractive (and strategy-aware)
+                // pipeline run even when the conversation is below the normal
+                // `min_items` / `estimated_tokens` budgets.
+                let gate_report = compact_conversation_with_strategy(
+                    &mut conversation,
+                    &mut context_compaction,
+                    &active_attachments,
+                    self.store.as_deref(),
+                    &self.provider,
+                    self.session_log.as_ref(),
+                    &self.redactor,
+                    &self.config,
+                    ContextCompactionTrigger::Auto,
+                    true,
+                )
+                .await;
+                if let Some(report) = gate_report {
+                    self.dispatch_post_compact(
+                        report.record.before.estimated_tokens,
+                        report.record.after.estimated_tokens,
+                    );
+                    self.log_event(
+                        "context_compacted",
+                        Some(self.turn_id),
+                        Some(format!(
+                            "round-input gate compacted gen={} {}->{} estimated tokens",
+                            report.record.generation,
+                            report.record.before.estimated_tokens,
+                            report.record.after.estimated_tokens,
+                        )),
+                        json!({
+                            "record": report.record,
+                            "summary": report.summary,
+                            "replacement_id": report.record.replacement_id,
+                            "conversation": report.post_compact,
+                            "phase": "round_input_gate",
+                        }),
+                    );
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::ContextCompacted {
+                            turn_id: self.turn_id,
+                            report,
+                        })
+                        .await;
+                    // Compaction rewrote `conversation`, so the server-side
+                    // response-id reuse path must be invalidated and the full
+                    // (now-smaller) conversation resent rather than only the
+                    // latest user delta — mirrors the mid-turn compaction
+                    // handling after a tool round.
+                    previous_response_id = None;
+                    next_input = conversation.clone();
+                }
+                // Re-estimate after compaction. If the round is still over the
+                // ceiling, gate the dispatch with a clear status instead of
+                // paying for the oversized round.
+                if let Some(status) = round_input_gate_status(
+                    self.config.max_round_input_tokens,
+                    estimate_context(&conversation).estimated_tokens,
+                    self.provider.name(),
+                    &current_model,
+                    CostBroker::projected_output_tokens(
+                        self.config.max_output_tokens,
+                        squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                            .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                    ),
+                ) {
+                    let reason = format_round_input_gate_reason(status);
+                    self.stamp_routing_savings(&mut broker.metrics);
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some(reason.clone()),
+                        &task_title,
+                    )
+                    .await;
+                    self.persist_turn_accounting(
+                        &total_cost,
+                        &broker.metrics,
+                        &broker.calibration,
+                        false,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(reason),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
             }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();

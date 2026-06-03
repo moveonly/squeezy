@@ -500,6 +500,14 @@ pub struct AppConfig {
     pub max_search_files_per_turn: u64,
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: u8,
+    /// Optional pre-flight ceiling on the estimated input tokens of a single
+    /// LLM round. `None` (the default) disables the gate entirely, leaving
+    /// every round dispatched exactly as before. When set, the agent
+    /// estimates the assembled request's input tokens before sending; if the
+    /// estimate exceeds this value it first attempts mid-turn compaction and,
+    /// if the round is still over, gates the dispatch with a clear status
+    /// instead of paying for an oversized round.
+    pub max_round_input_tokens: Option<u64>,
     pub routing: RoutingConfig,
     pub telemetry: TelemetryConfig,
     pub feedback: FeedbackConfig,
@@ -1038,6 +1046,10 @@ impl AppConfig {
             .filter(|value| (1..=100).contains(value))
             .or(budgets.cost_warn_percent)
             .unwrap_or(DEFAULT_COST_WARN_PERCENT);
+        let max_round_input_tokens = get_var("SQUEEZY_MAX_ROUND_INPUT_TOKENS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .or(budgets.max_round_input_tokens);
         let routing = RoutingConfig::from_settings_and_env(
             settings.routing.unwrap_or_default(),
             &mut get_var,
@@ -1156,6 +1168,7 @@ impl AppConfig {
             max_search_files_per_turn,
             max_session_cost_usd_micros,
             cost_warn_percent,
+            max_round_input_tokens,
             routing,
             telemetry,
             feedback,
@@ -1468,10 +1481,14 @@ impl AppConfig {
         } else {
             output.push_str("# max_session_cost_usd_micros = unset\n");
         }
-        output.push_str(&format!(
-            "cost_warn_percent = {}\n\n",
-            self.cost_warn_percent
-        ));
+        output.push_str(&format!("cost_warn_percent = {}\n", self.cost_warn_percent));
+        if let Some(max_round_input_tokens) = self.max_round_input_tokens {
+            output.push_str(&format!(
+                "max_round_input_tokens = {max_round_input_tokens}\n\n"
+            ));
+        } else {
+            output.push_str("# max_round_input_tokens = unset\n\n");
+        }
 
         output.push_str("[routing]\n");
         output.push_str(&format!("auto_cheap = {}\n", self.routing.auto_cheap));
@@ -3810,6 +3827,7 @@ pub struct BudgetSettings {
     pub max_search_files_per_turn: Option<u64>,
     pub max_session_cost_usd_micros: Option<u64>,
     pub cost_warn_percent: Option<u8>,
+    pub max_round_input_tokens: Option<u64>,
 }
 
 impl BudgetSettings {
@@ -3827,6 +3845,7 @@ impl BudgetSettings {
                 "max_search_files_per_turn",
                 "max_session_cost_usd_micros",
                 "cost_warn_percent",
+                "max_round_input_tokens",
             ],
             source,
             path,
@@ -3892,6 +3911,12 @@ impl BudgetSettings {
                 source,
                 &field(path, "cost_warn_percent"),
             )?,
+            max_round_input_tokens: u64_value(
+                table,
+                "max_round_input_tokens",
+                source,
+                &field(path, "max_round_input_tokens"),
+            )?,
         })
     }
 
@@ -3927,6 +3952,10 @@ impl BudgetSettings {
             next.max_session_cost_usd_micros,
         );
         replace_if_some(&mut self.cost_warn_percent, next.cost_warn_percent);
+        replace_if_some(
+            &mut self.max_round_input_tokens,
+            next.max_round_input_tokens,
+        );
     }
 }
 
@@ -8918,6 +8947,7 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_result_bytes_per_round = 50000
 # max_session_cost_usd_micros = 5000000
 # cost_warn_percent = 85
+# max_round_input_tokens = 200000  # pre-flight per-round input-token ceiling; unset = off (compact-first, then gate)
 
 [agent]
 # exploration_compiler = true  # graph-first planner for common navigation prompts
