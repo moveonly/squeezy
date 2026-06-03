@@ -11648,8 +11648,10 @@ impl TurnVisualState {
 }
 
 fn turn_coin_span(app: &TuiApp) -> Span<'static> {
+    // Static full moon marking the assistant's reply — never input-driven and
+    // never timer-animated; the working-line star carries any motion.
     Span::styled(
-        prompt_coin_frame(app),
+        "●",
         Style::default()
             .fg(app.turn_visual.color(app.animation_tick))
             .add_modifier(Modifier::BOLD),
@@ -11660,35 +11662,7 @@ fn assistant_static_span(color: Color) -> Span<'static> {
     Span::styled("●", Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
-/// True while the agent is blocked on the user (a plan-mode question,
-/// approval, plan choice, MCP elicitation, or feedback prompt). The prompt
-/// coin holds steady in these states so it never drifts "for no reason"
-/// while you read or decide.
-fn awaiting_user_input(app: &TuiApp) -> bool {
-    app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_feedback.is_some()
-}
-
-/// The prompt coin only eases through moon phases while the agent is actively
-/// generating; it freezes when idle, finished, or waiting on the user. A
-/// per-tick cell change also keeps terminal-emulator activity indicators
-/// buzzing, so freezing matters beyond aesthetics.
-fn prompt_coin_animating(app: &TuiApp) -> bool {
-    matches!(app.turn_visual, TurnVisualState::Running) && !awaiting_user_input(app)
-}
-
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    if !prompt_coin_animating(app) {
-        return Span::styled(
-            "☽",
-            Style::default()
-                .fg(crate::render::theme::accent())
-                .add_modifier(Modifier::BOLD),
-        );
-    }
     Span::styled(
         prompt_coin_frame(app),
         Style::default()
@@ -11698,23 +11672,12 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
 }
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
-    // A full lunar cycle (new → waxing crescent → first quarter → full →
-    // last quarter → waning crescent), matching the header band.
-    const FRAMES: [&str; 6] = ["○", "☽", "◑", "●", "◐", "☾"];
-    // ~1.1 s per phase: the moon should ease through its cycle. A fast cycle
-    // reads as distracting flicker rather than a moon drifting.
-    const PHASE_MS: u64 = 1100;
-    if !prompt_coin_animating(app) {
-        return "☽";
-    }
-    let elapsed_ms = prompt_elapsed_ms(app);
-    let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
-    let frame_index = ((elapsed_ms / PHASE_MS) as usize) % FRAMES.len();
-    if direction_reversed {
-        FRAMES[FRAMES.len() - 1 - frame_index]
-    } else {
-        FRAMES[frame_index]
-    }
+    // The prompt coin is a typing indicator: it advances one moon phase per
+    // character in the composer and never animates on a timer, so it only
+    // ever turns when you do — waxing as you add text, waning as you delete.
+    // The resting state (an empty composer) is a steady crescent.
+    const FRAMES: [&str; 6] = ["☽", "◑", "●", "◐", "☾", "○"];
+    FRAMES[app.input.chars().count() % FRAMES.len()]
 }
 
 fn prompt_elapsed_ms(app: &TuiApp) -> u64 {

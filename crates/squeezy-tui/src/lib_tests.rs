@@ -6903,7 +6903,7 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
 }
 
 #[test]
-fn pending_assistant_uses_rotating_coin_marker() {
+fn pending_assistant_uses_static_moon_marker() {
     let mut app = test_app(SessionMode::Build);
     app.pending_assistant.push_delta("streaming");
     app.turn_visual = TurnVisualState::Running;
@@ -6911,7 +6911,9 @@ fn pending_assistant_uses_rotating_coin_marker() {
 
     let lines = transcript_lines_for_render(&app, Some(80), false);
 
-    assert_eq!(lines[0].spans[1].content.as_ref(), prompt_coin_frame(&app));
+    // The assistant reply marker is a static full moon (never timer-animated
+    // or input-driven); the working-line star carries the motion instead.
+    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(app.turn_visual.color(app.animation_tick))
