@@ -1823,19 +1823,16 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             };
             true
         }
-        KeyCode::Esc => {
+        KeyCode::Esc
             if app.subagent_pane.focused
-                || !matches!(app.subagent_pane.active, ConversationSource::Main)
-            {
-                app.subagent_pane.focused = false;
-                app.subagent_pane.active = ConversationSource::Main;
-                app.subagent_pane.selected = 0;
-                set_active_transcript_scroll_from_bottom(app, 0);
-                app.status = "main conversation selected".to_string();
-                true
-            } else {
-                false
-            }
+                || !matches!(app.subagent_pane.active, ConversationSource::Main) =>
+        {
+            app.subagent_pane.focused = false;
+            app.subagent_pane.active = ConversationSource::Main;
+            app.subagent_pane.selected = 0;
+            set_active_transcript_scroll_from_bottom(app, 0);
+            app.status = "main conversation selected".to_string();
+            true
         }
         KeyCode::Delete | KeyCode::Backspace if app.subagent_pane.focused => {
             app.clear_finished_subagents();
