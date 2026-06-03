@@ -347,7 +347,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance in class-based languages pass `attribute=\"base:<TypeName>\"`, not `base:` in `query`. To match ANY of several bases in ONE call, pipe-separate them: `attribute=\"base:Foo|base:Bar|base:Baz\"` — do this instead of one decl_search per base, so a wide hierarchy stays a single call. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<TypeName>\"` (pipe-separate to match several bases in one call: `base:A|base:B`), not `base:` in `query`. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -359,7 +359,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
                 "path": {"type": "string", "description": "Optional workspace-relative path filter. Multi-segment values (e.g. `gson/src/main/java`) match by strict directory prefix; single tokens (e.g. `squeezy_graph`) fall back to fuzzy segment matching."},
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
-                "attribute": {"type": "string", "description": "Optional attribute filter such as `base:<TypeName>` for subclasses/implementors. Pipe-separate to match any of several in one call: `base:Foo|base:Bar`."},
+                "attribute": {"type": "string"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
                 "offset": {"type": "integer", "minimum": 0}
             }

@@ -11388,7 +11388,12 @@ async fn read_file_dispatch_misspelled_alias_still_fails() {
 fn core_tool_prefix_stays_within_byte_baseline() {
     // Recorded after the G2 prefix-slimming pass. Was 25_852 before the
     // pass; keep this monotonically non-increasing for cache stability.
-    const PREFIX_BYTES_BASELINE: usize = 24_593;
+    // 24_593 -> 24_700: deliberate bump for the multi-value `decl_search`
+    // attribute filter guidance (`base:A|base:B`). The +43 bytes of prefix
+    // buys collapsing an N-base enumeration from N serial calls to one,
+    // which on a wide hierarchy saves far more tokens (and per-turn budget)
+    // than the prose costs — a strongly net-negative token change.
+    const PREFIX_BYTES_BASELINE: usize = 24_700;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools

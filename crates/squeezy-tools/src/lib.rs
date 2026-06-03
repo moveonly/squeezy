@@ -147,7 +147,14 @@ use web::{
 pub(crate) const DEFAULT_MAX_FILES: usize = 10_000;
 pub(crate) const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
 pub(crate) const CHECKPOINTS_DISABLED_MESSAGE: &str = "checkpointing is disabled by default; commit or stash with git, or set [tools].checkpoints_enabled = true to re-enable Squeezy checkpoints";
-pub(crate) const DEFAULT_READ_LIMIT: usize = 64_000;
+// The default applies only when the model OMITS `limit`. A whole-file default
+// re-bills a 16k-token file into context on every subsequent turn; capping the
+// no-argument read keeps an unbounded read_file from pulling an entire large
+// file. read_file returns `truncated` + `total_bytes`, so the model paginates
+// (offset) when it needs more — recall is preserved, only the cost of reading
+// a whole file "just in case" is removed. An explicit `limit` (which Mini
+// passes ~95% of the time) is unaffected.
+pub(crate) const DEFAULT_READ_LIMIT: usize = 24_000;
 pub(crate) const MAX_READ_LIMIT: usize = 128_000;
 pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const MAX_SHELL_TIMEOUT_MS: u64 = 300_000;
