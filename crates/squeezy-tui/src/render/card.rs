@@ -4,24 +4,14 @@
 //! module so tool-call cards can apply the same subtle surface tint, with
 //! a single gate against terminals that can't render bg blends cleanly.
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use crate::render::palette::{self, ColorLevel};
-
-/// Tone- and color-level-aware background for a card surface. Returns
-/// `None` on Ansi16 / NoColor terminals where blended bg cells look
-/// muddy — callers then fall back to the flat (unpatched) layout.
+/// Tool cards render flat — the redesign drops the filled surface tint so the
+/// transcript reads as one calm background. Kept as a `None`-returning seam so
+/// the card helpers and their callers stay unchanged.
 pub(crate) fn card_background_style() -> Option<Style> {
-    if !matches!(palette::color_level(), ColorLevel::TrueColor) {
-        return None;
-    }
-    let bg = crate::render::theme::surface();
-    if bg == Color::Reset {
-        None
-    } else {
-        Some(Style::default().bg(bg))
-    }
+    None
 }
 
 /// Patch `bg` onto every span in `line`. No-op when `bg` is `None`.

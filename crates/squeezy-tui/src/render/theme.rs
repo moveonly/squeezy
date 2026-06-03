@@ -240,14 +240,6 @@ pub(crate) fn footer() -> Color {
     color(token::UI_FOOTER)
 }
 
-pub(crate) fn surface() -> Color {
-    color(token::UI_SURFACE)
-}
-
-pub(crate) fn prompt_bg() -> Color {
-    color(token::UI_PROMPT_BG)
-}
-
 pub(crate) fn shimmer() -> Color {
     color(token::EFFECTS_SHIMMER)
 }
