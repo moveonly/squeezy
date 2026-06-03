@@ -193,6 +193,11 @@ pub struct SqueezyOverlay {
     pub tool_choice: Option<String>,
     pub mode: Option<String>,
     pub permission_mode: Option<String>,
+    /// Override `AppConfig.batch_tool_calls_hint` — when true, the system
+    /// prompt nudges the model to issue independent read-only lookups in a
+    /// single parallel batch rather than one per turn. Used to A/B whether
+    /// batching reduces a tier's round-trip-driven cost.
+    pub batch_tool_calls_hint: Option<bool>,
     pub instructions: Option<String>,
     pub max_output_tokens: Option<u32>,
     /// Override `AppConfig.max_tool_calls_per_turn` — squeezy's live

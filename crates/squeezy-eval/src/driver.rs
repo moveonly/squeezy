@@ -553,6 +553,9 @@ fn apply_overlay(
     // 20 MB read, $5 session cap) which lets a planner over-fetch
     // burst slide. Scenarios that probe budget behavior can ratchet
     // them down via the overlay.
+    if let Some(v) = overlay.batch_tool_calls_hint {
+        config.batch_tool_calls_hint = v;
+    }
     if let Some(v) = overlay.max_tool_calls_per_turn {
         config.max_tool_calls_per_turn = v;
     }
