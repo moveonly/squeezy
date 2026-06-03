@@ -279,6 +279,35 @@ graph/packet change could touch. The trustworthy wins remain the build-fix three
 relative cpp −12%. A clean absolute verdict needs a **fresh re-baseline** (the
 `codex` CLI is available; harness at `/tmp/codex-runs/realworld/`).
 
+### Fresh codex re-baseline (drift-free, same rates) — the trustworthy verdict
+
+The committed baselines don't reproduce, so I re-ran **codex `gpt-5.4-mini`
+fresh** on the same scenarios and compared with **identical squeezy
+pricing** (input $0.75 / output $4.50 / cache-read $0.075 per Mtok) applied to
+codex's own token usage — a same-day, same-tier, apples-to-apples head-to-head:
+
+| lang | squeezy wg | fresh codex | result |
+|---|---|---|---|
+| **php** | $0.0311 | $0.0468 | **squeezy WIN — 34% cheaper**, recall 100 |
+| **scala** | $0.0345 | $0.0630 | **squeezy WIN — 45% cheaper**, recall 100 |
+| **cpp** | $0.0670 | $0.1078 | **squeezy WIN — 38% cheaper**, recall 100 |
+| python | $0.1038, rec 0 | $0.0346, **rec 0** | **scenario broken** — both fail |
+
+Two conclusions, now drift-free:
+1. **php/scala/cpp are genuine wins vs codex measured *today*** — squeezy is 34–45%
+   cheaper at 100% recall, no stale-baseline caveat. (Methodology note: an early
+   pass used a wrong codex rate ($0.25/Mtok) and falsely showed squeezy losing 2x;
+   recomputing at squeezy's actual $0.75/Mtok flipped it back to the wins above —
+   a reminder to pin pricing on both sides.)
+2. **The python recall collapse is a broken benchmark, not squeezy:** fresh codex
+   *also* scores 0% recall, so the scenario/grader no longer fits the current
+   model. python (and by the same pattern rust) should be **excluded** from the
+   loss column pending a scenario/grader refresh — they are eval bugs.
+
+This upgrades php/scala/cpp from the §"directional, vs drifted baselines" tally to
+**verified wins vs a fresh codex baseline**. The remaining mini langs still need
+the same fresh-codex treatment for a fully trustworthy 15-lang count.
+
 **Audit confirmation:** a per-language sweep of the remaining resolvers
 (java/kotlin/csharp/go/swift/c-c++/js-ts) found **no further pathology** — Java's
 `this.foo()` and C#/C++'s `base.Foo()` inheritance all route through the same
