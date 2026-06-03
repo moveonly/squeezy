@@ -251,6 +251,20 @@ fn picker_signals_cross_project_switch() {
 }
 
 #[test]
+fn picker_ellipsises_long_labels_instead_of_hard_cropping() {
+    let mut long = summary("long");
+    long.first_user_task = Some("verylongsessiontitlewithnospaces".repeat(12));
+    let mut state = ResumePickerState::new(vec![long], cwd());
+    state.dispatch(press(KeyCode::Down)); // cursor onto the candidate
+
+    let text = render_state_to_text(&state, 70, 16);
+    assert!(
+        text.contains('…'),
+        "an over-long label must be ellipsised, not hard-cropped:\n{text}"
+    );
+}
+
+#[test]
 fn picker_enter_on_start_fresh_starts_fresh() {
     let mut state = ResumePickerState::new(vec![summary("first")], cwd());
     assert_eq!(

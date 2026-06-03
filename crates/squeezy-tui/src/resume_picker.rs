@@ -742,10 +742,28 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     .alignment(Alignment::Left);
     frame.render_widget(intro, layout[1]);
 
+    let cwd_str = state.cwd.display().to_string();
+    // Resolve the viewport first: the list scrolls so the cursor stays on
+    // screen, and a scrollbar steals a column when it overflows. Knowing the
+    // real content width up front lets candidate labels ellipsise to fit
+    // instead of hard-cropping into the scrollbar.
+    let list_area = layout[3];
+    let visible = list_area.height.max(1) as usize;
+    let total = state.candidates.len() + 3; // Start fresh + candidates + 2 checkboxes
+    let (body_area, scrollbar_area) = if total > visible {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(list_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (list_area, None)
+    };
+    let content_width = body_area.width as usize;
+
     // Start fresh leads the list as the safe default (cursor opens on it),
     // followed by each candidate session at index 1..=N.
-    let cwd_str = state.cwd.display().to_string();
-    let mut rows: Vec<Line<'_>> = Vec::with_capacity(state.candidates.len() + 3);
+    let mut rows: Vec<Line<'_>> = Vec::with_capacity(total);
     rows.push(render_start_fresh_row(
         state.cursor == state.start_fresh_index(),
     ));
@@ -753,7 +771,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         // candidates start at row 1; active row uses the cursor offset.
         let row_idx = idx + 1;
         let cross_project = entry.summary.cwd != cwd_str;
-        render_candidate_row(idx, entry, row_idx == state.cursor, cross_project)
+        render_candidate_row(entry, row_idx == state.cursor, cross_project, content_width)
     }));
     rows.push(render_checkbox_row(
         "Never ask again for this project",
@@ -766,13 +784,6 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         state.cursor == state.user_checkbox_index(),
     ));
 
-    // Scroll the list so the cursor is always visible. With up to
-    // MAX_PICKER_ENTRIES candidates plus the fresh/checkbox rows the list
-    // routinely overflows a short terminal, and a fixed Paragraph would clip
-    // the cursor right off the bottom. Center the cursor in the viewport.
-    let list_area = layout[3];
-    let visible = list_area.height.max(1) as usize;
-    let total = rows.len();
     let offset = if total <= visible {
         0
     } else {
@@ -780,15 +791,6 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             .cursor
             .saturating_sub(visible / 2)
             .min(total - visible)
-    };
-    let (body_area, scrollbar_area) = if total > visible {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(list_area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (list_area, None)
     };
     frame.render_widget(Paragraph::new(rows).scroll((offset as u16, 0)), body_area);
     if let Some(sb_area) = scrollbar_area {
@@ -890,10 +892,10 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
 }
 
 fn render_candidate_row(
-    _idx: usize,
     entry: &PickerEntry,
     active: bool,
     cross_project: bool,
+    content_width: usize,
 ) -> Line<'static> {
     let summary = &entry.summary;
     let (prefix_color, label_style) = if active {
@@ -931,21 +933,38 @@ fn render_candidate_row(
         None => (summary.label(), None),
     };
     let label_hint = summary.label_hint();
-    let mut spans = Vec::with_capacity(
-        6 + usize::from(branch_marker.is_some())
-            + if label_hint.is_empty() { 0 } else { 2 }
-            + if cross_project { 3 } else { 0 },
-    );
+    let timestamp = format_started_at(summary.started_at_ms);
+    let turns = format!("{:>10}", summary.turn_indicator());
+    let project_hint = if cross_project {
+        summary.project_hint()
+    } else {
+        String::new()
+    };
+    // Ellipsise the label to the width left after the fixed prefix and the
+    // trailing markers, so long session titles never hard-crop into the
+    // scrollbar and the ↪ cross-project marker stays visible.
+    let branch_len = branch_marker.as_ref().map_or(0, |m| m.chars().count());
+    let hint_len = if label_hint.is_empty() {
+        0
+    } else {
+        2 + label_hint.chars().count()
+    };
+    let cross_len = if cross_project {
+        4 + project_hint.chars().count()
+    } else {
+        0
+    };
+    let fixed = prefix.chars().count() + timestamp.chars().count() + 2 + turns.chars().count() + 2;
+    let label_budget = content_width
+        .saturating_sub(fixed + branch_len + hint_len + cross_len)
+        .max(8);
+    let label = truncate_label(&label, label_budget);
+
+    let mut spans = Vec::with_capacity(11);
     spans.push(Span::styled(prefix, Style::default().fg(prefix_color)));
-    spans.push(Span::styled(
-        format_started_at(summary.started_at_ms),
-        timestamp_style,
-    ));
+    spans.push(Span::styled(timestamp, timestamp_style));
     spans.push(Span::styled("  ", Style::default()));
-    spans.push(Span::styled(
-        format!("{:>10}", summary.turn_indicator()),
-        timestamp_style,
-    ));
+    spans.push(Span::styled(turns, timestamp_style));
     spans.push(Span::styled("  ", Style::default()));
     spans.push(Span::styled(label, label_style));
     if let Some(marker) = branch_marker {
@@ -969,11 +988,25 @@ fn render_candidate_row(
             Style::default().fg(crate::render::theme::accent()),
         ));
         spans.push(Span::styled(
-            summary.project_hint(),
+            project_hint,
             Style::default().fg(crate::render::theme::path_hint()),
         ));
     }
     Line::from(spans)
+}
+
+/// Truncate a single-line label to `max` display columns, appending an
+/// ellipsis when it overflows so the cut is visibly intentional.
+fn truncate_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = label.chars().take(max - 1).collect();
+    out.push('…');
+    out
 }
 
 fn render_start_fresh_row(active: bool) -> Line<'static> {
@@ -1027,8 +1060,10 @@ fn render_checkbox_row(label: &'static str, checked: bool, active: bool) -> Line
 /// Center a fixed-size area inside `full` with reasonable bounds for small
 /// terminals.
 fn centered_area(full: Rect) -> Rect {
-    let max_width = 98u16;
-    let max_height = 22u16;
+    // Use most of the terminal so long session labels have room, capped so the
+    // overlay stays scannable (and centered) on ultra-wide monitors.
+    let max_width = 160u16;
+    let max_height = 32u16;
     let width = full.width.min(max_width);
     let height = full.height.min(max_height);
     let x = full.x + full.width.saturating_sub(width) / 2;
