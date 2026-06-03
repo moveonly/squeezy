@@ -8182,6 +8182,10 @@ pub const DEFAULT_TUI_THEME_NAME: &str = "default";
 pub const BUILTIN_TUI_THEME_NAMES: &[&str] =
     &["default", "bright", "fun", "catppuccin", "high-contrast"];
 
+pub const DEFAULT_TUI_SPINNER_NAME: &str = "drift";
+
+pub const BUILTIN_TUI_SPINNER_NAMES: &[&str] = &["twinkle", "scintillate", "drift"];
+
 pub const TUI_THEME_COLOR_TOKENS: &[&str] = &[
     "palette.accent",
     "palette.secondary",
@@ -8258,6 +8262,17 @@ pub fn normalize_tui_theme_name(value: &str) -> Option<String> {
 
 pub fn is_builtin_tui_theme_name(value: &str) -> bool {
     BUILTIN_TUI_THEME_NAMES.contains(&value)
+}
+
+pub fn normalize_tui_spinner_name(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let canonical = match normalized.as_str() {
+        "twinkle" | "twinkling" | "star" => "twinkle",
+        "scintillate" | "scintillating" | "sparkle" => "scintillate",
+        "drift" | "drifting" | "shooting" | "comet" => "drift",
+        _ => return None,
+    };
+    Some(canonical.to_string())
 }
 
 pub fn is_tui_theme_color_token(value: &str) -> bool {
@@ -8337,6 +8352,8 @@ pub struct TuiConfig {
     /// Active named TUI theme. Builtins are `default`, `bright`, `fun`,
     /// `catppuccin`, and `high-contrast`; user settings may add more names.
     pub theme: String,
+    /// Working-status spinner style: `twinkle`, `scintillate`, or `drift`.
+    pub spinner: String,
     /// User-defined or overridden theme colors, merged through the normal
     /// settings precedence chain.
     pub themes: BTreeMap<String, TuiThemeSettings>,
@@ -8389,6 +8406,9 @@ impl TuiConfig {
             theme: settings
                 .theme
                 .unwrap_or_else(|| DEFAULT_TUI_THEME_NAME.to_string()),
+            spinner: settings
+                .spinner
+                .unwrap_or_else(|| DEFAULT_TUI_SPINNER_NAME.to_string()),
             themes: settings.themes.unwrap_or_default(),
             desktop_notifications: settings
                 .desktop_notifications
@@ -8420,6 +8440,7 @@ pub struct TuiSettings {
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<String>,
+    pub spinner: Option<String>,
     pub themes: Option<BTreeMap<String, TuiThemeSettings>>,
     pub desktop_notifications: Option<NotificationMethod>,
     pub persist_prompt_history: Option<bool>,
@@ -8444,6 +8465,7 @@ impl TuiSettings {
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+                "spinner",
                 "themes",
                 "desktop_notifications",
                 "persist_prompt_history",
@@ -8516,6 +8538,7 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+            spinner: tui_spinner_value(table, "spinner", source, &field(path, "spinner"))?,
             themes: tui_themes_value(table, "themes", source, &field(path, "themes"))?,
             desktop_notifications: notification_method_value(
                 table,
@@ -10967,6 +10990,22 @@ fn tui_theme_value(
     normalize_tui_theme_name(&value).map(Some).ok_or_else(|| {
         SqueezyError::Config(format!(
             "{source}: {path}: invalid TUI theme {value:?}; expected a theme slug"
+        ))
+    })
+}
+
+fn tui_spinner_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    normalize_tui_spinner_name(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI spinner {value:?}; expected twinkle, scintillate, or drift"
         ))
     })
 }

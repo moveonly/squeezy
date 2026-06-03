@@ -21,11 +21,12 @@ use crate::{
     DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
-    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_THEME_NAME,
-    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode,
-    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, SessionResumePicker,
-    StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
-    TuiSynchronizedOutput, normalize_tui_theme_name,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
+    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
+    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    TuiAlternateScreen, TuiSynchronizedOutput, normalize_tui_spinner_name,
+    normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -865,6 +866,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "default",
                 default: || FieldValue::String(DEFAULT_TUI_THEME_NAME.to_string()),
                 help: "Active named theme. Configure colors in the Themes section or via /theme.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "spinner",
+                toml_path: &["tui", "spinner"],
+                kind: FieldKind::Enum {
+                    options: crate::BUILTIN_TUI_SPINNER_NAMES,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_spinner,
+                set: set_spinner,
+                default_display: "drift",
+                default: || FieldValue::Enum(DEFAULT_TUI_SPINNER_NAME),
+                help: "Working-status spinner shape: twinkle, scintillate, or drift.",
                 env_override: None,
                 secret: false,
             },
@@ -2132,6 +2148,24 @@ fn set_theme(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str>
         _ => return Err("expects theme name"),
     };
     cfg.tui.theme = normalize_tui_theme_name(&s).ok_or("invalid theme")?;
+    Ok(())
+}
+
+fn get_spinner(cfg: &AppConfig) -> FieldValue {
+    let name = crate::BUILTIN_TUI_SPINNER_NAMES
+        .iter()
+        .copied()
+        .find(|s| *s == cfg.tui.spinner)
+        .unwrap_or(DEFAULT_TUI_SPINNER_NAME);
+    FieldValue::Enum(name)
+}
+fn set_spinner(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        FieldValue::Enum(s) => s.to_string(),
+        _ => return Err("expects spinner name"),
+    };
+    cfg.tui.spinner = normalize_tui_spinner_name(&s).ok_or("invalid spinner")?;
     Ok(())
 }
 

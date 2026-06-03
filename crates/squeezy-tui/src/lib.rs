@@ -2773,6 +2773,7 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
 /// render caches observe the same generation.
 pub(crate) fn apply_theme_overrides(config: &AppConfig) {
     render::theme::set_active_theme(config);
+    render::spinner::set_active_spinner(config);
 }
 
 /// Apply a `/theme` switch: flip the runtime palette override, mirror the
@@ -6050,15 +6051,18 @@ fn should_advance_animation_tick(app: &TuiApp) -> bool {
 
 fn working_line(app: &TuiApp) -> Line<'static> {
     let interrupting = app.status == "interrupting";
+    // The live agent is a cool-silver star (the moon motif is reserved
+    // for the header band and the prompt coin); red only when interrupting.
     let activity_color = if interrupting {
         crate::render::theme::red()
     } else {
-        render::palette::accent_primary()
+        crate::render::theme::foreground()
     };
+    let spinner_frame = crate::render::spinner::active_style().frame(prompt_elapsed_ms(app));
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "• ",
+            format!("{spinner_frame} "),
             Style::default()
                 .fg(activity_color)
                 .add_modifier(Modifier::BOLD),
@@ -7124,21 +7128,33 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
-    const FULL: &[&str] = &["◌", "◔", "◑", "◕", "●"];
-    const COMPACT: &[&str] = &["◔", "◑", "◕", "●"];
-    const TIGHT: &[&str] = &["◑", "◕", "●"];
-    const MINIMAL: &[&str] = &["●"];
+    // Waxing phases (new → full) on the left, waning phases (full → new)
+    // on the right, so the strip reads as one true lunar cycle rather than
+    // a mirror of the same glyphs.
+    const WAX_FULL: &[&str] = &["○", "☽", "◑", "●"];
+    const WANE_FULL: &[&str] = &["●", "◐", "☾", "○"];
+    const WAX_COMPACT: &[&str] = &["☽", "◑", "●"];
+    const WANE_COMPACT: &[&str] = &["●", "◐", "☾"];
+    const WAX_TIGHT: &[&str] = &["◑", "●"];
+    const WANE_TIGHT: &[&str] = &["●", "◐"];
+    const WAX_MINIMAL: &[&str] = &["●"];
+    const WANE_MINIMAL: &[&str] = &["●"];
 
     let title = "Squeezy";
     let version_text = format!(" v{version}");
     let title_total = title.chars().count() + version_text.chars().count();
 
-    for glyphs in [FULL, COMPACT, TIGHT, MINIMAL] {
-        let strip_chars = glyphs.len() * 2 - 1;
+    for (wax, wane) in [
+        (WAX_FULL, WANE_FULL),
+        (WAX_COMPACT, WANE_COMPACT),
+        (WAX_TIGHT, WANE_TIGHT),
+        (WAX_MINIMAL, WANE_MINIMAL),
+    ] {
+        let strip_chars = wax.len() * 2 - 1;
         let content_total = strip_chars + 2 + title_total + 2 + strip_chars;
         if content_total <= card_width {
-            let left_strip = glyphs.join(" ");
-            let right_strip = glyphs.iter().rev().copied().collect::<Vec<_>>().join(" ");
+            let left_strip = wax.join(" ");
+            let right_strip = wane.join(" ");
             let pad_total = card_width.saturating_sub(content_total);
             let pad_left = pad_total / 2;
             let pad_right = pad_total.saturating_sub(pad_left);
@@ -8035,7 +8051,7 @@ fn format_user_prompt_entry(
     // visually different bullet — content-hashed (not index-based) so
     // the marker is stable per message even when prompts are
     // reordered/collapsed in the transcript.
-    const BULLETS: &[&str] = &["◌", "◔", "◑", "◕", "◒", "◓"];
+    const BULLETS: &[&str] = &["○", "☽", "◑", "●", "◐", "☾"];
     let bullet_idx = item
         .content
         .bytes()
@@ -11647,13 +11663,13 @@ fn assistant_static_span(color: Color) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    // At idle the coin is a steady crate::render::theme::accent() ●. Animating it forced a real
-    // cell change every 320 ms, which kept terminal-emulator per-tab
-    // activity indicators buzzing forever even though the agent was
+    // At idle the indicator is a steady amber crescent moon. Animating it
+    // forced a real cell change every 320 ms, which kept terminal-emulator
+    // per-tab activity indicators buzzing forever even though the agent was
     // doing nothing.
     if app.turn_visual == TurnVisualState::Idle {
         return Span::styled(
-            "●",
+            "☽",
             Style::default()
                 .fg(crate::render::theme::accent())
                 .add_modifier(Modifier::BOLD),
@@ -11671,9 +11687,12 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
 }
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
-    const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
+    // A full lunar cycle (new → waxing crescent → first quarter → full →
+    // last quarter → waning crescent) so the coin turns through real
+    // phases, matching the header band.
+    const FRAMES: [&str; 6] = ["○", "☽", "◑", "●", "◐", "☾"];
     if app.turn_visual == TurnVisualState::Idle {
-        return FRAMES[0];
+        return "☽";
     }
     let elapsed_ms = prompt_elapsed_ms(app);
     let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;

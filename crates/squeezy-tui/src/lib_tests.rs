@@ -6656,7 +6656,8 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
     app.turn_visual = TurnVisualState::Running;
 
     let output = render_to_string(&app, 100, 12);
-    assert!(output.contains("●  ship it┃"), "{output}");
+    let coin = prompt_coin_frame(&app);
+    assert!(output.contains(&format!("{coin}  ship it┃")), "{output}");
 }
 
 #[test]
@@ -6672,12 +6673,14 @@ fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
     app.transcript.clear();
 
     app.animation_tick = 0;
+    let coin_first = prompt_coin_frame(&app);
     let first = render_to_string(&app, 100, 12);
     app.animation_tick = 4;
+    let coin_second = prompt_coin_frame(&app);
     let second = render_to_string(&app, 100, 12);
 
-    assert!(first.contains("●  ┃"), "{first}");
-    assert!(second.contains("◕  ┃"), "{second}");
+    assert!(first.contains(&format!("{coin_first}  ┃")), "{first}");
+    assert!(second.contains(&format!("{coin_second}  ┃")), "{second}");
     assert_ne!(
         first, second,
         "first-turn spinner frame should repaint before any assistant delta"
@@ -6691,8 +6694,9 @@ fn render_prompt_places_cursor_inside_input_text() {
     app.input_cursor = 2;
 
     let output = render_to_string(&app, 100, 12);
-    assert!(output.contains("●  ab┃cd"), "{output}");
-    assert!(!output.contains("●  abcd┃"), "{output}");
+    let coin = prompt_coin_frame(&app);
+    assert!(output.contains(&format!("{coin}  ab┃cd")), "{output}");
+    assert!(!output.contains(&format!("{coin}  abcd┃")), "{output}");
 }
 
 #[test]
@@ -6762,7 +6766,8 @@ fn active_prompt_cursor_is_vertically_centered() {
 
     // Composer at min height: top rule + top pad + content + bottom pad = 4 rows.
     assert_eq!(lines.len(), 4);
-    let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains('●'));
+    let coin = prompt_coin_frame(&app);
+    let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains(coin));
     assert!(!has_coin(&lines[0]), "{lines:?}");
     assert!(!has_coin(&lines[1]), "{lines:?}");
     assert!(has_coin(&lines[2]), "{lines:?}");
@@ -6962,7 +6967,7 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
     let output = render_to_string(&app, 120, 18);
 
     assert!(output.contains("why?"), "{output}");
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
     assert!(!output.contains("active Start turn"), "{output}");
@@ -6978,7 +6983,7 @@ fn completed_turn_shows_worked_duration_divider() {
     let output = render_to_string(&app, 120, 18);
 
     assert!(output.contains("─ Worked for 13m 23s"), "{output}");
-    assert!(!output.contains("• Working"), "{output}");
+    assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
 }
 
@@ -7055,7 +7060,7 @@ fn active_prompt_content_stays_centered_after_submitted_prompt() {
     let lines = output.lines().collect::<Vec<_>>();
     let working_line = lines
         .iter()
-        .position(|line| line.contains("• Working"))
+        .position(|line| line.contains("Working ("))
         .expect("working line");
 
     assert!(
@@ -7083,7 +7088,7 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
         .expect("submitted prompt");
     let working_line = lines
         .iter()
-        .position(|line| line.contains("• Working"))
+        .position(|line| line.contains("Working ("))
         .expect("working line");
 
     assert!(!output.contains("Asked ship it"), "{output}");
@@ -7189,7 +7194,7 @@ fn active_tool_surfaces_current_work_in_working_line() {
 
     let output = render_to_string(&app, 120, 16);
 
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(output.contains("Definition: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
@@ -7217,7 +7222,7 @@ async fn queued_tool_event_updates_visible_working_status_without_transcript_row
     assert_eq!(app.active_tool.as_deref(), Some("grep"));
     assert!(app.transcript.is_empty());
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(output.contains("Grep: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
@@ -7272,7 +7277,7 @@ fn working_cell_shows_current_tool() {
 
     let output = render_to_string(&app, 140, 16);
 
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("Shell: cargo test --workspace"), "{output}");
 }
 
@@ -12235,11 +12240,11 @@ fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
         app.animation_tick = tick * 50; // ~160 frames worth of motion
         assert_eq!(
             prompt_coin_frame(&app),
-            "●",
-            "idle prompt coin glyph must stay '●' at tick {tick}"
+            "☽",
+            "idle prompt coin glyph must stay '☽' at tick {tick}"
         );
         let span = prompt_coin_span(&app);
-        assert_eq!(span.content.as_ref(), "●");
+        assert_eq!(span.content.as_ref(), "☽");
         assert_eq!(span.style.fg, Some(crate::render::theme::accent()));
     }
 }

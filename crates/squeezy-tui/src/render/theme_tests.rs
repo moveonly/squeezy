@@ -15,8 +15,8 @@ fn default_theme_resolves_every_token() {
         TUI_THEME_COLOR_TOKENS.len(),
         "builtin default should define every public color token"
     );
-    assert_eq!(theme.resolve(token::PALETTE_ACCENT), Some([252, 211, 77]));
-    assert_eq!(theme.resolve(token::DIFF_ADDED), Some([21, 128, 61]));
+    assert_eq!(theme.resolve(token::PALETTE_ACCENT), Some([242, 199, 92]));
+    assert_eq!(theme.resolve(token::DIFF_ADDED), Some([143, 217, 176]));
 }
 
 #[test]
