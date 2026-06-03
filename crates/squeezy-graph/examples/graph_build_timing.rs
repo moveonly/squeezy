@@ -15,7 +15,17 @@ fn main() {
     let result = squeezy_graph::GraphManager::open(&root);
     let elapsed = started.elapsed();
     match result {
-        Ok(_) => println!("OK   build={:.2}s  root={root}", elapsed.as_secs_f64()),
+        Ok(manager) => {
+            let report = manager.build_report();
+            // symbols+edges are a determinism fingerprint: serial vs parallel
+            // resolution must produce identical counts.
+            println!(
+                "OK   build={:.2}s  symbols={} edges={}  root={root}",
+                elapsed.as_secs_f64(),
+                report.stats.symbols,
+                report.stats.edges
+            );
+        }
         Err(err) => println!(
             "ERR  build={:.2}s  root={root}  error={err}",
             elapsed.as_secs_f64()

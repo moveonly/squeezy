@@ -62,10 +62,63 @@ impl SemanticGraph {
         self.references = references;
     }
 
+    /// Resolve at most one edge per input item, in parallel.
+    ///
+    /// Each `f` call is a read-only (`&self`) lookup into the symbol table and
+    /// ancestor index and returns at most one edge; the only shared mutation in
+    /// the original loop — pushing onto `self.edges` — is hoisted out, which is
+    /// what lets the resolution itself parallelize. Resolution is by far the
+    /// dominant build phase (fixing its complexity took flutter 332s→29s), so
+    /// fanning it across cores is the next lever after the algorithmic fix.
+    ///
+    /// Output is **identical to the serial path**: chunks are concatenated in
+    /// input order and each chunk preserves item order, so the produced graph
+    /// is byte-for-byte the same as the single-threaded build. Small inputs run
+    /// serially — thread fan-out only pays off past a threshold.
+    fn par_resolve_edges<T, F>(&self, items: &[T], f: F) -> Vec<GraphEdge>
+    where
+        T: Sync,
+        F: Fn(&Self, &T) -> Option<GraphEdge> + Sync,
+    {
+        // Below this, the std::thread::scope fan-out costs more than it saves.
+        const MIN_ITEMS_FOR_PARALLEL: usize = 512;
+        // Escape hatch: `SQUEEZY_GRAPH_PARALLEL_RESOLVE=0` forces the serial
+        // path (debugging / determinism comparison / pathological hosts).
+        let parallel_disabled = std::env::var("SQUEEZY_GRAPH_PARALLEL_RESOLVE")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        let worker_count = std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+            .min(items.len());
+        if parallel_disabled || worker_count <= 1 || items.len() < MIN_ITEMS_FOR_PARALLEL {
+            return items.iter().filter_map(|item| f(self, item)).collect();
+        }
+        let chunk_size = items.len().div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let handles = items
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(|| {
+                        chunk
+                            .iter()
+                            .filter_map(|item| f(self, item))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut edges = Vec::with_capacity(items.len());
+            for handle in handles {
+                edges.extend(handle.join().expect("edge-resolution worker panicked"));
+            }
+            edges
+        })
+    }
+
     pub(crate) fn add_import_edges(&mut self, imports: &[ParsedImport]) {
-        for import in imports {
+        let edges = self.par_resolve_edges(imports, |graph, import| {
             if crate::is_package_marker_alias(import.alias.as_deref()) {
-                continue;
+                return None;
             }
             let file_symbol_id = file_symbol_id(&import.file_id);
             let from = import
@@ -76,54 +129,58 @@ impl SemanticGraph {
                 .alias
                 .as_deref()
                 .unwrap_or_else(|| last_path_segment_str(&import.path));
-            let mut candidates = self.symbols_by_name_or_scan(target_name);
-            if self
+            let mut candidates = graph.symbols_by_name_or_scan(target_name);
+            if graph
                 .files
                 .get(&import.file_id)
                 .map(|file| file.language == squeezy_core::LanguageKind::Java)
                 .unwrap_or(false)
             {
                 candidates.retain(|id| {
-                    self.symbols
+                    graph
+                        .symbols
                         .get(id)
-                        .map(|symbol| self.java_import_matches_symbol(import, symbol))
+                        .map(|symbol| graph.java_import_matches_symbol(import, symbol))
                         .unwrap_or(false)
                 });
             }
-            if self
+            if graph
                 .files
                 .get(&import.file_id)
                 .map(|file| file.language == squeezy_core::LanguageKind::Kotlin)
                 .unwrap_or(false)
             {
                 candidates.retain(|id| {
-                    self.symbols
+                    graph
+                        .symbols
                         .get(id)
-                        .map(|symbol| self.kotlin_import_matches_symbol(import, symbol))
+                        .map(|symbol| graph.kotlin_import_matches_symbol(import, symbol))
                         .unwrap_or(false)
                 });
             }
-            if self
+            if graph
                 .files
                 .get(&import.file_id)
                 .map(|file| file.language == squeezy_core::LanguageKind::CSharp)
                 .unwrap_or(false)
             {
                 candidates.retain(|id| {
-                    self.symbols
+                    graph
+                        .symbols
                         .get(id)
                         .map(|symbol| csharp_import_matches_symbol(import, symbol))
                         .unwrap_or(false)
                 });
             }
-            if self
+            if graph
                 .files
                 .get(&import.file_id)
                 .map(|file| file.language == squeezy_core::LanguageKind::Php)
                 .unwrap_or(false)
             {
                 candidates.retain(|id| {
-                    self.symbols
+                    graph
+                        .symbols
                         .get(id)
                         .map(|symbol| {
                             crate::languages::php::php_import_matches_symbol(import, symbol)
@@ -140,13 +197,14 @@ impl SemanticGraph {
                 _ => (
                     None,
                     Confidence::CandidateSet,
-                    self.rank_import_candidates(&candidates, &import.file_id)
+                    graph
+                        .rank_import_candidates(&candidates, &import.file_id)
                         .into_iter()
                         .take(MAX_EDGE_CANDIDATES)
                         .collect(),
                 ),
             };
-            self.edges.push(GraphEdge {
+            Some(GraphEdge {
                 from,
                 to,
                 target_text: import.path.clone(),
@@ -160,19 +218,20 @@ impl SemanticGraph {
                 freshness: Freshness::Fresh,
                 provenance: import.provenance.clone(),
                 candidates: edge_candidates,
-            });
-        }
+            })
+        });
+        self.edges.extend(edges);
     }
 
     pub(crate) fn add_call_edges(&mut self, calls: &[ParsedCall]) {
-        for call in calls {
+        let edges = self.par_resolve_edges(calls, |graph, call| {
             let file_symbol_id = file_symbol_id(&call.file_id);
             let from = call
                 .caller_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let (to, confidence, rank_reason, edge_candidates) = self.resolve_call(call, &from);
-            self.edges.push(GraphEdge {
+            let (to, confidence, rank_reason, edge_candidates) = graph.resolve_call(call, &from);
+            Some(GraphEdge {
                 from,
                 to,
                 target_text: call.target_text.clone(),
@@ -185,29 +244,27 @@ impl SemanticGraph {
                     format!("{}; rank={rank_reason}", call.provenance.reason),
                 ),
                 candidates: edge_candidates,
-            });
-        }
+            })
+        });
+        self.edges.extend(edges);
     }
 
     pub(crate) fn add_reference_edges(&mut self, references: &[ParsedReference]) {
-        for reference in references {
-            if self.should_skip_reference_edge(reference) {
-                continue;
+        let edges = self.par_resolve_edges(references, |graph, reference| {
+            if graph.should_skip_reference_edge(reference) {
+                return None;
             }
             let file_symbol_id = file_symbol_id(&reference.file_id);
             let from = reference
                 .owner_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let candidates = self.symbols_by_name_or_scan(last_path_segment_str(&reference.text));
+            let candidates = graph.symbols_by_name_or_scan(last_path_segment_str(&reference.text));
             let (to, confidence) = match candidates.as_slice() {
                 [only] => (Some(only.clone()), Confidence::Heuristic),
-                _ => continue,
+                _ => return None,
             };
-            if to.is_none() {
-                continue;
-            }
-            self.edges.push(GraphEdge {
+            Some(GraphEdge {
                 from,
                 to,
                 target_text: reference.text.clone(),
@@ -217,8 +274,9 @@ impl SemanticGraph {
                 freshness: Freshness::Fresh,
                 provenance: reference.provenance.clone(),
                 candidates: Vec::new(),
-            });
-        }
+            })
+        });
+        self.edges.extend(edges);
     }
 
     pub(crate) fn should_skip_reference_edge(&self, reference: &ParsedReference) -> bool {
