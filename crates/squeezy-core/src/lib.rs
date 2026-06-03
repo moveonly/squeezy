@@ -456,6 +456,21 @@ pub struct AppConfig {
     /// smaller MoEs). Configured via `[model].tool_choice` in TOML or
     /// `SQUEEZY_TOOL_CHOICE` env var.
     pub tool_choice: Option<String>,
+    /// Forwarded to the provider as `parallel_tool_calls` on the main
+    /// agent (and subagent) request. `None` (the default) omits the
+    /// field, leaving the provider's default — *parallel* for OpenAI
+    /// Responses / Chat-Completions — in place, so the model is already
+    /// free to batch independent tool calls without re-sending the
+    /// growing prefix on extra rounds. `Some(true)` forwards an explicit
+    /// opt-in; `Some(false)` forces serial tool calls. Configured via
+    /// `[model].parallel_tool_calls` or `SQUEEZY_PARALLEL_TOOL_CALLS`.
+    pub parallel_tool_calls: Option<bool>,
+    /// When `true`, append a short system-prompt nudge encouraging the
+    /// model to batch independent read-only lookups into one assistant
+    /// turn. `false` (the default) leaves the prompt byte-for-byte
+    /// unchanged. Configured via `[model].batch_tool_calls_hint` or
+    /// `SQUEEZY_BATCH_TOOL_CALLS_HINT`.
+    pub batch_tool_calls_hint: bool,
     pub stream_idle_timeout: Duration,
     pub tick_rate: Duration,
     pub workspace_root: PathBuf,
@@ -904,6 +919,13 @@ impl AppConfig {
             .map(|raw| raw.trim().to_string())
             .filter(|value| !value.is_empty())
             .or(model_settings.tool_choice.clone());
+        // Tri-state: env override wins; otherwise fall back to the TOML
+        // `[model]` value; `None` leaves the provider default in place.
+        let parallel_tool_calls = parse_tristate_bool(get_var("SQUEEZY_PARALLEL_TOOL_CALLS"))
+            .or(model_settings.parallel_tool_calls);
+        let batch_tool_calls_hint = parse_tristate_bool(get_var("SQUEEZY_BATCH_TOOL_CALLS_HINT"))
+            .or(model_settings.batch_tool_calls_hint)
+            .unwrap_or(false);
         let provider_timeout_keys = provider_settings_keys(&provider);
         let stream_idle_timeout_ms = parse_u64(
             get_var("SQUEEZY_STREAM_IDLE_TIMEOUT_MS")
@@ -1106,6 +1128,8 @@ impl AppConfig {
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens,
             tool_choice,
+            parallel_tool_calls,
+            batch_tool_calls_hint,
             stream_idle_timeout: Duration::from_millis(stream_idle_timeout_ms),
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root,
@@ -1243,6 +1267,20 @@ impl AppConfig {
                 "# max_output_tokens = unset  # no Squeezy cap; provider/model limit applies\n",
             );
         }
+        match self.parallel_tool_calls {
+            Some(value) => {
+                output.push_str(&format!("parallel_tool_calls = {value}\n"));
+            }
+            None => {
+                output.push_str(
+                    "# parallel_tool_calls = unset  # provider default (parallel on OpenAI)\n",
+                );
+            }
+        }
+        output.push_str(&format!(
+            "batch_tool_calls_hint = {}\n",
+            self.batch_tool_calls_hint
+        ));
         output.push_str(&format!(
             "stream_idle_timeout_ms = {}\n",
             self.stream_idle_timeout.as_millis()
@@ -3605,6 +3643,25 @@ pub struct ModelSettings {
     /// and finish with `stop` without calling any tool. Other accepted
     /// values: `"auto"`, `"none"`.
     pub tool_choice: Option<String>,
+    /// Forwarded to the provider as `parallel_tool_calls` on the main
+    /// agent (and subagent) request whenever tools are advertised.
+    /// `None` (the default) omits the field, leaving the provider's own
+    /// default in place — which is *parallel* for OpenAI Responses /
+    /// Chat-Completions, so the common path already lets the model batch
+    /// independent tool calls. Set to `true` to forward an explicit
+    /// opt-in (useful on aggregator routes whose default is unknown), or
+    /// `false` to force serial tool calls. Configured via
+    /// `[model].parallel_tool_calls` in TOML or
+    /// `SQUEEZY_PARALLEL_TOOL_CALLS`.
+    pub parallel_tool_calls: Option<bool>,
+    /// When `true`, append a short system-prompt nudge encouraging the
+    /// model to batch independent read-only lookups (read_file / grep /
+    /// definition_search) into a single assistant turn so the growing
+    /// prompt prefix is re-sent on fewer round-trips. `None`/`false` (the
+    /// default) leaves the prompt byte-for-byte unchanged. Configured via
+    /// `[model].batch_tool_calls_hint` in TOML or
+    /// `SQUEEZY_BATCH_TOOL_CALLS_HINT`.
+    pub batch_tool_calls_hint: Option<bool>,
 }
 
 impl ModelSettings {
@@ -3622,6 +3679,8 @@ impl ModelSettings {
                 "store_responses",
                 "selection_version",
                 "tool_choice",
+                "parallel_tool_calls",
+                "batch_tool_calls_hint",
             ],
             source,
             path,
@@ -3682,6 +3741,18 @@ impl ModelSettings {
                 source,
                 &field(path, "tool_choice"),
             )?,
+            parallel_tool_calls: bool_value(
+                table,
+                "parallel_tool_calls",
+                source,
+                &field(path, "parallel_tool_calls"),
+            )?,
+            batch_tool_calls_hint: bool_value(
+                table,
+                "batch_tool_calls_hint",
+                source,
+                &field(path, "batch_tool_calls_hint"),
+            )?,
         })
     }
 
@@ -3699,6 +3770,8 @@ impl ModelSettings {
         replace_if_some(&mut self.store_responses, next.store_responses);
         replace_if_some(&mut self.selection_version, next.selection_version);
         replace_if_some(&mut self.tool_choice, next.tool_choice);
+        replace_if_some(&mut self.parallel_tool_calls, next.parallel_tool_calls);
+        replace_if_some(&mut self.batch_tool_calls_hint, next.batch_tool_calls_hint);
     }
 }
 
@@ -6772,6 +6845,20 @@ fn parse_disabled_bool(value: Option<&str>) -> bool {
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("0" | "false" | "no" | "off" | "disabled")
     )
+}
+
+/// Tri-state bool parse for env overrides of `Option<bool>` settings.
+/// Recognized truthy / falsy spellings map to `Some(true)` / `Some(false)`;
+/// an empty or unset value yields `None` so the caller can fall back to the
+/// TOML setting (which itself defaults to "leave the provider default").
+fn parse_tristate_bool(value: Option<String>) -> Option<bool> {
+    let raw = value?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_usize(value: Option<String>, default: usize) -> usize {

@@ -1926,3 +1926,45 @@ fn request_body_encodes_image_as_base64_content_block() {
         .expect("valid base64");
     assert_eq!(decoded.as_slice(), bytes.as_ref());
 }
+
+#[test]
+fn request_body_ignores_parallel_tool_calls_for_unsupported_provider() {
+    // G3: `parallel_tool_calls` is OpenAI-shaped. Anthropic does not have
+    // a matching wire field, so the param must never leak into the body —
+    // regardless of which value the caller set. This guards the
+    // "unaffected for other providers" half of the G3 contract.
+    for value in [None, Some(true), Some(false)] {
+        let request = LlmRequest {
+            model: "claude-test".to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+            max_output_tokens: Some(32),
+            response_verbosity: None,
+            reasoning_effort: None,
+            previous_response_id: None,
+            cache_key: None,
+            cache: CacheSpec::default(),
+            tools: Arc::from(vec![
+                LlmToolSpec {
+                    name: "read_file".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: true,
+                }
+                .into(),
+            ]),
+            store: false,
+            tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: value,
+            beta_headers: std::sync::Arc::from(Vec::new()),
+            ..LlmRequest::default()
+        };
+
+        let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "Anthropic body must never carry parallel_tool_calls (value={value:?}): {body}"
+        );
+    }
+}

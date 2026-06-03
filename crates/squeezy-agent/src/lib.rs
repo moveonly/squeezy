@@ -2106,6 +2106,8 @@ impl Agent {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        let raw_instructions =
+            instructions_with_batch_hint(&raw_instructions, self.config.batch_tool_calls_hint);
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
@@ -2146,7 +2148,9 @@ impl Agent {
             store,
             tool_choice: self.config.tool_choice.clone(),
             output_schema: None,
-            parallel_tool_calls: None,
+            // Mirror the wire request so context/token accounting reflects
+            // the same `parallel_tool_calls` choice the real request sends.
+            parallel_tool_calls: self.config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
             ..LlmRequest::default()
         }
@@ -4735,6 +4739,25 @@ fn instructions_with_response_verbosity(
     format!("{instructions}\n\n{guidance}")
 }
 
+/// G3 batching nudge appended to the system prompt when
+/// `[model].batch_tool_calls_hint` is enabled. Kept to one sentence so the
+/// added cache-prefix bytes stay negligible. Scoped to *read-only* lookups
+/// so the model is never encouraged to reorder writes/edits, whose
+/// correctness depends on sequencing.
+const BATCH_TOOL_CALLS_HINT: &str = "When several read-only lookups (read_file, grep, definition_search, read_slice) are independent and none depends on another's result, issue them together in a single turn rather than one per turn; keep dependent steps and any file edits sequential.";
+
+/// Append the G3 batching nudge when `enabled`. Off by default, so the
+/// system prompt is byte-for-byte unchanged unless the operator opts in.
+/// When enabled, the hint lands in a deterministic position (immediately
+/// after the verbosity guidance, before the tool index) so the per-session
+/// prefix stays byte-stable across rounds.
+fn instructions_with_batch_hint(instructions: &str, enabled: bool) -> String {
+    if !enabled {
+        return instructions.to_string();
+    }
+    format!("{instructions}\n\n{BATCH_TOOL_CALLS_HINT}")
+}
+
 impl TurnRuntime {
     fn session_prompt_cache_key(&self) -> Option<String> {
         self.session_log
@@ -4989,13 +5012,20 @@ impl TurnRuntime {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        // G3: optional batching nudge. Off by default (byte-for-byte
+        // unchanged prompt); when enabled it lands in a deterministic
+        // position so the per-session cache prefix stays stable.
+        let batch_hint_instructions = instructions_with_batch_hint(
+            &verbosity_instructions,
+            self.config.batch_tool_calls_hint,
+        );
         // Plan mode is enforced by tool-filtering elsewhere; the overlay
         // here tells the model *why* its toolbox shrank and what the
         // expected output contract (`<proposed_plan>`) looks like.
         let active_mode = load_session_mode(&self.session_mode);
         let session_id_for_plan_mode = self.session_id();
         let mode_instructions = plan_mode::instructions_for_mode(
-            &verbosity_instructions,
+            &batch_hint_instructions,
             active_mode,
             &self.config.workspace_root,
             session_id_for_plan_mode.as_deref(),
@@ -5605,7 +5635,13 @@ impl TurnRuntime {
                 store: self.config.store_responses,
                 tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
                 output_schema: None,
-                parallel_tool_calls: None,
+                // G3: forward the operator's `parallel_tool_calls` choice
+                // so the model can batch independent tool calls into one
+                // turn, re-sending the growing prefix on fewer rounds.
+                // `None` (the default) leaves the provider's default —
+                // parallel on OpenAI Responses / Chat-Completions — in
+                // place, so behavior is unchanged unless opted in.
+                parallel_tool_calls: self.config.parallel_tool_calls,
                 beta_headers: std::sync::Arc::from(Vec::new()),
                 ..LlmRequest::default()
             };
@@ -8687,7 +8723,11 @@ async fn run_subagent_rounds(
             store: false,
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
             output_schema: None,
-            parallel_tool_calls: None,
+            // G3: subagents run their own multi-round tool loop and
+            // re-bill the prefix each round, so they get the same
+            // operator-controlled batching opt-in. `None` keeps the
+            // provider default.
+            parallel_tool_calls: config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
             ..LlmRequest::default()
         };

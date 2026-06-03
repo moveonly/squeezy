@@ -1446,6 +1446,65 @@ fn instructions_skip_prompt_hint_on_default_and_native_capable_models() {
     assert!(verbose.contains("Response verbosity: verbose"), "{verbose}");
 }
 
+#[test]
+fn batch_tool_calls_hint_is_off_by_default_and_appends_when_enabled() {
+    let base = "system rules";
+
+    // Default (disabled): the system prompt is byte-for-byte unchanged so
+    // the cache prefix is never disturbed unless the operator opts in.
+    assert_eq!(instructions_with_batch_hint(base, false), base);
+
+    // Enabled: the nudge is appended in a deterministic position and the
+    // base prompt remains a verbatim prefix (cache-stable per session).
+    let hinted = instructions_with_batch_hint(base, true);
+    assert!(hinted.starts_with(base), "{hinted}");
+    assert!(
+        hinted.contains(BATCH_TOOL_CALLS_HINT),
+        "enabled hint must contain the nudge text: {hinted}"
+    );
+    // The nudge steers only read-only lookups and explicitly keeps edits
+    // sequential — the load-bearing safety property for G3.
+    assert!(
+        BATCH_TOOL_CALLS_HINT.contains("read-only") && BATCH_TOOL_CALLS_HINT.contains("sequential"),
+        "nudge must scope to read-only and preserve edit ordering"
+    );
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_config_flows_into_dispatched_request() {
+    // G3 end-to-end: the operator's `[model].parallel_tool_calls` choice and
+    // the batching nudge must reach the wire request the agent dispatches.
+    // The default config leaves both untouched (None / no nudge); an opted-in
+    // config carries `Some(true)` and appends the hint to the system prompt.
+    for (parallel, hint) in [(None, false), (Some(true), true), (Some(false), false)] {
+        let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })]]));
+        let mut config = AppConfig::default();
+        config.parallel_tool_calls = parallel;
+        config.batch_tool_calls_hint = hint;
+        let agent = Agent::new(config, provider.clone());
+
+        let mut rx = agent.start_turn("hello".to_string(), CancellationToken::new());
+        while rx.recv().await.is_some() {}
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "exactly one request per turn");
+        assert_eq!(
+            requests[0].parallel_tool_calls, parallel,
+            "request must carry the configured parallel_tool_calls={parallel:?}"
+        );
+        let carries_hint = requests[0].instructions.contains(BATCH_TOOL_CALLS_HINT);
+        assert_eq!(
+            carries_hint, hint,
+            "system prompt nudge presence must track batch_tool_calls_hint={hint}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let root = temp_workspace("agent_tool_loop");
