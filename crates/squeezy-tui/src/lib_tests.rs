@@ -4711,7 +4711,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "{output}"
     );
     assert!(
-        output.contains("│ cargo test -p squeezy-tui in .:"),
+        output.contains("│   cargo test -p squeezy-tui in .:"),
         "{output}"
     );
     assert!(
@@ -4819,7 +4819,7 @@ fn read_only_shell_rows_render_codex_style_output_block() {
         "{output}"
     );
     assert!(
-        output.contains("│ inspect workspace --details in /tmp/project:"),
+        output.contains("│   inspect workspace --details in /tmp/project:"),
         "{output}"
     );
     assert!(

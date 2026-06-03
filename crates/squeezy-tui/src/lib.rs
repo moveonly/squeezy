@@ -6723,6 +6723,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
     }
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
+    let mut prev_work = false;
     for (index, entry) in entries.iter().enumerate() {
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -6730,13 +6731,13 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                 if app.show_reasoning_usage
                     && let TranscriptEntryKind::Reasoning(snapshot) = &entry.kind
                 {
-                    lines.extend(reasoning_block_lines_with_extras(
+                    let mut block = reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         false,
                         selected_entry == Some(index),
                         extras,
-                    ));
-                    lines.push(Line::from(""));
+                    );
+                    push_rail_work_block(&mut lines, &mut block, &mut prev_work);
                 }
                 continue;
             }
@@ -6748,19 +6749,20 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                 let members = collect_tool_run_members(entries, index, extras);
                 // Overlay always forces expanded form so users browsing
                 // the full transcript can read every member's body.
-                lines.extend(format_grouped_tool_result_entry(
+                let mut block = format_grouped_tool_result_entry(
                     &members,
                     false,
                     selected_entry == Some(index),
                     overlay_verbosity,
                     width,
                     ToolCardSurface::Plain,
-                ));
+                );
+                push_rail_work_block(&mut lines, &mut block, &mut prev_work);
                 continue;
             }
             None => {}
         }
-        lines.extend(cached_transcript_entry_lines(
+        let mut block = cached_transcript_entry_lines(
             app.render_cache_session,
             entry,
             selected_entry == Some(index),
@@ -6769,7 +6771,13 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             width,
             app.show_reasoning_usage,
             true,
-        ));
+        );
+        if is_rail_work_node(&entry.kind) {
+            push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+        } else {
+            lines.append(&mut block);
+            prev_work = false;
+        }
     }
     let pending = active_pending_assistant_lines(app);
     if !pending.is_empty() {
@@ -7026,6 +7034,45 @@ fn active_conversation_title(app: &TuiApp) -> Option<Line<'static>> {
     ]))
 }
 
+/// True for transcript entries that render as Quiet Rail work nodes (reasoning,
+/// tool results, plans). Messages, diffs, logs and slash echoes flow at the
+/// normal margin, off the rail.
+fn is_rail_work_node(kind: &TranscriptEntryKind) -> bool {
+    matches!(
+        kind,
+        TranscriptEntryKind::ToolResult(_)
+            | TranscriptEntryKind::PlanCard(_)
+            | TranscriptEntryKind::Reasoning(_)
+    )
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
+/// Append a settled work-entry block to the transcript on the Quiet Rail: trim
+/// its trailing blank, drop a `│` connector above it when it follows another
+/// rail node, gutter it, then extend. An empty block is skipped entirely so a
+/// hidden (reasoning-off) entry leaves no stray connector on the rail.
+fn push_rail_work_block(
+    lines: &mut Vec<Line<'static>>,
+    block: &mut Vec<Line<'static>>,
+    prev_work: &mut bool,
+) {
+    while block.last().is_some_and(line_is_blank) {
+        block.pop();
+    }
+    if block.is_empty() {
+        return;
+    }
+    if *prev_work {
+        lines.push(rail::connector_line());
+    }
+    rail::apply_block_gutter(block, false);
+    lines.append(block);
+    *prev_work = true;
+}
+
 fn transcript_lines_for_render(
     app: &TuiApp,
     width: Option<u16>,
@@ -7042,6 +7089,7 @@ fn transcript_lines_for_render(
     }
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
+    let mut prev_work = false;
     for (index, item) in entries.iter().enumerate() {
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -7049,13 +7097,13 @@ fn transcript_lines_for_render(
                 if app.show_reasoning_usage
                     && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
                 {
-                    lines.extend(reasoning_block_lines_with_extras(
+                    let mut block = reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         item.collapsed,
                         selected_entry == Some(index),
                         extras,
-                    ));
-                    lines.push(Line::from(""));
+                    );
+                    push_rail_work_block(&mut lines, &mut block, &mut prev_work);
                 }
                 continue;
             }
@@ -7065,19 +7113,20 @@ fn transcript_lines_for_render(
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(entries, index, extras);
-                lines.extend(format_grouped_tool_result_entry(
+                let mut block = format_grouped_tool_result_entry(
                     &members,
                     item.collapsed,
                     selected_entry == Some(index),
                     app.tool_output_verbosity,
                     width,
                     ToolCardSurface::Tinted,
-                ));
+                );
+                push_rail_work_block(&mut lines, &mut block, &mut prev_work);
                 continue;
             }
             None => {}
         }
-        lines.extend(cached_transcript_entry_lines(
+        let mut block = cached_transcript_entry_lines(
             app.render_cache_session,
             item,
             selected_entry == Some(index),
@@ -7086,7 +7135,13 @@ fn transcript_lines_for_render(
             width,
             app.show_reasoning_usage,
             false,
-        ));
+        );
+        if is_rail_work_node(&item.kind) {
+            push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+        } else {
+            lines.append(&mut block);
+            prev_work = false;
+        }
     }
     let pending_reasoning = active_pending_reasoning(app);
     if app.show_reasoning_usage && !pending_reasoning.trim().is_empty() {
@@ -8887,9 +8942,58 @@ pub(crate) mod rail {
     /// (`├─`/`╰─`), keeping whatever marker span the caller already placed after
     /// it. Used by the live work cell, whose marker is its own spinner star, so
     /// `elbow + star` lands content in the same column as `elbow + marker`.
+    fn is_margin_span(span: &Span<'_>) -> bool {
+        matches!(span.content.as_ref(), "  " | "> ")
+    }
+
     pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool) {
-        let elbow = if is_last { "╰─" } else { "├─" };
-        splice_prefix(line, vec![Span::styled(elbow.to_string(), chrome_style())]);
+        let elbow = Span::styled(
+            if is_last { "╰─" } else { "├─" }.to_string(),
+            chrome_style(),
+        );
+        // Replace a leading two-cell margin where one exists (tool/live rows),
+        // otherwise prepend (reasoning rows embed their own marker, no margin).
+        if line.spans.first().is_some_and(is_margin_span) {
+            line.spans.splice(0..1, vec![elbow]);
+        } else if line.spans.is_empty() {
+            line.spans.push(elbow);
+        } else {
+            line.spans.insert(0, elbow);
+        }
+    }
+
+    /// Thread a settled work-entry's already-built block onto the gutter: the
+    /// header keeps its own status marker and just gains the tee/close elbow;
+    /// every body row gets the dim `│` connector. A body row's existing margin
+    /// and `│ ` detail bar are collapsed into the gutter so it never doubles.
+    /// No-op on an empty block (reasoning-off leaves no orphan connector).
+    pub(crate) fn apply_block_gutter(lines: &mut [Line<'static>], is_last: bool) {
+        let Some((first, rest)) = lines.split_first_mut() else {
+            return;
+        };
+        set_elbow(first, is_last);
+        for line in rest {
+            if line.spans.is_empty() {
+                line.spans = vec![body_span()];
+                continue;
+            }
+            let mut drop = 0;
+            if is_margin_span(&line.spans[0]) {
+                drop += 1;
+            }
+            if line
+                .spans
+                .get(drop)
+                .is_some_and(|s| s.content.as_ref() == "│ ")
+            {
+                drop += 1;
+            }
+            if drop == 0 {
+                line.spans.insert(0, body_span());
+            } else {
+                line.spans.splice(0..drop, vec![body_span()]);
+            }
+        }
     }
 
     /// Rewrite an entry's already-built lines onto the rail gutter: the first
