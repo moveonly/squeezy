@@ -43,6 +43,10 @@ pub struct RunOutcome {
     pub ticket_count: u64,
     pub findings: Vec<String>,
     pub cost_micro_usd: u64,
+    /// Sum of provider-reported input tokens across every turn in the run.
+    /// Surfaced so the CI byte/token regression gate can compare a run
+    /// against a stored per-scenario baseline (see `ci::InputRegression`).
+    pub input_tokens: u64,
 }
 
 #[derive(Debug, Error)]
@@ -275,6 +279,7 @@ pub async fn run_scenario(
     let trace_event_count = read_line_count(&capture.path())?;
     let frame_count = read_line_count(&frames.path())?;
     let total_cost_micro_usd = *driver.total_cost_micro_usd.lock().await;
+    let total_input_tokens = *driver.total_input_tokens.lock().await;
     let per_turn_costs = read_per_turn_costs(&frames.path())?;
     let manifest = build_manifest(
         &scenario,
@@ -347,6 +352,7 @@ pub async fn run_scenario(
         ticket_count,
         findings: legacy_findings,
         cost_micro_usd: total_cost_micro_usd,
+        input_tokens: total_input_tokens,
     })
 }
 

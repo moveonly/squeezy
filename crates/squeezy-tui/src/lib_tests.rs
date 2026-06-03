@@ -3961,6 +3961,47 @@ async fn slash_context_uses_registry_fallback_for_unknown_models() {
     assert!(output.contains("Consumption by source"), "{output}");
 }
 
+#[test]
+fn context_recommendations_flag_largest_and_secondary_sources() {
+    use commands::{ContextSourceTokens, context_source_recommendations};
+
+    // tool_outputs dominates (~48%) and history (user text) is independently
+    // large (~31%): both should surface, largest first, with the others quiet.
+    let recs = context_source_recommendations(&ContextSourceTokens {
+        user: 3_100,
+        tool_outputs: 4_800,
+        reasoning: 0,
+        image: 0,
+        attachments: 0,
+        system: 2_100,
+    });
+    assert_eq!(recs.len(), 2, "{recs:?}");
+    assert_eq!(
+        recs[0],
+        "largest: tool_outputs 48% → narrow reads (read_slice / signature spans), prefer grep counts, or enable output dedup",
+        "{recs:?}"
+    );
+    assert_eq!(
+        recs[1], "history 31% → run /compact to summarize older turns",
+        "{recs:?}"
+    );
+
+    // A balanced session (no source crosses the largest threshold) yields no
+    // advice rather than nagging about an evenly split context.
+    let balanced = context_source_recommendations(&ContextSourceTokens {
+        user: 1_000,
+        tool_outputs: 1_000,
+        reasoning: 1_000,
+        image: 1_000,
+        attachments: 1_000,
+        system: 1_000,
+    });
+    assert!(balanced.is_empty(), "{balanced:?}");
+
+    // An empty/fresh session has nothing actionable to say.
+    assert!(context_source_recommendations(&ContextSourceTokens::default()).is_empty());
+}
+
 #[tokio::test]
 async fn small_paste_stays_in_prompt() {
     let root = temp_workspace("tui_inline_paste");

@@ -4,10 +4,12 @@
 //! `--no-triage`, and exits non-zero when any scenario violates the
 //! requested `fail_on` policy.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::driver::{EvalError, RunOptions, run_scenario};
@@ -53,6 +55,9 @@ pub struct CheckOptions {
     /// in `Driver::run_scenario` (which a parallel runner needs to
     /// either accept or split into separate processes).
     pub parallelism: Option<usize>,
+    /// Optional input-token regression gate. Inert when `baseline_path` is
+    /// `None` (the default), so existing `check` invocations are unaffected.
+    pub input_regression: InputRegression,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,6 +65,12 @@ pub struct FailOn {
     pub findings: bool,
     pub expectations: bool,
     pub errors: bool,
+    /// Opt-in: when a run's provider-reported input tokens exceed the stored
+    /// per-scenario baseline by more than the configured tolerance, treat it
+    /// as a failure. Off by default so existing CI is never broken by simply
+    /// upgrading; enable with `--fail-on input-regression`. When this keyword
+    /// is absent the gate still *reports* (warns) but never fails the run.
+    pub input_regression: bool,
 }
 
 impl FailOn {
@@ -75,9 +86,148 @@ impl FailOn {
                 fail_on.expectations = true;
             } else if part.eq_ignore_ascii_case("errors") {
                 fail_on.errors = true;
+            } else if part.eq_ignore_ascii_case("input-regression")
+                || part.eq_ignore_ascii_case("input_regression")
+                || part.eq_ignore_ascii_case("input-tokens")
+            {
+                fail_on.input_regression = true;
             }
         }
         fail_on
+    }
+}
+
+/// Default fraction a run may exceed its baseline input-token count before
+/// the regression gate fires. 0.10 == 10%. Chosen to absorb provider-side
+/// tokenizer jitter and minor prompt churn while still catching the 2×–200×
+/// prefix blowups that prompt/retrieval drift causes.
+pub const DEFAULT_INPUT_TOLERANCE: f64 = 0.10;
+
+/// Configuration for the input-byte/token regression gate. Fully optional:
+/// when `baseline_path` is `None` the gate is inert and `run_check` behaves
+/// exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct InputRegression {
+    /// JSON file mapping scenario id → baseline input-token count. Missing
+    /// file or missing entry means "no baseline yet": the run is recorded as
+    /// the new baseline and never fails.
+    pub baseline_path: Option<PathBuf>,
+    /// Fraction over baseline that is tolerated before flagging (e.g. 0.10).
+    pub tolerance: f64,
+    /// When true, a freshly observed (previously-unbaselined) scenario is
+    /// written back into the baseline file so the next run has something to
+    /// compare against. When false the file is treated as read-only.
+    pub update_baseline: bool,
+}
+
+/// On-disk baseline store: scenario id → recorded input-token count. Stored
+/// as a stable, sorted JSON object so diffs in version control are minimal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InputBaseline {
+    #[serde(default)]
+    pub scenarios: BTreeMap<String, u64>,
+}
+
+impl InputBaseline {
+    pub fn load(path: &Path) -> Result<Self, EvalError> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|err| EvalError::Io(format!("parse baseline {path:?}: {err}"))),
+            // A missing baseline file is the expected first-run state, not an
+            // error: start empty and let the run populate it.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(EvalError::Io(format!("read baseline {path:?}: {err}"))),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), EvalError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| EvalError::Io(format!("create baseline dir {parent:?}: {err}")))?;
+        }
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|err| EvalError::Internal(format!("serialize baseline: {err}")))?;
+        std::fs::write(path, json)
+            .map_err(|err| EvalError::Io(format!("write baseline {path:?}: {err}")))
+    }
+}
+
+/// Outcome of comparing one run's input tokens against its baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputRegressionVerdict {
+    /// No baseline recorded yet for this scenario; the observed value becomes
+    /// the baseline. Never a failure.
+    Baselined { observed: u64 },
+    /// Within tolerance of the baseline.
+    Ok { observed: u64, baseline: u64 },
+    /// Exceeded baseline + tolerance. `fail` reflects the active policy (true
+    /// only when `--fail-on input-regression` was set); otherwise it is a warn.
+    Regressed {
+        observed: u64,
+        baseline: u64,
+        limit: u64,
+        fail: bool,
+    },
+}
+
+impl InputRegressionVerdict {
+    /// True only for a real, policy-enabled failure.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Regressed { fail: true, .. })
+    }
+
+    /// Human-readable one-liner for the CLI / JUnit detail.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Baselined { observed } => {
+                format!("input-tokens baseline recorded: {observed}")
+            }
+            Self::Ok { observed, baseline } => {
+                format!("input-tokens {observed} within baseline {baseline}")
+            }
+            Self::Regressed {
+                observed,
+                baseline,
+                limit,
+                fail,
+            } => {
+                let kind = if *fail { "FAIL" } else { "warn" };
+                format!(
+                    "input-tokens regression ({kind}): {observed} exceeds baseline {baseline} + tolerance (limit {limit})"
+                )
+            }
+        }
+    }
+}
+
+/// Pure comparison: given the observed input tokens, an optional baseline,
+/// a tolerance fraction, and whether the policy is set to fail, decide the
+/// verdict. No I/O — the caller owns baseline loading/persisting so this is
+/// trivially unit-testable.
+pub fn evaluate_input_regression(
+    observed: u64,
+    baseline: Option<u64>,
+    tolerance: f64,
+    fail_policy: bool,
+) -> InputRegressionVerdict {
+    let Some(baseline) = baseline else {
+        return InputRegressionVerdict::Baselined { observed };
+    };
+    // Clamp negative tolerances to 0 so a misconfigured value can only make
+    // the gate stricter, never silently disable it.
+    let tolerance = tolerance.max(0.0);
+    // Round the limit up so an exactly-on-tolerance run is treated as OK
+    // (the boundary is inclusive of the tolerated headroom).
+    let limit = ((baseline as f64) * (1.0 + tolerance)).floor() as u64;
+    if observed > limit {
+        InputRegressionVerdict::Regressed {
+            observed,
+            baseline,
+            limit,
+            fail: fail_policy,
+        }
+    } else {
+        InputRegressionVerdict::Ok { observed, baseline }
     }
 }
 
@@ -90,9 +240,11 @@ impl Default for CheckOptions {
                 findings: false,
                 expectations: true,
                 errors: true,
+                input_regression: false,
             },
             junit_path: None,
             parallelism: None,
+            input_regression: InputRegression::default(),
         }
     }
 }
@@ -106,6 +258,11 @@ pub struct ScenarioResult {
     pub finding_rule_ids: Vec<String>,
     pub expectation_rule_ids: Vec<String>,
     pub elapsed_ms: u128,
+    /// Provider-reported input tokens for this run, when the scenario ran.
+    /// `None` for load/parse/panic failures that never reached a run.
+    pub input_tokens: Option<u64>,
+    /// Verdict from the input-token regression gate, when it was active.
+    pub input_regression: Option<InputRegressionVerdict>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -158,6 +315,8 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
                         finding_rule_ids: vec![],
                         expectation_rule_ids: vec![],
                         elapsed_ms: started.elapsed().as_millis(),
+                        input_tokens: None,
+                        input_regression: None,
                     };
                 }
             };
@@ -193,6 +352,11 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
                         finding_rule_ids,
                         expectation_rule_ids,
                         elapsed_ms: started.elapsed().as_millis(),
+                        // Regression verdict is applied in a post-pass that
+                        // owns the loaded baseline; here we only carry the raw
+                        // observation so that pass stays deterministic.
+                        input_tokens: Some(outcome.input_tokens),
+                        input_regression: None,
                     }
                 }
                 Err(err) => ScenarioResult {
@@ -203,6 +367,8 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
                     finding_rule_ids: vec![],
                     expectation_rule_ids: vec![],
                     elapsed_ms: started.elapsed().as_millis(),
+                    input_tokens: None,
+                    input_regression: None,
                 },
             }
         });
@@ -222,6 +388,8 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
                     finding_rule_ids: vec![],
                     expectation_rule_ids: vec![],
                     elapsed_ms: 0,
+                    input_tokens: None,
+                    input_regression: None,
                 });
             }
         }
@@ -229,10 +397,68 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
     // Restore deterministic ordering (parallel tasks can finish out of order).
     report.results.sort_by(|a, b| a.path.cmp(&b.path));
 
+    // Input-token regression gate (opt-in via a configured baseline path).
+    // Runs as a post-pass so it owns the single loaded baseline and the
+    // writeback, instead of cloning state into every scenario task.
+    apply_input_regression_gate(
+        &mut report,
+        &opts.input_regression,
+        opts.fail_on.input_regression,
+    )?;
+
     if let Some(junit_path) = &opts.junit_path {
         write_junit(junit_path, &report)?;
     }
     Ok(report)
+}
+
+/// Compare each run's input tokens against the stored baseline, annotate the
+/// results, flip `passed` to false on a policy-enabled regression, and (when
+/// `update_baseline`) persist any newly-observed scenarios. Inert when no
+/// `baseline_path` is configured.
+fn apply_input_regression_gate(
+    report: &mut CheckReport,
+    cfg: &InputRegression,
+    fail_policy: bool,
+) -> Result<(), EvalError> {
+    let Some(baseline_path) = cfg.baseline_path.as_ref() else {
+        return Ok(());
+    };
+    let tolerance = if cfg.tolerance > 0.0 {
+        cfg.tolerance
+    } else {
+        DEFAULT_INPUT_TOLERANCE
+    };
+    let mut baseline = InputBaseline::load(baseline_path)?;
+    let mut dirty = false;
+
+    for result in &mut report.results {
+        let Some(observed) = result.input_tokens else {
+            continue;
+        };
+        let prior = baseline.scenarios.get(&result.name).copied();
+        let verdict = evaluate_input_regression(observed, prior, tolerance, fail_policy);
+        match &verdict {
+            InputRegressionVerdict::Baselined { observed } => {
+                // First sighting: record it so the next run has a reference.
+                if cfg.update_baseline {
+                    baseline.scenarios.insert(result.name.clone(), *observed);
+                    dirty = true;
+                }
+            }
+            InputRegressionVerdict::Regressed { fail: true, .. } => {
+                result.passed = false;
+            }
+            // Within tolerance or warn-only regression: report, don't fail.
+            InputRegressionVerdict::Ok { .. } | InputRegressionVerdict::Regressed { .. } => {}
+        }
+        result.input_regression = Some(verdict);
+    }
+
+    if dirty {
+        baseline.save(baseline_path)?;
+    }
+    Ok(())
 }
 
 fn rule_ids<S: AsRef<str>>(items: &[S]) -> Vec<String> {
@@ -268,10 +494,14 @@ fn write_junit(path: &Path, report: &CheckReport) -> Result<(), EvalError> {
         );
         if !r.passed {
             let detail = r.error.clone().unwrap_or_else(|| {
-                format!(
-                    "findings={:?} expectations={:?}",
-                    r.finding_rule_ids, r.expectation_rule_ids
-                )
+                if let Some(verdict) = r.input_regression.as_ref().filter(|v| v.is_failure()) {
+                    verdict.message()
+                } else {
+                    format!(
+                        "findings={:?} expectations={:?}",
+                        r.finding_rule_ids, r.expectation_rule_ids
+                    )
+                }
             });
             let _ = writeln!(
                 xml,
@@ -294,3 +524,7 @@ fn escape_xml(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+
+#[cfg(test)]
+#[path = "ci_tests.rs"]
+mod tests;

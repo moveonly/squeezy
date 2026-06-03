@@ -81,8 +81,10 @@ enum Command {
         /// Optional JUnit XML output path for CI consumers.
         #[arg(long)]
         junit: Option<PathBuf>,
-        /// Comma-separated policy: any of `findings`, `expectations`, `errors`.
-        /// Default: `expectations,errors`.
+        /// Comma-separated policy: any of `findings`, `expectations`,
+        /// `errors`, `input-regression`. Default: `expectations,errors`.
+        /// `input-regression` is opt-in and only bites when a baseline is
+        /// provided via `--input-baseline`.
         #[arg(long, default_value = "expectations,errors")]
         fail_on: String,
         /// Output root directory; defaults to `target/eval`.
@@ -92,6 +94,20 @@ enum Command {
         /// (serial); use a higher number for fan-out CI runs.
         #[arg(long)]
         parallelism: Option<usize>,
+        /// Optional JSON file storing per-scenario input-token baselines.
+        /// When set, each run is compared against its baseline; when absent,
+        /// the input-token regression gate is inert.
+        #[arg(long)]
+        input_baseline: Option<PathBuf>,
+        /// Fraction a run may exceed its baseline input tokens before the gate
+        /// flags it (e.g. 0.10 == 10%). Defaults to 0.10.
+        #[arg(long)]
+        input_tolerance: Option<f64>,
+        /// Record newly-seen scenarios into the baseline file (and only those;
+        /// existing baselines are never overwritten). Off by default so a CI
+        /// run can't silently move the goalposts.
+        #[arg(long)]
+        update_baseline: bool,
     },
 }
 
@@ -147,7 +163,22 @@ fn main() -> ExitCode {
                 fail_on,
                 out,
                 parallelism,
-            } => check_cmd(dir, junit, fail_on, out, parallelism).await,
+                input_baseline,
+                input_tolerance,
+                update_baseline,
+            } => {
+                check_cmd(
+                    dir,
+                    junit,
+                    fail_on,
+                    out,
+                    parallelism,
+                    input_baseline,
+                    input_tolerance,
+                    update_baseline,
+                )
+                .await
+            }
         }
     });
     // 2 s is well beyond the wall-clock of any tracked task the
@@ -230,12 +261,16 @@ fn replay_cmd(trace: PathBuf) -> Result<(), squeezy_eval::driver::EvalError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_cmd(
     dir: PathBuf,
     junit: Option<PathBuf>,
     fail_on: String,
     out: PathBuf,
     parallelism: Option<usize>,
+    input_baseline: Option<PathBuf>,
+    input_tolerance: Option<f64>,
+    update_baseline: bool,
 ) -> Result<(), squeezy_eval::driver::EvalError> {
     let opts = squeezy_eval::ci::CheckOptions {
         dir,
@@ -243,6 +278,11 @@ async fn check_cmd(
         fail_on: squeezy_eval::ci::FailOn::parse(&fail_on),
         junit_path: junit,
         parallelism,
+        input_regression: squeezy_eval::ci::InputRegression {
+            baseline_path: input_baseline,
+            tolerance: input_tolerance.unwrap_or(squeezy_eval::ci::DEFAULT_INPUT_TOLERANCE),
+            update_baseline,
+        },
     };
     let report = squeezy_eval::ci::run_check(opts).await?;
     let total = report.results.len();
@@ -258,6 +298,9 @@ async fn check_cmd(
         }
         if !r.finding_rule_ids.is_empty() {
             println!("       findings:     {:?}", r.finding_rule_ids);
+        }
+        if let Some(verdict) = &r.input_regression {
+            println!("       {}", verdict.message());
         }
     }
     println!("\nsummary: {failed}/{total} failed");

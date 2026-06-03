@@ -303,6 +303,27 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         ),
     ));
 
+    // Actionable per-source advice derived from the same per-source token
+    // shares rendered above. Purely additive: the breakdown numbers are
+    // unchanged; this block only suggests what to do about the largest
+    // contributors. Deterministic — no model call, fixed thresholds.
+    let recommendations = context_source_recommendations(&ContextSourceTokens {
+        user: user_tokens as u64,
+        tool_outputs: tool_tokens as u64,
+        reasoning: reasoning_tokens as u64,
+        image: image_tokens as u64,
+        attachments: attachment_tokens as u64,
+        system: system_estimate,
+    });
+    if !recommendations.is_empty() {
+        out.push('\n');
+        out.push_str(&style::header("Recommendations"));
+        out.push('\n');
+        for rec in &recommendations {
+            out.push_str(&format!("  {} {}\n", style::warn("→"), rec));
+        }
+    }
+
     out.push('\n');
     out.push_str(&style::header("Session"));
     out.push('\n');
@@ -412,6 +433,116 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         "accuracy: token counts above are deterministic local estimates of assembled request content; per-source token attribution at the MCP / internal-tool / skill level requires deeper instrumentation (see squeezy-rw0i).",
     ));
     out
+}
+
+/// Per-source token estimates fed into [`context_source_recommendations`].
+/// Mirrors the buckets rendered under "Consumption by source" so the advice
+/// stays consistent with the breakdown the user already sees.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ContextSourceTokens {
+    pub user: u64,
+    pub tool_outputs: u64,
+    pub reasoning: u64,
+    pub image: u64,
+    pub attachments: u64,
+    pub system: u64,
+}
+
+/// Deterministic, data-only cut recommendations derived from the existing
+/// per-source token shares. No model call, no randomness: the same shape
+/// always yields the same ordered advice. Returns an empty vec when the
+/// context is effectively empty (nothing actionable to say yet).
+///
+/// The rule is intentionally simple and explainable: identify the single
+/// largest source by share, and — when it crosses a meaningful fraction of
+/// the assembled request — emit a targeted suggestion plus any secondary
+/// callouts (history/reasoning) that are individually large enough to act on.
+pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Vec<String> {
+    let total = tokens.user
+        + tokens.tool_outputs
+        + tokens.reasoning
+        + tokens.image
+        + tokens.attachments
+        + tokens.system;
+    // Nothing assembled yet (fresh session): no actionable advice.
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let pct = |value: u64| ((value as f64 / total as f64) * 100.0).round() as u64;
+    // Ordered by descending share so "largest" ties break deterministically
+    // toward the bucket the user is most likely to recognize as actionable.
+    let sources: [(&str, u64, &str); 6] = [
+        (
+            "tool_outputs",
+            tokens.tool_outputs,
+            "narrow reads (read_slice / signature spans), prefer grep counts, or enable output dedup",
+        ),
+        (
+            "history",
+            tokens.user,
+            "run /compact to summarize older turns",
+        ),
+        (
+            "reasoning",
+            tokens.reasoning,
+            "lower reasoning effort for routine turns",
+        ),
+        (
+            "attachments",
+            tokens.attachments,
+            "drop stale attachments with /context or detach unused files",
+        ),
+        (
+            "images",
+            tokens.image,
+            "downscale images or remove ones no longer referenced",
+        ),
+        (
+            "system",
+            tokens.system,
+            "trim custom system prompt / tool schemas if customizable",
+        ),
+    ];
+
+    let mut recs = Vec::new();
+    // Largest source: only worth surfacing once it dominates a real share of
+    // the request (below this it's noise and any advice is premature).
+    const LARGEST_THRESHOLD_PCT: u64 = 25;
+    if let Some((name, value, action)) = sources
+        .iter()
+        .copied()
+        .max_by_key(|(_, value, _)| *value)
+        .filter(|(_, value, _)| pct(*value) >= LARGEST_THRESHOLD_PCT)
+    {
+        recs.push(format!("largest: {name} {}% → {action}", pct(value)));
+    }
+
+    // Secondary callouts: any *other* source that is independently large
+    // enough to act on, so a 30% history slice isn't hidden behind a 40%
+    // tool-output line. Reported in the fixed source order above.
+    const SECONDARY_THRESHOLD_PCT: u64 = 30;
+    let largest_name = recs
+        .first()
+        .map(|_| {
+            sources
+                .iter()
+                .copied()
+                .max_by_key(|(_, value, _)| *value)
+                .map(|(name, _, _)| name)
+                .unwrap_or("")
+        })
+        .unwrap_or("");
+    for (name, value, action) in sources.iter().copied() {
+        if name == largest_name {
+            continue;
+        }
+        if pct(value) >= SECONDARY_THRESHOLD_PCT {
+            recs.push(format!("{name} {}% → {action}", pct(value)));
+        }
+    }
+
+    recs
 }
 
 fn format_request_estimate(label: &str, estimate: &RequestTokenEstimate) -> String {
