@@ -5957,8 +5957,18 @@ fn task_panel_height(app: &TuiApp) -> u16 {
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut lines = if turn_in_progress(app) {
-        let mut rows = vec![working_line(app)];
-        if let Some(detail) = working_detail_line(app) {
+        let mut working = working_line(app);
+        let detail = working_detail_line(app);
+        // The active tool is the live rail node (its spinner star is the
+        // marker); close the rail here unless a queued-tail row follows.
+        rail::set_elbow(&mut working, detail.is_none());
+        let mut rows = vec![working];
+        if let Some(mut detail) = detail {
+            rail::apply_gutter(
+                std::slice::from_mut(&mut detail),
+                rail::RailMarker::Queued,
+                true,
+            );
             rows.push(detail);
         }
         rows
@@ -5967,7 +5977,9 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else if let Some(snapshot) = app.task_state.as_ref() {
         vec![compact_task_state_line(snapshot)]
     } else {
-        vec![working_line(app)]
+        let mut working = working_line(app);
+        rail::set_elbow(&mut working, true);
+        vec![working]
     };
     if lines.len() < area.height as usize {
         // Pad so the bottom row doesn't shift when the detail goes away.
@@ -5988,10 +6000,13 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     // Highest priority: a `/diff` snapshot is running on the blocking
     // pool. The user typed `/diff` and is waiting for git to finish.
     if app.pending_diff.is_some() {
-        return Some(Line::from(Span::styled(
-            "    ↳ computing diff…",
-            Style::default().fg(crate::render::theme::quiet()),
-        )));
+        return Some(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "computing diff…",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]));
     }
     if let Some(snapshot) = app.mcp_status.as_ref() {
         let mut starting = 0usize;
@@ -6006,11 +6021,11 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
             }
         }
         if starting > 0 && total > 0 {
-            let text = format!("    ↳ mcp: starting {ready}/{total} servers");
-            return Some(Line::from(Span::styled(
-                text,
-                Style::default().fg(crate::render::theme::quiet()),
-            )));
+            let text = format!("mcp: starting {ready}/{total} servers");
+            return Some(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+            ]));
         }
     }
 
@@ -6023,13 +6038,13 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     if visible_tools > 1 {
         let extra = visible_tools - 1;
         let text = format!(
-            "    ↳ +{extra} more tool call{} queued",
+            "+{extra} more tool call{} queued",
             if extra == 1 { "" } else { "s" }
         );
-        return Some(Line::from(Span::styled(
-            text,
-            Style::default().fg(crate::render::theme::quiet()),
-        )));
+        return Some(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+        ]));
     }
     None
 }
@@ -8868,6 +8883,15 @@ pub(crate) mod rail {
     /// A standalone connector row drawn on the gutter between rail nodes.
     pub(crate) fn connector_line() -> Line<'static> {
         Line::from(Span::styled("│".to_string(), chrome_style()))
+    }
+
+    /// Replace a line's leading two-cell margin with just the tree elbow
+    /// (`├─`/`╰─`), keeping whatever marker span the caller already placed after
+    /// it. Used by the live work cell, whose marker is its own spinner star, so
+    /// `elbow + star` lands content in the same column as `elbow + marker`.
+    pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool) {
+        let elbow = if is_last { "╰─" } else { "├─" };
+        splice_prefix(line, vec![Span::styled(elbow.to_string(), chrome_style())]);
     }
 
     /// Rewrite an entry's already-built lines onto the rail gutter: the first
