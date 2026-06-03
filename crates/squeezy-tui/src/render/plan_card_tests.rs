@@ -1,4 +1,4 @@
-use super::{PlanCardData, line_width, render_plan_card, render_plan_diff};
+use super::{PlanCardData, render_plan_card, render_plan_diff};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,8 +53,8 @@ fn render_plan_card_shows_id_path_and_step_count() {
 }
 
 #[test]
-fn render_plan_card_uses_amber_box_not_full_amber_body() {
-    let root = fresh_workspace("amber_box");
+fn render_plan_card_uses_calm_heading_not_box() {
+    let root = fresh_workspace("calm_heading");
     let body = "Context\n\n1. Edit README\n";
     let (plan_id, path) =
         proposed_plan::persist_plan(&root, TEST_SESSION, body, &PlanMeta::default())
@@ -73,11 +73,21 @@ fn render_plan_card_uses_amber_box_not_full_amber_body() {
         .find(|line| line_text(line).contains("Context"))
         .expect("body line");
 
-    assert!(top.starts_with("╭─ Plan "), "{top}");
+    // Calm amber heading marker, not a boxed border.
+    assert!(top.starts_with("◇ Plan "), "{top}");
     assert_eq!(
         lines[0].spans[0].style.fg,
         Some(crate::render::theme::accent())
     );
+    // No box frame anywhere, and no filled background.
+    assert!(
+        lines.iter().all(|line| {
+            let text = line_text(line);
+            !text.contains('╭') && !text.contains('╰') && !text.starts_with("│ ")
+        }),
+        "plan should be borderless: {lines:?}"
+    );
+    assert!(!path.starts_with("│ "), "{path}");
     assert!(
         lines
             .iter()
@@ -85,17 +95,12 @@ fn render_plan_card_uses_amber_box_not_full_amber_body() {
             .all(|span| span.style.bg.is_none()),
         "plan card should not set a background color: {lines:?}"
     );
-    assert!(path.starts_with("│ "), "{path}");
     assert!(
         body.spans
             .iter()
             .any(|span| span.content.contains("Context")
                 && span.style.fg != Some(crate::render::theme::accent())),
         "body text should not be painted amber: {body:?}"
-    );
-    assert!(
-        line_text(lines.last().expect("bottom border")).starts_with('╰'),
-        "bottom border missing"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -156,41 +161,6 @@ fn render_plan_card_handles_missing_file_gracefully() {
     };
     let lines = render_plan_card(&data, None);
     assert!(line_text(&lines[0]).contains("file missing"));
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn render_plan_card_clamps_box_to_terminal_width() {
-    let root = fresh_workspace("clamp_width");
-    // One long sentence of ordinary words (~180 chars, no token over 56)
-    // survives markdown rendering unwrapped, so the box used to size
-    // itself to it and overflow an 80-column terminal.
-    let body = "This plan reworks the dispatch layer and the turn router and the cost broker and the subagent catalog so the whole control loop reads consistently end to end across the entire codebase here.\n";
-    assert!(body.trim_end().len() >= 180, "body must be long enough");
-    let (plan_id, path) =
-        proposed_plan::persist_plan(&root, TEST_SESSION, body, &PlanMeta::default())
-            .expect("persist plan");
-    let data = PlanCardData {
-        plan_id,
-        path,
-        parent_plan_id: None,
-    };
-
-    let width = 80u16;
-    let lines = render_plan_card(&data, Some(width));
-    for line in &lines {
-        assert!(
-            line_width(line) <= usize::from(width),
-            "line exceeds terminal width {width}: {:?} ({} cols)",
-            line_text(line),
-            line_width(line)
-        );
-    }
-    // The box must still be a rectangle: top and bottom borders share the
-    // same width.
-    let top = line_width(&lines[0]);
-    let bottom = line_width(lines.last().expect("bottom border"));
-    assert_eq!(top, bottom, "border rows must match width to form a box");
     let _ = std::fs::remove_dir_all(&root);
 }
 
