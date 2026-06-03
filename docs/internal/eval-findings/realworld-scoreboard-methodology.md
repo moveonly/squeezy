@@ -41,15 +41,21 @@ These come from the `perf/cost-wins` branch (PR #290); see
 
 ## Caveats (read before trusting the Haiku column)
 
-1. **Mini 15/15 is solid.** Mini queries the graph early, so the graph attaches reliably;
-   the wins reproduce across runs.
-2. **Haiku 10/15 is directional, not final.** Two effects make several Haiku rows
-   unreliable: (a) after merging #292's *lazy/deferred* graph startup, the graph only
-   builds on first query — Haiku tends to `delegate` before querying, so for some langs the
-   graph never attached and squeezy ran degraded (grep + delegate-storms); (b) the
-   delegate-cost-accounting fix raised the true cost of delegate-heavy langs. A valid
-   re-measure (eager graph build + a hard delegate gate) is in progress; the Haiku numbers
-   here are the best available snapshot, not the converged result.
-3. **Known Haiku gaps:** `ruby` (extra round-trips, zero-hit greps), `python`/`dart`
-   (recall), `csharp`/`php` (ties — per-method `read_slice` round-trips). These are the
-   active work items, not measurement noise.
+1. **Mini 15/15 (vs Codex) is solid.** Mini queries the graph early, so the graph attaches
+   reliably; the wins reproduce across runs. This is the *only* 15/15 board — there is no
+   Haiku-vs-CC 15/15 and never was (the four haiku-vs-cc scoreboards on disk peak at 10).
+2. **Haiku is currently 5/15 (WIN: cpp, php, rust, scala, swift), cost-driven not recall.**
+   Computed from the newest `run.json` (full parent+subagent cost) vs the frozen CC
+   baselines in `/tmp/cc-baseline-realworld/_results.json` (n=3 medians). Recall is at
+   parity everywhere (only rust 93.8%, and it still wins). Two cost effects, both being
+   worked: (a) **delegate-to-subagent** — 6 langs (c, dart, go, java, js, python) issue a
+   single `delegate` that hands the whole task to a same-model subagent which re-explores
+   from scratch, so subagent spend dominates (e.g. c = $0.077 parent + $0.260 subagent =
+   $0.338), and `15c226d8` now correctly counts it; (b) **parent round-trips** — csharp,
+   ts, scala, ruby are parent-only yet expensive from per-method `read_slice`/grep chains.
+   There is **no delegate-storm** (each delegating lang calls `delegate` exactly once).
+3. **The graph builds eagerly before the first tool call** (confirmed in code): `graph_used`
+   is false for some langs only because Haiku never *queries* the graph (audit-style
+   prompts don't trigger the exploration preflight, and Haiku acts before querying), not
+   because the graph failed to load. The fix is model-steering (preflight for audit intents
+   / delegate gating), not graph startup.
