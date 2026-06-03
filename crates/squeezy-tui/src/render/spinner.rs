@@ -47,7 +47,7 @@ impl SpinnerStyle {
             // spinning fast. Drift sweeps slowest, like a star adrift.
             Self::Twinkle => 300,
             Self::Scintillate => 220,
-            Self::Drift => 560,
+            Self::Drift => 620,
         }
     }
 

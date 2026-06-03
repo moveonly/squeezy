@@ -6675,7 +6675,7 @@ fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
     app.animation_tick = 0;
     let coin_first = prompt_coin_frame(&app);
     let first = render_to_string(&app, 100, 12);
-    app.animation_tick = 4;
+    app.animation_tick = 12;
     let coin_second = prompt_coin_frame(&app);
     let second = render_to_string(&app, 100, 12);
 
