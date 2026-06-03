@@ -269,6 +269,7 @@ fn filter_inner(
     let mut out: Vec<SessionSummary> = sessions
         .iter()
         .filter(|meta| meta.resume_available)
+        .filter(|meta| session_metadata_has_resume_content(meta))
         .filter(|meta| now_ms.saturating_sub(meta.started_at_ms) <= RECENT_WINDOW_MS)
         .filter(|meta| extra(meta))
         .map(SessionSummary::from_metadata)
@@ -297,6 +298,9 @@ pub(crate) fn merge_candidates_for_picker(
         if !meta.resume_available {
             continue;
         }
+        if !session_metadata_has_resume_content(meta) {
+            continue;
+        }
         if now_ms.saturating_sub(meta.started_at_ms) > RECENT_WINDOW_MS {
             continue;
         }
@@ -307,6 +311,9 @@ pub(crate) fn merge_candidates_for_picker(
     }
     for entry in global {
         if !entry.resume_available {
+            continue;
+        }
+        if !global_index_entry_has_resume_content(entry) {
             continue;
         }
         if now_ms.saturating_sub(entry.started_at_ms) > RECENT_WINDOW_MS {
@@ -320,6 +327,23 @@ pub(crate) fn merge_candidates_for_picker(
     out.sort_by_key(|summary| std::cmp::Reverse(summary.started_at_ms));
     out.truncate(MAX_PICKER_ENTRIES);
     out
+}
+
+fn nonblank(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn session_metadata_has_resume_content(meta: &SessionMetadata) -> bool {
+    meta.metrics.turns > 0
+        || nonblank(meta.first_user_task.as_deref())
+        || nonblank(meta.latest_summary.as_deref())
+        || nonblank(meta.display_name.as_deref())
+}
+
+fn global_index_entry_has_resume_content(entry: &GlobalSessionIndexEntry) -> bool {
+    entry.turn_count > 0
+        || nonblank(entry.title.as_deref())
+        || nonblank(entry.display_name.as_deref())
 }
 
 /// State machine driving the picker. Pure — owns no IO.

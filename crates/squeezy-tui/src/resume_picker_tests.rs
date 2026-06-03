@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use squeezy_store::{EventBranchTip, SessionMetadata, SessionStatus};
+use squeezy_store::{EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionStatus};
 
 use super::*;
 
@@ -73,6 +73,62 @@ fn filter_excludes_unresumable() {
     let out = filter_candidates(&sessions, &cwd, now);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].session_id, "ok");
+}
+
+#[test]
+fn filter_excludes_empty_sessions_without_resume_content() {
+    let cwd = PathBuf::from("/work/repo");
+    let now = 1_000_000;
+    let mut empty = meta("empty", "/work/repo", now - 1_000, true);
+    empty.first_user_task = None;
+    empty.latest_summary = None;
+    empty.display_name = None;
+    empty.metrics.turns = 0;
+    empty.event_count = 2;
+    let mut failed_turn = meta("failed-turn", "/work/repo", now - 2_000, true);
+    failed_turn.metrics.turns = 0;
+
+    let out = filter_candidates(&[empty, failed_turn], &cwd, now);
+
+    assert_eq!(
+        out.iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["failed-turn"]
+    );
+}
+
+#[test]
+fn merge_candidates_excludes_empty_global_index_entries() {
+    let now = 1_000_000;
+    let empty = GlobalSessionIndexEntry {
+        session_id: "empty".to_string(),
+        cwd: "/work/repo".to_string(),
+        workspace_root: "/work/repo".to_string(),
+        repo_root: None,
+        title: None,
+        display_name: None,
+        started_at_ms: now - 1_000,
+        last_event_at_ms: now - 1_000,
+        turn_count: 0,
+        resume_available: true,
+    };
+    let useful = GlobalSessionIndexEntry {
+        session_id: "useful".to_string(),
+        title: Some("debug failure".to_string()),
+        started_at_ms: now - 2_000,
+        last_event_at_ms: now - 2_000,
+        ..empty.clone()
+    };
+
+    let out = merge_candidates_for_picker(&[], &[empty, useful], now);
+
+    assert_eq!(
+        out.iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["useful"]
+    );
 }
 
 #[test]
