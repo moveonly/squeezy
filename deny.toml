@@ -73,11 +73,12 @@ skip = [
     # are platform-conditional or used in disjoint code paths.
     { crate = "hmac:0.12.1", reason = "secret-service (Linux keyring) on hmac 0.12 vs aws-sigv4 on 0.13" },
     { crate = "sha2:0.10.9", reason = "secret-service (Linux keyring) on sha2 0.10 vs aws-sigv4 on 0.11" },
-    # Windows MSVC target pulls `aws-lc-sys` (via rustls), whose build
-    # script depends on `cc 1.2 -> jobserver -> getrandom 0.3`, while
-    # `rand_core 0.6` (via `secret-service`/`keyring` and `ring`) stays on
-    # `getrandom 0.2`. Both coexist; aws-lc-sys upstream is migrating.
-    { crate = "getrandom:0.2.17", reason = "aws-lc-sys cc/jobserver build deps pull getrandom 0.3 on Windows; rand_core 0.6 stays on 0.2" },
+    # `ring` still pulls `getrandom 0.2`, and build-script helper crates pull
+    # `getrandom 0.3` through `cc -> jobserver`, while workspace code has moved
+    # to direct `getrandom 0.4`. The older copies are isolated to dependency
+    # stacks that have not migrated yet.
+    { crate = "getrandom:0.2.17", reason = "ring/rustls still use getrandom 0.2 while workspace direct use is on 0.4" },
+    { crate = "getrandom:0.3.4", reason = "cc/jobserver build dependencies still use getrandom 0.3 while workspace direct use is on 0.4" },
     # Several Windows-touching crates (tokio, crossterm, dirs-sys, mio,
     # parking_lot, rustls-platform-verifier, …) and the direct windows-sys
     # used by squeezy-tools' Job Object backend sit on different

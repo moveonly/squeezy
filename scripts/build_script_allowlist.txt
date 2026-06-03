@@ -28,7 +28,9 @@
 #      section) and reference the audit reason in the PR description.
 
 # ----- Core proc-macro / type-level plumbing ---------------------------------
+anyhow
 proc-macro2
+prettyplease
 quote
 rustversion
 serde
@@ -113,6 +115,8 @@ jni-macros
 wasm-bindgen
 wasm-bindgen-shared
 wit-bindgen
+wit-bindgen-rust
+wit-bindgen-rust-macro
 zmij
 
 # ----- Haiku-only shim (pulled by iana-time-zone) ---------------------------
