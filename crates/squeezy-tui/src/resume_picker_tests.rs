@@ -205,6 +205,52 @@ fn picker_opens_with_start_fresh_selected() {
 }
 
 #[test]
+fn picker_scrolls_to_keep_cursor_visible_when_list_overflows() {
+    let summaries: Vec<SessionSummary> = (0..MAX_PICKER_ENTRIES)
+        .map(|i| summary(&format!("s{i:02}")))
+        .collect();
+    let mut state = ResumePickerState::new(summaries, cwd());
+    let last_candidate = state.candidates.len();
+    for _ in 0..last_candidate {
+        state.dispatch(press(KeyCode::Down));
+    }
+    assert_eq!(state.cursor, last_candidate, "cursor on the last candidate");
+
+    // A short terminal can't fit all 20 rows, so the viewport must scroll:
+    // the selected row stays on screen and an early one scrolls off.
+    let text = render_state_to_text(&state, 80, 16);
+    assert!(
+        text.contains("task for s19"),
+        "selected row must stay visible:\n{text}"
+    );
+    assert!(
+        !text.contains("task for s00"),
+        "early rows must scroll off the top:\n{text}"
+    );
+}
+
+#[test]
+fn picker_signals_cross_project_switch() {
+    let here = summary_at("here", "/work/repo");
+    let there = summary_at("there", "/other/place");
+    let mut state = ResumePickerState::new(vec![here, there], cwd());
+    state.dispatch(press(KeyCode::Tab)); // show sessions from all projects
+    // Move the cursor onto the cross-project candidate.
+    state.dispatch(press(KeyCode::Down));
+    state.dispatch(press(KeyCode::Down));
+
+    let text = render_state_to_text(&state, 90, 18);
+    assert!(
+        text.contains('↪'),
+        "cross-project rows carry the ↪ marker:\n{text}"
+    );
+    assert!(
+        text.contains("switches to /other/place"),
+        "the highlighted cross-project row explains the directory switch:\n{text}"
+    );
+}
+
+#[test]
 fn picker_enter_on_start_fresh_starts_fresh() {
     let mut state = ResumePickerState::new(vec![summary("first")], cwd());
     assert_eq!(

@@ -20,7 +20,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
 };
 use squeezy_core::{AppConfig, SqueezyError};
 use squeezy_store::{
@@ -763,8 +766,61 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         state.cursor == state.user_checkbox_index(),
     ));
 
-    let body = Paragraph::new(rows).wrap(Wrap { trim: false });
-    frame.render_widget(body, layout[3]);
+    // Scroll the list so the cursor is always visible. With up to
+    // MAX_PICKER_ENTRIES candidates plus the fresh/checkbox rows the list
+    // routinely overflows a short terminal, and a fixed Paragraph would clip
+    // the cursor right off the bottom. Center the cursor in the viewport.
+    let list_area = layout[3];
+    let visible = list_area.height.max(1) as usize;
+    let total = rows.len();
+    let offset = if total <= visible {
+        0
+    } else {
+        state
+            .cursor
+            .saturating_sub(visible / 2)
+            .min(total - visible)
+    };
+    let (body_area, scrollbar_area) = if total > visible {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(list_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (list_area, None)
+    };
+    frame.render_widget(Paragraph::new(rows).scroll((offset as u16, 0)), body_area);
+    if let Some(sb_area) = scrollbar_area {
+        let mut sb_state = ScrollbarState::new(total).position(state.cursor);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            sb_area,
+            &mut sb_state,
+        );
+    }
+
+    // When the highlighted row is a session from another directory, spell out
+    // that confirming will switch into that directory before resuming — the
+    // inline `↪ project` marker can be truncated on a narrow terminal, this
+    // line is not.
+    if let Some(entry) = state
+        .cursor
+        .checked_sub(1)
+        .and_then(|idx| state.candidates.get(idx))
+        && entry.summary.cwd != cwd_str
+    {
+        let hint = Line::from(vec![
+            Span::styled(" ↪ ", Style::default().fg(crate::render::theme::accent())),
+            Span::styled(
+                format!("Enter switches to {} and resumes there", entry.summary.cwd),
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint), layout[4]);
+    }
 
     let tab_hint = if state.show_all_projects {
         "this dir"
@@ -906,9 +962,11 @@ fn render_candidate_row(
         ));
     }
     if cross_project {
+        // ↪ signals that picking this row switches to another directory,
+        // distinguishing it from same-project sessions at a glance.
         spans.push(Span::styled(
-            "  · ",
-            Style::default().fg(crate::render::theme::quiet()),
+            "  ↪ ",
+            Style::default().fg(crate::render::theme::accent()),
         ));
         spans.push(Span::styled(
             summary.project_hint(),
