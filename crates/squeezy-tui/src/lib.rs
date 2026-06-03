@@ -15812,6 +15812,13 @@ fn inline_history_lines_for_flush(
         lines.extend(startup_card_lines(app, width));
         lines.push(Line::from(""));
     }
+    // Seed the rail-connector state from the entry just before this flush so a
+    // `│` threads across the incremental scrollback flushes, not just within one.
+    let mut prev_work = transcript_from > 0
+        && app
+            .transcript
+            .get(transcript_from - 1)
+            .is_some_and(|prev| is_rail_work_node(&prev.kind));
     for (index, item) in app.transcript.iter().enumerate().skip(transcript_from) {
         match reasoning_run_info(&app.transcript, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -15819,13 +15826,13 @@ fn inline_history_lines_for_flush(
                 if app.show_reasoning_usage
                     && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
                 {
-                    lines.extend(reasoning_block_lines_with_extras(
+                    let mut block = reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         item.collapsed,
                         false,
                         extras,
-                    ));
-                    lines.push(Line::from(""));
+                    );
+                    push_rail_work_block(&mut lines, &mut block, &mut prev_work);
                 }
                 continue;
             }
@@ -15835,26 +15842,33 @@ fn inline_history_lines_for_flush(
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(&app.transcript, index, extras);
-                lines.extend(format_grouped_tool_result_entry(
+                let mut block = format_grouped_tool_result_entry(
                     &members,
                     item.collapsed,
                     false,
                     app.tool_output_verbosity,
                     Some(width),
                     ToolCardSurface::Tinted,
-                ));
+                );
+                push_rail_work_block(&mut lines, &mut block, &mut prev_work);
                 continue;
             }
             None => {}
         }
-        lines.extend(format_transcript_entry_with_width(
+        let mut block = format_transcript_entry_with_width(
             item,
             false,
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             Some(width),
             app.show_reasoning_usage,
-        ));
+        );
+        if is_rail_work_node(&item.kind) {
+            push_rail_work_block(&mut lines, &mut block, &mut prev_work);
+        } else {
+            lines.append(&mut block);
+            prev_work = false;
+        }
     }
     lines
 }
