@@ -6567,6 +6567,166 @@ async fn shell_truncation_spills_full_output_to_tempfile_and_round_trips_via_rea
 }
 
 #[tokio::test]
+async fn shell_over_cap_streams_raw_sidecar_recoverable_via_read_tool_output() {
+    let root = temp_workspace("shell_raw_sidecar_recovery");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // 200000 bytes of `x\n` capped at 4096: the live result keeps 4096 bytes,
+    // the capped spillover mirrors only those, but the raw sidecar must hold
+    // the FULL pre-cap stream — the bytes the hard cap would otherwise lose.
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_rawsidecar".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "yes x | head -c 200000",
+                    "output_byte_cap": 4096,
+                    "description": "exercise raw sidecar"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], true);
+
+    let raw_spill = result
+        .content
+        .get("raw_spillover")
+        .expect("over-cap shell result must carry a raw_spillover pointer");
+    let raw_path = raw_spill["path"].as_str().expect("raw_spillover.path");
+    let raw_bytes = raw_spill["bytes"].as_u64().expect("raw_spillover.bytes");
+    assert!(
+        raw_path.ends_with("-raw.txt"),
+        "raw sidecar must use the {{call_id}}-raw suffix: {raw_path:?}",
+    );
+
+    // The raw sidecar is a strict superset of the capped spillover.
+    let capped = result
+        .content
+        .get("spillover")
+        .expect("capped spillover still present");
+    let capped_bytes = capped["bytes"].as_u64().expect("spillover.bytes");
+    assert!(
+        raw_bytes > capped_bytes,
+        "raw sidecar ({raw_bytes}) must hold more than the capped spillover ({capped_bytes})",
+    );
+    // `yes x | head -c 200000` emits exactly 200000 bytes on stdout.
+    assert_eq!(
+        raw_bytes, 200_000,
+        "raw sidecar must hold the full pre-cap output"
+    );
+
+    // The footer points the model at the full pre-cap recovery path.
+    let shaped_stdout = result.content["stdout"].as_str().expect("stdout");
+    assert!(
+        shaped_stdout.contains(&format!("full pre-cap output: {raw_path}"))
+            && shaped_stdout.contains("read_tool_output"),
+        "footer must name the raw sidecar recovery path: {shaped_stdout:?}",
+    );
+
+    // The path lives under the spillover session dir.
+    let tmp_base = std::env::temp_dir().join("squeezy-spillover");
+    let tmp_canon = tmp_base.canonicalize().expect("canonical tempdir base");
+    let raw_canon = PathBuf::from(raw_path)
+        .canonicalize()
+        .expect("canonical raw sidecar path");
+    assert!(
+        raw_canon.starts_with(&tmp_canon),
+        "raw sidecar {raw_path:?} must live under {tmp_base:?}",
+    );
+
+    // Model-initiated recovery: read_tool_output { path } can reach the bytes
+    // the hard cap dropped. Read a window past the live cap (offset 50000,
+    // well beyond the 4096-byte cap) and under the 25KB tool-spill threshold
+    // so the bytes return inline; `total_bytes` proves the full output is
+    // reachable.
+    const WINDOW: usize = 8_000;
+    let offset = 50_000usize;
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_read_rawsidecar".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "path": raw_path,
+                    "offset": offset,
+                    "limit": WINDOW,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(fetched.status, ToolStatus::Success);
+    assert_eq!(
+        fetched.content["total_bytes"], raw_bytes,
+        "recovery must see the full pre-cap byte count",
+    );
+    let content = fetched.content["content"].as_str().expect("content");
+    let on_disk = fs::read(raw_path).expect("raw sidecar readable");
+    assert_eq!(
+        content.as_bytes(),
+        &on_disk[offset..offset + WINDOW],
+        "read_tool_output must return the dropped-by-cap window byte-for-byte",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_under_cap_writes_no_raw_sidecar() {
+    let root = temp_workspace("shell_no_raw_sidecar_under_cap");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_under_cap".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'small output that fits\\n'",
+                    "description": "under-cap output writes no raw sidecar"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], false);
+    assert!(
+        result.content.get("raw_spillover").is_none(),
+        "under-cap output must not produce a raw sidecar: {:?}",
+        result.content,
+    );
+
+    // No `-raw.txt` file may exist anywhere under the spillover tree.
+    let spill_base = std::env::temp_dir().join("squeezy-spillover");
+    if spill_base.exists() {
+        let mut stack = vec![spill_base];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    assert!(
+                        !name.ends_with("-raw.txt") || !name.starts_with("call_under_cap"),
+                        "under-cap run must leave no raw sidecar: {path:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_truncation_records_spillover_path_under_session_dir_for_raw_output_mode() {
     let root = temp_workspace("shell_truncation_raw_mode_spill");
     let registry = registry_with_shell_sandbox_off(&root);

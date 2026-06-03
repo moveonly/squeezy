@@ -95,6 +95,11 @@ struct RawSidecarState {
     /// once a write or budget failure latches the sidecar shut.
     file: Option<std::result::Result<fs::File, ()>>,
     bytes_written: u64,
+    /// Combined raw bytes seen across *both* streams. The live truncation
+    /// budget is shared by stdout+stderr, so the sidecar must mirror once
+    /// their combined total crosses the cap even when neither stream
+    /// overflows on its own.
+    raw_total: u64,
 }
 
 /// Streaming handle that persists the raw, pre-cap shell bytes to a
@@ -115,6 +120,17 @@ pub(crate) struct RawSidecar {
 }
 
 impl RawSidecar {
+    /// Add `chunk_len` raw (pre-redaction) bytes to the combined cross-stream
+    /// total and report whether that total now exceeds `cap`. The shell
+    /// truncation budget is shared by stdout+stderr, so this is the trigger
+    /// the mirror uses to decide it must start persisting — it fires even
+    /// when one stream alone never reaches the cap.
+    pub(crate) async fn note_raw_and_overflowed(&self, chunk_len: usize, cap: usize) -> bool {
+        let mut state = self.state.lock().await;
+        state.raw_total = state.raw_total.saturating_add(chunk_len as u64);
+        state.raw_total > cap as u64
+    }
+
     /// Append already-redacted `text` to the sidecar, charging the session
     /// budget. The file is created on the first non-empty write so a stream
     /// that never overflows leaves no sidecar behind. Budget exhaustion or

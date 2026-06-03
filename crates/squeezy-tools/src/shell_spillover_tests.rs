@@ -155,3 +155,140 @@ fn distinct_stores_get_distinct_session_directories() {
         "every store must mint a fresh session directory",
     );
 }
+
+#[tokio::test]
+async fn raw_sidecar_writes_nothing_when_never_fed() {
+    let store = Arc::new(ShellSpilloverStore::new());
+    let sidecar = store
+        .open_raw_sidecar("call_idle")
+        .expect("open raw sidecar");
+    let path = sidecar.path.clone();
+    // No chunk ever written (the under-cap, zero-cost path): finalize must
+    // report no spillover, leave no file, and charge nothing.
+    assert!(sidecar.finalize().await.is_none());
+    assert!(
+        !path.exists(),
+        "an unused raw sidecar must not leave a file behind: {path:?}",
+    );
+    assert_eq!(store.bytes_used(), 0, "an idle sidecar charges no budget");
+}
+
+#[tokio::test]
+async fn raw_sidecar_persists_full_bytes_and_round_trips_via_read_range() {
+    let store = Arc::new(ShellSpilloverStore::new());
+    let sidecar = store
+        .open_raw_sidecar("call_overflow")
+        .expect("open raw sidecar");
+    // Two chunks totalling more than any cap the live result keeps; the
+    // sidecar must persist the FULL byte stream, not a capped prefix.
+    let head = "A".repeat(5_000);
+    let tail = "B".repeat(5_000);
+    sidecar.write_chunk(&head).await;
+    sidecar.write_chunk(&tail).await;
+    let info = sidecar.finalize().await.expect("over-cap sidecar persists");
+
+    let expected = format!("{head}{tail}");
+    assert_eq!(info.bytes, expected.len() as u64);
+    assert_eq!(
+        store.bytes_used(),
+        expected.len() as u64,
+        "every persisted byte is charged to the session budget",
+    );
+    let on_disk = fs::read(&info.path).expect("read back raw sidecar");
+    assert_eq!(on_disk, expected.as_bytes());
+
+    // The exact recovery path the model uses: read_tool_output -> read_range.
+    let recovered = store
+        .read_range(&info.path.to_string_lossy(), 0, expected.len())
+        .expect("read_range over the raw sidecar");
+    assert_eq!(recovered.total_bytes, expected.len());
+    assert_eq!(recovered.content.as_bytes(), expected.as_bytes());
+}
+
+#[tokio::test]
+async fn raw_sidecar_filename_carries_the_call_id_raw_suffix() {
+    let store = Arc::new(ShellSpilloverStore::new());
+    let sidecar = store
+        .open_raw_sidecar("call_named")
+        .expect("open raw sidecar");
+    let name = sidecar
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("sidecar file name");
+    assert_eq!(name, "call_named-raw.txt");
+}
+
+#[tokio::test]
+async fn raw_sidecar_is_bounded_by_the_session_budget() {
+    // Budget below the chunk size: only the granted prefix is written and the
+    // 100 MB-style cap still holds — the raw sidecar can never blow the
+    // shared spillover budget.
+    let store = Arc::new(ShellSpilloverStore::with_budget(32));
+    let sidecar = store
+        .open_raw_sidecar("call_budget")
+        .expect("open raw sidecar");
+    let big = "Z".repeat(64);
+    sidecar.write_chunk(&big).await;
+    // A second chunk after the budget is exhausted must be dropped entirely.
+    sidecar.write_chunk("more").await;
+    let info = sidecar.finalize().await.expect("partial bytes persisted");
+
+    assert_eq!(info.bytes, 32, "only the budgeted prefix is written");
+    assert_eq!(
+        store.bytes_used(),
+        32,
+        "the session budget bounds the raw sidecar",
+    );
+    let on_disk = fs::read(&info.path).expect("read back");
+    assert_eq!(on_disk, vec![b'Z'; 32]);
+}
+
+#[tokio::test]
+async fn raw_sidecar_and_capped_spill_share_one_session_budget() {
+    // The raw sidecar and the capped spill() draw from the same 100 MB-style
+    // counter, so the two together can never exceed it.
+    let store = Arc::new(ShellSpilloverStore::with_budget(40));
+    let sidecar = store
+        .open_raw_sidecar("call_shared")
+        .expect("open raw sidecar");
+    sidecar.write_chunk(&"R".repeat(30)).await;
+    let info = sidecar.finalize().await.expect("raw bytes persisted");
+    assert_eq!(info.bytes, 30);
+    assert_eq!(store.bytes_used(), 30);
+
+    // Only 10 bytes of budget remain; a capped spill of 8 fits, a second
+    // spill of 8 does not.
+    let first = store.spill("call_shared", &[b'x'; 8], b"");
+    assert!(first.is_some(), "8-byte spill fits the remaining 10 bytes");
+    assert_eq!(store.bytes_used(), 38);
+    let second = store.spill("call_shared", &[b'y'; 8], b"");
+    assert!(
+        second.is_none(),
+        "the shared budget refuses the spill once the raw sidecar consumed it",
+    );
+    assert_eq!(
+        store.bytes_used(),
+        38,
+        "refused spill leaves usage unchanged"
+    );
+}
+
+#[tokio::test]
+async fn note_raw_and_overflowed_keys_on_combined_total() {
+    let store = Arc::new(ShellSpilloverStore::new());
+    let sidecar = store
+        .open_raw_sidecar("call_combined")
+        .expect("open raw sidecar");
+    // Two streams sharing one sidecar: neither chunk alone exceeds cap=4096,
+    // but their combined total does — mirroring the live shared truncation
+    // budget. The overflow trigger must fire on the second.
+    assert!(
+        !sidecar.note_raw_and_overflowed(3_000, 4_096).await,
+        "first stream alone stays under the shared cap",
+    );
+    assert!(
+        sidecar.note_raw_and_overflowed(3_000, 4_096).await,
+        "combined stdout+stderr crossing the cap must trigger overflow",
+    );
+}

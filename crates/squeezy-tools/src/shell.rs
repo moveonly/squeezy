@@ -1491,14 +1491,14 @@ where
 }
 
 /// Streams the full redacted pipe output into a [`RawSidecar`], deferring
-/// any disk write until the raw byte total exceeds the in-memory cap.
+/// any disk write until the *combined* stdout+stderr raw byte total exceeds
+/// the in-memory cap (the same budget the live truncation enforces).
 struct RawStreamMirror {
     sink: RawSidecar,
     redactor: StreamRedactor,
     /// Redacted text produced before the cap was crossed, held in memory
     /// (bounded by ~`cap`) so a stream that never overflows writes nothing.
     pending: String,
-    raw_bytes: usize,
     overflowed: bool,
 }
 
@@ -1508,38 +1508,46 @@ impl RawStreamMirror {
             sink,
             redactor: StreamRedactor::new(redactor),
             pending: String::new(),
-            raw_bytes: 0,
             overflowed: false,
         }
     }
 
     async fn ingest(&mut self, chunk: &[u8], cap: usize) {
-        self.raw_bytes = self.raw_bytes.saturating_add(chunk.len());
+        // Record the raw bytes against the shared cross-stream total first so
+        // the overflow trigger fires even when stdout and stderr each stay
+        // under the cap but together exceed it.
+        let over = self.sink.note_raw_and_overflowed(chunk.len(), cap).await;
         let emitted = self.redactor.push(&String::from_utf8_lossy(chunk)).text;
         if self.overflowed {
             self.sink.write_chunk(&emitted).await;
             return;
         }
         self.pending.push_str(&emitted);
-        if self.raw_bytes > cap {
+        if over {
             // First overflow: persist the redacted prefix accumulated so far,
             // then switch to streaming each subsequent chunk straight to disk.
-            self.overflowed = true;
-            let pending = std::mem::take(&mut self.pending);
-            self.sink.write_chunk(&pending).await;
+            self.flush_pending().await;
         }
     }
 
     async fn finish(&mut self, cap: usize) {
         let tail = self.redactor.finish().text;
-        if self.overflowed || self.raw_bytes > cap {
+        // The redactor may have buffered a trailing secret-guard window; only
+        // its `finish()` reveals the true byte total, so re-check overflow
+        // before deciding whether the (now complete) prefix must be persisted.
+        let over = self.sink.note_raw_and_overflowed(0, cap).await;
+        if self.overflowed || over {
             if !self.overflowed {
-                let pending = std::mem::take(&mut self.pending);
-                self.sink.write_chunk(&pending).await;
-                self.overflowed = true;
+                self.flush_pending().await;
             }
             self.sink.write_chunk(&tail).await;
         }
+    }
+
+    async fn flush_pending(&mut self) {
+        self.overflowed = true;
+        let pending = std::mem::take(&mut self.pending);
+        self.sink.write_chunk(&pending).await;
     }
 }
 
