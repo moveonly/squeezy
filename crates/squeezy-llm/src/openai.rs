@@ -211,12 +211,29 @@ impl OpenAiProvider {
         // `previous_response_id` chain (codex mirrors this with
         // `#[serde(skip_serializing_if = "String::is_empty")]`).
         if !request.instructions.is_empty() {
-            body["instructions"] = json!(request.instructions);
+            // OpenAI caches on a prefix hash and cannot be disabled
+            // server-side, so a per-request nonce at the very front of the
+            // (cacheable) `instructions` prefix forces a cold, full-priced
+            // prefill every turn when caching is suppressed.
+            if request.disable_prompt_cache {
+                body["instructions"] = json!(format!(
+                    "[cache-bust:{}]\n{}",
+                    cache_bust_nonce(),
+                    request.instructions
+                ));
+            } else {
+                body["instructions"] = json!(request.instructions);
+            }
         }
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
-        if let Some(key) = request.effective_cache_key() {
+        if request.disable_prompt_cache {
+            // Unique key so cache affinity never routes this turn to a
+            // warmed prefix; pairs with the instructions nonce above to
+            // guarantee a cold prefill.
+            body["prompt_cache_key"] = json!(format!("nocache-{}", cache_bust_nonce()));
+        } else if let Some(key) = request.effective_cache_key() {
             // OpenAI's Responses API silently drops `prompt_cache_key`
             // values longer than 64 codepoints — the request succeeds
             // but the field is ignored server-side, so every turn pays
@@ -321,6 +338,24 @@ impl OpenAiProvider {
             ("x-client-request-id", clamped),
         ]
     }
+}
+
+/// Process-unique nonce used to bust OpenAI's automatic prompt-prefix
+/// cache when `disable_prompt_cache` is set. Combines a monotonic counter
+/// (uniqueness within the process, even for same-nanosecond parallel
+/// requests) with the wall-clock nanosecond (uniqueness across processes
+/// in a parallel eval sweep) so no two requests ever share a cacheable
+/// prefix.
+fn cache_bust_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{n:x}")
 }
 
 /// Clamp a cache-key value to 256 bytes for use as an HTTP header.
