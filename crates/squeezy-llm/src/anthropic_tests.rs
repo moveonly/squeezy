@@ -2112,7 +2112,7 @@ fn stable_anchor_sits_backoff_user_turns_behind_moving_breakpoint() {
 
     // The two markers are on distinct messages — never a double marker.
     assert_ne!(
-        last_user_idx, expected_anchor_idx,
+        moving_breakpoint_idx, expected_anchor_idx,
         "moving breakpoint and anchor must not share a message"
     );
 }
