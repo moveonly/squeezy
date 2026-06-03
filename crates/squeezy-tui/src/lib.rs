@@ -613,7 +613,10 @@ pub fn startup_resume_question_available(config: &AppConfig) -> bool {
     if config.session_resume_picker == SessionResumePicker::Never {
         return false;
     }
-    let candidates = resume_picker::load_candidates(config);
+    // Only a yes/no answer is needed here, so use the summary-only loader:
+    // skip the per-candidate event-log reads that `load_candidates` does for
+    // branch detection (the picker itself still does them when it renders).
+    let candidates = resume_picker::load_candidate_summaries(config);
     resume_picker::has_scoped_candidates(&candidates, &config.workspace_root)
 }
 

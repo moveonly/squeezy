@@ -49,6 +49,20 @@ pub const ARCHIVED_SUBDIR: &str = "archived";
 /// 500 unique sessions before compaction kicks in.
 pub const GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES: u64 = 256 * 1024;
 
+/// Hard ceiling on entries retained when the index is compacted. Dedup by
+/// `session_id` cannot shrink a file of all-distinct sessions, so a user with
+/// thousands of sessions would otherwise rewrite the entire multi-megabyte
+/// index on every startup for no benefit (the original 256KiB threshold
+/// silently assumed re-appends would keep the unique count near ~500). The
+/// resume picker only ever surfaces the newest few within its recency window,
+/// and the per-project scoped view is served by the authoritative on-disk
+/// session list rather than this cross-project cache, so trimming the oldest
+/// entries here is invisible to it. Sized below the byte threshold
+/// (~500B/line) so a compacted index drops back under
+/// [`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`] and stops rewriting until it grows
+/// again.
+pub const GLOBAL_INDEX_MAX_ENTRIES: usize = 400;
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
@@ -242,6 +256,7 @@ impl SessionStore {
         let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
         let mut reader = BufReader::new(file);
         let mut line = String::new();
+        let mut raw_lines = 0usize;
         loop {
             line.clear();
             match reader.read_line(&mut line) {
@@ -256,6 +271,7 @@ impl SessionStore {
             let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
                 continue;
             };
+            raw_lines += 1;
             match by_id.get(&entry.session_id) {
                 Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
                 _ => {
@@ -263,17 +279,27 @@ impl SessionStore {
                 }
             }
         }
-        let should_compact = fs::metadata(&path)
+        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+        // Drop all but the most-recent `GLOBAL_INDEX_MAX_ENTRIES` so the index
+        // can never grow unbounded with a user's lifetime session count. The
+        // newest-first return order below is what the picker consumes.
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
+        let trimmed_to_cap = entries.len() > GLOBAL_INDEX_MAX_ENTRIES;
+        entries.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+        let oversized = fs::metadata(&path)
             .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
             .unwrap_or(false);
-        if should_compact {
-            let mut entries: Vec<&GlobalSessionIndexEntry> = by_id.values().collect();
-            // Compact in oldest-first order so future appends keep the
-            // newest entries at the tail — matches how readers see time.
-            entries.sort_by_key(|entry| entry.started_at_ms);
-            let _ = rewrite_global_index(&path, &entries);
+        // Rewrite only when compaction actually removes lines (we trimmed past
+        // the cap, or dedup collapsed duplicate appends). Rewriting an already
+        // minimal, all-distinct index on every read — as the byte-threshold
+        // alone did — is pure write+fsync waste that scales with history.
+        if oversized && (trimmed_to_cap || raw_lines > entries.len()) {
+            let mut ordered: Vec<&GlobalSessionIndexEntry> = entries.iter().collect();
+            // Compact in oldest-first order so future appends keep the newest
+            // entries at the tail — matches how readers see time.
+            ordered.sort_by_key(|entry| entry.started_at_ms);
+            let _ = rewrite_global_index(&path, &ordered);
         }
-        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
         entries
     }

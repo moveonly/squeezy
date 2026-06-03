@@ -570,7 +570,11 @@ fn expand_entries(summaries: Vec<SessionSummary>) -> Vec<PickerEntry> {
 /// snapshots so sibling-repo sessions surface alongside the local ones.
 /// On error we log to stderr and start fresh — the picker is a
 /// convenience, not a hard dependency.
-pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
+/// Build the picker candidate list (scoped + recency-filtered + capped)
+/// without the per-candidate event-log reads. Callers that only need the
+/// set of recent sessions — e.g. the startup gate deciding whether to offer
+/// a resume question — use this to avoid touching `events.jsonl` at all.
+pub(crate) fn load_candidate_summaries(config: &AppConfig) -> Vec<SessionSummary> {
     let store = SessionStore::open(config);
     let local = match store.list(&SessionQuery::default()) {
         Ok(sessions) => sessions,
@@ -582,7 +586,12 @@ pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
     };
     let global = SessionStore::list_global_index();
     let now_ms = current_unix_ms();
-    let mut summaries = merge_candidates_for_picker(&local, &global, now_ms);
+    merge_candidates_for_picker(&local, &global, now_ms)
+}
+
+pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
+    let store = SessionStore::open(config);
+    let mut summaries = load_candidate_summaries(config);
     // Branch detection requires reading each candidate's event log. The
     // list is already capped so this stays cheap on cold start; we
     // silently ignore read errors because the picker is a convenience
