@@ -1455,6 +1455,20 @@ pub(crate) struct PendingToolResult {
     same_as_current_call_id: Option<String>,
 }
 
+#[cfg(test)]
+impl PendingToolResult {
+    /// Plain (non-deduped) pending result for packing tests: no current-round
+    /// dedup reference and nothing to remember, so packing depends only on
+    /// `result`'s status/size.
+    pub(crate) fn plain(result: ToolResult) -> Self {
+        Self {
+            result,
+            remember: None,
+            same_as_current_call_id: None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SeenToolOutputs {
     by_tool_output: BTreeMap<(String, String), SeenToolOutput>,
@@ -1712,6 +1726,50 @@ fn is_negative_receipt_result(result: &ToolResult) -> bool {
     }
 }
 
+/// Priority tier for [`pack_tool_results`]. Lower sorts earlier, so the
+/// most signal-dense / least-recoverable results are considered for
+/// inclusion before the aggregate budget is spent. Within a tier the
+/// caller breaks ties by ascending model-output size and then original
+/// order, so under budget pressure tiny critical results survive and only
+/// large bulky reads get pushed past the budget (and those already degrade
+/// to sha-bearing stubs, so the bytes remain recoverable).
+fn tool_result_pack_priority(
+    pending: &PendingToolResult,
+    referenced_originals: &BTreeSet<String>,
+) -> u8 {
+    // Originals that another result in this same batch points at via
+    // `same_as_current_call_id` must be packed before that dependent stub,
+    // otherwise the stub is rewritten to an omitted-reference error (the
+    // referent isn't yet in `visible_current_call_ids`). Pin them to the
+    // front so reordering can never break that visibility invariant.
+    if referenced_originals.contains(&pending.result.call_id) {
+        return 0;
+    }
+    // Errors / failures first: usually tiny, never recoverable from a
+    // stub, and a dropped tool error silently strands the model.
+    if pending.result.status != ToolStatus::Success {
+        return 1;
+    }
+    // Receipt-stubs next: already compacted to a few hundred bytes, so
+    // keeping them is near-free and preserves the dedup references.
+    if is_packed_receipt_stub(&pending.result) {
+        return 2;
+    }
+    // Everything else ranks by size below, so small high-signal outputs
+    // land ahead of large bulky reads.
+    3
+}
+
+/// True when `result` is already a compacted receipt stub (cross-round
+/// dedup or negative receipt). These are tiny and cheap to retain.
+fn is_packed_receipt_stub(result: &ToolResult) -> bool {
+    result
+        .content
+        .get("receipt_stub")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub(crate) fn pack_tool_results(
     results: Vec<PendingToolResult>,
     budget_bytes: usize,
@@ -1720,11 +1778,32 @@ pub(crate) fn pack_tool_results(
         return results;
     }
 
+    // Consider results for inclusion in signal-priority order before
+    // applying the (unchanged) aggregate budget, so small high-signal
+    // results (errors, receipt stubs, tiny reads) win the budget over large
+    // bulky reads under pressure. The budget accounting, omission, and stub
+    // behavior are identical to input-order packing — and the *returned*
+    // order is restored to input order at the end, since downstream callers
+    // pair results with their `ToolCall`s positionally. The sort is stable
+    // and the size tie-break is deterministic, so identical inputs always
+    // pack identically.
+    let referenced_originals: BTreeSet<String> = results
+        .iter()
+        .filter_map(|pending| pending.same_as_current_call_id.clone())
+        .collect();
+    let mut ordered: Vec<(usize, PendingToolResult)> = results.into_iter().enumerate().collect();
+    ordered.sort_by_key(|(_, pending)| {
+        (
+            tool_result_pack_priority(pending, &referenced_originals),
+            pending.result.model_output().len(),
+        )
+    });
+
     let mut used = 0usize;
     let mut visible_current_call_ids = BTreeSet::new();
-    results
+    let mut packed: Vec<(usize, PendingToolResult)> = ordered
         .into_iter()
-        .map(|mut pending| {
+        .map(|(idx, mut pending)| {
             if pending
                 .same_as_current_call_id
                 .as_ref()
@@ -1741,20 +1820,27 @@ pub(crate) fn pack_tool_results(
                 if pending.remember.is_some() {
                     visible_current_call_ids.insert(pending.result.call_id.clone());
                 }
-                pending
+                (idx, pending)
             } else {
                 let compact = pending
                     .result
                     .aggregate_budget_exceeded(budget_bytes, bytes);
                 used = used.saturating_add(compact.model_output().len());
-                PendingToolResult {
-                    result: compact,
-                    remember: None,
-                    same_as_current_call_id: None,
-                }
+                (
+                    idx,
+                    PendingToolResult {
+                        result: compact,
+                        remember: None,
+                        same_as_current_call_id: None,
+                    },
+                )
             }
         })
-        .collect()
+        .collect();
+
+    // Restore input order: only inclusion decisions depend on priority.
+    packed.sort_by_key(|(idx, _)| *idx);
+    packed.into_iter().map(|(_, pending)| pending).collect()
 }
 
 fn receipt_stub_reference_omitted(result: ToolResult) -> ToolResult {

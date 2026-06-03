@@ -1,11 +1,13 @@
 use serde_json::json;
 use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
+use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus, sha256_hex};
 
 use super::{
-    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, build_compaction_summary,
-    build_structured_compaction_prompt, durable_context_lines, estimate_context,
-    is_structured_compaction_summary, strip_media_for_compaction, unresolved_question_lines,
+    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, PendingToolResult,
+    build_compaction_summary, build_structured_compaction_prompt, durable_context_lines,
+    estimate_context, is_structured_compaction_summary, pack_tool_results,
+    strip_media_for_compaction, unresolved_question_lines,
 };
 
 fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {
@@ -787,5 +789,111 @@ fn unresolved_question_lines_keep_most_recent_when_capped() {
         lines.last().unwrap(),
         &format!("- question {}?", total - 1),
         "most recent open question must survive compaction"
+    );
+}
+
+fn tool_result(
+    call_id: &str,
+    tool_name: &str,
+    status: ToolStatus,
+    content: serde_json::Value,
+) -> ToolResult {
+    let output_bytes = serde_json::to_vec(&content).unwrap();
+    ToolResult {
+        call_id: call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        status,
+        content,
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(&output_bytes),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+fn omitted_to_stub(result: &ToolResult) -> bool {
+    // `aggregate_budget_exceeded` rewrites the omitted result to an Error
+    // carrying `original_output_sha256` (the sha-bearing stub).
+    result.status == ToolStatus::Error
+        && result
+            .content
+            .get("original_output_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+#[test]
+fn pack_tool_results_prioritizes_small_error_over_large_read_under_tight_budget() {
+    // Input order is [large read, small error], so input-order packing would
+    // spend the whole budget on the large read and omit the error. Priority
+    // packing must reverse this: the small error is retained, the large read
+    // is the one pushed past the budget and degraded to a sha-bearing stub.
+    let large_read = tool_result(
+        "call-read",
+        "read_file",
+        ToolStatus::Success,
+        json!({ "path": "src/big.rs", "content": "x".repeat(4096) }),
+    );
+    let small_error = tool_result(
+        "call-grep",
+        "grep",
+        ToolStatus::Error,
+        json!({ "error": "regex compile failed: unbalanced parenthesis" }),
+    );
+
+    let large_bytes = large_read.model_output().len();
+    let small_bytes = small_error.model_output().len();
+    // Budget admits the small error but not both — so exactly one survives.
+    let budget = small_bytes + (large_bytes - small_bytes) / 2;
+    assert!(
+        budget >= small_bytes && budget < large_bytes,
+        "test budget must fit the small error but not the large read"
+    );
+
+    let packed = pack_tool_results(
+        vec![
+            PendingToolResult::plain(large_read.clone()),
+            PendingToolResult::plain(small_error.clone()),
+        ],
+        budget,
+    );
+
+    // call-ids and their positions are preserved (only inclusion changes).
+    assert_eq!(packed.len(), 2);
+    assert_eq!(packed[0].result.call_id, "call-read");
+    assert_eq!(packed[1].result.call_id, "call-grep");
+
+    let read_out = &packed[0].result;
+    let error_out = &packed[1].result;
+
+    // The small error survives intact; the large read is omitted-to-stub.
+    assert_eq!(
+        error_out.status,
+        ToolStatus::Error,
+        "small tool error must be retained under budget pressure"
+    );
+    assert!(
+        !omitted_to_stub(error_out),
+        "small error must NOT be omitted to a budget stub"
+    );
+    assert!(
+        error_out.model_output().contains("unbalanced parenthesis"),
+        "retained error must keep its original content, got {:?}",
+        error_out.content
+    );
+    assert!(
+        omitted_to_stub(read_out),
+        "large read must be omitted to a sha-bearing budget stub, got {:?}",
+        read_out.content
+    );
+    // The stub stays recoverable: it carries the original output sha.
+    assert_eq!(
+        read_out
+            .content
+            .get("original_output_sha256")
+            .and_then(serde_json::Value::as_str),
+        Some(large_read.receipt.output_sha256.as_str()),
     );
 }
