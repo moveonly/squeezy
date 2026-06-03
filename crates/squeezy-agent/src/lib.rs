@@ -12879,9 +12879,10 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate broad research to an isolated subagent. \
+            description: "Delegate open-ended research to an isolated subagent. \
                           Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring — \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
+                          Do NOT delegate enumeration or extraction over a list of files or symbols you ALREADY have (e.g. from a graph/hierarchy result) — read or slice those yourself; the subagent runs the same model and re-reads the same files, so delegating known-target extraction is pure overhead. Delegate only when the set of files to inspect is itself unknown and must be discovered. \
                           `prompt` is required; the parent receives only a structured summary, supporting receipts, and separate spend metrics."
                 .to_string(),
             parameters: json!({
