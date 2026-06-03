@@ -314,6 +314,38 @@ impl ToolRegistry {
             .min(128_000);
         let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize;
 
+        // Cross-tool "already-resident" dedup: when the grep target is a
+        // single file the model already read in full this session (a
+        // `read_file`/`read_slice` snapshot whose `content_sha256` still
+        // matches the file on disk and whose byte window fully covers the
+        // file), run the regex IN-MEMORY against the stored source and
+        // return a receipt carrying only the matched line numbers + text.
+        // This avoids re-walking disk and, more importantly, avoids
+        // re-emitting bytes that are already resident in the model's
+        // context (which would otherwise be re-billed as cache_write).
+        // Provably equivalent: the regex runs over identical content, so
+        // the matches equal a disk grep's. Gated to the plain content
+        // path (no include/exclude/diff_only/context filters) so the
+        // short-circuit can never change the result set; anything outside
+        // that gate falls through to the normal disk grep below.
+        if matches!(output_mode, GrepOutputMode::Content)
+            && context == 0
+            && !diff_only
+            && include.is_none()
+            && exclude.is_none()
+            && start.is_file()
+            && let Some(result) = self.grep_resident_snapshot_receipt(
+                call,
+                &start,
+                &regex,
+                offset,
+                max_matches,
+                output_byte_cap,
+            )
+        {
+            return result;
+        }
+
         let mut builder = WalkBuilder::new(&start);
         builder
             .follow_links(false)
@@ -580,6 +612,121 @@ impl ToolRegistry {
         };
 
         make_result(call, ToolStatus::Success, content, cost, None)
+    }
+
+    /// Cross-tool "already-resident" grep dedup for a single-file target.
+    ///
+    /// When `path` was already read in full this session and is unchanged
+    /// on disk, run `regex` over the stored source in memory and return a
+    /// content-mode receipt carrying only the matched line numbers + text.
+    /// Returns `None` (so the caller falls through to the disk grep) when
+    /// there is no state store, no covering snapshot, the file changed
+    /// (SHA mismatch), or the snapshot only covers part of the file —
+    /// correctness comes first, so any uncertainty defers to disk.
+    fn grep_resident_snapshot_receipt(
+        &self,
+        call: &ToolCall,
+        path: &Path,
+        regex: &Regex,
+        offset: usize,
+        max_matches: usize,
+        output_byte_cap: usize,
+    ) -> Option<ToolResult> {
+        let store = self.state_store.as_deref()?;
+        let rel = self.relative(path);
+        if is_secret_path(&rel) {
+            return None;
+        }
+        let rel_str = workspace_path(&rel);
+
+        let total_bytes = file_len(path).ok()?;
+        let content_sha256 = sha256_file(path).ok()?;
+        let snapshots = store.read_snapshots_for_path(rel_str.as_str()).ok()?;
+
+        // Require an exact SHA match (file unchanged since the read) AND a
+        // window that starts at byte 0 and reaches end-of-file, so the
+        // stored content is the whole file the regex would scan on disk.
+        // Anything narrower falls through.
+        let snap = snapshots
+            .iter()
+            .filter(|snap| matches!(snap.tool_name.as_str(), "read_file" | "read_slice"))
+            .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
+            .filter(|snap| snap.start_byte == 0 && snap.end_byte >= total_bytes)
+            .max_by_key(|snap| snap.created_unix_millis)?;
+
+        // The stored `content` is the model-facing, line-numbered render
+        // (`"{line_no}\t{source}"` from `prefix_lines_with_numbers`). Strip
+        // the `"{N}\t"` prefix so the regex matches the source — not the
+        // line-number gutter — and reuse the embedded line number, which is
+        // the authoritative 1-based number the model already saw.
+        let mut matches = Vec::new();
+        let mut count = 0u64;
+        let mut skipped_matches = 0usize;
+        let mut cost = ToolCostHint {
+            files_scanned: 1,
+            bytes_read: total_bytes,
+            ..ToolCostHint::default()
+        };
+        let mut truncated = false;
+        for raw_line in snap.content.lines() {
+            let (line_no, source) = match raw_line.split_once('\t') {
+                Some((number, rest)) if number.parse::<usize>().is_ok() => {
+                    (number.parse::<usize>().unwrap_or(0), rest)
+                }
+                // A line without the expected `"{N}\t"` gutter means the
+                // stored content is not the line-numbered render we rely on
+                // here; bail out to the disk grep rather than guess at line
+                // numbers.
+                _ => return None,
+            };
+            if !regex.is_match(source) {
+                continue;
+            }
+            if skipped_matches < offset {
+                skipped_matches += 1;
+                continue;
+            }
+            count += 1;
+            let next = json!({
+                "path": &rel_str,
+                "line": line_no,
+                "text": truncate_text(source, 2000),
+            });
+            let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
+            if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
+                truncated = true;
+                break;
+            }
+            cost.output_bytes += next_len as u64;
+            cost.matches_returned += 1;
+            matches.push(next);
+            if matches.len() >= max_matches {
+                truncated = true;
+                break;
+            }
+        }
+        cost.truncated = truncated;
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("pattern".to_string(), json!(regex.as_str()));
+        metadata.insert("path".to_string(), json!(&rel_str));
+        metadata.insert("output_mode".to_string(), json!("content"));
+        metadata.insert("offset".to_string(), json!(offset));
+        metadata.insert("context".to_string(), json!(0));
+        metadata.insert("count".to_string(), json!(count));
+        // Reuse the existing receipt envelope so downstream dedup / packing
+        // treats this like any other already-resident receipt.
+        metadata.insert("receipt_stub".to_string(), json!(true));
+        metadata.insert("dedup".to_string(), json!(true));
+        metadata.insert("resident_read".to_string(), json!(true));
+        metadata.insert("same_as_call_id".to_string(), json!(snap.call_id));
+        metadata.insert("same_as_tool_name".to_string(), json!(snap.tool_name));
+
+        let content = json!({
+            "matches": matches,
+            "metadata": metadata,
+        });
+        Some(make_result(call, ToolStatus::Success, content, cost, None))
     }
 
     pub(crate) async fn execute_read_file(&self, call: &ToolCall) -> ToolResult {

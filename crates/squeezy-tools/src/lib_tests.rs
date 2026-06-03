@@ -1536,6 +1536,236 @@ async fn read_file_does_not_dedup_when_window_differs() {
 }
 
 #[tokio::test]
+async fn grep_returns_resident_receipt_when_file_already_read_in_full() {
+    let root = temp_workspace("grep_resident_receipt");
+    let body = "alpha fox\nbeta\nalpha bird\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    // A full-file read_file snapshot, stored in the model-facing
+    // line-numbered render that `prefix_lines_with_numbers` produces.
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: "1\talpha fox\n2\tbeta\n3\talpha bird\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_call".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let metadata = result.content["metadata"]
+        .as_object()
+        .expect("metadata object");
+    assert_eq!(metadata["receipt_stub"], true);
+    assert_eq!(metadata["dedup"], true);
+    assert_eq!(metadata["resident_read"], true);
+    assert_eq!(metadata["same_as_call_id"], "prior_read");
+    assert_eq!(metadata["same_as_tool_name"], "read_file");
+
+    let matches = result.content["matches"].as_array().expect("matches array");
+    assert_eq!(matches.len(), 2);
+    // Matched line numbers come from the embedded gutter, and the emitted
+    // text is the source line WITHOUT the "{N}\t" gutter — never the full
+    // file source.
+    assert_eq!(matches[0]["line"], 1);
+    assert_eq!(matches[0]["text"], "alpha fox");
+    assert_eq!(matches[1]["line"], 3);
+    assert_eq!(matches[1]["text"], "alpha bird");
+    // The receipt must not re-emit the full file content.
+    assert!(result.content.get("content").is_none());
+    let serialized = serde_json::to_string(&result.content).expect("serialize");
+    assert!(
+        !serialized.contains("beta"),
+        "non-matching line leaked into the receipt: {serialized}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_resident_receipt_matches_equal_disk_grep() {
+    let root = temp_workspace("grep_resident_equals_disk");
+    let body = "alpha fox\nbeta\nalpha bird\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+
+    // Ground truth: a normal disk grep with no resident snapshot.
+    let disk_registry = ToolRegistry::new(&root).expect("registry");
+    let disk = disk_registry
+        .execute(
+            ToolCall {
+                call_id: "disk_grep".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let disk_matches = disk.content["matches"].as_array().expect("disk matches");
+
+    // Resident path: same file, same regex, served from the snapshot.
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: "1\talpha fox\n2\tbeta\n3\talpha bird\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+    let resident = registry
+        .execute(
+            ToolCall {
+                call_id: "resident_grep".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let resident_matches = resident.content["matches"]
+        .as_array()
+        .expect("resident matches");
+
+    assert_eq!(disk_matches.len(), resident_matches.len());
+    for (disk_match, resident_match) in disk_matches.iter().zip(resident_matches.iter()) {
+        assert_eq!(disk_match["line"], resident_match["line"]);
+        assert_eq!(disk_match["text"], resident_match["text"]);
+        assert_eq!(disk_match["path"], resident_match["path"]);
+    }
+    // Disk grep must NOT carry the resident-receipt markers; the resident
+    // path must.
+    assert!(disk.content["metadata"].get("resident_read").is_none());
+    assert_eq!(resident.content["metadata"]["resident_read"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_falls_through_to_disk_when_snapshot_missing_stale_or_partial() {
+    let body = "alpha fox\nbeta\nalpha bird\n";
+
+    // (1) No snapshot at all -> normal disk grep, no resident markers.
+    let root = temp_workspace("grep_resident_missing");
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store(&root, store);
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_missing".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["metadata"].get("resident_read").is_none());
+    assert_eq!(result.content["matches"].as_array().unwrap().len(), 2);
+    let _ = fs::remove_dir_all(root);
+
+    // (2) Stale SHA (file changed since the read) -> fall through to disk.
+    let root = temp_workspace("grep_resident_stale");
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            // Hash of some OTHER content -> SHA mismatch.
+            content_sha256: Some(sha256_hex("alpha fox\nbeta\ngamma\n".as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: "1\talpha fox\n2\tbeta\n3\tgamma\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_stale".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["metadata"].get("resident_read").is_none());
+    // Disk grep sees the real file: "alpha bird" on line 3, not "gamma".
+    let matches = result.content["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[1]["text"], "alpha bird");
+    let _ = fs::remove_dir_all(root);
+
+    // (3) Partial-span snapshot (covers only the first line) -> fall through.
+    let root = temp_workspace("grep_resident_partial");
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            // Only the first line of the file is covered.
+            end_byte: 10,
+            content: "1\talpha fox\n".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep_partial".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "alpha", "path": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["metadata"].get("resident_read").is_none());
+    // Disk grep finds BOTH matches, proving we did not stop at the
+    // partial snapshot's single covered line.
+    assert_eq!(result.content["matches"].as_array().unwrap().len(), 2);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn diff_context_reports_changed_file_and_dirty_symbol() {
     let root = temp_workspace("diff_context");
     write_rust_crate(
