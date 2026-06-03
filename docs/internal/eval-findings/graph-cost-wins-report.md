@@ -342,7 +342,32 @@ graph-guided navigation is simply cheaper than codex's read/grep loop.
 inheritance-free. The build fix is comprehensive (independently re-confirmed
 laravel 233s→6.1s, ~38×, byte-identical graph).
 
-## 4. The measurement blocker (fully diagnosed, not the product code)
+## 4. The Haiku blocker — a squeezy regression bug (FIXED), not environmental
+
+> **This section's original conclusion was wrong, and is corrected here.** For
+> most of the session I diagnosed the Haiku `stream reconnect diverged` failure
+> as *environmental* (reqwest TLS/transport), because the unmodified `main`
+> binary failed identically while raw `curl` worked. That reasoning was
+> backwards: `main` fails because **`main` contains the bug**, and `curl` works
+> because the bug is in squeezy's own stream skip-cursor, *not* the transport. A
+> dedicated investigation found and fixed it (one line). **Haiku now streams**
+> (the repro that returned `$0` all session now bills `$0.0609`).
+>
+> **Root cause:** a regression introduced in commit `61e2cc87`. When
+> `skip_delta_prefix` was refactored into separate `consumed`/`forwarded`
+> values, `skip_validated_prefix` advanced its per-attempt cursor (`seen`) by
+> only the re-validated prefix, never the freshly-forwarded suffix — while
+> `StreamSkipState` grows by the *full* delta. After the first reasoning delta
+> the cursor falls behind, and the next fresh delta is re-validated against
+> already-emitted text → a spurious "stream reconnect diverged" **on the first
+> attempt, with no reconnect at all**. It only bit Haiku because Haiku streams
+> thinking as several short consecutive deltas (an untested path); OpenAI/Mini
+> emit differently and never tripped it. **Fix** (`retry.rs`): advance `seen` by
+> the whole delta — `*seen += consumed + forwarded.len()` — plus a regression
+> test that fails on the old code. This is a real product bug affecting *any*
+> Anthropic user with extended thinking, not just the eval.
+
+The original (wrong) "environmental" investigation is kept below for the record:
 
 Every attempt to live-measure failed with
 `provider stream failed: stream reconnect diverged`. The investigation:
