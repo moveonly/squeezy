@@ -724,7 +724,16 @@ fn skip_validated_prefix(text: String, prefix: &str, seen: &mut usize) -> Result
                 .collect::<String>(),
         )));
     }
-    *seen += consumed;
+    // Advance `seen` by the *whole* delta, not just the re-validated
+    // `consumed` prefix. The forwarded suffix is appended to
+    // `skip.emitted_reasoning`/`emitted_text` by the caller's
+    // `observe_yielded`, so on the next delta `prefix.chars().count()`
+    // grows by exactly that suffix length. If `seen` only tracked the
+    // re-validated portion it would fall behind the recorded prefix, and
+    // the *next* fresh delta of the same attempt would be re-validated
+    // against content it just emitted — a spurious "stream reconnect
+    // diverged" error on the very first (non-reconnecting) attempt.
+    *seen += consumed + forwarded.map_or(0, |suffix| suffix.chars().count());
     Ok(forwarded.map(str::to_string))
 }
 
