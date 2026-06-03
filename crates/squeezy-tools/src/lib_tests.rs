@@ -2103,6 +2103,37 @@ fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn cargo_setup_failure_reason_separates_environment_from_code_failures() {
+    // The exact failure shape that keeps surfacing: a private git dependency
+    // cargo can't fetch/authenticate, with a pinned revision that is gone.
+    let dep_failure = "Updating git repository `https://github.com/SonarSource/semsitter.git`\n\
+         error: failed to get `udg-gen` as a dependency of package `sonar-context-augmentation`\n\
+         Caused by:\n  failed to load source for dependency `udg-gen`\n\
+         Caused by:\n  revision 0a910a90 not found\n\
+         Caused by:\n  failed to authenticate when downloading repository\n";
+    assert!(cargo_setup_failure_reason(dep_failure).is_some());
+
+    // A missing toolchain/std is also an environment failure.
+    assert!(cargo_setup_failure_reason("can't find crate for `core`").is_some());
+
+    // Genuine code-quality failures must NOT be masked as setup failures.
+    assert!(
+        cargo_setup_failure_reason(
+            "error[E0425]: cannot find value `x`\n\
+             error: could not compile `foo` (lib) due to 1 previous error"
+        )
+        .is_none()
+    );
+    assert!(
+        cargo_setup_failure_reason(
+            "test tests::it_works ... FAILED\nassertion `left == right` failed"
+        )
+        .is_none()
+    );
+    assert!(cargo_setup_failure_reason("").is_none());
+}
+
 #[tokio::test]
 async fn verify_reports_not_run_when_no_cargo_manifest_exists() {
     let root = temp_workspace("verify_no_manifest");

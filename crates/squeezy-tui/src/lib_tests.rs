@@ -323,6 +323,8 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     .expect("focus pane");
     assert!(app.subagent_pane.focused);
     assert_eq!(app.subagent_pane.selected, 1);
+    // Highlighting a row previews its conversation live — no Enter required.
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
 
     handle_key(
         &mut app,
@@ -330,11 +332,11 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await
-    .expect("select subagent");
+    .expect("commit selection");
     assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
     assert!(
         !app.subagent_pane.focused,
-        "selecting a conversation should release selector focus so scroll keys target the transcript"
+        "Enter should release selector focus so scroll keys target the transcript"
     );
     let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(80), false));
     assert!(
@@ -743,15 +745,15 @@ fn subagent_row_shows_lifecycle_word_for_accessibility() {
         "boom".to_string(),
         TurnMetrics::default(),
     );
-    // Even with the row selected (glyph forced to ⏺), the failed state is
-    // still conveyed as text.
+    // The failed state is conveyed by the leading "failed" word + red colour,
+    // independent of the selection marker (○/●).
     app.subagent_pane.selected = 1;
     let output = render_to_string(&app, 120, 18);
     assert!(output.contains("failed"), "{output}");
 }
 
 #[tokio::test]
-async fn subagent_lifecycle_logs_are_neutral_and_untruncated() {
+async fn subagent_lifecycle_logs_are_neutral_and_compact() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
@@ -800,7 +802,8 @@ async fn subagent_lifecycle_logs_are_neutral_and_untruncated() {
         .collect::<Vec<_>>();
     assert_eq!(lifecycle_logs.len(), 2);
 
-    for log in lifecycle_logs {
+    // Neutral (Info/cyan), never an alarming colour.
+    for log in &lifecycle_logs {
         assert_eq!(log.kind, LogKind::Info);
         let lines = format_log_entry(log, true, false);
         assert_eq!(
@@ -810,15 +813,25 @@ async fn subagent_lifecycle_logs_are_neutral_and_untruncated() {
                 .and_then(|span| span.style.fg),
             Some(crate::render::theme::cyan())
         );
-        let rendered = lines_to_plain_text(&lines);
-        assert!(!rendered.contains('…'), "{rendered}");
-        assert!(!rendered.contains("truncated"), "{rendered}");
     }
 
-    let rendered = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
-    assert!(rendered.contains(prompt_tail), "{rendered}");
-    assert!(rendered.contains(summary_tail), "{rendered}");
-    assert!(rendered.contains("tools=51 bytes=1207538"), "{rendered}");
+    // Main transcript: compact one-liners. The long prompt/summary bodies are
+    // folded (not dumped) and the noisy byte counter is gone.
+    let main_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
+    assert!(
+        main_view.contains("subagent completed · 51 tools"),
+        "{main_view}"
+    );
+    assert!(!main_view.contains(summary_tail), "{main_view}");
+    assert!(!main_view.contains(prompt_tail), "{main_view}");
+    assert!(!main_view.contains("bytes="), "{main_view}");
+
+    // The full prompt + summary remain available inside the subagent's own
+    // conversation (open it with Down / Enter).
+    app.subagent_pane.active = ConversationSource::Subagent(11);
+    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
+    assert!(subagent_view.contains(prompt_tail), "{subagent_view}");
+    assert!(subagent_view.contains(summary_tail), "{subagent_view}");
 }
 
 #[tokio::test]

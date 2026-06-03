@@ -1775,6 +1775,26 @@ fn debug_log_key_event(key: &KeyEvent) {
     );
 }
 
+/// Switch the shown conversation to the currently highlighted pane row and
+/// reset its scroll, so moving the selection previews the conversation live
+/// instead of only committing on Enter.
+fn select_subagent_row(app: &mut TuiApp) {
+    app.subagent_pane.active = if app.subagent_pane.selected == 0 {
+        ConversationSource::Main
+    } else {
+        app.subagent_pane
+            .records
+            .get(app.subagent_pane.selected - 1)
+            .map(|record| ConversationSource::Subagent(record.id))
+            .unwrap_or(ConversationSource::Main)
+    };
+    set_active_transcript_scroll_from_bottom(app, 0);
+    app.status = match app.subagent_pane.active {
+        ConversationSource::Main => "main conversation".to_string(),
+        ConversationSource::Subagent(_) => "subagent conversation".to_string(),
+    };
+}
+
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.subagent_pane.records.is_empty() || !key.modifiers.is_empty() {
         return false;
@@ -1784,7 +1804,7 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Down if app.subagent_pane.focused => {
             app.subagent_pane.selected = (app.subagent_pane.selected + 1).min(row_count - 1);
-            app.status = "subagent pane selection changed".to_string();
+            select_subagent_row(app);
             true
         }
         KeyCode::Down if app.input.is_empty() => {
@@ -1792,12 +1812,12 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             if row_count > 1 && app.subagent_pane.selected == 0 {
                 app.subagent_pane.selected = 1;
             }
-            app.status = "subagent pane focused".to_string();
+            select_subagent_row(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused && app.subagent_pane.selected > 0 => {
             app.subagent_pane.selected -= 1;
-            app.status = "subagent pane selection changed".to_string();
+            select_subagent_row(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused => {
@@ -1806,17 +1826,10 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter if app.subagent_pane.focused => {
-            app.subagent_pane.active = if app.subagent_pane.selected == 0 {
-                ConversationSource::Main
-            } else {
-                app.subagent_pane
-                    .records
-                    .get(app.subagent_pane.selected - 1)
-                    .map(|record| ConversationSource::Subagent(record.id))
-                    .unwrap_or(ConversationSource::Main)
-            };
+            // Selection already previews live (see `select_subagent_row`);
+            // Enter just releases pane focus so the arrow keys scroll the
+            // now-active transcript instead of moving the selector.
             app.subagent_pane.focused = false;
-            set_active_transcript_scroll_from_bottom(app, 0);
             app.status = match app.subagent_pane.active {
                 ConversationSource::Main => "main conversation selected".to_string(),
                 ConversationSource::Subagent(_) => "subagent conversation selected".to_string(),
@@ -6957,7 +6970,7 @@ fn active_conversation_title(app: &TuiApp) -> Option<Line<'static>> {
     let record = active_subagent_record(app)?;
     Some(Line::from(vec![
         Span::styled(
-            record.lifecycle.glyph(true),
+            "●",
             Style::default()
                 .fg(record.lifecycle.color())
                 .add_modifier(Modifier::BOLD),
@@ -12426,7 +12439,10 @@ fn subagent_pane_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
 fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
     let selected = app.subagent_pane.selected == 0;
     let active = matches!(app.subagent_pane.active, ConversationSource::Main);
-    let glyph = if selected || active { "⏺" } else { "◯" };
+    // Glyph encodes selection only: ● = the conversation currently shown,
+    // ○ = the others. Run status (for subagent rows) rides on colour + the
+    // leading lifecycle word, so the marker no longer conflates the two.
+    let glyph = if active { "●" } else { "○" };
     let style = if selected {
         Style::default()
             .fg(crate::render::theme::accent())
@@ -12435,7 +12451,7 @@ fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
         Style::default().fg(crate::render::theme::quiet())
     };
     let hint = if selected && app.subagent_pane.focused {
-        "↑/↓ to select · Enter view"
+        "↑/↓ switch · Enter scroll · Esc back"
     } else if active {
         "active"
     } else {
@@ -12460,7 +12476,9 @@ fn subagent_record_row(
     let row = index + 1;
     let selected = app.subagent_pane.selected == row;
     let active = app.subagent_pane.active == ConversationSource::Subagent(record.id);
-    let glyph = record.lifecycle.glyph(selected || active);
+    // ● = shown conversation, ○ = others (selection). The lifecycle colour
+    // below and the leading lifecycle word carry run status separately.
+    let glyph = if active { "●" } else { "○" };
     let glyph_style = Style::default()
         .fg(record.lifecycle.color())
         .add_modifier(if selected {
@@ -12469,7 +12487,7 @@ fn subagent_record_row(
             Modifier::empty()
         });
     let detail = if selected && app.subagent_pane.focused {
-        "↑/↓ to select · Enter view".to_string()
+        "↑/↓ switch · Enter scroll · Esc back".to_string()
     } else if !record.latest.trim().is_empty() {
         record.latest.clone()
     } else {
@@ -12484,9 +12502,9 @@ fn subagent_record_row(
         ),
         _ => detail,
     };
-    // Lead with the lifecycle word so the state survives a monochrome
-    // terminal and the selected-row glyph (which is always ⏺) can't mask a
-    // failed/running/capped subagent.
+    // Lead with the lifecycle word so run state survives a monochrome
+    // terminal, where the marker only encodes selection (○/●) and colour
+    // carries the failed/running/capped state.
     let detail = format!("{} · {}", record.lifecycle.label(), detail);
     // Disambiguate same-kind rows during parallel fanout (e.g. three
     // "delegate" subagents) with their row ordinal.
@@ -12722,7 +12740,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         };
     }
     if app.subagent_pane.focused {
-        return "Up/Down select · Enter view · Del clear done · type/Esc back to prompt"
+        return "Up/Down switch · Enter scroll · Del clear done · type/Esc back to prompt"
             .to_string();
     }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
@@ -13275,16 +13293,6 @@ enum SubagentLifecycle {
 }
 
 impl SubagentLifecycle {
-    fn glyph(self, selected: bool) -> &'static str {
-        match (selected, self) {
-            (true, _) => "⏺",
-            (false, Self::Running) => "◐",
-            (false, Self::Completed) => "●",
-            (false, Self::Failed) => "◯",
-            (false, Self::Rejected) => "⊘",
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::Running => "running",

@@ -3775,6 +3775,43 @@ impl ToolRegistry {
         let shell_result = self
             .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS, group_id, None)
             .await;
+        // Distinguish "the build environment couldn't start" (dependency
+        // fetch/auth, missing pinned revision, unavailable toolchain) from
+        // "your code failed checks". The former is not a code-quality signal,
+        // so report it as a benign no-op rather than a red failure.
+        let exit_code = shell_result
+            .content
+            .get("exit_code")
+            .and_then(Value::as_i64);
+        let failed = !matches!(shell_result.status, ToolStatus::Success)
+            || exit_code.is_some_and(|code| code != 0);
+        if failed {
+            let stderr = shell_result.content["stderr"].as_str().unwrap_or("");
+            let stdout = shell_result.content["stdout"].as_str().unwrap_or("");
+            let combined = format!("{stderr}\n{stdout}");
+            if let Some(reason) = cargo_setup_failure_reason(&combined) {
+                let excerpt: String = combined.trim().chars().take(600).collect();
+                return make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "scope": verify_scope_str(scope),
+                        "level": verify_level_str(level),
+                        "changed_files": changed_paths,
+                        "command": plan.command,
+                        "not_run": true,
+                        "setup_failure": true,
+                        "reason": format!(
+                            "verify could not run: {reason}. This is a build-environment issue, \
+                             not a code defect — review statically and skip local verification."
+                        ),
+                        "details": excerpt,
+                    }),
+                    shell_result.cost_hint,
+                    None,
+                );
+            }
+        }
         let mut content = shell_result.content;
         if let Some(object) = content.as_object_mut() {
             object.insert("scope".to_string(), json!(verify_scope_str(scope)));
@@ -5251,6 +5288,44 @@ impl StagedOp {
             }
         }
     }
+}
+
+/// Detect cargo/rustup failures that mean "the build environment could not
+/// even start" — dependency resolution, a private-repo fetch/auth failure, a
+/// missing pinned git revision, or an unavailable toolchain — as opposed to
+/// "your code failed checks". These strings are emitted before any
+/// compilation, so matching them never masks a real code defect, and lets
+/// `verify` report a benign "did not run" instead of a red failure the model
+/// might waste a turn trying to "fix".
+fn cargo_setup_failure_reason(output: &str) -> Option<&'static str> {
+    const DEPENDENCY_SIGNATURES: &[&str] = &[
+        "failed to load source for dependency",
+        "as a dependency of package",
+        "failed to select a version for",
+        "no matching package named",
+        "failed to fetch into:",
+        "failed to download",
+        "spurious network error",
+        "failed to authenticate",
+        "failed to acquire username/password",
+        "could not read Username",
+    ];
+    const TOOLCHAIN_SIGNATURES: &[&str] = &[
+        "error: rustup could not",
+        "no override and no default toolchain set",
+        "can't find crate for `core`",
+        "can't find crate for `std`",
+    ];
+    if DEPENDENCY_SIGNATURES.iter().any(|sig| output.contains(sig)) {
+        return Some(
+            "cargo could not resolve or fetch dependencies (network access, private-repo \
+             authentication, or a missing pinned revision)",
+        );
+    }
+    if TOOLCHAIN_SIGNATURES.iter().any(|sig| output.contains(sig)) {
+        return Some("the Rust toolchain or a required component is unavailable");
+    }
+    None
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {

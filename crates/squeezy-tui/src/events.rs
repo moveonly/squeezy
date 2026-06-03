@@ -223,7 +223,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format!("{agent} subagent running");
                     app.note_subagent_started(id, agent.clone(), prompt.clone());
-                    app.push_info(format!("{agent} subagent started: {prompt}"));
+                    // Keep the main transcript to a one-liner; the full prompt
+                    // is the seed message of the subagent's own conversation
+                    // (open it with Down / Enter to read it untruncated).
+                    app.push_info(format!(
+                        "{agent} subagent started: {}",
+                        crate::compact_text(&prompt, 140)
+                    ));
                 }
                 AgentEvent::SubagentActivity {
                     id, agent, message, ..
@@ -244,11 +250,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         summary.clone(),
                         metrics.clone(),
                     );
+                    // One-liner in the main transcript. The full summary is
+                    // stored as the final message of the subagent's own
+                    // conversation (open it with Down / Enter for details).
                     app.push_info(format!(
-                        "{agent} subagent completed tools={} bytes={} summary={}",
+                        "{agent} subagent completed · {} tools · {}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
-                        metrics.subagent_bytes_read.max(metrics.bytes_read),
-                        summary
+                        crate::compact_text(&summary, 140)
                     ));
                 }
                 AgentEvent::SubagentFailed {
@@ -261,10 +269,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.status = format!("{agent} subagent failed");
                     app.note_subagent_failed(id, agent.clone(), error.clone(), metrics.clone());
                     app.push_warn(format!(
-                        "{agent} subagent failed tools={} bytes={} error={}",
+                        "{agent} subagent failed · {} tools · {}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
-                        metrics.subagent_bytes_read.max(metrics.bytes_read),
-                        error
+                        crate::compact_text(&error, 140)
                     ));
                 }
                 AgentEvent::SubagentRejected {
