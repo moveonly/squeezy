@@ -12,8 +12,9 @@
 //! order; only the bulky payload is replaced.
 //!
 //! Compactable tools are a closed set: only the tools that plausibly emit
-//! large outputs (file reads, shell, search, web) are in scope. Tools that
-//! already return receipt-stubbed or otherwise small payloads
+//! large outputs (file reads, shell, search, web, and the graph navigation
+//! tools whose packets carry full symbol/span payloads) are in scope. Tools
+//! that already return receipt-stubbed or otherwise small payloads
 //! (`notes_recall`, `checkpoint_*`, MCP control calls) are intentionally
 //! excluded — there is nothing worth clearing.
 use std::collections::BTreeMap;
@@ -26,10 +27,16 @@ use crate::context_compaction::estimate_context;
 
 /// Tools whose `FunctionCallOutput.output` payload may be rewritten to a
 /// placeholder once the conversation crosses the micro-compaction
-/// threshold. Limited to tools that can plausibly emit large outputs
-/// (file/shell/search/web). Tools whose outputs are already capped by
-/// receipts or by aggregate budgets stay out of the set so the model
-/// keeps their full content.
+/// threshold. Covers tools that can plausibly emit large outputs
+/// (file/shell/search/web) plus the graph navigation tools — a single
+/// `definition_search`/`symbol_context`/`hierarchy` packet routinely runs
+/// tens of KB of symbol, span, and signature data, and once emitted it
+/// pins into context and is re-billed on every subsequent prefill of the
+/// turn. Those packets are exactly the kind of stale bulk this tier exists
+/// to reclaim; `micro_compaction_keep_recent` keeps the newest result
+/// verbatim, and the placeholder preserves the call-id so the model can
+/// re-issue the lookup if it still needs the detail. Tools whose outputs
+/// are already capped by receipts or aggregate budgets stay out of the set.
 pub(crate) const COMPACTABLE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "read_slice",
@@ -40,6 +47,16 @@ pub(crate) const COMPACTABLE_TOOL_NAMES: &[&str] = &[
     "websearch",
     "apply_patch",
     "write_file",
+    // Graph navigation packets (mirror `is_graph_navigation_tool`); these
+    // carry the heaviest structured payloads in a code-audit turn.
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "upstream_flow",
+    "downstream_flow",
+    "symbol_context",
+    "hierarchy",
 ];
 
 /// Placeholder substituted for cleared `FunctionCallOutput.output` bodies.

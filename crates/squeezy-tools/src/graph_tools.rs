@@ -2105,16 +2105,22 @@ fn read_slice_byte_window(
 }
 
 /// Targeted total span (in lines) the read_slice line-range mode auto-widens
-/// toward when the caller passes a tight window. Picked to comfortably contain
-/// a typical Rust `impl Trait for Foo { fn name() … }` block (~10 lines) plus
-/// enough surrounding context that a single fetch covers the enclosing
-/// function/impl in most languages — without forcing a second read when the
-/// model only knew the method's body span.
-const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 80;
+/// toward when the caller passes a tight window. Sized to cover a typical
+/// function/method body plus a few lines of surrounding context in one fetch.
+/// The caller's requested `[start_line, end_line]` is always fully included,
+/// so this padding only ever adds context — it can never drop a requested
+/// line, and recall cannot regress if it's tight. Kept modest because
+/// read_slice is the single highest-volume tool and most callers request a
+/// far narrower window (Haiku's median line read is ~20 lines); over-padding
+/// every such read toward a large target inflates input tokens on the
+/// dominant cost driver for no recall benefit.
+const READ_SLICE_AUTO_WIDEN_TARGET_LINES: u32 = 48;
 /// Threshold below which a caller-supplied line range is treated as "too
 /// tight" and gets auto-widened up to `READ_SLICE_AUTO_WIDEN_TARGET_LINES`.
-/// Ranges already at or above this size are left exactly as the caller asked.
-const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 60;
+/// Ranges already at or above this size are left exactly as the caller asked
+/// — a caller that deliberately requested a wide window already has its
+/// context and should not be padded further.
+const READ_SLICE_AUTO_WIDEN_THRESHOLD_LINES: u32 = 40;
 
 fn line_window(
     text: &str,
