@@ -8182,7 +8182,7 @@ pub const DEFAULT_TUI_THEME_NAME: &str = "default";
 pub const BUILTIN_TUI_THEME_NAMES: &[&str] =
     &["default", "bright", "fun", "catppuccin", "high-contrast"];
 
-pub const DEFAULT_TUI_SPINNER_NAME: &str = "drift";
+pub const DEFAULT_TUI_SPINNER_NAME: &str = "scintillate";
 
 pub const BUILTIN_TUI_SPINNER_NAMES: &[&str] = &["twinkle", "scintillate", "drift"];
 

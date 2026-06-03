@@ -14,9 +14,9 @@ fn from_name_resolves_builtins_and_aliases() {
         SpinnerStyle::Scintillate
     );
     assert_eq!(SpinnerStyle::from_name("shooting"), SpinnerStyle::Drift);
-    // unknown falls back to the default style (drift)
-    assert_eq!(SpinnerStyle::from_name("nope"), SpinnerStyle::Drift);
-    assert_eq!(SpinnerStyle::default(), SpinnerStyle::Drift);
+    // unknown falls back to the default style (scintillate)
+    assert_eq!(SpinnerStyle::from_name("nope"), SpinnerStyle::Scintillate);
+    assert_eq!(SpinnerStyle::default(), SpinnerStyle::Scintillate);
 }
 
 #[test]

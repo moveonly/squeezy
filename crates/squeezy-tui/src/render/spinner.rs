@@ -15,10 +15,11 @@ use squeezy_core::AppConfig;
 pub(crate) enum SpinnerStyle {
     /// A single star that swells and fades — a calm twinkle.
     Twinkle,
-    /// A multi-point sparkle that rotates its points.
+    /// A multi-point sparkle that breathes through its points — the calm
+    /// default, slow enough to read as gently alive on the rail.
+    #[default]
     Scintillate,
     /// A star drifting left-to-right across a short field.
-    #[default]
     Drift,
 }
 
@@ -27,9 +28,10 @@ impl SpinnerStyle {
     /// default for anything unrecognized.
     pub(crate) fn from_name(name: &str) -> Self {
         match squeezy_core::normalize_tui_spinner_name(name).as_deref() {
-            Some("scintillate") => Self::Scintillate,
             Some("twinkle") => Self::Twinkle,
-            _ => Self::Drift,
+            Some("drift") => Self::Drift,
+            // "scintillate" and anything unrecognized resolve to the calm default.
+            _ => Self::Scintillate,
         }
     }
 
@@ -44,9 +46,10 @@ impl SpinnerStyle {
     fn interval_ms(self) -> u64 {
         match self {
             // Calm cadence: the star reads as gently alive rather than
-            // spinning fast. Drift sweeps slowest, like a star adrift.
+            // spinning fast. Scintillate is the default and breathes slowly;
+            // twinkle is the livelier option; drift sweeps slowest.
             Self::Twinkle => 300,
-            Self::Scintillate => 220,
+            Self::Scintillate => 420,
             Self::Drift => 620,
         }
     }

@@ -878,7 +878,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::Immediate,
                 get: get_spinner,
                 set: set_spinner,
-                default_display: "drift",
+                default_display: "scintillate",
                 default: || FieldValue::Enum(DEFAULT_TUI_SPINNER_NAME),
                 help: "Working-status spinner shape: twinkle, scintillate, or drift.",
                 env_override: None,
