@@ -218,18 +218,22 @@ directional.
 | **cpp** (n=8) | 0.0643 → **0.0566** (−12%; ng also −15%) | 100 | 0.0743 | **WIN**; my code cuts both variants |
 | **php** (build-fix, n=3) | graph was *unavailable* → **0.0350**, tax **−19%** | 100 | 0.0426 | **WIN** — graph now earns its keep |
 | **scala** (build-fix, n=3) | graph was *unavailable* → **0.0148**, tax **−75%** | 100 | 0.0401 | **WIN (large)** — graph now earns its keep |
+| **dart** (build-fix, n=3) | graph was *unavailable* → **0.0656**, tax **−44%** | 100 (1 rep dipped) | 0.1777 | **WIN** — graph now earns its keep |
 | java | → 0.136 | 100 | 0.0729 | cost-LOSS, not fixed |
 | python | 0.0144 → 0.0152 | **0** | 0.0210 | recall-LOSS (model fails task) |
 | rust | → 0.041 | **25** | 0.0370 | recall-LOSS |
 
-php and scala are the cleanest demonstration of the **Wave 3b build fix**: both
-had a 100%-`graph_available=false` arm (the graph never finished building), so
-with-graph was just grep + a per-turn spec tax. With the graph now building in
-seconds and actually *available*, with-graph is **cheaper than its own no-graph
-arm** (php tax −19%, scala −75%) and well below the Codex baseline at 100%
-recall — the graph flips from pure overhead to a large net saving. This is the
-single highest-value result in the branch, and it only shows up once the graph
-is operational.
+php, scala, and dart are the cleanest demonstration of the **Wave 3b build fix**:
+all three had a 100%-`graph_available=false` arm (the graph never finished
+building), so with-graph was just grep + a per-turn spec tax. With the graph now
+building in seconds and actually *available* (verified `graph_available=True` in
+the new traces), with-graph is **cheaper than its own no-graph arm** (php tax
+−19%, scala −75%, dart −44%) and well below the Codex baseline at 100% recall —
+the graph flips from pure overhead to a large net saving on every previously
+graph-dead language. This is the single highest-value result in the branch, and
+it only shows up once the graph is operational. (dart shows one recall dip to
+28% across 3 reps — the flutter task is hard and noisy — but median recall is
+100; the cost saving is robust.)
 
 Three honest findings:
 
