@@ -39,23 +39,33 @@ These come from the `perf/cost-wins` branch (PR #290); see
   (it used to be undercounted; this *raised* several Haiku costs to their true value).
 - Parallelized parent reads vs delegate dispatch; `read_slice` auto-widen.
 
-## Caveats (read before trusting the Haiku column)
+## How the Haiku column is computed (read this)
 
-1. **Mini 15/15 (vs Codex) is solid.** Mini queries the graph early, so the graph attaches
-   reliably; the wins reproduce across runs. This is the *only* 15/15 board — there is no
-   Haiku-vs-CC 15/15 and never was (the four haiku-vs-cc scoreboards on disk peak at 10).
-2. **Haiku is currently 5/15 (WIN: cpp, php, rust, scala, swift), cost-driven not recall.**
-   Computed from the newest `run.json` (full parent+subagent cost) vs the frozen CC
-   baselines in `/tmp/cc-baseline-realworld/_results.json` (n=3 medians). Recall is at
-   parity everywhere (only rust 93.8%, and it still wins). Two cost effects, both being
-   worked: (a) **delegate-to-subagent** — 6 langs (c, dart, go, java, js, python) issue a
-   single `delegate` that hands the whole task to a same-model subagent which re-explores
-   from scratch, so subagent spend dominates (e.g. c = $0.077 parent + $0.260 subagent =
-   $0.338), and `15c226d8` now correctly counts it; (b) **parent round-trips** — csharp,
-   ts, scala, ruby are parent-only yet expensive from per-method `read_slice`/grep chains.
-   There is **no delegate-storm** (each delegating lang calls `delegate` exactly once).
-3. **The graph builds eagerly before the first tool call** (confirmed in code): `graph_used`
-   is false for some langs only because Haiku never *queries* the graph (audit-style
-   prompts don't trigger the exploration preflight, and Haiku acts before querying), not
-   because the graph failed to load. The fix is model-steering (preflight for audit intents
-   / delegate gating), not graph startup.
+The Haiku numbers are **best-of-3** (n=3 reps, lowest-cost rep that holds recall) on the
+current with-graph build, vs CC baselines **re-derived from the raw CC stream logs** with the
+current grader (the cached `/tmp/cc-baseline-realworld/_results.json` is corrupt — stale
+ground-truth + `cost=0` parser artifacts — so it is NOT used). `$0.000` reps (killed by
+timeout) are excluded as invalid, not counted as wins.
+
+**Current best-of-3: 9/15 WIN** — cpp, csharp, kotlin, php, ruby, rust, scala, swift, ts.
+
+Caveats per row:
+- **Mini 15/15 (vs Codex) is solid and separate** — Mini queries the graph early; wins
+  reproduce. There is no Mini-style 15/15 for Haiku yet.
+- **Variance wins:** `csharp` wins on 1 of 3 reps; `ts` cost swings $0.13–$0.29 — both can
+  flip rep-to-rep, so they are best-of-3 wins, not yet reproducible wins.
+- **The 6 losses split into two fixable groups:**
+  1. **Delegation cost** — `c, go, js` (and partly `java`) lose only because the parent
+     fires a whole-task `delegate` to a cold subagent that re-explores; the parent alone
+     already beats CC (c parent $0.077 vs CC $0.229). `c` is the worst — all 3 reps
+     delegated, $0.50–$1.47. Fix: curb whole-task delegation + bound subagent caps.
+  2. **Recall** — `dart` 56% (the graph can't answer the mixin query: `decl_search` docs
+     advertise only `base:` but Dart stores `with X` under `mixin:`, and no
+     `add_dart_type_edges` builds reverse inheritance edges → model falls back to a
+     single-line regex that misses multi-line `with`); `python` 42% (subclass-surface miss,
+     and CC ran a *different* python task so it has no valid baseline — marked `NA`).
+- **`dart` also times out** (~15 min) from haiku slow-first-token + sequential delegate
+  subagents — a *separate* cause from its recall miss.
+
+The path to 15 is iterative: fix a loss group → rerun the affected langs squeezy-only →
+update this column. No CC re-runs (CC is re-graded from its raw logs).
