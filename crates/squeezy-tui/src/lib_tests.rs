@@ -310,7 +310,13 @@ fn subagent_pane_overflow_marks_hidden_and_keeps_newest_reachable() {
 #[tokio::test]
 async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
+    // Live preview-on-highlight is an alternate-screen behavior (the transcript
+    // region re-renders in place). In inline mode highlighting only moves the
+    // selector and the conversation is opened via the overlay on Enter — see
+    // `enter_opens_full_screen_subagent_overlay_in_inline_mode`.
+    let mut config = test_config(SessionMode::Build);
+    config.tui.alternate_screen = TuiAlternateScreen::Always;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
     app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
     app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
 
@@ -354,6 +360,78 @@ async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
     .expect("return to main");
     assert_eq!(app.subagent_pane.active, ConversationSource::Main);
     assert!(!app.subagent_pane.focused);
+}
+
+#[tokio::test]
+async fn inline_down_midsentence_focuses_subagent_pane() {
+    // Down with a half-typed single-line draft (cursor mid-line) must reach the
+    // pane in inline mode — it used to require an empty composer.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.alternate_scroll_enabled, "default is inline");
+    app.note_subagent_started(9, "delegate".to_string(), "x".to_string());
+    app.input = "hello world".to_string();
+    app.input_cursor = 5;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.subagent_pane.focused,
+        "down mid-sentence must focus the pane"
+    );
+    assert_eq!(app.input, "hello world", "draft must be preserved");
+}
+
+#[tokio::test]
+async fn inline_plain_updown_iterate_history_even_with_a_draft() {
+    // Plain Up/Down iterate prompt history; a half-typed draft is stashed and
+    // restored when stepping back past the newest entry (shell-style).
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    push_input_history(&mut app, "first".to_string());
+    push_input_history(&mut app, "second".to_string());
+    app.input = "draft".to_string();
+    app.input_cursor = app.input.len();
+    let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, up()).await.unwrap();
+    assert_eq!(app.input, "second", "Up recalls newest even with a draft");
+    handle_key(&mut app, &mut agent, up()).await.unwrap();
+    assert_eq!(app.input, "first", "Up recalls older");
+    handle_key(&mut app, &mut agent, down()).await.unwrap();
+    assert_eq!(app.input, "second", "Down recalls newer");
+    handle_key(&mut app, &mut agent, down()).await.unwrap();
+    assert_eq!(
+        app.input, "draft",
+        "Down past newest restores the stashed draft"
+    );
+}
+
+#[tokio::test]
+async fn inline_down_in_history_steps_forward_not_into_pane() {
+    // While iterating history (not at the newest entry), Down steps forward
+    // through prompts; it must not jump into the subagent pane.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "x".to_string());
+    push_input_history(&mut app, "a".to_string());
+    push_input_history(&mut app, "b".to_string());
+    push_input_history(&mut app, "c".to_string());
+    let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, up()).await.unwrap(); // c
+    handle_key(&mut app, &mut agent, up()).await.unwrap(); // b
+    assert_eq!(app.input, "b");
+    handle_key(&mut app, &mut agent, down()).await.unwrap(); // -> c, NOT pane
+    assert_eq!(app.input, "c", "Down mid-history steps forward");
+    assert!(
+        !app.subagent_pane.focused,
+        "Down mid-history must not focus the pane"
+    );
 }
 
 #[tokio::test]
@@ -602,6 +680,179 @@ async fn delete_clears_finished_subagents_and_keeps_running_ones() {
     assert_eq!(app.subagent_pane.records.len(), 1);
     assert_eq!(app.subagent_pane.records[0].id, 2);
     assert_eq!(app.status, "cleared finished subagents");
+}
+
+#[tokio::test]
+async fn enter_opens_full_screen_subagent_overlay_in_inline_mode() {
+    // The default terminal mode is inline (alternate_screen = auto), where the
+    // conversation lives in scrollback that can't be repainted. Enter on a
+    // selected subagent must therefore open the full-screen overlay so the
+    // subagent's conversation is actually visible — the original bug was that
+    // selecting did nothing in this mode.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(
+        !app.alternate_scroll_enabled,
+        "default test config must be inline mode for this scenario"
+    );
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert_eq!(app.subagent_pane.selected, 1);
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "inline highlighting must not hijack the shown conversation (keyboard scroll stays on main)"
+    );
+    assert!(
+        app.transcript_overlay.is_none(),
+        "highlighting alone should not open the overlay yet"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open overlay");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Enter must open the full-screen view in inline mode"
+    );
+    assert!(!app.subagent_pane.focused);
+    let overlay = render_to_string(&app, 90, 16);
+    assert!(overlay.contains("delegate subagent"), "{overlay}");
+    assert!(overlay.contains("running grep"), "{overlay}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close overlay");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc closes the overlay in one press"
+    );
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "Esc backs all the way out to the main conversation"
+    );
+    assert!(!app.subagent_pane.focused);
+}
+
+#[tokio::test]
+async fn down_focuses_subagent_pane_with_a_nonempty_composer() {
+    // Regression: Down used to focus the pane only when the composer was
+    // empty, so any draft text trapped the selector below it.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.input = "half-typed prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+
+    assert!(
+        app.subagent_pane.focused,
+        "Down should reach the pane even with draft text in the composer"
+    );
+    assert_eq!(app.subagent_pane.selected, 1);
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "inline highlighting keeps the shown conversation on main until Enter"
+    );
+    assert_eq!(
+        app.input, "half-typed prompt",
+        "focusing the pane must not disturb the draft"
+    );
+}
+
+#[tokio::test]
+async fn down_reaches_pane_after_prompt_history_is_exhausted() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    push_input_history(&mut app, "first".to_string());
+    push_input_history(&mut app, "second".to_string());
+
+    // Up walks back into history, Down walks forward; the final Down past the
+    // newest entry steps out of history, and the next Down should fall through
+    // to the pane rather than dead-ending.
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, up()).await.expect("up");
+    assert_eq!(app.input, "second");
+    handle_key(&mut app, &mut agent, up()).await.expect("up");
+    assert_eq!(app.input, "first");
+    handle_key(&mut app, &mut agent, down())
+        .await
+        .expect("down");
+    assert_eq!(app.input, "second");
+    handle_key(&mut app, &mut agent, down())
+        .await
+        .expect("down");
+    assert!(app.input.is_empty(), "stepped out of history to the draft");
+    assert!(
+        !app.subagent_pane.focused,
+        "leaving history should not also jump straight into the pane"
+    );
+    handle_key(&mut app, &mut agent, down())
+        .await
+        .expect("down");
+    assert!(
+        app.subagent_pane.focused,
+        "Down once history is exhausted should focus the pane"
+    );
+}
+
+#[test]
+fn clearing_finished_subagents_keeps_highlight_on_shown_conversation() {
+    // Regression: `selected` (a row index) and `active` (a record id) are
+    // sourced independently. Dropping finished rows above the shown subagent
+    // shifts the vector, which used to leave the bold highlight on a different
+    // row than the ● "shown" marker.
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string()); // running
+    app.note_subagent_started(3, "explore".to_string(), "c".to_string()); // running
+
+    // View the middle (running) subagent #2, highlighted on row 2.
+    app.subagent_pane.active = ConversationSource::Subagent(2);
+    app.subagent_pane.selected = 2;
+
+    app.clear_finished_subagents();
+
+    assert_eq!(app.subagent_pane.records.len(), 2);
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(2));
+    assert_eq!(
+        app.subagent_pane.selected, 1,
+        "highlight must follow #2 to its new row after #1 was dropped"
+    );
 }
 
 #[test]
@@ -3523,13 +3774,25 @@ async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
     assert_eq!(app.input, "hi");
     assert_eq!(app.transcript_scroll_from_bottom, 0);
 
+    // ALT+Up recalls prompt history even with a draft present; the draft is
+    // stashed and restored when stepping back down past the newest entry.
     handle_key(
         &mut app,
         &mut agent,
         KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
     )
     .await
-    .expect("history up keeps draft");
+    .expect("history up recalls and stashes draft");
+
+    assert_eq!(app.input, "previous prompt");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+    )
+    .await
+    .expect("history down restores draft");
 
     assert_eq!(app.input, "hi");
 }
