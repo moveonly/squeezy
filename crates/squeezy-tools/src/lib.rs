@@ -35,7 +35,7 @@ pub use squeezy_mcp::{
     McpElicitationResponse, McpRefreshOutcome, McpServerStatus, McpStatusSnapshot,
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
-use squeezy_store::{Observation, ObservationKind, SqueezyStore};
+use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
     CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs,
     canonicalize_workspace_root, strip_verbatim_prefix,
@@ -194,25 +194,34 @@ pub(crate) const GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES: u64 = 5_000_000;
 /// `clippy::too_many_arguments` while leaving each tool config struct as the
 /// place to look for that tool's settings.
 ///
-/// `state_store` carries an already-open [`SqueezyStore`] when the caller wants
-/// the registry's graph manager to share persistence with the surrounding
-/// agent. redb enforces single-handle access per database file (verified by
-/// `state_store_open_rejects_a_second_handle_on_the_same_file`), so callers
-/// that also need the store outside the registry must open it once and pass
-/// the same `Arc` in here rather than open a parallel handle.
+/// `state_store` carries an already-open [`SqueezyStore`] for session-side
+/// persistence. Graph persistence is opened lazily by the registry against
+/// `graph.redb`, so session startup does not synchronously touch the large
+/// graph cache file.
 #[derive(Debug, Clone, Default)]
 pub struct ToolRegistryRuntime {
     /// Shared persistent state store. `None` disables graph persistence in
     /// the registry's `GraphManager` (matches the pre-persistence default).
     pub state_store: Option<Arc<SqueezyStore>>,
+    /// Optional cache root forwarded to the lazy graph store open.
+    pub graph_cache_root: Option<PathBuf>,
     /// Shared redactor used by tools that surface user-visible text.
     pub redactor: Arc<Redactor>,
 }
 
 impl ToolRegistryRuntime {
     pub fn new(state_store: Option<Arc<SqueezyStore>>, redactor: Arc<Redactor>) -> Self {
+        Self::new_with_graph_cache_root(state_store, redactor, None)
+    }
+
+    pub fn new_with_graph_cache_root(
+        state_store: Option<Arc<SqueezyStore>>,
+        redactor: Arc<Redactor>,
+        graph_cache_root: Option<PathBuf>,
+    ) -> Self {
         Self {
-            state_store: state_store.clone(),
+            state_store,
+            graph_cache_root,
             redactor,
         }
     }
@@ -1138,6 +1147,7 @@ impl ToolRegistry {
     ) -> Result<Self> {
         let ToolRegistryRuntime {
             state_store,
+            graph_cache_root,
             redactor,
         } = runtime;
         let full_access = config.full_access;
@@ -1166,13 +1176,21 @@ impl ToolRegistry {
                 let graph_ready = Arc::clone(&graph_ready);
                 let root_for_graph = root.clone();
                 let crawl_options_for_graph = crawl_options.clone();
-                let state_store_for_graph = state_store.clone();
+                let graph_cache_root_for_graph = graph_cache_root.clone();
+                let persist_graph = state_store.is_some();
                 handle.spawn_blocking(move || {
+                    let graph_store = persist_graph
+                        .then(|| {
+                            GraphStore::open(&root_for_graph, graph_cache_root_for_graph.as_deref())
+                                .ok()
+                                .map(Arc::new)
+                        })
+                        .flatten();
                     let opened = GraphManager::open_with_store(
                         &root_for_graph,
                         Default::default(),
                         crawl_options_for_graph,
-                        state_store_for_graph,
+                        graph_store,
                     )
                     .ok();
                     if let Ok(mut slot) = graph.lock() {
@@ -1186,11 +1204,19 @@ impl ToolRegistry {
                 });
             }
             Err(_) => {
+                let graph_store = state_store
+                    .is_some()
+                    .then(|| {
+                        GraphStore::open(&root, graph_cache_root.as_deref())
+                            .ok()
+                            .map(Arc::new)
+                    })
+                    .flatten();
                 let opened = GraphManager::open_with_store(
                     &root,
                     Default::default(),
                     crawl_options.clone(),
-                    state_store.clone(),
+                    graph_store,
                 )
                 .ok();
                 if let Ok(mut slot) = graph.lock() {

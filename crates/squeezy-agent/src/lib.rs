@@ -1538,16 +1538,19 @@ impl Agent {
                 .redactor()
                 .expect("validated redaction config must compile"),
         );
-        // Open the persistent state store exactly once and share the handle
-        // with the tool registry. redb only allows a single live `Database`
-        // per file (see `state_store_open_rejects_a_second_handle_on_the_same_file`),
-        // so the registry's graph manager must reuse this handle instead of
-        // opening its own — otherwise the second open would fail silently
-        // and graph partitions would never be persisted.
+        // Open only the small session-side state store synchronously. The
+        // graph cache lives in `graph.redb` and is opened by the registry's
+        // deferred graph task so a large semantic cache cannot block prompt
+        // entry during session startup.
         let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
             .ok()
             .map(Arc::new);
-        if let Some(store) = store.as_deref() {
+        if let Some(store) = store.clone() {
+            // Pruning expired compaction checkpoints is a best-effort GC
+            // write transaction; nothing on the input path depends on it.
+            // Run it on the blocking pool (when a runtime is present) so the
+            // redb write never gates prompt entry. Sync construction
+            // contexts (tests, no current runtime) keep the inline prune.
             let now: u128 = unix_timestamp_millis() as u128;
             let ttl_ms: u128 = (squeezy_store::DEFAULT_COMPACTION_CHECKPOINT_RETENTION_DAYS
                 as u128)
@@ -1556,15 +1559,27 @@ impl Agent {
                 * 60
                 * 1_000;
             let cutoff = now.saturating_sub(ttl_ms);
-            if let Err(err) = store.prune_compaction_checkpoints(cutoff) {
-                tracing::warn!(
-                    target: "squeezy::store",
-                    error = %err,
-                    "failed to prune compaction_checkpoints; old entries may persist",
-                );
+            let prune = move || {
+                if let Err(err) = store.prune_compaction_checkpoints(cutoff) {
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        error = %err,
+                        "failed to prune compaction_checkpoints; old entries may persist",
+                    );
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(prune);
+                }
+                Err(_) => prune(),
             }
         }
-        let registry_runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
+        let registry_runtime = ToolRegistryRuntime::new_with_graph_cache_root(
+            store.clone(),
+            redactor.clone(),
+            config.cache.root.clone(),
+        );
         let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
             ToolRuntimeConfig {

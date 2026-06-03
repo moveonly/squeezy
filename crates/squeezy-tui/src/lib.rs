@@ -45,8 +45,8 @@ use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    SessionResumePicker, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
-    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
+    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
     TuiSynchronizedOutput, TurnMetrics, context_attachment_storage_text,
     detect_context_attachment_kind, detect_image_mime,
 };
@@ -104,7 +104,7 @@ pub mod testing;
 pub(crate) use events::apply_mcp_status_update;
 pub(crate) use events::{
     drain_agent_events, drain_job_events, drain_pending_diff, drain_pending_mention_walk,
-    drain_plan_housekeeping,
+    drain_plan_housekeeping, drain_repo_status,
 };
 #[cfg(test)]
 pub(crate) use input::set_input;
@@ -610,10 +610,10 @@ pub async fn run_with_startup_profile_in_terminal(
 }
 
 pub fn startup_resume_question_available(config: &AppConfig) -> bool {
-    if config.session_resume_picker == SessionResumePicker::Never {
-        return false;
-    }
-    let candidates = resume_picker::load_candidates(config);
+    // Only a yes/no answer is needed here, so use the summary-only loader:
+    // skip the per-candidate event-log reads that `load_candidates` does for
+    // branch detection (the picker itself still does them when it renders).
+    let candidates = resume_picker::load_candidate_summaries(config);
     resume_picker::has_scoped_candidates(&candidates, &config.workspace_root)
 }
 
@@ -649,7 +649,7 @@ async fn run_inner(
 }
 
 async fn run_inner_with_terminal(
-    config: AppConfig,
+    mut config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     resume_session_id: Option<String>,
     startup: StartupProfile,
@@ -663,6 +663,19 @@ async fn run_inner_with_terminal(
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
             ResumeStartup::Use(id) => Some(id),
+            ResumeStartup::UseInDir {
+                session_id,
+                workspace_root,
+            } => {
+                // Re-root everything (session store, tools, graph, git) at the
+                // session's own directory so it opens exactly as if launched
+                // there. `set_current_dir` best-effort matches subprocess cwd;
+                // `workspace_root` is the authoritative knob the agent reads.
+                let _ = std::env::set_current_dir(&workspace_root);
+                config.workspace_root = workspace_root;
+                apply_theme_overrides(&config);
+                Some(session_id)
+            }
             ResumeStartup::Fresh => None,
             ResumeStartup::BackToSetup => {
                 return Ok((StartupRunOutcome::BackToSetup, Some(terminal)));
@@ -679,12 +692,14 @@ async fn run_inner_with_terminal(
     } else {
         "Starting session…"
     };
+    squeezy_core::startup_trace::mark("tui_placeholder_drawn");
     let _ = terminal.draw_startup_placeholder(startup_message);
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
         Agent::resume(config.clone(), provider, &session_id)?
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };
+    squeezy_core::startup_trace::mark("agent_built");
     // Plan housekeeping (legacy migration + git-referenced protection +
     // retention pruning) is best-effort maintenance: the 30-day `git
     // log` shell-out and the plan-dir fs walks add tens-to-hundreds of
@@ -739,8 +754,20 @@ async fn run_inner_with_terminal(
         agent.session_mode(),
         startup,
     );
+    squeezy_core::startup_trace::mark("tuiapp_new");
     app.session_id = session_id_for_plans;
     app.plan_housekeeping_rx = Some(plan_housekeeping_rx);
+    // Probe repo status (git worktree snapshot + `gh pr view` + branch
+    // diff) on the blocking pool instead of in `TuiApp::new`. Those
+    // subprocesses — the `gh` network call especially — were the single
+    // largest contributor to time-to-interactive; nothing on the input
+    // path depends on the result, so the status bar fills in once it lands.
+    let (repo_status_tx, repo_status_rx) = oneshot::channel::<RepoStatus>();
+    let repo_status_root = config.workspace_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = repo_status_tx.send(RepoStatus::detect_at(&repo_status_root));
+    });
+    app.repo_status_rx = Some(repo_status_rx);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -762,16 +789,19 @@ async fn run_inner_with_terminal(
     }
     terminal.set_exit_hint(exit_hint(agent.session_id().as_deref()));
 
+    squeezy_core::startup_trace::mark("snapshots_done");
     let mut settings_watcher = settings_watcher::SettingsWatcher::new();
     // Poll mtimes roughly once per second; tick_rate defaults to 50ms.
     let settings_poll_every = (1000 / config.tick_rate.as_millis().max(1) as u64).max(1);
     let mut frame_limiter = FrameRateLimiter::default();
+    let mut interactive_marked = false;
 
     loop {
         // Drain producers first so the next draw reflects everything that
         // has landed since the previous iteration. A flurry of events
         // therefore coalesces into a single frame.
         drain_plan_housekeeping(&mut app);
+        drain_repo_status(&mut app);
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
         if app.auto_drain_queue {
@@ -839,6 +869,10 @@ async fn run_inner_with_terminal(
             terminal.draw_app(&mut app)?;
             app.needs_redraw = false;
             frame_limiter.mark_emitted(now);
+            if !interactive_marked {
+                interactive_marked = true;
+                squeezy_core::startup_trace::mark("interactive_ready");
+            }
         }
 
         // Bound the input poll so a deferred draw wakes promptly when the
@@ -868,6 +902,13 @@ async fn run_inner_with_terminal(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeStartup {
     Use(String),
+    /// Resume a session that belongs to a different directory: re-root the
+    /// workspace at `workspace_root` so the agent, tools, and graph all open
+    /// there, exactly as if `squeezy` had been launched from that directory.
+    UseInDir {
+        session_id: String,
+        workspace_root: PathBuf,
+    },
     Fresh,
     BackToSetup,
     Quit,
@@ -888,9 +929,6 @@ fn maybe_pick_resume_session(
     if startup.skip_resume_picker {
         return Ok(ResumeStartup::Fresh);
     }
-    if config.session_resume_picker == SessionResumePicker::Never {
-        return Ok(ResumeStartup::Fresh);
-    }
     let candidates = resume_picker::load_candidates(config);
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
@@ -906,10 +944,7 @@ fn maybe_pick_resume_session(
     )
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
-        resume_picker::ResumeChoice::StartFresh { suppress } => {
-            persist_resume_picker_suppression(config, suppress)?;
-            Ok(ResumeStartup::Fresh)
-        }
+        resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         // `branch_tip` is captured by the picker but not yet wired through
         // the resume flow — the agent restarts at the most recent event in
         // the session log. Branch-aware resume is a follow-up; the
@@ -923,41 +958,24 @@ fn maybe_pick_resume_session(
             session_id,
             target_cwd,
         } => {
-            // Silently switching cwd would surprise users juggling sibling
-            // repos; instead exit with the exact recommended invocation in
-            // the exit hint so they can re-run from the target directory.
-            terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
-            Ok(ResumeStartup::Quit)
+            // The user explicitly picked this session, so open it in place by
+            // re-rooting at its directory. If that directory no longer exists
+            // (repo moved or deleted) fall back to the exit hint rather than
+            // resuming against a missing tree.
+            let workspace_root = PathBuf::from(&target_cwd);
+            if workspace_root.is_dir() {
+                Ok(ResumeStartup::UseInDir {
+                    session_id,
+                    workspace_root,
+                })
+            } else {
+                terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
+                Ok(ResumeStartup::Quit)
+            }
         }
         resume_picker::ResumeChoice::Back => Ok(ResumeStartup::BackToSetup),
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
-}
-
-fn persist_resume_picker_suppression(
-    config: &AppConfig,
-    suppress: resume_picker::ResumePickerSuppress,
-) -> Result<()> {
-    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
-
-    if !suppress.project && !suppress.user {
-        return Ok(());
-    }
-    let edit = SettingsEdit {
-        path: &["session", "resume_picker"],
-        op: EditOp::SetString(SessionResumePicker::Never.as_str().to_string()),
-    };
-    if suppress.project {
-        let path = squeezy_core::per_repo_settings_path(&config.workspace_root);
-        apply_edits(&SettingsScope::repo(&path), std::slice::from_ref(&edit))
-            .map_err(|err| SqueezyError::Config(err.to_string()))?;
-    }
-    if suppress.user {
-        let path = squeezy_core::default_settings_path();
-        apply_edits(&SettingsScope::user(&path), &[edit])
-            .map_err(|err| SqueezyError::Config(err.to_string()))?;
-    }
-    Ok(())
 }
 
 /// Format the exit hint printed when the user picks a cross-project
@@ -12232,6 +12250,8 @@ fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
 fn status_left_text(app: &TuiApp) -> String {
     let branch = if app.repo.available {
         app.repo.branch.as_deref().unwrap_or("detached")
+    } else if app.repo.pending {
+        "…"
     } else {
         "no repo"
     };
@@ -13023,11 +13043,19 @@ struct RepoStatus {
     /// `(added, removed)` line counts of the current branch relative to
     /// the repository's default branch. Populated via `git diff --shortstat`.
     branch_changes: Option<(u32, u32)>,
+    /// The background probe (git snapshot + `gh pr view` + `git diff`) has
+    /// not landed yet. `RepoStatus::detect` runs off the startup path so the
+    /// prompt is interactive immediately; the status bar shows a neutral
+    /// placeholder until [`drain_repo_status`] swaps in the real result.
+    pending: bool,
 }
 
 impl RepoStatus {
-    fn detect(config: &AppConfig) -> Self {
-        let Ok(vcs) = GitVcs::open(&config.workspace_root) else {
+    /// Run the repo-status probes against `workspace_root`. Spawns git/`gh`
+    /// subprocesses, so callers must keep this off the latency-critical
+    /// startup path (see the deferral in `run_inner_with_terminal`).
+    fn detect_at(workspace_root: &std::path::Path) -> Self {
+        let Ok(vcs) = GitVcs::open(workspace_root) else {
             return Self::none();
         };
         let snapshot = vcs.snapshot(DiffMode::Worktree, DiffOptions::default());
@@ -13040,8 +13068,8 @@ impl RepoStatus {
             .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head)));
         let pull_request = branch
             .as_deref()
-            .and_then(|b| probe_pull_request(&config.workspace_root, b));
-        let branch_changes = probe_branch_changes(&config.workspace_root);
+            .and_then(|b| probe_pull_request(workspace_root, b));
+        let branch_changes = probe_branch_changes(workspace_root);
         Self {
             branch,
             changed_files: snapshot.summary.files_changed,
@@ -13049,6 +13077,7 @@ impl RepoStatus {
             available: true,
             pull_request,
             branch_changes,
+            pending: false,
         }
     }
 
@@ -13060,6 +13089,18 @@ impl RepoStatus {
             available: false,
             pull_request: None,
             branch_changes: None,
+            pending: false,
+        }
+    }
+
+    /// Neutral placeholder shown while the real probe runs in the
+    /// background. Distinct from [`none`] (which means "checked, not a git
+    /// repo") so the status bar can render a quiet "…" instead of the
+    /// misleading "no repo" during the sub-second probe window.
+    fn pending() -> Self {
+        Self {
+            pending: true,
+            ..Self::none()
         }
     }
 
@@ -13551,6 +13592,11 @@ pub(crate) struct TuiApp {
     /// `prune_plan_dir`). Moved off the boot path so a 30-day `git log`
     /// shell-out and any plan-dir fs walks don't gate the first frame.
     pub(crate) plan_housekeeping_rx: Option<oneshot::Receiver<Vec<String>>>,
+    /// Receives the result of the deferred `RepoStatus::detect` probe (git
+    /// worktree snapshot + `gh pr view` + `git diff --shortstat`). Those
+    /// subprocesses dominate time-to-interactive, so they run off the boot
+    /// path and the status bar shows a neutral placeholder until this lands.
+    pub(crate) repo_status_rx: Option<oneshot::Receiver<RepoStatus>>,
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
@@ -13834,7 +13880,11 @@ impl TuiApp {
                 set_shell_diff_inline(config.tui.shell_diff_inline);
                 config.tui.shell_diff_inline
             },
-            repo: RepoStatus::detect(config),
+            // The repo status (branch, changed files, PR number, branch
+            // diff) is built from git + `gh` subprocesses that dominate
+            // time-to-interactive; start neutral and let the background
+            // probe spawned in `run_inner_with_terminal` fill it in.
+            repo: RepoStatus::pending(),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
@@ -13923,6 +13973,7 @@ impl TuiApp {
             jobs: BTreeMap::new(),
             notifications: VecDeque::new(),
             plan_housekeeping_rx: None,
+            repo_status_rx: None,
             cancel: None,
             pending_approval: None,
             approval_selection_index: 0,

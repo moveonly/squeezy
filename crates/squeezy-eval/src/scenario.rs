@@ -199,6 +199,10 @@ pub struct SqueezyOverlay {
     /// batching reduces a tier's round-trip-driven cost.
     pub batch_tool_calls_hint: Option<bool>,
     pub instructions: Option<String>,
+    /// Override `AppConfig.cache.root`. Relative paths stay workspace-relative,
+    /// which lets fixtures carry a cache directory without using ignored
+    /// `.squeezy/cache` paths.
+    pub cache_root: Option<PathBuf>,
     pub max_output_tokens: Option<u32>,
     /// Override `AppConfig.max_tool_calls_per_turn` — squeezy's live
     /// per-turn tool-call cap (default 64). Scenarios that probe planner

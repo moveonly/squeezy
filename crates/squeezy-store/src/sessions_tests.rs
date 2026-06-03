@@ -10,7 +10,7 @@ use squeezy_core::{
 };
 
 use crate::{
-    BugReportOptions, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
+    BugReportOptions, GraphStore, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
     StoredReadSnapshot, StoredToolReceipt,
 };
 
@@ -890,9 +890,10 @@ fn cleanup_excluding_skips_protected_session() {
 }
 
 #[test]
-fn state_store_round_trips_graph_receipts_and_observations() {
+fn state_and_graph_stores_round_trip_split_cache_data() {
     let root = temp_root("state-round-trip");
     let store = SqueezyStore::open(&root, None).expect("open store");
+    let graph_store = GraphStore::open(&root, None).expect("open graph store");
 
     let metadata = GraphStoreMetadata {
         workspace_root: root.display().to_string(),
@@ -900,14 +901,19 @@ fn state_store_round_trips_graph_receipts_and_observations() {
         language_registry_version: "langs".to_string(),
         graph_format_version: 1,
     };
-    store.set_graph_metadata(&metadata).expect("set metadata");
-    assert_eq!(store.graph_metadata().expect("metadata"), Some(metadata));
+    graph_store
+        .set_graph_metadata(&metadata)
+        .expect("set metadata");
+    assert_eq!(
+        graph_store.graph_metadata().expect("metadata"),
+        Some(metadata)
+    );
 
     let file_id = FileId::new("src/lib.rs");
-    store
+    graph_store
         .put_graph_partition(&file_id, &serde_json::json!({"hash": "abc"}))
         .expect("put partition");
-    let partition: serde_json::Value = store
+    let partition: serde_json::Value = graph_store
         .graph_partition(&file_id)
         .expect("partition")
         .expect("partition exists");
@@ -1055,11 +1061,9 @@ fn state_store_schema_mismatch_backs_up_old_database_without_data_loss() {
 
     let store = SqueezyStore::open(&root, None).expect("open store");
     assert_eq!(
-        store
-            .graph_metadata()
-            .expect("metadata")
-            .map(|metadata| metadata.graph_format_version),
-        None
+        store.tool_receipts().expect("receipts"),
+        Vec::<StoredToolReceipt>::new(),
+        "new state store should open after the old schema is backed up"
     );
     assert!(
         fs::read_dir(state.parent().unwrap())
@@ -3599,4 +3603,70 @@ fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
     assert_eq!(value.get("k").and_then(|v| v.as_str()), Some("third"));
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn global_index_caps_to_most_recent_and_compacts_oversized_file() {
+    let home = temp_root("global-index-cap");
+    with_home(&home, || {
+        // More distinct sessions than the cap, with enough bytes to clear the
+        // compaction threshold. Dedup alone can never shrink this (every id is
+        // unique), so without the count cap the file would be rewritten whole
+        // on every read — the exact pathology this guards.
+        let total = GLOBAL_INDEX_MAX_ENTRIES + 1_500;
+        for i in 0..total {
+            let entry = GlobalSessionIndexEntry {
+                session_id: format!("session-{i:06}"),
+                cwd: "/Users/dev/projects/example-workspace".to_string(),
+                workspace_root: "/Users/dev/projects/example-workspace".to_string(),
+                repo_root: None,
+                title: Some("recent task summary placeholder".to_string()),
+                display_name: None,
+                started_at_ms: i as u64,
+                last_event_at_ms: i as u64,
+                turn_count: 1,
+                resume_available: true,
+            };
+            SessionStore::append_global_index_entry(&entry);
+        }
+        let path = SessionStore::global_index_path().expect("HOME set");
+        assert!(
+            fs::metadata(&path).expect("index exists").len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES,
+            "test fixture must exceed the compaction threshold"
+        );
+
+        // Invariants asserted rather than exact ids: other suite tests create
+        // sessions without taking `HOME_LOCK`, so a concurrent real append can
+        // land in this temp index. The cap, compaction, and ordering hold
+        // regardless of such interlopers.
+        let listed = SessionStore::list_global_index();
+        assert_eq!(
+            listed.len(),
+            GLOBAL_INDEX_MAX_ENTRIES,
+            "read must cap to the most-recent N"
+        );
+        assert!(
+            listed
+                .windows(2)
+                .all(|pair| pair[0].started_at_ms >= pair[1].started_at_ms),
+            "entries are returned newest-first"
+        );
+        // The read compacted the oversized file down to ~cap (far below the
+        // `total` we wrote). A small margin tolerates a concurrent real append
+        // landing after our compaction; the point is that it is bounded near
+        // the cap, not unbounded with history.
+        let lines = fs::read_to_string(&path)
+            .expect("read index")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert!(
+            lines <= GLOBAL_INDEX_MAX_ENTRIES + 64 && lines < total,
+            "oversized index compacted near the cap on read (got {lines})"
+        );
+        assert_eq!(
+            SessionStore::list_global_index().len(),
+            GLOBAL_INDEX_MAX_ENTRIES
+        );
+    });
 }

@@ -15,6 +15,7 @@ use thiserror::Error;
 pub mod config_schema;
 mod hardening;
 pub mod settings_writer;
+pub mod startup_trace;
 pub use hardening::pre_main_hardening;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";

@@ -20,7 +20,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
 };
 use squeezy_core::{AppConfig, SqueezyError};
 use squeezy_store::{
@@ -28,9 +31,10 @@ use squeezy_store::{
     detect_branches,
 };
 
-/// Maximum number of sessions shown in the overlay. Keep small — the user
-/// is choosing one of "most recent" and a longer list is just noise.
-pub(crate) const MAX_PICKER_ENTRIES: usize = 5;
+/// Maximum number of sessions shown in the overlay, newest-first. The picker
+/// is opt-in (`--resume`) and scrolls, so the user came here deliberately to
+/// hunt for a session — show a deep list rather than an arbitrarily short one.
+pub(crate) const MAX_PICKER_ENTRIES: usize = 100;
 
 /// Sessions started within this window of `now_ms` are considered for the
 /// resume picker. Older sessions can still be reached via
@@ -171,9 +175,7 @@ impl SessionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeChoice {
-    StartFresh {
-        suppress: ResumePickerSuppress,
-    },
+    StartFresh,
     Resume {
         session_id: String,
         /// When `Some(sequence)`, the user picked a branch tip in a
@@ -182,22 +184,16 @@ pub(crate) enum ResumeChoice {
         /// (the common case), where the resume flow is unchanged.
         branch_tip: Option<u64>,
     },
-    /// Selected session lives outside the current cwd. The TUI exits without
-    /// chdir-ing and surfaces the `squeezy sessions resume <id>` invocation
-    /// the user should run from `target_cwd` — silently relocating the
-    /// process would surprise users juggling sibling repos.
+    /// Selected session lives outside the current cwd. The caller re-roots the
+    /// workspace at `target_cwd` and resumes in place; only if that directory
+    /// is gone does it fall back to surfacing the `squeezy sessions resume
+    /// <id>` invocation to run from there.
     CrossProject {
         session_id: String,
         target_cwd: String,
     },
     Back,
     Quit,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ResumePickerSuppress {
-    pub(crate) project: bool,
-    pub(crate) user: bool,
 }
 
 /// One selectable row in the picker. Linear sessions produce a single
@@ -269,6 +265,7 @@ fn filter_inner(
     let mut out: Vec<SessionSummary> = sessions
         .iter()
         .filter(|meta| meta.resume_available)
+        .filter(|meta| session_metadata_has_resume_content(meta))
         .filter(|meta| now_ms.saturating_sub(meta.started_at_ms) <= RECENT_WINDOW_MS)
         .filter(|meta| extra(meta))
         .map(SessionSummary::from_metadata)
@@ -297,6 +294,9 @@ pub(crate) fn merge_candidates_for_picker(
         if !meta.resume_available {
             continue;
         }
+        if !session_metadata_has_resume_content(meta) {
+            continue;
+        }
         if now_ms.saturating_sub(meta.started_at_ms) > RECENT_WINDOW_MS {
             continue;
         }
@@ -307,6 +307,9 @@ pub(crate) fn merge_candidates_for_picker(
     }
     for entry in global {
         if !entry.resume_available {
+            continue;
+        }
+        if !global_index_entry_has_resume_content(entry) {
             continue;
         }
         if now_ms.saturating_sub(entry.started_at_ms) > RECENT_WINDOW_MS {
@@ -320,6 +323,23 @@ pub(crate) fn merge_candidates_for_picker(
     out.sort_by_key(|summary| std::cmp::Reverse(summary.started_at_ms));
     out.truncate(MAX_PICKER_ENTRIES);
     out
+}
+
+fn nonblank(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn session_metadata_has_resume_content(meta: &SessionMetadata) -> bool {
+    meta.metrics.turns > 0
+        || nonblank(meta.first_user_task.as_deref())
+        || nonblank(meta.latest_summary.as_deref())
+        || nonblank(meta.display_name.as_deref())
+}
+
+fn global_index_entry_has_resume_content(entry: &GlobalSessionIndexEntry) -> bool {
+    entry.turn_count > 0
+        || nonblank(entry.title.as_deref())
+        || nonblank(entry.display_name.as_deref())
 }
 
 /// State machine driving the picker. Pure — owns no IO.
@@ -336,8 +356,6 @@ pub(crate) struct ResumePickerState {
     all_sessions: Vec<SessionSummary>,
     pub(crate) cursor: usize,
     pub(crate) show_all_projects: bool,
-    pub(crate) never_project: bool,
-    pub(crate) never_user: bool,
     setup_progress: Option<(usize, usize)>,
     cwd: PathBuf,
 }
@@ -363,8 +381,6 @@ impl ResumePickerState {
             all_sessions,
             cursor: 0,
             show_all_projects: false,
-            never_project: false,
-            never_user: false,
             setup_progress,
             cwd,
         }
@@ -377,25 +393,13 @@ impl ResumePickerState {
     /// Number of selectable rows in the list — the leading "Start fresh"
     /// row plus every candidate.
     fn row_count(&self) -> usize {
-        self.candidates.len() + 3
+        self.candidates.len() + 1
     }
 
     /// Index of the "Start fresh" row — always 0 so the safe default is
     /// pre-selected when the picker opens.
     pub(crate) const fn start_fresh_index(&self) -> usize {
         0
-    }
-
-    fn project_checkbox_index(&self) -> usize {
-        self.candidates.len() + 1
-    }
-
-    fn user_checkbox_index(&self) -> usize {
-        self.candidates.len() + 2
-    }
-
-    fn cursor_on_checkbox(&self) -> bool {
-        self.cursor == self.project_checkbox_index() || self.cursor == self.user_checkbox_index()
     }
 
     /// Flip the project scope and re-derive `candidates`. The cursor is
@@ -414,12 +418,7 @@ impl ResumePickerState {
 
     fn select_at_cursor(&self) -> Option<ResumeChoice> {
         if self.cursor == self.start_fresh_index() {
-            return Some(ResumeChoice::StartFresh {
-                suppress: self.suppress_choice(),
-            });
-        }
-        if self.cursor_on_checkbox() {
-            return None;
+            return Some(ResumeChoice::StartFresh);
         }
         // candidate rows live at indices 1..=N.
         let entry = self.candidates.get(self.cursor - 1)?;
@@ -435,31 +434,6 @@ impl ResumePickerState {
                 target_cwd: entry.summary.cwd.clone(),
             })
         }
-    }
-
-    fn suppress_choice(&self) -> ResumePickerSuppress {
-        ResumePickerSuppress {
-            project: self.never_project || self.never_user,
-            user: self.never_user,
-        }
-    }
-
-    fn toggle_at_cursor(&mut self) -> bool {
-        if self.cursor == self.project_checkbox_index() {
-            self.never_project = !self.never_project;
-            if !self.never_project {
-                self.never_user = false;
-            }
-            return true;
-        }
-        if self.cursor == self.user_checkbox_index() {
-            self.never_user = !self.never_user;
-            if self.never_user {
-                self.never_project = true;
-            }
-            return true;
-        }
-        false
     }
 
     pub(crate) fn dispatch(&mut self, key: KeyEvent) -> Option<ResumeChoice> {
@@ -486,21 +460,9 @@ impl ResumePickerState {
             (KeyCode::Left, _) | (KeyCode::Backspace, _) if self.can_go_back() => {
                 Some(ResumeChoice::Back)
             }
-            (KeyCode::Char(' '), _) => {
-                self.toggle_at_cursor();
-                None
-            }
-            (KeyCode::Enter, _) => {
-                if self.toggle_at_cursor() {
-                    None
-                } else {
-                    self.select_at_cursor()
-                }
-            }
+            (KeyCode::Enter, _) => self.select_at_cursor(),
             (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
-                Some(ResumeChoice::StartFresh {
-                    suppress: self.suppress_choice(),
-                })
+                Some(ResumeChoice::StartFresh)
             }
             (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => Some(ResumeChoice::Quit),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(ResumeChoice::Quit),
@@ -546,7 +508,11 @@ fn expand_entries(summaries: Vec<SessionSummary>) -> Vec<PickerEntry> {
 /// snapshots so sibling-repo sessions surface alongside the local ones.
 /// On error we log to stderr and start fresh — the picker is a
 /// convenience, not a hard dependency.
-pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
+/// Build the picker candidate list (scoped + recency-filtered + capped)
+/// without the per-candidate event-log reads. Callers that only need the
+/// set of recent sessions — e.g. the startup gate deciding whether to offer
+/// a resume question — use this to avoid touching `events.jsonl` at all.
+pub(crate) fn load_candidate_summaries(config: &AppConfig) -> Vec<SessionSummary> {
     let store = SessionStore::open(config);
     let local = match store.list(&SessionQuery::default()) {
         Ok(sessions) => sessions,
@@ -558,7 +524,12 @@ pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
     };
     let global = SessionStore::list_global_index();
     let now_ms = current_unix_ms();
-    let mut summaries = merge_candidates_for_picker(&local, &global, now_ms);
+    merge_candidates_for_picker(&local, &global, now_ms)
+}
+
+pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
+    let store = SessionStore::open(config);
+    let mut summaries = load_candidate_summaries(config);
     // Branch detection requires reading each candidate's event log. The
     // list is already capped so this stays cheap on cold start; we
     // silently ignore read errors because the picker is a convenience
@@ -596,9 +567,7 @@ pub(crate) fn run_picker<W: io::Write>(
         ResumePickerState::new(all_sessions, cwd)
     };
     if state.candidates.is_empty() {
-        return Ok(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress::default(),
-        });
+        return Ok(ResumeChoice::StartFresh);
     }
     loop {
         terminal.draw(|frame| render_picker(frame, &state))?;
@@ -705,10 +674,28 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     .alignment(Alignment::Left);
     frame.render_widget(intro, layout[1]);
 
+    let cwd_str = state.cwd.display().to_string();
+    // Resolve the viewport first: the list scrolls so the cursor stays on
+    // screen, and a scrollbar steals a column when it overflows. Knowing the
+    // real content width up front lets candidate labels ellipsise to fit
+    // instead of hard-cropping into the scrollbar.
+    let list_area = layout[3];
+    let visible = list_area.height.max(1) as usize;
+    let total = state.candidates.len() + 1; // Start fresh + candidates
+    let (body_area, scrollbar_area) = if total > visible {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(list_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (list_area, None)
+    };
+    let content_width = body_area.width as usize;
+
     // Start fresh leads the list as the safe default (cursor opens on it),
     // followed by each candidate session at index 1..=N.
-    let cwd_str = state.cwd.display().to_string();
-    let mut rows: Vec<Line<'_>> = Vec::with_capacity(state.candidates.len() + 3);
+    let mut rows: Vec<Line<'_>> = Vec::with_capacity(total);
     rows.push(render_start_fresh_row(
         state.cursor == state.start_fresh_index(),
     ));
@@ -716,21 +703,48 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         // candidates start at row 1; active row uses the cursor offset.
         let row_idx = idx + 1;
         let cross_project = entry.summary.cwd != cwd_str;
-        render_candidate_row(idx, entry, row_idx == state.cursor, cross_project)
+        render_candidate_row(entry, row_idx == state.cursor, cross_project, content_width)
     }));
-    rows.push(render_checkbox_row(
-        "Never ask again for this project",
-        state.never_project || state.never_user,
-        state.cursor == state.project_checkbox_index(),
-    ));
-    rows.push(render_checkbox_row(
-        "Never ask again for this user",
-        state.never_user,
-        state.cursor == state.user_checkbox_index(),
-    ));
 
-    let body = Paragraph::new(rows).wrap(Wrap { trim: false });
-    frame.render_widget(body, layout[3]);
+    let offset = if total <= visible {
+        0
+    } else {
+        state
+            .cursor
+            .saturating_sub(visible / 2)
+            .min(total - visible)
+    };
+    frame.render_widget(Paragraph::new(rows).scroll((offset as u16, 0)), body_area);
+    if let Some(sb_area) = scrollbar_area {
+        let mut sb_state = ScrollbarState::new(total).position(state.cursor);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            sb_area,
+            &mut sb_state,
+        );
+    }
+
+    // When the highlighted row is a session from another directory, spell out
+    // that confirming will switch into that directory before resuming — the
+    // inline `↪ project` marker can be truncated on a narrow terminal, this
+    // line is not.
+    if let Some(entry) = state
+        .cursor
+        .checked_sub(1)
+        .and_then(|idx| state.candidates.get(idx))
+        && entry.summary.cwd != cwd_str
+    {
+        let hint = Line::from(vec![
+            Span::styled(" ↪ ", Style::default().fg(crate::render::theme::accent())),
+            Span::styled(
+                format!("Enter switches to {} and resumes there", entry.summary.cwd),
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint), layout[4]);
+    }
 
     let tab_hint = if state.show_all_projects {
         "this dir"
@@ -749,15 +763,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             Style::default().fg(crate::render::theme::secondary()),
         ),
         Span::styled(
-            "confirm/toggle  ",
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-        Span::styled(
-            "Space ",
-            Style::default().fg(crate::render::theme::secondary()),
-        ),
-        Span::styled(
-            "toggle  ",
+            "confirm  ",
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]));
@@ -800,10 +806,10 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
 }
 
 fn render_candidate_row(
-    _idx: usize,
     entry: &PickerEntry,
     active: bool,
     cross_project: bool,
+    content_width: usize,
 ) -> Line<'static> {
     let summary = &entry.summary;
     let (prefix_color, label_style) = if active {
@@ -841,21 +847,38 @@ fn render_candidate_row(
         None => (summary.label(), None),
     };
     let label_hint = summary.label_hint();
-    let mut spans = Vec::with_capacity(
-        6 + usize::from(branch_marker.is_some())
-            + if label_hint.is_empty() { 0 } else { 2 }
-            + if cross_project { 3 } else { 0 },
-    );
+    let timestamp = format_started_at(summary.started_at_ms);
+    let turns = format!("{:>10}", summary.turn_indicator());
+    let project_hint = if cross_project {
+        summary.project_hint()
+    } else {
+        String::new()
+    };
+    // Ellipsise the label to the width left after the fixed prefix and the
+    // trailing markers, so long session titles never hard-crop into the
+    // scrollbar and the ↪ cross-project marker stays visible.
+    let branch_len = branch_marker.as_ref().map_or(0, |m| m.chars().count());
+    let hint_len = if label_hint.is_empty() {
+        0
+    } else {
+        2 + label_hint.chars().count()
+    };
+    let cross_len = if cross_project {
+        4 + project_hint.chars().count()
+    } else {
+        0
+    };
+    let fixed = prefix.chars().count() + timestamp.chars().count() + 2 + turns.chars().count() + 2;
+    let label_budget = content_width
+        .saturating_sub(fixed + branch_len + hint_len + cross_len)
+        .max(8);
+    let label = truncate_label(&label, label_budget);
+
+    let mut spans = Vec::with_capacity(11);
     spans.push(Span::styled(prefix, Style::default().fg(prefix_color)));
-    spans.push(Span::styled(
-        format_started_at(summary.started_at_ms),
-        timestamp_style,
-    ));
+    spans.push(Span::styled(timestamp, timestamp_style));
     spans.push(Span::styled("  ", Style::default()));
-    spans.push(Span::styled(
-        format!("{:>10}", summary.turn_indicator()),
-        timestamp_style,
-    ));
+    spans.push(Span::styled(turns, timestamp_style));
     spans.push(Span::styled("  ", Style::default()));
     spans.push(Span::styled(label, label_style));
     if let Some(marker) = branch_marker {
@@ -872,16 +895,32 @@ fn render_candidate_row(
         ));
     }
     if cross_project {
+        // ↪ signals that picking this row switches to another directory,
+        // distinguishing it from same-project sessions at a glance.
         spans.push(Span::styled(
-            "  · ",
-            Style::default().fg(crate::render::theme::quiet()),
+            "  ↪ ",
+            Style::default().fg(crate::render::theme::accent()),
         ));
         spans.push(Span::styled(
-            summary.project_hint(),
+            project_hint,
             Style::default().fg(crate::render::theme::path_hint()),
         ));
     }
     Line::from(spans)
+}
+
+/// Truncate a single-line label to `max` display columns, appending an
+/// ellipsis when it overflows so the cut is visibly intentional.
+fn truncate_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = label.chars().take(max - 1).collect();
+    out.push('…');
+    out
 }
 
 fn render_start_fresh_row(active: bool) -> Line<'static> {
@@ -909,34 +948,13 @@ fn render_start_fresh_row(active: bool) -> Line<'static> {
     ])
 }
 
-fn render_checkbox_row(label: &'static str, checked: bool, active: bool) -> Line<'static> {
-    let (prefix_color, label_style) = if active {
-        (
-            crate::render::theme::accent(),
-            Style::default()
-                .fg(crate::render::theme::secondary())
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (
-            crate::render::theme::quiet(),
-            Style::default().fg(crate::render::theme::foreground()),
-        )
-    };
-    let prefix = if active { "▸ " } else { "  " };
-    let mark = if checked { "[x] " } else { "[ ] " };
-    Line::from(vec![
-        Span::styled(prefix, Style::default().fg(prefix_color)),
-        Span::styled(mark, Style::default().fg(crate::render::theme::accent())),
-        Span::styled(label, label_style),
-    ])
-}
-
 /// Center a fixed-size area inside `full` with reasonable bounds for small
 /// terminals.
 fn centered_area(full: Rect) -> Rect {
-    let max_width = 98u16;
-    let max_height = 22u16;
+    // Use most of the terminal so long session labels have room, capped so the
+    // overlay stays scannable (and centered) on ultra-wide monitors.
+    let max_width = 160u16;
+    let max_height = 32u16;
     let width = full.width.min(max_width);
     let height = full.height.min(max_height);
     let x = full.x + full.width.saturating_sub(width) / 2;

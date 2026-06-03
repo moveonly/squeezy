@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use squeezy_store::{EventBranchTip, SessionMetadata, SessionStatus};
+use squeezy_store::{EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionStatus};
 
 use super::*;
 
@@ -76,13 +76,70 @@ fn filter_excludes_unresumable() {
 }
 
 #[test]
+fn filter_excludes_empty_sessions_without_resume_content() {
+    let cwd = PathBuf::from("/work/repo");
+    let now = 1_000_000;
+    let mut empty = meta("empty", "/work/repo", now - 1_000, true);
+    empty.first_user_task = None;
+    empty.latest_summary = None;
+    empty.display_name = None;
+    empty.metrics.turns = 0;
+    empty.event_count = 2;
+    let mut failed_turn = meta("failed-turn", "/work/repo", now - 2_000, true);
+    failed_turn.metrics.turns = 0;
+
+    let out = filter_candidates(&[empty, failed_turn], &cwd, now);
+
+    assert_eq!(
+        out.iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["failed-turn"]
+    );
+}
+
+#[test]
+fn merge_candidates_excludes_empty_global_index_entries() {
+    let now = 1_000_000;
+    let empty = GlobalSessionIndexEntry {
+        session_id: "empty".to_string(),
+        cwd: "/work/repo".to_string(),
+        workspace_root: "/work/repo".to_string(),
+        repo_root: None,
+        title: None,
+        display_name: None,
+        started_at_ms: now - 1_000,
+        last_event_at_ms: now - 1_000,
+        turn_count: 0,
+        resume_available: true,
+    };
+    let useful = GlobalSessionIndexEntry {
+        session_id: "useful".to_string(),
+        title: Some("debug failure".to_string()),
+        started_at_ms: now - 2_000,
+        last_event_at_ms: now - 2_000,
+        ..empty.clone()
+    };
+
+    let out = merge_candidates_for_picker(&[], &[empty, useful], now);
+
+    assert_eq!(
+        out.iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["useful"]
+    );
+}
+
+#[test]
 fn filter_orders_newest_first_and_caps_at_max() {
     let cwd = PathBuf::from("/work/repo");
     let now = 1_000_000;
-    let sessions: Vec<SessionMetadata> = (0..10)
+    let total = MAX_PICKER_ENTRIES + 5;
+    let sessions: Vec<SessionMetadata> = (0..total)
         .map(|i| {
             meta(
-                &format!("s{i}"),
+                &format!("s{i:02}"),
                 "/work/repo",
                 now - (i as u64 * 1_000),
                 true,
@@ -91,8 +148,12 @@ fn filter_orders_newest_first_and_caps_at_max() {
         .collect();
     let out = filter_candidates(&sessions, &cwd, now);
     assert_eq!(out.len(), MAX_PICKER_ENTRIES);
+    // Newest-first, capped to the most-recent MAX_PICKER_ENTRIES.
     let ids: Vec<&str> = out.iter().map(|s| s.session_id.as_str()).collect();
-    assert_eq!(ids, vec!["s0", "s1", "s2", "s3", "s4"]);
+    let expected: Vec<String> = (0..MAX_PICKER_ENTRIES)
+        .map(|i| format!("s{i:02}"))
+        .collect();
+    assert_eq!(ids, expected);
 }
 
 fn summary(id: &str) -> SessionSummary {
@@ -144,13 +205,72 @@ fn picker_opens_with_start_fresh_selected() {
 }
 
 #[test]
+fn picker_scrolls_to_keep_cursor_visible_when_list_overflows() {
+    let summaries: Vec<SessionSummary> = (0..MAX_PICKER_ENTRIES)
+        .map(|i| summary(&format!("s{i:02}")))
+        .collect();
+    let mut state = ResumePickerState::new(summaries, cwd());
+    let last_candidate = state.candidates.len();
+    for _ in 0..last_candidate {
+        state.dispatch(press(KeyCode::Down));
+    }
+    assert_eq!(state.cursor, last_candidate, "cursor on the last candidate");
+
+    // A short terminal can't fit the whole list, so the viewport must scroll:
+    // the selected (last) row stays on screen and an early one scrolls off.
+    let last_label = format!("task for s{:02}", state.candidates.len() - 1);
+    let text = render_state_to_text(&state, 80, 16);
+    assert!(
+        text.contains(&last_label),
+        "selected row must stay visible:\n{text}"
+    );
+    assert!(
+        !text.contains("task for s00"),
+        "early rows must scroll off the top:\n{text}"
+    );
+}
+
+#[test]
+fn picker_signals_cross_project_switch() {
+    let here = summary_at("here", "/work/repo");
+    let there = summary_at("there", "/other/place");
+    let mut state = ResumePickerState::new(vec![here, there], cwd());
+    state.dispatch(press(KeyCode::Tab)); // show sessions from all projects
+    // Move the cursor onto the cross-project candidate.
+    state.dispatch(press(KeyCode::Down));
+    state.dispatch(press(KeyCode::Down));
+
+    let text = render_state_to_text(&state, 90, 18);
+    assert!(
+        text.contains('↪'),
+        "cross-project rows carry the ↪ marker:\n{text}"
+    );
+    assert!(
+        text.contains("switches to /other/place"),
+        "the highlighted cross-project row explains the directory switch:\n{text}"
+    );
+}
+
+#[test]
+fn picker_ellipsises_long_labels_instead_of_hard_cropping() {
+    let mut long = summary("long");
+    long.first_user_task = Some("verylongsessiontitlewithnospaces".repeat(12));
+    let mut state = ResumePickerState::new(vec![long], cwd());
+    state.dispatch(press(KeyCode::Down)); // cursor onto the candidate
+
+    let text = render_state_to_text(&state, 70, 16);
+    assert!(
+        text.contains('…'),
+        "an over-long label must be ellipsised, not hard-cropped:\n{text}"
+    );
+}
+
+#[test]
 fn picker_enter_on_start_fresh_starts_fresh() {
     let mut state = ResumePickerState::new(vec![summary("first")], cwd());
     assert_eq!(
         state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress::default(),
-        })
+        Some(ResumeChoice::StartFresh)
     );
 }
 
@@ -176,9 +296,7 @@ fn picker_esc_starts_fresh() {
     state.dispatch(press(KeyCode::Down)); // cursor on candidate
     assert_eq!(
         state.dispatch(press(KeyCode::Esc)),
-        Some(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress::default(),
-        })
+        Some(ResumeChoice::StartFresh)
     );
 }
 
@@ -193,53 +311,16 @@ fn picker_q_quits() {
 
 #[test]
 fn picker_arrow_wraps_through_start_fresh_at_top() {
-    // [start_fresh, candidate, project checkbox, user checkbox] — 4 rows total.
+    // [start_fresh, candidate] — 2 rows total now that the suppression
+    // checkboxes are gone (the picker is opt-in via --resume).
     let mut state = ResumePickerState::new(vec![summary("only")], cwd());
     assert_eq!(state.cursor, 0); // opens on start_fresh
     state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 1); // candidate
     state.dispatch(press(KeyCode::Down));
-    assert_eq!(state.cursor, 2); // project checkbox
-    state.dispatch(press(KeyCode::Down));
-    assert_eq!(state.cursor, 3); // user checkbox
-    state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 0); // wraps back to start_fresh
     state.dispatch(press(KeyCode::Up));
-    assert_eq!(state.cursor, 3); // wraps up to last row (user checkbox)
-}
-
-#[test]
-fn user_never_ask_checkbox_implies_project_checkbox() {
-    let mut state = ResumePickerState::new(vec![summary("only")], cwd());
-    state.cursor = state.user_checkbox_index();
-
-    state.dispatch(press(KeyCode::Char(' ')));
-
-    assert!(state.never_user);
-    assert!(state.never_project);
-    state.cursor = state.start_fresh_index();
-    assert_eq!(
-        state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::StartFresh {
-            suppress: ResumePickerSuppress {
-                project: true,
-                user: true,
-            },
-        })
-    );
-}
-
-#[test]
-fn clearing_project_checkbox_also_clears_user_checkbox() {
-    let mut state = ResumePickerState::new(vec![summary("only")], cwd());
-    state.cursor = state.user_checkbox_index();
-    state.dispatch(press(KeyCode::Char(' ')));
-    state.cursor = state.project_checkbox_index();
-
-    state.dispatch(press(KeyCode::Char(' ')));
-
-    assert!(!state.never_project);
-    assert!(!state.never_user);
+    assert_eq!(state.cursor, 1); // wraps up to the last row (candidate)
 }
 
 #[test]

@@ -110,8 +110,13 @@ struct Cli {
     )]
     no_default: bool,
     #[arg(
+        long = "resume",
+        help = "Open the resume picker to choose a recent session (this project, or Tab for any project) instead of starting fresh"
+    )]
+    resume: bool,
+    #[arg(
         long = "no-resume-picker",
-        help = "Skip the startup picker that offers to resume a recent session for this directory"
+        help = "Force a fresh session even when --resume is passed"
     )]
     no_resume_picker: bool,
     #[arg(
@@ -463,6 +468,8 @@ fn main() -> squeezy_core::Result<()> {
 }
 
 async fn run() -> squeezy_core::Result<()> {
+    squeezy_core::startup_trace::init();
+    squeezy_core::startup_trace::mark("main_start");
     squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -470,6 +477,7 @@ async fn run() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    squeezy_core::startup_trace::mark("cli_parsed");
     let stdin_is_tty = print_mode::stdin_is_tty();
     let prompt_mode_active = !cli.prompt.is_empty() || !stdin_is_tty;
     if cli.format == PromptFormat::Json && !prompt_mode_active {
@@ -507,6 +515,7 @@ async fn run() -> squeezy_core::Result<()> {
     }
 
     let mut config = config_from_cli(&cli)?;
+    squeezy_core::startup_trace::mark("config_loaded");
 
     if cli.list_providers {
         for provider in PROVIDERS {
@@ -575,11 +584,15 @@ async fn run() -> squeezy_core::Result<()> {
         config = config_from_cli(&cli)?;
     }
 
+    squeezy_core::startup_trace::mark("model_selector_done");
+
     let onboarding = prepare_repo_profile(&mut config);
+    squeezy_core::startup_trace::mark("repo_profile_done");
 
     show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
     telemetry.spawn(TelemetryEvent::app_started(&config));
+    squeezy_core::startup_trace::mark("telemetry_spawned");
 
     // Resolve `--session <prefix>` against the on-disk session store
     // before any downstream code sees it, so the user can pass a short
@@ -634,6 +647,7 @@ async fn run() -> squeezy_core::Result<()> {
     } else {
         None
     };
+    squeezy_core::startup_trace::mark("session_resolved");
     if prompt_mode_active {
         let provider = provider_from_app_config(&config);
         let prompts = print_mode::resolve_prompt_inputs(
@@ -683,10 +697,15 @@ async fn run() -> squeezy_core::Result<()> {
     // banner, while live update probing remains available through `doctor`.
     let update_banner = update::cached_banner_for_startup();
     let resume_session_id = resume_session_id_opt;
-    let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
+    // The resume picker is opt-in: bare `squeezy` starts a fresh session
+    // immediately. `--resume` brings up the picker; `--continue` / `--session`
+    // resolve a target directly and skip the picker as before.
+    let skip_resume_picker = !cli.resume || cli.no_resume_picker || resume_session_id.is_some();
     let mut onboarding = onboarding;
+    squeezy_core::startup_trace::mark("update_banner_done");
     loop {
         let provider = provider_from_app_config(&config);
+        squeezy_core::startup_trace::mark("provider_built");
         let startup_profile = squeezy_tui::StartupProfile {
             onboarding_summary: onboarding.visible_summary.clone(),
             languages: onboarding.language_summary.clone(),
@@ -1833,7 +1852,9 @@ fn model_selection_state_from_paths(
 }
 
 fn startup_resume_question_available(cli: &Cli, config: &AppConfig) -> bool {
-    if cli.no_resume_picker || cli.session.is_some() || cli.continue_session {
+    // The picker is opt-in, so bare launches never offer a resume question and
+    // never pay the candidate scan; only `--resume` reaches the on-disk lookup.
+    if !cli.resume || cli.no_resume_picker || cli.session.is_some() || cli.continue_session {
         return false;
     }
     squeezy_tui::startup_resume_question_available(config)

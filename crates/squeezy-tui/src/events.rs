@@ -668,6 +668,26 @@ pub(crate) fn drain_plan_housekeeping(app: &mut TuiApp) {
     }
 }
 
+/// Install the deferred `RepoStatus::detect` result once the background
+/// probe lands. Until then the status bar shows the neutral placeholder
+/// from `RepoStatus::pending()`; this swaps in the real branch / changed
+/// files / PR number on the frame the probe completes.
+pub(crate) fn drain_repo_status(app: &mut TuiApp) {
+    let Some(mut rx) = app.repo_status_rx.take() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(status) => {
+            app.repo = status;
+            app.needs_redraw = true;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            app.repo_status_rx = Some(rx);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+    }
+}
+
 /// Drain the in-flight `@`-mention workspace walk. The walk runs in
 /// `spawn_blocking` (kicked off by `refresh_mention_popup`) so the
 /// `ignore`-crate `readdir`/`stat` over up to `MAX_WORKSPACE_FILES`

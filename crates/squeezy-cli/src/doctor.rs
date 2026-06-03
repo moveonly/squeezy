@@ -7,9 +7,14 @@ use squeezy_core::{
     SettingsFile, default_settings_path,
 };
 use squeezy_llm::{KeySource, fallback_env_var, resolve_api_key_with_inline};
-use squeezy_store::{SessionStore, SqueezyStore, ensure_repo_profile};
+use squeezy_store::{
+    SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
+};
 
 use crate::update::{self, UpdateStatus};
+
+const STATE_CACHE_WARN_BYTES: u64 = 128 * 1024 * 1024;
+const GRAPH_CACHE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
@@ -21,6 +26,9 @@ pub struct DoctorArgs {
     /// (and, for first-party Anthropic, may consume a handful of tokens).
     #[arg(long)]
     pub probe: bool,
+    /// Remove rotated redb schema backups after reporting cache health.
+    #[arg(long)]
+    pub prune_cache: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +188,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(mcp_check(&config.mcp_servers));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
+        checks.push(cache_check(config, args.prune_cache));
     }
 
     checks.push(sandbox_check());
@@ -359,6 +368,82 @@ fn state_store_check(config: &AppConfig) -> Check {
             status: Status::Fail,
             detail: format!("{error}"),
         },
+    }
+}
+
+fn cache_check(config: &AppConfig, prune: bool) -> Check {
+    let diagnostics = match cache_diagnostics(&config.workspace_root, config.cache.root.as_deref())
+    {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => {
+            return Check {
+                name: "cache".to_string(),
+                status: Status::Fail,
+                detail: format!("{error}"),
+            };
+        }
+    };
+    let mut status = Status::Ok;
+    let mut detail = format!(
+        "state={} graph={} backups={} ({}) at {}",
+        format_bytes(diagnostics.state.size_bytes),
+        format_bytes(diagnostics.graph.size_bytes),
+        diagnostics.backups.len(),
+        format_bytes(diagnostics.backup_total_bytes),
+        diagnostics.cache_dir.display(),
+    );
+    if diagnostics.state.size_bytes > STATE_CACHE_WARN_BYTES {
+        status = Status::Warn;
+        detail.push_str("; state.redb is unusually large");
+    }
+    if diagnostics.graph.size_bytes > GRAPH_CACHE_WARN_BYTES {
+        status = Status::Warn;
+        detail.push_str("; graph.redb is large but lazy-loaded");
+    }
+    if diagnostics.backup_total_bytes > 0 && !prune {
+        status = Status::Warn;
+        detail.push_str("; run `squeezy doctor --prune-cache` to remove backups");
+    }
+    if prune {
+        match prune_cache_backups(&config.workspace_root, config.cache.root.as_deref()) {
+            Ok(report) => {
+                detail.push_str(&format!(
+                    "; pruned {} backups ({})",
+                    report.removed_files.len(),
+                    format_bytes(report.removed_bytes)
+                ));
+                if diagnostics.state.size_bytes <= STATE_CACHE_WARN_BYTES
+                    && diagnostics.graph.size_bytes <= GRAPH_CACHE_WARN_BYTES
+                {
+                    status = Status::Ok;
+                }
+            }
+            Err(error) => {
+                status = Status::Fail;
+                detail.push_str(&format!("; prune failed: {error}"));
+            }
+        }
+    }
+    Check {
+        name: "cache".to_string(),
+        status,
+        detail,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.1} GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.1} MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

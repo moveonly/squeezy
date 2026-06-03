@@ -6181,6 +6181,7 @@ fn compact_status_surfaces_context_without_dense_counters() {
         available: true,
         pull_request: None,
         branch_changes: None,
+        pending: false,
     };
     app.status = "running search".to_string();
 
@@ -6292,6 +6293,7 @@ fn render_uses_two_line_status_footer() {
         available: true,
         pull_request: None,
         branch_changes: None,
+        pending: false,
     };
 
     let output = render_to_string(&app, 140, 18);
@@ -8081,13 +8083,51 @@ fn retryable_provider_request_keeps_retry_hint() {
 }
 
 #[test]
+fn repo_status_starts_pending_then_drains_from_background() {
+    let config = test_config(SessionMode::Build);
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+    // The probe is deferred off the startup path, so a fresh app shows the
+    // neutral placeholder rather than the misleading "no repo".
+    assert!(app.repo.pending);
+    assert!(status_left_text(&app).contains("git …"));
+
+    // Deliver a detected status the way the background `spawn_blocking`
+    // probe does, then drain it as the main loop would.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tx.send(RepoStatus {
+        branch: Some("main".to_string()),
+        changed_files: 0,
+        operation: None,
+        available: true,
+        pull_request: None,
+        branch_changes: None,
+        pending: false,
+    })
+    .unwrap();
+    app.repo_status_rx = Some(rx);
+    drain_repo_status(&mut app);
+
+    assert!(!app.repo.pending);
+    assert!(status_left_text(&app).contains("git main"));
+}
+
+#[test]
 fn repo_status_handles_non_git_roots() {
     let config = AppConfig {
         workspace_root: std::env::temp_dir(),
         ..test_config(SessionMode::Build)
     };
 
-    assert_eq!(RepoStatus::detect(&config).compact(), "repo=none");
+    assert_eq!(
+        RepoStatus::detect_at(&config.workspace_root).compact(),
+        "repo=none"
+    );
 }
 
 #[test]

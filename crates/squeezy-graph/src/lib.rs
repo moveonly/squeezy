@@ -23,7 +23,7 @@ use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
-use squeezy_store::{GraphStoreMetadata, GraphWriteBatch, SqueezyStore};
+use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 use crate::languages::{
@@ -1970,7 +1970,7 @@ pub struct GraphManager {
     parser: LanguageParser,
     graph: SemanticGraph,
     config: RefreshConfig,
-    store: Option<Arc<SqueezyStore>>,
+    store: Option<Arc<GraphStore>>,
     store_metadata: Option<GraphStoreMetadata>,
     last_refresh: Instant,
     build_report: GraphBuildReport,
@@ -2002,12 +2002,8 @@ impl GraphManager {
         Self::open_with_optional_store(root, config, crawl_options, None)
     }
 
-    /// Open a `GraphManager` that uses its own private [`SqueezyStore`] under
+    /// Open a `GraphManager` that uses its own private [`GraphStore`] under
     /// `<workspace_root>/.squeezy/cache` (or `cache_root` when overridden).
-    /// Production callers that already hold a shared `Arc<SqueezyStore>`
-    /// should use [`open_with_store`] instead: redb forbids two `Database`
-    /// handles on the same file, so opening another one here against an
-    /// agent-owned store would fail silently and disable graph persistence.
     pub fn open_persistent_with_crawl_options(
         root: impl AsRef<Path>,
         config: RefreshConfig,
@@ -2015,20 +2011,19 @@ impl GraphManager {
         cache_root: Option<PathBuf>,
     ) -> Result<Self> {
         let root_path = root.as_ref().to_path_buf();
-        let store = SqueezyStore::open(&root_path, cache_root.as_deref())
+        let store = GraphStore::open(&root_path, cache_root.as_deref())
             .ok()
             .map(Arc::new);
         Self::open_with_optional_store(root_path, config, crawl_options, store)
     }
 
-    /// Open a `GraphManager` against an already-open [`SqueezyStore`]. Pass
-    /// `None` to disable persistence. Sharing one handle keeps the agent and
-    /// the tool registry from racing to acquire redb's exclusive file lock.
+    /// Open a `GraphManager` against an already-open [`GraphStore`]. Pass
+    /// `None` to disable persistence.
     pub fn open_with_store(
         root: impl AsRef<Path>,
         config: RefreshConfig,
         crawl_options: CrawlOptions,
-        store: Option<Arc<SqueezyStore>>,
+        store: Option<Arc<GraphStore>>,
     ) -> Result<Self> {
         Self::open_with_optional_store(root, config, crawl_options, store)
     }
@@ -2044,7 +2039,7 @@ impl GraphManager {
         root: impl AsRef<Path>,
         config: RefreshConfig,
         crawl_options: CrawlOptions,
-        store: Option<Arc<SqueezyStore>>,
+        store: Option<Arc<GraphStore>>,
         watcher_config: watcher::WatcherConfig,
     ) -> Result<Self> {
         let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
@@ -2064,7 +2059,7 @@ impl GraphManager {
         root: impl AsRef<Path>,
         config: RefreshConfig,
         crawl_options: CrawlOptions,
-        store: Option<Arc<SqueezyStore>>,
+        store: Option<Arc<GraphStore>>,
     ) -> Result<Self> {
         let started = Instant::now();
         let root = root.as_ref().to_path_buf();
@@ -2183,7 +2178,7 @@ impl GraphManager {
     /// will compare against. The single-blob import adjacency is mirrored
     /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
     /// so persistence errors cannot poison the in-memory graph.
-    fn persist_resolver_cache(&self, store: &SqueezyStore) {
+    fn persist_resolver_cache(&self, store: &GraphStore) {
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2496,7 +2491,7 @@ struct LoadedPartitions {
 }
 
 fn load_persisted_partitions(
-    store: Option<&SqueezyStore>,
+    store: Option<&GraphStore>,
     expected_metadata: Option<&GraphStoreMetadata>,
     records: &[FileRecord],
 ) -> Result<LoadedPartitions> {

@@ -726,15 +726,36 @@ fn detect_git_state(root: &Path) -> GitState {
     if !root.join(".git").exists() {
         return GitState::default();
     }
+    // The four probes are independent, and `git status --porcelain` alone can
+    // run for tens of milliseconds on a large worktree. Fan them out across
+    // threads so onboarding pays the cost of the single slowest probe rather
+    // than their sum. All four outputs feed the light fingerprint
+    // (`RepoFingerprint::detect`), so none can be dropped.
+    let (branch, head, default_branch, dirty) = std::thread::scope(|scope| {
+        let branch = scope.spawn(|| git_output(root, &["branch", "--show-current"]));
+        let head = scope.spawn(|| git_output(root, &["rev-parse", "HEAD"]));
+        let default_branch = scope.spawn(|| {
+            git_output(
+                root,
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            )
+        });
+        let dirty = scope.spawn(|| {
+            git_output(root, &["status", "--porcelain"]).map(|status| !status.is_empty())
+        });
+        (
+            branch.join().ok().flatten(),
+            head.join().ok().flatten(),
+            default_branch.join().ok().flatten(),
+            dirty.join().ok().flatten(),
+        )
+    });
     GitState {
         vcs_type: Some("git".to_string()),
-        branch: git_output(root, &["branch", "--show-current"]),
-        head: git_output(root, &["rev-parse", "HEAD"]),
-        default_branch: git_output(
-            root,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        ),
-        dirty: git_output(root, &["status", "--porcelain"]).map(|status| !status.is_empty()),
+        branch,
+        head,
+        default_branch,
+        dirty,
     }
 }
 

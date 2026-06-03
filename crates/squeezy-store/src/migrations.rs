@@ -151,6 +151,7 @@ pub fn default_registry() -> MigrationRegistry {
     let mut registry = MigrationRegistry::new();
     registry.register(InitializeStoreSchemaV1);
     registry.register(V2AddResolverTables);
+    registry.register(V3SplitGraphCache);
     registry
 }
 
@@ -279,6 +280,43 @@ impl Migration for V2AddResolverTables {
                 .open_table(META)
                 .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
             let encoded = serde_json::to_vec(&2u64).map_err(|err| {
+                squeezy_core::SqueezyError::Tool(format!("store encode failed: {err}"))
+            })?;
+            meta.insert("schema_version", encoded.as_slice())
+                .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+        }
+        write
+            .commit()
+            .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))
+    }
+}
+
+/// State schema v3 moves graph-only cache rows to `graph.redb`. The runtime
+/// open path rewrites legacy files by rotating the old DB and copying only
+/// non-graph tables into a fresh v3 state store; this migration keeps the
+/// public registry target aligned for callers that still exercise the
+/// forward-only registry directly.
+pub struct V3SplitGraphCache;
+
+impl Migration for V3SplitGraphCache {
+    fn version(&self) -> u64 {
+        3
+    }
+
+    fn migrate(&self, cwd: &Path) -> Result<()> {
+        let path = state_path(cwd, None);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let database = open_database(&path)?;
+        let write = database
+            .begin_write()
+            .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+        {
+            let mut meta = write
+                .open_table(META)
+                .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+            let encoded = serde_json::to_vec(&3u64).map_err(|err| {
                 squeezy_core::SqueezyError::Tool(format!("store encode failed: {err}"))
             })?;
             meta.insert("schema_version", encoded.as_slice())
