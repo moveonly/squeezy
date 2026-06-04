@@ -5810,7 +5810,11 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
     let subagent_height = subagent_pane_height(app);
-    let live_lines = pending_assistant_lines(app);
+    // Just-finished work nodes that are still folding render here in the live
+    // region (held back from scrollback) above the streaming answer, then flush
+    // collapsed once their 600ms settle finishes.
+    let mut live_lines = live_settling_lines(app, area.width);
+    live_lines.extend(pending_assistant_lines(app));
     let live_visual_height = visual_line_count(&live_lines, area.width);
     let live_gap = if live_visual_height > 0 { 1 } else { 0 };
     let required_height = task_height
@@ -16064,14 +16068,19 @@ impl TerminalGuard {
             .size()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?
             .width;
+        // Hold the still-settling tail back from scrollback: those nodes are
+        // animating their fold in the live region and only flush (collapsed)
+        // once the fold finishes and `finalize_elapsed_settles` clears them.
+        let flush_to = settling_flush_boundary(app);
         let lines = inline_history_lines_for_flush(
             app,
             width,
             !self.startup_flushed,
             self.transcript_flushed_len,
+            flush_to,
         );
         self.startup_flushed = true;
-        self.transcript_flushed_len = app.transcript.len();
+        self.transcript_flushed_len = flush_to;
         self.insert_before(lines, width)
     }
 
@@ -16134,11 +16143,34 @@ fn render_lines_to_buffer(buffer: &mut Buffer, lines: Vec<Line<'static>>) {
         .render(buffer.area, buffer);
 }
 
+/// Index of the first transcript entry still animating its settle-fold. Those
+/// trailing nodes are held in the live region until the fold finishes, so the
+/// inline scrollback flush stops here. Returns `transcript.len()` when nothing
+/// is settling (the whole transcript is flushable).
+fn settling_flush_boundary(app: &TuiApp) -> usize {
+    app.transcript
+        .iter()
+        .position(|entry| entry.settle.is_some())
+        .unwrap_or(app.transcript.len())
+}
+
+/// The still-settling tail rendered for the inline live region: each held node
+/// folds in place there, then flushes to scrollback collapsed once its fold
+/// finishes. Empty when nothing is settling.
+fn live_settling_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let boundary = settling_flush_boundary(app);
+    if boundary >= app.transcript.len() {
+        return Vec::new();
+    }
+    inline_history_lines_for_flush(app, width, false, boundary, app.transcript.len())
+}
+
 fn inline_history_lines_for_flush(
     app: &TuiApp,
     width: u16,
     include_startup_card: bool,
     transcript_from: usize,
+    transcript_to: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if include_startup_card {
@@ -16152,7 +16184,35 @@ fn inline_history_lines_for_flush(
             .transcript
             .get(transcript_from - 1)
             .is_some_and(|prev| is_rail_work_node(&prev.kind));
-    for (index, item) in app.transcript.iter().enumerate().skip(transcript_from) {
+    for (index, item) in app
+        .transcript
+        .iter()
+        .enumerate()
+        .take(transcript_to)
+        .skip(transcript_from)
+    {
+        // A finished work node mid settle-fold renders folded in the live
+        // region (it is held back from the scrollback flush until the fold
+        // finishes), then flushes collapsed. Checked before run-coalescing so
+        // each settling node folds standalone.
+        if let Some(settle) = item.settle {
+            let mut block = settle_folded_entry_lines(
+                item,
+                false,
+                app.tool_output_verbosity,
+                message_outcome(&app.transcript, index),
+                Some(width),
+                app.show_reasoning_usage,
+                settle,
+            );
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, false),
+            );
+            continue;
+        }
         match reasoning_run_info(&app.transcript, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {

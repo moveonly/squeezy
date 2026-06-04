@@ -6691,15 +6691,43 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
     app.push_transcript_item(TranscriptItem::user("find getFoo"));
     app.push_transcript_item(TranscriptItem::assistant("No definition found."));
 
-    let first = inline_history_lines_for_flush(&app, 100, true, 0);
+    let len = app.transcript.len();
+    let first = inline_history_lines_for_flush(&app, 100, true, 0, len);
     let rendered = lines_to_plain_text(&first);
 
     assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
     assert!(rendered.contains("find getFoo"), "{rendered}");
     assert!(rendered.contains("● No definition found."), "{rendered}");
 
-    let next = inline_history_lines_for_flush(&app, 100, false, app.transcript.len());
+    let next = inline_history_lines_for_flush(&app, 100, false, len, len);
     assert!(next.is_empty());
+}
+
+#[test]
+fn settling_node_is_held_from_flush_and_folds_in_live_region() {
+    let mut app = test_app(SessionMode::Build);
+    // A success tool result arms a settle-fold (it rests collapsed).
+    app.push_tool_result(sample_tool_result("grep", "match-1\nmatch-2"));
+    assert!(app.transcript[0].settle.is_some(), "a success tool folds");
+
+    // The scrollback flush stops before the settling node — it is held back.
+    let boundary = settling_flush_boundary(&app);
+    assert_eq!(boundary, 0);
+    let flushed = inline_history_lines_for_flush(&app, 100, false, 0, boundary);
+    assert!(flushed.is_empty(), "settling node must not flush yet");
+
+    // Meanwhile it renders folding on the rail in the live region.
+    let live = lines_to_plain_text(&live_settling_lines(&app, 100));
+    assert!(live.contains("grep"), "{live}");
+    assert!(
+        live.contains("├─") || live.contains("╰─"),
+        "rail gutter: {live}"
+    );
+
+    // Once the fold finishes the node becomes flushable and leaves the live region.
+    app.finalize_settles_for_test();
+    assert_eq!(settling_flush_boundary(&app), app.transcript.len());
+    assert!(live_settling_lines(&app, 100).is_empty());
 }
 
 #[test]
