@@ -1338,6 +1338,7 @@ impl TelemetryEvent {
                 model_family: Some(ModelFamily::from_model(&config.provider, &config.model)),
                 duration_ms: Some(report.duration_ms),
                 session_status: Some(report.status),
+                store_session_id: report.store_session_id,
                 turn_count: Some(report.turns),
                 tool_calls: Some(report.tool_calls),
                 tool_successes: Some(report.tool_successes),
@@ -1750,6 +1751,13 @@ pub struct TelemetryProperties {
     /// `None` on every other event type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_reason: Option<String>,
+    /// The durable on-disk store session ID. Set only on `session_ended`
+    /// and `session_summary` events. Lets operators correlate a PostHog
+    /// session back to the on-disk session file and stitch together a chain
+    /// of resumes that all share the same store session (even though each
+    /// process run has a distinct telemetry `session_id` and `trace_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_session_id: Option<String>,
     /// Per-session trace id stamped by [`TelemetryClient`] on every event
     /// it accepts. W3C-trace-context-shaped 32-hex-char string. Equal
     /// across every event emitted by a single Squeezy session so an
@@ -2295,10 +2303,14 @@ pub struct LanguageDistribution {
     pub unknown_files: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTelemetryReport {
     pub duration_ms: u64,
     pub status: SessionStatusKind,
+    /// The durable on-disk session ID (distinct from the per-process
+    /// telemetry `session_id`). Lets operators correlate PostHog sessions
+    /// back to the session store file and stitch together resume chains.
+    pub store_session_id: Option<String>,
     pub turns: u64,
     pub tool_calls: u64,
     pub tool_successes: u64,

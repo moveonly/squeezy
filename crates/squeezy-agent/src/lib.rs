@@ -1228,6 +1228,13 @@ pub struct Agent {
     jobs: JobRegistry,
     telemetry: TelemetryClient,
     session_started_at: Instant,
+    /// Metrics snapshot captured at agent-build time from `metadata.metrics`
+    /// when the agent is constructed via [`Agent::resume_with_telemetry`].
+    /// Zero for fresh sessions. Subtracted from the final `SessionMetrics`
+    /// in `finish_session` so that `session_ended` reports only the delta
+    /// contributed by this process run, preventing cumulative overcounting
+    /// across resumptions.
+    prior_metrics: SessionMetrics,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     session_log: Option<SessionHandle>,
@@ -1353,6 +1360,7 @@ impl Agent {
             conversation_state,
             None,
             telemetry,
+            SessionMetrics::default(),
         )
     }
 
@@ -1428,6 +1436,11 @@ impl Agent {
             Vec::new()
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
+        // Capture the cumulative metrics from all prior runs of this session
+        // before passing conversation_state into build. finish_session subtracts
+        // this baseline so session_ended only reports the delta contributed by
+        // this process run, preventing cumulative overcounting across resumes.
+        let prior_metrics = conversation_state.metrics.clone();
         let routing_sticky_remaining = conversation_state.routing_sticky_remaining_turns();
         let routing_session_disabled = conversation_state.routing_session_disabled();
         let agent = Self::build(
@@ -1437,6 +1450,7 @@ impl Agent {
             conversation_state,
             None,
             telemetry,
+            prior_metrics,
         );
         if routing_sticky_remaining > 0 || routing_session_disabled {
             // Honour the persisted sticky window so a follow-up
@@ -1533,6 +1547,7 @@ impl Agent {
             ConversationState::default(),
             Some(runtime.clone()),
             TelemetryClient::disabled(),
+            SessionMetrics::default(),
         );
 
         let mut final_answer = String::new();
@@ -1568,6 +1583,7 @@ impl Agent {
         conversation_state: ConversationState,
         replay: Option<Arc<ReplayRuntime>>,
         telemetry: TelemetryClient,
+        prior_metrics: SessionMetrics,
     ) -> Self {
         // Arm context compaction by default. The mid-turn micro-compaction
         // tier (and the full tier) early-returns when
@@ -1762,6 +1778,7 @@ impl Agent {
         Self {
             telemetry,
             session_started_at: Instant::now(),
+            prior_metrics,
             config,
             provider,
             tools,
@@ -2659,21 +2676,27 @@ impl Agent {
         let _ = session.write_resume_state(&state.to_resume_state());
         let metrics = state.metrics.clone();
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
+        let p = &self.prior_metrics;
         self.telemetry
             .record(TelemetryEvent::session_ended(
                 &self.config,
                 SessionTelemetryReport {
                     duration_ms: self.session_started_at.elapsed().as_millis() as u64,
                     status: telemetry_session_status(status),
-                    turns: metrics.turns,
-                    tool_calls: metrics.tool_calls,
-                    tool_successes: metrics.tool_successes,
-                    tool_errors: metrics.tool_errors,
-                    tool_denials: metrics.tool_denials,
-                    tool_cancellations: metrics.tool_cancellations,
-                    budget_denials: metrics.budget_denials,
-                    subagent_calls: metrics.subagent_calls,
-                    subagent_failures: metrics.subagent_failures,
+                    store_session_id: Some(session.session_id().to_string()),
+                    turns: metrics.turns.saturating_sub(p.turns),
+                    tool_calls: metrics.tool_calls.saturating_sub(p.tool_calls),
+                    tool_successes: metrics.tool_successes.saturating_sub(p.tool_successes),
+                    tool_errors: metrics.tool_errors.saturating_sub(p.tool_errors),
+                    tool_denials: metrics.tool_denials.saturating_sub(p.tool_denials),
+                    tool_cancellations: metrics
+                        .tool_cancellations
+                        .saturating_sub(p.tool_cancellations),
+                    budget_denials: metrics.budget_denials.saturating_sub(p.budget_denials),
+                    subagent_calls: metrics.subagent_calls.saturating_sub(p.subagent_calls),
+                    subagent_failures: metrics
+                        .subagent_failures
+                        .saturating_sub(p.subagent_failures),
                 },
             ))
             .await;

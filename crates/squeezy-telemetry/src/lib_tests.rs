@@ -139,6 +139,7 @@ fn durable_summary_is_pending_before_send_and_cleared_after_ack() {
         SessionTelemetryReport {
             duration_ms: 500,
             status: SessionStatusKind::Completed,
+            store_session_id: None,
             turns: 1,
             tool_calls: 2,
             tool_successes: 2,
@@ -865,6 +866,7 @@ fn session_ended_event_carries_aggregate_perf_and_failure_counts() {
         SessionTelemetryReport {
             duration_ms: 12_345,
             status: SessionStatusKind::Completed,
+            store_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
             turns: 4,
             tool_calls: 9,
             tool_successes: 7,
@@ -883,6 +885,7 @@ fn session_ended_event_carries_aggregate_perf_and_failure_counts() {
     assert!(text.contains("\"turn_count\":4"));
     assert!(text.contains("\"tool_errors\":1"));
     assert!(text.contains("\"subagent_failures\":1"));
+    assert!(text.contains("\"store_session_id\":\"22222222-2222-4222-8222-222222222222\""));
     assert!(!text.contains(&config.model));
 }
 
