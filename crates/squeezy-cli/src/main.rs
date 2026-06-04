@@ -164,6 +164,11 @@ enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    #[command(about = "Inspect, enable/disable, or validate discovered Squeezy skills")]
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     #[command(about = "Ask the running Squeezy shell session for an in-flight permission decision")]
     Ask(AskArgs),
     #[command(about = "Manage provider API keys stored inline in the settings TOML")]
@@ -285,6 +290,55 @@ struct McpNameScope {
 #[derive(Debug, Args)]
 #[group(required = true, multiple = false)]
 struct McpConfigScope {
+    #[arg(long, help = "Edit the user-level settings file")]
+    user: bool,
+    #[arg(long, help = "Edit the project-level settings file")]
+    project: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCommand {
+    #[command(about = "List discovered skills, including disabled ones")]
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        about = "Enable a discovered skill via [[skills.config]] (selector is name XOR path)"
+    )]
+    Enable(SkillsSelectorScope),
+    #[command(about = "Disable a discovered skill via [[skills.config]]")]
+    Disable(SkillsSelectorScope),
+    #[command(about = "Validate frontmatter/manifest of every discovered skill")]
+    Validate {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SkillsSelectorScope {
+    #[command(flatten)]
+    selector: SkillsSelector,
+    #[command(flatten)]
+    scope: SkillsConfigScope,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct SkillsSelector {
+    #[arg(long, help = "Match by skill name (mutually exclusive with --path)")]
+    name: Option<String>,
+    #[arg(
+        long,
+        help = "Match by skill directory path (mutually exclusive with --name)"
+    )]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct SkillsConfigScope {
     #[arg(long, help = "Edit the user-level settings file")]
     user: bool,
     #[arg(long, help = "Edit the project-level settings file")]
@@ -496,6 +550,7 @@ async fn run() -> squeezy_core::Result<()> {
         }
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
+        Some(Command::Skills { command }) => return handle_skills_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args).await,
         Some(Command::Auth { command }) => return handle_auth_command(command).await,
         Some(Command::Doctor(args)) => {
@@ -1041,6 +1096,263 @@ fn set_mcp_enabled(cli: &Cli, args: &McpNameScope, enabled: bool) -> squeezy_cor
         table.insert("enabled", Item::Value(TomlValue::from(enabled)));
         Ok(())
     })
+}
+
+fn handle_skills_command(command: &SkillsCommand, cli: &Cli) -> squeezy_core::Result<()> {
+    match command {
+        SkillsCommand::List { json } => skills_list(cli, *json),
+        SkillsCommand::Enable(args) => skills_set_enabled(cli, args, true),
+        SkillsCommand::Disable(args) => skills_set_enabled(cli, args, false),
+        SkillsCommand::Validate { json } => skills_validate(cli, *json),
+    }
+}
+
+fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+    let summaries = catalog.summaries();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&catalog.summaries_json()).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if summaries.is_empty() {
+        println!("No skills discovered.");
+        return Ok(());
+    }
+    let mut rows: Vec<[String; 4]> = Vec::with_capacity(summaries.len() + 1);
+    rows.push([
+        "NAME".to_string(),
+        "STATE".to_string(),
+        "SOURCE".to_string(),
+        "LOCATION".to_string(),
+    ]);
+    for summary in &summaries {
+        let state = if summary.disabled {
+            "disabled"
+        } else if catalog.ambiguous_names().contains(&summary.name) {
+            "ambiguous"
+        } else {
+            "enabled"
+        };
+        rows.push([
+            summary.name.clone(),
+            state.to_string(),
+            summary.source.as_str().to_string(),
+            summary.location.display().to_string(),
+        ]);
+    }
+    let widths = (0..4)
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    for row in rows {
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+        );
+    }
+    Ok(())
+}
+
+fn skills_set_enabled(
+    cli: &Cli,
+    args: &SkillsSelectorScope,
+    enabled: bool,
+) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    update_skills_config(&config, &args.scope, |entries| {
+        skills_upsert_entry(entries, &args.selector, enabled)
+    })
+}
+
+fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+    let summaries = catalog.summaries();
+    let mut diagnostics: Vec<serde_json::Value> = Vec::new();
+    let mut ok = 0usize;
+    let mut errored = 0usize;
+    let mut ambiguous = 0usize;
+    for summary in &summaries {
+        let mut issues: Vec<String> = Vec::new();
+        if catalog.ambiguous_names().contains(&summary.name) {
+            ambiguous += 1;
+            issues.push(
+                "duplicate name at same precedence; auto-trigger activation skipped".to_string(),
+            );
+        }
+        match fs::read_to_string(&summary.location) {
+            Ok(content) => match squeezy_skills::validate_skill_md(&content) {
+                Ok(_) => {}
+                Err(err) => {
+                    issues.push(format!("frontmatter invalid: {err}"));
+                }
+            },
+            Err(err) => {
+                issues.push(format!("could not read SKILL.md: {err}"));
+            }
+        }
+        if issues.is_empty() {
+            ok += 1;
+        } else {
+            errored += 1;
+        }
+        diagnostics.push(serde_json::json!({
+            "name": summary.name,
+            "location": summary.location,
+            "source": summary.source.as_str(),
+            "disabled": summary.disabled,
+            "issues": issues,
+        }));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "skills": diagnostics,
+                "summary": {
+                    "ok": ok,
+                    "errored": errored,
+                    "ambiguous": ambiguous,
+                    "total": summaries.len(),
+                },
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        for entry in &diagnostics {
+            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let issues = entry
+                .get("issues")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            if issues == 0 {
+                println!("ok      {name}");
+            } else {
+                println!("error   {name}");
+                if let Some(issue_arr) = entry.get("issues").and_then(|v| v.as_array()) {
+                    for issue in issue_arr {
+                        if let Some(text) = issue.as_str() {
+                            println!("          {text}");
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "{} ok, {} error(s), {} ambiguous, {} total",
+            ok,
+            errored,
+            ambiguous,
+            summaries.len()
+        );
+    }
+    if errored > 0 || ambiguous > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn skills_settings_path(config: &AppConfig, scope: &SkillsConfigScope) -> PathBuf {
+    if scope.user {
+        default_settings_path()
+    } else {
+        config.workspace_root.join(PROJECT_SETTINGS_FILE)
+    }
+}
+
+fn update_skills_config(
+    config: &AppConfig,
+    scope: &SkillsConfigScope,
+    update: impl FnOnce(&mut toml_edit::ArrayOfTables) -> squeezy_core::Result<()>,
+) -> squeezy_core::Result<()> {
+    let path = skills_settings_path(config, scope);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|err| SqueezyError::Config(format!("{}: {err}", path.display())))?;
+    let entries = ensure_skills_config_array(&mut doc)?;
+    update(entries)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, doc.to_string())?;
+    println!("updated {}", path.display());
+    Ok(())
+}
+
+fn ensure_skills_config_array(
+    doc: &mut DocumentMut,
+) -> squeezy_core::Result<&mut toml_edit::ArrayOfTables> {
+    let skills = ensure_table(doc.as_table_mut(), "skills")?;
+    let item = skills
+        .entry("config")
+        .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    if !item.is_array_of_tables() {
+        return Err(SqueezyError::Config(
+            "skills.config exists but is not an array of tables".to_string(),
+        ));
+    }
+    Ok(item
+        .as_array_of_tables_mut()
+        .expect("checked array of tables"))
+}
+
+/// Find an existing `[[skills.config]]` entry that matches `selector`
+/// or push a new one, then set its `enabled` field. Honors the same
+/// `name` XOR `path` selector contract that `SkillCatalog::apply_config_rules`
+/// enforces at load time.
+fn skills_upsert_entry(
+    entries: &mut toml_edit::ArrayOfTables,
+    selector: &SkillsSelector,
+    enabled: bool,
+) -> squeezy_core::Result<()> {
+    let selector_path = selector
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    for entry in entries.iter_mut() {
+        let entry_name = entry.get("name").and_then(|item| item.as_str());
+        let entry_path = entry.get("path").and_then(|item| item.as_str());
+        let matches_name = match (selector.name.as_deref(), entry_name) {
+            (Some(needle), Some(found)) => needle == found,
+            _ => false,
+        };
+        let matches_path = match (selector_path.as_deref(), entry_path) {
+            (Some(needle), Some(found)) => needle == found,
+            _ => false,
+        };
+        if matches_name || matches_path {
+            entry.insert("enabled", Item::Value(TomlValue::from(enabled)));
+            return Ok(());
+        }
+    }
+    let mut entry = Table::new();
+    if let Some(name) = selector.name.as_deref() {
+        entry.insert("name", Item::Value(TomlValue::from(name)));
+    } else if let Some(path) = selector_path.as_deref() {
+        entry.insert("path", Item::Value(TomlValue::from(path)));
+    } else {
+        return Err(SqueezyError::Config(
+            "skills enable/disable requires --name or --path".to_string(),
+        ));
+    }
+    entry.insert("enabled", Item::Value(TomlValue::from(enabled)));
+    entries.push(entry);
+    Ok(())
 }
 
 fn update_mcp_settings(

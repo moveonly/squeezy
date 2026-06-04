@@ -1499,6 +1499,25 @@ fn load_manifest(base_dir: &Path) -> Option<SkillManifest> {
     }
 }
 
+/// Parse `SKILL.md` content and report whether it satisfies the
+/// catalog's frontmatter and naming rules.
+///
+/// Reuses the same parser the discovery walker uses, so a `Ok(name)`
+/// means the file is byte-for-byte loadable into the catalog. The
+/// returned `name` is the canonical skill name read from the
+/// frontmatter `name:` field, useful for the CLI's `validate`
+/// subcommand to surface what is being validated.
+pub fn validate_skill_md(content: &str) -> std::result::Result<String, String> {
+    let (metadata, _body) = parse_skill_file(content)?;
+    if !is_valid_skill_name(&metadata.name) {
+        return Err(format!(
+            "invalid skill name {:?}: must start with a lowercase ASCII letter and contain only lowercase letters, digits, '-', or '_'",
+            metadata.name
+        ));
+    }
+    Ok(metadata.name)
+}
+
 pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillManifest, String> {
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }
