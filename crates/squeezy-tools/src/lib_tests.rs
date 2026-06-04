@@ -12323,6 +12323,16 @@ fn detect_inheritance_grep_positives() {
         vec!["ClientProxy", "Server", "BaseRpcContext"]
     );
     assert_eq!(alt.decl_kw, "class");
+
+    // Ruby `include`/`prepend` mixin idiom — the standard way Ruby classes mix
+    // in a module. The graph records `mixin:<Type>` on the host, so a grep for
+    // `include Sidekiq::Component` should fire the augment (`Component` is the
+    // queried supertype; the namespace segment only widens, never narrows).
+    let ruby = detect_inheritance_grep(r"^\s*include\s+Sidekiq::Component\b")
+        .expect("ruby include qualifies");
+    assert!(ruby.base_names.iter().any(|b| b == "Component"));
+    let prepend = detect_inheritance_grep(r"prepend Comparable").expect("ruby prepend qualifies");
+    assert!(prepend.base_names.iter().any(|b| b == "Comparable"));
 }
 
 #[test]

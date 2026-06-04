@@ -4971,6 +4971,10 @@ end
             .iter()
             .any(|a| a == "mixin:include:Auditable")
     );
+    // ...and the bare `mixin:Auditable` form the graph build must carry through
+    // so `decl_search attribute=mixin:Auditable` and the grep→graph augment
+    // (which query `base:T|mixin:T|iface:T`) can enumerate Ruby mixers.
+    assert!(admin_sym.attributes.iter().any(|a| a == "mixin:Auditable"));
 
     // attr_accessor synthesized name reader/writer Methods sit under User.
     assert!(

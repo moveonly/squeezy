@@ -130,7 +130,7 @@ const DECL_KEYWORDS: &[&str] = &[
 
 /// Inheritance operator tokens. A capitalized identifier appearing AFTER one
 /// of these (in the pattern's literal part) is a candidate supertype.
-const INHERITANCE_OPS: &[&str] = &["extends", "implements", "with"];
+const INHERITANCE_OPS: &[&str] = &["extends", "implements", "with", "include", "prepend"];
 
 /// Strip the regex metacharacters that commonly fence an
 /// enumeration-by-supertype pattern down to its literal word/identifier

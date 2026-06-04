@@ -2575,6 +2575,9 @@ end
             .iter()
             .any(|a| a == "mixin:include:Auditable")
     );
+    // The bare `mixin:<Type>` form is what `decl_search attribute=mixin:T` and
+    // the grep→graph augment query (`base:T|mixin:T|iface:T`) substring-match.
+    assert!(admin.attributes.iter().any(|a| a == "mixin:Auditable"));
     assert!(parsed.symbols.iter().any(|s| s.name == "promote"
         && s.kind == SymbolKind::Method
         && s.parent_id == Some(admin.id.clone())));

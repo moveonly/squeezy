@@ -8,8 +8,10 @@
 //!   `Partial` Method symbols (one reader and/or writer per symbol argument).
 //! - `require`/`require_relative`/`load`/`autoload` calls become imports.
 //! - `include`/`extend`/`prepend` calls become Type references on the host
-//!   class plus `mixin:include:<Mod>` style attributes so the graph resolver
-//!   can walk the ancestor chain.
+//!   class plus BOTH a bare `mixin:<Mod>` attribute (queryable by
+//!   `decl_search attribute=mixin:T` and the grep→graph augment) and a
+//!   kind-tagged `mixin:<include|extend|prepend>:<Mod>` attribute, so the graph
+//!   resolver can walk the ancestor chain and enumerate mixers.
 //! - `heredoc_body` subtrees are skipped wholesale.
 //! - `define_method`, `eval`/`instance_eval`/`class_eval`/`module_eval` are
 //!   not mined for symbols (documented recall gap in the spec).
@@ -624,9 +626,15 @@ fn extract_ruby_mixin_or_attr(
                 continue;
             }
             let leaf = last_path_segment(text);
-            // Attach the mixin attribute to the host class symbol so the
-            // graph resolver can find it via ancestor lookup.
+            // Attach the mixin attribute to the host class symbol so the graph
+            // resolver can find it via ancestor lookup. Emit BOTH the bare
+            // `mixin:<Type>` form — so `decl_search attribute=mixin:T` and the
+            // grep→graph augment (which query `base:T|mixin:T|iface:T`) match it,
+            // exactly as Dart's `with` mixers do — AND the kind-tagged
+            // `mixin:<include|extend|prepend>:<Type>` form that preserves which
+            // directive introduced the mixin.
             if let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id) {
+                host.attributes.push(format!("mixin:{leaf}"));
                 host.attributes.push(format!("mixin:{mixin}:{leaf}"));
             }
             ctx.references.push(ParsedReference {
