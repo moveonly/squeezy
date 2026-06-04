@@ -1882,7 +1882,7 @@ async fn push_warn_suppresses_when_last_tool_card_is_cancelled() {
 }
 
 #[tokio::test]
-async fn slash_command_does_not_enqueue_mid_turn() {
+async fn slash_command_queues_mid_turn() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(8);
@@ -1905,10 +1905,42 @@ async fn slash_command_does_not_enqueue_mid_turn() {
     .await
     .expect("handle enter");
 
+    assert_eq!(
+        app.prompt_queue.iter().collect::<Vec<_>>(),
+        vec![&"/help".to_string()],
+        "slash commands entered during a turn should queue like any other input",
+    );
+    assert_eq!(app.input, "", "composer should clear after queueing");
+    assert_eq!(app.status, "queued (1)");
+    assert!(app.turn_rx.is_some(), "active turn should keep running");
+}
+
+#[tokio::test]
+async fn queued_slash_clear_executes_after_running_turn_finishes() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("old context"));
+    app.prompt_queue.push_back("/clear".to_string());
+
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+
     assert!(
         app.prompt_queue.is_empty(),
-        "slash commands should execute immediately, never queue",
+        "queued clear should consume the queue entry",
     );
+    assert!(app.turn_rx.is_none(), "clear should not start a model turn");
+    assert_eq!(app.status, "conversation cleared");
+    assert!(
+        app.terminal_clear_pending,
+        "queued clear should request the same hard terminal clear as typed clear",
+    );
+    assert_eq!(
+        app.transcript.len(),
+        1,
+        "clear should replace the old transcript with the clear notice",
+    );
+    let notice = last_message_content(&app).expect("clear notice");
+    assert!(notice.contains("Conversation cleared."), "{notice}");
 }
 
 #[tokio::test]
@@ -4591,13 +4623,49 @@ async fn slash_clear_wipes_transcript_and_rotates_to_a_fresh_session() {
 
     app.push_transcript_item(TranscriptItem::user("explain this stack trace"));
     app.push_transcript_item(TranscriptItem::assistant("here's the rundown"));
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: "@file:1".to_string(),
+        payload: PromptAttachmentPayload::Text {
+            replacement: "file context".to_string(),
+        },
+    });
+    app.prompt_queue.push_back("queued follow-up".to_string());
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+    app.auto_drain_queue = true;
+    app.context_compaction_nudge_shown = true;
 
     let prior_id = agent.session_id().expect("prior session id");
+    let prior_render_cache_session = app.render_cache_session;
     assert!(handle_slash_command(&mut app, &mut agent, "/clear").await);
 
     let new_id = agent.session_id().expect("new session id");
     assert_ne!(new_id, prior_id, "clear must rotate to a fresh session id");
     assert_eq!(app.status, "conversation cleared");
+    assert!(
+        app.terminal_clear_pending,
+        "clear must request a terminal scrollback/visible-screen purge",
+    );
+    assert_ne!(
+        app.render_cache_session, prior_render_cache_session,
+        "entry ids restart after clear, so the render-cache session must rotate",
+    );
+    assert!(
+        app.prompt_attachments.is_empty(),
+        "prompt attachments are tied to the cleared conversation",
+    );
+    assert!(
+        app.prompt_queue.is_empty(),
+        "queued prompts from the old context must not auto-run after clear",
+    );
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "queue overlay should close when the queue is cleared",
+    );
+    assert!(!app.auto_drain_queue, "stale queue drain must be cancelled");
+    assert!(
+        !app.context_compaction_nudge_shown,
+        "fresh context should not inherit the old compaction nudge",
+    );
     // The visible transcript is dropped; only the post-clear confirmation
     // remains (the slash echo is wiped along with the rest).
     assert_eq!(
@@ -4636,6 +4704,76 @@ async fn slash_clear_without_session_log_still_wipes_the_transcript() {
         !announce.contains("/resume"),
         "with no durable session there is nothing to resume: {announce}",
     );
+}
+
+#[test]
+fn hard_terminal_clear_resets_inline_flush_to_the_fresh_transcript() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::system("Conversation cleared."));
+
+    let mut startup_flushed = false;
+    let mut transcript_flushed_len = 2;
+    reset_inline_flush_after_hard_clear(&mut startup_flushed, &mut transcript_flushed_len);
+
+    assert!(
+        !startup_flushed,
+        "the startup card should be repainted after the hard terminal clear",
+    );
+    assert_eq!(
+        transcript_flushed_len, 0,
+        "fresh-session transcript must flush from index zero",
+    );
+
+    let lines = inline_history_lines_for_flush(
+        &app,
+        80,
+        !startup_flushed,
+        transcript_flushed_len,
+        app.transcript.len(),
+    );
+    let rendered = lines_to_plain_text(&lines);
+    assert!(rendered.contains("Conversation cleared."), "{rendered}");
+    assert!(rendered.contains("Squeezy v"), "{rendered}");
+}
+
+#[test]
+fn hard_terminal_clear_replays_startup_at_top_of_fresh_screen() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::system("Conversation cleared."));
+
+    let lines = inline_history_lines_for_flush(&app, 80, true, 0, app.transcript.len());
+    let height = fresh_inline_history_height(visual_line_count(&lines, 80), 20);
+    assert_eq!(
+        fresh_inline_cursor_row(height, 20),
+        height,
+        "the rebuilt inline viewport should start immediately after the replayed history",
+    );
+
+    let mut backend = TestBackend::new(80, 20);
+    draw_lines_at_top(&mut backend, lines, 80, height).expect("draw fresh history");
+
+    let buffer = backend.buffer();
+    let rows = (0..20)
+        .map(|y| {
+            let mut row = String::new();
+            for x in 0..80 {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let first_nonblank = rows
+        .iter()
+        .position(|row| !row.trim().is_empty())
+        .expect("fresh history should render");
+
+    assert_eq!(
+        first_nonblank,
+        0,
+        "fresh replay must not leave blank rows above the startup card:\n{}",
+        rows.join("\n")
+    );
+    assert!(rows[0].contains("Squeezy v"), "{}", rows.join("\n"));
 }
 
 #[tokio::test]
@@ -10737,9 +10875,10 @@ fn slash_commands_have_documented_capability_for_every_entry() {
 }
 
 #[test]
-fn slash_compact_unavailable_during_turn_renders_dim_hint() {
+fn slash_compact_during_turn_renders_queue_hint() {
     let mut app = test_app(SessionMode::Build);
-    app.cancel = Some(CancellationToken::new());
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
     set_input(&mut app, "/compact".to_string());
 
     let output = render_to_string(&app, 120, 16);
@@ -10748,15 +10887,16 @@ fn slash_compact_unavailable_during_turn_renders_dim_hint() {
         "expected /compact in output: {output}"
     );
     assert!(
-        output.contains("unavailable during turn"),
-        "expected unavailable hint: {output}"
+        output.contains("queues after turn"),
+        "expected queue hint: {output}"
     );
 }
 
 #[test]
-fn slash_unavailable_commands_stay_readable_during_turn() {
+fn slash_queued_commands_stay_readable_during_turn() {
     let mut app = test_app(SessionMode::Build);
-    app.cancel = Some(CancellationToken::new());
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
     set_input(&mut app, "/attach".to_string());
 
     let lines = slash_suggestion_lines(&app, 120);
@@ -10783,8 +10923,8 @@ fn slash_unavailable_commands_stay_readable_during_turn() {
         attach_line
             .spans
             .iter()
-            .any(|span| span.content.contains("unavailable during turn")),
-        "unavailable hint should remain explicit"
+            .any(|span| span.content.contains("queues after turn")),
+        "queue hint should remain explicit"
     );
 }
 
