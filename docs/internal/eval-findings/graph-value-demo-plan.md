@@ -342,6 +342,29 @@ win. THEN iterate A2 tasks/repos for the rest (go/python/js likely need a larger
 - java/ruby unaffected by GAP 1 (they already had `base:` attributes; their loss is the read-storm
   = GAP 4, and Ruby `include` augment = GAP 3). C/Go have no class inheritance → GAP 1 N/A there.
 
+### RESULT (round 3) — transitive decl_search works but the cost-win zone is NARROW
+- transitive decl_search (committed): VALIDATED end-to-end. On a php Store-implementers task the
+  model called `decl_search base:TaggableStore transitive=true` and hit 100% recall at $0.011 in
+  5 tool calls — the capability is used and correct.
+- BUT two redesigned tasks FAILED the no-graph gate by measurement (not assumption):
+  - go/grpc-go (implicit interface): 0.524 — squeezy's graph doesn't resolve Go structural
+    interfaces, so with-graph queries, gets nothing, greps anyway (overhead).
+  - php Store (shallow transitive + co-located): 0.98 — ONE intermediate base (TaggableStore) that
+    grep chases with one extra `extends TaggableStore` grep, and Cache/ is ~14 files (cheap to read).
+    Both arms 100% recall at ~$0.015; graph vs grep is noise at that scale.
+- PATTERN (go + php Store + A1): the graph beats grep on COST only in a NARROW zone — DEEP multi-level
+  transitive (grep must chase many intermediates) AND members SCATTERED across many files AND a large
+  repo. Shallow / co-located / small / implicit-interface tasks are grep-shaped. Grep is very efficient
+  on well-organized code; the graph's composability (fewer tool calls) doesn't become a cost win unless
+  grep is forced to be expensive.
+- The one remaining cloned candidate in the decisive zone: dart RenderBox (RenderBox -> RenderProxyBox
+  -> RenderProxyBoxWithHitTestBehavior -> ...; ~70-120 transitive scattered across rendering/widgets/
+  material/cupertino; flutter is huge). Make-or-break deep test (big GT build + slow measurement).
+- META: capability wins (JS/TS inheritance, Ruby mixins, transitive closure) are real PRODUCT wins;
+  turning them into decisive BENCHMARK cost-wins on comprehension is hard. Consider reframing the demo
+  to capability/composability + the few genuine cost-wins, or pivoting to the CODE-GEN track (Track B)
+  where the graph's exhaustive-edit (recall-of-sites) value is more inherently decisive than cost.
+
 ### Harness note
 Always rebuild release after a squeezy change: `cargo build --release -p squeezy-eval`. Drivers:
 `.work/a1/a1_driver.py` (with/no-graph ratio), `.work/a1/confirm_h2h.py` (head-to-head verdict).
