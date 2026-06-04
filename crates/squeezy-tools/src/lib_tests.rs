@@ -9198,6 +9198,125 @@ public class C : B { }
 }
 
 #[tokio::test]
+async fn decl_search_transitive_walks_mixed_kind_chain() {
+    // Mixed-kind chain: `class C` reaches base interface `I` only THROUGH an
+    // intermediate interface `J` (`I` <- iface `J` <- class `C`). A
+    // `kind=class, attribute=base:I, transitive=true` query must still return
+    // `C`: the closure has to walk the interface intermediate (a *different*
+    // kind) and apply `kind=class` to the EMITTED results, not to the walk.
+    // Before the fix the walk threaded `kind=class` into every expansion, so
+    // the interface `J` was never enqueued and `C`'s subtree was dropped.
+    let root = temp_workspace("decl_search_transitive_mixed_kind");
+    fs::write(
+        root.join("Mixed.cs"),
+        r#"
+namespace App;
+
+public interface I { }
+public interface J : I { }
+public class C : J { }
+"#,
+    )
+    .expect("write csharp source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let transitive = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_mixed".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:I", "kind": "class", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        transitive.status,
+        ToolStatus::Success,
+        "{:?}",
+        transitive.content
+    );
+    let names = decl_search_packet_names(&transitive.content);
+    assert!(
+        names.contains(&"C".to_string()),
+        "transitive closure must reach class C THROUGH interface J (kind applied \
+         to emitted results, not the walk), got {names:?}: {:?}",
+        transitive.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_transitive_honors_query_filter() {
+    // `query` must narrow a transitive closure exactly as it narrows a one-shot
+    // search. base:A's closure is {B, Admin, SuperAdmin}; adding query="Admin"
+    // must drop the unrelated sibling B and keep the Admin branch. Before the
+    // fix the transitive branch ignored `query` entirely and returned the whole
+    // closure.
+    let root = temp_workspace("decl_search_transitive_query");
+    fs::write(
+        root.join("Roles.cs"),
+        r#"
+namespace App;
+
+public class A { }
+public class B : A { }
+public class Admin : A { }
+public class SuperAdmin : Admin { }
+"#,
+    )
+    .expect("write csharp source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Without query: the whole closure includes the unrelated sibling B.
+    let all = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_all".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let all_names = decl_search_packet_names(&all.content);
+    assert!(
+        all_names.contains(&"B".to_string()),
+        "unfiltered transitive closure should include B: {all_names:?}"
+    );
+
+    // With query="Admin": B is dropped, the Admin branch kept.
+    let narrowed = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_query".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "query": "Admin", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        narrowed.status,
+        ToolStatus::Success,
+        "{:?}",
+        narrowed.content
+    );
+    let narrowed_names = decl_search_packet_names(&narrowed.content);
+    assert!(
+        narrowed_names.contains(&"Admin".to_string()),
+        "query=Admin must keep the Admin branch: {narrowed_names:?}"
+    );
+    assert!(
+        !narrowed_names.contains(&"B".to_string()),
+        "query=Admin must drop the unrelated sibling B (returned without query): {narrowed_names:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn decl_search_rejects_empty_unfiltered_query() {
     let root = temp_workspace("decl_search_empty_unfiltered");
     write_rust_crate(&root, "pub fn marker() {}\n");
@@ -12435,12 +12554,14 @@ fn detect_inheritance_grep_positives() {
     assert_eq!(alt.decl_kw, "class");
 
     // Ruby `include`/`prepend` mixin idiom — the standard way Ruby classes mix
-    // in a module. The graph records `mixin:<Type>` on the host, so a grep for
-    // `include Sidekiq::Component` should fire the augment (`Component` is the
-    // queried supertype; the namespace segment only widens, never narrows).
+    // in a module. The graph records `mixin:<leaf>` (plus a qualified
+    // `mixin:<ns>:<leaf>`) on the host, so a grep for `include Sidekiq::Component`
+    // must seed ONLY the leaf `Component` — never the namespace segment
+    // `Sidekiq`, which would inject unrelated `mixin:Sidekiq` declarations and
+    // dilute the augment.
     let ruby = detect_inheritance_grep(r"^\s*include\s+Sidekiq::Component\b")
         .expect("ruby include qualifies");
-    assert!(ruby.base_names.iter().any(|b| b == "Component"));
+    assert_eq!(ruby.base_names, vec!["Component"]);
     let prepend = detect_inheritance_grep(r"prepend Comparable").expect("ruby prepend qualifies");
     assert!(prepend.base_names.iter().any(|b| b == "Comparable"));
 }

@@ -161,11 +161,41 @@ fn inheritance_grep_literalize(pattern: &str) -> String {
 }
 
 /// Tokenize a literalized pattern into `[A-Za-z0-9_]+` runs, preserving order.
+/// A `::` namespace separator is kept *inside* a token (`Sidekiq::Component`
+/// stays one token) so a namespaced mixin/supertype can be distinguished from
+/// an alternation of distinct bases (`A B C` from `extends (A|B|C)`): only the
+/// leaf of a `::` chain is the real supertype, whereas every alternation member
+/// is. A single `:` (Python/Kotlin `: Base`) still separates.
 fn inheritance_grep_tokens(literal: &str) -> Vec<&str> {
-    literal
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|tok| !tok.is_empty())
-        .collect()
+    let bytes = literal.as_bytes();
+    let is_ident = |b: u8| (b as char).is_ascii_alphanumeric() || b == b'_';
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        loop {
+            while i < bytes.len() && is_ident(bytes[i]) {
+                i += 1;
+            }
+            // Span a `::` join only when another identifier follows it.
+            if i + 2 < bytes.len()
+                && bytes[i] == b':'
+                && bytes[i + 1] == b':'
+                && is_ident(bytes[i + 2])
+            {
+                i += 2;
+            } else {
+                break;
+            }
+        }
+        tokens.push(&literal[start..i]);
+    }
+    tokens
 }
 
 /// Is `tok` a "concrete supertype" literal — a Capitalized identifier of at
@@ -289,8 +319,13 @@ pub(crate) fn detect_inheritance_grep(pattern: &str) -> Option<InheritanceGrep> 
 /// to `out` when it is a real supertype literal and not already present.
 fn push_supertype(tok: &str, out: &mut Vec<String>) {
     let head = tok.split(['<', '>', '(', ')']).next().unwrap_or(tok).trim();
-    if is_supertype_literal(head) && !out.iter().any(|b| b == head) {
-        out.push(head.to_string());
+    // Reduce a namespace-qualified name (`Sidekiq::Component`, `A::B::C`) to its
+    // leaf. The graph records the leaf as `mixin:`/`base:<leaf>` (plus a
+    // qualified `mixin:ns:leaf`), never the bare namespace segment — seeding
+    // `Sidekiq` would inject unrelated declarations and dilute the augment.
+    let leaf = head.rsplit("::").next().unwrap_or(head).trim();
+    if is_supertype_literal(leaf) && !out.iter().any(|b| b == leaf) {
+        out.push(leaf.to_string());
     }
 }
 
@@ -1087,6 +1122,7 @@ impl ToolRegistry {
         // supertype; the bound below keeps it to `GRAPH_AUGMENT_CAP`.
         let symbols = graph_transitive_subtype_closure(
             graph,
+            None,
             kind,
             None,
             None,

@@ -1033,10 +1033,16 @@ fn seed_type_names(attribute: &str) -> Vec<String> {
 ///
 /// Termination/cycle safety comes from a seen-names set (each type name is
 /// expanded at most once); size is bounded by [`TRANSITIVE_CLOSURE_CAP`]. The
-/// `kind`/`path`/`language`/`visibility` scopes are threaded through unchanged
-/// so the closure respects the same filters the seed query did.
+/// `path`/`language`/`visibility` scope the walk; `kind` and `query` are
+/// applied to the *emitted* results (not the walk) so a mixed-kind intermediate
+/// is still traversed and a `query` still narrows the closure — matching the
+/// non-transitive search's filter semantics.
+// Mirrors `graph_symbol_search`'s filter surface (query/kind/path/language/
+// visibility) plus the seed/cap, so the argument count is inherent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn graph_transitive_subtype_closure(
     graph: &squeezy_graph::SemanticGraph,
+    query: Option<&str>,
     kind: Option<&str>,
     path: Option<&str>,
     language: Option<&str>,
@@ -1044,6 +1050,9 @@ pub(crate) fn graph_transitive_subtype_closure(
     seed_names: &[String],
     cap: usize,
 ) -> Vec<GraphSymbol> {
+    let kind_filter = kind.and_then(parse_symbol_kind_filter);
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     for name in seed_names {
@@ -1057,28 +1066,55 @@ pub(crate) fn graph_transitive_subtype_closure(
 
     while let Some(name) = queue.pop_front() {
         let attribute = format!("base:{name}|mixin:{name}|iface:{name}");
+        // Expand KIND-AGNOSTICALLY. The hierarchy must be walked through every
+        // inheritance edge regardless of kind, or a mixed-kind *intermediate*
+        // (e.g. `interface J extends I`, an abstract class between two concrete
+        // ones) is never enqueued and its whole subtree is silently dropped
+        // (`class C implements J` would be missed for a `kind=class base:I`
+        // query). The requested `kind` is applied to *emitted* results below,
+        // not to the walk. `path`/`language`/`visibility` still scope the walk.
         let matches = graph_symbol_search(
             graph,
             None,
-            kind,
+            None,
             path,
             language,
             visibility,
             Some(&attribute),
         );
         for symbol in matches {
+            let newly_seen = seen_ids.insert(symbol.id.clone());
+            // Enqueue every newly-seen *name* so its subtypes are discovered too
+            // — even when the symbol itself is filtered out of the results. This
+            // is what keeps the closure transitive across kind boundaries.
+            if seen_names.insert(symbol.name.clone()) {
+                queue.push_back(symbol.name.clone());
+            }
+            if !newly_seen {
+                continue;
+            }
+            // Result filters. `kind` narrows emitted results (the walk above was
+            // kind-agnostic); `query`, when present, narrows the closure to name
+            // matches so `decl_search{query,attribute:base:X,transitive:true}`
+            // honors the query just like the non-transitive path does.
+            if !symbol_matches_kind_filter(symbol.kind, kind_filter) {
+                continue;
+            }
+            if let Some(query) = query {
+                let view = squeezy_rank::GraphSymbolView {
+                    name: symbol.name.as_str(),
+                    signature: symbol.signature.as_str(),
+                };
+                if squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                    == squeezy_rank::symbol_rank::RankTier::NoMatch
+                {
+                    continue;
+                }
+            }
             if results.len() >= cap {
                 return results;
             }
-            // A symbol genuinely new to the closure (by id) is a result; if its
-            // own name has not been expanded yet, enqueue it so its subtypes are
-            // discovered too — this is what makes the closure transitive.
-            if seen_ids.insert(symbol.id.clone()) {
-                if seen_names.insert(symbol.name.clone()) {
-                    queue.push_back(symbol.name.clone());
-                }
-                results.push(symbol);
-            }
+            results.push(symbol);
         }
     }
 
@@ -2637,6 +2673,7 @@ impl ToolRegistry {
         let symbols = match transitive_seed {
             Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
                 graph,
+                args.query.as_deref(),
                 args.kind.as_deref(),
                 args.path.as_deref(),
                 args.language.as_deref(),
