@@ -474,7 +474,7 @@ impl LlmProvider for OllamaProvider {
 
             yield LlmEvent::Started;
             let mut decoder = JsonLineDecoder::default();
-            let mut server_model_slot: Option<String> = None;
+            let mut parse_state = OllamaStreamParseState::default();
             let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
             loop {
@@ -504,8 +504,8 @@ impl LlmProvider for OllamaProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for line in decoder.push(&chunk)? {
-                    let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
-                    if let Some(server) = server_model_slot.take()
+                    let parsed = parse_ollama_line(&line, &mut parse_state)?;
+                    if let Some(server) = parse_state.server_model_slot.take()
                         && let Some(echo) = server_model_echo.observe(&request.model, &server)
                     {
                         yield echo;
@@ -516,8 +516,8 @@ impl LlmProvider for OllamaProvider {
                 }
             }
             for line in decoder.finish() {
-                let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
-                if let Some(server) = server_model_slot.take()
+                let parsed = parse_ollama_line(&line, &mut parse_state)?;
+                if let Some(server) = parse_state.server_model_slot.take()
                     && let Some(echo) = server_model_echo.observe(&request.model, &server)
                 {
                     yield echo;
@@ -686,14 +686,20 @@ fn push_json_line(bytes: &[u8], lines: &mut Vec<String>) {
     }
 }
 
-fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Result<Vec<LlmEvent>> {
+#[derive(Debug, Default)]
+struct OllamaStreamParseState {
+    server_model_slot: Option<String>,
+    next_tool_call_index: usize,
+}
+
+fn parse_ollama_line(line: &str, state: &mut OllamaStreamParseState) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(line)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Ollama JSON: {err}")))?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
         return Err(SqueezyError::ProviderStream(error.to_string()));
     }
 
-    if server_model_slot.is_none()
+    if state.server_model_slot.is_none()
         && let Some(server_model) = value.get("model").and_then(Value::as_str)
         && !server_model.is_empty()
     {
@@ -702,7 +708,7 @@ fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Resu
         // emits `ServerModel` once when the canonical tag (e.g.
         // `llama3:latest` → `llama3:8b-instruct-q4_0`) differs from
         // the user-supplied request model.
-        *server_model_slot = Some(server_model.to_string());
+        state.server_model_slot = Some(server_model.to_string());
     }
 
     let mut events = Vec::new();
@@ -741,7 +747,7 @@ fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Resu
         .and_then(|message| message.get("tool_calls"))
         .and_then(Value::as_array)
     {
-        for (index, tool_call) in tool_calls.iter().enumerate() {
+        for tool_call in tool_calls {
             let Some(function) = tool_call.get("function") else {
                 continue;
             };
@@ -774,6 +780,8 @@ fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Resu
                 }
                 Some(other) => other.clone(),
             };
+            let index = state.next_tool_call_index;
+            state.next_tool_call_index += 1;
             events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id: format!("ollama_call_{index}"),
                 name,

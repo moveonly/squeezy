@@ -159,15 +159,15 @@ fn request_body_preserves_function_tool_order() {
 
 #[test]
 fn parser_extracts_text_tool_calls_and_usage() {
-    let mut server_model_slot: Option<String> = None;
+    let mut state = OllamaStreamParseState::default();
     let events = parse_ollama_line(
         r#"{"model":"llama3:8b-instruct-q4_0","message":{"content":"hi","tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"needle"}}}]},"done":true,"prompt_eval_count":10,"eval_count":2}"#,
-        &mut server_model_slot,
+        &mut state,
     )
     .expect("valid event");
 
     assert_eq!(
-        server_model_slot.as_deref(),
+        state.server_model_slot.as_deref(),
         Some("llama3:8b-instruct-q4_0")
     );
     assert_eq!(events[0], LlmEvent::TextDelta("hi".to_string()));
@@ -274,10 +274,10 @@ fn request_body_skips_think_for_non_reasoning_models() {
 
 #[test]
 fn parser_emits_reasoning_delta_from_message_thinking() {
-    let mut server_model_slot: Option<String> = None;
+    let mut state = OllamaStreamParseState::default();
     let events = parse_ollama_line(
         r#"{"model":"qwen3:8b","message":{"thinking":"let me ponder","content":""}}"#,
-        &mut server_model_slot,
+        &mut state,
     )
     .expect("thinking chunk parses");
     assert_eq!(events.len(), 1);
@@ -292,10 +292,10 @@ fn parser_emits_reasoning_delta_from_message_thinking() {
 
 #[test]
 fn parser_decodes_string_encoded_tool_arguments() {
-    let mut server_model_slot: Option<String> = None;
+    let mut state = OllamaStreamParseState::default();
     let events = parse_ollama_line(
         r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":"{\"pattern\":\"needle\"}"}}]}}"#,
-        &mut server_model_slot,
+        &mut state,
     )
     .expect("string arguments parse");
     assert_eq!(
@@ -309,11 +309,43 @@ fn parser_decodes_string_encoded_tool_arguments() {
 }
 
 #[test]
+fn parser_assigns_unique_tool_call_ids_across_chunks() {
+    let mut state = OllamaStreamParseState::default();
+    let first = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"needle"}}}]}}"#,
+        &mut state,
+    )
+    .expect("first chunk parses");
+    let second = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"read_file","arguments":{"path":"src/lib.rs"}}}]}}"#,
+        &mut state,
+    )
+    .expect("second chunk parses");
+
+    assert_eq!(
+        first[0],
+        LlmEvent::ToolCall(LlmToolCall {
+            call_id: "ollama_call_0".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "needle"}),
+        })
+    );
+    assert_eq!(
+        second[0],
+        LlmEvent::ToolCall(LlmToolCall {
+            call_id: "ollama_call_1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+        })
+    );
+}
+
+#[test]
 fn parser_marks_invalid_string_encoded_tool_arguments() {
-    let mut server_model_slot: Option<String> = None;
+    let mut state = OllamaStreamParseState::default();
     let events = parse_ollama_line(
         r#"{"model":"qwen3","message":{"tool_calls":[{"function":{"name":"grep","arguments":"{not-json"}}]}}"#,
-        &mut server_model_slot,
+        &mut state,
     )
     .expect("unparseable string still surfaces a call");
     let LlmEvent::ToolCall(call) = &events[0] else {
@@ -350,10 +382,9 @@ fn parser_treats_load_and_unload_done_reasons_as_noop() {
     // swallow them so the stream loop keeps polling instead of closing
     // the turn with zero tokens.
     for reason in ["load", "unload"] {
-        let mut server_model_slot: Option<String> = None;
+        let mut state = OllamaStreamParseState::default();
         let line = format!(r#"{{"model":"qwen3:0.6b","done":true,"done_reason":"{reason}"}}"#);
-        let events =
-            parse_ollama_line(&line, &mut server_model_slot).expect("housekeeping frame parses");
+        let events = parse_ollama_line(&line, &mut state).expect("housekeeping frame parses");
         assert!(
             events.is_empty(),
             "expected no events for done_reason={reason}, got {events:?}",
@@ -362,10 +393,10 @@ fn parser_treats_load_and_unload_done_reasons_as_noop() {
 
     // Following the housekeeping frame, real content chunks must still
     // surface a TextDelta plus the genuine terminal Completed event.
-    let mut server_model_slot: Option<String> = None;
+    let mut state = OllamaStreamParseState::default();
     let text_events = parse_ollama_line(
         r#"{"model":"qwen3:0.6b","message":{"content":"after-load"}}"#,
-        &mut server_model_slot,
+        &mut state,
     )
     .expect("content chunk parses");
     assert_eq!(text_events.len(), 1);
@@ -376,7 +407,7 @@ fn parser_treats_load_and_unload_done_reasons_as_noop() {
 
     let terminal_events = parse_ollama_line(
         r#"{"model":"qwen3:0.6b","done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":4}"#,
-        &mut server_model_slot,
+        &mut state,
     )
     .expect("terminal stop frame parses");
     assert!(matches!(
