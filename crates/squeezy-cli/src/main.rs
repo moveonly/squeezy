@@ -2844,6 +2844,10 @@ async fn run_prompts(
         SessionStatus::Failed
     };
     agent.finish_session(exit_status).await;
+    // Flush the agent's telemetry so the session summary is persisted and
+    // sent before the process exits. Without this the headless path may
+    // exit before the background flush timer fires.
+    agent.flush_telemetry().await;
     result
 }
 

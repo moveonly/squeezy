@@ -164,6 +164,12 @@ impl PromptTemplateCatalog {
     /// parsing follows bash-style quoting so `/review "two words"`
     /// passes a single argument.
     pub fn expand(&self, input: &str) -> Option<String> {
+        self.expand_with_info(input).map(|(text, _, _)| text)
+    }
+
+    /// Like [`expand`] but also returns `(source, arg_count)` for telemetry.
+    /// Returns `None` if the input doesn't match a template.
+    pub fn expand_with_info(&self, input: &str) -> Option<(String, PromptTemplateSource, u32)> {
         let trimmed = input.trim_start();
         let rest = trimmed.strip_prefix('/')?;
         let (head, args_str) = match rest.find(char::is_whitespace) {
@@ -175,10 +181,12 @@ impl PromptTemplateCatalog {
         }
         let template = self.templates.get(head)?;
         let arg_values = parse_command_args(args_str);
-        Some(substitute_args(
-            &template.content,
-            &arg_values,
-            &template.args,
+        let arg_count = arg_values.len() as u32;
+        let source = template.source;
+        Some((
+            substitute_args(&template.content, &arg_values, &template.args),
+            source,
+            arg_count,
         ))
     }
 

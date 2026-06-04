@@ -4,7 +4,7 @@ use std::{
     net::IpAddr,
     pin::Pin,
     sync::LazyLock,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use futures_util::StreamExt;
@@ -21,8 +21,9 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ToolCall, ToolCostHint, ToolRegistry, ToolResult, ToolStatus, collapse_whitespace, make_result,
-    sha256_hex, tool_arg_error, tool_error, truncate::truncate_middle_bytes, unix_timestamp_millis,
+    ToolCall, ToolCostHint, ToolRegistry, ToolResult, ToolStatus, WebCallStats,
+    collapse_whitespace, make_result, sha256_hex, tool_arg_error, tool_error,
+    truncate::truncate_middle_bytes, unix_timestamp_millis,
 };
 
 pub(crate) const DEFAULT_WEB_SEARCH_RESULTS: usize = 8;
@@ -208,6 +209,7 @@ impl ToolRegistry {
         call: &ToolCall,
         cancel: CancellationToken,
     ) -> ToolResult {
+        let web_started = Instant::now();
         let args = match serde_json::from_value::<WebSearchArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -361,7 +363,7 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
-        make_result(
+        let mut result = make_result(
             call,
             ToolStatus::Success,
             json!({
@@ -392,7 +394,16 @@ impl ToolRegistry {
             }),
             cost,
             None,
-        )
+        );
+        result.web_call_stats = Some(WebCallStats {
+            provider_token: provider.as_str().to_string(),
+            status_token: "success".to_string(),
+            ssrf_blocked: false,
+            redirect_blocked: false,
+            response_byte_bucket: WebCallStats::response_byte_bucket(bytes_read).to_string(),
+            duration_ms: web_started.elapsed().as_millis() as u64,
+        });
+        result
     }
 
     pub(crate) async fn execute_webfetch(
@@ -400,6 +411,7 @@ impl ToolRegistry {
         call: &ToolCall,
         cancel: CancellationToken,
     ) -> ToolResult {
+        let web_started = Instant::now();
         let args = match serde_json::from_value::<WebFetchArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -474,8 +486,34 @@ impl ToolRegistry {
             result = time::timeout(Duration::from_millis(timeout_ms), fetch) => result,
         } {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(err)) => return tool_error(call, err),
-            Err(_) => return tool_error(call, format!("webfetch timed out after {timeout_ms} ms")),
+            Ok(Err(err)) => {
+                let ssrf_blocked = err.contains("internal address");
+                let redirect_blocked = err.contains("too many redirects");
+                let duration_ms = web_started.elapsed().as_millis() as u64;
+                let mut result = tool_error(call, err);
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: "webfetch".to_string(),
+                    status_token: "error".to_string(),
+                    ssrf_blocked,
+                    redirect_blocked,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms,
+                });
+                return result;
+            }
+            Err(_) => {
+                let mut result =
+                    tool_error(call, format!("webfetch timed out after {timeout_ms} ms"));
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: "webfetch".to_string(),
+                    status_token: "error".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: false,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                return result;
+            }
         };
 
         match outcome {
@@ -483,18 +521,29 @@ impl ToolRegistry {
                 status,
                 original_url,
                 redirect_url,
-            } => make_result(
-                call,
-                ToolStatus::Error,
-                json!({
-                    "error": "redirect to another host detected; call webfetch again with redirect_url if approved",
-                    "status": status,
-                    "original_url": original_url,
-                    "redirect_url": redirect_url,
-                }),
-                ToolCostHint::default(),
-                None,
-            ),
+            } => {
+                let mut result = make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "error": "redirect to another host detected; call webfetch again with redirect_url if approved",
+                        "status": status,
+                        "original_url": original_url,
+                        "redirect_url": redirect_url,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: "webfetch".to_string(),
+                    status_token: "error".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: true,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                result
+            }
             WebFetchOutcome::Fetched {
                 final_url,
                 status,
@@ -550,7 +599,7 @@ impl ToolRegistry {
                     truncated: output_truncated,
                     ..ToolCostHint::default()
                 };
-                make_result(
+                let mut result = make_result(
                     call,
                     ToolStatus::Success,
                     json!({
@@ -578,7 +627,16 @@ impl ToolRegistry {
                     }),
                     cost,
                     Some(content_sha256),
-                )
+                );
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: "webfetch".to_string(),
+                    status_token: "success".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: false,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(raw_len).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                result
             }
         }
     }

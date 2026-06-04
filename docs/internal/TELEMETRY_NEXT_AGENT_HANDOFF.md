@@ -59,20 +59,30 @@ Candidate direct-send exceptions besides feedback/report are only fatal errors
 that cannot be durably recorded first. Prefer durable local recording and
 next-start recovery whenever possible.
 
-## Suggested Summary Sections
+## Implemented Summary Sections
+
+The `squeezy_session_summary` event now carries:
 
 - Session: started/ended timestamps, duration, status, abnormal-exit flag.
-- Startup: route, time to placeholder draw, agent build, first interactive draw.
-- Graph: build/refresh counts, duration buckets, file/language/exclusion/cache
-  counts, error counts.
+- Startup: route, phase timings (placeholder/agent-build/snapshot/interactive).
+- Graph: build/refresh counts, duration, file/language/exclusion/cache counts.
 - Slash usage: counts by command token, surface, outcome, alias kind, arg shape.
-- Config: counts by scope, section, field id, apply tier, change kind, value
-  bucket transition.
-- Tools: counts by tool family/name/status, duration buckets, bytes/read/search
-  buckets, output buckets.
-- Failures: counts by coarse error kind and phase.
-- Cost/context: aggregate token/cost/cache/budget counters already captured in
-  turn/session metrics.
+- Config: counts by scope, section, field id, apply tier, change kind, value bucket.
+- Tools: counts by tool family/name/status (MCP now classified separately).
+- Failures + provider errors: coarse error kinds and provider error category counts.
+- MCP: server transport/enabled/disabled, tool discovery/cache/stale counts,
+  capability presence booleans, elicitation outcome counts.
+- External network: websearch/webfetch counts by provider, status, byte bucket,
+  SSRF/redirect block flags.
+- Skills: activation source/kind/included/dropped/body-truncated/preamble counts.
+- Prompt templates: expansion source, arg-count bucket, queued-vs-started counts.
+- Subagents: per-kind (delegate/explore/plan/review) call/failure counts,
+  concurrency-cap rejection count.
+- Approvals/permissions: capability × risk × decision × source counts.
+- Retry counts by reason kind.
+- Stop-reason counts by normalized reason token.
+- Cache fields: cache_supported, cache_write_tokens, reasoning_output_tokens.
+- Cost/context: aggregate token/cost/cache/budget counters.
 
 ## Files Touched In This Branch
 

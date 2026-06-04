@@ -3784,11 +3784,15 @@ fn expand_prompt_template_or_fallthrough(
     input: &str,
     _surface: SlashSurface,
 ) -> bool {
-    let Some(expanded) = app.prompt_templates.expand(input) else {
+    let Some((expanded, source, arg_count)) = app.prompt_templates.expand_with_info(input) else {
         return false;
     };
     app.push_slash_command_echo(input);
-    if app.turn_rx.is_some() {
+    let queued = app.turn_rx.is_some();
+    // Fire prompt-template telemetry: source, arg-count bucket, and
+    // queued-vs-started outcome.
+    agent.record_prompt_template_telemetry(source.as_str(), arg_count, queued);
+    if queued {
         app.prompt_queue.push_back(expanded);
         app.status = format!("queued ({})", app.prompt_queue.len());
         return true;

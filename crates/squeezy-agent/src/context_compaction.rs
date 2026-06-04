@@ -1587,6 +1587,7 @@ fn grep_count_from_content_stub(result: ToolResult, source: &GrepContentCount) -
             content_sha256: result.receipt.content_sha256,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -1882,6 +1883,7 @@ fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult 
             content_sha256: result.receipt.content_sha256,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -2047,6 +2049,7 @@ fn receipt_stub_reference_omitted(result: ToolResult) -> ToolResult {
             content_sha256: result.receipt.content_sha256,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 

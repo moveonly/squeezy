@@ -23,11 +23,11 @@ use squeezy_core::{
     ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot,
     DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE,
     PermissionAction, PermissionCapability, PermissionPolicyMode, PermissionRequest,
-    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
-    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
-    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
-    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
-    default_settings_path, detect_context_attachment_kind,
+    PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
+    ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
+    StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig,
+    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
@@ -39,8 +39,8 @@ use squeezy_llm::{
     provider_honors_output_schema,
 };
 use squeezy_skills::{
-    BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, matches_squeezy_help_input,
-    relevant_docs_for_input,
+    BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SkillActivationKind, SqueezyHelp,
+    bundled_docs, matches_squeezy_help_input, relevant_docs_for_input,
 };
 use squeezy_store::{
     BugReportBundle, BugReportOptions, HydratedTranscriptItem, ResumeItem, SessionEvent,
@@ -49,11 +49,12 @@ use squeezy_store::{
     SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
-    ConfigChangeReport, ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback,
-    ReportUpload, SessionStatusKind as TelemetrySessionStatusKind, SessionTelemetryReport,
+    ConfigChangeReport, ErrorKind, FeedbackClient, FeedbackSubmitResult, McpDiscoveryReport,
+    PreparedFeedback, ProviderErrorKind, ReportUpload,
+    SessionStatusKind as TelemetrySessionStatusKind, SessionTelemetryReport, SkillActivationReport,
     SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, SlashTelemetryReport, StartupRoute,
     TelemetryClient, TelemetryEvent, ToolCostProperties, ToolStatusKind as TelemetryToolStatusKind,
-    ToolTelemetryReport, prepare_feedback,
+    ToolTelemetryReport, WebRequestReport, prepare_feedback,
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
@@ -2364,6 +2365,25 @@ impl Agent {
             .spawn(TelemetryEvent::config_change_committed(report));
     }
 
+    /// Fire `prompt_template_expanded` telemetry for a template that matched
+    /// a user's slash input. `source_token` is the safe token for the template
+    /// source (e.g. `"user"` or `"project"`), `arg_count` is the number of
+    /// positional arguments supplied, and `queued` distinguishes a queued
+    /// expansion (turn is active) from an immediately-started one.
+    pub fn record_prompt_template_telemetry(
+        &self,
+        source_token: &str,
+        arg_count: u32,
+        queued: bool,
+    ) {
+        self.telemetry
+            .spawn(TelemetryEvent::prompt_template_expanded(
+                source_token,
+                arg_count,
+                queued,
+            ));
+    }
+
     pub fn session_id(&self) -> Option<String> {
         self.session_log
             .as_ref()
@@ -2885,6 +2905,25 @@ impl Agent {
         let metrics = state.metrics.clone();
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
         let p = &self.prior_metrics;
+        // Build per-kind subagent count map from the accumulated metrics.
+        let mut subagent_kind_counts = std::collections::BTreeMap::new();
+        for (kind, bucket) in [
+            ("delegate", &metrics.subagent_by_kind.delegate),
+            ("explore", &metrics.subagent_by_kind.explore),
+            ("plan", &metrics.subagent_by_kind.plan),
+            ("review", &metrics.subagent_by_kind.review),
+        ] {
+            if bucket.calls > 0 {
+                *subagent_kind_counts
+                    .entry(format!("{kind}_calls"))
+                    .or_default() += bucket.calls;
+            }
+            if bucket.failures > 0 {
+                *subagent_kind_counts
+                    .entry(format!("{kind}_failures"))
+                    .or_default() += bucket.failures;
+            }
+        }
         self.telemetry
             .record(TelemetryEvent::session_ended(
                 &self.config,
@@ -2905,6 +2944,8 @@ impl Agent {
                     subagent_failures: metrics
                         .subagent_failures
                         .saturating_sub(p.subagent_failures),
+                    subagent_kind_counts,
+                    subagent_cap_rejections: 0,
                 },
             ))
             .await;
@@ -4076,15 +4117,16 @@ impl Agent {
                 all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
                 retain_non_excluded_tools(&mut all_tool_specs, &config.tools);
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
-                refresh_mcp_tools_in_background(
-                    tools.clone(),
-                    cancel.clone(),
-                    session_log.clone(),
-                    redactor.clone(),
-                    tx.clone(),
+                refresh_mcp_tools_in_background(McpRefreshContext {
+                    tools: tools.clone(),
+                    cancel: cancel.clone(),
+                    session_log: session_log.clone(),
+                    redactor: redactor.clone(),
+                    tx: tx.clone(),
                     turn_id,
-                    background_tasks.clone(),
-                );
+                    background_tasks: background_tasks.clone(),
+                    telemetry: telemetry.clone(),
+                });
 
                 let outcome = TurnRuntime {
                     turn_id,
@@ -4148,6 +4190,9 @@ impl Agent {
                         });
                     }
                     telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
+                    if let Some(provider_kind) = classify_provider_error(&error) {
+                        telemetry.spawn(TelemetryEvent::provider_error(provider_kind));
+                    }
                     let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
                 }
             },
@@ -4197,6 +4242,9 @@ where
                 });
             }
             telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
+            if let Some(provider_kind) = classify_provider_error(&error) {
+                telemetry.spawn(TelemetryEvent::provider_error(provider_kind));
+            }
             let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
         }
         done.notify_waiters();
@@ -4851,7 +4899,7 @@ async fn complete_local_tool_turn(
         .await;
 }
 
-fn refresh_mcp_tools_in_background(
+struct McpRefreshContext {
     tools: ToolRegistry,
     cancel: CancellationToken,
     session_log: Option<SessionHandle>,
@@ -4859,9 +4907,48 @@ fn refresh_mcp_tools_in_background(
     tx: mpsc::Sender<AgentEvent>,
     turn_id: TurnId,
     background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
-) {
+    telemetry: TelemetryClient,
+}
+
+fn refresh_mcp_tools_in_background(ctx: McpRefreshContext) {
+    let McpRefreshContext {
+        tools,
+        cancel,
+        session_log,
+        redactor,
+        tx,
+        turn_id,
+        background_tasks,
+        telemetry,
+    } = ctx;
     let task = async move {
         let outcome = tools.refresh_mcp_tools(cancel).await;
+        // Fire MCP discovery telemetry if the outcome has stats.
+        if let Some(stats) = &outcome.discovery_stats {
+            let (has_resources, has_elicitation, has_experimental) =
+                tools.aggregate_mcp_capabilities().await;
+            let mut error_kind_counts = std::collections::BTreeMap::new();
+            for kind in &stats.error_kind_tokens {
+                *error_kind_counts.entry(kind.clone()).or_default() += 1u64;
+            }
+            telemetry.spawn(TelemetryEvent::mcp_discovery(McpDiscoveryReport {
+                servers_stdio: stats.servers_stdio,
+                servers_http: stats.servers_http,
+                servers_sse: stats.servers_sse,
+                servers_enabled: stats.servers_enabled,
+                servers_disabled: stats.servers_disabled,
+                tools_discovered: stats.tools_discovered,
+                tools_cached: stats.tools_cached,
+                tools_stale_retained: stats.tools_stale_retained,
+                tools_dropped_disabled: stats.tools_dropped_disabled,
+                discovery_errors: stats.discovery_errors,
+                error_kind_counts,
+                has_resources,
+                has_elicitation,
+                has_experimental,
+                duration_ms: stats.duration_ms,
+            }));
+        }
         log_session_event(
             session_log.as_ref(),
             &redactor,
@@ -5499,6 +5586,10 @@ impl TurnRuntime {
     }
 
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
+        // Open a per-turn span so all events emitted during this turn carry
+        // the same span_id. `begin_turn` returns None when telemetry is
+        // disabled; end_turn is called in finish_turn/finish_cancelled_turn.
+        self.telemetry.begin_turn();
         // Session-scoped hooks fire on the first turn so handlers
         // installed via `Agent::set_hooks` *after* `Agent::new`
         // still observe the boundary. Cheap when no hooks are
@@ -5535,8 +5626,47 @@ impl TurnRuntime {
                     squeezy_skills::SkillContextMode::Fork
                 )
             });
-        let active_block = self.tools.format_active_skills(&inline_skills);
+        let (active_block, skill_metrics) = self
+            .tools
+            .format_active_skills_with_metrics(&inline_skills);
         let fork_block = self.tools.format_fork_skills(&fork_skills);
+        // Fire skill activation telemetry for all activated skills.
+        if !activation.skills.is_empty() {
+            let mut source_counts = std::collections::BTreeMap::new();
+            for skill in &activation.skills {
+                *source_counts
+                    .entry(skill.summary.source.as_str().to_string())
+                    .or_default() += 1u64;
+            }
+            let explicit_count = activation
+                .kinds
+                .iter()
+                .filter(|k| matches!(k, SkillActivationKind::Explicit))
+                .count() as u32;
+            let trigger_count = activation
+                .kinds
+                .iter()
+                .filter(|k| matches!(k, SkillActivationKind::Trigger))
+                .count() as u32;
+            let implicit_shell_count = activation
+                .kinds
+                .iter()
+                .filter(|k| matches!(k, SkillActivationKind::ImplicitShell))
+                .count() as u32;
+            self.telemetry
+                .spawn(TelemetryEvent::skill_activated(SkillActivationReport {
+                    total: skill_metrics.total as u32,
+                    included: skill_metrics.included as u32,
+                    dropped: skill_metrics.dropped as u32,
+                    body_truncated: skill_metrics.body_truncated as u32,
+                    preamble_emitted: false,
+                    preamble_omitted_count: 0,
+                    explicit_count,
+                    trigger_count,
+                    implicit_shell_count,
+                    source_counts,
+                }));
+        }
         // `manifest.tool_deps` declared by an activated skill must
         // match an advertised tool name (or `mcp:<server>` for a
         // ready MCP). When a dep is missing the skill body would
@@ -6902,6 +7032,27 @@ impl TurnRuntime {
                 return Ok(());
             }
 
+            // Record stop-reason and cache telemetry fields on the turn metrics.
+            broker.metrics.stop_reason_token = stop_reason.as_ref().map(|r| match r {
+                StopReason::EndTurn => "end_turn".to_string(),
+                StopReason::ToolUse => "tool_use".to_string(),
+                StopReason::MaxTokens => "max_tokens".to_string(),
+                StopReason::ContextWindowExceeded => "context_window_exceeded".to_string(),
+                StopReason::StopSequence => "stop_sequence".to_string(),
+                StopReason::Refusal => "refusal".to_string(),
+                StopReason::PauseTurn => "pause_turn".to_string(),
+                StopReason::MalformedFunctionCall => "malformed_function_call".to_string(),
+                StopReason::Other(_) | _ => "other".to_string(),
+            });
+            broker.metrics.reasoning_only_stop = reasoning_only_stop;
+            if completed_cost.cached_input_tokens.is_some()
+                || completed_cost.cache_write_input_tokens.is_some()
+            {
+                broker.metrics.cache_supported = true;
+            }
+            broker.metrics.cache_write_tokens = completed_cost.cache_write_input_tokens;
+            broker.metrics.reasoning_output_tokens = completed_cost.reasoning_output_tokens;
+
             // Explicit `stop_reason` branches. Truncation (max-tokens,
             // context-window-exceeded) and refusal previously surfaced
             // either as a provider transport error (Anthropic raised
@@ -7636,11 +7787,14 @@ impl TurnRuntime {
     }
 
     async fn finish_turn(&self, metrics: &TurnMetrics) {
+        self.telemetry.end_turn();
         self.telemetry.spawn(TelemetryEvent::turn_completed(
             &self.config,
             self.turn_id.get(),
             metrics.clone(),
         ));
+        // Drain MCP elicitation audit ring and emit per-elicitation events.
+        emit_mcp_elicitation_telemetry(&self.tools, &self.telemetry);
         self.session_metrics.lock().await.merge_turn(metrics);
         // Stop fires after telemetry persistence so audit handlers
         // see the final TurnMetrics already on disk.
@@ -7870,6 +8024,7 @@ impl TurnRuntime {
                 "metrics": metrics,
             }),
         );
+        self.telemetry.end_turn();
         self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
         let _ = self
             .tx
@@ -10854,6 +11009,7 @@ fn control_tool_result(call: &ToolCall, status: ToolStatus, content: Value) -> T
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -12613,6 +12769,7 @@ fn budget_denied_result(call: &ToolCall, reason: String) -> ToolResult {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -12621,11 +12778,10 @@ fn emit_tool_telemetry(
     telemetry: &TelemetryClient,
     turn_id: TurnId,
     tool_sequence: u64,
-    call: &ToolCall,
+    _call: &ToolCall,
     result: &ToolResult,
     duration: Duration,
 ) {
-    let args_sha256 = tool_call_args_sha256(call);
     telemetry.spawn(TelemetryEvent::tool_completed(ToolTelemetryReport {
         provider: &config.provider,
         model: &config.model,
@@ -12640,10 +12796,44 @@ fn emit_tool_telemetry(
             matches_returned: result.cost_hint.matches_returned,
             output_bytes: result.cost_hint.output_bytes,
         },
-        args_sha256: args_sha256.as_deref(),
-        output_sha256: Some(result.receipt.output_sha256.as_str()),
-        content_sha256: result.receipt.content_sha256.as_deref(),
     }));
+    // Fire web-request telemetry for websearch/webfetch results.
+    if let Some(web_stats) = &result.web_call_stats {
+        telemetry.spawn(TelemetryEvent::web_request(WebRequestReport {
+            provider_token: web_stats.provider_token.clone(),
+            status_token: web_stats.status_token.clone(),
+            ssrf_blocked: web_stats.ssrf_blocked,
+            redirect_blocked: web_stats.redirect_blocked,
+            response_byte_bucket: web_stats.response_byte_bucket.clone(),
+            duration_ms: web_stats.duration_ms,
+        }));
+    }
+    // Fire implicit-skill-activation telemetry for shell results that
+    // detected a skill context via `detect_for_command`.
+    if result.tool_name == "shell" && result.content.get("implicit_skill_activation").is_some() {
+        let source_token = result
+            .content
+            .get("implicit_skill_activation")
+            .and_then(|v| v.get("skill_source"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        telemetry.spawn(TelemetryEvent::skill_activated(SkillActivationReport {
+            total: 1,
+            included: 1,
+            dropped: 0,
+            body_truncated: 0,
+            preamble_emitted: false,
+            preamble_omitted_count: 0,
+            explicit_count: 0,
+            trigger_count: 0,
+            implicit_shell_count: 1,
+            source_counts: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(source_token.to_string(), 1u64);
+                m
+            },
+        }));
+    }
     // `approval.best_effort.fallback{tool=shell}` ticks once per silent
     // shell-sandbox degradation. Co-located with the per-tool event so
     // every call site that already calls `emit_tool_telemetry` benefits
@@ -12692,6 +12882,24 @@ fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
     serde_json::to_vec(&call.arguments)
         .ok()
         .map(|bytes| squeezy_tools::sha256_hex(&bytes))
+}
+
+/// Drain the MCP elicitation audit ring and fire `mcp_elicitation` telemetry
+/// for each event. Called after tool batches so elicitations that happened
+/// during tool execution are captured in the session summary.
+fn emit_mcp_elicitation_telemetry(tools: &ToolRegistry, telemetry: &TelemetryClient) {
+    for event in tools.mcp_elicitation_audit_snapshot() {
+        let policy_str = match event.policy {
+            squeezy_core::PermissionMode::Allow => "allow",
+            squeezy_core::PermissionMode::Ask => "ask",
+            squeezy_core::PermissionMode::Deny => "deny",
+        };
+        telemetry.spawn(TelemetryEvent::mcp_elicitation(
+            event.kind.as_str(),
+            policy_str,
+            event.outcome.as_str(),
+        ));
+    }
 }
 
 fn telemetry_tool_status(status: ToolStatus) -> TelemetryToolStatusKind {
@@ -12864,6 +13072,68 @@ fn error_kind(error: &SqueezyError) -> ErrorKind {
         | SqueezyError::Terminal(_)
         | SqueezyError::Workspace(_)
         | SqueezyError::Parse(_) => ErrorKind::Unknown,
+    }
+}
+
+/// Classify a provider error message into a coarse `ProviderErrorKind` bucket
+/// for telemetry. Inspects the error string with simple keyword matching,
+/// which is sufficient for the "what fraction are rate limits vs auth?"
+/// use case without requiring squeezy-llm to export a typed error enum.
+fn classify_provider_error(error: &SqueezyError) -> Option<ProviderErrorKind> {
+    let message = match error {
+        SqueezyError::ProviderRequest(msg) | SqueezyError::ProviderStream(msg) => msg.as_str(),
+        SqueezyError::ProviderNotConfigured(_) => return Some(ProviderErrorKind::Auth),
+        _ => return None,
+    };
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unauthorized")
+        || lower.contains("unauthenticated")
+        || lower.contains("authentication_error")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication failed")
+    {
+        Some(ProviderErrorKind::Auth)
+    } else if lower.contains("forbidden") || lower.contains("permission_error") {
+        Some(ProviderErrorKind::Permission)
+    } else if lower.contains("quota_exceeded")
+        || lower.contains("insufficient_quota")
+        || lower.contains("monthly_usage_limit")
+        || lower.contains("billing_hard_limit")
+    {
+        Some(ProviderErrorKind::Quota)
+    } else if lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+    {
+        Some(ProviderErrorKind::RateLimit)
+    } else if lower.contains("context window")
+        || lower.contains("context_window")
+        || lower.contains("context_length")
+        || lower.contains("token limit")
+    {
+        Some(ProviderErrorKind::ContextOverflow)
+    } else if lower.contains("content_filtered")
+        || lower.contains("content filter")
+        || lower.contains("refusal")
+        || lower.contains("safety")
+    {
+        Some(ProviderErrorKind::ContentFilter)
+    } else if lower.contains("invalid_request") || lower.contains("bad request") {
+        Some(ProviderErrorKind::InvalidRequest)
+    } else if lower.contains("not_found") || lower.contains("404") {
+        Some(ProviderErrorKind::NotFound)
+    } else if lower.contains("server error") || lower.contains("5xx") || lower.contains("503") {
+        Some(ProviderErrorKind::Server)
+    } else if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection")
+    {
+        Some(ProviderErrorKind::Transport)
+    } else if lower.contains("parse") || lower.contains("invalid json") {
+        Some(ProviderErrorKind::Parse)
+    } else {
+        Some(ProviderErrorKind::Unknown)
     }
 }
 
@@ -13108,6 +13378,21 @@ async fn permission_decision_for_request(
         verdict = classifier;
     }
     log_permission_verdict(&request, &verdict);
+    // Emit permission_decided telemetry for auto-evaluated verdicts (Allow/Deny
+    // from rules or mode policy, before any user prompt). Never includes targets
+    // or reasons — only capability, action, and rule source.
+    if verdict.action != PermissionAction::Ask {
+        let source_token = verdict
+            .matched_rule
+            .as_ref()
+            .map(|r| r.source.as_str())
+            .unwrap_or("policy");
+        context.telemetry.spawn(TelemetryEvent::permission_decided(
+            request.capability.as_str(),
+            verdict.action.as_str(),
+            source_token,
+        ));
+    }
     match verdict.action {
         PermissionAction::Allow => approved_decision(context, &request),
         PermissionAction::Deny => {
@@ -13324,6 +13609,25 @@ async fn permission_decision_for_request(
             {
                 dispatch_permission_denied(registry, context.turn_id, call, &request, reason);
             }
+            // Emit approval_decided telemetry for user-prompted verdicts.
+            // Capability + risk + decision + source only — no targets or reasons.
+            let approval_decision_token = match &outcome {
+                ApprovalDecision::Approved => "approved",
+                ApprovalDecision::Denied(_) => "denied",
+                ApprovalDecision::Cancelled => "cancelled",
+            };
+            let risk_token = match request.risk {
+                PermissionRisk::Low => "low",
+                PermissionRisk::Medium => "medium",
+                PermissionRisk::High => "high",
+                PermissionRisk::Critical => "critical",
+            };
+            context.telemetry.spawn(TelemetryEvent::approval_decided(
+                request.capability.as_str(),
+                risk_token,
+                approval_decision_token,
+                "user",
+            ));
             outcome
         }
     }

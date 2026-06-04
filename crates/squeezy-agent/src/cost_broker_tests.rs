@@ -452,6 +452,7 @@ fn budget_denied_result_counts_once_across_accounting_paths() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
 
     broker.record_executed_result(&result);

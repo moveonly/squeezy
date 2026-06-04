@@ -1306,9 +1306,6 @@ impl TelemetryEvent {
                 bytes_read: Some(report.cost.bytes_read),
                 output_bytes: Some(report.cost.output_bytes),
                 matches_returned: Some(report.cost.matches_returned),
-                args_sha256: report.args_sha256.map(str::to_string),
-                output_sha256: report.output_sha256.map(str::to_string),
-                content_sha256: report.content_sha256.map(str::to_string),
                 ..TelemetryProperties::default()
             },
         }
@@ -1333,6 +1330,10 @@ impl TelemetryEvent {
     }
 
     pub fn startup_ready(config: &AppConfig, route: StartupRoute, duration: Duration) -> Self {
+        // Read per-phase timings recorded by startup_trace::mark() in-memory.
+        let placeholder_ms = squeezy_core::startup_trace::elapsed_ms_for("tui_placeholder_drawn");
+        let agent_build_ms = squeezy_core::startup_trace::elapsed_ms_for("agent_built");
+        let snapshot_ms = squeezy_core::startup_trace::elapsed_ms_for("snapshots_done");
         Self {
             event: TelemetryEventName::StartupReady,
             timestamp_ms: now_ms(),
@@ -1343,12 +1344,21 @@ impl TelemetryEvent {
                 duration_ms: Some(duration.as_millis() as u64),
                 startup_route: Some(route),
                 status: Some(OutcomeStatus::Success),
+                startup_placeholder_ms: placeholder_ms,
+                startup_agent_build_ms: agent_build_ms,
+                startup_snapshot_ms: snapshot_ms,
                 ..TelemetryProperties::default()
             },
         }
     }
 
     pub fn session_ended(config: &AppConfig, report: SessionTelemetryReport) -> Self {
+        let subagent_counts = non_empty_map(report.subagent_kind_counts);
+        let subagent_cap_rejections = if report.subagent_cap_rejections > 0 {
+            Some(report.subagent_cap_rejections)
+        } else {
+            None
+        };
         Self {
             event: TelemetryEventName::SessionEnded,
             timestamp_ms: now_ms(),
@@ -1368,6 +1378,8 @@ impl TelemetryEvent {
                 budget_denials: Some(report.budget_denials),
                 subagent_calls: Some(report.subagent_calls),
                 subagent_failures: Some(report.subagent_failures),
+                subagent_counts,
+                subagent_cap_rejections,
                 ..TelemetryProperties::default()
             },
         }
@@ -1498,6 +1510,266 @@ impl TelemetryEvent {
             },
         }
     }
+
+    pub fn mcp_discovery(report: McpDiscoveryReport) -> Self {
+        let mut mcp_counts = BTreeMap::new();
+        if report.servers_stdio > 0 {
+            *mcp_counts.entry("transport_stdio".to_string()).or_default() +=
+                u64::from(report.servers_stdio);
+        }
+        if report.servers_http > 0 {
+            *mcp_counts.entry("transport_http".to_string()).or_default() +=
+                u64::from(report.servers_http);
+        }
+        if report.servers_sse > 0 {
+            *mcp_counts.entry("transport_sse".to_string()).or_default() +=
+                u64::from(report.servers_sse);
+        }
+        if report.servers_enabled > 0 {
+            *mcp_counts.entry("server_enabled".to_string()).or_default() +=
+                u64::from(report.servers_enabled);
+        }
+        if report.servers_disabled > 0 {
+            *mcp_counts.entry("server_disabled".to_string()).or_default() +=
+                u64::from(report.servers_disabled);
+        }
+        if report.tools_discovered > 0 {
+            *mcp_counts
+                .entry("tools_discovered".to_string())
+                .or_default() += u64::from(report.tools_discovered);
+        }
+        if report.tools_cached > 0 {
+            *mcp_counts.entry("tools_cached".to_string()).or_default() +=
+                u64::from(report.tools_cached);
+        }
+        if report.tools_stale_retained > 0 {
+            *mcp_counts
+                .entry("tools_stale_retained".to_string())
+                .or_default() += u64::from(report.tools_stale_retained);
+        }
+        if report.tools_dropped_disabled > 0 {
+            *mcp_counts
+                .entry("tools_dropped_disabled".to_string())
+                .or_default() += u64::from(report.tools_dropped_disabled);
+        }
+        if report.discovery_errors > 0 {
+            *mcp_counts
+                .entry("discovery_errors".to_string())
+                .or_default() += u64::from(report.discovery_errors);
+        }
+        for (kind, count) in &report.error_kind_counts {
+            let key = format!("error_kind_{kind}");
+            *mcp_counts.entry(key).or_default() += count;
+        }
+        if report.has_resources {
+            *mcp_counts.entry("cap_resources".to_string()).or_default() += 1;
+        }
+        if report.has_elicitation {
+            *mcp_counts.entry("cap_elicitation".to_string()).or_default() += 1;
+        }
+        if report.has_experimental {
+            *mcp_counts
+                .entry("cap_experimental".to_string())
+                .or_default() += 1;
+        }
+        Self {
+            event: TelemetryEventName::McpDiscovery,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                mcp_counts: non_empty_map(mcp_counts),
+                duration_ms: Some(report.duration_ms),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn mcp_elicitation(kind: &str, policy: &str, outcome: &str) -> Self {
+        let key = format!("elicitation_{kind}_{policy}_{outcome}");
+        let mut mcp_counts = BTreeMap::new();
+        *mcp_counts.entry(key).or_default() += 1u64;
+        Self {
+            event: TelemetryEventName::McpElicitation,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                mcp_counts: Some(mcp_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn web_request(report: WebRequestReport) -> Self {
+        let key = format!(
+            "provider_{}_status_{}_bytes_{}",
+            report.provider_token, report.status_token, report.response_byte_bucket
+        );
+        let mut external_counts = BTreeMap::new();
+        *external_counts.entry(key).or_default() += 1u64;
+        if report.ssrf_blocked {
+            *external_counts
+                .entry("ssrf_blocked".to_string())
+                .or_default() += 1;
+        }
+        if report.redirect_blocked {
+            *external_counts
+                .entry("redirect_blocked".to_string())
+                .or_default() += 1;
+        }
+        Self {
+            event: TelemetryEventName::WebRequest,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                external_counts: non_empty_map(external_counts),
+                duration_ms: Some(report.duration_ms),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn skill_activated(report: SkillActivationReport) -> Self {
+        let mut skill_counts = BTreeMap::new();
+        if report.total > 0 {
+            *skill_counts.entry("activated".to_string()).or_default() += u64::from(report.total);
+        }
+        if report.included > 0 {
+            *skill_counts.entry("included".to_string()).or_default() += u64::from(report.included);
+        }
+        if report.dropped > 0 {
+            *skill_counts.entry("dropped".to_string()).or_default() += u64::from(report.dropped);
+        }
+        if report.body_truncated > 0 {
+            *skill_counts
+                .entry("body_truncated".to_string())
+                .or_default() += u64::from(report.body_truncated);
+        }
+        if report.preamble_omitted_count > 0 {
+            *skill_counts
+                .entry("preamble_omitted".to_string())
+                .or_default() += u64::from(report.preamble_omitted_count);
+        }
+        if report.explicit_count > 0 {
+            *skill_counts
+                .entry("activation_explicit".to_string())
+                .or_default() += u64::from(report.explicit_count);
+        }
+        if report.trigger_count > 0 {
+            *skill_counts
+                .entry("activation_trigger".to_string())
+                .or_default() += u64::from(report.trigger_count);
+        }
+        if report.implicit_shell_count > 0 {
+            *skill_counts
+                .entry("activation_implicit_shell".to_string())
+                .or_default() += u64::from(report.implicit_shell_count);
+        }
+        for (source, count) in &report.source_counts {
+            let key = format!("source_{source}");
+            *skill_counts.entry(key).or_default() += count;
+        }
+        Self {
+            event: TelemetryEventName::SkillActivated,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                skill_counts: non_empty_map(skill_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn prompt_template_expanded(source: &str, arg_count: u32, queued: bool) -> Self {
+        let arg_bucket = match arg_count {
+            0 => "args_0",
+            1..=5 => "args_1_5",
+            6..=20 => "args_6_20",
+            _ => "args_many",
+        };
+        let state = if queued { "queued" } else { "started" };
+        let key = format!("source_{source}_{state}_{arg_bucket}");
+        let mut prompt_template_counts = BTreeMap::new();
+        *prompt_template_counts.entry(key).or_default() += 1u64;
+        Self {
+            event: TelemetryEventName::PromptTemplateExpanded,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                prompt_template_counts: Some(prompt_template_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    /// Approval or permission decision event. `capability`, `risk_bucket`, `decision`,
+    /// and `source` are short safe tokens derived from enum `as_str()` methods.
+    /// Never includes targets, reasons, rule patterns, or any user data.
+    pub fn approval_decided(
+        capability: &str,
+        risk_bucket: &str,
+        decision: &str,
+        source: &str,
+    ) -> Self {
+        let key = format!("{capability}_{risk_bucket}_{decision}_{source}");
+        let mut approval_counts = BTreeMap::new();
+        *approval_counts.entry(key).or_default() += 1u64;
+        Self {
+            event: TelemetryEventName::ApprovalDecided,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                approval_counts: Some(approval_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    /// Automatic policy-evaluated permission decision. `capability`, `action`, and
+    /// `source` are short safe tokens. Never includes targets or rule patterns.
+    pub fn permission_decided(capability: &str, action: &str, source: &str) -> Self {
+        let key = format!("{capability}_{action}_{source}");
+        let mut permission_counts = BTreeMap::new();
+        *permission_counts.entry(key).or_default() += 1u64;
+        Self {
+            event: TelemetryEventName::PermissionDecided,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                permission_counts: Some(permission_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn provider_retry(reason: RetryReasonKind) -> Self {
+        let key = reason.as_str().to_string();
+        let mut retry_counts = BTreeMap::new();
+        *retry_counts.entry(key).or_default() += 1u64;
+        Self {
+            event: TelemetryEventName::ProviderRetry,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                retry_counts: Some(retry_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn provider_error(kind: ProviderErrorKind) -> Self {
+        let key = kind.as_str().to_string();
+        let mut provider_error_counts = BTreeMap::new();
+        *provider_error_counts.entry(key).or_default() += 1u64;
+        Self {
+            event: TelemetryEventName::ProviderError,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                provider_error_counts: Some(provider_error_counts),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1552,6 +1824,40 @@ pub enum TelemetryEventName {
     /// reason at a high rate signals a threshold to tune.
     #[serde(rename = "squeezy_routing_escalated")]
     RoutingEscalated,
+    /// Per-refresh MCP discovery summary: server counts by transport,
+    /// discovered/cached/retained/dropped tool counts, capability booleans,
+    /// elicitation outcome counts, and coarse duration bucket.
+    #[serde(rename = "squeezy_mcp_discovery")]
+    McpDiscovery,
+    /// Per-elicitation MCP event: kind (form/url) × policy × outcome.
+    #[serde(rename = "squeezy_mcp_elicitation")]
+    McpElicitation,
+    /// Per-web-request external network event: provider × status ×
+    /// SSRF/redirect blocks × coarse response-byte bucket.
+    #[serde(rename = "squeezy_web_request")]
+    WebRequest,
+    /// Per-turn skill activation summary: source/kind/included/dropped/
+    /// body-truncated/preamble counts.
+    #[serde(rename = "squeezy_skill_activated")]
+    SkillActivated,
+    /// Per-expansion prompt-template event: source × arg-count bucket ×
+    /// queued-vs-started outcome.
+    #[serde(rename = "squeezy_prompt_template_expanded")]
+    PromptTemplateExpanded,
+    /// Per-approval/permission-verdict event: capability × risk bucket ×
+    /// decision × source — never targets or reasons.
+    #[serde(rename = "squeezy_approval_decided")]
+    ApprovalDecided,
+    /// Per-permission-policy verdict event: capability × policy-action ×
+    /// source — never targets or reasons.
+    #[serde(rename = "squeezy_permission_decided")]
+    PermissionDecided,
+    /// Per-provider-retry event: retry reason kind.
+    #[serde(rename = "squeezy_provider_retry")]
+    ProviderRetry,
+    /// Per-provider-error event: normalized error kind bucket.
+    #[serde(rename = "squeezy_provider_error")]
+    ProviderError,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1736,21 +2042,6 @@ pub struct TelemetryProperties {
     pub config_prev_bucket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_new_bucket: Option<String>,
-    /// SHA-256 of the canonical JSON arguments the model sent into this tool
-    /// call. Paired with `output_sha256` and `content_sha256`, lets offline
-    /// replay/dedup tooling answer "did we already pay for this exact call?"
-    /// without re-executing the tool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub args_sha256: Option<String>,
-    /// SHA-256 of the serialized model-visible tool output (stable across
-    /// non-spilled runs of the same call).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_sha256: Option<String>,
-    /// SHA-256 of the underlying file/document content the tool read, when
-    /// applicable (e.g. `read_file`, `read_slice`, `webfetch`). `None` for
-    /// tools that don't surface a content hash.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_sha256: Option<String>,
     /// Tagged on shell-sandbox events (e.g.
     /// `ShellSandboxBestEffortFallback`) so dashboards can break down by
     /// the OS backend that was attempted (`macos-sandbox-exec`,
@@ -1801,6 +2092,55 @@ pub struct TelemetryProperties {
     pub routing_counts: Option<BTreeMap<String, u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_counts: Option<BTreeMap<String, u64>>,
+    // --- new domain count-maps ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_template_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_error_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason_counts: Option<BTreeMap<String, u64>>,
+    // --- new scalar/boolean fields ---
+    /// `stop_reason` for this turn (safe token from StopReasonKind).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Whether reasoning-only stop (Qwen3/DeepSeek-R1 style) occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_only_stop: Option<bool>,
+    /// Whether prompt caching was supported by the provider for this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_supported: Option<bool>,
+    /// Cache-write (creation) tokens for this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Reasoning output tokens for this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+    /// Number of subagent concurrency-cap rejections this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_cap_rejections: Option<u64>,
+    /// Startup duration from process launch to first placeholder draw (ms bucket token).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_placeholder_ms: Option<u64>,
+    /// Startup duration from process launch to agent build complete (ms bucket token).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_agent_build_ms: Option<u64>,
+    /// Startup duration from process launch to snapshots loaded (ms bucket token).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_snapshot_ms: Option<u64>,
 }
 
 impl TelemetryProperties {
@@ -1822,6 +2162,19 @@ impl TelemetryProperties {
             negative_receipt_hits: Some(metrics.negative_receipt_hits),
             budget_denials: Some(metrics.budget_denials),
             status: Some(OutcomeStatus::Success),
+            stop_reason: metrics.stop_reason_token.clone(),
+            reasoning_only_stop: if metrics.reasoning_only_stop {
+                Some(true)
+            } else {
+                None
+            },
+            cache_supported: if metrics.cache_supported {
+                Some(true)
+            } else {
+                None
+            },
+            cache_write_tokens: metrics.cache_write_tokens,
+            reasoning_output_tokens: metrics.reasoning_output_tokens,
             ..Self::default()
         }
     }
@@ -1903,8 +2256,33 @@ fn build_summary_from_events(
     let (failure_counts, failure_dropped) = capped_count_map(accumulator.failure_counts);
     let (routing_counts, routing_dropped) = capped_count_map(accumulator.routing_counts);
     let (config_counts, config_dropped) = capped_count_map(accumulator.config_counts);
-    let dropped_buckets =
-        tool_dropped + slash_dropped + failure_dropped + routing_dropped + config_dropped;
+    let (mcp_counts, mcp_dropped) = capped_count_map(accumulator.mcp_counts);
+    let (external_counts, external_dropped) = capped_count_map(accumulator.external_counts);
+    let (skill_counts, skill_dropped) = capped_count_map(accumulator.skill_counts);
+    let (prompt_template_counts, pt_dropped) = capped_count_map(accumulator.prompt_template_counts);
+    let (subagent_counts, subagent_dropped) = capped_count_map(accumulator.subagent_counts);
+    let (approval_counts, approval_dropped) = capped_count_map(accumulator.approval_counts);
+    let (permission_counts, permission_dropped) = capped_count_map(accumulator.permission_counts);
+    let (retry_counts, retry_dropped) = capped_count_map(accumulator.retry_counts);
+    let (provider_error_counts, provider_error_dropped) =
+        capped_count_map(accumulator.provider_error_counts);
+    let (stop_reason_counts, stop_reason_dropped) =
+        capped_count_map(accumulator.stop_reason_counts);
+    let dropped_buckets = tool_dropped
+        + slash_dropped
+        + failure_dropped
+        + routing_dropped
+        + config_dropped
+        + mcp_dropped
+        + external_dropped
+        + skill_dropped
+        + pt_dropped
+        + subagent_dropped
+        + approval_dropped
+        + permission_dropped
+        + retry_dropped
+        + provider_error_dropped
+        + stop_reason_dropped;
     let truncated = dropped_buckets > 0;
     let tool_calls = accumulator.tool_calls.max(accumulator.turn_tool_calls);
     let files_scanned = accumulator
@@ -1972,6 +2350,35 @@ fn build_summary_from_events(
             failure_counts: non_empty_map(failure_counts),
             routing_counts: non_empty_map(routing_counts),
             config_counts: non_empty_map(config_counts),
+            mcp_counts: non_empty_map(mcp_counts),
+            external_counts: non_empty_map(external_counts),
+            skill_counts: non_empty_map(skill_counts),
+            prompt_template_counts: non_empty_map(prompt_template_counts),
+            subagent_counts: non_empty_map(subagent_counts),
+            approval_counts: non_empty_map(approval_counts),
+            permission_counts: non_empty_map(permission_counts),
+            retry_counts: non_empty_map(retry_counts),
+            provider_error_counts: non_empty_map(provider_error_counts),
+            stop_reason_counts: non_empty_map(stop_reason_counts),
+            subagent_cap_rejections: if accumulator.subagent_cap_rejections > 0 {
+                Some(accumulator.subagent_cap_rejections)
+            } else {
+                None
+            },
+            cache_write_tokens: if accumulator.cache_write_tokens > 0 {
+                Some(accumulator.cache_write_tokens)
+            } else {
+                None
+            },
+            reasoning_output_tokens: if accumulator.reasoning_output_tokens > 0 {
+                Some(accumulator.reasoning_output_tokens)
+            } else {
+                None
+            },
+            cache_supported: accumulator.cache_supported,
+            startup_placeholder_ms: accumulator.startup_placeholder_ms,
+            startup_agent_build_ms: accumulator.startup_agent_build_ms,
+            startup_snapshot_ms: accumulator.startup_snapshot_ms,
             ..TelemetryProperties::default()
         },
     }
@@ -2033,6 +2440,25 @@ struct SummaryAccumulator {
     failure_counts: BTreeMap<String, u64>,
     routing_counts: BTreeMap<String, u64>,
     config_counts: BTreeMap<String, u64>,
+    // new domain count-maps
+    mcp_counts: BTreeMap<String, u64>,
+    external_counts: BTreeMap<String, u64>,
+    skill_counts: BTreeMap<String, u64>,
+    prompt_template_counts: BTreeMap<String, u64>,
+    subagent_counts: BTreeMap<String, u64>,
+    approval_counts: BTreeMap<String, u64>,
+    permission_counts: BTreeMap<String, u64>,
+    retry_counts: BTreeMap<String, u64>,
+    provider_error_counts: BTreeMap<String, u64>,
+    stop_reason_counts: BTreeMap<String, u64>,
+    // new scalar accumulators
+    subagent_cap_rejections: u64,
+    cache_write_tokens: u64,
+    reasoning_output_tokens: u64,
+    cache_supported: Option<bool>,
+    startup_placeholder_ms: Option<u64>,
+    startup_agent_build_ms: Option<u64>,
+    startup_snapshot_ms: Option<u64>,
 }
 
 impl SummaryAccumulator {
@@ -2153,6 +2579,12 @@ impl SummaryAccumulator {
                 self.subagent_failures = self
                     .subagent_failures
                     .max(props.subagent_failures.unwrap_or(0));
+                // Fold per-kind subagent counts from the session_ended event.
+                if let Some(counts) = props.subagent_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.subagent_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
             }
             TelemetryEventName::SlashCommandUsed => {
                 self.slash_command_count = self.slash_command_count.saturating_add(1);
@@ -2198,7 +2630,102 @@ impl SummaryAccumulator {
                     increment_count(&mut self.routing_counts, format!("escalated:{reason}"));
                 }
             }
+            TelemetryEventName::McpDiscovery => {
+                if let Some(counts) = props.mcp_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.mcp_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::McpElicitation => {
+                if let Some(counts) = props.mcp_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.mcp_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::WebRequest => {
+                if let Some(counts) = props.external_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.external_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::SkillActivated => {
+                if let Some(counts) = props.skill_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.skill_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::PromptTemplateExpanded => {
+                if let Some(counts) = props.prompt_template_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.prompt_template_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::ApprovalDecided => {
+                if let Some(counts) = props.approval_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.approval_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::PermissionDecided => {
+                if let Some(counts) = props.permission_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.permission_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::ProviderRetry => {
+                if let Some(counts) = props.retry_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.retry_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
+            TelemetryEventName::ProviderError => {
+                if let Some(counts) = props.provider_error_counts.as_ref() {
+                    for (k, v) in counts {
+                        *self.provider_error_counts.entry(k.clone()).or_default() += v;
+                    }
+                }
+            }
             TelemetryEventName::SessionSummary => {}
+        }
+        // Accumulate per-turn scalars present on any event type.
+        self.subagent_cap_rejections = self
+            .subagent_cap_rejections
+            .saturating_add(props.subagent_cap_rejections.unwrap_or(0));
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(props.cache_write_tokens.unwrap_or(0));
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(props.reasoning_output_tokens.unwrap_or(0));
+        if props.cache_supported == Some(true) {
+            self.cache_supported = Some(true);
+        }
+        if let Some(ms) = props.startup_placeholder_ms {
+            self.startup_placeholder_ms = Some(ms);
+        }
+        if let Some(ms) = props.startup_agent_build_ms {
+            self.startup_agent_build_ms = Some(ms);
+        }
+        if let Some(ms) = props.startup_snapshot_ms {
+            self.startup_snapshot_ms = Some(ms);
+        }
+        // Fold stop-reason into count-map.
+        if let Some(reason) = props.stop_reason.as_ref() {
+            increment_count(&mut self.stop_reason_counts, reason.clone());
+        }
+        // Fold subagent per-kind counts.
+        if let Some(counts) = props.subagent_counts.as_ref() {
+            for (k, v) in counts {
+                *self.subagent_counts.entry(k.clone()).or_default() += v;
+            }
         }
     }
 
@@ -2272,12 +2799,6 @@ pub struct ToolTelemetryReport<'a> {
     pub status: ToolStatusKind,
     pub duration: Duration,
     pub cost: ToolCostProperties,
-    /// F06: paired-SHA trace fields. Each is `Option<&str>` so existing
-    /// emission sites that haven't been threaded yet keep compiling without
-    /// supplying placeholder hashes.
-    pub args_sha256: Option<&'a str>,
-    pub output_sha256: Option<&'a str>,
-    pub content_sha256: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2343,6 +2864,11 @@ pub struct SessionTelemetryReport {
     pub budget_denials: u64,
     pub subagent_calls: u64,
     pub subagent_failures: u64,
+    /// Per-kind subagent counts keyed by `"<kind>_success"` / `"<kind>_failure"`.
+    /// Capped in the summary by `MAX_SUMMARY_MAP_ENTRIES`.
+    pub subagent_kind_counts: std::collections::BTreeMap<String, u64>,
+    /// Number of subagent calls rejected by the concurrency cap.
+    pub subagent_cap_rejections: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2520,6 +3046,7 @@ pub enum FirstPartyToolName {
     Websearch,
     Graph,
     Ast,
+    Mcp,
     Other,
 }
 
@@ -2538,6 +3065,7 @@ impl FirstPartyToolName {
             | "upstream_flow" | "downstream_flow" | "symbol_context" | "hierarchy"
             | "read_slice" => Self::Graph,
             "ast_build" | "graph_refresh" => Self::Ast,
+            name if name.starts_with("mcp__") => Self::Mcp,
             _ => Self::Other,
         }
     }
@@ -2553,6 +3081,7 @@ pub enum ToolFamily {
     Web,
     Graph,
     Ast,
+    Mcp,
     Other,
 }
 
@@ -2568,6 +3097,7 @@ impl ToolFamily {
             | "upstream_flow" | "downstream_flow" | "symbol_context" | "hierarchy"
             | "read_slice" => Self::Graph,
             "ast_build" | "graph_refresh" => Self::Ast,
+            name if name.starts_with("mcp__") => Self::Mcp,
             _ => Self::Other,
         }
     }
@@ -2869,6 +3399,127 @@ fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+/// Report passed to [`TelemetryEvent::mcp_discovery`].
+#[derive(Debug, Clone, Default)]
+pub struct McpDiscoveryReport {
+    pub servers_stdio: u32,
+    pub servers_http: u32,
+    pub servers_sse: u32,
+    pub servers_enabled: u32,
+    pub servers_disabled: u32,
+    pub tools_discovered: u32,
+    pub tools_cached: u32,
+    pub tools_stale_retained: u32,
+    pub tools_dropped_disabled: u32,
+    pub discovery_errors: u32,
+    /// Counts keyed by coarse error kind token (e.g. `"transport"`, `"timeout"`).
+    pub error_kind_counts: BTreeMap<String, u64>,
+    pub has_resources: bool,
+    pub has_elicitation: bool,
+    pub has_experimental: bool,
+    pub duration_ms: u64,
+}
+
+/// Report passed to [`TelemetryEvent::web_request`].
+#[derive(Debug, Clone)]
+pub struct WebRequestReport {
+    /// Safe token for the provider (e.g. `"exa"`, `"parallel"`).
+    pub provider_token: String,
+    /// Safe token for the outcome status (e.g. `"success"`, `"error"`, `"cancelled"`).
+    pub status_token: String,
+    pub ssrf_blocked: bool,
+    pub redirect_blocked: bool,
+    /// Coarse byte bucket token (e.g. `"0_1k"`, `"1k_10k"`, `"10k_100k"`, `"100k_plus"`).
+    pub response_byte_bucket: String,
+    pub duration_ms: u64,
+}
+
+/// Report passed to [`TelemetryEvent::skill_activated`].
+#[derive(Debug, Clone, Default)]
+pub struct SkillActivationReport {
+    pub total: u32,
+    pub included: u32,
+    pub dropped: u32,
+    pub body_truncated: u32,
+    pub preamble_emitted: bool,
+    pub preamble_omitted_count: u32,
+    pub explicit_count: u32,
+    pub trigger_count: u32,
+    pub implicit_shell_count: u32,
+    /// Counts keyed by source token (e.g. `"user"`, `"project"`, `"extra_root"`).
+    pub source_counts: BTreeMap<String, u64>,
+}
+
+/// Normalized provider retry reason, used in [`TelemetryEvent::provider_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryReasonKind {
+    RateLimit,
+    Server5xx,
+    Transport,
+    IdleTimeout,
+    Truncated,
+    Divergence,
+    AuthRefresh,
+    StreamReconnect,
+    TerminalQuota,
+    NonRetryable,
+}
+
+impl RetryReasonKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Server5xx => "server_5xx",
+            Self::Transport => "transport",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Truncated => "truncated",
+            Self::Divergence => "divergence",
+            Self::AuthRefresh => "auth_refresh",
+            Self::StreamReconnect => "stream_reconnect",
+            Self::TerminalQuota => "terminal_quota",
+            Self::NonRetryable => "non_retryable",
+        }
+    }
+}
+
+/// Normalized provider error category, used in [`TelemetryEvent::provider_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    Auth,
+    Permission,
+    Quota,
+    RateLimit,
+    ContextOverflow,
+    ContentFilter,
+    InvalidRequest,
+    NotFound,
+    Server,
+    Transport,
+    Parse,
+    Unknown,
+}
+
+impl ProviderErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Permission => "permission",
+            Self::Quota => "quota",
+            Self::RateLimit => "rate_limit",
+            Self::ContextOverflow => "context_overflow",
+            Self::ContentFilter => "content_filter",
+            Self::InvalidRequest => "invalid_request",
+            Self::NotFound => "not_found",
+            Self::Server => "server",
+            Self::Transport => "transport",
+            Self::Parse => "parse",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 pub fn telemetry_config(enabled: bool, endpoint: impl Into<String>) -> TelemetryConfig {
