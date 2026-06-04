@@ -829,6 +829,13 @@ async fn run_inner_with_terminal(
         if should_advance_animation_tick(&app) {
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
+        // Settle-fold mutation pass: the render path is read-only, so the
+        // loop owns finalizing folds whose 600ms has elapsed (rest the node
+        // collapsed and invalidate its cached lines). A finalize is a
+        // visible state change, so request a repaint.
+        if app.finalize_elapsed_settles() {
+            app.needs_redraw = true;
+        }
         if app.app_notifications.tick() {
             app.needs_redraw = true;
         }
@@ -4424,6 +4431,14 @@ fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Optio
 fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     let mut changed = 0;
     for entry in &mut app.transcript {
+        // An explicit collapse/expand toggle is the user taking manual
+        // control of the node's height, which cancels any in-flight
+        // settle-fold so the requested state sticks instead of being
+        // overridden by the animation's folded render.
+        if entry.settle.take().is_some() {
+            entry.bump_revision();
+            changed += 1;
+        }
         if entry.collapsed != collapsed {
             entry.collapsed = collapsed;
             entry.bump_revision();
@@ -6068,7 +6083,12 @@ fn turn_in_progress(app: &TuiApp) -> bool {
 }
 
 fn should_advance_animation_tick(app: &TuiApp) -> bool {
-    app.focused || turn_in_progress(app)
+    // Keep ticking while a node is mid settle-fold so the fold advances
+    // frame to frame; this naturally stops once every settle finalizes
+    // (`finalize_elapsed_settles` clears them), so an idle transcript with
+    // no settling entries and no active turn returns to its prior behavior
+    // and does not perpetually repaint.
+    app.focused || turn_in_progress(app) || app.has_settling_entry()
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
@@ -7138,6 +7158,30 @@ fn transcript_lines_for_render(
     let mut prev_work = false;
     let subagent_view = active_subagent_record(app).is_some();
     for (index, item) in entries.iter().enumerate() {
+        // A finished work node that is mid settle-fold renders folded —
+        // its expanded block truncated to an eased height that descends to
+        // the collapsed preview — instead of from the line cache (whose key
+        // does not carry the per-frame fold height). It still threads the
+        // Quiet Rail gutter so the folding node stays on the rail it will
+        // rest on, rather than jumping onto it when the fold finalizes.
+        if let Some(settle) = item.settle {
+            let mut block = settle_folded_entry_lines(
+                item,
+                selected_entry == Some(index),
+                app.tool_output_verbosity,
+                message_outcome(entries, index),
+                width,
+                app.show_reasoning_usage,
+                settle,
+            );
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, subagent_view),
+            );
+            continue;
+        }
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
@@ -7221,6 +7265,65 @@ fn transcript_lines_for_render(
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Render a finished work node mid settle-fold: its expanded block,
+/// truncated to an eased height that descends from the captured expanded
+/// height down to the collapsed preview over [`SETTLE_DURATION_MS`].
+///
+/// Computed fresh (outside the per-entry render cache) because the fold
+/// height changes every frame and is not part of the cache key. The
+/// collapsed-preview height is measured at the real render width so the
+/// fold lands exactly on the resting collapsed block; the expanded block
+/// it truncates is likewise measured fresh at that width. Once the elapsed
+/// time reaches `SETTLE_DURATION_MS` the eased count equals the collapsed
+/// height, so the last animated frame already matches the post-settle
+/// collapsed render the cache will serve afterward.
+#[allow(clippy::too_many_arguments)]
+fn settle_folded_entry_lines(
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+    settle: SettleState,
+) -> Vec<Line<'static>> {
+    let collapsed = format_transcript_entry_with_width(
+        entry,
+        selected,
+        tool_output_verbosity,
+        outcome,
+        width,
+        show_reasoning,
+    );
+    let collapsed_lines = collapsed.len().min(u16::MAX as usize) as u16;
+    let elapsed_ms = settle
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let visible = settle_visible_line_count(settle.from_lines, collapsed_lines, elapsed_ms);
+    // Once the fold has reached (or passed) the collapsed height there is
+    // nothing left to animate — serve the collapsed block directly so the
+    // animated tail frame is pixel-identical to the resting state.
+    if visible <= collapsed_lines {
+        return collapsed;
+    }
+    let expanded = format_transcript_entry_expanded(
+        entry,
+        selected,
+        tool_output_verbosity,
+        outcome,
+        width,
+        show_reasoning,
+    );
+    let take = (visible as usize).min(expanded.len());
+    if take >= expanded.len() {
+        expanded
+    } else {
+        expanded.into_iter().take(take).collect()
+    }
 }
 
 fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
@@ -14459,6 +14562,12 @@ impl TuiApp {
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
             || self.pending_diff.is_some()
+            // A settle-fold is wall-clock driven, so each repaint advances
+            // it; keep `draw_app` running while any node is folding. Gated by
+            // the unfocused early-return above so a background window does
+            // not repaint a fold it cannot show — the fold still finalizes
+            // collapsed via `finalize_elapsed_settles` when focus returns.
+            || self.has_settling_entry()
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -14503,7 +14612,7 @@ impl TuiApp {
             }
         }
         let id = self.next_id();
-        let entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
+        let mut entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
         if let Some(last) = self.transcript.last_mut()
             && coalesce_tool_transcript_entry(last, &entry)
         {
@@ -14515,6 +14624,9 @@ impl TuiApp {
                 if matches!(t.result.tool_name.as_str(), "apply_patch" | "write_file")
                     && t.result.status == ToolStatus::Error
         );
+        // Arm the settle-fold only past the coalesce early-return so a
+        // retry that folds into the prior row does not re-arm an animation.
+        entry.arm_settle();
         self.push_entry(entry);
         if is_edit_failure {
             for path in edit_paths {
@@ -14821,8 +14933,63 @@ impl TuiApp {
         ));
     }
 
-    fn push_entry(&mut self, entry: TranscriptEntry) {
+    fn push_entry(&mut self, mut entry: TranscriptEntry) {
+        // Arm the settle-fold for the finished work nodes that flow through
+        // the generic push path: reasoning blocks and plan cards. Tool
+        // results are armed in `push_tool_result_with_call` after their
+        // coalesce early-return, so they are deliberately excluded here to
+        // avoid re-arming (and resetting the clock on) a tool row.
+        if matches!(
+            entry.kind,
+            TranscriptEntryKind::Reasoning(_) | TranscriptEntryKind::PlanCard(_)
+        ) {
+            entry.arm_settle();
+        }
         self.transcript.push(entry);
+    }
+
+    /// Whether any transcript entry is currently mid settle-fold. Drives the
+    /// animation-tick / repaint loop so the fold advances frame to frame and
+    /// stops repainting once every node has settled. Only the main
+    /// transcript can hold armed nodes — subagent transcripts only ever push
+    /// messages and logs, which never settle.
+    fn has_settling_entry(&self) -> bool {
+        self.transcript.iter().any(|entry| entry.settle.is_some())
+    }
+
+    /// Finalize any settle-fold that has run its full [`SETTLE_DURATION_MS`]:
+    /// clear the animation state, rest the node collapsed, and bump its
+    /// revision so the render cache re-renders it in its collapsed form.
+    /// Returns `true` when at least one entry finalized (so the caller can
+    /// request a repaint). Run from the main loop's mutation pass — the
+    /// render path is read-only and cannot mutate.
+    fn finalize_elapsed_settles(&mut self) -> bool {
+        let mut changed = false;
+        for entry in &mut self.transcript {
+            if let Some(settle) = entry.settle
+                && settle.started_at.elapsed().as_millis() as u64 >= SETTLE_DURATION_MS
+            {
+                entry.settle = None;
+                entry.collapsed = true;
+                entry.bump_revision();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Force every in-flight settle-fold to its resting collapsed state
+    /// immediately, as if 600ms had elapsed. Test-only affordance so render
+    /// assertions can observe the post-settle collapsed card without waiting
+    /// on the wall clock.
+    #[cfg(test)]
+    fn finalize_settles_for_test(&mut self) {
+        for entry in &mut self.transcript {
+            if entry.settle.take().is_some() {
+                entry.collapsed = true;
+                entry.bump_revision();
+            }
+        }
     }
 
     pub(crate) fn remember_active_tool_call(&mut self, call: ToolCall) {
@@ -14871,6 +15038,65 @@ struct TranscriptEntry {
     /// MUST call `bump_revision`; the cache's correctness contract
     /// depends on it (F09 finding).
     revision: u64,
+    /// When `Some`, the entry is mid "settle-fold": its rendered height is
+    /// easing from its just-finished expanded form down to its collapsed
+    /// preview over ~600ms. Armed at push time for finished work nodes
+    /// (`ToolResult`, `Reasoning`, `PlanCard`) only. The render path
+    /// (`transcript_lines_for_render`) draws the entry folded while this is
+    /// `Some`; the mutation pass in the main loop clears it (and sets
+    /// `collapsed = true`, bumping the revision) once 600ms has elapsed.
+    /// Absolute `Instant` so the fold clock is independent of the per-frame
+    /// `animation_tick`.
+    settle: Option<SettleState>,
+}
+
+/// Animation state for a finished work node easing from its expanded
+/// height down to its collapsed preview. `started_at` is absolute so the
+/// fold progresses across redraws regardless of `animation_tick`;
+/// `from_lines` is the entry's expanded rendered height captured at arm
+/// time (the curtain's starting position).
+#[derive(Debug, Clone, Copy)]
+struct SettleState {
+    started_at: std::time::Instant,
+    from_lines: u16,
+}
+
+/// Duration of the settle-fold animation. A finished work node folds from
+/// its expanded height to its collapsed preview over this window, then
+/// rests collapsed.
+const SETTLE_DURATION_MS: u64 = 600;
+
+/// Representative width used to seed the settle-fold's starting height at
+/// arm time. The exact viewport width isn't available at push time, and
+/// this value only sets the curtain's initial position before the render
+/// path takes over at the real width.
+const SETTLE_MEASURE_WIDTH: u16 = 80;
+
+/// Ease a finished work node's visible height from `from_lines` down to
+/// `collapsed_lines` over [`SETTLE_DURATION_MS`]. Pure and time-injected
+/// (`elapsed_ms`) so it is unit-testable without a clock: returns
+/// `from_lines` at `elapsed_ms == 0`, decreases monotonically, and returns
+/// `collapsed_lines` for any `elapsed_ms >= SETTLE_DURATION_MS`. Uses a
+/// quadratic ease-out so the fold starts quickly and settles gently.
+///
+/// In practice `from_lines >= collapsed_lines` (a node's expanded height is
+/// never shorter than its collapsed preview). The degenerate `from_lines <
+/// collapsed_lines` case has nothing to fold and resolves by resting at
+/// `from_lines` so the height never grows.
+fn settle_visible_line_count(from_lines: u16, collapsed_lines: u16, elapsed_ms: u64) -> u16 {
+    // The fold's floor is the collapsed height, but never above the
+    // starting height — a node already at/below its collapsed preview has
+    // nothing to fold, so it rests at `from_lines` without ever growing.
+    let floor = collapsed_lines.min(from_lines);
+    if elapsed_ms >= SETTLE_DURATION_MS || from_lines <= floor {
+        return floor;
+    }
+    let span = (from_lines - floor) as f32;
+    let t = elapsed_ms as f32 / SETTLE_DURATION_MS as f32;
+    // Quadratic ease-out: fast collapse up front, gentle landing.
+    let eased = 1.0 - (1.0 - t) * (1.0 - t);
+    let remaining = span * (1.0 - eased);
+    floor + remaining.round() as u16
 }
 
 impl TranscriptEntry {
@@ -14894,6 +15120,7 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::Message(item),
             collapsed,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14926,6 +15153,7 @@ impl TranscriptEntry {
             })),
             collapsed: collapsed_default,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14947,6 +15175,7 @@ impl TranscriptEntry {
             collapsed: kind != LogKind::Operational
                 && transcript_default == TranscriptDefault::Compact,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14962,6 +15191,7 @@ impl TranscriptEntry {
             // — the whole point of the card is to show the plan body.
             collapsed: false,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14973,6 +15203,7 @@ impl TranscriptEntry {
             // Ctrl-E to fold the body if it's huge.
             collapsed: false,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14982,6 +15213,7 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::SlashEcho(data),
             collapsed: false,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14998,7 +15230,52 @@ impl TranscriptEntry {
             // a concise chip. Ctrl-T opens the full transcript with details.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
+            settle: None,
         }
+    }
+
+    /// True for the finished work nodes that settle-fold on completion:
+    /// tool results, reasoning blocks, and plan cards. Messages, logs,
+    /// diffs, and slash echoes snap collapsed instantly (no fold).
+    fn is_settleable_work_node(&self) -> bool {
+        matches!(
+            self.kind,
+            TranscriptEntryKind::ToolResult(_)
+                | TranscriptEntryKind::Reasoning(_)
+                | TranscriptEntryKind::PlanCard(_)
+        )
+    }
+
+    /// Arm the settle-fold for a finished work node: record `started_at`
+    /// and the entry's expanded rendered height so the renderer can ease
+    /// the height down to the collapsed preview over [`SETTLE_DURATION_MS`].
+    /// No-op for non-work-node kinds. The expanded height is measured at a
+    /// representative width (the exact viewport width isn't known at push
+    /// time and only seeds the fold's starting position).
+    fn arm_settle(&mut self) {
+        // Only fold nodes that come to rest collapsed. A node that stays
+        // expanded — an auto-expanded failed tool, a plan card, a `/diff` —
+        // has nothing to fold down to, and force-collapsing it on finalize
+        // would hide content the user is meant to keep seeing.
+        if !self.is_settleable_work_node() || !self.collapsed {
+            return;
+        }
+        // Measure the expanded block with reasoning shown so reasoning
+        // nodes have a body to fold from; verbosity/outcome/selection do
+        // not change the line count materially for the fold's start.
+        let expanded = format_transcript_entry_expanded(
+            self,
+            false,
+            ToolOutputVerbosity::Normal,
+            MessageOutcome::Normal,
+            Some(SETTLE_MEASURE_WIDTH),
+            true,
+        );
+        let from_lines = expanded.len().min(u16::MAX as usize) as u16;
+        self.settle = Some(SettleState {
+            started_at: Instant::now(),
+            from_lines,
+        });
     }
 
     fn assistant_content(&self) -> Option<String> {

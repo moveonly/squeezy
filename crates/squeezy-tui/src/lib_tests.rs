@@ -4619,6 +4619,9 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
         .collect::<Vec<_>>()
         .join("\n");
     app.push_tool_result(sample_tool_result("grep", &payload));
+    // A freshly-pushed work node settle-folds from its expanded form for
+    // ~600ms; rest it collapsed so this asserts the post-settle preview.
+    app.finalize_settles_for_test();
 
     assert!(app.transcript[0].collapsed);
     let collapsed = render_to_string(&app, 100, 24);
@@ -10971,6 +10974,9 @@ fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
+    // Rest the freshly-pushed node past its settle-fold so this asserts the
+    // collapsed head-tail preview rather than the mid-fold expanded body.
+    app.finalize_settles_for_test();
 
     let output = render_to_string(&app, 140, 18);
     // First and last lines must survive head-tail truncation; middle is elided.
@@ -12194,6 +12200,201 @@ fn idle_app_reports_no_active_animation() {
     assert!(
         !app.needs_redraw,
         "no mutation occurred so needs_redraw should stay false"
+    );
+}
+
+#[test]
+fn settle_visible_line_count_eases_from_expanded_to_collapsed() {
+    // The pure fold-height helper is time-injected, so its full curve can
+    // be asserted without a clock: it starts at the expanded height, never
+    // increases, and lands exactly on the collapsed height at 600ms.
+    let from = 20u16;
+    let collapsed = 5u16;
+
+    assert_eq!(
+        settle_visible_line_count(from, collapsed, 0),
+        from,
+        "at elapsed 0 the fold has not moved off the expanded height"
+    );
+    assert_eq!(
+        settle_visible_line_count(from, collapsed, SETTLE_DURATION_MS),
+        collapsed,
+        "at exactly 600ms the fold rests on the collapsed height"
+    );
+    assert_eq!(
+        settle_visible_line_count(from, collapsed, SETTLE_DURATION_MS + 5_000),
+        collapsed,
+        "past 600ms the fold stays pinned to the collapsed height"
+    );
+
+    // Monotonically non-increasing across the whole window, and strictly
+    // inside the [collapsed, from] band before it finishes.
+    let mut prev = from;
+    for elapsed in (0..=SETTLE_DURATION_MS).step_by(20) {
+        let visible = settle_visible_line_count(from, collapsed, elapsed);
+        assert!(
+            visible <= prev,
+            "fold height must not grow: {visible} > {prev} at {elapsed}ms"
+        );
+        assert!(
+            (collapsed..=from).contains(&visible),
+            "fold height {visible} escaped the [{collapsed}, {from}] band at {elapsed}ms"
+        );
+        prev = visible;
+    }
+
+    // A node already at or below its collapsed height has nothing to fold.
+    assert_eq!(settle_visible_line_count(3, 5, 0), 3);
+    assert_eq!(settle_visible_line_count(5, 5, 0), 5);
+}
+
+#[test]
+fn armed_settle_renders_more_lines_than_after_it_finishes() {
+    // A freshly-armed work node renders its expanded block (folding down),
+    // so it occupies more rows than the same node once the settle finishes
+    // and it rests collapsed. The early-frame count is asserted via the
+    // pure helper to keep the test independent of the wall clock.
+    let mut app = test_app(SessionMode::Build);
+    let payload = (0..30)
+        .map(|i| format!("row-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
+
+    let settle = app.transcript[0]
+        .settle
+        .expect("a finished tool result must arm a settle-fold");
+    assert!(
+        settle.from_lines > 1,
+        "expanded grep output should seed a multi-line fold start, got {}",
+        settle.from_lines
+    );
+
+    // Render the just-armed (folding) node and count its rows. The exact
+    // count drifts with the few microseconds elapsed between push and
+    // render, so the strict "more lines early than late" inequality is
+    // asserted via the pure helper below; here we only require the folding
+    // frame to be taller than the resting collapsed frame.
+    let folding = transcript_lines_for_render(&app, Some(100), false);
+    let folding_count = folding.len();
+
+    // After the settle finalizes the node rests collapsed.
+    app.finalize_settles_for_test();
+    assert!(app.transcript[0].settle.is_none());
+    assert!(app.transcript[0].collapsed);
+    let settled = transcript_lines_for_render(&app, Some(100), false);
+    let settled_count = settled.len();
+
+    assert!(
+        folding_count > settled_count,
+        "a folding node ({folding_count} rows) must be taller than the same node \
+         once settled collapsed ({settled_count} rows)"
+    );
+
+    // The pure helper carries the strict monotonic claim independent of the
+    // clock: shortly after arming the visible height exceeds the 600ms one.
+    let early = settle_visible_line_count(settle.from_lines, settled_count as u16, 30);
+    let done =
+        settle_visible_line_count(settle.from_lines, settled_count as u16, SETTLE_DURATION_MS);
+    assert!(
+        early > done,
+        "fold height shortly after arming ({early}) must exceed the settled height ({done})"
+    );
+    assert_eq!(
+        done, settled_count as u16,
+        "the fold's 600ms height must equal the resting collapsed row count"
+    );
+}
+
+#[test]
+fn failed_tool_does_not_settle_fold_and_stays_expanded() {
+    // An auto-expanded failure must NOT arm a settle-fold: the fold finalizes
+    // by force-collapsing, which would hide the error after 600ms — the exact
+    // opposite of the "show the failure reason inline" behaviour.
+    let mut app = test_app(SessionMode::Build);
+    let mut failed = sample_tool_result("delegate", "missing required string field: prompt");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+
+    assert!(
+        app.transcript[0].settle.is_none(),
+        "a failed (auto-expanded) tool result must not arm a settle-fold"
+    );
+    assert!(!app.transcript[0].collapsed);
+    app.finalize_settles_for_test();
+    assert!(
+        !app.transcript[0].collapsed,
+        "a failed tool result must stay expanded, never fold collapsed"
+    );
+}
+
+#[test]
+fn settling_node_threads_the_rail_gutter() {
+    // While folding, a node stays on the Quiet Rail (├─/╰─ elbow) instead of
+    // rendering off-rail and jumping onto it when the fold finalizes.
+    let mut app = test_app(SessionMode::Build);
+    let payload = (0..30)
+        .map(|i| format!("row-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
+    assert!(
+        app.transcript[0].settle.is_some(),
+        "success tool should fold"
+    );
+
+    let folding = lines_to_plain_text(&transcript_lines_for_render(&app, Some(100), false));
+    assert!(
+        folding.contains("├─") || folding.contains("╰─"),
+        "folding node must thread the rail gutter: {folding}"
+    );
+}
+
+#[test]
+fn settling_entry_keeps_animation_tick_alive_then_idles_when_settled() {
+    // The fold must keep repaints flowing frame to frame while a node is
+    // settling, then return to idle (no perpetual repaint) once every
+    // settle finalizes.
+    let mut app = test_app(SessionMode::Build);
+    app.focused = false;
+    app.needs_redraw = false;
+    assert!(
+        !should_advance_animation_tick(&app),
+        "an idle, unfocused transcript with no settles and no turn must not tick"
+    );
+
+    app.push_tool_result(sample_tool_result("grep", "alpha\nbeta\ngamma"));
+    assert!(app.has_settling_entry(), "the pushed node arms a settle");
+    // The tick keeps advancing while settling regardless of focus, so the
+    // loop keeps cycling to finalize the fold.
+    assert!(
+        should_advance_animation_tick(&app),
+        "a node mid settle-fold must keep the animation tick alive"
+    );
+    // A focused window also keeps `draw_app` running so the fold actually
+    // animates frame to frame; an unfocused background window does not
+    // repaint a fold it cannot show (it still finalizes via the tick loop).
+    app.focused = true;
+    assert!(
+        app.has_active_animation(),
+        "a focused settling node must keep draw_app running so the fold animates"
+    );
+    app.focused = false;
+    assert!(
+        !app.has_active_animation(),
+        "an unfocused settling node must not repaint the background window"
+    );
+
+    app.focused = false;
+    app.finalize_settles_for_test();
+    assert!(!app.has_settling_entry());
+    assert!(
+        !should_advance_animation_tick(&app),
+        "once every settle finalizes the tick returns to its idle behavior"
+    );
+    assert!(
+        !app.has_active_animation(),
+        "a fully settled idle transcript must not advertise active animation"
     );
 }
 
