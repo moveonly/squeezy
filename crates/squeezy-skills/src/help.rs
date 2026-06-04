@@ -900,13 +900,59 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["providers", "config"],
     },
     SlashCommandHelp {
+        name: "/config",
+        what: "Open the configuration screen. Pass a section name to jump directly to that section.",
+        syntax: "/config [section]",
+        examples: &[
+            "/config           — open full config screen",
+            "/config model     — jump to model/provider section",
+            "/config tui       — jump to TUI display section",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
         name: "/model",
         what: "Open the config screen focused on provider and model selection.",
         syntax: "/model",
         examples: &["/model  — open provider/model selection screen"],
-        available_during_turn: false,
+        available_during_turn: true,
         capability_note: Some("Requires: [edit]"),
         related: &["providers", "config"],
+    },
+    SlashCommandHelp {
+        name: "/permissions",
+        what: "Open the config screen focused on the permissions and sandbox policy.",
+        syntax: "/permissions",
+        examples: &["/permissions  — open permissions configuration screen"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["permissions", "config"],
+    },
+    SlashCommandHelp {
+        name: "/plan",
+        what: "Switch to Plan mode (read/search/navigation tools only; mutating tools are not advertised). Optionally supply an initial prompt.",
+        syntax: "/plan [prompt]",
+        examples: &[
+            "/plan                   — switch to Plan mode",
+            "/plan where is Foo used — switch to Plan mode and send a prompt",
+        ],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["agent", "tui"],
+    },
+    SlashCommandHelp {
+        name: "/build",
+        what: "Switch to Build mode (all tools available under the configured permission policy). Optionally supply an initial prompt.",
+        syntax: "/build [prompt]",
+        examples: &[
+            "/build                — switch to Build mode",
+            "/build refactor Foo   — switch to Build mode and send a prompt",
+        ],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["agent", "tui"],
     },
     SlashCommandHelp {
         name: "/plans",
@@ -943,33 +989,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/attach",
-        what: "Attach a file or directory path as context for the current session.",
+        what: "Insert a file or directory token in the prompt editor as attached context.",
         syntax: "/attach <path>",
         examples: &[
             "/attach src/main.rs    — attach a specific file",
             "/attach src/           — attach an entire directory",
         ],
-        available_during_turn: true,
+        available_during_turn: false,
         capability_note: Some("Requires: [read]"),
         related: &["tui", "sessions"],
-    },
-    SlashCommandHelp {
-        name: "/attachments",
-        what: "List all currently attached context items.",
-        syntax: "/attachments",
-        examples: &["/attachments  — show all active context attachments"],
-        available_during_turn: true,
-        capability_note: None,
-        related: &["tui"],
-    },
-    SlashCommandHelp {
-        name: "/detach",
-        what: "Remove an attached context item by its id.",
-        syntax: "/detach <id>",
-        examples: &["/detach 3  — remove attachment with id 3 (see /attachments for ids)"],
-        available_during_turn: true,
-        capability_note: None,
-        related: &["tui"],
     },
     SlashCommandHelp {
         name: "/compact",
@@ -982,15 +1010,16 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/effort",
-        what: "Set the reasoning effort level for this and future turns.",
-        syntax: "/effort [low|medium|high|xhigh]",
+        what: "Set the reasoning effort level for this session, or pass `auto` to clear a manual override.",
+        syntax: "/effort [low|medium|high|xhigh|auto]",
         examples: &[
             "/effort low    — minimal reasoning, fastest responses",
             "/effort medium — balanced effort (default)",
             "/effort high   — deeper reasoning for complex tasks",
             "/effort xhigh  — maximum reasoning effort",
+            "/effort auto   — clear manual effort; model/provider decides",
         ],
-        available_during_turn: true,
+        available_during_turn: false,
         capability_note: None,
         related: &["providers", "config"],
     },
@@ -1023,24 +1052,29 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/spinner",
-        what: "Toggle the activity spinner display in the TUI.",
-        syntax: "/spinner",
-        examples: &["/spinner  — toggle spinner on/off"],
+        what: "Switch the working-status spinner style.",
+        syntax: "/spinner [twinkle|scintillate|drift]",
+        examples: &[
+            "/spinner twinkle     — twinkling dot spinner",
+            "/spinner scintillate — scintillating spinner",
+            "/spinner drift       — drifting bar spinner",
+        ],
         available_during_turn: true,
-        capability_note: None,
+        capability_note: Some("Requires: [edit]"),
         related: &["tui"],
     },
     SlashCommandHelp {
         name: "/verbosity",
-        what: "Set the transcript display verbosity level.",
-        syntax: "/verbosity [compact|normal|verbose]",
+        what: "Set the transcript display verbosity level, or open the verbosity config screen.",
+        syntax: "/verbosity [concise|normal|verbose]",
         examples: &[
-            "/verbosity compact  — show condensed transcript",
+            "/verbosity concise  — show condensed transcript",
             "/verbosity normal   — standard display (default)",
             "/verbosity verbose  — show all transcript detail",
+            "/verbosity          — open verbosity config screen",
         ],
-        available_during_turn: true,
-        capability_note: None,
+        available_during_turn: false,
+        capability_note: Some("Requires: [edit]"),
         related: &["tui"],
     },
     SlashCommandHelp {
@@ -1055,6 +1089,45 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         available_during_turn: true,
         capability_note: None,
         related: &["tui"],
+    },
+    SlashCommandHelp {
+        name: "/sessions",
+        what: "List recent sessions for the current project.",
+        syntax: "/sessions",
+        examples: &["/sessions  — show recent session list with status and cost summaries"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [read]"),
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/session",
+        what: "Show a saved session's details, or rename/label the currently active session.",
+        syntax: "/session [id]",
+        examples: &[
+            "/session          — show the active session",
+            "/session abc123   — show a specific saved session",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [read]"),
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/resume",
+        what: "Resume a previously saved session, seeding context from its stored state.",
+        syntax: "/resume <id>",
+        examples: &["/resume abc123  — resume the session with id abc123"],
+        available_during_turn: false,
+        capability_note: Some("Requires: [read]"),
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/statusline",
+        what: "Configure which items appear in the TUI status bar.",
+        syntax: "/statusline",
+        examples: &["/statusline  — open status bar configuration screen"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["tui", "config"],
     },
     SlashCommandHelp {
         name: "/cost",
@@ -1084,18 +1157,6 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["sessions"],
     },
     SlashCommandHelp {
-        name: "/skill",
-        what: "Activate a named skill, optionally with an initial prompt.",
-        syntax: "/skill <name> [prompt]",
-        examples: &[
-            "/skill beads              — activate the beads skill",
-            "/skill beads ready tasks  — activate with an initial prompt",
-        ],
-        available_during_turn: true,
-        capability_note: None,
-        related: &["skills"],
-    },
-    SlashCommandHelp {
         name: "/feedback",
         what: "Prepare a redacted maintainer feedback message (shows a preview before sending).",
         syntax: "/feedback <message>",
@@ -1119,9 +1180,9 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     SlashCommandHelp {
         name: "/pin",
         what: "Protect the latest (or selected) transcript item from compaction.",
-        syntax: "/pin",
-        examples: &["/pin  — pin the most recent turn so compaction preserves it"],
-        available_during_turn: true,
+        syntax: "/pin <id>",
+        examples: &["/pin 3  — pin transcript item with id 3 (see /context for ids)"],
+        available_during_turn: false,
         capability_note: None,
         related: &["sessions", "cost"],
     },
@@ -1135,6 +1196,13 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["checkpoints"],
     },
 ];
+
+/// Return the slash command names that have a curated local help entry.
+/// Used by the drift test in `squeezy-tui` to verify coverage against the
+/// live `SLASH_COMMANDS` registry.
+pub fn slash_command_help_names() -> impl Iterator<Item = &'static str> {
+    SLASH_COMMAND_HELP_TABLE.iter().map(|e| e.name)
+}
 
 /// Return the local help answer for a slash command (e.g. `"/theme"`, `"/router"`).
 ///

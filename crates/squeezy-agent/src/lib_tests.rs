@@ -2479,9 +2479,7 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert!(
-        request
-            .instructions
-            .contains("hidden documentation subagent"),
+        request.instructions.contains("doc-help subagent"),
         "{:?}",
         request.instructions
     );
@@ -2507,15 +2505,20 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
             _ => None,
         })
         .expect("subagent user prompt");
-    // Unknown topics fall back to the minimal corpus (README + AGENT_APPROACH).
-    // AGENT_APPROACH must be present; PROVIDERS.md is topic-specific and must be absent.
+    // Unknown topics (no curated match) get the full corpus so DocHelp has
+    // maximum coverage.  Both a providers-related doc and a sessions-related doc
+    // must be present; neither is topic-specific for "quantum billing rules".
     assert!(
         user_prompt.contains("PATH: docs/external/AGENT_APPROACH.md"),
-        "unknown-topic corpus must contain the baseline AGENT_APPROACH doc: {user_prompt:?}"
+        "unknown-topic corpus must include AGENT_APPROACH.md: {user_prompt:?}"
     );
     assert!(
-        !user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
-        "unknown-topic corpus must NOT contain unrelated topic-specific docs: corpus scoping is broken"
+        user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
+        "unknown-topic corpus must include PROVIDERS.md (full corpus, not scoped): {user_prompt:?}"
+    );
+    assert!(
+        user_prompt.contains("PATH: docs/external/SESSIONS.md"),
+        "unknown-topic corpus must include SESSIONS.md (full corpus, not scoped): {user_prompt:?}"
     );
 
     let completed = completed.expect("help turn should complete");
