@@ -54,6 +54,10 @@ struct TelemetryState {
     current_span_id: std::sync::Mutex<Option<String>>,
     next_event_sequence: AtomicU64,
     queue: Mutex<TelemetryQueue>,
+    /// Serializes concurrent calls to `send_pending_summaries` so that the
+    /// startup-retry task, the periodic 5-second flush, and the exit flush
+    /// cannot simultaneously lease and double-send the same pending summary.
+    flush_lock: Mutex<()>,
     store: Option<Arc<TelemetryStore>>,
     http: reqwest::Client,
 }
@@ -131,6 +135,7 @@ impl TelemetryClient {
             current_span_id: std::sync::Mutex::new(None),
             next_event_sequence: AtomicU64::new(1),
             queue: Mutex::new(TelemetryQueue::default()),
+            flush_lock: Mutex::new(()),
             store,
             http,
         });
@@ -268,6 +273,7 @@ impl TelemetryClient {
             current_span_id: std::sync::Mutex::new(None),
             next_event_sequence: AtomicU64::new(1),
             queue: Mutex::new(TelemetryQueue::default()),
+            flush_lock: Mutex::new(()),
             store: Some(store),
             http,
         });
@@ -666,7 +672,12 @@ async fn send_pending_summaries(state: Arc<TelemetryState>) -> Result<(), Teleme
     let Some(store) = state.store.as_ref() else {
         return Ok(());
     };
+    // Serialise concurrent callers (startup-retry, periodic flush, exit flush)
+    // so that the read-then-write lease acquisition in `lease_due_summaries`
+    // cannot hand the same summary to two senders simultaneously.
+    let _flush_guard = state.flush_lock.lock().await;
     let pending = store.lease_due_summaries(now_ms(), PENDING_SEND_LIMIT, PENDING_LEASE_MS)?;
+    let mut first_error: Option<TelemetryError> = None;
     for summary in pending {
         let result = send_batch_for_session(
             state.clone(),
@@ -676,15 +687,20 @@ async fn send_pending_summaries(state: Arc<TelemetryState>) -> Result<(), Teleme
         .await;
         match result {
             Ok(()) => {
-                store.mark_summary_sent(&summary)?;
+                let _ = store.mark_summary_sent(&summary);
             }
             Err(error) => {
                 let _ = store.mark_summary_failed(&summary.summary_id, now_ms());
-                return Err(error);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 async fn send_batch_for_session(

@@ -1862,10 +1862,9 @@ impl Agent {
     /// build time (tools/MCP/redactor) are NOT rebuilt; pair this with the
     /// "restart required" badge in the UI for those.
     pub fn replace_config(&mut self, next: AppConfig) {
-        if !next.telemetry.enabled {
-            self.telemetry = TelemetryClient::disabled();
+        if next.telemetry != self.config.telemetry {
+            self.telemetry = TelemetryClient::from_config(&next);
         }
-        self.telemetry = TelemetryClient::from_config(&next);
         self.config = next;
     }
 
@@ -2654,22 +2653,24 @@ impl Agent {
         let _ = session.write_resume_state(&state.to_resume_state());
         let metrics = state.metrics.clone();
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
-        self.telemetry.spawn(TelemetryEvent::session_ended(
-            &self.config,
-            SessionTelemetryReport {
-                duration_ms: self.session_started_at.elapsed().as_millis() as u64,
-                status: telemetry_session_status(status),
-                turns: metrics.turns,
-                tool_calls: metrics.tool_calls,
-                tool_successes: metrics.tool_successes,
-                tool_errors: metrics.tool_errors,
-                tool_denials: metrics.tool_denials,
-                tool_cancellations: metrics.tool_cancellations,
-                budget_denials: metrics.budget_denials,
-                subagent_calls: metrics.subagent_calls,
-                subagent_failures: metrics.subagent_failures,
-            },
-        ));
+        self.telemetry
+            .record(TelemetryEvent::session_ended(
+                &self.config,
+                SessionTelemetryReport {
+                    duration_ms: self.session_started_at.elapsed().as_millis() as u64,
+                    status: telemetry_session_status(status),
+                    turns: metrics.turns,
+                    tool_calls: metrics.tool_calls,
+                    tool_successes: metrics.tool_successes,
+                    tool_errors: metrics.tool_errors,
+                    tool_denials: metrics.tool_denials,
+                    tool_cancellations: metrics.tool_cancellations,
+                    budget_denials: metrics.budget_denials,
+                    subagent_calls: metrics.subagent_calls,
+                    subagent_failures: metrics.subagent_failures,
+                },
+            ))
+            .await;
     }
 
     fn flush_active_session_log(&self) {
