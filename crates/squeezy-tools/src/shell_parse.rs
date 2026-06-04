@@ -1291,3 +1291,379 @@ pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
         "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "grep" | "rg"
     )
 }
+
+/// Extract candidate filesystem write-target path strings from the
+/// destination arguments of common non-destructive file-mutating verbs
+/// (`tee`, `cp`, `mv`, `install`, `dd of=`, `ln`, `sed -i`, `chmod`,
+/// `touch`, `mkdir`).
+///
+/// The verb set deliberately omits destructive verbs (`rm`, `chown`,
+/// `truncate`, `shred`, `mv -f`, …) and output redirects (`>`, `>>`):
+/// those already classify as the `Destructive` capability and gate behind
+/// approval, whereas the verbs here would otherwise be auto-allowed as a
+/// plain `Shell`/`Edit` write under the workspace-write default.
+///
+/// Parsing reuses the tree-sitter-backed [`extract_command_units`] over the
+/// unwrapped segments (so `sh -c "cp x /etc/y"` is inspected on its real
+/// payload). Targets are returned with a leading `~` / `~/` expanded to the
+/// user's home directory so the common `sed -i ~/.bashrc` form resolves
+/// outside the workspace. Unexpanded `$VAR` references are left as-is and
+/// will not be flagged (a known limitation of static analysis; the kernel
+/// sandbox remains the backstop for those).
+pub(crate) fn extract_shell_write_targets(command: &str) -> Vec<String> {
+    let normalized = collapse_whitespace(command);
+    let segments = expand_wrapper_segments(shell_segments(&normalized));
+    let mut targets = Vec::new();
+    for segment in &segments {
+        for unit in extract_command_units(segment) {
+            collect_verb_write_targets(&unit.name, &unit.args, &mut targets);
+        }
+    }
+    targets
+}
+
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| home.to_string_lossy().into_owned())
+}
+
+fn is_valid_var_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Substitute `$VAR` / `${VAR}` from the process environment. An unresolved
+/// variable is left literal (with its `$`) so the caller can treat it as an
+/// unverifiable — and therefore out-of-workspace — target.
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        // cmd-style `%VAR%`. Resolved vars are substituted; an unresolved one
+        // is left literal so `path_has_unresolved_var` escalates it.
+        if c == '%' {
+            let mut name = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc.is_ascii_alphanumeric() || nc == '_' {
+                    name.push(nc);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !name.is_empty() && chars.peek() == Some(&'%') {
+                chars.next();
+                match std::env::var(&name) {
+                    Ok(val) => out.push_str(&val),
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(&name);
+                        out.push('%');
+                    }
+                }
+            } else {
+                out.push('%');
+                out.push_str(&name);
+            }
+            continue;
+        }
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for nc in chars.by_ref() {
+                    if nc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(nc);
+                }
+                match std::env::var(&name) {
+                    Ok(val) if closed && is_valid_var_name(&name) => out.push_str(&val),
+                    _ => {
+                        out.push_str("${");
+                        out.push_str(&name);
+                        if closed {
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            Some(c2) if c2.is_ascii_alphabetic() || c2 == '_' => {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match std::env::var(&name) {
+                    Ok(val) => out.push_str(&val),
+                    // Leave the literal `$NAME`; a remaining `$` signals an
+                    // unverifiable target to the workspace-escape check.
+                    Err(_) => {
+                        out.push('$');
+                        out.push_str(&name);
+                    }
+                }
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
+/// True when `path` still contains an unresolved shell variable after
+/// expansion (a literal `$VAR`/`${VAR}` or cmd-style `%VAR%`). Such a target
+/// cannot be proven to stay in the workspace, so callers escalate it.
+pub(crate) fn path_has_unresolved_var(path: &str) -> bool {
+    if path.contains('$') {
+        return true;
+    }
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            continue;
+        }
+        let mut len = 0usize;
+        let mut closed = false;
+        while let Some(&nc) = chars.peek() {
+            if nc.is_ascii_alphanumeric() || nc == '_' {
+                len += 1;
+                chars.next();
+            } else {
+                closed = nc == '%';
+                break;
+            }
+        }
+        if len > 0 && closed {
+            return true;
+        }
+    }
+    false
+}
+
+/// Expand `~`/`~/`, `$VAR`/`${VAR}`, and cmd-style `%VAR%` in a shell path so
+/// targets like `~/.bashrc`, `$HOME/x`, and `%USERPROFILE%\x` resolve to their
+/// real (out-of-workspace) locations instead of looking like in-workspace
+/// relative paths.
+fn expand_path_vars(path: &str) -> String {
+    let tilde_expanded = if path == "~" {
+        home_dir().unwrap_or_else(|| path.to_string())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        match home_dir() {
+            Some(home) => format!("{}/{}", home.trim_end_matches('/'), rest),
+            None => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    };
+    expand_env_vars(&tilde_expanded)
+}
+
+fn push_write_target(raw: &str, out: &mut Vec<String>) {
+    let raw = raw.trim();
+    // `-` is stdin/stdout for most of these verbs, not a path; `/dev/*`
+    // entries (`/dev/null`, `/dev/stdout`, …) are not real file mutations.
+    if raw.is_empty() || raw == "-" || raw.starts_with("/dev/") {
+        return;
+    }
+    let expanded = expand_path_vars(raw);
+    if !out.contains(&expanded) {
+        out.push(expanded);
+    }
+}
+
+fn is_shell_flag(token: &str) -> bool {
+    token.starts_with('-') && token != "-"
+}
+
+/// `--target-directory=DIR`, `--target-directory DIR`, `-t DIR`, `-tDIR`.
+fn target_directory_arg(args: &[String]) -> Option<&str> {
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "-t" || arg == "--target-directory" {
+            return args.get(idx + 1).map(String::as_str);
+        }
+        if let Some(rest) = arg.strip_prefix("--target-directory=") {
+            return Some(rest);
+        }
+        if let Some(rest) = arg.strip_prefix("-t")
+            && !rest.is_empty()
+        {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+fn collect_verb_write_targets(name: &str, args: &[String], out: &mut Vec<String>) {
+    match name {
+        // Every non-flag argument is a write target. `ln` is included with
+        // both operands: an in-workspace symlink whose *target* points
+        // outside (`ln -s /etc/passwd link`) is a sandbox-escape vector, so
+        // the outside target must escalate even though the link name itself
+        // is in-bounds.
+        "tee" | "touch" | "mkdir" | "ln" => {
+            for arg in args {
+                if !is_shell_flag(arg) {
+                    push_write_target(arg, out);
+                }
+            }
+        }
+        // Destination is `--target-directory` if present, else the last
+        // non-flag operand.
+        "cp" | "mv" | "install" => {
+            if let Some(dir) = target_directory_arg(args) {
+                push_write_target(dir, out);
+            } else if let Some(dest) = args.iter().rev().find(|arg| !is_shell_flag(arg)) {
+                push_write_target(dest, out);
+            }
+        }
+        // `dd of=PATH` is the write target (`if=` is the read source).
+        "dd" => {
+            for arg in args {
+                if let Some(path) = arg.strip_prefix("of=") {
+                    push_write_target(path, out);
+                }
+            }
+        }
+        // In-place edit (`-i`/`--in-place`) writes its file operands. When
+        // the script is positional (no `-e`/`-f`) it is the first non-flag
+        // operand, so drop it.
+        "sed" => {
+            let in_place = args
+                .iter()
+                .any(|arg| arg.starts_with("-i") || arg.starts_with("--in-place"));
+            if in_place {
+                let script_via_flag = args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-e" | "--expression" | "-f" | "--file"));
+                let files: Vec<&String> = args.iter().filter(|arg| !is_shell_flag(arg)).collect();
+                let targets: &[&String] = if script_via_flag || files.len() <= 1 {
+                    &files
+                } else {
+                    &files[1..]
+                };
+                for file in targets {
+                    push_write_target(file, out);
+                }
+            }
+        }
+        // First non-flag operand is the mode; the rest are files.
+        "chmod" => {
+            let files: Vec<&String> = args.iter().filter(|arg| !is_shell_flag(arg)).collect();
+            for file in files.iter().skip(1) {
+                push_write_target(file, out);
+            }
+        }
+        _ => collect_windows_write_targets(name, args, out),
+    }
+}
+
+/// A cmd.exe switch like `/Y`, `/S`, `/MIR`, `/LOG:file` — distinct from a
+/// POSIX path that merely begins with `/` (those contain a path separator, so
+/// they are not all alphanumeric).
+fn is_cmd_flag(token: &str) -> bool {
+    token.starts_with('/')
+        && token.len() >= 2
+        && token[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ':')
+}
+
+/// Value of a PowerShell named parameter (`-Destination dst` / `-Path:dst`,
+/// case-insensitive).
+fn powershell_named_value<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
+    for (idx, arg) in args.iter().enumerate() {
+        if let Some((flag, inline)) = arg.split_once(':')
+            && names.iter().any(|n| flag.eq_ignore_ascii_case(n))
+            && !inline.is_empty()
+        {
+            return Some(inline);
+        }
+        if names.iter().any(|n| arg.eq_ignore_ascii_case(n)) {
+            return args.get(idx + 1).map(String::as_str);
+        }
+    }
+    None
+}
+
+/// PowerShell positional operands: tokens that are neither a `-Parameter` nor
+/// the value immediately following a bare `-Parameter`.
+fn powershell_positionals(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg.starts_with('-') {
+            // A bare `-Param` (no inline `:value`) consumes the next token.
+            skip_value = !arg.contains(':');
+            continue;
+        }
+        positionals.push(arg.as_str());
+    }
+    positionals
+}
+
+/// Windows file-mutating verbs (cmd.exe + PowerShell). The tree-sitter-bash
+/// parser still tokenises these into a name + args, so we can extract their
+/// write targets even though their flag/parameter syntax differs from POSIX.
+fn collect_windows_write_targets(name: &str, args: &[String], out: &mut Vec<String>) {
+    let lowered = name.to_ascii_lowercase();
+    let verb = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    match verb {
+        // cmd: `copy SRC DEST`, `move SRC DEST`, `xcopy SRC DEST [/flags]` —
+        // destination is the last non-switch operand.
+        "copy" | "move" | "xcopy" => {
+            if let Some(dest) = args.iter().rev().find(|arg| !is_cmd_flag(arg)) {
+                push_write_target(dest, out);
+            }
+        }
+        // `robocopy SOURCE DEST [files] [options]` — the written dir is the
+        // second positional.
+        "robocopy" => {
+            let positional: Vec<&String> = args.iter().filter(|arg| !is_cmd_flag(arg)).collect();
+            if let Some(dest) = positional.get(1) {
+                push_write_target(dest, out);
+            }
+        }
+        // `md DIR` (cmd alias for mkdir).
+        "md" => {
+            for arg in args {
+                if !is_cmd_flag(arg) {
+                    push_write_target(arg, out);
+                }
+            }
+        }
+        // PowerShell copy/move: `-Destination` (or the last positional).
+        "copy-item" | "move-item" => {
+            if let Some(dest) = powershell_named_value(args, &["-destination", "-dest"]) {
+                push_write_target(dest, out);
+            } else if let Some(dest) = powershell_positionals(args).last() {
+                push_write_target(dest, out);
+            }
+        }
+        // PowerShell file writers: `-Path`/`-FilePath`/`-LiteralPath` (or the
+        // first positional).
+        "set-content" | "add-content" | "out-file" | "new-item" => {
+            if let Some(target) =
+                powershell_named_value(args, &["-path", "-filepath", "-literalpath"])
+            {
+                push_write_target(target, out);
+            } else if let Some(target) = powershell_positionals(args).first() {
+                push_write_target(target, out);
+            }
+        }
+        _ => {}
+    }
+}

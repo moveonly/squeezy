@@ -99,7 +99,7 @@ pub(crate) use shell::{
 use shell_output::insert_content_field;
 #[cfg(test)]
 use shell_output::shape_shell_output;
-use shell_parse::analyze_shell_command;
+use shell_parse::{analyze_shell_command, extract_shell_write_targets};
 #[cfg(test)]
 use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
@@ -1902,6 +1902,15 @@ impl ToolRegistry {
                     .map(|args| args.command.as_str())
                     .unwrap_or("");
                 let analysis = analyze_shell_command(command);
+                // A file-mutating shell command whose write target escapes the
+                // workspace (e.g. `sed -i ~/.bashrc`, `tee /etc/hosts`,
+                // `cp secret ~/exfil`, `chmod 777 /etc/passwd`) must escalate
+                // like the structured edit tools do, rather than auto-allowing
+                // under the workspace-write `shell`/`edit` defaults. The
+                // matching gate is `path_request_targets_outside_workspace`.
+                if self.shell_command_writes_outside_workspace(command) {
+                    metadata.insert("outside_workspace".to_string(), "true".to_string());
+                }
                 let workdir = args
                     .as_ref()
                     .and_then(|args| args.workdir.as_deref())
@@ -2159,6 +2168,21 @@ impl ToolRegistry {
     fn raw_path_targets_outside_workspace(&self, raw: &str) -> bool {
         let path = Path::new(raw);
         path.is_absolute() && !path.starts_with(self.root.as_ref())
+    }
+
+    /// True when any write target extracted from `command` resolves outside
+    /// the permission-writable roots (workspace + OS temp + configured
+    /// `write_roots`). Temp dirs are treated as in-bounds so routine
+    /// `mktemp`/`/tmp` scratch writes do not prompt, matching the shell
+    /// sandbox's writable roots.
+    fn shell_command_writes_outside_workspace(&self, command: &str) -> bool {
+        extract_shell_write_targets(command).iter().any(|target| {
+            safety::path_escapes_permission_writable_roots(
+                target,
+                self.root.as_ref(),
+                &self.shell_sandbox,
+            )
+        })
     }
 
     fn call_has_outside_path_grant(&self, call_id: &str, capability: PermissionCapability) -> bool {

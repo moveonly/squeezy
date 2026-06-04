@@ -633,7 +633,63 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_perm_mode,
                 default_display: "default",
                 default: || FieldValue::Enum("default"),
-                help: "Permission preset. Default allows workspace read/edit/local commands, Auto-review routes eligible approvals through the reviewer, Full Access removes workspace/network prompts, Custom exposes each capability.",
+                help: "Permission preset (shipped default: Default — human prompts, no LLM reviewer). Default allows workspace read/edit/shell/git/compiler and asks on web/mcp/destructive. Auto-review (opt-in) instead routes edit/shell/git/compiler/web/mcp through the reviewer, which auto-approves the safe ones (see reviewer_model / reviewer_policy). Full Access removes workspace/network prompts; Custom exposes each capability.",
+                env_override: None,
+                secret: false,
+            },
+            // Reviewer rows are shown under Auto-review (and Custom). They sit
+            // immediately after `mode` so the Permissions section's visible
+            // rows stay a contiguous prefix — see `permissions_visible_rows`
+            // in the TUI config screen.
+            FieldMeta {
+                label: "reviewer_model",
+                toml_path: &["permissions", "ai_reviewer", "model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_model,
+                set: set_ai_reviewer_model,
+                default_display: "small-fast",
+                default: || FieldValue::String(String::new()),
+                help: "Model the Auto-review reviewer uses to judge permission prompts. Empty uses the provider's small/fast tier (cheap). Distinct from the turn-routing judge_model.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "reviewer_policy",
+                toml_path: &["permissions", "ai_reviewer", "policy_file"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_policy_file,
+                set: set_ai_reviewer_policy_file,
+                default_display: "built-in",
+                default: || FieldValue::String(String::new()),
+                help: "Path to a Markdown file that replaces the built-in Auto-review judging policy (APPROVAL_POLICY.md). Empty uses the built-in policy.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "reviewer_policy_extra",
+                toml_path: &["permissions", "ai_reviewer", "policy"],
+                kind: FieldKind::String { multiline: true },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_policy_text,
+                set: set_ai_reviewer_policy_text,
+                default_display: "none",
+                help: "Extra judging instructions appended to the base Auto-review policy (the built-in one, or reviewer_policy if set). Press Enter to edit. Tightens or extends the policy without replacing it.",
+                default: || FieldValue::String(String::new()),
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "reviewer_capabilities",
+                toml_path: &["permissions", "ai_reviewer", "allow_capabilities"],
+                kind: FieldKind::StringList { min: 0, max: 9 },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_capabilities,
+                set: set_ai_reviewer_capabilities,
+                default_display: "read, search, network, mcp, edit, shell, git, compiler",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Capabilities the Auto-review reviewer may auto-approve (read, search, edit, shell, git, compiler, network, mcp). Anything else always reaches a human; destructive is never auto-approved, and high-risk network/mcp and out-of-workspace writes always escalate. Empty = review-only.",
                 env_override: None,
                 secret: false,
             },
@@ -1981,6 +2037,112 @@ fn set_perm_mode(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static 
     };
     let mode = PermissionPolicyMode::parse(s).ok_or("invalid permission policy mode")?;
     cfg.permissions.apply_mode(mode);
+    Ok(())
+}
+
+fn get_ai_reviewer_model(cfg: &AppConfig) -> FieldValue {
+    // Show the model that will actually run: the explicit override, else the
+    // provider's resolved small/fast tier, else the main model — matching the
+    // reviewer's own resolution. Clearing the override reverts the row to the
+    // resolved default rather than a blank cell.
+    let resolved = cfg
+        .permissions
+        .ai_reviewer
+        .model
+        .clone()
+        .or_else(|| cfg.resolved_small_fast_model())
+        .unwrap_or_else(|| cfg.model.clone());
+    FieldValue::String(resolved)
+}
+// Unlike the per-capability setters, this does not force mode = Custom: the
+// reviewer model is meaningful under the Auto-review preset.
+fn set_ai_reviewer_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("reviewer model expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.permissions.ai_reviewer.model = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    Ok(())
+}
+
+fn get_ai_reviewer_policy_file(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.permissions
+            .ai_reviewer
+            .policy_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    )
+}
+fn set_ai_reviewer_policy_file(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("reviewer policy file expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.permissions.ai_reviewer.policy_file = if trimmed.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    };
+    Ok(())
+}
+
+fn get_ai_reviewer_policy_text(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.permissions
+            .ai_reviewer
+            .policy
+            .clone()
+            .unwrap_or_default(),
+    )
+}
+fn set_ai_reviewer_policy_text(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("reviewer policy expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.permissions.ai_reviewer.policy = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    Ok(())
+}
+
+fn get_ai_reviewer_capabilities(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(
+        cfg.permissions
+            .ai_reviewer
+            .allow_capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect(),
+    )
+}
+fn set_ai_reviewer_capabilities(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let FieldValue::StringList(items) = value else {
+        return Err("reviewer capabilities expects string list");
+    };
+    let mut caps = Vec::new();
+    for item in items {
+        let capability =
+            crate::PermissionCapability::parse(item.trim()).ok_or("invalid reviewer capability")?;
+        if !caps.contains(&capability) {
+            caps.push(capability);
+        }
+    }
+    cfg.permissions.ai_reviewer.allow_capabilities = caps;
     Ok(())
 }
 fn get_perm_read(cfg: &AppConfig) -> FieldValue {

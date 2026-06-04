@@ -2774,7 +2774,14 @@ fn toggle_config_screen(
         app.status = "config closed".to_string();
         return;
     }
-    let state = config_screen::ConfigScreenState::new(agent.config_snapshot(), focus);
+    // Build the screen from a freshly-merged settings config so it reflects
+    // what's saved on disk — the agent snapshot can lag a settings file written
+    // in an earlier session, which would otherwise leave the Permissions rows
+    // (and other fields) showing a stale mode. Fall back to the running config
+    // if the reload fails.
+    let effective = squeezy_core::AppConfig::from_env_and_settings()
+        .unwrap_or_else(|_| agent.config_snapshot());
+    let state = config_screen::ConfigScreenState::new(effective, focus);
     app.config_screen = Some(state);
     app.status = "config".to_string();
 }
@@ -14807,8 +14814,12 @@ impl TuiApp {
             settings_path_override: None,
         };
         if let Some(section) = open_config_section {
+            // Prefer a freshly-merged settings config (matches what's saved on
+            // disk) over the startup snapshot; fall back to it on error.
+            let effective =
+                squeezy_core::AppConfig::from_env_and_settings().unwrap_or_else(|_| config.clone());
             app.config_screen = Some(config_screen::ConfigScreenState::new(
-                config.clone(),
+                effective,
                 Some(section),
             ));
         }

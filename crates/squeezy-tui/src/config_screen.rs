@@ -100,6 +100,23 @@ impl ConfigFeedback {
 /// `FieldMeta` in `CONFIG_SECTIONS`.
 const SYNTHETIC_KEY_ROW: usize = 2;
 
+/// Number of Auto-review reviewer rows (`reviewer_model`, `reviewer_policy`,
+/// `reviewer_policy_extra`, `reviewer_capabilities`) that follow `mode` in the
+/// Permissions section's field list.
+const PERMISSION_REVIEWER_ROWS: usize = 4;
+
+/// Visible row count for the Permissions section. Rows are a contiguous
+/// prefix of the section's field list — `mode` only for Default/Full Access,
+/// plus the reviewer rows for Auto-review, plus every per-capability row for
+/// Custom. Keeping it a prefix means `field_at_row(row) == fields[row]`.
+fn permissions_visible_rows(mode: PermissionPolicyMode, field_count: usize) -> usize {
+    match mode {
+        PermissionPolicyMode::Custom => field_count,
+        PermissionPolicyMode::AutoReview => 1 + PERMISSION_REVIEWER_ROWS,
+        PermissionPolicyMode::Default | PermissionPolicyMode::FullAccess => 1,
+    }
+}
+
 /// Static row metadata for the synthetic Reset section. Each row deletes
 /// one tier's TOML file. The `Reset` section itself is declared in
 /// `CONFIG_SECTIONS` with an empty `fields` slice — the rendering and
@@ -590,19 +607,44 @@ impl ConfigScreenState {
     }
 
     /// Number of selectable rows on the active section, including the
+    /// Permission mode as shown in the `mode` row (resolved against the active
+    /// scope's saved sources). Visibility of the reviewer rows tracks this so
+    /// they stay consistent with the value the user actually sees, even when the
+    /// agent snapshot behind `effective` lags a freshly-saved settings file.
+    fn displayed_permission_mode(&self) -> Option<PermissionPolicyMode> {
+        let section = CONFIG_SECTIONS
+            .iter()
+            .find(|s| s.id == SectionId::Permissions)?;
+        let mode_field = section
+            .fields
+            .iter()
+            .find(|f| f.toml_path == ["permissions", "mode"])?;
+        match self.displayed_value_and_source(mode_field).0 {
+            FieldValue::Enum(s) => PermissionPolicyMode::parse(s),
+            _ => None,
+        }
+    }
+
+    /// Visible Permissions rows: the larger of what the running config
+    /// (`effective`) and the displayed (saved) mode would show, so the reviewer
+    /// rows appear whenever either indicates Auto-review/Custom. This keeps the
+    /// rows from disappearing when the agent snapshot and the saved file
+    /// disagree about the mode at open time.
+    fn permission_visible_rows(&self, field_count: usize) -> usize {
+        let by_effective = permissions_visible_rows(self.effective.permissions.mode, field_count);
+        match self.displayed_permission_mode() {
+            Some(mode) => by_effective.max(permissions_visible_rows(mode, field_count)),
+            None => by_effective,
+        }
+    }
+
     /// synthetic "API key" row for the Models section and the three
     /// per-tier action rows for the Reset section.
     pub(crate) fn row_count(&self) -> usize {
         let section = self.current_section();
         match section.id {
             SectionId::Models => section.fields.len() + 1,
-            SectionId::Permissions => {
-                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
-                    section.fields.len()
-                } else {
-                    1
-                }
-            }
+            SectionId::Permissions => self.permission_visible_rows(section.fields.len()),
             // The Reset section only ever surfaces the action for the active
             // scope tab — resetting another tab's file from here would be
             // confusing and the tier-tab context already disambiguates which
@@ -633,13 +675,8 @@ impl ConfigScreenState {
                 r => section.fields.get(r - 1),
             },
             SectionId::Permissions => {
-                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
-                    section.fields.get(row)
-                } else if row == 0 {
-                    section.fields.first()
-                } else {
-                    None
-                }
+                let visible = self.permission_visible_rows(section.fields.len());
+                (row < visible).then(|| section.fields.get(row)).flatten()
             }
             SectionId::Reset | SectionId::Themes => None,
             _ => section.fields.get(row),
@@ -747,6 +784,21 @@ impl ConfigScreenState {
             for (src, tier) in chain {
                 if let Some(t) = tier
                     && t.contains_path(&real)
+                {
+                    return (value, *src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
+        // AI-reviewer fields resolve against the running config so the row
+        // reflects what will actually be used (the resolved reviewer model, the
+        // active capability set) rather than a static, often-empty default. The
+        // badge still reflects whether the active tab sets the value.
+        if let ["permissions", "ai_reviewer", _] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            for (src, tier) in chain {
+                if let Some(t) = tier
+                    && tier_value_at_path(t, field).is_some()
                 {
                     return (value, *src);
                 }

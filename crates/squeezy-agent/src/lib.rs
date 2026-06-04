@@ -12281,52 +12281,70 @@ async fn permission_decision_for_request(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
-    if verdict.action == PermissionAction::Ask
-        && request.tool_name == "shell"
+    // The structural pre-classifier runs for every shell call, not just those
+    // whose policy verdict is already Ask. Its AutoDeny floor (dangerous
+    // interpreter, destructive verb, sensitive path) must be able to override a
+    // permissive `shell = Allow` default — otherwise `python -c '...'`,
+    // `sudo ...`, and sensitive-path access execute with no gate.
+    if request.tool_name == "shell"
         && let Some(command) = request.metadata.get("command")
     {
         match pre_classify_shell(command, &context.config.permissions.shell_sandbox) {
             ShellPreClassification::AutoAllow { reason } => {
-                let reason = format!("pre-classifier auto-allow: {reason}");
-                log_session_event(
-                    context.session_log.as_ref(),
-                    &context.redactor,
-                    "permission_pre_classifier_allow",
-                    Some(context.turn_id),
-                    Some(reason.clone()),
-                    json!({
-                        "reason": reason,
-                        "capability": request.capability.as_str(),
-                        "target": request.target.clone(),
-                    }),
-                );
-                verdict = PermissionVerdict {
-                    action: PermissionAction::Allow,
-                    matched_rule: None,
-                    reason,
-                    silent: false,
-                };
+                // Only relax an Ask to Allow; never re-affirm an existing Allow
+                // nor weaken a Deny.
+                if verdict.action == PermissionAction::Ask {
+                    let reason = format!("pre-classifier auto-allow: {reason}");
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_pre_classifier_allow",
+                        Some(context.turn_id),
+                        Some(reason.clone()),
+                        json!({
+                            "reason": reason,
+                            "capability": request.capability.as_str(),
+                            "target": request.target.clone(),
+                        }),
+                    );
+                    verdict = PermissionVerdict {
+                        action: PermissionAction::Allow,
+                        matched_rule: None,
+                        reason,
+                        silent: false,
+                    };
+                }
             }
             ShellPreClassification::AutoDeny { reason } => {
-                let reason = format!("pre-classifier auto-deny: {reason}");
-                log_session_event(
-                    context.session_log.as_ref(),
-                    &context.redactor,
-                    "permission_pre_classifier_deny",
-                    Some(context.turn_id),
-                    Some(reason.clone()),
-                    json!({
-                        "reason": reason,
-                        "capability": request.capability.as_str(),
-                        "target": request.target.clone(),
-                    }),
-                );
-                verdict = PermissionVerdict {
-                    action: PermissionAction::Deny,
-                    matched_rule: None,
-                    reason,
-                    silent: false,
+                // Tighten one step toward deny so the command cannot run
+                // silently: Allow -> Ask (force a human/reviewer gate),
+                // Ask -> Deny. An existing Deny is left untouched.
+                let tightened = match verdict.action {
+                    PermissionAction::Allow => PermissionAction::Ask,
+                    PermissionAction::Ask | PermissionAction::Deny => PermissionAction::Deny,
                 };
+                if tightened != verdict.action {
+                    let reason = format!("pre-classifier auto-deny: {reason}");
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_pre_classifier_deny",
+                        Some(context.turn_id),
+                        Some(reason.clone()),
+                        json!({
+                            "reason": reason,
+                            "action": tightened.as_str(),
+                            "capability": request.capability.as_str(),
+                            "target": request.target.clone(),
+                        }),
+                    );
+                    verdict = PermissionVerdict {
+                        action: tightened,
+                        matched_rule: None,
+                        reason,
+                        silent: false,
+                    };
+                }
             }
             ShellPreClassification::AskAi => {}
         }

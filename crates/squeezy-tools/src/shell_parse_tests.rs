@@ -6,7 +6,7 @@
 
 use super::{
     CommandUnit, Redirect, analyze_shell_command, extract_command_units,
-    shell_segment_has_destructive_redirect,
+    extract_shell_write_targets, shell_segment_has_destructive_redirect,
 };
 use crate::PermissionCapability;
 
@@ -151,4 +151,189 @@ fn command_unit_default_is_empty() {
     assert!(unit.env.is_empty());
     assert!(unit.redirects.is_empty());
     assert!(!unit.has_substitution);
+}
+
+fn test_home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .expect("HOME or USERPROFILE set in test env")
+}
+
+#[test]
+fn write_targets_cover_copy_move_install_destination() {
+    assert_eq!(
+        extract_shell_write_targets("cp secret /etc/passwd"),
+        vec!["/etc/passwd".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("mv build.log /var/log/app.log"),
+        vec!["/var/log/app.log".to_string()]
+    );
+    // `--target-directory` is the destination, not the trailing operand.
+    assert_eq!(
+        extract_shell_write_targets("cp -t /etc a.conf b.conf"),
+        vec!["/etc".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_cover_tee_dd_ln_touch_mkdir() {
+    assert_eq!(
+        extract_shell_write_targets("echo x | tee /etc/hosts"),
+        vec!["/etc/hosts".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("dd if=/dev/zero of=/boot/blob"),
+        vec!["/boot/blob".to_string()]
+    );
+    // Both operands are reported so an in-workspace symlink pointing at an
+    // outside target (`/etc/passwd`) still escalates.
+    assert_eq!(
+        extract_shell_write_targets("ln -s /etc/passwd /workspace/link"),
+        vec!["/etc/passwd".to_string(), "/workspace/link".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("touch /etc/cron.d/evil"),
+        vec!["/etc/cron.d/evil".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("mkdir /opt/payload"),
+        vec!["/opt/payload".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_handle_sed_in_place_and_chmod_mode() {
+    // Positional script is dropped; the file operand remains.
+    assert_eq!(
+        extract_shell_write_targets("sed -i 's/a/b/' /etc/hosts"),
+        vec!["/etc/hosts".to_string()]
+    );
+    // The mode (`777`) is not a path; only the file operand is a target.
+    assert_eq!(
+        extract_shell_write_targets("chmod 777 /etc/passwd"),
+        vec!["/etc/passwd".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_expand_home_prefix() {
+    let home = test_home();
+    assert_eq!(
+        extract_shell_write_targets("sed -i 's/a/b/' ~/.bashrc"),
+        vec![format!("{}/.bashrc", home.trim_end_matches('/'))]
+    );
+}
+
+#[test]
+fn write_targets_unwrap_sh_dash_c() {
+    assert_eq!(
+        extract_shell_write_targets("sh -c \"cp loot /etc/loot\""),
+        vec!["/etc/loot".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_ignore_reads_devnull_and_stdin() {
+    // Read-only verbs and `/dev/null` redirects produce no write targets.
+    assert!(extract_shell_write_targets("grep -R foo .").is_empty());
+    assert!(extract_shell_write_targets("cat file | sort").is_empty());
+    assert!(extract_shell_write_targets("ls -la 2>/dev/null").is_empty());
+    // `cp - dest`/`tee -` stream handles are not paths.
+    assert!(extract_shell_write_targets("tee -").is_empty());
+}
+
+#[test]
+fn write_targets_relative_in_workspace_paths_are_still_reported() {
+    // Extraction is path-blind; the caller decides in/out of workspace. A
+    // relative destination is reported verbatim so the resolver can place it
+    // under the workspace root.
+    assert_eq!(
+        extract_shell_write_targets("cp a.txt src/b.txt"),
+        vec!["src/b.txt".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_expand_env_vars() {
+    let home = test_home();
+    let home = home.trim_end_matches('/');
+    assert_eq!(
+        extract_shell_write_targets("touch \"$HOME/abbas.txt\""),
+        vec![format!("{home}/abbas.txt")],
+        "$HOME must expand so the home write is seen as out-of-workspace"
+    );
+    assert_eq!(
+        extract_shell_write_targets("tee ${HOME}/x"),
+        vec![format!("{home}/x")]
+    );
+    // An unset variable is left literal so the caller escalates on the `$`.
+    assert_eq!(
+        extract_shell_write_targets("touch $SQZ_DEFINITELY_UNSET_VAR/x"),
+        vec!["$SQZ_DEFINITELY_UNSET_VAR/x".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_cover_windows_verbs() {
+    // cmd copy/move/xcopy: destination is the last non-switch operand
+    // (forward-slash + quoted forms keep the bash tokenizer unambiguous).
+    assert_eq!(
+        extract_shell_write_targets("copy secret \"C:/Windows/evil.txt\""),
+        vec!["C:/Windows/evil.txt".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("xcopy src \"D:/out\" /E /I"),
+        vec!["D:/out".to_string()]
+    );
+    // robocopy: destination is the 2nd positional.
+    assert_eq!(
+        extract_shell_write_targets("robocopy src \"//server/share\" /MIR"),
+        vec!["//server/share".to_string()]
+    );
+    // md = cmd mkdir alias.
+    assert_eq!(
+        extract_shell_write_targets("md \"E:/payload\""),
+        vec!["E:/payload".to_string()]
+    );
+    // PowerShell named destination + file writers.
+    assert_eq!(
+        extract_shell_write_targets("Copy-Item secret -Destination \"C:/Windows/x\""),
+        vec!["C:/Windows/x".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("Set-Content -Path \"C:/hosts\" -Value y"),
+        vec!["C:/hosts".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"C:/log.txt\""),
+        vec!["C:/log.txt".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_expand_percent_vars() {
+    let home = test_home();
+    let home = home.trim_end_matches('/');
+    // %HOME% is set in the test env; resolves like cmd's %USERPROFILE%.
+    assert_eq!(
+        extract_shell_write_targets("copy secret \"%HOME%/evil.txt\""),
+        vec![format!("{home}/evil.txt")]
+    );
+    // An unset %VAR% stays literal so the escape check escalates on it.
+    assert_eq!(
+        extract_shell_write_targets("copy secret \"%SQZ_UNSET_VAR%/x\""),
+        vec!["%SQZ_UNSET_VAR%/x".to_string()]
+    );
+}
+
+#[test]
+fn write_targets_preserve_unquoted_backslash_windows_path() {
+    // The bash tokenizer preserves an unquoted backslash drive path verbatim,
+    // so on a Windows build std::path resolves `C:\...` as an absolute
+    // (drive-prefixed) path and the workspace-escape check flags it.
+    assert_eq!(
+        extract_shell_write_targets("copy secret C:\\Windows\\evil.txt"),
+        vec!["C:\\Windows\\evil.txt".to_string()]
+    );
 }

@@ -1817,6 +1817,9 @@ impl AppConfig {
                 toml_string(&policy_file.display().to_string())
             ));
         }
+        if let Some(policy) = &self.permissions.ai_reviewer.policy {
+            output.push_str(&format!("policy = {}\n", toml_string(policy)));
+        }
         output.push_str(&format!(
             "max_transcript_tokens = {}\n",
             self.permissions.ai_reviewer.max_transcript_tokens
@@ -5624,7 +5627,10 @@ impl PermissionCapability {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Severity is ordered `Low < Medium < High < Critical` (the variant
+/// declaration order), so callers can compare against a ceiling — e.g. the AI
+/// reviewer refuses to auto-allow anything `>= High`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PermissionRisk {
     Low,
     Medium,
@@ -5973,6 +5979,7 @@ pub struct AiReviewerSettings {
     pub model: Option<String>,
     pub allow_capabilities: Option<Vec<String>>,
     pub policy_file: Option<String>,
+    pub policy: Option<String>,
     pub timeout_secs: Option<u64>,
     pub max_transcript_tokens: Option<u64>,
 }
@@ -5986,6 +5993,7 @@ impl AiReviewerSettings {
                 "model",
                 "allow_capabilities",
                 "policy_file",
+                "policy",
                 "timeout_secs",
                 "max_transcript_tokens",
             ],
@@ -6002,6 +6010,7 @@ impl AiReviewerSettings {
                 &field(path, "allow_capabilities"),
             )?,
             policy_file: string_value(table, "policy_file", source, &field(path, "policy_file"))?,
+            policy: string_value(table, "policy", source, &field(path, "policy"))?,
             timeout_secs: u64_value(table, "timeout_secs", source, &field(path, "timeout_secs"))?,
             max_transcript_tokens: u64_value(
                 table,
@@ -6017,6 +6026,7 @@ impl AiReviewerSettings {
         replace_if_some(&mut self.model, next.model);
         replace_if_some(&mut self.allow_capabilities, next.allow_capabilities);
         replace_if_some(&mut self.policy_file, next.policy_file);
+        replace_if_some(&mut self.policy, next.policy);
         replace_if_some(&mut self.timeout_secs, next.timeout_secs);
         replace_if_some(&mut self.max_transcript_tokens, next.max_transcript_tokens);
     }
@@ -6028,6 +6038,10 @@ pub struct AiReviewerConfig {
     pub model: Option<String>,
     pub allow_capabilities: Vec<PermissionCapability>,
     pub policy_file: Option<PathBuf>,
+    /// Extra instructions appended to the base judging policy (the built-in
+    /// `APPROVAL_POLICY.md` or `policy_file`). Lets a project tighten/extend the
+    /// policy without replacing it wholesale.
+    pub policy: Option<String>,
     pub timeout_secs: u64,
     /// Sliding-window transcript budget for the reviewer prompt. Keeps the most
     /// recent turns whole and compacts older entries into a single summary
@@ -6046,6 +6060,7 @@ impl Default for AiReviewerConfig {
             model: None,
             allow_capabilities: vec![PermissionCapability::Read, PermissionCapability::Search],
             policy_file: None,
+            policy: None,
             timeout_secs: 15,
             max_transcript_tokens: DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS,
         }
@@ -6071,6 +6086,12 @@ impl AiReviewerConfig {
             let policy_file = policy_file.trim();
             if !policy_file.is_empty() {
                 config.policy_file = Some(expand_home_path(PathBuf::from(policy_file)));
+            }
+        }
+        if let Some(policy) = settings.policy {
+            let policy = policy.trim();
+            if !policy.is_empty() {
+                config.policy = Some(policy.to_string());
             }
         }
         if let Some(timeout_secs) = settings.timeout_secs {
@@ -6731,18 +6752,14 @@ impl PermissionPolicy {
         let legacy_defaults = settings.has_legacy_defaults();
         let custom_defaults = settings.custom.is_some();
         let legacy_compat = legacy_defaults && settings.mode.is_none();
-        let explicit_mode = settings.mode.is_some();
         let mode = settings
             .mode
             .unwrap_or(if legacy_defaults || custom_defaults {
                 PermissionPolicyMode::Custom
             } else {
-                PermissionPolicyMode::AutoReview
+                PermissionPolicyMode::Default
             });
         let ai_reviewer_settings = settings.ai_reviewer.clone();
-        let ai_reviewer_enabled_configured = ai_reviewer_settings
-            .as_ref()
-            .is_some_and(|settings| settings.enabled.is_some());
         let ai_reviewer_allow_capabilities_configured = ai_reviewer_settings
             .as_ref()
             .is_some_and(|settings| settings.allow_capabilities.is_some());
@@ -6787,10 +6804,12 @@ impl PermissionPolicy {
         policy.ai_reviewer = AiReviewerConfig::from_settings(ai_reviewer_settings, source)?;
         match mode {
             PermissionPolicyMode::AutoReview => {
-                if explicit_mode || !ai_reviewer_enabled_configured {
-                    policy.ai_reviewer.enabled = true;
-                }
-                if explicit_mode || !ai_reviewer_allow_capabilities_configured {
+                // Selecting Auto-review enables the reviewer (toggle it off by
+                // choosing a different preset). The auto-approve set defaults to
+                // the workspace-write capabilities but is respected when the user
+                // has configured `allow_capabilities`, so the remit is tunable.
+                policy.ai_reviewer.enabled = true;
+                if !ai_reviewer_allow_capabilities_configured {
                     policy.ai_reviewer.allow_capabilities = auto_review_allow_capabilities();
                 }
             }
@@ -6926,9 +6945,15 @@ impl PermissionPolicy {
 }
 
 fn path_request_targets_outside_workspace(request: &PermissionRequest) -> bool {
+    // `Shell` is included so a file-mutating shell command writing outside the
+    // workspace (`sed -i ~/.bashrc`, `tee /etc/hosts`, `cp x /etc/y`) escalates
+    // like the structured edit tools, instead of auto-allowing under the
+    // workspace-write `shell` default. The shell permission request sets the
+    // `outside_workspace` metadata in that case (chmod/ln/mv/touch classify as
+    // `Edit`, which is already covered here).
     matches!(
         request.capability,
-        PermissionCapability::Read | PermissionCapability::Edit
+        PermissionCapability::Read | PermissionCapability::Edit | PermissionCapability::Shell
     ) && request
         .metadata
         .get("outside_workspace")
@@ -6983,7 +7008,11 @@ pub fn target_is_effectively_wildcard(target: &str) -> bool {
 
 impl Default for PermissionPolicy {
     fn default() -> Self {
-        Self::preset(PermissionPolicyMode::AutoReview)
+        // Opt-in by default: ship the human-prompt `Default` preset, matching
+        // peer agents (codex/clear-code) where the LLM reviewer is a choice the
+        // user makes, not the shipped default. Users select `AutoReview` to turn
+        // the reviewer on.
+        Self::preset(PermissionPolicyMode::Default)
     }
 }
 
@@ -6996,9 +7025,7 @@ impl PermissionPolicy {
         let mut ai_reviewer = AiReviewerConfig::default();
         let (read, search, edit, shell, ignored_search, web, mcp, git, compiler, destructive) =
             match mode {
-                PermissionPolicyMode::Default
-                | PermissionPolicyMode::AutoReview
-                | PermissionPolicyMode::Custom => (
+                PermissionPolicyMode::Default | PermissionPolicyMode::Custom => (
                     PermissionMode::Allow,
                     PermissionMode::Allow,
                     PermissionMode::Allow,
@@ -7008,6 +7035,23 @@ impl PermissionPolicy {
                     PermissionMode::Ask,
                     PermissionMode::Allow,
                     PermissionMode::Allow,
+                    PermissionMode::Ask,
+                ),
+                // Auto-review routes the workspace-write capabilities through the
+                // reviewer (Ask) rather than auto-allowing them, so the reviewer
+                // can actually adjudicate edit/shell/git/compiler. read/search stay
+                // Allow; web/mcp stay Ask; destructive stays Ask (the reviewer may
+                // deny it but never auto-approve it).
+                PermissionPolicyMode::AutoReview => (
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Allow,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
                     PermissionMode::Ask,
                 ),
                 PermissionPolicyMode::FullAccess => {
@@ -7103,12 +7147,21 @@ impl PermissionPolicy {
     }
 }
 
+/// Default set of capabilities the Auto-review reviewer may auto-approve.
+/// Includes the workspace-write capabilities (Edit/Shell/Git/Compiler) so the
+/// reviewer actually adjudicates them; Destructive is intentionally excluded
+/// (the reviewer may deny it but must never auto-approve it). Users can narrow
+/// or widen this set via `permissions.ai_reviewer.allow_capabilities`.
 fn auto_review_allow_capabilities() -> Vec<PermissionCapability> {
     vec![
         PermissionCapability::Read,
         PermissionCapability::Search,
         PermissionCapability::Network,
         PermissionCapability::Mcp,
+        PermissionCapability::Edit,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Compiler,
     ]
 }
 

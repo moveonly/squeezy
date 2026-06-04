@@ -133,17 +133,14 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
     assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
-    assert_eq!(config.permissions.mode, PermissionPolicyMode::AutoReview);
+    // Opt-in default: the shipped preset is Default (human prompts), with the
+    // LLM reviewer off until the user selects Auto-review.
+    assert_eq!(config.permissions.mode, PermissionPolicyMode::Default);
     assert_eq!(config.permissions.edit, PermissionMode::Allow);
-    assert!(config.permissions.ai_reviewer.enabled);
+    assert!(!config.permissions.ai_reviewer.enabled);
     assert_eq!(
         config.permissions.ai_reviewer.allow_capabilities,
-        vec![
-            PermissionCapability::Read,
-            PermissionCapability::Search,
-            PermissionCapability::Network,
-            PermissionCapability::Mcp,
-        ]
+        vec![PermissionCapability::Read, PermissionCapability::Search]
     );
     assert_eq!(
         config.permissions.shell_sandbox.protected_metadata_names,
@@ -593,6 +590,7 @@ enabled = true
 model = "reviewer-model"
 allow_capabilities = ["read", "search", "edit"]
 policy_file = "docs/approval.md"
+policy = "Never auto-approve writes to generated files."
 timeout_secs = 7
 
 [permissions.shell_sandbox]
@@ -620,6 +618,10 @@ deny_debug_attach = false
     assert_eq!(
         config.permissions.ai_reviewer.model.as_deref(),
         Some("reviewer-model")
+    );
+    assert_eq!(
+        config.permissions.ai_reviewer.policy.as_deref(),
+        Some("Never auto-approve writes to generated files.")
     );
     assert_eq!(config.permissions.ai_reviewer.timeout_secs, 7);
     assert_eq!(
@@ -1166,21 +1168,13 @@ fn permission_mode_parses_expected_values() {
 #[test]
 fn permission_policy_modes_apply_presets() {
     let implicit = AppConfig::from_env_vars(None, |_| None);
-    assert_eq!(implicit.permissions.mode, PermissionPolicyMode::AutoReview);
+    // Opt-in default: implicit config is the Default preset with the reviewer off.
+    assert_eq!(implicit.permissions.mode, PermissionPolicyMode::Default);
     assert_eq!(implicit.permissions.read, PermissionMode::Allow);
     assert_eq!(implicit.permissions.edit, PermissionMode::Allow);
     assert_eq!(implicit.permissions.shell, PermissionMode::Allow);
     assert_eq!(implicit.permissions.web, PermissionMode::Ask);
-    assert!(implicit.permissions.ai_reviewer.enabled);
-    assert_eq!(
-        implicit.permissions.ai_reviewer.allow_capabilities,
-        vec![
-            PermissionCapability::Read,
-            PermissionCapability::Search,
-            PermissionCapability::Network,
-            PermissionCapability::Mcp,
-        ]
-    );
+    assert!(!implicit.permissions.ai_reviewer.enabled);
     assert_eq!(
         implicit.permissions.shell_sandbox.network,
         ShellSandboxNetworkPolicy::AllowWhenApproved
@@ -1227,9 +1221,17 @@ mode = "auto_review"
             PermissionCapability::Search,
             PermissionCapability::Network,
             PermissionCapability::Mcp,
+            PermissionCapability::Edit,
+            PermissionCapability::Shell,
+            PermissionCapability::Git,
+            PermissionCapability::Compiler,
         ]
     );
-    assert_eq!(auto_review.permissions.shell, PermissionMode::Allow);
+    // Auto-review routes the workspace-write capabilities through the reviewer.
+    assert_eq!(auto_review.permissions.shell, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.edit, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.git, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.compiler, PermissionMode::Ask);
 
     let full_access = SettingsFile::from_toml_str(
         r#"
@@ -1271,6 +1273,79 @@ mode = "full_access"
     );
     assert_eq!(
         full_access.permissions.evaluate(&outside).action,
+        PermissionAction::Allow
+    );
+}
+
+#[test]
+fn shell_writes_outside_workspace_escalate_unless_full_access() {
+    fn policy(mode: &str) -> AppConfig {
+        let settings =
+            SettingsFile::from_toml_str(&format!("[permissions]\nmode = \"{mode}\"\n"), "test")
+                .expect("settings parse");
+        AppConfig::from_settings_and_env_vars(settings, |_| None)
+    }
+
+    fn shell_request(outside: bool) -> PermissionRequest {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("command".to_string(), "cp secret /etc/passwd".to_string());
+        if outside {
+            metadata.insert("outside_workspace".to_string(), "true".to_string());
+        }
+        PermissionRequest {
+            call_id: "call".to_string(),
+            tool_name: "shell".to_string(),
+            capability: PermissionCapability::Shell,
+            target: "shell:cp:*".to_string(),
+            risk: PermissionRisk::High,
+            summary: "shell write".to_string(),
+            metadata,
+            suggested_rules: Vec::new(),
+        }
+    }
+
+    // Default keeps shell = Allow, so an in-workspace shell write auto-allows,
+    // but an out-of-workspace write escalates to a prompt (the shell hole that
+    // previously auto-allowed `cp secret /etc/passwd`).
+    let default = policy("default");
+    assert_eq!(
+        default.permissions.evaluate(&shell_request(false)).action,
+        PermissionAction::Allow,
+        "default: in-workspace shell write should auto-allow"
+    );
+    assert_eq!(
+        default.permissions.evaluate(&shell_request(true)).action,
+        PermissionAction::Ask,
+        "default: out-of-workspace shell write should escalate"
+    );
+
+    // Auto-review routes shell through the reviewer, so both in- and
+    // out-of-workspace writes reach Ask (the reviewer adjudicates in-workspace
+    // ones; out-of-workspace is never auto-approved).
+    let auto_review = policy("auto_review");
+    assert_eq!(
+        auto_review
+            .permissions
+            .evaluate(&shell_request(false))
+            .action,
+        PermissionAction::Ask,
+        "auto_review: in-workspace shell routes to the reviewer"
+    );
+    assert_eq!(
+        auto_review
+            .permissions
+            .evaluate(&shell_request(true))
+            .action,
+        PermissionAction::Ask,
+        "auto_review: out-of-workspace shell escalates"
+    );
+
+    // Full access never prompts, even for an out-of-workspace shell write.
+    assert_eq!(
+        policy("full_access")
+            .permissions
+            .evaluate(&shell_request(true))
+            .action,
         PermissionAction::Allow
     );
 }
@@ -1399,15 +1474,14 @@ allow_capabilities = ["read"]
         auto_review.permissions.mode,
         PermissionPolicyMode::AutoReview
     );
+    // Selecting Auto-review enables the reviewer even though the TOML set
+    // enabled = false (the preset governs the toggle)...
     assert!(auto_review.permissions.ai_reviewer.enabled);
+    // ...but a configured allow_capabilities is respected (tunable remit),
+    // rather than being force-reset to the Auto-review default set.
     assert_eq!(
         auto_review.permissions.ai_reviewer.allow_capabilities,
-        vec![
-            PermissionCapability::Read,
-            PermissionCapability::Search,
-            PermissionCapability::Network,
-            PermissionCapability::Mcp,
-        ]
+        vec![PermissionCapability::Read]
     );
     assert_eq!(auto_review.permissions.web, PermissionMode::Deny);
     assert_eq!(auto_review.permissions.git, PermissionMode::Ask);

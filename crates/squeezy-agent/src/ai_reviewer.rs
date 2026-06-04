@@ -8,8 +8,8 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionVerdict, Role,
-    TranscriptItem, TurnId,
+    AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionRisk,
+    PermissionVerdict, Role, TranscriptItem, TurnId,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, provider_honors_output_schema,
@@ -17,6 +17,46 @@ use squeezy_llm::{
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
+
+/// Whether the cheap reviewer model may auto-approve an allowlisted request of
+/// this capability and risk. Critical is never auto-approved (destructive ops
+/// always reach a human). Network/Mcp are capped at Medium — a cheap model
+/// rubber-stamping a High-risk reach-out (`curl … -d @secret`) is an
+/// exfil/SSRF risk. Workspace-mutation capabilities (edit/shell/git/compiler)
+/// are blast-radius-limited to the workspace — outside-workspace writes are
+/// escalated separately (see the `outside_workspace` guard in the Allow arm) —
+/// so they may auto-approve up to High.
+fn within_auto_allow_ceiling(capability: PermissionCapability, risk: PermissionRisk) -> bool {
+    if risk >= PermissionRisk::Critical {
+        return false;
+    }
+    match capability {
+        PermissionCapability::Network | PermissionCapability::Mcp => risk <= PermissionRisk::Medium,
+        _ => risk <= PermissionRisk::High,
+    }
+}
+
+/// Whether `request` targets a path outside the workspace (set by the tool
+/// layer for file/shell writes). Such requests are never auto-approved — they
+/// always reach a human even when the capability is allowlisted.
+fn reviewer_request_outside_workspace(request: &PermissionRequest) -> bool {
+    request
+        .metadata
+        .get("outside_workspace")
+        .is_some_and(|value| value == "true")
+}
+
+/// Whether the reviewer may auto-approve an `Allow` verdict for `request`: the
+/// capability must be allowlisted, the target in-workspace, and the risk within
+/// the per-capability ceiling.
+fn reviewer_may_auto_allow(
+    allow_capabilities: &[PermissionCapability],
+    request: &PermissionRequest,
+) -> bool {
+    allow_capabilities.contains(&request.capability)
+        && !reviewer_request_outside_workspace(request)
+        && within_auto_allow_ceiling(request.capability, request.risk)
+}
 
 fn default_policy() -> &'static str {
     bundled_doc(APPROVAL_POLICY_DOC_PATH).expect("APPROVAL_POLICY.md missing from bundled docs")
@@ -223,10 +263,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
     };
     match decision.action {
         PermissionAction::Allow => {
-            if reviewer
-                .allow_capabilities
-                .contains(&input.request.capability)
-            {
+            if reviewer_may_auto_allow(&reviewer.allow_capabilities, input.request) {
                 let reason = format!("AI reviewer approved: {}", decision.reason);
                 {
                     let mut state = input.state.lock().expect("ai reviewer state");
@@ -245,15 +282,27 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                     silent: false,
                 })
             } else {
+                // The reviewer judged Allow but auto-approval is withheld; record
+                // why so /reviewer can explain the fall-through to a human prompt.
                 input
                     .telemetry
                     .spawn(TelemetryEvent::ai_reviewer_allow_downgrade(
                         input.request.capability.as_str(),
                     ));
-                let reason = format!(
-                    "ai reviewer allow ignored for non-allowlisted {} capability",
-                    input.request.capability.as_str()
-                );
+                let cap = input.request.capability.as_str();
+                let reason = if !reviewer
+                    .allow_capabilities
+                    .contains(&input.request.capability)
+                {
+                    format!("ai reviewer allow ignored for non-allowlisted {cap} capability")
+                } else if reviewer_request_outside_workspace(input.request) {
+                    format!("ai reviewer allow withheld for out-of-workspace {cap} request")
+                } else {
+                    format!(
+                        "ai reviewer allow withheld for {}-risk {cap} request (exceeds auto-allow ceiling)",
+                        input.request.risk.as_str()
+                    )
+                };
                 {
                     let mut state = input.state.lock().expect("ai reviewer state");
                     state.record_non_denial(input.turn_id);
@@ -343,19 +392,30 @@ async fn collect_reviewer_text(
 }
 
 fn load_policy(config: &AppConfig) -> Result<String, String> {
-    let Some(policy_file) = &config.permissions.ai_reviewer.policy_file else {
-        return Ok(default_policy().to_string());
+    let reviewer = &config.permissions.ai_reviewer;
+    let base = match &reviewer.policy_file {
+        None => default_policy().to_string(),
+        Some(policy_file) => {
+            let path = if policy_file.is_absolute() {
+                policy_file.clone()
+            } else {
+                config.workspace_root.join(policy_file)
+            };
+            fs::read_to_string(&path).map_err(|err| {
+                format!(
+                    "failed to read AI reviewer policy {}: {err}",
+                    path.display()
+                )
+            })?
+        }
     };
-    let path = if policy_file.is_absolute() {
-        policy_file.clone()
-    } else {
-        config.workspace_root.join(policy_file)
-    };
-    fs::read_to_string(&path).map_err(|err| {
-        format!(
-            "failed to read AI reviewer policy {}: {err}",
-            path.display()
-        )
+    // Append the project's extra instructions to whichever base policy applies,
+    // so a project can extend the policy without replacing it wholesale.
+    Ok(match &reviewer.policy {
+        Some(extra) if !extra.trim().is_empty() => {
+            format!("{base}\n\n## Additional project policy\n\n{}", extra.trim())
+        }
+        _ => base,
     })
 }
 

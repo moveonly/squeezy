@@ -1,6 +1,11 @@
+use std::path::{Path, PathBuf};
+
 use squeezy_core::ShellSandboxConfig;
 
-use super::{ShellPreClassification, pre_classify_shell};
+use super::{
+    ShellPreClassification, path_escapes_permission_writable_roots, pre_classify_shell,
+    temp_dir_roots,
+};
 
 fn sandbox() -> ShellSandboxConfig {
     ShellSandboxConfig::default()
@@ -129,4 +134,87 @@ fn pre_classify_shell_mixed_segments_falls_through() {
     // so the all-read-only check fails and we hand to the reviewer.
     let result = pre_classify_shell("ls && make build", &sandbox());
     assert_eq!(result, ShellPreClassification::AskAi);
+}
+
+const WS: &str = "/home/dev/project";
+
+fn ws_root() -> &'static Path {
+    Path::new(WS)
+}
+
+#[test]
+fn writable_roots_keep_workspace_and_temp_in_bounds() {
+    let sandbox = sandbox();
+    // Inside the workspace (absolute and relative) is in-bounds.
+    assert!(!path_escapes_permission_writable_roots(
+        &format!("{WS}/src/main.rs"),
+        ws_root(),
+        &sandbox
+    ));
+    assert!(!path_escapes_permission_writable_roots(
+        "src/main.rs",
+        ws_root(),
+        &sandbox
+    ));
+    // OS temp dirs are treated as safe-to-write.
+    for temp in temp_dir_roots() {
+        let candidate = temp.join("scratch.txt");
+        assert!(
+            !path_escapes_permission_writable_roots(
+                &candidate.to_string_lossy(),
+                ws_root(),
+                &sandbox
+            ),
+            "temp root {temp:?} should be in-bounds"
+        );
+    }
+}
+
+#[test]
+fn writable_roots_flag_system_and_home_paths() {
+    let sandbox = sandbox();
+    for outside in ["/etc/passwd", "/usr/local/bin/x", "/home/dev/.bashrc"] {
+        assert!(
+            path_escapes_permission_writable_roots(outside, ws_root(), &sandbox),
+            "{outside} should escape writable roots"
+        );
+    }
+    // `..` traversal that climbs out of the workspace is normalized first.
+    assert!(path_escapes_permission_writable_roots(
+        "../../etc/shadow",
+        ws_root(),
+        &sandbox
+    ));
+}
+
+#[test]
+fn writable_roots_honor_configured_write_roots() {
+    let mut sandbox = sandbox();
+    sandbox.write_roots = vec![PathBuf::from("/srv/cache")];
+    assert!(!path_escapes_permission_writable_roots(
+        "/srv/cache/out.bin",
+        ws_root(),
+        &sandbox
+    ));
+    assert!(path_escapes_permission_writable_roots(
+        "/srv/other/out.bin",
+        ws_root(),
+        &sandbox
+    ));
+}
+
+#[test]
+fn writable_roots_escalate_unresolved_variables() {
+    // A target with an unresolved shell variable can't be proven in-workspace —
+    // both POSIX `$VAR` and cmd-style `%VAR%` escalate.
+    assert!(path_escapes_permission_writable_roots(
+        "$SQZ_UNSET_VAR/x",
+        ws_root(),
+        &sandbox()
+    ));
+    assert!(path_escapes_permission_writable_roots(
+        "%SQZ_UNSET_VAR%\\x",
+        ws_root(),
+        &sandbox()
+    ));
 }

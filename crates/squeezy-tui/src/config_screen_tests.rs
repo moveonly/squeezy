@@ -1818,3 +1818,148 @@ async fn esc_on_judge_prompt_editor_discards_edits() {
         "Esc must not persist the edit"
     );
 }
+
+#[test]
+fn permissions_visible_rows_reveal_reviewer_under_auto_review() {
+    // Field count for the Permissions section (mode + 2 reviewer + caps).
+    let total = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap()
+        .fields
+        .len();
+    // Default / Full Access expose only the mode row.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::Default, total),
+        1
+    );
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::FullAccess, total),
+        1
+    );
+    // Auto-review adds the two reviewer rows.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::AutoReview, total),
+        1 + PERMISSION_REVIEWER_ROWS
+    );
+    // Custom exposes every per-capability row.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::Custom, total),
+        total
+    );
+}
+
+#[test]
+fn permission_mode_change_reveals_reviewer_rows_immediately() {
+    // State-level: flipping the effective mode changes the visible row count on
+    // the very next query — no navigation needed.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::Default
+    );
+    assert_eq!(state.row_count(), 1, "default mode shows only the mode row");
+
+    let mode_field = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "mode")
+        .unwrap();
+    (mode_field.set)(&mut state.effective, FieldValue::Enum("auto_review")).unwrap();
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::AutoReview
+    );
+    assert_eq!(state.row_count(), 1 + PERMISSION_REVIEWER_ROWS);
+}
+
+#[test]
+fn cycling_permission_mode_via_key_expands_rows() {
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    state.field_index = 0; // the `mode` row
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    assert_eq!(state.row_count(), 1);
+
+    // Space cycles the mode enum: default -> auto_review.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::AutoReview,
+        "space must cycle the mode to auto_review"
+    );
+    assert_eq!(
+        state.row_count(),
+        1 + PERMISSION_REVIEWER_ROWS,
+        "cycling mode must reveal the reviewer rows in the same frame"
+    );
+}
+
+#[test]
+fn reviewer_rows_display_resolved_values_not_dashes() {
+    // Regression: reviewer rows used to show "—" because the display fell back
+    // to the static (empty) default instead of the running effective value.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    state
+        .effective
+        .permissions
+        .apply_mode(PermissionPolicyMode::AutoReview);
+
+    let perms = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap();
+    let field = |label: &str| perms.fields.iter().find(|f| f.label == label).unwrap();
+
+    // The capability remit shows the active set, not a bare dash.
+    let (caps, _) = state.displayed_value_and_source(field("reviewer_capabilities"));
+    let caps_str = caps.as_display();
+    assert!(
+        caps_str.contains("edit") && caps_str.contains("shell"),
+        "reviewer_capabilities should list the active set, got {caps_str:?}"
+    );
+
+    // The model shows the resolved model, never empty/dash.
+    let (model, _) = state.displayed_value_and_source(field("reviewer_model"));
+    let model_str = model.as_display();
+    assert!(
+        !model_str.is_empty() && model_str != "—",
+        "reviewer_model should resolve to a real model, got {model_str:?}"
+    );
+}
+
+#[test]
+fn reviewer_rows_visible_when_saved_mode_diverges_from_snapshot() {
+    use squeezy_core::TierSource;
+    // The agent snapshot (effective) lags at the shipped `default`, but the
+    // saved settings file says auto_review — the divergence that hid the
+    // reviewer rows on open. Row visibility tracks the displayed (saved) mode.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::Default
+    );
+    state.sources.user = Some(TierSource {
+        path: std::path::PathBuf::from("/virtual/user.toml"),
+        doc: "[permissions]\nmode = \"auto_review\"\n"
+            .parse()
+            .expect("valid toml"),
+    });
+    assert_eq!(
+        state.row_count(),
+        1 + PERMISSION_REVIEWER_ROWS,
+        "reviewer rows must show when the saved mode is auto_review, even if the snapshot lags"
+    );
+    assert_eq!(
+        state.field_at_row(state.row_count() - 1).map(|f| f.label),
+        Some("reviewer_capabilities")
+    );
+}
