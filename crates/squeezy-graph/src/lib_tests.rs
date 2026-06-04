@@ -7784,12 +7784,18 @@ type ReadWriter interface {
         .find(|symbol| symbol.kind == SymbolKind::Interface)
         .expect("ReadWriter interface symbol");
     assert!(
-        read_writer.attributes.iter().any(|attr| attr == "base:Reader"),
+        read_writer
+            .attributes
+            .iter()
+            .any(|attr| attr == "base:Reader"),
         "ReadWriter should carry base:Reader, got {:?}",
         read_writer.attributes,
     );
     assert!(
-        read_writer.attributes.iter().any(|attr| attr == "base:Writer"),
+        read_writer
+            .attributes
+            .iter()
+            .any(|attr| attr == "base:Writer"),
         "ReadWriter should carry base:Writer, got {:?}",
         read_writer.attributes,
     );
