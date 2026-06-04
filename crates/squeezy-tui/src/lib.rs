@@ -1863,8 +1863,13 @@ fn focus_subagent_pane_from_composer(app: &mut TuiApp) {
 /// this overlay (which renders the active conversation source).
 fn open_subagent_transcript_overlay(app: &mut TuiApp) {
     app.transcript_overlay_scrollbar_cache.set(None);
-    app.transcript_overlay = Some(TranscriptOverlayState::default());
-    app.status = "subagent conversation (Esc to close)".to_string();
+    // Open folded, formatted like the main inline conversation; Ctrl-T then
+    // expands every body, Esc closes.
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        detail: OverlayDetail::Collapsed,
+        ..TranscriptOverlayState::default()
+    });
+    app.status = "subagent conversation — Ctrl-T to expand, Esc to close".to_string();
 }
 
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -2600,15 +2605,22 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             app.transcript_overlay_scrollbar_cache.set(None);
-            app.transcript_overlay = if app.transcript_overlay.is_some() {
-                None
-            } else {
-                Some(TranscriptOverlayState::default())
-            };
-            app.status = if app.transcript_overlay.is_some() {
-                "transcript overlay (Esc to close)".to_string()
-            } else {
-                "transcript overlay closed".to_string()
+            // Step Collapsed → Expanded → closed: a folded subagent view first
+            // unfolds in place, and an already-expanded overlay closes. Opening
+            // from nothing (the main-transcript Ctrl-T) goes straight to expanded.
+            app.status = match app.transcript_overlay.as_mut() {
+                Some(state) if state.detail == OverlayDetail::Collapsed => {
+                    state.detail = OverlayDetail::Expanded;
+                    "transcript overlay expanded (Esc to close)".to_string()
+                }
+                Some(_) => {
+                    app.transcript_overlay = None;
+                    "transcript overlay closed".to_string()
+                }
+                None => {
+                    app.transcript_overlay = Some(TranscriptOverlayState::default());
+                    "transcript overlay (Esc to close)".to_string()
+                }
             };
             true
         }
@@ -6327,13 +6339,30 @@ impl TranscriptOverlayMode {
     }
 }
 
-/// State for the full-screen transcript overlay (Ctrl+T). All transcript
-/// entries are rendered in their fully-expanded form regardless of each
-/// entry's collapsed flag; the user scrolls with PgUp/PgDn/arrows.
+/// How much of each entry the overlay shows. `Collapsed` mirrors the main
+/// inline view — tool cards folded, reasoning trimmed — so a subagent opens
+/// formatted like the main conversation; `Expanded` unfolds every body for the
+/// "read everything" view. Ctrl-T steps Collapsed → Expanded → closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OverlayDetail {
+    Collapsed,
+    Expanded,
+}
+
+impl OverlayDetail {
+    fn expand_all(self) -> bool {
+        matches!(self, Self::Expanded)
+    }
+}
+
+/// State for the full-screen transcript overlay (Ctrl+T). `detail` selects
+/// whether entries render folded (like the inline view) or fully expanded; the
+/// user scrolls with PgUp/PgDn/arrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranscriptOverlayState {
     pub(crate) scroll: usize,
     pub(crate) mode: TranscriptOverlayMode,
+    pub(crate) detail: OverlayDetail,
 }
 
 impl Default for TranscriptOverlayState {
@@ -6341,6 +6370,7 @@ impl Default for TranscriptOverlayState {
         Self {
             scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
             mode: TranscriptOverlayMode::NativeSelection,
+            detail: OverlayDetail::Expanded,
         }
     }
 }
@@ -6356,6 +6386,7 @@ struct TranscriptOverlayRenderKey {
     coalesce_tool_runs: bool,
     animation_tick: u64,
     palette_generation: u64,
+    detail: OverlayDetail,
 }
 
 #[derive(Debug, Default)]
@@ -6448,11 +6479,21 @@ fn with_transcript_overlay_rows<R>(
     let key = transcript_overlay_render_key(app, width);
     let mut cache = app.transcript_overlay_render_cache.borrow_mut();
     if cache.key != Some(key) {
-        let logical_lines = transcript_lines_for_overlay(app, Some(width));
+        let logical_lines =
+            transcript_lines_for_overlay(app, Some(width), overlay_detail(app).expand_all());
         cache.rows = wrap_transcript_overlay_rows(&logical_lines, width);
         cache.key = Some(key);
     }
     f(&cache.rows)
+}
+
+/// The detail level the transcript overlay is currently showing, defaulting to
+/// `Expanded` when no overlay is open (the value the render cache keys on).
+fn overlay_detail(app: &TuiApp) -> OverlayDetail {
+    app.transcript_overlay
+        .as_ref()
+        .map(|state| state.detail)
+        .unwrap_or(OverlayDetail::Expanded)
 }
 
 fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
@@ -6480,6 +6521,7 @@ fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayR
         coalesce_tool_runs: app.coalesce_tool_runs,
         animation_tick: app.animation_tick,
         palette_generation: render::palette::palette_generation(),
+        detail: overlay_detail(app),
     }
 }
 
@@ -6815,12 +6857,20 @@ fn render_transcript_overlay_scrollbar(
 /// Build the per-entry line list for the overlay: every committed entry is
 /// forced to its expanded form, and the live assistant tail is appended so
 /// opening Ctrl-T mid-turn does not look frozen.
-fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
-    // The overlay is the "Ctrl-T for full transcript" escape hatch — body
-    // content blocks (e.g. read_tool_output payloads, shell stdout/stderr)
-    // honour this verbosity, so pin Verbose to defeat the per-mode line cap
-    // even when the user has `/verbosity compact` set for inline cards.
-    let overlay_verbosity = ToolOutputVerbosity::Verbose;
+fn transcript_lines_for_overlay(
+    app: &TuiApp,
+    width: Option<u16>,
+    expand_all: bool,
+) -> Vec<Line<'static>> {
+    // Expanded is the "Ctrl-T for full transcript" escape hatch — body content
+    // blocks (read_tool_output payloads, shell stdout/stderr) honour this
+    // verbosity, so pin Verbose to defeat the per-mode line cap. Collapsed
+    // mirrors the inline view, so it honours the user's configured verbosity.
+    let overlay_verbosity = if expand_all {
+        ToolOutputVerbosity::Verbose
+    } else {
+        app.tool_output_verbosity
+    };
     let mut lines = Vec::new();
     if let Some(title) = active_conversation_title(app) {
         lines.push(title);
@@ -6858,11 +6908,12 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(entries, index, extras);
-                // Overlay always forces expanded form so users browsing
-                // the full transcript can read every member's body.
+                // Expanded forces every member's body open so the full
+                // transcript reads end to end; Collapsed honours the lead's
+                // folded state so the view matches the inline conversation.
                 let mut block = format_grouped_tool_result_entry(
                     &members,
-                    false,
+                    !expand_all && entry.collapsed,
                     selected_entry == Some(index),
                     overlay_verbosity,
                     width,
@@ -6886,7 +6937,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             message_outcome(entries, index),
             width,
             app.show_reasoning_usage,
-            true,
+            expand_all,
         );
         if is_rail_work_node(&entry.kind) {
             push_rail_work_block(

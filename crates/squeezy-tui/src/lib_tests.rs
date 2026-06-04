@@ -1695,6 +1695,7 @@ async fn wheel_scroll_targets_transcript_overlay_when_open() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
 
     handle_mouse(
@@ -6208,7 +6209,7 @@ fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
     assert!(!rendered.contains("▏ second thought"), "{rendered}");
 
     app.transcript_overlay = Some(TranscriptOverlayState::default());
-    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(100)));
+    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(100), true));
     assert!(overlay.contains("▾ reasoning"), "{overlay}");
     assert!(overlay.contains("▏ first thought"), "{overlay}");
     assert!(overlay.contains("▏ second thought"), "{overlay}");
@@ -11288,6 +11289,7 @@ fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     let changed = handle_mouse(
@@ -11319,6 +11321,7 @@ fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
     let events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11371,6 +11374,7 @@ fn input_batch_prioritizes_key_before_transcript_drag_flood() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
     let mut events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11459,6 +11463,7 @@ fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     assert_eq!(
@@ -11474,6 +11479,7 @@ fn input_batch_does_not_coalesce_drags_outside_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
     let events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11505,6 +11511,7 @@ fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
     app.transcript_overlay_scrollbar_cache
         .set(Some(TranscriptOverlayScrollbarCache {
@@ -11549,6 +11556,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
 
     handle_key(
@@ -11581,6 +11589,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
     let quit = handle_key(
         &mut app,
@@ -11608,6 +11617,7 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
 
     handle_key(
@@ -11669,6 +11679,7 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     tx.send(AgentEvent::Completed {
@@ -11704,6 +11715,7 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     tx.send(AgentEvent::Completed {
@@ -11744,6 +11756,7 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     tx.send(AgentEvent::Completed {
@@ -11825,7 +11838,7 @@ fn transcript_overlay_includes_pending_assistant_mid_turn() {
     app.pending_assistant.push_delta("Once the lantern woke,");
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let lines = transcript_lines_for_overlay(&app, Some(100), true);
     let rendered = lines_to_plain_text(&lines);
 
     assert!(
@@ -12023,7 +12036,7 @@ fn transcript_overlay_tool_cards_are_expanded_and_plain() {
     };
     app.push_tool_result_with_call(result, Some(call));
 
-    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let lines = transcript_lines_for_overlay(&app, Some(100), true);
     let rendered = lines_to_plain_text(&lines);
 
     assert!(
@@ -13525,4 +13538,41 @@ fn rail_prefix_and_continuation_track_the_gutter() {
     assert_eq!(rail_continuation_prefix("   ├─✔ "), "   │   ");
     assert_eq!(rail_continuation_prefix("   ╰─✖ "), "       ");
     assert_eq!(rail_continuation_prefix("   │   │   "), "   │   │   ");
+}
+
+#[test]
+fn overlay_collapsed_folds_long_output_expanded_shows_all() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("explore"));
+    let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+    app.push_tool_result(sample_tool_result("explore", &body));
+    let shown = |expand_all: bool| {
+        lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(80), expand_all))
+            .lines()
+            .filter(|l| l.contains("line "))
+            .count()
+    };
+    let collapsed = shown(false);
+    let expanded = shown(true);
+    assert!(
+        collapsed < expanded,
+        "collapsed ({collapsed}) should fold below expanded ({expanded})"
+    );
+    assert_eq!(expanded, 40, "expanded shows every body line");
+}
+
+#[test]
+fn subagent_overlay_opens_collapsed_default_is_expanded() {
+    // Pressing a subagent opens it folded (formatted like the main inline view);
+    // the main-transcript Ctrl-T opens straight to expanded.
+    let mut app = test_app(SessionMode::Build);
+    open_subagent_transcript_overlay(&mut app);
+    assert_eq!(
+        app.transcript_overlay.unwrap().detail,
+        OverlayDetail::Collapsed
+    );
+    assert_eq!(
+        TranscriptOverlayState::default().detail,
+        OverlayDetail::Expanded
+    );
 }
