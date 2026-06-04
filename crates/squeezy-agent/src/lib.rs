@@ -2905,23 +2905,42 @@ impl Agent {
         let metrics = state.metrics.clone();
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
         let p = &self.prior_metrics;
-        // Build per-kind subagent count map from the accumulated metrics.
+        // Build per-kind subagent count map. Subtract prior_metrics so resumed
+        // sessions only report the delta since this process started.
         let mut subagent_kind_counts = std::collections::BTreeMap::new();
-        for (kind, bucket) in [
-            ("delegate", &metrics.subagent_by_kind.delegate),
-            ("explore", &metrics.subagent_by_kind.explore),
-            ("plan", &metrics.subagent_by_kind.plan),
-            ("review", &metrics.subagent_by_kind.review),
+        for (kind, bucket, prior_bucket) in [
+            (
+                "delegate",
+                &metrics.subagent_by_kind.delegate,
+                &p.subagent_by_kind.delegate,
+            ),
+            (
+                "explore",
+                &metrics.subagent_by_kind.explore,
+                &p.subagent_by_kind.explore,
+            ),
+            (
+                "plan",
+                &metrics.subagent_by_kind.plan,
+                &p.subagent_by_kind.plan,
+            ),
+            (
+                "review",
+                &metrics.subagent_by_kind.review,
+                &p.subagent_by_kind.review,
+            ),
         ] {
-            if bucket.calls > 0 {
+            let calls = bucket.calls.saturating_sub(prior_bucket.calls);
+            let failures = bucket.failures.saturating_sub(prior_bucket.failures);
+            if calls > 0 {
                 *subagent_kind_counts
                     .entry(format!("{kind}_calls"))
-                    .or_default() += bucket.calls;
+                    .or_default() += calls;
             }
-            if bucket.failures > 0 {
+            if failures > 0 {
                 *subagent_kind_counts
                     .entry(format!("{kind}_failures"))
-                    .or_default() += bucket.failures;
+                    .or_default() += failures;
             }
         }
         self.telemetry
@@ -5632,6 +5651,9 @@ impl TurnRuntime {
         let fork_block = self.tools.format_fork_skills(&fork_skills);
         // Fire skill activation telemetry for all activated skills.
         if !activation.skills.is_empty() {
+            // Count sources from the *activated* skills only, not the whole
+            // catalog; using discovery.by_source would count every discovered
+            // skill regardless of whether it was activated.
             let mut source_counts = std::collections::BTreeMap::new();
             for skill in &activation.skills {
                 *source_counts
@@ -7045,13 +7067,15 @@ impl TurnRuntime {
                 StopReason::Other(_) | _ => "other".to_string(),
             });
             broker.metrics.reasoning_only_stop = reasoning_only_stop;
-            if completed_cost.cached_input_tokens.is_some()
-                || completed_cost.cache_write_input_tokens.is_some()
+            // Use total_cost (accumulated across all rounds) so multi-round
+            // turns with tool calls don't undercount these metrics.
+            if total_cost.cached_input_tokens.is_some()
+                || total_cost.cache_write_input_tokens.is_some()
             {
                 broker.metrics.cache_supported = true;
             }
-            broker.metrics.cache_write_tokens = completed_cost.cache_write_input_tokens;
-            broker.metrics.reasoning_output_tokens = completed_cost.reasoning_output_tokens;
+            broker.metrics.cache_write_tokens = total_cost.cache_write_input_tokens;
+            broker.metrics.reasoning_output_tokens = total_cost.reasoning_output_tokens;
 
             // Explicit `stop_reason` branches. Truncation (max-tokens,
             // context-window-exceeded) and refusal previously surfaced
@@ -7787,12 +7811,18 @@ impl TurnRuntime {
     }
 
     async fn finish_turn(&self, metrics: &TurnMetrics) {
+        // Record turn_completed while the span is still open so the event
+        // carries the per-turn span_id. Use `record()` (awaited) rather than
+        // `spawn()` so the event is persisted to the durable ledger before
+        // finish_session / flush_telemetry read from it.
+        self.telemetry
+            .record(TelemetryEvent::turn_completed(
+                &self.config,
+                self.turn_id.get(),
+                metrics.clone(),
+            ))
+            .await;
         self.telemetry.end_turn();
-        self.telemetry.spawn(TelemetryEvent::turn_completed(
-            &self.config,
-            self.turn_id.get(),
-            metrics.clone(),
-        ));
         // Drain MCP elicitation audit ring and emit per-elicitation events.
         emit_mcp_elicitation_telemetry(&self.tools, &self.telemetry);
         self.session_metrics.lock().await.merge_turn(metrics);
@@ -12884,11 +12914,11 @@ fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
         .map(|bytes| squeezy_tools::sha256_hex(&bytes))
 }
 
-/// Drain the MCP elicitation audit ring and fire `mcp_elicitation` telemetry
-/// for each event. Called after tool batches so elicitations that happened
-/// during tool execution are captured in the session summary.
+/// Drain and clear the MCP elicitation audit ring, then fire `mcp_elicitation`
+/// telemetry for each new event. Called at the end of each turn so each
+/// elicitation decision is counted exactly once across the session.
 fn emit_mcp_elicitation_telemetry(tools: &ToolRegistry, telemetry: &TelemetryClient) {
-    for event in tools.mcp_elicitation_audit_snapshot() {
+    for event in tools.drain_mcp_elicitation_audit() {
         let policy_str = match event.policy {
             squeezy_core::PermissionMode::Allow => "allow",
             squeezy_core::PermissionMode::Ask => "ask",

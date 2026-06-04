@@ -317,13 +317,45 @@ impl ToolRegistry {
         };
 
         let (bytes_read, response_sha256, result) = match tokio::select! {
-            _ = cancel.cancelled() => return ToolResult::cancelled(call),
+            _ = cancel.cancelled() => {
+                let mut result = ToolResult::cancelled(call);
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: provider.as_str().to_string(),
+                    status_token: "cancelled".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: false,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                return result;
+            },
             result = time::timeout(Duration::from_millis(timeout_ms), fetch) => result,
         } {
             Ok(Ok(result)) => result,
-            Ok(Err(err)) => return tool_error(call, err),
+            Ok(Err(err)) => {
+                let mut result = tool_error(call, err);
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: provider.as_str().to_string(),
+                    status_token: "error".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: false,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                return result;
+            }
             Err(_) => {
-                return tool_error(call, format!("websearch timed out after {timeout_ms} ms"));
+                let mut result =
+                    tool_error(call, format!("websearch timed out after {timeout_ms} ms"));
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: provider.as_str().to_string(),
+                    status_token: "error".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: false,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                return result;
             }
         };
         let retrieved_at_unix_ms = unix_timestamp_millis(SystemTime::now());
@@ -482,7 +514,18 @@ impl ToolRegistry {
         };
 
         let outcome = match tokio::select! {
-            _ = cancel.cancelled() => return ToolResult::cancelled(call),
+            _ = cancel.cancelled() => {
+                let mut result = ToolResult::cancelled(call);
+                result.web_call_stats = Some(WebCallStats {
+                    provider_token: "webfetch".to_string(),
+                    status_token: "cancelled".to_string(),
+                    ssrf_blocked: false,
+                    redirect_blocked: false,
+                    response_byte_bucket: WebCallStats::response_byte_bucket(0).to_string(),
+                    duration_ms: web_started.elapsed().as_millis() as u64,
+                });
+                return result;
+            },
             result = time::timeout(Duration::from_millis(timeout_ms), fetch) => result,
         } {
             Ok(Ok(outcome)) => outcome,

@@ -2721,12 +2721,14 @@ impl SummaryAccumulator {
         if let Some(reason) = props.stop_reason.as_ref() {
             increment_count(&mut self.stop_reason_counts, reason.clone());
         }
-        // Fold subagent per-kind counts.
-        if let Some(counts) = props.subagent_counts.as_ref() {
-            for (k, v) in counts {
-                *self.subagent_counts.entry(k.clone()).or_default() += v;
-            }
+        // Fold reasoning_only_stop into stop_reason_counts so it surfaces in
+        // the summary even when reasoning_only_stop is true without a distinct
+        // stop_reason token being set.
+        if props.reasoning_only_stop == Some(true) {
+            increment_count(&mut self.stop_reason_counts, "reasoning_only".to_string());
         }
+        // NOTE: subagent_counts are folded inside the SessionEnded branch above
+        // and must NOT be folded here too — doing so would double-count them.
     }
 
     fn observe_graph(&mut self, props: &TelemetryProperties) {

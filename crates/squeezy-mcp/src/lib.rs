@@ -405,6 +405,17 @@ impl McpClientRegistry {
             .unwrap_or_default()
     }
 
+    /// Drain and return all elicitation audit events since the last drain.
+    /// Unlike `elicitation_audit_log`, this clears the ring so subsequent
+    /// calls return only new events — preventing per-turn re-emission of the
+    /// same decisions.
+    pub fn drain_elicitation_audit_log(&self) -> Vec<McpElicitationAuditEvent> {
+        self.elicitation_audit
+            .lock()
+            .map(|mut log| std::mem::take(&mut *log).into_iter().collect())
+            .unwrap_or_default()
+    }
+
     pub fn status_snapshot(&self) -> McpStatusSnapshot {
         self.status_tx.borrow().clone()
     }

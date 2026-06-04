@@ -1952,10 +1952,16 @@ impl ToolRegistry {
         self.mcp.aggregate_capabilities().await
     }
 
-    /// Snapshot of recent MCP elicitation audit events. The agent drains this
-    /// and fires `mcp_elicitation` telemetry for each event.
+    /// Snapshot of recent MCP elicitation audit events.
     pub fn mcp_elicitation_audit_snapshot(&self) -> Vec<McpElicitationAuditEvent> {
         self.mcp.elicitation_audit_log()
+    }
+
+    /// Drain and clear all new MCP elicitation audit events since the last
+    /// drain. The agent calls this in `finish_turn` so each event is only
+    /// counted once across the session.
+    pub fn drain_mcp_elicitation_audit(&self) -> Vec<McpElicitationAuditEvent> {
+        self.mcp.drain_elicitation_audit_log()
     }
 
     pub fn set_mcp_elicitation_handler(&self, handler: Option<McpElicitationHandler>) {
