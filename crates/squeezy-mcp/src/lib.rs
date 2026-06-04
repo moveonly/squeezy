@@ -234,7 +234,12 @@ const MCP_AUDIT_LOG_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct McpClientRegistry {
-    servers: Arc<BTreeMap<String, McpServerConfig>>,
+    /// Live server map. Wrapped in `RwLock<Arc<…>>` so reads stay cheap
+    /// (clone the `Arc` under a short lock, then release it before any
+    /// `.await`) while admin mutations (`set_server_enabled`,
+    /// `restart_server`, `replace_servers`) can swap in a new map mid-
+    /// session without rebuilding the whole `McpClientRegistry`.
+    servers: Arc<std::sync::RwLock<Arc<BTreeMap<String, McpServerConfig>>>>,
     cache: Arc<Mutex<BTreeMap<String, ExternalMcpTool>>>,
     sessions: Arc<TokioMutex<BTreeMap<String, Arc<SessionEntry>>>>,
     store: Option<Arc<SqueezyStore>>,
@@ -268,7 +273,7 @@ impl McpClientRegistry {
     ) -> Self {
         let (status_tx, _) = watch::channel(McpStatusSnapshot::default());
         let registry = Self {
-            servers: Arc::new(servers),
+            servers: Arc::new(std::sync::RwLock::new(Arc::new(servers))),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
             sessions: Arc::new(TokioMutex::new(BTreeMap::new())),
             store,
@@ -285,8 +290,29 @@ impl McpClientRegistry {
         registry
     }
 
+    /// Clone the current `Arc<BTreeMap<…>>` of configured servers under a
+    /// short read lock. Callers should hold this `Arc` across `.await`
+    /// points instead of repeatedly reaching back into `self.servers`,
+    /// both to avoid lock contention and to keep the iteration stable if
+    /// a concurrent `replace_servers` swaps the inner map.
+    fn servers_snapshot(&self) -> Arc<BTreeMap<String, McpServerConfig>> {
+        self.servers
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poison| poison.into_inner().clone())
+    }
+
+    /// Snapshot of the configured MCP servers — useful for surfaces (the
+    /// `/mcp` config page, eval drivers) that need to render the live
+    /// server map without going through `AppConfig`.
+    pub fn servers(&self) -> BTreeMap<String, McpServerConfig> {
+        (*self.servers_snapshot()).clone()
+    }
+
     pub fn has_no_enabled_servers(&self) -> bool {
-        self.servers.iter().all(|(_, server)| !server.enabled)
+        self.servers_snapshot()
+            .iter()
+            .all(|(_, server)| !server.enabled)
     }
 
     pub fn tools(&self) -> Vec<ExternalMcpTool> {
@@ -366,8 +392,13 @@ impl McpClientRegistry {
             };
         }
 
+        let servers = self.servers_snapshot();
         let mut starting = self.status_snapshot().per_server;
-        for (name, _server) in self.servers.iter().filter(|(_, server)| server.enabled) {
+        // Drop status rows for servers that have been removed since the
+        // last refresh — otherwise a deleted server's old status would
+        // linger forever in the snapshot.
+        starting.retain(|name, _| servers.contains_key(name));
+        for (name, _server) in servers.iter().filter(|(_, server)| server.enabled) {
             starting
                 .entry(name.clone())
                 .or_insert(McpServerStatus::Starting);
@@ -378,7 +409,7 @@ impl McpClientRegistry {
         });
 
         let mut futures = FuturesUnordered::new();
-        for (server_name, server) in self.servers.iter() {
+        for (server_name, server) in servers.iter() {
             if !server.enabled {
                 continue;
             }
@@ -437,8 +468,7 @@ impl McpClientRegistry {
         }
 
         for (model_name, tool) in &prior_cache {
-            let server_still_enabled = self
-                .servers
+            let server_still_enabled = servers
                 .get(&tool.server)
                 .map(|server| server.enabled)
                 .unwrap_or(false);
@@ -463,7 +493,7 @@ impl McpClientRegistry {
             *cache = next;
         }
 
-        for (name, server) in self.servers.iter() {
+        for (name, server) in servers.iter() {
             if !server.enabled {
                 continue;
             }
@@ -481,6 +511,110 @@ impl McpClientRegistry {
         McpRefreshOutcome { errors, status }
     }
 
+    /// Toggle the `enabled` flag for a single configured server and
+    /// re-run tool discovery. Returns the refresh outcome (the same
+    /// shape `refresh_tools` produces) so callers can surface
+    /// per-server status without an extra round-trip.
+    ///
+    /// If `enabled = false` the existing session is torn down so the
+    /// child process / HTTP keep-alive does not linger after the user
+    /// has switched the server off. Unknown server names return a
+    /// `UnknownServer` error without touching the live map.
+    pub async fn set_server_enabled(
+        &self,
+        server_name: &str,
+        enabled: bool,
+        cancel: CancellationToken,
+    ) -> McpResult<McpRefreshOutcome> {
+        let prior = self.servers_snapshot();
+        if !prior.contains_key(server_name) {
+            return Err(McpError::UnknownServer {
+                server: server_name.to_string(),
+            });
+        }
+        if prior.get(server_name).map(|s| s.enabled) == Some(enabled) {
+            // No-op: still run a refresh so callers see an updated
+            // status snapshot, but skip the map swap and session
+            // teardown.
+            return Ok(self.refresh_tools(cancel).await);
+        }
+        let mut next: BTreeMap<String, McpServerConfig> = (*prior).clone();
+        if let Some(server) = next.get_mut(server_name) {
+            server.enabled = enabled;
+        }
+        self.swap_servers(Arc::new(next));
+        if !enabled {
+            self.invalidate_session(server_name).await;
+        }
+        Ok(self.refresh_tools(cancel).await)
+    }
+
+    /// Tear down the live session for `server_name` (if any) and re-run
+    /// tool discovery. The next discovery call brings up a fresh
+    /// child process / HTTP session, which is what a user means when
+    /// they ask the `/mcp` page to "restart" a server.
+    pub async fn restart_server(
+        &self,
+        server_name: &str,
+        cancel: CancellationToken,
+    ) -> McpResult<McpRefreshOutcome> {
+        if !self.servers_snapshot().contains_key(server_name) {
+            return Err(McpError::UnknownServer {
+                server: server_name.to_string(),
+            });
+        }
+        self.invalidate_session(server_name).await;
+        Ok(self.refresh_tools(cancel).await)
+    }
+
+    /// Replace the entire configured-server map and refresh tool
+    /// discovery. Used for bulk operations (add/remove from the
+    /// `/mcp` config page; reacting to an external `settings.toml`
+    /// edit). Sessions whose servers vanish or whose config changes
+    /// are dropped so the next call recreates them against the new
+    /// config.
+    pub async fn replace_servers(
+        &self,
+        servers: BTreeMap<String, McpServerConfig>,
+        cancel: CancellationToken,
+    ) -> McpRefreshOutcome {
+        let prior = self.servers_snapshot();
+        let next = Arc::new(servers);
+        // Determine which sessions to drop *before* swapping so we
+        // do not race against an in-flight discovery using the new
+        // map.
+        let mut to_invalidate: Vec<String> = Vec::new();
+        for (name, prev_server) in prior.iter() {
+            match next.get(name) {
+                None => to_invalidate.push(name.clone()),
+                Some(new_server) if new_server != prev_server => {
+                    to_invalidate.push(name.clone());
+                }
+                _ => {}
+            }
+        }
+        self.swap_servers(next);
+        for name in to_invalidate {
+            self.invalidate_session(&name).await;
+        }
+        self.refresh_tools(cancel).await
+    }
+
+    /// Replace the inner `Arc<BTreeMap<…>>`. Held in a tiny helper so
+    /// every mutator goes through the same lock-acquisition path; if
+    /// the lock is poisoned we recover the inner data rather than
+    /// panic — the registry must stay usable across config edits.
+    fn swap_servers(&self, next: Arc<BTreeMap<String, McpServerConfig>>) {
+        match self.servers.write() {
+            Ok(mut guard) => {
+                *guard = next;
+            }
+            Err(poison) => {
+                *poison.into_inner() = next;
+            }
+        }
+    }
+
     pub async fn call_tool(
         &self,
         model_name: &str,
@@ -491,7 +625,7 @@ impl McpClientRegistry {
             tool: model_name.to_string(),
         })?;
         let server = self
-            .servers
+            .servers_snapshot()
             .get(&tool.server)
             .ok_or_else(|| McpError::UnknownTool {
                 tool: model_name.to_string(),
@@ -814,7 +948,7 @@ impl McpClientRegistry {
     }
 
     fn server_config(&self, server_name: &str) -> McpResult<McpServerConfig> {
-        self.servers
+        self.servers_snapshot()
             .get(server_name)
             .filter(|server| server.enabled)
             .cloned()
@@ -833,7 +967,8 @@ impl McpClientRegistry {
         };
         let mut raw_tools = Vec::new();
         let mut status = BTreeMap::new();
-        for (name, server) in self.servers.iter().filter(|(_, server)| server.enabled) {
+        let servers = self.servers_snapshot();
+        for (name, server) in servers.iter().filter(|(_, server)| server.enabled) {
             let key = tool_cache_key(name, server);
             let Ok(Some(record)) = store.mcp_tool_cache::<McpToolCacheRecord>(&key) else {
                 continue;
@@ -865,7 +1000,8 @@ impl McpClientRegistry {
         let Some(store) = &self.store else {
             return;
         };
-        let Some(server) = self.servers.get(server_name) else {
+        let servers = self.servers_snapshot();
+        let Some(server) = servers.get(server_name) else {
             return;
         };
         let record = McpToolCacheRecord {

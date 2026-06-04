@@ -32,7 +32,8 @@ use squeezy_graph::{CargoFactProvenance, GraphManager};
 use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 pub use squeezy_mcp::{
     McpElicitationAction, McpElicitationHandler, McpElicitationKind, McpElicitationRequest,
-    McpElicitationResponse, McpRefreshOutcome, McpServerStatus, McpStatusSnapshot,
+    McpElicitationResponse, McpError, McpRefreshOutcome, McpResult, McpServerStatus,
+    McpStatusSnapshot,
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
 use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
@@ -1813,6 +1814,56 @@ impl ToolRegistry {
         // tool set.
         self.invalidate_cached_specs();
         outcome
+    }
+
+    /// Toggle an MCP server's `enabled` flag mid-session. Re-runs
+    /// discovery (via `refresh_tools`) and invalidates cached `specs()`
+    /// so the next turn advertises the updated tool palette.
+    pub async fn set_mcp_server_enabled(
+        &self,
+        server_name: &str,
+        enabled: bool,
+        cancel: CancellationToken,
+    ) -> McpResult<McpRefreshOutcome> {
+        let outcome = self
+            .mcp
+            .set_server_enabled(server_name, enabled, cancel)
+            .await?;
+        self.invalidate_cached_specs();
+        Ok(outcome)
+    }
+
+    /// Restart a single MCP server: drop its live session and re-run
+    /// discovery so the next request opens a fresh child process /
+    /// HTTP keep-alive.
+    pub async fn restart_mcp_server(
+        &self,
+        server_name: &str,
+        cancel: CancellationToken,
+    ) -> McpResult<McpRefreshOutcome> {
+        let outcome = self.mcp.restart_server(server_name, cancel).await?;
+        self.invalidate_cached_specs();
+        Ok(outcome)
+    }
+
+    /// Replace the whole configured-server map atomically. Used when
+    /// the `/mcp` config page bulk-adds/removes servers and when an
+    /// external `settings.toml` edit changes `[mcp.servers]`.
+    pub async fn replace_mcp_servers(
+        &self,
+        servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+        cancel: CancellationToken,
+    ) -> McpRefreshOutcome {
+        let outcome = self.mcp.replace_servers(servers, cancel).await;
+        self.invalidate_cached_specs();
+        outcome
+    }
+
+    /// Snapshot of the live configured-server map. Mirrors
+    /// `AppConfig.mcp_servers` but reads from the live registry so
+    /// callers see post-`replace_mcp_servers` state.
+    pub fn mcp_servers(&self) -> std::collections::BTreeMap<String, squeezy_core::McpServerConfig> {
+        self.mcp.servers()
     }
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {

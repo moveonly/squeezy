@@ -7706,6 +7706,71 @@ fn arm_then_drain_applies_swap_with_optional_provider() {
     assert!(agent.pending_config_swap().is_none());
 }
 
+/// Pin the hot-reload bridge between `PendingConfigSwap` and the MCP
+/// registry: when a settings-watcher reload changes the provider AND
+/// `[mcp.servers]` on the same beat, the swap path used to bypass
+/// `replace_config` and leave the registry stale until restart.
+/// `drain_pending_swap` now invokes the shared reload hook so the
+/// observable `mcp_servers()` snapshot reflects the new map by the
+/// time the next turn begins.
+#[tokio::test]
+async fn drain_pending_swap_picks_up_mcp_servers_drift() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![]));
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    assert!(
+        agent.mcp_servers().is_empty(),
+        "fresh agent starts with no MCP servers"
+    );
+
+    let mut next = agent.config_snapshot();
+    next.mcp_servers.insert(
+        "docs".to_string(),
+        squeezy_core::McpServerConfig {
+            enabled: true,
+            transport: squeezy_core::McpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            url: Some("https://docs.example/mcp".to_string()),
+            timeout_ms: None,
+            discovery_timeout_ms: None,
+            tool_call_timeout_ms: None,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            env: BTreeMap::new(),
+            permissions: squeezy_core::McpPermissionConfig::default(),
+            bearer_token_env_var: None,
+            http_headers: BTreeMap::new(),
+            env_http_headers: BTreeMap::new(),
+        },
+    );
+
+    agent.arm_config_swap(PendingConfigSwap {
+        config: next,
+        // No provider entry → exercises the NextPrompt swap path
+        // exactly the way a provider-changing reload would; the
+        // provider field would arrive populated, but the MCP-side
+        // assertion is identical either way.
+        provider: None,
+        display_note: None,
+    });
+    let _drained = agent.drain_pending_swap().expect("swap armed");
+
+    // Yield until the background `replace_mcp_servers` task has run
+    // and updated the registry. We poll for up to a few hundred
+    // milliseconds; the assertion fails loudly if the reload never
+    // happened (the previous bug shape).
+    for _ in 0..40 {
+        if agent.mcp_servers().contains_key("docs") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        agent.mcp_servers().contains_key("docs"),
+        "drain_pending_swap must propagate [mcp.servers] drift to the registry"
+    );
+}
+
 #[tokio::test]
 async fn drained_swap_makes_next_request_carry_new_model_id() {
     // Build a provider that records every request it sees and answers with

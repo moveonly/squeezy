@@ -74,6 +74,7 @@ mod history;
 mod input;
 mod keymap;
 mod keymap_config;
+mod mcp_settings_edit;
 mod mention;
 mod notification;
 mod overlay;
@@ -895,6 +896,17 @@ async fn run_inner_with_terminal(
             apply_external_settings_reload(&mut app, &mut agent);
             app.needs_redraw = true;
         }
+        // While `/mcp` is open, refresh the cached registry view each
+        // animation tick so background discovery results (status row
+        // flipping ready/failed) appear without requiring a key press.
+        if app.config_screen.is_some()
+            && app.animation_tick.is_multiple_of(settings_poll_every)
+            && let Some(state) = app.config_screen.as_ref()
+            && state.current_section().id == squeezy_core::config_schema::SectionId::McpServers
+        {
+            refresh_mcp_screen_state(&mut app, &agent);
+            app.needs_redraw = true;
+        }
         // Refresh the language-summary status item from the graph at
         // the same cadence as the settings poll. The agent call is
         // cheap when the file watcher hasn't queued changes (graph
@@ -1267,6 +1279,307 @@ async fn apply_plan_choice(
 /// Read errors are surfaced as a notification but do not interrupt the
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
+/// Drain MCP actions staged by the `/mcp` config page key handlers
+/// and dispatch them through the agent. Each action is async because
+/// it reaches into the registry to (re)open sessions and run
+/// discovery; the page handler stages them on the screen state so
+/// the per-key code stays sync.
+async fn drain_mcp_actions(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    feedback: &mut config_screen::ConfigFeedback,
+) {
+    let actions: Vec<config_screen::McpAction> = match app.config_screen.as_mut() {
+        Some(state) => std::mem::take(&mut state.mcp_pending_actions),
+        None => return,
+    };
+    for action in actions {
+        apply_mcp_action(app, agent, feedback, action).await;
+    }
+    // After every batch, refresh the cached snapshot so the next
+    // render reflects the live registry/status — even partial
+    // failures should surface the new state.
+    refresh_mcp_screen_state(app, agent);
+}
+
+async fn apply_mcp_action(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    feedback: &mut config_screen::ConfigFeedback,
+    action: config_screen::McpAction,
+) {
+    use config_screen::{McpAction, Severity};
+    match action {
+        McpAction::Toggle {
+            server,
+            enabled,
+            persist,
+        } => {
+            if persist {
+                snapshot_active_scope_for_undo(app);
+                if let Err(err) = persist_mcp_toggle(app, &server, enabled) {
+                    pop_undo_snapshot(app);
+                    feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+                }
+            }
+            match agent.set_mcp_server_enabled(&server, enabled).await {
+                Ok(_) => {}
+                Err(err) => {
+                    feedback.push(format!("mcp toggle failed: {err}"), Severity::Error);
+                }
+            }
+        }
+        McpAction::Restart { server } => match agent.restart_mcp_server(&server).await {
+            Ok(_) => {}
+            Err(err) => {
+                feedback.push(format!("mcp restart failed: {err}"), Severity::Error);
+            }
+        },
+        McpAction::Add {
+            name,
+            server,
+            persist,
+        } => {
+            if persist {
+                snapshot_active_scope_for_undo(app);
+                if let Err(err) = persist_mcp_add(app, &name, &server) {
+                    pop_undo_snapshot(app);
+                    feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+                }
+            }
+            let mut next = agent.mcp_servers();
+            next.insert(name.clone(), *server);
+            agent.replace_mcp_servers(next).await;
+        }
+        McpAction::Remove { name, persist } => {
+            if persist {
+                // Snapshot the active-scope file BEFORE the write so
+                // Ctrl+Z on the /config screen can revert this MCP
+                // remove the same way it reverts any other persisted
+                // field edit.
+                snapshot_active_scope_for_undo(app);
+                match persist_mcp_remove(app, &name) {
+                    Ok(outcome) => {
+                        if outcome.removed_from_active_scope {
+                            feedback.push(
+                                format!("removed {name} from {}", outcome.path.display()),
+                                Severity::Info,
+                            );
+                        } else {
+                            // Drop the unused undo entry: the file
+                            // never changed because the active scope
+                            // did not define the server, so a Ctrl+Z
+                            // here would needlessly rewrite a fresh
+                            // file with its baseline.
+                            pop_undo_snapshot(app);
+                            feedback.push(
+                                format!(
+                                    "active scope does not define {name}; removed from running \
+                                     session only"
+                                ),
+                                Severity::Info,
+                            );
+                        }
+                        if !outcome.other_tiers_defining.is_empty() {
+                            let paths = outcome
+                                .other_tiers_defining
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            feedback.push(
+                                format!(
+                                    "{name} is still defined in {paths}; switch tabs to remove \
+                                     it from those tiers"
+                                ),
+                                Severity::Warn,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        // Drop the unused undo entry — the write
+                        // failed so there is nothing to revert.
+                        pop_undo_snapshot(app);
+                        feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+                    }
+                }
+            }
+            let mut next = agent.mcp_servers();
+            next.remove(&name);
+            agent.replace_mcp_servers(next).await;
+        }
+    }
+}
+
+/// Refresh the `/mcp` page's cached server map and status snapshot
+/// from the live agent. Called after every MCP action and once per
+/// animation tick so the page reflects in-flight discovery.
+fn refresh_mcp_screen_state(app: &mut TuiApp, agent: &Agent) {
+    if let Some(state) = app.config_screen.as_mut() {
+        state.mcp_servers = agent.mcp_servers();
+        state.mcp_status = agent.mcp_status_snapshot();
+    }
+}
+
+/// Push a snapshot of the active scope's settings file onto the
+/// config-screen undo stack so a subsequent `Ctrl+Z` reverts the
+/// persisted MCP write. Mirrors `save::save_field`'s pre-write
+/// bookkeeping. Reads the bytes BEFORE the persist runs; `None` is
+/// recorded when the tier file did not exist on disk yet so undo
+/// can recreate the absence.
+fn snapshot_active_scope_for_undo(app: &mut TuiApp) {
+    let Some(state) = app.config_screen.as_mut() else {
+        return;
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    let pre_write_bytes = std::fs::read(&path).ok();
+    state.push_undo_snapshot(path, pre_write_bytes);
+}
+
+/// Undo the most recent `snapshot_active_scope_for_undo` push. Used
+/// when a persist fails or turns out to be a no-op (e.g. the active
+/// scope didn't define the server we tried to remove) so the undo
+/// stack stays in lockstep with what is actually on disk.
+fn pop_undo_snapshot(app: &mut TuiApp) {
+    if let Some(state) = app.config_screen.as_mut() {
+        let _ = state.pop_undo_snapshot();
+    }
+}
+
+/// Persist a single server's `enabled` toggle to the active config
+/// scope's TOML.
+///
+/// We write the **full** server table — not just the `enabled` flag
+/// — because `McpServerConfig::merge` (in `squeezy-core`)
+/// unconditionally overwrites `transport` from the higher-precedence
+/// tier. If the toggled server is inherited from a lower tier as
+/// HTTP/SSE and we wrote only `enabled = …` to the active tier, the
+/// parser would default the missing `transport` to `Stdio`, then the
+/// merge would replace the inherited HTTP/SSE transport with that
+/// `Stdio` default — silently corrupting the server config after
+/// reload. Writing the entire table preserves the running server's
+/// full identity on disk.
+fn persist_mcp_toggle(app: &TuiApp, name: &str, enabled: bool) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    // The live cached `mcp_servers` map already reflects the optimistic
+    // post-toggle `enabled` value (the `/mcp` key handler applies it
+    // before staging the action), so the table we serialize here is
+    // exactly what production should see at the next reload.
+    let server = match state.mcp_servers.get(name) {
+        Some(server) => server.clone(),
+        // Toggling a server that the cached snapshot does not know
+        // about would only happen if the registry got out of sync —
+        // a no-op persist is safer than fabricating a fresh table
+        // with default fields that could clobber other tiers.
+        None => return Ok(()),
+    };
+    debug_assert_eq!(server.enabled, enabled);
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        servers.insert(
+            name,
+            toml_edit::Item::Table(mcp_settings_edit::mcp_server_table(&server)),
+        );
+        Ok(())
+    })
+}
+
+fn persist_mcp_add(
+    app: &TuiApp,
+    name: &str,
+    server: &squeezy_core::McpServerConfig,
+) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        servers.insert(
+            name,
+            toml_edit::Item::Table(mcp_settings_edit::mcp_server_table(server)),
+        );
+        Ok(())
+    })
+}
+
+/// Outcome of a scoped persist_mcp_remove. Carries enough context
+/// for the caller to surface accurate feedback without reaching
+/// back into the screen state itself.
+struct McpRemoveOutcome {
+    /// Active scope's settings path the removal was directed at.
+    path: std::path::PathBuf,
+    /// `true` when the active scope's TOML actually had the entry
+    /// (so the write changed disk state); `false` when the active
+    /// scope inherited the entry from another tier and the persist
+    /// was effectively a no-op.
+    removed_from_active_scope: bool,
+    /// Other tier files (besides the active scope) that still
+    /// define this server. After the persisted write those tiers
+    /// will resurrect the server on the next merge — surfaced to
+    /// the user so the inheritance is not silent.
+    other_tiers_defining: Vec<std::path::PathBuf>,
+}
+
+/// Persist a server removal **scoped to the active /config tab**.
+///
+/// Earlier revisions of this helper iterated every tier file (User,
+/// Project, Local) so a remove always survived restart. That broke
+/// the `/config` model — a user on the User tab could silently
+/// edit Project/Local files for a server they didn't own. This
+/// version writes only to the active scope's TOML, mirroring the
+/// `add` and `toggle` paths. The caller still removes the server
+/// from the live registry so the running session reflects the user's
+/// intent immediately, and we surface the other tiers that still
+/// define the server so the user knows where to go to make the
+/// change durable everywhere.
+fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<McpRemoveOutcome> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => {
+            // Without a screen we cannot determine the active scope;
+            // an empty outcome keeps the caller's feedback honest.
+            return Ok(McpRemoveOutcome {
+                path: std::path::PathBuf::new(),
+                removed_from_active_scope: false,
+                other_tiers_defining: Vec::new(),
+            });
+        }
+    };
+    let active_path = config_screen::tier_path(state, state.scope);
+    let mut removed_from_active_scope = false;
+    if active_path.exists() {
+        mcp_settings_edit::mcp_settings_edit(&active_path, |servers| {
+            removed_from_active_scope = servers.remove(name).is_some();
+            Ok(())
+        })?;
+    }
+    // Read-only sniff at the other tier files to spot inherited
+    // definitions. We do NOT mutate them — that's the whole point of
+    // the scope-respecting fix.
+    let mut other_tiers_defining = Vec::new();
+    for path in [
+        state.sources.user_path_default.clone(),
+        state.sources.project_path_default.clone(),
+        state.sources.repo_path_default.clone(),
+    ] {
+        if path == active_path || !path.exists() {
+            continue;
+        }
+        if mcp_settings_edit::tier_defines_mcp_server(&path, name) {
+            other_tiers_defining.push(path);
+        }
+    }
+    Ok(McpRemoveOutcome {
+        path: active_path,
+        removed_from_active_scope,
+        other_tiers_defining,
+    })
+}
+
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     let new_cfg = match AppConfig::from_env_and_settings() {
         Ok(cfg) => cfg,
@@ -2116,6 +2429,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             let state = app.config_screen.as_mut().expect("checked above");
             config_screen::handle_key(state, agent, &mut feedback, key)
         };
+        // Drain any MCP actions staged by `/mcp` key bindings before
+        // the next draw so the user sees status updates immediately
+        // rather than waiting for the next animation tick.
+        drain_mcp_actions(app, agent, &mut feedback).await;
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             close_config_screen(app, agent, "config closed");
         }
@@ -2849,7 +3166,12 @@ fn toggle_config_screen(
     // if the reload fails.
     let effective = squeezy_core::AppConfig::from_env_and_settings()
         .unwrap_or_else(|_| agent.config_snapshot());
-    let state = config_screen::ConfigScreenState::new(effective, focus);
+    let mut state = config_screen::ConfigScreenState::new(effective, focus);
+    // Seed the cached registry view from the live agent so the
+    // McpServers section reflects in-flight enable/disable from the
+    // moment it opens.
+    state.mcp_servers = agent.mcp_servers();
+    state.mcp_status = agent.mcp_status_snapshot();
     app.config_screen = Some(state);
     app.status = "config".to_string();
 }
@@ -3057,7 +3379,9 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/mcp" | "/help" => {
+            false
+        }
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -3197,6 +3521,7 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Cost
         | DispatchCommand::Context
         | DispatchCommand::Reviewer
+        | DispatchCommand::Mcp
         | DispatchCommand::Model
         | DispatchCommand::Permissions
         | DispatchCommand::Attachments
@@ -3500,6 +3825,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 ));
             }
             toggle_config_screen(app, agent, id);
+        }
+        DispatchCommand::Mcp => {
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::McpServers),
+            );
         }
         DispatchCommand::Statusline => toggle_status_line_setup(app),
         DispatchCommand::Plan { prompt } => {

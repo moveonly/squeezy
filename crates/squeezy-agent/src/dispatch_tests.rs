@@ -51,6 +51,15 @@ fn parse_model_and_permissions() {
 }
 
 #[test]
+fn parse_mcp_is_no_arg_command() {
+    // `/mcp` opens the MCP config page without arguments.
+    assert_eq!(parse("/mcp").unwrap(), DispatchCommand::Mcp);
+    assert_eq!(DispatchCommand::Mcp.slash_name(), "/mcp");
+    // Trailing whitespace must not turn it into an unknown command.
+    assert_eq!(parse("/mcp   ").unwrap(), DispatchCommand::Mcp);
+}
+
+#[test]
 fn parse_plan_and_build_capture_inline_prompt() {
     assert_eq!(
         parse("/plan").unwrap(),

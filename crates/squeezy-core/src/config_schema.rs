@@ -1776,6 +1776,18 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
         ],
     },
     ConfigSectionMeta {
+        id: SectionId::McpServers,
+        label: "MCP Servers",
+        // Render path: the `/mcp` page renders one row per configured
+        // server with live status, and handles toggle/restart/add/
+        // remove via dedicated key bindings rather than the generic
+        // field editor. Fields stay empty here so the regular field
+        // navigator skips the section without rendering a stub row.
+        description: "Status, enable, disable, restart, add or remove configured MCP servers \
+                      (lives behind `/mcp`).",
+        fields: &[],
+    },
+    ConfigSectionMeta {
         id: SectionId::Reset,
         label: "Reset",
         description: "Delete a tier's settings file. Inherited values from \

@@ -1915,6 +1915,7 @@ impl Agent {
         }
         let skills_changed = next.skills != self.config.skills;
         let workspace_changed = next.workspace_root != self.config.workspace_root;
+        self.schedule_mcp_servers_reload_if_changed(&next);
         self.config = next;
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
@@ -1925,6 +1926,41 @@ impl Agent {
             // stale would let old `PreToolUse`/`PostToolUse` shell-outs keep
             // firing against the user's stated intent.
             self.rebuild_hooks_registry();
+        }
+    }
+
+    /// Spawn a background `replace_mcp_servers` against the tool
+    /// registry when the incoming `[mcp.servers]` map differs from the
+    /// currently-installed one. Shared between `replace_config`
+    /// (settings reload + Immediate-tier saves) and
+    /// `drain_pending_swap` (NextPrompt-tier saves that also change
+    /// provider) so a server-map change is never silently dropped on
+    /// either path. The tool *runtime* outside the MCP registry still
+    /// needs a full restart for other field changes — this helper
+    /// only addresses the registry hot-reload gap.
+    fn schedule_mcp_servers_reload_if_changed(&self, next: &AppConfig) {
+        if next.mcp_servers == self.config.mcp_servers {
+            return;
+        }
+        let tools = self.tools.clone();
+        let servers = next.mcp_servers.clone();
+        let task = async move {
+            let _ = tools
+                .replace_mcp_servers(servers, CancellationToken::new())
+                .await;
+        };
+        // Hand the spawn to the tracked `JoinSet` so `Agent::shutdown`
+        // waits for the registry to settle before dropping the redb
+        // store. Lock poisoning here only comes from a panic inside
+        // another spawn site; we recover the inner data rather than
+        // panic — the registry must stay usable across config edits.
+        match self.background_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.spawn(task);
+            }
+            Err(poison) => {
+                poison.into_inner().spawn(task);
+            }
         }
     }
 
@@ -2010,6 +2046,14 @@ impl Agent {
         let swap = self.pending_swap.take()?;
         let skills_changed = swap.config.skills != self.config.skills;
         let workspace_changed = swap.config.workspace_root != self.config.workspace_root;
+        // Honour any `[mcp.servers]` drift bundled into the swap on
+        // the same beat as the provider/config replacement. Without
+        // this, a settings-watcher reload that *also* changes the
+        // provider would arm a `PendingConfigSwap` instead of going
+        // through `replace_config`, and the MCP registry would
+        // silently fall out of sync with `AppConfig.mcp_servers` until
+        // the next process restart.
+        self.schedule_mcp_servers_reload_if_changed(&swap.config);
         self.config = swap.config.clone();
         if let Some(provider) = swap.provider.clone() {
             self.provider = provider;
@@ -2139,6 +2183,64 @@ impl Agent {
     /// can issue `mcp__*` tool calls without racing the background task.
     pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
         self.tools.refresh_mcp_tools(CancellationToken::new()).await
+    }
+
+    /// Toggle an MCP server's `enabled` flag without restarting the
+    /// agent. Returns the same refresh outcome `refresh_mcp_tools`
+    /// produces so the caller (the `/mcp` config page, eval driver)
+    /// can pull the new per-server status.
+    pub async fn set_mcp_server_enabled(
+        &mut self,
+        server_name: &str,
+        enabled: bool,
+    ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
+        let outcome = self
+            .tools
+            .set_mcp_server_enabled(server_name, enabled, CancellationToken::new())
+            .await?;
+        // Keep `self.config.mcp_servers` aligned with the registry so
+        // the next config snapshot reflects the toggle without going
+        // back to disk.
+        if let Some(server) = self.config.mcp_servers.get_mut(server_name) {
+            server.enabled = enabled;
+        }
+        Ok(outcome)
+    }
+
+    /// Restart an MCP server in place: tear down its live session and
+    /// re-run discovery.
+    pub async fn restart_mcp_server(
+        &self,
+        server_name: &str,
+    ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
+        self.tools
+            .restart_mcp_server(server_name, CancellationToken::new())
+            .await
+    }
+
+    /// Replace the entire MCP server map without restarting the
+    /// agent. Used for add/remove flows from the `/mcp` config page
+    /// and to honour external `settings.toml` edits picked up by the
+    /// settings watcher.
+    pub async fn replace_mcp_servers(
+        &mut self,
+        servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+    ) -> squeezy_tools::McpRefreshOutcome {
+        self.config.mcp_servers = servers.clone();
+        self.tools
+            .replace_mcp_servers(servers, CancellationToken::new())
+            .await
+    }
+
+    /// Snapshot of the registry's live server map. Mirrors
+    /// `AppConfig.mcp_servers` but reads from the registry directly so
+    /// callers see post-`replace_mcp_servers` state.
+    pub fn mcp_servers(&self) -> std::collections::BTreeMap<String, squeezy_core::McpServerConfig> {
+        self.tools.mcp_servers()
+    }
+
+    pub fn mcp_status_snapshot(&self) -> squeezy_tools::McpStatusSnapshot {
+        self.tools.mcp_status_snapshot()
     }
 
     /// Drain every background task the agent spawned (currently just the
@@ -3294,6 +3396,7 @@ impl Agent {
             | DispatchCommand::RevertTurn { .. }
             | DispatchCommand::Help { .. }
             | DispatchCommand::Config { .. }
+            | DispatchCommand::Mcp
             | DispatchCommand::Model
             | DispatchCommand::Plans { .. }
             | DispatchCommand::Feedback { .. }
@@ -12617,6 +12720,7 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Cost
         | DispatchCommand::Context
         | DispatchCommand::Reviewer
+        | DispatchCommand::Mcp
         | DispatchCommand::Model
         | DispatchCommand::Permissions
         | DispatchCommand::Attachments
