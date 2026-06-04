@@ -335,6 +335,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[default|bright|fun|catppuccin|high-contrast|<custom>]",
         &[PermissionCapability::Edit],
     ),
+    slash_args_caps(
+        "/spinner",
+        "set the working-status spinner",
+        true,
+        "[twinkle|scintillate|drift]",
+        &[PermissionCapability::Edit],
+    ),
     slash("/keymap", "list current key bindings"),
 ];
 

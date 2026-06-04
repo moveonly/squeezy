@@ -2863,6 +2863,33 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
     app.needs_redraw = true;
 }
 
+fn apply_spinner_change(app: &mut TuiApp, agent: &mut Agent, spinner: String) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let mut next = agent.config_snapshot();
+    next.tui.spinner = spinner.clone();
+    crate::render::spinner::set_active_spinner(&next);
+    agent.replace_config(next);
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edits = [SettingsEdit {
+        path: &["tui", "spinner"],
+        op: EditOp::SetString(spinner.clone()),
+    }];
+    match apply_edits(&scope_target, &edits) {
+        Ok(_) => {
+            app.push_status(format!("spinner → {spinner}"));
+            app.status = format!("spinner saved to {}", target_path.display());
+        }
+        Err(err) => {
+            app.push_warn(format!("spinner switched but save failed: {err}"));
+            app.status = format!("spinner switched (not persisted): {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Persist the picker's selection to `[tui].status_line` /
 /// `[tui].status_line_use_colors` in the user-scope settings file and
 /// apply it in-memory immediately.
@@ -3442,6 +3469,31 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 return;
             }
             apply_theme_change(app, agent, parsed);
+        }
+        DispatchCommand::Spinner { spinner: None } => {
+            let current = agent.config_snapshot().tui.spinner.clone();
+            let options = squeezy_core::BUILTIN_TUI_SPINNER_NAMES.join(", ");
+            set_status_with_notice(
+                app,
+                format!("spinner: {current} (options: {options})"),
+                format!(
+                    "Working-status spinner is {current:?}. Set one with `/spinner <name>` — options: {options}."
+                ),
+            );
+        }
+        DispatchCommand::Spinner {
+            spinner: Some(spinner),
+        } => {
+            let Some(parsed) = squeezy_core::normalize_tui_spinner_name(&spinner) else {
+                let options = squeezy_core::BUILTIN_TUI_SPINNER_NAMES.join(", ");
+                set_status_with_notice(
+                    app,
+                    format!("unknown spinner {spinner:?}; options: {options}"),
+                    format!("Unknown spinner {spinner:?}. Options: {options}."),
+                );
+                return;
+            };
+            apply_spinner_change(app, agent, parsed);
         }
         DispatchCommand::Keymap => {
             let body = keymap::format_keymap_command(&app.keymap);

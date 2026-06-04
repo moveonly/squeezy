@@ -3079,6 +3079,7 @@ impl Agent {
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
+            | DispatchCommand::Spinner { .. }
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
