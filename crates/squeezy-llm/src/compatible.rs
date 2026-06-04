@@ -2139,6 +2139,7 @@ fn parse_chat_usage(usage: &Value) -> CostSnapshot {
         .get("prompt_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .or_else(|| usage.get("prompt_cache_hit_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
         .and_then(Value::as_u64);
     let reasoning_output_tokens = usage
         .get("completion_tokens_details")

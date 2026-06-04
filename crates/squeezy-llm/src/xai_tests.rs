@@ -692,12 +692,9 @@ fn dispatcher_xai_config_with_extra_headers(
 
 /// xAI Chat-Completions SSE that reports prompt cache hits at the
 /// top-level `usage.cached_tokens` field (per xAI's chat docs
-/// examples). The squeezy chat parser today only looks at
+/// examples). This shape must be counted alongside
 /// `prompt_tokens_details.cached_tokens` and
-/// `prompt_cache_hit_tokens`, so this shape silently zeros out the
-/// cached-tokens column. The fixture lives here so M-31's
-/// `compatible.rs` fix can flip the assertion from `None` to
-/// `Some(42)` in lockstep.
+/// `prompt_cache_hit_tokens`.
 const CHAT_TOPLEVEL_CACHED_TOKENS_SSE_BODY: &str = concat!(
     "data: {\"id\":\"chatcmpl_xai_m31\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n",
     "data: {\"id\":\"chatcmpl_xai_m31\",\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":1,\"cached_tokens\":42}}\n\n",
@@ -705,23 +702,10 @@ const CHAT_TOPLEVEL_CACHED_TOKENS_SSE_BODY: &str = concat!(
 );
 
 #[tokio::test]
-async fn xai_chat_top_level_cached_tokens_gap_marker_m31() {
-    // M-31: regression marker for xAI's top-level
-    // `usage.cached_tokens` shape. The chat parser in `compatible.rs`
-    // currently only consults `prompt_tokens_details.cached_tokens`
-    // and `prompt_cache_hit_tokens`, so this fixture surfaces
-    // `cached_input_tokens = None`. The asymmetry is documented at
-    // `.audit/providers/xai.md` (M-31); once `compatible.rs` learns
-    // the third fallback, flip this expectation to `Some(42)` to
-    // guard against losing the fix.
-    //
-    // M-31 STATUS: OPEN. This `== None` assertion is a tracked
-    // placeholder for an out-of-scope fix that lives in
-    // `compatible.rs` (the `parse_chat_usage` top-level
-    // `usage.cached_tokens` fallback). It is intentionally left as-is
-    // here: when that fallback lands, this assertion MUST flip to
-    // `Some(42)` in the same change so the test guards the fix rather
-    // than the gap.
+async fn xai_chat_top_level_cached_tokens_counted_m31() {
+    // M-31: xAI can report Chat cache hits at top-level
+    // `usage.cached_tokens`. Keep that shape wired into the shared
+    // compatible parser so cache savings are reflected in cost/accounting.
     let recorder = DispatcherRecorder::new();
     let bodies = RouteBodies {
         responses: RESPONSES_SSE_BODY,
@@ -749,8 +733,9 @@ async fn xai_chat_top_level_cached_tokens_gap_marker_m31() {
     assert_eq!(cost.input_tokens, Some(20));
     assert_eq!(cost.output_tokens, Some(1));
     assert_eq!(
-        cost.cached_input_tokens, None,
-        "M-31 gap marker: xAI's top-level `usage.cached_tokens` is not yet picked up by `parse_chat_usage` in compatible.rs. Flip to `Some(42)` once that fix lands."
+        cost.cached_input_tokens,
+        Some(42),
+        "xAI top-level `usage.cached_tokens` must count as cached input tokens"
     );
 }
 
