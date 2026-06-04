@@ -424,7 +424,9 @@ const CATPPUCCIN_COLORS: &[(&str, TuiRgb)] = &[
     (token::PALETTE_GREEN, [166, 227, 161]),
     (token::PALETTE_YELLOW, [249, 226, 175]),
     (token::PALETTE_BLUE, [137, 180, 250]),
-    (token::PALETTE_MAGENTA, [203, 166, 247]),
+    // Pink (not Mauve) so the subagent rail stays distinct from the plan
+    // accent, which is Mauve in this theme.
+    (token::PALETTE_MAGENTA, [245, 194, 231]),
     (token::PALETTE_CYAN, [148, 226, 213]),
     (token::UI_BACKGROUND, [30, 30, 46]),
     (token::UI_FOREGROUND, [205, 214, 244]),

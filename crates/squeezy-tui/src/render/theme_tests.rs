@@ -20,6 +20,29 @@ fn default_theme_resolves_every_token() {
 }
 
 #[test]
+fn every_theme_keeps_rail_hues_distinct() {
+    // The Quiet Rail tints plan nodes with the accent, subagent context with
+    // magenta, and reasoning runs with blue. Those three must stay mutually
+    // distinct in every builtin theme or the rail loses its at-a-glance meaning.
+    let cfg = AppConfig::default();
+    for name in squeezy_core::BUILTIN_TUI_THEME_NAMES {
+        let theme = resolve_theme(&cfg, name);
+        let accent = theme.resolve(token::PALETTE_ACCENT);
+        let magenta = theme.resolve(token::PALETTE_MAGENTA);
+        let blue = theme.resolve(token::PALETTE_BLUE);
+        assert_ne!(
+            accent, magenta,
+            "{name}: plan (accent) vs subagent (magenta)"
+        );
+        assert_ne!(accent, blue, "{name}: plan (accent) vs reasoning (blue)");
+        assert_ne!(
+            magenta, blue,
+            "{name}: subagent (magenta) vs reasoning (blue)"
+        );
+    }
+}
+
+#[test]
 fn custom_theme_overlays_default_tokens() {
     let mut cfg = AppConfig::default();
     cfg.tui.themes.insert(
