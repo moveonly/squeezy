@@ -589,6 +589,18 @@ impl SkillCatalog {
         }
     }
 
+    /// Render the activated fork-mode skills (those whose frontmatter
+    /// declares `context: fork`) into a `<fork_skills>` system block.
+    /// Returns `None` when `skills` is empty.
+    ///
+    /// Fork-mode skills are intentionally rendered separately from
+    /// `<active_skills>` because the design intent is for the model to
+    /// dispatch them through a focused subagent (via the existing
+    /// `delegate` tool) rather than executing the body inline.
+    pub fn render_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        render::render_fork_skills(skills, self.active_budget_chars, self.active_body_cap_chars)
+    }
+
     pub fn render_preamble(&self) -> Option<SkillPreambleRender> {
         self.preamble_enabled
             .then(|| {

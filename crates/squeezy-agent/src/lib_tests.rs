@@ -2422,6 +2422,73 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn fork_mode_skills_render_in_fork_block_not_active_block() {
+    let root = temp_workspace("agent_skill_fork_partition");
+    let inline_dir = root.join(".agents/skills/inline-skill");
+    fs::create_dir_all(&inline_dir).expect("mkdir inline");
+    fs::write(
+        inline_dir.join("SKILL.md"),
+        "---\nname: inline-skill\ndescription: \"inline desc\"\ntriggers:\n  - inline phrase\n---\n# Inline Body\n",
+    )
+    .expect("write inline skill");
+    let fork_dir = root.join(".agents/skills/fork-skill");
+    fs::create_dir_all(&fork_dir).expect("mkdir fork");
+    fs::write(
+        fork_dir.join("SKILL.md"),
+        "---\nname: fork-skill\ndescription: \"fork desc\"\ncontext: fork\ntriggers:\n  - fork phrase\n---\n# Fork Body\n",
+    )
+    .expect("write fork skill");
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "trigger inline phrase and fork phrase together".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured llm request");
+    let instructions = &request.instructions;
+    assert!(
+        instructions.contains("<active_skills>"),
+        "inline-mode skill must still render under <active_skills>: {instructions}"
+    );
+    assert!(
+        instructions.contains("inline-skill"),
+        "inline skill missing from instructions: {instructions}"
+    );
+    assert!(
+        instructions.contains("<fork_skills>"),
+        "fork-mode skill must render in a separate <fork_skills> block: {instructions}"
+    );
+    assert!(
+        instructions.contains("context_mode=\"fork\""),
+        "fork block must tag the skill with context_mode=\"fork\": {instructions}"
+    );
+    let active_segment = instructions
+        .split("<active_skills>")
+        .nth(1)
+        .and_then(|tail| tail.split("</active_skills>").next())
+        .unwrap_or("");
+    assert!(
+        !active_segment.contains("fork-skill"),
+        "fork-mode skill leaked into <active_skills>: {active_segment}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn agent_skill_hooks_default_to_disabled() {
     let root = temp_workspace("agent_skill_hooks_off");
@@ -7096,11 +7163,42 @@ fn parse_subagent_structured_tail_rejects_json_array_only() {
 }
 
 #[test]
+fn skill_subagent_uses_system_override_as_instructions() {
+    let request = super::SubagentRequest {
+        prompt: "explain how this skill applies to the user's task".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: Some("# Skill body\nFollow these steps exactly.".to_string()),
+    };
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
+    assert!(
+        instructions.contains("# Skill body"),
+        "skill subagent must run the supplied body as system instructions: {instructions}"
+    );
+}
+
+#[test]
+fn skill_subagent_falls_back_when_system_override_missing() {
+    let request = super::SubagentRequest {
+        prompt: "do the thing".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: None,
+    };
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
+    assert!(
+        instructions.to_lowercase().contains("fork-mode skill"),
+        "missing fallback prompt for skill subagent without override: {instructions}"
+    );
+}
+
+#[test]
 fn plan_subagent_instructions_advertise_json_tail_contract() {
     let request = super::SubagentRequest {
         prompt: "plan something".to_string(),
         scope: None,
         thoroughness: None,
+        system_override: None,
     };
     let plan = super::subagent_instructions(SubagentKind::Plan, &request);
     assert!(

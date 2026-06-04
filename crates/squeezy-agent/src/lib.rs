@@ -4197,6 +4197,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
                 .to_string(),
         ),
         thoroughness: None,
+        system_override: None,
     };
     let mut all_tool_specs = core_control_tools(
         &deps.config.subagents,
@@ -5310,9 +5311,28 @@ impl TurnRuntime {
         }
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
-        let base_instructions = match self.tools.format_active_skills(&activation.skills) {
-            Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
-            None => self.config.instructions.clone(),
+        // Partition by execution-context mode declared in `SKILL.md`
+        // frontmatter. Inline-mode skills (the default) keep the
+        // existing `<active_skills>` system-prompt injection. Fork-mode
+        // skills are surfaced via a separate `<fork_skills>` block so
+        // the model treats them as candidates for a focused subagent
+        // dispatch rather than instructions for the parent turn.
+        let (inline_skills, fork_skills): (Vec<_>, Vec<_>) =
+            activation.skills.iter().cloned().partition(|skill| {
+                !matches!(
+                    skill.summary.context_mode,
+                    squeezy_skills::SkillContextMode::Fork
+                )
+            });
+        let active_block = self.tools.format_active_skills(&inline_skills);
+        let fork_block = self.tools.format_fork_skills(&fork_skills);
+        let base_instructions = match (active_block, fork_block) {
+            (Some(active), Some(fork)) => {
+                format!("{}\n\n{}\n\n{}", self.config.instructions, active, fork)
+            }
+            (Some(active), None) => format!("{}\n\n{}", self.config.instructions, active),
+            (None, Some(fork)) => format!("{}\n\n{}", self.config.instructions, fork),
+            (None, None) => self.config.instructions.clone(),
         };
         let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
             .is_some_and(|capabilities| capabilities.text_verbosity);
@@ -7895,6 +7915,15 @@ enum SubagentKind {
     DocHelp,
     Plan,
     Review,
+    /// Bounded subagent invoked to run a fork-mode skill body in
+    /// isolation from the parent turn. The skill body is provided via
+    /// `SubagentRequest.system_override` so the subagent's system
+    /// prompt is the skill's own instructions, and the user task is
+    /// passed through the standard `prompt` field. Wired but not yet
+    /// auto-dispatched — fork-mode skills currently appear in a
+    /// `<fork_skills>` system block and rely on the parent agent
+    /// invoking `delegate` to actually run them.
+    Skill,
 }
 
 impl SubagentKind {
@@ -7905,6 +7934,7 @@ impl SubagentKind {
             Self::DocHelp => "doc_help",
             Self::Plan => "plan",
             Self::Review => "review",
+            Self::Skill => "skill",
         }
     }
 
@@ -7920,6 +7950,10 @@ impl SubagentKind {
             Self::DocHelp => None,
             Self::Plan => Some(SubagentRole::Planner),
             Self::Review => Some(SubagentRole::Reviewer),
+            // Skill subagents inherit the parent model and run the
+            // skill body as their system prompt; they have no role
+            // overlay.
+            Self::Skill => None,
         }
     }
 }
@@ -8451,6 +8485,11 @@ struct SubagentRequest {
     prompt: String,
     scope: Option<String>,
     thoroughness: Option<String>,
+    /// Optional override that replaces the per-kind default system
+    /// prompt produced by [`subagent_instructions`]. Used by
+    /// [`SubagentKind::Skill`] so a fork-mode skill body becomes the
+    /// subagent's system instructions verbatim; other kinds ignore it.
+    system_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8922,7 +8961,10 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .unwrap_or_else(|| {
                 "Review the current diff. Report only actionable findings.".to_string()
             }),
-        SubagentKind::Delegate | SubagentKind::Explore | SubagentKind::DocHelp => call
+        SubagentKind::Delegate
+        | SubagentKind::Explore
+        | SubagentKind::DocHelp
+        | SubagentKind::Skill => call
             .arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -8942,6 +8984,10 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         prompt,
         scope,
         thoroughness,
+        // Tool-call-driven requests never carry a system override.
+        // Skill subagents reaching this path through `delegate`-style
+        // wiring would inherit the kind's default instructions.
+        system_override: None,
     })
 }
 
@@ -10293,6 +10339,9 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
                 "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains.\n\n{SUBAGENT_JSON_TAIL_INSTRUCTION}"
             )
         }
+        SubagentKind::Skill => request.system_override.clone().unwrap_or_else(|| {
+            "You are a Squeezy fork-mode skill subagent invoked without an explicit instruction body. Treat the user prompt as the entire task and return a concise summary for the parent agent. Do not modify files or run shell commands.".to_string()
+        }),
     }
 }
 
@@ -10318,6 +10367,11 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         (SubagentKind::DocHelp, _) => cheap_model_for(provider, config)
             .filter(|m| !m.is_empty())
             .unwrap_or(parent_model),
+        // Skill subagents run the skill author's own instructions on
+        // the parent model so the body's expectations about capability
+        // hold — falling to a cheap tier here would change behavior
+        // silently for any skill that relies on planner-grade output.
+        (SubagentKind::Skill, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
@@ -10411,6 +10465,10 @@ fn subagent_allowed_tools(
         SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::DocHelp => DOC_HELP_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        // Skill subagents reuse the Delegate read-only research toolset
+        // — fork-mode skill authors expect the same `read_file`, grep,
+        // graph, and `plan_patch` surfaces the Delegate kind offers.
+        SubagentKind::Skill => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Plan => role_config(SubagentRole::Planner)
             .allowed_tools
             .iter()

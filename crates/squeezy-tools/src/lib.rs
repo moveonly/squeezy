@@ -2602,6 +2602,13 @@ impl ToolRegistry {
         self.skills.render_active_skills(skills)
     }
 
+    /// Render fork-mode skills (skills whose frontmatter declares
+    /// `context: fork`) into a separate `<fork_skills>` system block.
+    /// Returns `None` when no fork-mode skill is activated.
+    pub fn format_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        self.skills.render_fork_skills(skills)
+    }
+
     pub fn skills_preamble(&self) -> Option<SkillPreambleRender> {
         self.skills.render_preamble()
     }
