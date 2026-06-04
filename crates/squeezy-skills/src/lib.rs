@@ -1524,6 +1524,31 @@ fn load_manifest(base_dir: &Path) -> Option<SkillManifest> {
     }
 }
 
+/// Materialise the in-binary [`bundled_skills`] under `user_dir` so a
+/// fresh install actually has discoverable sample skills.
+///
+/// Each bundled skill is written to `<user_dir>/<name>/SKILL.md`. If
+/// the target directory or file already exists the entry is skipped
+/// — repeat calls and partial installs stay idempotent and never
+/// clobber an edited user copy.
+///
+/// Returns the list of skill names that were written this call.
+pub fn install_bundled_skills(user_dir: &Path) -> Result<Vec<String>> {
+    fs::create_dir_all(user_dir)?;
+    let mut written = Vec::new();
+    for source in BUNDLED_SKILL_SOURCES {
+        let target_dir = user_dir.join(source.dir_name);
+        let target_file = target_dir.join(SKILL_FILE);
+        if target_file.exists() {
+            continue;
+        }
+        fs::create_dir_all(&target_dir)?;
+        fs::write(&target_file, source.content)?;
+        written.push(source.dir_name.to_string());
+    }
+    Ok(written)
+}
+
 /// Inspect a `manifest.tool_deps` list and return the subset that is
 /// not satisfied by the runtime's available tools and MCP servers.
 ///

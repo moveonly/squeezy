@@ -224,6 +224,11 @@ enum ConfigCommand {
         scope: InitScope,
         #[arg(long, help = "Overwrite an existing file")]
         force: bool,
+        #[arg(
+            long = "with-bundled-skills",
+            help = "After writing settings, install the in-binary bundled sample skills under the user skills directory (--user only)"
+        )]
+        with_bundled_skills: bool,
     },
 }
 
@@ -313,6 +318,13 @@ enum SkillsCommand {
     Validate {
         #[arg(long)]
         json: bool,
+    },
+    #[command(
+        about = "Install the in-binary bundled sample skills under the user skills directory"
+    )]
+    Install {
+        #[arg(long, help = "Overwrite an existing target directory")]
+        force: bool,
     },
 }
 
@@ -894,14 +906,18 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             print!("{}", config.inspect_redacted());
             Ok(())
         }
-        Some(ConfigCommand::Init { scope, force }) => {
+        Some(ConfigCommand::Init {
+            scope,
+            force,
+            with_bundled_skills,
+        }) => {
             let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
             } else {
                 let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 (project_init_target(cwd), project_settings_template())
             };
-            if path.exists() && !force {
+            if path.exists() && !*force {
                 return Err(SqueezyError::Config(format!(
                     "{} already exists; pass --force to overwrite",
                     path.display()
@@ -914,6 +930,31 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             }
             fs::write(&path, template)?;
             println!("wrote {}", path.display());
+            if *with_bundled_skills {
+                if !scope.user {
+                    return Err(SqueezyError::Config(
+                        "--with-bundled-skills is only supported under --user".to_string(),
+                    ));
+                }
+                let config = config_from_cli(cli)?;
+                let target = &config.skills.user_dir;
+                let written = squeezy_skills::install_bundled_skills(target).map_err(|err| {
+                    SqueezyError::Config(format!(
+                        "failed to install bundled skills under {}: {err}",
+                        target.display()
+                    ))
+                })?;
+                if written.is_empty() {
+                    println!("bundled skills already present under {}", target.display());
+                } else {
+                    println!(
+                        "installed {} bundled skill(s) under {}: {}",
+                        written.len(),
+                        target.display(),
+                        written.join(", ")
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -1104,7 +1145,50 @@ fn handle_skills_command(command: &SkillsCommand, cli: &Cli) -> squeezy_core::Re
         SkillsCommand::Enable(args) => skills_set_enabled(cli, args, true),
         SkillsCommand::Disable(args) => skills_set_enabled(cli, args, false),
         SkillsCommand::Validate { json } => skills_validate(cli, *json),
+        SkillsCommand::Install { force } => skills_install(cli, *force),
     }
+}
+
+fn skills_install(cli: &Cli, force: bool) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let target = &config.skills.user_dir;
+    if force {
+        for source in skills_bundled_dir_names() {
+            let dir = target.join(source);
+            if dir.exists() {
+                fs::remove_dir_all(&dir).map_err(|err| {
+                    SqueezyError::Config(format!("failed to remove {}: {err}", dir.display()))
+                })?;
+            }
+        }
+    }
+    let written = squeezy_skills::install_bundled_skills(target).map_err(|err| {
+        SqueezyError::Config(format!(
+            "failed to install bundled skills under {}: {err}",
+            target.display()
+        ))
+    })?;
+    if written.is_empty() {
+        println!(
+            "no new bundled skills installed (all already present under {})",
+            target.display()
+        );
+    } else {
+        println!(
+            "installed {} bundled skill(s) under {}: {}",
+            written.len(),
+            target.display(),
+            written.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Names of the in-binary bundled skills. Hardcoded for the `--force`
+/// path so the installer doesn't need to enumerate `bundled_skills()`
+/// (which would parse every body upfront).
+fn skills_bundled_dir_names() -> &'static [&'static str] {
+    &["customize-squeezy", "release-notes", "skill-creator"]
 }
 
 fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {

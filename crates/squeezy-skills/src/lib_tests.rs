@@ -1719,6 +1719,55 @@ fn cross_precedence_name_collision_emits_load_time_warning() {
 }
 
 #[test]
+fn install_bundled_skills_is_idempotent_and_skips_existing() {
+    let root = temp_workspace("skills_install_bundled");
+    let user_dir = root.join("user");
+
+    let first = super::install_bundled_skills(&user_dir).expect("install first");
+    assert!(
+        !first.is_empty(),
+        "first install must write at least one bundled skill"
+    );
+    let names_first: BTreeSet<String> = first.into_iter().collect();
+    let expected: BTreeSet<String> = ["customize-squeezy", "release-notes", "skill-creator"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names_first, expected);
+
+    for name in &expected {
+        let path = user_dir.join(name).join("SKILL.md");
+        assert!(path.exists(), "missing installed skill: {}", path.display());
+        let body = fs::read_to_string(&path).expect("read installed");
+        assert!(
+            body.contains(&format!("name: {name}")),
+            "frontmatter must declare the skill name verbatim: {body}"
+        );
+    }
+
+    // Second invocation is a no-op even if the user has hand-edited
+    // a SKILL.md — the installer must never clobber existing files.
+    let user_edit = user_dir.join("customize-squeezy").join("SKILL.md");
+    fs::write(
+        &user_edit,
+        "---\nname: customize-squeezy\ndescription: \"mine\"\n---\nedited\n",
+    )
+    .expect("simulate user edit");
+    let second = super::install_bundled_skills(&user_dir).expect("install second");
+    assert!(
+        second.is_empty(),
+        "second install must not rewrite any skill"
+    );
+    let preserved = fs::read_to_string(&user_edit).expect("read after second install");
+    assert!(
+        preserved.contains("edited"),
+        "user edits must survive a re-install: {preserved}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn unmet_tool_deps_flags_missing_builtin_and_mcp() {
     let deps = vec![
         "shell".to_string(),
