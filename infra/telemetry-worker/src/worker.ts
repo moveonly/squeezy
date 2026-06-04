@@ -11,6 +11,8 @@ const DEFAULT_POSTHOG_HOST = "https://eu.i.posthog.com";
 const PRODUCT_EVENT_RE = /^squeezy_[a-z0-9_]{1,96}$/;
 const SAFE_TOKEN_RE = /^[A-Za-z0-9._+:-]+$/;
 const SAFE_PROPERTY_KEY_RE = /^[A-Za-z0-9_]{1,80}$/;
+const TRACE_ID_RE = /^[0-9a-f]{32}$/;
+const SPAN_ID_RE = /^[0-9a-f]{16}$/;
 
 const TEXT_ENCODER = new TextEncoder();
 function utf8ByteLength(text: string): number {
@@ -76,13 +78,10 @@ export default {
       return jsonResponse(404, { error: "not_found" });
     }
 
-    const contentLength = Number(request.headers.get("content-length") || "0");
-    if (contentLength > MAX_BODY_BYTES) {
-      return jsonResponse(413, { error: "body_too_large" });
-    }
-
-    const text = await request.text();
-    if (utf8ByteLength(text) > MAX_BODY_BYTES) {
+    let text: string;
+    try {
+      text = await boundedText(request, MAX_BODY_BYTES);
+    } catch {
       return jsonResponse(413, { error: "body_too_large" });
     }
 
@@ -513,6 +512,12 @@ function sanitizePropertyValue(value: unknown, label: string): unknown {
       return value;
     }
     if (typeof value === "string") {
+      if (label === "trace_id") {
+        return TRACE_ID_RE.test(value) ? value : undefined;
+      }
+      if (label === "span_id") {
+        return SPAN_ID_RE.test(value) ? value : undefined;
+      }
       assertString(value, label, 1, 128);
       return value;
     }

@@ -2371,10 +2371,13 @@ impl Agent {
         &self,
         feedback: &PreparedFeedback,
     ) -> squeezy_core::Result<FeedbackSubmitResult> {
-        FeedbackClient::from_config(&self.config)
-            .submit_feedback(feedback)
-            .await
-            .map_err(|error| SqueezyError::Tool(error.to_string()))
+        FeedbackClient::from_config_with_session(
+            &self.config,
+            self.telemetry.session_id().as_deref(),
+        )
+        .submit_feedback(feedback)
+        .await
+        .map_err(|error| SqueezyError::Tool(error.to_string()))
     }
 
     pub fn build_bug_report(
@@ -2394,17 +2397,20 @@ impl Agent {
             .iter()
             .map(|section| section.name.clone())
             .collect::<Vec<_>>();
-        FeedbackClient::from_config(&self.config)
-            .submit_report(ReportUpload {
-                report_id: &bundle.report_id,
-                session_id: &bundle.session_id,
-                archive_bytes: &bundle.archive_bytes,
-                redactions: bundle.redactions,
-                sections,
-                source: "tui",
-            })
-            .await
-            .map_err(|error| SqueezyError::Tool(error.to_string()))
+        FeedbackClient::from_config_with_session(
+            &self.config,
+            self.telemetry.session_id().as_deref(),
+        )
+        .submit_report(ReportUpload {
+            report_id: &bundle.report_id,
+            session_id: &bundle.session_id,
+            archive_bytes: &bundle.archive_bytes,
+            redactions: bundle.redactions,
+            sections,
+            source: "tui",
+        })
+        .await
+        .map_err(|error| SqueezyError::Tool(error.to_string()))
     }
 
     pub fn resume_current(

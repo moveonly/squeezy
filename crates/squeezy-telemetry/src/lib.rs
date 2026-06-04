@@ -180,6 +180,14 @@ impl TelemetryClient {
         self.state.as_ref().map(|state| state.trace_id.clone())
     }
 
+    /// The session id assigned to this telemetry client. `None` when telemetry
+    /// is disabled. Exposed so call sites can thread the same id into
+    /// `FeedbackClient::from_config_with_session` so that feedback and bug
+    /// reports in PostHog are correlated with the product session summary.
+    pub fn session_id(&self) -> Option<String> {
+        self.state.as_ref().map(|state| state.session_id.clone())
+    }
+
     pub fn spawn(&self, event: TelemetryEvent) {
         let Some(state) = self.state.clone() else {
             return;
@@ -351,7 +359,20 @@ impl std::error::Error for FeedbackError {}
 
 impl FeedbackClient {
     pub fn from_config(config: &AppConfig) -> Self {
-        Self::from_config_with_install_path(config, default_install_id_path())
+        Self::from_config_with_session(config, None)
+    }
+
+    /// Like [`Self::from_config`] but binds `session_id` to the caller's
+    /// telemetry session so that feedback and bug reports in PostHog are
+    /// correlated with the matching product session summary. Pass
+    /// `telemetry_client.session_id().as_deref()` at call sites that have an
+    /// active `TelemetryClient`.
+    pub fn from_config_with_session(config: &AppConfig, session_id: Option<&str>) -> Self {
+        Self::from_config_with_install_path_and_session(
+            config,
+            default_install_id_path(),
+            session_id,
+        )
     }
 
     pub fn disabled() -> Self {
@@ -361,6 +382,14 @@ impl FeedbackClient {
     pub fn from_config_with_install_path(
         config: &AppConfig,
         install_id_path: impl AsRef<Path>,
+    ) -> Self {
+        Self::from_config_with_install_path_and_session(config, install_id_path, None)
+    }
+
+    fn from_config_with_install_path_and_session(
+        config: &AppConfig,
+        install_id_path: impl AsRef<Path>,
+        session_id: Option<&str>,
     ) -> Self {
         if !config.feedback.enabled {
             return Self::disabled();
@@ -380,7 +409,9 @@ impl FeedbackClient {
                 max_feedback_bytes: config.feedback.max_feedback_bytes,
                 max_report_bytes: config.feedback.max_report_bytes,
                 install_id,
-                session_id: random_uuid_like(),
+                session_id: session_id
+                    .map(str::to_string)
+                    .unwrap_or_else(random_uuid_like),
                 http,
             })),
         }
