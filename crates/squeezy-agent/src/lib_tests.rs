@@ -2508,16 +2508,61 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
         })
         .expect("subagent user prompt");
     // Unknown topics fall back to the minimal corpus (README + AGENT_APPROACH).
-    // Check for something present in that fallback set rather than PROVIDERS.md,
-    // which is only included when the curated topic cites it.
+    // AGENT_APPROACH must be present; PROVIDERS.md is topic-specific and must be absent.
     assert!(
         user_prompt.contains("PATH: docs/external/AGENT_APPROACH.md"),
-        "subagent prompt must inline at least the fallback docs: {user_prompt:?}"
+        "unknown-topic corpus must contain the baseline AGENT_APPROACH doc: {user_prompt:?}"
+    );
+    assert!(
+        !user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
+        "unknown-topic corpus must NOT contain unrelated topic-specific docs: corpus scoping is broken"
     );
 
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("quantum-billing"), "{completed}");
     assert!(!completed.contains("No local help coverage"), "{completed}");
+}
+
+#[tokio::test]
+async fn doc_help_subagent_scopes_corpus_to_matching_topic() {
+    // A /help <known-topic> request must send only that topic's docs (plus
+    // baseline), not the full ~120 KB corpus.  This test fires on the
+    // "providers" topic: PROVIDERS.md must be present, while SESSIONS.md
+    // (a different topic's doc) must be absent.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("Providers answer.".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_scope".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn("/help providers".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "exactly one DocHelp subagent request");
+    let user_prompt = requests[0]
+        .input
+        .iter()
+        .find_map(|item| match item {
+            squeezy_llm::LlmInputItem::UserText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("subagent user prompt");
+
+    assert!(
+        user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
+        "providers topic corpus must include PROVIDERS.md"
+    );
+    assert!(
+        !user_prompt.contains("PATH: docs/external/SESSIONS.md"),
+        "providers topic corpus must NOT include unrelated SESSIONS.md: corpus scoping is broken"
+    );
 }
 
 #[tokio::test]
