@@ -7228,6 +7228,7 @@ fn transcript_lines_for_render(
             turn_coin_span(app),
             &pending_assistant,
             Style::default(),
+            None,
         ));
         lines.push(Line::from(""));
     }
@@ -7314,6 +7315,7 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
             turn_coin_span(app),
             &content,
             Style::default(),
+            None,
         ));
     }
     lines
@@ -8142,7 +8144,14 @@ fn format_message_entry_with_width(
         return format_user_prompt_entry(item, selected, width);
     }
     if item.role == Role::Assistant {
-        return format_assistant_message_entry(item, collapsed, selected, outcome, show_reasoning);
+        return format_assistant_message_entry(
+            item,
+            collapsed,
+            selected,
+            outcome,
+            width,
+            show_reasoning,
+        );
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
@@ -8326,6 +8335,7 @@ fn format_assistant_message_entry(
     collapsed: bool,
     selected: bool,
     outcome: MessageOutcome,
+    width: Option<u16>,
     show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
@@ -8357,6 +8367,7 @@ fn format_assistant_message_entry(
             assistant_static_span(color),
             &item.content,
             Style::default(),
+            width,
         ));
     }
     lines.push(Line::from(""));
@@ -9233,7 +9244,10 @@ fn assistant_line(
     content: impl Into<String>,
     content_style: Style,
 ) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
+    // Three-cell margin lands the answer marker in the rail's gutter column so
+    // the `│` connector threads straight down into it; selection shows `>` at
+    // the far left without disturbing that column.
+    let marker = if selected { ">  " } else { "   " };
     let content = content.into();
     let spacer = if content.is_empty() { "" } else { " " };
     Line::from(vec![
@@ -9249,29 +9263,138 @@ fn assistant_text_lines(
     status: Span<'static>,
     content: &str,
     content_style: Style,
+    width: Option<u16>,
 ) -> Vec<Line<'static>> {
+    // The marker (3 cells) + status glyph (1) + a space (1) push the answer text
+    // to column 5; every wrapped/continuation row hangs to that same column so a
+    // long answer reads as one indented block under the marker rather than
+    // spilling back to column 0 when the terminal soft-wraps it.
+    let marker = if selected { ">  " } else { "   " };
+    let hang = "     ";
+    let marker_head = |seg: Vec<Span<'static>>| {
+        let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
+        spans.extend(seg);
+        Line::from(spans)
+    };
     if content.is_empty() {
-        return vec![assistant_line(selected, status, "", content_style)];
+        return vec![marker_head(Vec::new())];
     }
-    render::markdown::render_markdown(content)
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            for span in &mut line.spans {
-                span.style = content_style.patch(span.style);
-            }
-            if index == 0 {
-                let marker = if selected { "> " } else { "  " };
-                let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
-                spans.extend(line.spans);
-                Line::from(spans)
+    // Reserve the 5-cell margin from the usable width so wrapped text fits inside
+    // the terminal; with no known width (tests/overlay) leave the markdown lines
+    // intact and let the caller's renderer wrap.
+    let text_width = width
+        .map(|w| usize::from(w).saturating_sub(hang.len()).max(8))
+        .unwrap_or(usize::MAX);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for mut line in render::markdown::render_markdown(content) {
+        for span in &mut line.spans {
+            span.style = content_style.patch(span.style);
+        }
+        for seg in wrap_styled_words(&line.spans, text_width) {
+            if first {
+                out.push(marker_head(seg));
+                first = false;
+            } else if seg.is_empty() {
+                out.push(Line::from(""));
             } else {
-                let mut spans = vec![Span::raw("    ")];
-                spans.extend(line.spans);
-                Line::from(spans)
+                let mut spans = vec![Span::raw(hang)];
+                spans.extend(seg);
+                out.push(Line::from(spans));
             }
-        })
-        .collect()
+        }
+    }
+    if out.is_empty() {
+        out.push(marker_head(Vec::new()));
+    }
+    out
+}
+
+/// Greedy word-wrap a styled line to `width` display cells, preserving each
+/// span's style. Words longer than the width are hard-broken; runs of spaces
+/// collapse to one at a wrap point. A `usize::MAX` width returns the line as a
+/// single row (no wrapping). Width is measured in `char`s, matching the rest of
+/// the transcript layout.
+fn wrap_styled_words(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut word: Vec<(char, Style)> = Vec::new();
+    for span in spans {
+        for ch in span.content.chars() {
+            if ch == ' ' {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                word.push((ch, span.style));
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row: Vec<(char, Style)> = Vec::new();
+    let mut row_w = 0usize;
+    for word in words {
+        let wl = word.len();
+        if row_w != 0 && row_w + 1 + wl > width {
+            rows.push(std::mem::take(&mut row));
+            row_w = 0;
+        }
+        if row_w != 0 {
+            row.push((' ', Style::default()));
+            row_w += 1;
+        }
+        if wl <= width {
+            row.extend(word);
+            row_w += wl;
+        } else {
+            for cell in word {
+                if row_w >= width {
+                    rows.push(std::mem::take(&mut row));
+                    row_w = 0;
+                }
+                row.push(cell);
+                row_w += 1;
+            }
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows.into_iter().map(coalesce_cells_to_spans).collect()
+}
+
+/// Merge a row of per-`char` styled cells back into the fewest `Span`s, joining
+/// runs that share a style.
+fn coalesce_cells_to_spans(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (ch, style) in cells {
+        if cur == Some(style) {
+            buf.push(ch);
+        } else {
+            if let Some(prev) = cur.take() {
+                spans.push(Span::styled(std::mem::take(&mut buf), prev));
+            }
+            buf.push(ch);
+            cur = Some(style);
+        }
+    }
+    if let Some(style) = cur {
+        spans.push(Span::styled(buf, style));
+    }
+    spans
 }
 
 fn detail_text_lines(selected: bool, color: Color, content: &str) -> Vec<Line<'static>> {

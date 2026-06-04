@@ -13353,10 +13353,10 @@ fn rail_gallery_renders_a_full_turn() {
         1,
         "{scrollback}"
     );
-    // The gutter threads into the answer: a `│` connector then the `☽` answer
-    // (its crescent sits in the gutter column).
+    // The gutter threads into the answer: a `│` connector then the `☽` answer,
+    // whose crescent sits in the gutter column (col 3) so the line is unbroken.
     assert!(
-        scrollback.contains("exit 1\n   │\n  ☽ Found 2 auth issues"),
+        scrollback.contains("exit 1\n   │\n   ☽ Found 2 auth issues"),
         "{scrollback}"
     );
 }
