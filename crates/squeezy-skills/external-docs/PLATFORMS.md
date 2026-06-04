@@ -33,6 +33,11 @@ CI smoke-tests both debug and release artifacts with:
 squeezy doctor
 ```
 
+macOS release binaries are not fully static. Apple does not support fully
+static userland binaries for normal CLI distribution, so Squeezy allows only
+Apple system dependencies (`/usr/lib/*` and `/System/Library/*`) and rejects
+third-party dylibs in CI.
+
 `squeezy doctor` prints a `squeezy: ok` (or `squeezy: ok (warnings)` /
 `squeezy: fail`) header, the binary version and target triple, and one
 indented row per check in the form `[ok|warn|fail] name  detail`. Checks
@@ -85,6 +90,12 @@ the deterministic validation harness, and the debug-artifact smoke test
 on Windows alongside the macOS and Linux entries. Release tagging
 produces an additional `squeezy-x86_64-pc-windows-msvc.zip` archive with
 a matching `.sha256`.
+
+Windows artifact builds pass `-C target-feature=+crt-static` so the MSVC C
+runtime is linked into the executable instead of requiring separate Visual C++
+runtime DLLs. CI inspects the PE import table and fails if `vcruntime`,
+`msvcp`, `concrt`, `ucrtbase`, or `api-ms-win-crt` DLL imports are present.
+The binary will still import Windows system DLLs supplied by the OS.
 
 Windows-specific notes:
 

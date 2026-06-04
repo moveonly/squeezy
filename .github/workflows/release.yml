@@ -106,6 +106,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools file binutils
 
+      - name: Install Windows binary inspection tools
+        if: endsWith(matrix.target, '-windows-msvc')
+        run: rustup component add llvm-tools-preview
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -127,6 +131,9 @@ jobs:
             aarch64-unknown-linux-musl)
               export CC_aarch64_unknown_linux_musl=musl-gcc
               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+              ;;
+            x86_64-pc-windows-msvc)
+              export RUSTFLAGS="-C target-feature=+crt-static"
               ;;
           esac
 
@@ -150,6 +157,29 @@ jobs:
                 echo "Linux release binary has dynamic library dependencies" >&2
                 exit 1
               fi
+              ;;
+            *-windows-msvc)
+              objdump="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objdump.exe"
+              if command -v cygpath >/dev/null 2>&1; then
+                objdump="$(cygpath -u "$objdump")"
+              fi
+              "$objdump" -p "$binary" | tee windows-imports.txt
+              if grep -Eiq 'DLL Name: (vcruntime|msvcp|concrt|ucrtbase|api-ms-win-crt)' windows-imports.txt; then
+                echo "Windows release binary imports C/C++ runtime DLLs; build with static CRT" >&2
+                exit 1
+              fi
+              ;;
+            *-apple-darwin)
+              otool -L "$binary" | tee macos-dylibs.txt
+              while IFS= read -r dylib; do
+                case "$dylib" in
+                  /usr/lib/*|/System/Library/*) ;;
+                  *)
+                    echo "macOS release binary depends on a non-system dylib: $dylib" >&2
+                    exit 1
+                    ;;
+                esac
+              done < <(awk 'NR > 1 { print $1 }' macos-dylibs.txt)
               ;;
           esac
 
