@@ -13360,3 +13360,28 @@ fn rail_gallery_renders_a_full_turn() {
         "{scrollback}"
     );
 }
+
+#[test]
+fn prompt_coin_iterates_full_moon_cycle_while_typing() {
+    let mut app = test_app(SessionMode::Build);
+    // An empty composer rests on a steady crescent.
+    app.input.clear();
+    assert_eq!(prompt_coin_frame(&app), "☽");
+    // Each character advances exactly one phase, walking the full lunar cycle.
+    // The live typing coin is not restricted to the sent prompt's half-moons.
+    for (typed, expected) in [
+        (1usize, "◑"),
+        (2, "●"),
+        (3, "◐"),
+        (4, "☾"),
+        (5, "○"),
+        (6, "☽"),
+    ] {
+        set_input(&mut app, "x".repeat(typed));
+        assert_eq!(
+            prompt_coin_frame(&app),
+            expected,
+            "{typed} characters typed"
+        );
+    }
+}

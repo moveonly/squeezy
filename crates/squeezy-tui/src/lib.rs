@@ -8256,11 +8256,14 @@ fn format_user_prompt_entry(
     let amber = Style::default().fg(crate::render::theme::accent());
     let bullet_style = amber.add_modifier(Modifier::BOLD);
     const INDENT: &str = "  ";
-    // Cycle through the moon-phase set so consecutive prompts get a
-    // visually different bullet — content-hashed (not index-based) so
-    // the marker is stable per message even when prompts are
-    // reordered/collapsed in the transcript.
-    const BULLETS: &[&str] = &["○", "☽", "◑", "●", "◐", "☾"];
+    // The sent prompt's bullet is a half-moon — first- or last-quarter,
+    // content-hashed (not index-based) so it stays stable per message yet
+    // alternates between consecutive prompts. It is deliberately held to the
+    // half phases so it never collides with the crescents `☾`/`☽` that mark the
+    // prompt coin and the answer; the three moon roles stay visually distinct.
+    // (The live typing coin, by contrast, walks the full cycle — see
+    // `prompt_coin_frame`.)
+    const BULLETS: &[&str] = &["◑", "◐"];
     let bullet_idx = item
         .content
         .bytes()
