@@ -156,13 +156,22 @@ fn skills_doctor_workspace(name: &str) -> std::path::PathBuf {
     root
 }
 
+fn skills_doctor_config(root: &std::path::Path) -> AppConfig {
+    AppConfig {
+        workspace_root: root.to_path_buf(),
+        skills: squeezy_core::SkillsConfig {
+            user_dir: root.join("user"),
+            compat_user_dir: root.join("compat"),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[test]
 fn skills_check_with_no_skills_is_ok() {
     let root = skills_doctor_workspace("skills_empty");
-    let mut config = AppConfig::default();
-    config.workspace_root = root.clone();
-    config.skills.user_dir = root.join("user");
-    config.skills.compat_user_dir = root.join("compat");
+    let config = skills_doctor_config(&root);
 
     let check = skills_check(&config);
     assert_eq!(check.status, Status::Ok);
@@ -182,10 +191,7 @@ fn skills_check_reports_enabled_count() {
     )
     .expect("write skill");
 
-    let mut config = AppConfig::default();
-    config.workspace_root = root.clone();
-    config.skills.user_dir = root.join("user");
-    config.skills.compat_user_dir = root.join("compat");
+    let config = skills_doctor_config(&root);
 
     let check = skills_check(&config);
     assert_eq!(check.status, Status::Ok);
@@ -215,10 +221,7 @@ fn skills_check_warns_on_ambiguous_same_precedence_names() {
     )
     .expect("write second dup");
 
-    let mut config = AppConfig::default();
-    config.workspace_root = root.clone();
-    config.skills.user_dir = root.join("user");
-    config.skills.compat_user_dir = root.join("compat");
+    let config = skills_doctor_config(&root);
 
     let check = skills_check(&config);
     assert_eq!(check.status, Status::Warn);
