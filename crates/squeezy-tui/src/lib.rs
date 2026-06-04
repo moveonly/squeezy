@@ -1949,7 +1949,10 @@ fn open_subagent_transcript_overlay(app: &mut TuiApp) {
         detail: OverlayDetail::Collapsed,
         ..TranscriptOverlayState::default()
     });
-    app.status = "subagent conversation — Ctrl+T to expand, Esc to close".to_string();
+    app.status = format!(
+        "subagent conversation — {} to expand, Esc to close",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
 }
 
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -6855,7 +6858,10 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Some(state) => state,
         None => return,
     };
-    let title = " Transcript — Ctrl+T or Esc to close · PgUp/PgDn or wheel scroll ";
+    let title = format!(
+        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll ",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -13991,6 +13997,13 @@ fn format_status_hints(app: &TuiApp) -> String {
     }
 }
 
+/// Returns the display string (e.g. `"Ctrl+T"`, `"Ctrl+O"`) for a
+/// rebindable action, consulting the live resolved keymap so hints
+/// stay accurate after `[tui.keymap]` overrides.
+fn key_hint(app: &TuiApp, action: keymap::Action) -> String {
+    app.keymap.binding(action).display()
+}
+
 fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(overlay) = app.transcript_overlay.as_ref() {
         return if overlay.mode.mouse_capture() {
@@ -14029,8 +14042,11 @@ fn format_status_hint_base(app: &TuiApp) -> String {
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
     } else if app.cancel.is_some() {
-        let mut hint = String::from(
-            "Ctrl+C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl+P task · Ctrl+T full transcript · Ctrl+Y copy · /help",
+        let mut hint = format!(
+            "Ctrl+C/Esc interrupt · Enter queue · Ctrl+J newline · {} task · {} full transcript · {} copy · /help",
+            key_hint(app, keymap::Action::ToggleTaskPanel),
+            key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+            key_hint(app, keymap::Action::CopyLastAssistant),
         );
         if !app.subagent_pane.records.is_empty() {
             hint.push_str(" · Down subagents");
@@ -14045,11 +14061,15 @@ fn format_status_hint_base(app: &TuiApp) -> String {
     if app.cancelled_prompt.is_some() && app.turn_rx.is_none() && app.input.is_empty() {
         // We're idle right after a cancelled/failed turn — surface the
         // recovery affordance before the regular hint set.
-        return "Ctrl+R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
+        return format!(
+            "{} restore last prompt · Enter send · Ctrl+J newline · /help",
+            key_hint(app, keymap::Action::RestoreCancelledPrompt)
+        );
     }
-    let mut base =
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl+T full transcript · /help"
-            .to_string();
+    let mut base = format!(
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · {} full transcript · /help",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
     if app.context_compaction_threshold > 0
         && context_window_pct(
             app.context_estimate.estimated_tokens,
