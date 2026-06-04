@@ -800,6 +800,109 @@ func (r Runner) TestSuiteStyle() {}
 }
 
 #[test]
+fn go_parser_records_struct_embedding_as_base_attribute() {
+    let source = r#"
+package zoo
+
+type Animal struct{}
+
+type Dog struct {
+    Animal
+}
+
+type Cat struct {
+    *Animal
+}
+
+type X struct {
+    io.Reader
+}
+
+type Puppy struct {
+    Dog
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("zoo/embed.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let base_attrs = |name: &str| -> Vec<String> {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::Struct)
+            .unwrap_or_else(|| panic!("{name} struct declaration"))
+            .attributes
+            .iter()
+            .filter(|attr| attr.starts_with("base:"))
+            .cloned()
+            .collect()
+    };
+
+    assert_eq!(base_attrs("Dog"), vec!["base:Animal".to_string()]);
+    // Pointer embedding strips the leading `*`.
+    assert_eq!(base_attrs("Cat"), vec!["base:Animal".to_string()]);
+    // Qualified embedding drops the `io.` package qualifier.
+    assert_eq!(base_attrs("X"), vec!["base:Reader".to_string()]);
+    // Transitive sanity: Puppy -> Dog -> Animal; the closure of base:Animal
+    // reaches Puppy via Dog's own base: edge.
+    assert_eq!(base_attrs("Puppy"), vec!["base:Dog".to_string()]);
+    assert!(
+        base_attrs("Animal").is_empty(),
+        "a struct with no embedding carries no base: attribute"
+    );
+}
+
+#[test]
+fn go_parser_records_generic_struct_embedding_as_base_attribute() {
+    let source = r#"
+package zoo
+
+type Sub struct {
+    Base[T]
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("zoo/generic.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let sub = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Sub" && symbol.kind == SymbolKind::Struct)
+        .expect("Sub struct declaration");
+    // Generic instantiation `Base[T]` is recorded by its underlying base name.
+    assert!(sub.attributes.contains(&"base:Base".to_string()));
+}
+
+#[test]
+fn go_parser_records_interface_embedding_as_base_attribute() {
+    let source = r#"
+package io
+
+type ReadWriter interface {
+    Reader
+    Writer
+    Greet(name string) string
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("io/rw.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let read_writer = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "ReadWriter" && symbol.kind == SymbolKind::Interface)
+        .expect("ReadWriter interface declaration");
+    assert!(read_writer.attributes.contains(&"base:Reader".to_string()));
+    assert!(read_writer.attributes.contains(&"base:Writer".to_string()));
+    // Method members (`method_elem`) are not embeddings and produce no base:.
+    assert!(
+        !read_writer.attributes.contains(&"base:Greet".to_string()),
+        "interface method members must not be recorded as base:"
+    );
+}
+
+#[test]
 fn go_parser_tags_embedded_struct_fields_with_embed_attribute() {
     let source = r#"
 package greeter

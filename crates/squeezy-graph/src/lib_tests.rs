@@ -7723,6 +7723,79 @@ export class Repo<T extends Entity> extends Base<T> implements Lifecycle<T> {}
 }
 
 #[test]
+fn graph_records_go_embedding_as_base_attributes() {
+    // The Go extractor records struct/interface embedding as queryable `base:`
+    // attributes (not only `go:embed` child fields), and the graph build carries
+    // them through — so `decl_search(attribute="base:Animal")` and its transitive
+    // closure can enumerate Go embedders (the capability Go previously lacked).
+    let mut parser = LanguageParser::new().unwrap();
+    let app = go_record(
+        "zoo/zoo.go",
+        r#"package zoo
+
+type Animal struct{}
+
+type Dog struct {
+    Animal
+}
+
+type Puppy struct {
+    Dog
+}
+
+type Reader interface{}
+type Writer interface{}
+
+type ReadWriter interface {
+    Reader
+    Writer
+}
+"#,
+    );
+    let parsed = parser.parse_record(&app).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let dog = graph
+        .find_symbol_by_name("Dog")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Struct)
+        .expect("Dog struct symbol");
+    assert!(
+        dog.attributes.iter().any(|attr| attr == "base:Animal"),
+        "Dog should carry base:Animal, got {:?}",
+        dog.attributes,
+    );
+
+    // Transitive closure of base:Animal reaches Puppy via Dog's own base: edge.
+    let puppy = graph
+        .find_symbol_by_name("Puppy")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Struct)
+        .expect("Puppy struct symbol");
+    assert!(
+        puppy.attributes.iter().any(|attr| attr == "base:Dog"),
+        "Puppy should carry base:Dog, got {:?}",
+        puppy.attributes,
+    );
+
+    let read_writer = graph
+        .find_symbol_by_name("ReadWriter")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Interface)
+        .expect("ReadWriter interface symbol");
+    assert!(
+        read_writer.attributes.iter().any(|attr| attr == "base:Reader"),
+        "ReadWriter should carry base:Reader, got {:?}",
+        read_writer.attributes,
+    );
+    assert!(
+        read_writer.attributes.iter().any(|attr| attr == "base:Writer"),
+        "ReadWriter should carry base:Writer, got {:?}",
+        read_writer.attributes,
+    );
+}
+
+#[test]
 fn dart_import_show_decomposes_into_named_imports() {
     let mut parser = LanguageParser::new().unwrap();
     let main = dart_record(
