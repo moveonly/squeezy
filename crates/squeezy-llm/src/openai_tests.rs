@@ -1753,6 +1753,73 @@ fn is_classic_azure_deployment_url_false_for_v1_url() {
 }
 
 #[test]
+fn azure_entra_config_uses_bearer_token_without_api_key() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: None,
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::new(),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: true,
+        entra_bearer_token: Some("entra-token".to_string()),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+
+    assert_eq!(provider.auth_mode, OpenAiAuthMode::Bearer);
+}
+
+#[test]
+fn azure_header_auth_does_not_require_api_key() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: None,
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::new(),
+        extra_headers: std::collections::BTreeMap::from([(
+            "Ocp-Apim-Subscription-Key".to_string(),
+            "apim-key".to_string(),
+        )]),
+        use_entra_id: false,
+        entra_bearer_token: None,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+
+    assert_eq!(provider.auth_mode, OpenAiAuthMode::HeadersOnly);
+    assert_eq!(
+        provider.extra_headers.get("Ocp-Apim-Subscription-Key"),
+        Some(&"apim-key".to_string()),
+    );
+}
+
+#[test]
+fn azure_without_key_or_auth_headers_still_reports_missing_key() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: None,
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::new(),
+        extra_headers: std::collections::BTreeMap::new(),
+        use_entra_id: false,
+        entra_bearer_token: None,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+
+    let error = OpenAiProvider::from_azure_config(&config).expect_err("missing key must fail");
+
+    assert!(
+        format!("{error}").contains("AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST"),
+        "error should name missing key env: {error}",
+    );
+}
+
+#[test]
 fn azure_deployment_name_map_translates_mapped_model() {
     let config = squeezy_core::AzureOpenAiConfig {
         api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),

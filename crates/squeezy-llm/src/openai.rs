@@ -32,11 +32,20 @@ pub struct OpenAiProvider {
     api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     api_version: Option<String>,
+    auth_mode: OpenAiAuthMode,
+    extra_headers: BTreeMap<String, String>,
     /// Logical model id → Azure-deployment name. Populated only from
     /// [`AzureOpenAiConfig::deployment_name_map`]; every other constructor
     /// leaves this empty so the model id passes through verbatim.
     deployment_name_map: BTreeMap<String, String>,
     transport: ProviderTransportConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiAuthMode {
+    Bearer,
+    ApiKey,
+    HeadersOnly,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -47,6 +56,11 @@ impl std::fmt::Debug for OpenAiProvider {
             .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("api_version", &self.api_version)
+            .field("auth_mode", &self.auth_mode)
+            .field(
+                "extra_headers",
+                &format_args!("<{} headers>", self.extra_headers.len()),
+            )
             .field("deployment_name_map", &self.deployment_name_map)
             .field("transport", &self.transport)
             .finish()
@@ -78,8 +92,21 @@ impl OpenAiProvider {
         // Responses endpoint under), so a bare `AZURE_OPENAI_*` config works
         // out of the box. Operators can still pin a dated version via
         // `[providers.azure_openai].api_version`.
-        let api_key =
-            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+        let (api_key, auth_mode) = if config.use_entra_id {
+            let token = config.entra_bearer_token.clone().ok_or_else(|| {
+                SqueezyError::ProviderNotConfigured(
+                    "missing AZURE_OPENAI_BEARER_TOKEN for Azure OpenAI Entra ID auth".to_string(),
+                )
+            })?;
+            (token, OpenAiAuthMode::Bearer)
+        } else if azure_headers_provide_auth(&config.extra_headers) {
+            (String::new(), OpenAiAuthMode::HeadersOnly)
+        } else {
+            (
+                resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value,
+                OpenAiAuthMode::ApiKey,
+            )
+        };
         // H-36: detect the classic `/openai/deployments/{deployment}` URL
         // shape that older Azure Government / Mooncake resources still
         // use. The Responses route on these resources expects the URL to
@@ -87,11 +114,13 @@ impl OpenAiProvider {
         // rewrite (with the v1 `/openai/v1` path) breaks them. Stash a
         // flag here so `stream_response` can skip the deployment-name
         // rewrite below.
-        let mut provider = Self::with_api_key_source(
+        let mut provider = Self::with_api_key_source_and_options(
             "azure_openai",
             static_api_key_source(api_key, "azure_openai"),
             config.base_url.trim_end_matches('/').to_string(),
             Some(config.api_version.clone()),
+            auth_mode,
+            config.extra_headers.clone(),
             config.transport,
         );
         provider.deployment_name_map = config.deployment_name_map.clone();
@@ -145,12 +174,34 @@ impl OpenAiProvider {
         api_version: Option<String>,
         transport: ProviderTransportConfig,
     ) -> Self {
+        Self::with_api_key_source_and_options(
+            name,
+            api_key,
+            base_url,
+            api_version,
+            OpenAiAuthMode::Bearer,
+            BTreeMap::new(),
+            transport,
+        )
+    }
+
+    fn with_api_key_source_and_options(
+        name: &'static str,
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        api_version: Option<String>,
+        auth_mode: OpenAiAuthMode,
+        extra_headers: BTreeMap<String, String>,
+        transport: ProviderTransportConfig,
+    ) -> Self {
         Self {
             name,
             client: shared_client(&transport),
             api_key,
             base_url,
             api_version,
+            auth_mode,
+            extra_headers,
             deployment_name_map: BTreeMap::new(),
             transport,
         }
@@ -468,6 +519,15 @@ fn percent_encode_query_component(value: &str) -> String {
     out
 }
 
+fn azure_headers_provide_auth(headers: &BTreeMap<String, String>) -> bool {
+    headers.keys().any(|key| {
+        key.eq_ignore_ascii_case("authorization")
+            || key.eq_ignore_ascii_case("api-key")
+            || key.eq_ignore_ascii_case("apim-subscription-key")
+            || key.eq_ignore_ascii_case("ocp-apim-subscription-key")
+    })
+}
+
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
         self.name
@@ -513,36 +573,8 @@ impl LlmProvider for OpenAiProvider {
             body["model"] = json!(deployment);
         }
         let affinity_headers = Self::affinity_headers(&request);
-        // H-35 (interim Entra-ID Bearer path): Microsoft Entra ID is
-        // the modern auth path for Azure OpenAI (`Authorization: Bearer
-        // <jwt>` with resource `https://cognitiveservices.azure.com/.default`).
-        // `AzureOpenAiConfig::use_entra_id` is the canonical config slot
-        // and lives in squeezy-core (Phase 4I). Until that schema add
-        // ships, callers can opt in via the `AZURE_OPENAI_USE_ENTRA_ID`
-        // env var — when set to a truthy value the provider attaches
-        // the api key as a Bearer token instead of the `api-key` header.
-        // TODO(Phase 4I): replace this env-var read with a typed config
-        //  field on `AzureOpenAiConfig` and a token-provider hook.
-        let use_entra_id_bearer = provider_name == "azure_openai"
-            && std::env::var("AZURE_OPENAI_USE_ENTRA_ID")
-                .ok()
-                .is_some_and(|v| {
-                    matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                });
-        // H-34 + M-04 (org/project/service_tier/extra_headers): the
-        // schema slots live on `AzureOpenAiConfig` / `OpenAiConfig` in
-        // squeezy-core. TODO(Phase 4I):
-        //  - add `OpenAiConfig::organization`, `OpenAiConfig::project`,
-        //    `OpenAiConfig::service_tier` fields and thread through to
-        //    this auth/body section (set `OpenAI-Organization`,
-        //    `OpenAI-Project` headers; emit `service_tier` in body).
-        //  - add `AzureOpenAiConfig::extra_headers` map and apply here
-        //    after `api-key` / Bearer so user-supplied headers (Entra
-        //    Bearer, APIM subscription key, x-ms-correlation-request-id)
-        //    can override the default.
+        let auth_mode = self.auth_mode;
+        let extra_headers = self.extra_headers.clone();
 
         Box::pin(try_stream! {
             let response = send_with_auth_retry(
@@ -551,13 +583,10 @@ impl LlmProvider for OpenAiProvider {
                 &cancel,
                 |key| {
                     let builder = client.post(&url);
-                    let builder = if provider_name == "azure_openai" && !use_entra_id_bearer {
-                        builder.header("api-key", key)
-                    } else {
-                        // OpenAI / xAI / Codex use Bearer; Azure with
-                        // `AZURE_OPENAI_USE_ENTRA_ID=1` also rides this
-                        // arm (H-35 interim path).
-                        builder.bearer_auth(key)
+                    let builder = match auth_mode {
+                        OpenAiAuthMode::ApiKey => builder.header("api-key", key),
+                        OpenAiAuthMode::Bearer => builder.bearer_auth(key),
+                        OpenAiAuthMode::HeadersOnly => builder,
                     };
                     // Cache-affinity headers (only emitted when the
                     // request carries a cache key) keep multi-turn
@@ -566,6 +595,9 @@ impl LlmProvider for OpenAiProvider {
                     let builder = affinity_headers
                         .iter()
                         .fold(builder, |b, (name, value)| b.header(*name, value.as_str()));
+                    let builder = extra_headers
+                        .iter()
+                        .fold(builder, |b, (name, value)| b.header(name, value));
                     builder.json(&body)
                 },
             ).await?;
