@@ -1,7 +1,9 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
-use super as help;
-use super::{HelpCitation, HelpStatus, SqueezyHelp};
+use super::{
+    HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
+    matches_squeezy_help_input,
+};
 
 #[test]
 fn squeezy_help_config_answer_cites_docs_and_config_sections() {
@@ -77,7 +79,7 @@ fn squeezy_help_falls_through_when_no_curated_topic_matches() {
         "natural-language prompts without a curated topic must reach the model"
     );
     assert!(
-        !help::matches_squeezy_help_input("Does Squeezy support quantum billing?"),
+        !matches_squeezy_help_input("Does Squeezy support quantum billing?"),
         "matches_squeezy_help_input must agree"
     );
 }
@@ -114,7 +116,7 @@ fn squeezy_help_ignores_implementation_and_debugging_requests() {
             "intercept must not capture implementation request: {input}"
         );
         assert!(
-            !help::matches_squeezy_help_input(input),
+            !matches_squeezy_help_input(input),
             "matches_squeezy_help_input must agree: {input}"
         );
     }
@@ -131,7 +133,7 @@ fn matches_squeezy_help_input_agrees_with_answer_for_input() {
     ];
     for input in positives {
         assert!(
-            help::matches_squeezy_help_input(input),
+            matches_squeezy_help_input(input),
             "matches_squeezy_help_input should accept: {input}"
         );
         assert!(
@@ -148,7 +150,7 @@ fn matches_squeezy_help_input_agrees_with_answer_for_input() {
     ];
     for input in negatives {
         assert!(
-            !help::matches_squeezy_help_input(input),
+            !matches_squeezy_help_input(input),
             "matches_squeezy_help_input should reject: {input}"
         );
         assert!(
@@ -174,7 +176,7 @@ fn squeezy_help_ignores_code_navigation_prompts() {
             "code-navigation prompt must reach the model: {input}"
         );
         assert!(
-            !help::matches_squeezy_help_input(input),
+            !matches_squeezy_help_input(input),
             "matches_squeezy_help_input must agree: {input}"
         );
     }
@@ -254,7 +256,7 @@ fn squeezy_help_falls_through_for_wild_squeezy_questions() {
             "wild squeezy prompt must reach the model: {input}"
         );
         assert!(
-            !help::matches_squeezy_help_input(input),
+            !matches_squeezy_help_input(input),
             "matches_squeezy_help_input must agree: {input}"
         );
     }
@@ -339,8 +341,8 @@ api_key_env = "<redacted>"
 fn bundled_doc_paths_exist_on_disk() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs_dir = manifest_dir.join("external-docs");
-    for path in help::bundled_doc_paths() {
-        let file_name = path
+    for path in bundled_doc_paths() {
+        let file_name: &str = path
             .rsplit('/')
             .next()
             .expect("bundled doc path has filename");
@@ -357,7 +359,7 @@ fn bundled_doc_paths_exist_on_disk() {
 fn bundled_docs_are_complete_external_corpus() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs_dir = manifest_dir.join("external-docs");
-    let bundled = help::bundled_docs();
+    let bundled = bundled_docs();
     let bundled_paths = bundled.iter().map(|doc| doc.path).collect::<BTreeSet<_>>();
 
     for doc in &bundled {
@@ -394,9 +396,7 @@ fn bundled_docs_are_complete_external_corpus() {
 
 #[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
-    let bundled = help::bundled_doc_paths()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let bundled = bundled_doc_paths().into_iter().collect::<BTreeSet<_>>();
     let topics = [
         "agent",
         "tui",

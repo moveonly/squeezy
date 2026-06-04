@@ -39,7 +39,7 @@ use squeezy_llm::{
     provider_honors_output_schema,
 };
 use squeezy_skills::{
-    BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
+    BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, matches_squeezy_help_input,
     relevant_docs_for_input,
 };
 use squeezy_store::{
