@@ -19,6 +19,12 @@ interface Env {
 }
 
 type JsonObject = Record<string, unknown>;
+type SanitizedTelemetryEvent = {
+  event: string;
+  timestampMs: number;
+  eventSequence: number;
+  properties: JsonObject;
+};
 
 interface R2Bucket {
   put(
@@ -38,6 +44,10 @@ const EVENT_NAMES = new Set([
   "squeezy_graph_build_completed",
   "squeezy_graph_refresh_completed",
   "squeezy_failure_seen",
+  "approval_best_effort_fallback",
+  "ai_reviewer_allow_downgrade",
+  "squeezy_routing_routed",
+  "squeezy_routing_escalated",
 ]);
 const SITE_EVENT_NAMES = new Set([
   "squeezy_site_page_view",
@@ -48,7 +58,35 @@ const FEEDBACK_SOURCES = new Set(["cli", "tui"]);
 const SITE_REFERRER_KINDS = new Set(["none", "internal", "search", "social", "external"]);
 const SITE_TARGET_KINDS = new Set(["internal", "github", "release", "docs", "install", "other"]);
 
-const PROVIDERS = new Set(["open_ai", "anthropic", "google", "azure_open_ai", "bedrock", "ollama"]);
+const PROVIDERS = new Set([
+  "open_ai",
+  "anthropic",
+  "google",
+  "azure_open_ai",
+  "bedrock",
+  "ollama",
+  "open_router",
+  "vercel",
+  "port_key",
+  "groq",
+  "x_ai",
+  "deep_seek",
+  "vertex",
+  "mistral",
+  "together",
+  "fireworks",
+  "cerebras",
+  "deep_infra",
+  "baseten",
+  "lmstudio",
+  "vllm",
+  "llamacpp",
+  "cloudflare_workers_ai",
+  "cloudflare_ai_gateway",
+  "open_ai_compatible",
+  "open_ai_codex",
+  "faux",
+]);
 const MODEL_FAMILIES = new Set(["gpt", "claude", "gemini", "bedrock", "ollama", "other"]);
 const TOOL_NAMES = new Set([
   "glob",
@@ -70,7 +108,9 @@ const GRAPH_SEQUENCE_SCOPES = new Set(["one_shot", "repeated"]);
 const OUTCOME_STATUSES = new Set(["success", "error", "cancelled", "skipped"]);
 const ERROR_KINDS = new Set(["provider", "tool", "permission", "budget", "graph", "io", "config", "unknown"]);
 
-const PROPERTY_SCHEMAS: Record<string, "u64" | Set<string>> = {
+type PropertySchema = "u64" | "hex64" | "hex32" | "hex16" | "token" | Set<string>;
+
+const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
   turn_index: "u64",
   tool_sequence: "u64",
   provider: PROVIDERS,
@@ -81,6 +121,11 @@ const PROPERTY_SCHEMAS: Record<string, "u64" | Set<string>> = {
   duration_ms: "u64",
   tool_calls: "u64",
   files_scanned: "u64",
+  c_files: "u64",
+  csharp_files: "u64",
+  cpp_files: "u64",
+  go_files: "u64",
+  python_files: "u64",
   rust_files: "u64",
   supported_files: "u64",
   unsupported_files: "u64",
@@ -104,6 +149,14 @@ const PROPERTY_SCHEMAS: Record<string, "u64" | Set<string>> = {
   graph_sequence_scope: GRAPH_SEQUENCE_SCOPES,
   status: OUTCOME_STATUSES,
   error_kind: ERROR_KINDS,
+  args_sha256: "hex64",
+  output_sha256: "hex64",
+  content_sha256: "hex64",
+  sandbox_backend: "token",
+  permission_capability: "token",
+  routing_reason: "token",
+  trace_id: "hex32",
+  span_id: "hex16",
 };
 
 export default {
@@ -142,19 +195,20 @@ export default {
     }
 
     let batch: JsonObject;
+    let events: SanitizedTelemetryEvent[];
     try {
       batch = JSON.parse(text) as JsonObject;
       validateBatch(batch);
+      events = (batch.events as JsonObject[]).map(sanitizeEvent);
     } catch {
       return jsonResponse(400, { error: "invalid_batch" });
     }
 
-    const events = batch.events as JsonObject[];
     const response = await sendPostHogBatch(
       env,
       events.map((event) => ({
         event: event.event,
-        timestamp: new Date(event.timestamp_ms as number).toISOString(),
+        timestamp: new Date(event.timestampMs).toISOString(),
         properties: {
           distinct_id: batch.user_id,
           $process_person_profile: false,
@@ -165,8 +219,8 @@ export default {
           app_version: batch.app_version,
           os: batch.os,
           arch: batch.arch,
-          event_sequence: event.event_sequence,
-          ...(event.properties as JsonObject),
+          event_sequence: event.eventSequence,
+          ...event.properties,
         },
       })),
     );
@@ -355,7 +409,7 @@ function validateBatch(batch: JsonObject): void {
     throw new Error("events must be a non-empty bounded array");
   }
   for (const event of batch.events) {
-    validateEvent(event as JsonObject);
+    sanitizeEvent(event as JsonObject);
   }
 }
 
@@ -512,10 +566,10 @@ function validateReportHeaders(headers: Headers): ReportMetadata {
   };
 }
 
-function validateEvent(event: JsonObject): void {
+function sanitizeEvent(event: JsonObject): SanitizedTelemetryEvent {
   assertPlainObject(event, "event");
   assertKeys(event, "event", ["event", "timestamp_ms", "event_sequence", "properties"]);
-  if (typeof event.event !== "string" || !EVENT_NAMES.has(event.event)) {
+  if (!isProductEventName(event.event)) {
     throw new Error("unknown event name");
   }
   assertU64(event.timestamp_ms, "timestamp_ms");
@@ -527,22 +581,49 @@ function validateEvent(event: JsonObject): void {
   ) {
     throw new Error("timestamp_ms outside accepted window");
   }
-  validateProperties(event.properties as JsonObject);
+  return {
+    event: event.event as string,
+    timestampMs: event.timestamp_ms as number,
+    eventSequence: event.event_sequence as number,
+    properties: sanitizeProperties(event.properties as JsonObject),
+  };
 }
 
-function validateProperties(properties: JsonObject): void {
+function isProductEventName(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  return EVENT_NAMES.has(value) || /^squeezy_[a-z0-9_]{1,96}$/.test(value);
+}
+
+function sanitizeProperties(properties: JsonObject): JsonObject {
   assertPlainObject(properties, "properties");
+  const sanitized: JsonObject = {};
   for (const [key, value] of Object.entries(properties)) {
     const schema = PROPERTY_SCHEMAS[key];
     if (!schema) {
-      throw new Error(`unknown property: ${key}`);
+      continue;
     }
-    if (schema === "u64") {
-      assertU64(value, key);
-    } else if (typeof value !== "string" || !schema.has(value)) {
-      throw new Error(`invalid enum value for ${key}`);
+    try {
+      if (schema === "u64") {
+        assertU64(value, key);
+      } else if (schema === "hex64") {
+        assertHex(value, key, 64);
+      } else if (schema === "hex32") {
+        assertHex(value, key, 32);
+      } else if (schema === "hex16") {
+        assertHex(value, key, 16);
+      } else if (schema === "token") {
+        assertString(value, key, 1, 128);
+      } else if (typeof value !== "string" || !schema.has(value)) {
+        throw new Error(`invalid enum value for ${key}`);
+      }
+    } catch {
+      continue;
     }
+    sanitized[key] = value;
   }
+  return sanitized;
 }
 
 function assertKeys(object: JsonObject, label: string, allowed: string[]): void {
@@ -566,6 +647,12 @@ function assertString(value: unknown, label: string, min: number, max: number): 
   }
   if (!/^[A-Za-z0-9._+:-]+$/.test(value)) {
     throw new Error(`${label} has invalid characters`);
+  }
+}
+
+function assertHex(value: unknown, label: string, length: number): void {
+  if (typeof value !== "string" || value.length !== length || !/^[0-9a-f]+$/.test(value)) {
+    throw new Error(`${label} must be ${length} lowercase hex chars`);
   }
 }
 

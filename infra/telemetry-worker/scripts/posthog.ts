@@ -1,10 +1,32 @@
 const DEFAULT_POSTHOG_HOST = "https://eu.posthog.com";
 const DEFAULT_ENVIRONMENT_ID = "185494";
-const DASHBOARD_NAME = "Squeezy Telemetry";
+const LEGACY_DASHBOARD_NAME = "Squeezy Telemetry";
+
+const DASHBOARDS = {
+  product: {
+    name: "Squeezy - 01 Product Overview",
+    description: "Usage, versions, platforms, event freshness, and cost.",
+  },
+  reliability: {
+    name: "Squeezy - 02 Reliability And Runtime",
+    description: "Failures, tool behavior, graph performance, routing, sandbox, and reviewer counters.",
+  },
+  website: {
+    name: "Squeezy - 03 Website",
+    description: "Anonymous website page views, CTA clicks, referrers, and paths.",
+  },
+  intake: {
+    name: "Squeezy - 04 Feedback And Reports",
+    description: "Explicit feedback and report intake metadata.",
+  },
+} as const;
+
+type DashboardKey = keyof typeof DASHBOARDS;
 
 type JsonObject = Record<string, unknown>;
 
 type InsightSpec = {
+  dashboard: DashboardKey;
   name: string;
   description: string;
   query: string;
@@ -12,6 +34,67 @@ type InsightSpec = {
 
 const INSIGHTS: InsightSpec[] = [
   {
+    dashboard: "product",
+    name: "Squeezy Ingestion Freshness",
+    description: "Latest event timestamp by event name. Use this first when the dashboard looks empty.",
+    query: `
+SELECT
+  event,
+  count() AS events,
+  uniq(distinct_id) AS distinct_ids,
+  max(timestamp) AS latest
+FROM events
+WHERE (
+    startsWith(event, 'squeezy_')
+    OR event IN ('approval_best_effort_fallback', 'ai_reviewer_allow_downgrade')
+  )
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY event
+ORDER BY latest DESC
+LIMIT 100
+`.trim(),
+  },
+  {
+    dashboard: "product",
+    name: "Squeezy Event Volume",
+    description: "Daily event volume by Squeezy event name.",
+    query: `
+SELECT
+  toDate(timestamp) AS day,
+  event,
+  count() AS events
+FROM events
+WHERE (
+    startsWith(event, 'squeezy_')
+    OR event IN ('approval_best_effort_fallback', 'ai_reviewer_allow_downgrade')
+  )
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY day, event
+ORDER BY day ASC, event ASC
+`.trim(),
+  },
+  {
+    dashboard: "product",
+    name: "Squeezy Recent Raw Events",
+    description: "Recent Squeezy telemetry rows with the full PostHog properties payload for ingestion debugging.",
+    query: `
+SELECT
+  timestamp,
+  event,
+  distinct_id,
+  properties
+FROM events
+WHERE (
+    startsWith(event, 'squeezy_')
+    OR event IN ('approval_best_effort_fallback', 'ai_reviewer_allow_downgrade')
+  )
+  AND timestamp > now() - INTERVAL 24 HOUR
+ORDER BY timestamp DESC
+LIMIT 200
+`.trim(),
+  },
+  {
+    dashboard: "product",
     name: "Squeezy DAU",
     description: "Daily anonymous unique users from app startup events.",
     query: `
@@ -26,6 +109,7 @@ ORDER BY day ASC
 `.trim(),
   },
   {
+    dashboard: "product",
     name: "Squeezy Version Distribution",
     description: "Recent app versions seen in telemetry.",
     query: `
@@ -42,6 +126,7 @@ LIMIT 20
 `.trim(),
   },
   {
+    dashboard: "website",
     name: "Squeezy Website Visits",
     description: "Anonymous website page views and CTA clicks.",
     query: `
@@ -58,6 +143,7 @@ ORDER BY day ASC, event ASC
 `.trim(),
   },
   {
+    dashboard: "website",
     name: "Squeezy Website Paths And CTAs",
     description: "Website paths and clicked calls to action.",
     query: `
@@ -76,6 +162,7 @@ LIMIT 50
 `.trim(),
   },
   {
+    dashboard: "product",
     name: "Squeezy OS And Arch",
     description: "Anonymous platform distribution.",
     query: `
@@ -91,6 +178,7 @@ ORDER BY users DESC
 `.trim(),
   },
   {
+    dashboard: "reliability",
     name: "Squeezy Tool Calls By Status",
     description: "First-party tool-call volume by tool and outcome.",
     query: `
@@ -108,6 +196,7 @@ LIMIT 50
 `.trim(),
   },
   {
+    dashboard: "product",
     name: "Squeezy Turn Cost And Tokens",
     description: "Turn-level token and estimated cost counters.",
     query: `
@@ -125,6 +214,7 @@ ORDER BY day ASC
 `.trim(),
   },
   {
+    dashboard: "reliability",
     name: "Squeezy Failures",
     description: "Coarse anonymous failure kinds.",
     query: `
@@ -139,6 +229,7 @@ ORDER BY failures DESC
 `.trim(),
   },
   {
+    dashboard: "intake",
     name: "Squeezy Feedback Intake",
     description: "Explicit user-submitted feedback counts and redaction volume.",
     query: `
@@ -156,6 +247,7 @@ ORDER BY day ASC, source ASC
 `.trim(),
   },
   {
+    dashboard: "intake",
     name: "Squeezy Report Uploads",
     description: "Explicit bug-report archive uploads with metadata only.",
     query: `
@@ -173,6 +265,7 @@ ORDER BY day ASC, source ASC
 `.trim(),
   },
   {
+    dashboard: "reliability",
     name: "Squeezy Graph Build Performance",
     description: "AST/graph build and refresh performance counters.",
     query: `
@@ -189,6 +282,60 @@ WHERE event IN ('squeezy_graph_build_completed', 'squeezy_graph_refresh_complete
   AND timestamp > now() - INTERVAL 30 DAY
 GROUP BY event, status
 ORDER BY events DESC
+`.trim(),
+  },
+  {
+    dashboard: "reliability",
+    name: "Squeezy Routing Decisions",
+    description: "Cheap-route and escalation counters by reason.",
+    query: `
+SELECT
+  event,
+  properties.routing_reason AS reason,
+  count() AS events,
+  uniq(properties.user_id) AS users
+FROM events
+WHERE event IN ('squeezy_routing_routed', 'squeezy_routing_escalated')
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY event, reason
+ORDER BY events DESC
+LIMIT 50
+`.trim(),
+  },
+  {
+    dashboard: "reliability",
+    name: "Squeezy Sandbox Fallbacks",
+    description: "Best-effort shell sandbox fallback counters by backend.",
+    query: `
+SELECT
+  properties.sandbox_backend AS backend,
+  count() AS events,
+  uniq(properties.user_id) AS users,
+  max(timestamp) AS latest
+FROM events
+WHERE event = 'approval_best_effort_fallback'
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY backend
+ORDER BY events DESC
+LIMIT 50
+`.trim(),
+  },
+  {
+    dashboard: "reliability",
+    name: "Squeezy Reviewer Allow Downgrades",
+    description: "AI-reviewer allow decisions downgraded by capability allowlist.",
+    query: `
+SELECT
+  properties.permission_capability AS capability,
+  count() AS events,
+  uniq(properties.user_id) AS users,
+  max(timestamp) AS latest
+FROM events
+WHERE event = 'ai_reviewer_allow_downgrade'
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY capability
+ORDER BY events DESC
+LIMIT 50
 `.trim(),
   },
 ];
@@ -227,11 +374,14 @@ Environment:
 
 async function setupDashboard(): Promise<void> {
   const client = posthogClient();
-  const dashboard = await ensureDashboard(client);
-  console.log(`Dashboard: ${dashboard.name} (${dashboard.id})`);
+  const dashboards = await ensureDashboards(client);
+  await demoteLegacyDashboard(client);
+  for (const dashboard of Object.values(dashboards)) {
+    console.log(`Dashboard: ${dashboard.name} (${dashboard.id})`);
+  }
 
   const created = await Promise.all(
-    INSIGHTS.map((insight) => ensureInsight(client, dashboard.id, insight)),
+    INSIGHTS.map((insight) => ensureInsight(client, dashboards[insight.dashboard].id, insight)),
   );
   for (const insight of created) {
     console.log(`Insight: ${insight.name} (${insight.id})`);
@@ -367,19 +517,54 @@ ORDER BY event ASC
   console.log(JSON.stringify(response, null, 2));
 }
 
-async function ensureDashboard(client: PosthogClient): Promise<JsonObject> {
-  const existing = await client.get<{ results?: JsonObject[] }>(
-    `/dashboards/?limit=100&search=${encodeURIComponent(DASHBOARD_NAME)}`,
+async function ensureDashboards(client: PosthogClient): Promise<Record<DashboardKey, JsonObject>> {
+  const entries = await Promise.all(
+    Object.entries(DASHBOARDS).map(async ([key, spec]) => [
+      key,
+      await ensureDashboard(client, spec.name, spec.description),
+    ]),
   );
-  const dashboard = existing.results?.find((item) => item.name === DASHBOARD_NAME);
+  return Object.fromEntries(entries) as Record<DashboardKey, JsonObject>;
+}
+
+async function ensureDashboard(
+  client: PosthogClient,
+  name: string,
+  description: string,
+): Promise<JsonObject> {
+  const existing = await client.get<{ results?: JsonObject[] }>(
+    `/dashboards/?limit=100&search=${encodeURIComponent(name)}`,
+  );
+  const dashboard = existing.results?.find((item) => item.name === name);
   if (dashboard) {
-    return dashboard;
+    return client.patch<JsonObject>(`/dashboards/${dashboard.id}/`, {
+      name,
+      description,
+      pinned: true,
+      tags: ["squeezy", "telemetry"],
+    });
   }
   return client.post<JsonObject>("/dashboards/", {
-    name: DASHBOARD_NAME,
-    description: "Anonymous Squeezy product telemetry: usage, reliability, cost, and performance.",
+    name,
+    description,
     pinned: true,
     tags: ["squeezy", "telemetry"],
+  });
+}
+
+async function demoteLegacyDashboard(client: PosthogClient): Promise<void> {
+  const existing = await client.get<{ results?: JsonObject[] }>(
+    `/dashboards/?limit=100&search=${encodeURIComponent(LEGACY_DASHBOARD_NAME)}`,
+  );
+  const dashboard = existing.results?.find((item) => item.name === LEGACY_DASHBOARD_NAME);
+  if (dashboard?.id === undefined) {
+    return;
+  }
+  await client.patch<JsonObject>(`/dashboards/${dashboard.id}/`, {
+    name: "Squeezy - Legacy Telemetry (superseded)",
+    description: "Superseded by the numbered Squeezy dashboards.",
+    pinned: false,
+    tags: ["squeezy", "telemetry", "legacy"],
   });
 }
 
