@@ -1306,6 +1306,15 @@ impl Agent {
         Self::new_with_session_log(config, provider, session_log)
     }
 
+    pub fn new_with_telemetry(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        telemetry: TelemetryClient,
+    ) -> Self {
+        let session_log = start_session_log(&config, provider.name());
+        Self::new_with_session_log_and_telemetry(config, provider, session_log, telemetry)
+    }
+
     /// Build an agent without opening a durable session log.
     ///
     /// This is for local harnesses that need agent state transitions but do
@@ -1319,6 +1328,16 @@ impl Agent {
         provider: Arc<dyn LlmProvider>,
         session_log: Option<SessionHandle>,
     ) -> Self {
+        let telemetry = TelemetryClient::from_config(&config);
+        Self::new_with_session_log_and_telemetry(config, provider, session_log, telemetry)
+    }
+
+    fn new_with_session_log_and_telemetry(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_log: Option<SessionHandle>,
+        telemetry: TelemetryClient,
+    ) -> Self {
         // Fresh sessions inherit the most-recent cross-session calibration so
         // the first round's estimator isn't stuck on per-provider defaults.
         // Missing or malformed files fall back to `TokenCalibration::default()`,
@@ -1327,13 +1346,30 @@ impl Agent {
             token_calibration: SessionStore::open(&config).load_global_calibration(),
             ..ConversationState::default()
         };
-        Self::build(config, provider, session_log, conversation_state, None)
+        Self::build(
+            config,
+            provider,
+            session_log,
+            conversation_state,
+            None,
+            telemetry,
+        )
     }
 
     pub fn resume(
         config: AppConfig,
         provider: Arc<dyn LlmProvider>,
         session_id: &str,
+    ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
+        let telemetry = TelemetryClient::from_config(&config);
+        Self::resume_with_telemetry(config, provider, session_id, telemetry)
+    }
+
+    pub fn resume_with_telemetry(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_id: &str,
+        telemetry: TelemetryClient,
     ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
         let store = SessionStore::open(&config);
         let handle = store.open_session(session_id.to_string());
@@ -1400,6 +1436,7 @@ impl Agent {
             Some(handle.clone()),
             conversation_state,
             None,
+            telemetry,
         );
         if routing_sticky_remaining > 0 || routing_session_disabled {
             // Honour the persisted sticky window so a follow-up
@@ -1495,6 +1532,7 @@ impl Agent {
             None,
             ConversationState::default(),
             Some(runtime.clone()),
+            TelemetryClient::disabled(),
         );
 
         let mut final_answer = String::new();
@@ -1529,6 +1567,7 @@ impl Agent {
         session_log: Option<SessionHandle>,
         conversation_state: ConversationState,
         replay: Option<Arc<ReplayRuntime>>,
+        telemetry: TelemetryClient,
     ) -> Self {
         // Arm context compaction by default. The mid-turn micro-compaction
         // tier (and the full tier) early-returns when
@@ -1609,7 +1648,6 @@ impl Agent {
                 Err(_) => prune(),
             }
         }
-        let telemetry = TelemetryClient::from_config(&config);
         let registry_runtime = ToolRegistryRuntime::new_with_graph_cache_root(
             store.clone(),
             redactor.clone(),
@@ -1824,6 +1862,9 @@ impl Agent {
     /// build time (tools/MCP/redactor) are NOT rebuilt; pair this with the
     /// "restart required" badge in the UI for those.
     pub fn replace_config(&mut self, next: AppConfig) {
+        if !next.telemetry.enabled {
+            self.telemetry = TelemetryClient::disabled();
+        }
         self.telemetry = TelemetryClient::from_config(&next);
         self.config = next;
     }

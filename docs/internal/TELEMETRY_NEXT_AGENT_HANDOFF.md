@@ -1,32 +1,24 @@
 # Telemetry Next-Agent Handoff
 
-This branch currently implements the expanded event-based telemetry pass. The
-next follow-up should migrate high-frequency telemetry into one bounded
+This branch migrates high-frequency product telemetry into one bounded
 `squeezy_session_summary` event built from a local durable telemetry ledger.
 
 ## Current Implementation
 
-- `squeezy_startup_ready`: emitted on the first interactive TUI draw with
-  startup route and elapsed startup time.
-- `squeezy_session_ended`: emitted during session finish with duration, final
-  status, turn count, tool result counts, budget denials, and subagent counts.
-- `squeezy_graph_build_completed`: emitted from deferred graph open in
-  `squeezy-tools` with build timing, file counts, language distribution,
-  exclusions, persistence cache counts, symbols, and edges.
-- `squeezy_slash_command_used`: emitted for TUI composer, TUI inline, and
-  headless agent dispatch. Command names are sanitized tokens derived from the
-  canonical slash head; unknown heads are reported as `unknown`.
-- `squeezy_config_change_committed`: accumulated while `/config` is open and
-  emitted only after the pane closes. Fields come from config schema metadata;
-  values are bucketed, never raw.
-- The telemetry client now buffers safely when called from sync code without a
+- Existing event constructors remain as local safe fact records. Call sites can
+  still record startup, session end, graph, slash, config, tool, routing, and
+  coarse failure facts without knowing about the remote summary.
+- `squeezy_session_summary` is the remote product telemetry event. It carries
+  aggregate counters plus capped count maps for already-sanitized tool, slash,
+  failure, routing, and config tokens.
+- The telemetry client buffers safely when called from sync code without a
   Tokio runtime.
-- The Worker allowlist accepts the new properties and treats `slash_command` as
-  a bounded token, not a manually maintained command enum.
+- The Worker allowlist accepts the summary event and validates bounded count
+  maps while dropping unknown/raw properties.
 
 ## One-Event Summary Direction
 
-Use local records as the source of truth and PostHog as the aggregate sink:
+Local records are the source of truth and PostHog is the aggregate sink:
 
 1. Persist a local telemetry record at the moment a safe fact happens.
 2. Include `occurred_at_ms` and a monotonic local sequence on each record.
@@ -37,6 +29,8 @@ Use local records as the source of truth and PostHog as the aggregate sink:
    telemetry is sent.
 6. On startup, detect prior sessions that have a start record but no clean end
    record and synthesize a summary with an abnormal status.
+7. Delete pending summaries and their source records only after the Worker
+   returns success.
 
 The raw local ledger can be more detailed than PostHog, but the remote summary
 must stay bounded and aggregate-first.
@@ -94,10 +88,5 @@ next-start recovery whenever possible.
 
 ## Validation Run
 
-- `cargo fmt --all`
 - `cargo test -p squeezy-telemetry`
-- `cargo check -p squeezy-agent -p squeezy-tools -p squeezy-tui`
-- `cargo test -p squeezy-tui config_screen --lib`
-- `bun test` in `infra/telemetry-worker`
-- `bun run typecheck` in `infra/telemetry-worker`
-- `git diff --check`
+- `cargo check -p squeezy-agent -p squeezy-tui -p squeezy`

@@ -118,6 +118,273 @@ async fn record_buffers_events_for_periodic_batch_flush() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn durable_summary_is_pending_before_send_and_cleared_after_ack() {
+    let root = telemetry_temp_root();
+    let store = TelemetryStore::open(root.join("telemetry.redb")).expect("open telemetry store");
+    let session_id = "22222222-2222-4222-8222-222222222222";
+    let trace_id = "a".repeat(32);
+    store
+        .mark_session_started(session_id, &trace_id, 1_000)
+        .expect("mark session start");
+    let config = AppConfig::default();
+    let mut started = TelemetryEvent::app_started(&config);
+    started.timestamp_ms = 1_000;
+    started.event_sequence = 1;
+    store
+        .append_event(session_id, &started)
+        .expect("append start");
+    let mut ended = TelemetryEvent::session_ended(
+        &config,
+        SessionTelemetryReport {
+            duration_ms: 500,
+            status: SessionStatusKind::Completed,
+            turns: 1,
+            tool_calls: 2,
+            tool_successes: 2,
+            tool_errors: 0,
+            tool_denials: 0,
+            tool_cancellations: 0,
+            budget_denials: 0,
+            subagent_calls: 0,
+            subagent_failures: 0,
+        },
+    );
+    ended.timestamp_ms = 1_500;
+    ended.event_sequence = 2;
+    store.append_event(session_id, &ended).expect("append end");
+    store
+        .mark_session_ended(session_id, ended.timestamp_ms)
+        .expect("mark session end");
+
+    let summary_id = store
+        .finalize_session_summary(session_id, false)
+        .expect("finalize")
+        .expect("summary id");
+    let due = store
+        .lease_due_summaries(2_000, 10, PENDING_LEASE_MS)
+        .expect("lease due");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].summary_id, summary_id);
+    assert_eq!(due[0].event.event, TelemetryEventName::SessionSummary);
+    assert_eq!(
+        due[0].event.properties.session_status,
+        Some(SessionStatusKind::Completed)
+    );
+
+    store.mark_summary_sent(&due[0]).expect("mark sent");
+    assert!(
+        store
+            .lease_due_summaries(3_000, 10, PENDING_LEASE_MS)
+            .expect("lease after sent")
+            .is_empty()
+    );
+    assert!(
+        store
+            .session_events(session_id)
+            .expect("events after sent")
+            .is_empty()
+    );
+    assert!(
+        store
+            .session(session_id)
+            .expect("session after sent")
+            .is_none()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_summary_is_rescheduled_not_deleted() {
+    let root = telemetry_temp_root();
+    let store = TelemetryStore::open(root.join("telemetry.redb")).expect("open telemetry store");
+    let session_id = "22222222-2222-4222-8222-222222222222";
+    store
+        .mark_session_started(session_id, &"b".repeat(32), 1_000)
+        .expect("mark session start");
+    let mut event = TelemetryEvent::app_started(&AppConfig::default());
+    event.timestamp_ms = 1_000;
+    event.event_sequence = 1;
+    store
+        .append_event(session_id, &event)
+        .expect("append event");
+    let summary_id = store
+        .finalize_session_summary(session_id, false)
+        .expect("finalize")
+        .expect("summary id");
+    let leased = store
+        .lease_due_summaries(2_000, 10, PENDING_LEASE_MS)
+        .expect("lease");
+    assert_eq!(leased.len(), 1);
+
+    store
+        .mark_summary_failed(&summary_id, 2_100)
+        .expect("mark failed");
+    assert!(
+        store
+            .lease_due_summaries(2_200, 10, PENDING_LEASE_MS)
+            .expect("early retry")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .lease_due_summaries(7_200, 10, PENDING_LEASE_MS)
+            .expect("due retry")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .session_events(session_id)
+            .expect("events preserved")
+            .len(),
+        1
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn abnormal_session_is_synthesized_on_next_startup() {
+    let root = telemetry_temp_root();
+    let store = TelemetryStore::open(root.join("telemetry.redb")).expect("open telemetry store");
+    let prior_session = "22222222-2222-4222-8222-222222222222";
+    store
+        .mark_session_started(prior_session, &"c".repeat(32), 1_000)
+        .expect("mark session start");
+    let mut event = TelemetryEvent::app_started(&AppConfig::default());
+    event.timestamp_ms = 1_000;
+    event.event_sequence = 1;
+    store
+        .append_event(prior_session, &event)
+        .expect("append event");
+
+    store
+        .synthesize_abnormal_sessions("33333333-3333-4333-8333-333333333333")
+        .expect("synthesize abnormal");
+    let due = store
+        .lease_due_summaries(2_000, 10, PENDING_LEASE_MS)
+        .expect("lease due");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event.properties.abnormal_exit, Some(true));
+    assert_eq!(
+        due[0].event.properties.session_status,
+        Some(SessionStatusKind::Failed)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn telemetry_opt_out_purges_pending_product_ledger() {
+    let root = telemetry_temp_root();
+    let install_id_path = root.join("install_id");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&install_id_path, "11111111-1111-4111-8111-111111111111\n").unwrap();
+    let store_path = root.join("telemetry.redb");
+    {
+        let store = TelemetryStore::open(store_path.clone()).expect("open telemetry store");
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        store
+            .mark_session_started(session_id, &"d".repeat(32), 1_000)
+            .expect("mark session start");
+        let mut event = TelemetryEvent::app_started(&AppConfig::default());
+        event.timestamp_ms = 1_000;
+        event.event_sequence = 1;
+        store
+            .append_event(session_id, &event)
+            .expect("append event");
+        store
+            .finalize_session_summary(session_id, false)
+            .expect("finalize");
+    }
+    assert!(store_path.exists(), "ledger should exist before opt-out");
+
+    let config = AppConfig {
+        telemetry: telemetry_config(false, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, &install_id_path);
+    assert!(!client.enabled());
+    assert!(
+        !store_path.exists(),
+        "opt-out must purge automatic telemetry"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn session_summary_does_not_double_count_turn_and_tool_totals() {
+    let config = AppConfig::default();
+    let session = StoredTelemetrySession {
+        session_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        trace_id: "e".repeat(32),
+        started_at_ms: 1_000,
+        ended_at_ms: Some(2_000),
+        clean_end: true,
+        summary_id: None,
+    };
+    let mut turn = TelemetryEvent::turn_completed(
+        &config,
+        1,
+        TurnMetrics {
+            tool_calls: 2,
+            bytes_read: 300,
+            model_output_bytes: 50,
+            matches_returned: 4,
+            ..TurnMetrics::default()
+        },
+    );
+    turn.timestamp_ms = 1_500;
+    turn.event_sequence = 1;
+    let mut shell = TelemetryEvent::tool_completed(ToolTelemetryReport {
+        provider: &config.provider,
+        model: &config.model,
+        turn_index: 1,
+        tool_sequence: 1,
+        tool_name: "shell",
+        status: ToolStatusKind::Success,
+        duration: Duration::from_millis(10),
+        cost: ToolCostProperties {
+            bytes_read: 100,
+            output_bytes: 25,
+            matches_returned: 1,
+            ..ToolCostProperties::default()
+        },
+        args_sha256: None,
+        output_sha256: None,
+        content_sha256: None,
+    });
+    shell.timestamp_ms = 1_600;
+    shell.event_sequence = 2;
+    let mut grep = TelemetryEvent::tool_completed(ToolTelemetryReport {
+        provider: &config.provider,
+        model: &config.model,
+        turn_index: 1,
+        tool_sequence: 2,
+        tool_name: "grep",
+        status: ToolStatusKind::Error,
+        duration: Duration::from_millis(10),
+        cost: ToolCostProperties {
+            bytes_read: 200,
+            output_bytes: 25,
+            matches_returned: 3,
+            ..ToolCostProperties::default()
+        },
+        args_sha256: None,
+        output_sha256: None,
+        content_sha256: None,
+    });
+    grep.timestamp_ms = 1_700;
+    grep.event_sequence = 3;
+
+    let summary = build_summary_from_events(&session, vec![turn, shell, grep], false, None);
+
+    assert_eq!(summary.properties.tool_calls, Some(2));
+    assert_eq!(summary.properties.tool_successes, Some(1));
+    assert_eq!(summary.properties.tool_errors, Some(1));
+    assert_eq!(summary.properties.bytes_read, Some(300));
+    assert_eq!(summary.properties.matches_returned, Some(4));
+}
+
 fn telemetry_temp_root() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(

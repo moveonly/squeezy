@@ -150,6 +150,68 @@ test("product telemetry accepts current trace and routing properties", async () 
   expect(batch.batch[6].properties.session_status).toBe("completed");
 });
 
+test("product telemetry accepts durable session summary fields", async () => {
+  const forwarded: unknown[] = [];
+  globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+    forwarded.push(JSON.parse(String(init?.body)));
+    return new Response(null, { status: 200 });
+  };
+
+  const response = await worker.fetch(
+    new Request("https://telemetry.example/v1/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        schema_version: 1,
+        user_id: "11111111-1111-4111-8111-111111111111",
+        install_id: "11111111-1111-4111-8111-111111111111",
+        session_id: "22222222-2222-4222-8222-222222222222",
+        app_version: "0.1.0",
+        os: "macos",
+        arch: "aarch64",
+        events: [
+          {
+            event: "squeezy_session_summary",
+            timestamp_ms: Date.now(),
+            event_sequence: 1,
+            properties: {
+              summary_id: "33333333-3333-4333-8333-333333333333",
+              trace_id: "d".repeat(32),
+              started_at_ms: Date.now() - 1000,
+              ended_at_ms: Date.now(),
+              source_records: 12,
+              dropped_buckets: 0,
+              abnormal_exit: false,
+              telemetry_truncated: false,
+              session_status: "completed",
+              turn_count: 2,
+              tool_calls: 3,
+              graph_build_count: 1,
+              slash_command_count: 1,
+              routing_escalated_count: 1,
+              tool_counts: { shell: 2, graph: 1 },
+              slash_counts: { plan: 1 },
+              failure_counts: { provider: 1 },
+              routing_counts: { "escalated:error_threshold": 1 },
+              config_counts: { "model.model": 1 },
+              prompt: "must not forward",
+            },
+          },
+        ],
+      }),
+    }),
+    env(),
+  );
+
+  expect(response.status).toBe(204);
+  expect(forwarded).toHaveLength(1);
+  const batch = forwarded[0] as { batch: Array<{ event: string; properties: Record<string, unknown> }> };
+  expect(batch.batch[0].event).toBe("squeezy_session_summary");
+  expect(batch.batch[0].properties.summary_id).toBe("33333333-3333-4333-8333-333333333333");
+  expect(batch.batch[0].properties.abnormal_exit).toBe(false);
+  expect(batch.batch[0].properties.tool_counts).toEqual({ shell: 2, graph: 1 });
+  expect(batch.batch[0].properties.prompt).toBeUndefined();
+});
+
 test("product telemetry drops unknown or malformed optional properties", async () => {
   const forwarded: unknown[] = [];
   globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {

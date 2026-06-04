@@ -54,7 +54,7 @@ use squeezy_skills::PromptTemplateCatalog;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::{
     ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
-    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, StartupRoute,
+    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, StartupRoute, TelemetryClient,
 };
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -492,7 +492,7 @@ impl FrameRateLimiter {
 }
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
-    run_inner(config, provider, None, StartupProfile::default())
+    run_inner(config, provider, None, StartupProfile::default(), None)
         .await
         .map(|_| ())
 }
@@ -515,6 +515,7 @@ pub async fn run_with_onboarding(
             setup_question_count: None,
             open_config_section: None,
         },
+        None,
     )
     .await
     .map(|_| ())
@@ -530,7 +531,17 @@ pub async fn run_with_startup_profile(
     // the canonical resume id so the rest of the boot path is identical
     // to `squeezy_tui::resume`.
     let resume = startup.resume_session_id.clone();
-    run_inner(config, provider, resume, startup).await
+    run_inner(config, provider, resume, startup, None).await
+}
+
+pub async fn run_with_startup_profile_and_telemetry(
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    startup: StartupProfile,
+    telemetry: TelemetryClient,
+) -> Result<StartupRunOutcome> {
+    let resume = startup.resume_session_id.clone();
+    run_inner(config, provider, resume, startup, Some(telemetry)).await
 }
 
 pub struct StartupTerminal {
@@ -604,7 +615,30 @@ pub async fn run_with_startup_profile_in_terminal(
 ) -> Result<StartupRunResult> {
     let resume = startup.resume_session_id.clone();
     let (outcome, terminal) =
-        run_inner_with_terminal(config, provider, resume, startup, terminal.guard).await?;
+        run_inner_with_terminal(config, provider, resume, startup, terminal.guard, None).await?;
+    Ok(StartupRunResult {
+        outcome,
+        terminal: terminal.map(|guard| StartupTerminal { guard }),
+    })
+}
+
+pub async fn run_with_startup_profile_in_terminal_and_telemetry(
+    terminal: StartupTerminal,
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    startup: StartupProfile,
+    telemetry: TelemetryClient,
+) -> Result<StartupRunResult> {
+    let resume = startup.resume_session_id.clone();
+    let (outcome, terminal) = run_inner_with_terminal(
+        config,
+        provider,
+        resume,
+        startup,
+        terminal.guard,
+        Some(telemetry),
+    )
+    .await?;
     Ok(StartupRunResult {
         outcome,
         terminal: terminal.map(|guard| StartupTerminal { guard }),
@@ -631,6 +665,7 @@ pub async fn resume(
         provider,
         Some(session_id),
         StartupProfile::default(),
+        None,
     )
     .await
     .map(|_| ())
@@ -641,11 +676,19 @@ async fn run_inner(
     provider: Arc<dyn LlmProvider>,
     resume_session_id: Option<String>,
     startup: StartupProfile,
+    telemetry: Option<TelemetryClient>,
 ) -> Result<StartupRunOutcome> {
     apply_theme_overrides(&config);
     let terminal = TerminalGuard::enter(config.tui.synchronized_output)?;
-    let (outcome, _) =
-        run_inner_with_terminal(config, provider, resume_session_id, startup, terminal).await?;
+    let (outcome, _) = run_inner_with_terminal(
+        config,
+        provider,
+        resume_session_id,
+        startup,
+        terminal,
+        telemetry,
+    )
+    .await?;
     Ok(outcome)
 }
 
@@ -655,6 +698,7 @@ async fn run_inner_with_terminal(
     resume_session_id: Option<String>,
     startup: StartupProfile,
     mut terminal: TerminalGuard,
+    telemetry: Option<TelemetryClient>,
 ) -> Result<(StartupRunOutcome, Option<TerminalGuard>)> {
     let startup_started = Instant::now();
     let direct_resume_requested = resume_session_id.is_some();
@@ -701,7 +745,16 @@ async fn run_inner_with_terminal(
     squeezy_core::startup_trace::mark("tui_placeholder_drawn");
     let _ = terminal.draw_startup_placeholder(startup_message);
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
-        Agent::resume(config.clone(), provider, &session_id)?
+        if let Some(telemetry) = telemetry.clone() {
+            Agent::resume_with_telemetry(config.clone(), provider, &session_id, telemetry)?
+        } else {
+            Agent::resume(config.clone(), provider, &session_id)?
+        }
+    } else if let Some(telemetry) = telemetry.clone() {
+        (
+            Agent::new_with_telemetry(config.clone(), provider, telemetry),
+            Vec::new(),
+        )
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };

@@ -48,46 +48,37 @@ only metadata to PostHog.
 Squeezy creates one random anonymous `user_id` and stores it at
 `~/.squeezy/install_id`. The value is stable across sessions on that machine and
 is used only to count anonymous unique users. Each process also gets a random
-`session_id`. Every event has a millisecond timestamp and an increasing
-`event_sequence`, so a dashboard can reconstruct the order of events within one
-session.
+`session_id`. Local telemetry facts are written with a millisecond timestamp
+and an increasing local sequence, then reduced into one bounded session summary
+before upload.
 
 ## Events
 
-Squeezy sends typed events with allowlisted numeric counters and enum values:
+Squeezy sends one typed product telemetry event per completed session:
 
-- `squeezy_app_started`: provider family and model family.
-- `squeezy_startup_ready`: startup route and time to first interactive TUI
-  draw.
-- `squeezy_turn_completed`: per-turn aggregate tool counts, read/search
-  counters, output bytes, receipt stub hits, budget denials, token counters,
-  cache counters, and estimated cost when available.
-- `squeezy_tool_completed`: one event per first-party Squeezy tool call with
-  `turn_index`, `tool_sequence`, tool name/family, status, duration in
-  milliseconds, files scanned, bytes read, output bytes, and matches returned.
-- `squeezy_graph_build_completed` and `squeezy_graph_refresh_completed`: graph
-  build/refresh timing, file counts, exclusion counts, persistence cache
-  counts, supported-language distribution, symbols, and edges.
-- `squeezy_session_ended`: session duration, final status, turn count, tool
-  success/error/denial/cancellation counts, budget denials, and subagent
-  call/failure counts.
-- `squeezy_slash_command_used`: sanitized command token, surface (TUI composer,
-  TUI inline, or headless agent dispatch), outcome, alias kind, and argument
-  shape. Unknown slash heads are reported as `unknown`; slash arguments are not
-  sent.
-- `squeezy_config_change_committed`: emitted after the `/config` pane closes
-  for committed writes made while the pane was open. It sends config scope,
-  section, field id, apply tier, change kind, and previous/new value buckets
-  only; it does not send raw setting values.
-- `squeezy_failure_seen`: coarse error kind such as provider, tool, permission,
-  budget, graph, I/O, config, or unknown.
+- `squeezy_session_summary`: aggregate startup route/timing, session status,
+  turn/tool counts, graph build/refresh counters, slash/config/routing/failure
+  counts, token/cost counters, and capped top-count maps for sanitized tool,
+  slash-command, failure, routing, and config-field tokens.
 
-Telemetry is silently disabled when the install_id cannot be loaded or
-persisted (read-only `$HOME`, missing `$HOME`, ENOSPC, etc.) so that a
-degraded environment does not invent a fresh anonymous user per process.
+The local ledger may contain detailed safe facts such as startup readiness,
+turn completion, tool completion, graph build/refresh, slash command use,
+config changes, routing decisions, and coarse failures. Those local facts are
+not uploaded individually by the product telemetry path.
 
-Events are buffered locally and sent in small batches, up to 50 events per
-request. Squeezy flushes queued telemetry on normal CLI/TUI exit.
+Safe local facts are persisted in a durable telemetry ledger before network
+delivery. On normal CLI/TUI exit, Squeezy stores the reduced summary as pending
+before attempting upload. If upload fails or the process exits before upload
+finishes, pending summaries are retried on the next startup and after explicit
+`doctor` update checks. Pending summaries and their source local facts are
+deleted only after the telemetry Worker returns success.
+
+Telemetry upload is best effort and never blocks prompt readiness. If the
+ledger cannot be opened, Squeezy falls back to process-local best-effort
+buffering for that run. Telemetry is silently disabled when the install_id
+cannot be loaded or persisted (read-only `$HOME`, missing `$HOME`, ENOSPC,
+etc.) so that a degraded environment does not invent a fresh anonymous user per
+process.
 
 ## What Is Never Sent
 

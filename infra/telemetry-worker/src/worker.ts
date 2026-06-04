@@ -38,6 +38,7 @@ interface R2Bucket {
 }
 
 const EVENT_NAMES = new Set([
+  "squeezy_session_summary",
   "squeezy_app_started",
   "squeezy_turn_completed",
   "squeezy_tool_completed",
@@ -139,9 +140,16 @@ const CONFIG_SCOPES = new Set(["user", "project", "local", "session"]);
 const CONFIG_APPLY_TIERS = new Set(["immediate", "next_prompt", "restart"]);
 const CONFIG_CHANGE_KINDS = new Set(["set", "unset", "reset"]);
 
-type PropertySchema = "u64" | "hex64" | "hex32" | "hex16" | "token" | Set<string>;
+type PropertySchema = "u64" | "bool" | "uuid" | "hex64" | "hex32" | "hex16" | "token" | "count_map" | Set<string>;
 
 const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
+  summary_id: "uuid",
+  started_at_ms: "u64",
+  ended_at_ms: "u64",
+  source_records: "u64",
+  dropped_buckets: "u64",
+  abnormal_exit: "bool",
+  telemetry_truncated: "bool",
   turn_index: "u64",
   tool_sequence: "u64",
   provider: PROVIDERS,
@@ -188,6 +196,13 @@ const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
   negative_receipt_hits: "u64",
   budget_denials: "u64",
   turn_count: "u64",
+  graph_build_count: "u64",
+  graph_refresh_count: "u64",
+  slash_command_count: "u64",
+  config_change_count: "u64",
+  failure_count: "u64",
+  routing_routed_count: "u64",
+  routing_escalated_count: "u64",
   tool_successes: "u64",
   tool_errors: "u64",
   tool_denials: "u64",
@@ -226,6 +241,11 @@ const PROPERTY_SCHEMAS: Record<string, PropertySchema> = {
   routing_reason: "token",
   trace_id: "hex32",
   span_id: "hex16",
+  tool_counts: "count_map",
+  slash_counts: "count_map",
+  failure_counts: "count_map",
+  routing_counts: "count_map",
+  config_counts: "count_map",
 };
 
 export default {
@@ -676,6 +696,10 @@ function sanitizeProperties(properties: JsonObject): JsonObject {
     try {
       if (schema === "u64") {
         assertU64(value, key);
+      } else if (schema === "bool") {
+        assertBoolean(value, key);
+      } else if (schema === "uuid") {
+        assertUuid(value, key);
       } else if (schema === "hex64") {
         assertHex(value, key, 64);
       } else if (schema === "hex32") {
@@ -684,6 +708,8 @@ function sanitizeProperties(properties: JsonObject): JsonObject {
         assertHex(value, key, 16);
       } else if (schema === "token") {
         assertString(value, key, 1, 128);
+      } else if (schema === "count_map") {
+        assertCountMap(value, key);
       } else if (typeof value !== "string" || !schema.has(value)) {
         throw new Error(`invalid enum value for ${key}`);
       }
@@ -773,6 +799,24 @@ function assertUuid(value: unknown, label: string): void {
 function assertU64(value: unknown, label: string): void {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new Error(`${label} must be a safe non-negative integer`);
+  }
+}
+
+function assertBoolean(value: unknown, label: string): void {
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be a boolean`);
+  }
+}
+
+function assertCountMap(value: unknown, label: string): void {
+  assertPlainObject(value, label);
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > 16) {
+    throw new Error(`${label} must be a bounded count map`);
+  }
+  for (const [key, count] of entries) {
+    assertString(key, `${label}.key`, 1, 128);
+    assertU64(count, `${label}.${key}`);
   }
 }
 
