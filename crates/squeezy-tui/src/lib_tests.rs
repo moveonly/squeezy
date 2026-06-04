@@ -13436,3 +13436,22 @@ fn warn_log_marker_is_cyan_not_amber() {
     assert_eq!(glyph.style.fg, Some(crate::render::theme::cyan()));
     assert_ne!(glyph.style.fg, Some(crate::render::theme::secondary()));
 }
+
+#[test]
+fn denied_and_cancelled_read_as_the_cyan_warn_tier() {
+    // A user-initiated block/stop is the warn tier (cyan), distinct from a hard
+    // failure (red), and never spends rationed amber.
+    assert_eq!(
+        status_color(ToolStatus::Denied),
+        crate::render::theme::cyan()
+    );
+    assert_eq!(
+        status_color(ToolStatus::Cancelled),
+        crate::render::theme::cyan()
+    );
+    assert_eq!(status_color(ToolStatus::Error), crate::render::theme::red());
+    assert_ne!(
+        status_color(ToolStatus::Denied),
+        crate::render::theme::secondary()
+    );
+}

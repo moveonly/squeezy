@@ -12074,13 +12074,16 @@ fn status_color(status: ToolStatus) -> Color {
     match status {
         ToolStatus::Success => crate::render::theme::green(),
         ToolStatus::Error | ToolStatus::Stale => crate::render::theme::red(),
-        ToolStatus::Denied | ToolStatus::Cancelled => crate::render::theme::secondary(),
+        // A user-initiated block/stop is the warn tier (cyan ⚠), distinct from a
+        // hard failure (red ✖) — and keeps amber rationed.
+        ToolStatus::Denied | ToolStatus::Cancelled => crate::render::theme::cyan(),
     }
 }
 
 fn tool_result_display_color(tool: &ToolTranscript) -> Color {
     if tool_result_not_run(tool) || is_retryable_tool_result(&tool.result) {
-        crate::render::theme::secondary()
+        // "Not run" / "Retried" are warn-tier ⚠ outcomes — cyan, not amber.
+        crate::render::theme::cyan()
     } else {
         status_color(tool.result.status)
     }
