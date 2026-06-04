@@ -3,7 +3,7 @@
 //!
 //! The audit (`tui-003`) flagged the hardcoded `Ctrl+T` / `Ctrl+P` /
 //! `Ctrl+Y` / `PageUp` / etc. bindings as unaccessible to users who
-//! collide with their host terminal (tmux Ctrl-T) or use non-QWERTY
+//! collide with their host terminal (tmux Ctrl+T) or use non-QWERTY
 //! layouts. The substrate here lets the user write
 //!
 //! ```toml
