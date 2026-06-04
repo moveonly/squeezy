@@ -28,13 +28,19 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 
 struct MockProvider {
+    name: &'static str,
     responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
     requests: Mutex<Vec<LlmRequest>>,
 }
 
 impl MockProvider {
     fn new(responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
+        Self::named("mock", responses)
+    }
+
+    fn named(name: &'static str, responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
         Self {
+            name,
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
         }
@@ -47,7 +53,7 @@ impl MockProvider {
 
 impl LlmProvider for MockProvider {
     fn name(&self) -> &'static str {
-        "mock"
+        self.name
     }
 
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
@@ -1646,6 +1652,71 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     assert!(!provider.requests()[0].tools.is_empty());
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn server_model_echo_drives_cost_estimation() {
+    let usage = CostSnapshot {
+        input_tokens: Some(1_000_000),
+        output_tokens: Some(0),
+        reasoning_output_tokens: None,
+        cached_input_tokens: None,
+        cache_write_input_tokens: None,
+        estimated_usd_micros: None,
+    };
+    assert_eq!(
+        squeezy_llm::estimate_cost("openai", "gpt-5.4-nano", &usage),
+        Some(200_000),
+        "fixture should price to the server model's known OpenAI rate"
+    );
+    let provider = Arc::new(MockProvider::named(
+        "openai",
+        vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ServerModel("gpt-5.4-nano".to_string())),
+            Ok(LlmEvent::TextDelta("priced by server model".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_server_model".to_string()),
+                cost: usage,
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ]],
+    ));
+    let config = AppConfig {
+        model: "gpt-5.5".to_string(),
+        routing: squeezy_core::RoutingConfig {
+            enabled: false,
+            ..AppConfig::default().routing
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+    assert_eq!(agent.provider.name(), "openai");
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut completed_cost = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { cost, .. } => {
+                completed_cost = Some(cost);
+            }
+            AgentEvent::Failed { error, .. } => {
+                failed = Some(error.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(failed.is_none(), "turn should complete, got: {failed:?}");
+    let completed_cost = completed_cost.expect("turn should emit AgentEvent::Completed");
+    assert_eq!(completed_cost.input_tokens, Some(1_000_000));
+    assert_eq!(
+        completed_cost.estimated_usd_micros,
+        Some(200_000),
+        "OpenAI gpt-5.4-nano input pricing should be used instead of requested gpt-5.5 pricing"
+    );
 }
 
 #[tokio::test]

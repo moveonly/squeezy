@@ -6426,6 +6426,7 @@ impl TurnRuntime {
                 ..LlmRequest::default()
             };
             let request_model = Arc::clone(&request.model);
+            let mut effective_model = Arc::clone(&request_model);
             let request_input_bytes = llm_request_input_bytes(&request);
             self.record_replay_request(&request);
             let mut stream = self
@@ -6493,7 +6494,7 @@ impl TurnRuntime {
                     self.fold_partial_cancel_cost(
                         &mut total_cost,
                         &mut broker,
-                        request_model.as_ref(),
+                        effective_model.as_ref(),
                         request_input_bytes,
                         round_output_bytes,
                     )
@@ -6742,7 +6743,7 @@ impl TurnRuntime {
                     } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
-                                estimate_cost(self.provider.name(), &request_model, &cost);
+                                estimate_cost(self.provider.name(), &effective_model, &cost);
                         }
                         let warning = broker.record_provider_cost(&cost);
                         if broker.note_unenforceable_cap_round(&cost) {
@@ -6751,7 +6752,7 @@ impl TurnRuntime {
                                 .send(AgentEvent::CostCapUnenforceable {
                                     turn_id: self.turn_id,
                                     provider: self.provider.name().to_string(),
-                                    model: request_model.to_string(),
+                                    model: effective_model.to_string(),
                                 })
                                 .await;
                         }
@@ -6801,7 +6802,7 @@ impl TurnRuntime {
                         self.fold_partial_cancel_cost(
                             &mut total_cost,
                             &mut broker,
-                            request_model.as_ref(),
+                            effective_model.as_ref(),
                             request_input_bytes,
                             round_output_bytes,
                         )
@@ -6819,7 +6820,9 @@ impl TurnRuntime {
                     LlmEvent::ContextOverflow { .. } => {
                         context_overflow_seen = true;
                     }
-                    LlmEvent::ServerModel(_) => {}
+                    LlmEvent::ServerModel(model) => {
+                        effective_model = Arc::from(model);
+                    }
                     // Known additive variants the main loop intentionally
                     // does not act on yet. `Citation` (OpenAI annotations /
                     // xAI Live Search sources) has no transcript recording
@@ -6921,7 +6924,7 @@ impl TurnRuntime {
                 self.fold_partial_cancel_cost(
                     &mut total_cost,
                     &mut broker,
-                    request_model.as_ref(),
+                    effective_model.as_ref(),
                     request_input_bytes,
                     round_output_bytes,
                 )
@@ -9740,6 +9743,7 @@ async fn run_subagent_rounds(
     let mut context_compaction = ContextCompactionState::default();
     'rounds: for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
+        let mut effective_model = Arc::clone(&request_model);
         // P1.3 fail-soft subagent input-token guard. Reuses the EXISTING
         // `max_round_input_tokens` ceiling (the same pre-flight gate the
         // parent loop applies) instead of inventing a new cap. When the
@@ -9918,7 +9922,7 @@ async fn run_subagent_rounds(
                     }
                     if cost.estimated_usd_micros.is_none() {
                         cost.estimated_usd_micros =
-                            estimate_cost(parent.provider.name(), &request_model, &cost);
+                            estimate_cost(parent.provider.name(), &effective_model, &cost);
                     }
                     broker.metrics.record_provider(&cost);
                     completed = true;
@@ -9942,7 +9946,9 @@ async fn run_subagent_rounds(
                 LlmEvent::ContextOverflow { .. } => {
                     context_overflow_seen = true;
                 }
-                LlmEvent::ServerModel(_) => {}
+                LlmEvent::ServerModel(model) => {
+                    effective_model = Arc::from(model);
+                }
                 // Known additive variants the subagent loop does not act on:
                 // `Refusal` text and `Citation` sources have no sink here
                 // (the subagent only accumulates assistant text + tool
