@@ -2429,7 +2429,14 @@ async fn run_prompts(
     let stderr = io::stderr();
     let mut stdout = stdout.lock();
     let mut stderr = stderr.lock();
-    pump_prompts(&agent, prompts, format, &mut stdout, &mut stderr).await
+    let result = pump_prompts(&agent, prompts, format, &mut stdout, &mut stderr).await;
+    let exit_status = if result.is_ok() {
+        SessionStatus::Completed
+    } else {
+        SessionStatus::Failed
+    };
+    agent.finish_session(exit_status).await;
+    result
 }
 
 /// Walk the resolved print-mode prompts and drive each one through the

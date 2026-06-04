@@ -1901,6 +1901,7 @@ fn build_summary_from_events(
         event_sequence: 0,
         properties: TelemetryProperties {
             trace_id: Some(session.trace_id.clone()),
+            store_session_id: accumulator.store_session_id,
             started_at_ms: Some(u128_to_u64(started_at_ms)),
             ended_at_ms: Some(u128_to_u64(ended_at_ms)),
             source_records: Some(events.len() as u64),
@@ -1967,6 +1968,7 @@ struct SummaryAccumulator {
     model_family: Option<ModelFamily>,
     startup_route: Option<StartupRoute>,
     session_status: Option<SessionStatusKind>,
+    store_session_id: Option<String>,
     turn_count: u64,
     tool_calls: u64,
     turn_tool_calls: u64,
@@ -2117,6 +2119,7 @@ impl SummaryAccumulator {
             }
             TelemetryEventName::SessionEnded => {
                 self.session_status = props.session_status;
+                self.store_session_id = props.store_session_id.clone();
                 self.turn_count = self.turn_count.max(props.turn_count.unwrap_or(0));
                 self.tool_calls = self.tool_calls.max(props.tool_calls.unwrap_or(0));
                 self.tool_successes = self.tool_successes.max(props.tool_successes.unwrap_or(0));
