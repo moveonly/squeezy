@@ -39,7 +39,7 @@ use squeezy_llm::{
     provider_honors_output_schema,
 };
 use squeezy_skills::{
-    BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, matches_squeezy_help_input,
+    BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, matches_squeezy_help_input,
     relevant_docs_for_input,
 };
 use squeezy_store::{
@@ -4159,6 +4159,31 @@ struct HelpResolutionDeps {
     hooks: Option<Arc<HookRegistry>>,
 }
 
+/// Scan `body` for inline `docs/external/<name>.md` path citations that the
+/// DocHelp subagent is instructed to include, and return them as structured
+/// [`HelpCitation::DocsPath`] entries (deduplicated, order-preserving).
+fn extract_doc_citations_from_body(body: &str) -> Vec<HelpCitation> {
+    let prefix = "docs/external/";
+    let suffix = ".md";
+    let mut seen = std::collections::HashSet::new();
+    let mut citations = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(prefix) {
+        rest = &rest[start + prefix.len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+            .unwrap_or(rest.len());
+        let candidate = &rest[..end];
+        if candidate.ends_with(suffix) {
+            let path = format!("{prefix}{candidate}");
+            if seen.insert(path.clone()) {
+                citations.push(HelpCitation::DocsPath(path));
+            }
+        }
+    }
+    citations
+}
+
 async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> DocHelpResolution {
     if !deps.config.subagents.enabled {
         return DocHelpResolution::skipped();
@@ -4217,11 +4242,15 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
 
     let answer = if execution.status == ToolStatus::Success && !execution.summary.trim().is_empty()
     {
+        // Extract any "docs/external/<filename>.md" paths that the subagent cited
+        // inline in its answer.  The subagent instruction asks it to cite by the
+        // listed PATH labels, so this gives structured citations without extra cost.
+        let citations = extract_doc_citations_from_body(&execution.summary);
         Some(HelpAnswer {
             topic: "doc-help".to_string(),
             status: HelpStatus::Answered,
             body: execution.summary,
-            citations: Vec::new(),
+            citations,
             config_sections: Vec::new(),
         })
     } else {
