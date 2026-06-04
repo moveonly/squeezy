@@ -258,7 +258,7 @@ fn read_diff_packet(
     cost_hint: ToolCostHint,
     next_action_kind: DiffNextActionKind,
 ) -> Value {
-    evidence_packet(
+    let mut packet = evidence_packet(
         claim,
         vec![span_for_path_json(path, span)],
         confidence,
@@ -266,7 +266,18 @@ fn read_diff_packet(
         provenance.to_vec(),
         cost_hint,
         read_diff_next_action(path, next_action_kind),
-    )
+    );
+    // Bare packet (no symbol/reference/edge body), so keep a minimal
+    // spans + confidence here — the diff `ranges` sibling carries content but
+    // is not part of the packet, and this is the only path+span the model has.
+    if let Some(object) = packet.as_object_mut() {
+        object.insert(
+            "spans".to_string(),
+            json!(vec![span_for_path_json(path, span)]),
+        );
+        object.insert("confidence".to_string(), json!(confidence.id()));
+    }
+    packet
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -888,7 +899,7 @@ fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
         })
 }
 
-fn graph_symbol_search(
+pub(crate) fn graph_symbol_search(
     graph: &squeezy_graph::SemanticGraph,
     query: Option<&str>,
     kind: Option<&str>,
@@ -1109,7 +1120,7 @@ fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
     }
 }
 
-fn symbol_kind_label(kind: SymbolKind) -> &'static str {
+pub(crate) fn symbol_kind_label(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Class => "class",
         SymbolKind::Crate => "crate",
@@ -1246,17 +1257,20 @@ fn graph_status_for_language(language: LanguageKind) -> &'static str {
 // the typed graph events rather than the tool result JSON.
 fn evidence_packet(
     _claim: impl Into<String>,
-    spans: Vec<Value>,
-    confidence: Confidence,
+    _spans: Vec<Value>,
+    _confidence: Confidence,
     _freshness: Freshness,
     _provenance: Vec<Provenance>,
     _cost_hint: ToolCostHint,
     _next_action: Value,
 ) -> Value {
-    json!({
-        "spans": spans,
-        "confidence": confidence.id(),
-    })
+    // The top-level `spans`/`confidence` mirror was an exact duplicate of the
+    // data each caller already re-encodes in its body field (symbol/reference/
+    // edge/hierarchy), so it is dropped here. The two callers that emit a bare
+    // packet with no body field — `read_diff_packet` and the
+    // `hierarchy_node_packet` fallback — add a minimal `spans`/`confidence`
+    // back themselves so the model still has the path+span+confidence it needs.
+    json!({})
 }
 
 fn provenance_json(provenance: Provenance) -> Value {
@@ -1287,8 +1301,11 @@ fn symbol_packet(
         },
         next_action,
     );
+    // The top-level `tool` mirror duplicates context the caller already knows
+    // (the tool name is the call that produced this packet); the `symbol` body
+    // identifies the symbol. Dropped to save tokens.
+    let _ = tool;
     if let Some(object) = packet.as_object_mut() {
-        object.insert("tool".to_string(), json!(tool));
         object.insert("symbol".to_string(), symbol_json(graph, symbol));
     }
     packet
@@ -1324,52 +1341,47 @@ fn symbol_context_packet(
         }),
     );
     if let Some(object) = packet.as_object_mut() {
-        object.insert(
-            "references".to_string(),
-            json!(
-                graph
-                    .references_to_symbol(&symbol.id)
-                    .into_iter()
-                    .take(max_references)
-                    .map(reference_json)
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "callers".to_string(),
-            json!(
-                graph
-                    .callers(&symbol.id)
-                    .into_iter()
-                    .take(max_references)
-                    .filter_map(|hit| hit.caller)
-                    .map(|caller| symbol_summary_json(&caller))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "callees".to_string(),
-            json!(
-                graph
-                    .callees(&symbol.id)
-                    .into_iter()
-                    .take(max_references)
-                    .filter_map(|hit| hit.callee)
-                    .map(|callee| symbol_summary_json(&callee))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        object.insert(
-            "diagnostics".to_string(),
-            json!(
-                graph
-                    .cargo_diagnostics_for_symbol(symbol)
-                    .into_iter()
-                    .take(max_references)
-                    .map(|hit| cargo_diagnostic_hit_json(&hit))
-                    .collect::<Vec<_>>()
-            ),
-        );
+        // Insert each collection only when non-empty: the common case (a symbol
+        // with no callers/callees/references/diagnostics) used to ship four
+        // empty arrays per packet, paying tokens for nothing.
+        let references = graph
+            .references_to_symbol(&symbol.id)
+            .into_iter()
+            .take(max_references)
+            .map(reference_json)
+            .collect::<Vec<_>>();
+        if !references.is_empty() {
+            object.insert("references".to_string(), json!(references));
+        }
+        let callers = graph
+            .callers(&symbol.id)
+            .into_iter()
+            .take(max_references)
+            .filter_map(|hit| hit.caller)
+            .map(|caller| symbol_summary_json(&caller))
+            .collect::<Vec<_>>();
+        if !callers.is_empty() {
+            object.insert("callers".to_string(), json!(callers));
+        }
+        let callees = graph
+            .callees(&symbol.id)
+            .into_iter()
+            .take(max_references)
+            .filter_map(|hit| hit.callee)
+            .map(|callee| symbol_summary_json(&callee))
+            .collect::<Vec<_>>();
+        if !callees.is_empty() {
+            object.insert("callees".to_string(), json!(callees));
+        }
+        let diagnostics = graph
+            .cargo_diagnostics_for_symbol(symbol)
+            .into_iter()
+            .take(max_references)
+            .map(|hit| cargo_diagnostic_hit_json(&hit))
+            .collect::<Vec<_>>();
+        if !diagnostics.is_empty() {
+            object.insert("diagnostics".to_string(), json!(diagnostics));
+        }
     }
     packet
 }
@@ -1509,8 +1521,10 @@ fn call_edge_packet(
         },
         next_action,
     );
+    // The top-level `tool` mirror duplicates the call context; the `edge` body
+    // already identifies the edge. Dropped to save tokens.
+    let _ = tool;
     if let Some(object) = packet.as_object_mut() {
-        object.insert("tool".to_string(), json!(tool));
         object.insert("edge".to_string(), edge_json(&hit.edge));
         object.insert(
             "caller".to_string(),
@@ -1748,7 +1762,7 @@ fn hierarchy_node_packet(
     if let Some(symbol) = graph.symbols.get(&node.id) {
         return symbol_packet(graph, symbol, tool, symbol_next_action(symbol));
     }
-    evidence_packet(
+    let mut packet = evidence_packet(
         format!("{:?} `{}` appears in hierarchy", node.kind, node.name),
         vec![span_for_path_json(&node.name, Some(node.span))],
         Confidence::ExactSyntax,
@@ -1766,7 +1780,21 @@ fn hierarchy_node_packet(
             "arguments": {"symbol_id": node.id.0},
             "reason": "expand this hierarchy node"
         }),
-    )
+    );
+    // Fallback bare packet (the node has no resolved symbol body), so keep a
+    // minimal spans + confidence — this is the only path+span the model has
+    // for an unresolved hierarchy node.
+    if let Some(object) = packet.as_object_mut() {
+        object.insert(
+            "spans".to_string(),
+            json!(vec![span_for_path_json(&node.name, Some(node.span))]),
+        );
+        object.insert(
+            "confidence".to_string(),
+            json!(Confidence::ExactSyntax.id()),
+        );
+    }
+    packet
 }
 
 pub(crate) fn symbol_json(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> Value {
@@ -2303,8 +2331,17 @@ fn span_json(span: squeezy_core::SourceSpan) -> Value {
     // dropped for the same reason — start column plus the line range pins
     // the span. Saves ~40-60B per span across every packet, repo_map node,
     // symbol, edge, and reference hit.
+    // `start.column` is omitted when it is 0 (the overwhelmingly common case
+    // for declaration spans, which start at column 0): the line range alone
+    // pins the span and the model routes follow-ups by line, so a zero column
+    // is pure overhead.
+    let mut start = serde_json::Map::with_capacity(2);
+    start.insert("line".to_string(), json!(span.start.line));
+    if span.start.column != 0 {
+        start.insert("column".to_string(), json!(span.start.column));
+    }
     json!({
-        "start": {"line": span.start.line, "column": span.start.column},
+        "start": Value::Object(start),
         "end": {"line": span.end.line},
     })
 }
@@ -3022,6 +3059,54 @@ impl ToolRegistry {
             Ok(hash) => hash,
             Err(err) => return tool_error(call, err),
         };
+        // Resident-read dedup: if the model already read a byte window that
+        // ENCLOSES this one from an unchanged file, it still has these exact
+        // bytes in context — re-serializing them re-bills the whole transcript.
+        // Recall-safe by the same contract grep/read_file dedup ship: suppress
+        // only on an exact SHA match (file unchanged) AND a prior window that
+        // fully contains the requested one. The stub names `same_as_call_id`
+        // so the model can locate the resident bytes.
+        let projected_end = offset.saturating_add(limit).min(total_bytes as usize);
+        if let Some(store) = self.state_store.as_deref()
+            && let Ok(snaps) = store.read_snapshots_for_path(rel_str.as_str())
+        {
+            let prior = snaps
+                .iter()
+                .filter(|snap| {
+                    matches!(snap.tool_name.as_str(), "read_file" | "read_slice")
+                })
+                .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
+                .filter(|snap| {
+                    snap.start_byte <= offset as u64 && snap.end_byte >= projected_end as u64
+                })
+                .max_by_key(|snap| snap.created_unix_millis);
+            if let Some(snap) = prior {
+                return make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "tool": "read_slice",
+                        "path": &rel_str,
+                        "offset": offset,
+                        "bytes_returned": 0,
+                        "total_bytes": total_bytes,
+                        "sha256": &content_sha256,
+                        "unchanged": true,
+                        "receipt_stub": true,
+                        "dedup": true,
+                        "resident_read": true,
+                        "same_as_call_id": snap.call_id,
+                        "same_as_tool_name": snap.tool_name,
+                        "original_output_sha256": snap.stable_output_sha256,
+                        "original_content_sha256": snap.content_sha256,
+                        "original_model_output_bytes": snap.model_output_bytes,
+                        "truncated": false,
+                    }),
+                    ToolCostHint::default(),
+                    Some(content_sha256.clone()),
+                );
+            }
+        }
         let start_line_1based: u32 = if let Some(span) = resolved_span {
             span.start.line.saturating_add(1)
         } else if offset == 0 {

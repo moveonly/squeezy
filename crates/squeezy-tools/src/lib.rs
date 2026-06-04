@@ -591,7 +591,21 @@ impl ToolCostHint {
     pub fn confidence_distribution_from_packets(packets: &[Value]) -> BTreeMap<String, u32> {
         let mut map: BTreeMap<String, u32> = BTreeMap::new();
         for packet in packets {
-            let Some(label) = packet.get("confidence").and_then(Value::as_str) else {
+            // Packets no longer mirror confidence at the top level; it now lives
+            // in the body field that re-encodes the span (symbol/edge/reference).
+            // Try the top-level field first for back-compat with older captured
+            // packets, then fall back to each body field.
+            let label = packet
+                .get("confidence")
+                .and_then(Value::as_str)
+                .or_else(|| packet.pointer("/symbol/confidence").and_then(Value::as_str))
+                .or_else(|| packet.pointer("/edge/confidence").and_then(Value::as_str))
+                .or_else(|| {
+                    packet
+                        .pointer("/reference/confidence")
+                        .and_then(Value::as_str)
+                });
+            let Some(label) = label else {
                 continue;
             };
             if let Some(c) = confidence_from_label(label) {

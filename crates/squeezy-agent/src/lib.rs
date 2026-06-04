@@ -139,6 +139,19 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
+/// Anti-redundant-delegation gate. A whole-task `delegate` is refused once the
+/// parent has ALREADY pulled substantial context for the task in-context,
+/// because the cold subagent starts with an empty conversation + empty
+/// read-dedup store and re-reads the very files the parent already holds — pure
+/// double-work (measured: a parent that grep/read-storms 20+ calls then
+/// delegates pays the subagent to re-derive the same findings). Keyed on the
+/// parent's own exploration magnitude (turn-spanning, parent-only metrics), NOT
+/// on a delegate count: a context-isolating delegate fired *before* the parent
+/// explores has both counters near zero and is intentionally exempt. Only the
+/// broad `Delegate` kind is gated; scoped `delegate_plan`/`delegate_review`
+/// pass through.
+const REDUNDANT_DELEGATE_EXPLORE_CALLS: u64 = 8;
+const REDUNDANT_DELEGATE_READ_BYTES: u64 = 32_768;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -1514,6 +1527,24 @@ impl Agent {
         conversation_state: ConversationState,
         replay: Option<Arc<ReplayRuntime>>,
     ) -> Self {
+        // Arm context compaction by default. The mid-turn micro-compaction
+        // tier (and the full tier) early-returns when
+        // `context_compaction.model_context_window` is `None`, and that field
+        // is only ever populated from explicit config — it was never derived
+        // from the model registry, so in practice compaction *never fired*.
+        // A long single-turn tool storm then re-sends its whole growing
+        // transcript to the provider every round (quadratic in tool calls;
+        // billed as cache-write on Anthropic). Derive the window from the
+        // model's own registered context size so compaction can do its job.
+        // Explicit config (`squeezy.toml` / `SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW`)
+        // still wins via the `is_none()` guard.
+        if config.context_compaction.model_context_window.is_none()
+            && let Some(window) = squeezy_llm::model_info_for(provider.name(), &config.model)
+                .and_then(|info| info.limits)
+                .map(|limits| limits.context_window_tokens)
+        {
+            config.context_compaction.model_context_window = Some(window);
+        }
         let output_config = ToolOutputConfig {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
             preview_bytes: config.tool_preview_bytes,
@@ -10615,6 +10646,41 @@ async fn execute_tool_calls(
             _ => None,
         };
         if let Some(kind) = delegate_batch_kind {
+            // Anti-redundant-delegation gate (see the const docs above). Refuse a
+            // whole-task `delegate` when the parent has already gathered
+            // substantial context this task — a cold subagent would re-read the
+            // same files for pure overhead. Recall-safe: `Denied` removes no
+            // information (the parent already holds the context that tripped the
+            // gate and keeps every read/grep/graph tool), and `Denied` is ignored
+            // by the repeated-failure loop guard so it cannot abort the turn. An
+            // early/context-isolating delegate (counters near zero) is exempt.
+            if kind == SubagentKind::Delegate
+                && (broker.metrics.bytes_read >= REDUNDANT_DELEGATE_READ_BYTES
+                    || broker.metrics.tool_calls >= REDUNDANT_DELEGATE_EXPLORE_CALLS)
+            {
+                let result = control_tool_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "ok": false,
+                        "error": "delegate is redundant: substantial context for this task is already gathered in-context",
+                        "parent_tool_calls": broker.metrics.tool_calls,
+                        "parent_bytes_read": broker.metrics.bytes_read,
+                        "guidance": "You have already read/searched substantial relevant context in this task. A delegate subagent starts cold and re-reads the same files — pure overhead. Finish in-context using what you have; use read_file/read_slice/grep and the graph tools directly for any remaining detail."
+                    }),
+                );
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+                let _ = context
+                    .tx
+                    .send(AgentEvent::ToolCallCompleted {
+                        turn_id: context.turn_id,
+                        result: result.clone(),
+                    })
+                    .await;
+                results[index] = Some(result);
+                recorded[index] = true;
+                continue;
+            }
             // Pre-bump the `subagent_calls` counter before the future
             // is spawned so the in-flight tally stays conservative even
             // while several delegates run concurrently. Per-outcome

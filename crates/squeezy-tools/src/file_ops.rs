@@ -18,9 +18,10 @@ use crate::{
     DEFAULT_MAX_BYTES_PER_FILE, DEFAULT_MAX_FILES, DEFAULT_READ_LIMIT, MAX_READ_LIMIT,
     POLICY_PREFIX_BYTES, ToolCall, ToolCostHint, ToolOutputReplayKey, ToolOutputReplayServed,
     ToolOutputReplaySource, ToolRegistry, ToolResult, ToolStatus, build_include_set,
-    build_required_glob, diff_path_set, file_len, is_secret_path, make_result, read_prefix,
-    read_range, sha256_file, tool_arg_error, tool_error, truncate_text, workspace_path,
+    build_required_glob, diff_path_set, file_len, graph_ready_wait, is_secret_path, make_result,
+    read_prefix, read_range, sha256_file, tool_arg_error, tool_error, truncate_text, workspace_path,
 };
+use crate::graph_tools::{graph_symbol_search, symbol_kind_label};
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 250;
 pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 48_000;
@@ -86,6 +87,277 @@ pub(crate) struct GrepArgs {
 /// a caller bypasses the JSON-schema `maximum` (e.g. an external client
 /// that does not re-validate). Mirrors the schema's `"maximum": 50`.
 pub(crate) const MAX_GREP_CONTEXT: u32 = 50;
+
+/// Upper bound on graph declarations injected alongside a grep result when
+/// the inheritance-enumeration predicate fires. Keeps the additive payload
+/// bounded on very wide hierarchies; the model can fall through to a real
+/// `decl_search` (with paging) when it needs the full set.
+const GRAPH_AUGMENT_CAP: usize = 50;
+
+/// A grep pattern the model is (very probably) using to enumerate
+/// declarations by their supertype — e.g. `class \w+.*\bwith\b.*Foo` or
+/// `extends TypeAdapter`. Line-oriented grep misses any declaration whose
+/// inheritance clause wraps onto a continuation line (Dart `with` on the
+/// next line) or is nested deep in a large file, but the semantic graph
+/// indexes them all. When this fires we ADDITIVELY augment the grep result
+/// with the graph's matching declarations; the model's own `matches` are
+/// never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InheritanceGrep {
+    /// The concrete supertype literal extracted from the pattern, with any
+    /// generic argument list stripped (`TypeAdapter<T>` -> `TypeAdapter`).
+    pub(crate) base_name: String,
+    /// The declaration keyword token found in the pattern, normalized to one
+    /// of class/interface/struct/trait/mixin/enum/protocol. Used to scope the
+    /// graph `kind` filter (mixin is attribute-only — see the augment path).
+    pub(crate) decl_kw: &'static str,
+}
+
+/// Declaration keyword tokens that anchor an inheritance-enumeration grep.
+const DECL_KEYWORDS: &[&str] = &[
+    "class",
+    "interface",
+    "struct",
+    "trait",
+    "mixin",
+    "enum",
+    "protocol",
+];
+
+/// Inheritance operator tokens. A capitalized identifier appearing AFTER one
+/// of these (in the pattern's literal part) is a candidate supertype.
+const INHERITANCE_OPS: &[&str] = &["extends", "implements", "with"];
+
+/// Strip the regex metacharacters that commonly fence an
+/// enumeration-by-supertype pattern down to its literal word/identifier
+/// tokens, so a token scan over the result sees `class`, `with`, `Foo`
+/// rather than `\bwith\b` / `\w+`. We replace metachars with spaces (never
+/// deleting) so adjacent literals never fuse into a spurious token.
+fn inheritance_grep_literalize(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // `\b`, `\w`, `\s`, `\.` etc. — drop the escape and its target.
+            '\\' => {
+                chars.next();
+                out.push(' ');
+            }
+            // Structural regex metacharacters: blank them out so the
+            // surrounding literals survive as standalone tokens.
+            '.' | '*' | '+' | '?' | '^' | '$' | '[' | ']' | '{' | '}' | '|' | '(' | ')' => {
+                out.push(' ');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Tokenize a literalized pattern into `[A-Za-z0-9_]+` runs, preserving order.
+fn inheritance_grep_tokens(literal: &str) -> Vec<&str> {
+    literal
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| !tok.is_empty())
+        .collect()
+}
+
+/// Is `tok` a "concrete supertype" literal — a Capitalized identifier of at
+/// least two chars that is not itself a declaration keyword? (`TypeAdapter`,
+/// `Base`, `WidgetsBindingObserver` qualify; `T`, `A`, `Class` do not.)
+fn is_supertype_literal(tok: &str) -> bool {
+    let mut chars = tok.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    // Reject single uppercase letters (generic params like `T`, `E`).
+    if chars.clone().next().is_none() {
+        return false;
+    }
+    if !tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    // A supertype literal is never one of the decl/operator keywords, even
+    // if it was written capitalized.
+    let lower = tok.to_ascii_lowercase();
+    !DECL_KEYWORDS.contains(&lower.as_str()) && !INHERITANCE_OPS.contains(&lower.as_str())
+}
+
+/// Detect whether a grep `pattern` is enumerating declarations by supertype.
+///
+/// A pattern qualifies iff ALL three hold:
+///  1. it contains a declaration keyword token (class/interface/struct/
+///     trait/mixin/enum/protocol), `\b`-delimited after stripping regex
+///     metachars;
+///  2. it contains an inheritance signal: an `extends`/`implements`/`with`
+///     token, OR a `:` / `(` / `<` immediately followed (in the literal
+///     part) by a Capitalized identifier;
+///  3. a concrete supertype literal is extractable — the LAST Capitalized
+///     identifier appearing AFTER an inheritance operator (extends/implements/
+///     with/`:`), with generic args stripped; for python `class X(Base)` the
+///     Capitalized name inside the first `(...)`.
+///
+/// Returns `None` (no augmentation) when extraction yields nothing, so
+/// ordinary greps like `class action plan`, `with the team`,
+/// `extends_helper`, or `error: class missing` never qualify.
+pub(crate) fn detect_inheritance_grep(pattern: &str) -> Option<InheritanceGrep> {
+    let literal = inheritance_grep_literalize(pattern);
+    let tokens = inheritance_grep_tokens(&literal);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // (1) declaration keyword token. Capture the *first* one so the graph
+    // `kind` scope reflects the construct the model named. `None` when the
+    // pattern has no decl keyword — that is acceptable ONLY when an explicit
+    // inheritance operator token (extends/implements/with) anchors a concrete
+    // supertype (handled below); otherwise the pattern does not qualify.
+    let decl_kw_opt: Option<&'static str> = tokens.iter().find_map(|tok| {
+        let lower = tok.to_ascii_lowercase();
+        DECL_KEYWORDS
+            .iter()
+            .copied()
+            .find(|kw| *kw == lower.as_str())
+    });
+
+    // Index (within `tokens`) of the last inheritance operator token, if any.
+    let last_op_idx = tokens.iter().enumerate().rev().find_map(|(idx, tok)| {
+        let lower = tok.to_ascii_lowercase();
+        INHERITANCE_OPS.contains(&lower.as_str()).then_some(idx)
+    });
+
+    // Qualify iff there is EITHER a declaration keyword OR an explicit
+    // inheritance-operator token. A bare `extends Foo` (no decl keyword) is a
+    // strong, unambiguous enumeration signal on its own; `extends_helper`
+    // literalizes to a single non-operator token and so never reaches here.
+    if decl_kw_opt.is_none() && last_op_idx.is_none() {
+        return None;
+    }
+    // When no construct keyword was named, default the graph `kind` scope to
+    // `class` (the overwhelmingly common enumerate-subtypes target). The
+    // attribute filter — not `kind` — is what actually selects the matches,
+    // so a wrong default only widens, never wrongly narrows.
+    let decl_kw: &'static str = decl_kw_opt.unwrap_or("class");
+
+    // (2)+(3) extract the supertype literal.
+    //
+    // Preferred: the last Capitalized identifier appearing AFTER an
+    // inheritance operator token. This handles `extends TypeAdapter`,
+    // `with WidgetsBindingObserver`, `implements Comparable`.
+    let mut base: Option<&str> = None;
+    if let Some(op_idx) = last_op_idx {
+        base = tokens[op_idx + 1..]
+            .iter()
+            .rev()
+            .copied()
+            .find(|tok| is_supertype_literal(tok));
+    }
+
+    // Fallback (covers `:`/`(`/`<`-style inheritance with no word operator):
+    // python `class X(Base):`, Rust/Kotlin `: Base`, C++ `: public Base`.
+    // Require a structural inheritance punctuation BEFORE a Capitalized
+    // identifier so plain `class Foo` (no supertype) does not qualify.
+    if base.is_none() {
+        base = supertype_after_punct(pattern);
+    }
+
+    let base_raw = base?;
+    // Strip generic argument lists: `TypeAdapter<T>` -> `TypeAdapter`. The
+    // literalizer already turned `<`/`>` into spaces, so a token scan keeps
+    // only the head; but the punct fallback reads the raw pattern, so strip
+    // defensively here too.
+    let base_name = base_raw
+        .split(['<', '>', '(', ')'])
+        .next()
+        .unwrap_or(base_raw)
+        .trim();
+    if !is_supertype_literal(base_name) {
+        return None;
+    }
+
+    Some(InheritanceGrep {
+        base_name: base_name.to_string(),
+        decl_kw,
+    })
+}
+
+/// Extract a Capitalized supertype that directly follows a `:`, `(`, or `<`
+/// inheritance-punctuation in the *raw* pattern. Returns the first such
+/// identifier (e.g. `class X(Base)` -> `Base`, `: public Base` -> `Base`).
+/// Walks every match so `class Foo(meta=Bar): Base` still finds `Bar`/`Base`.
+fn supertype_after_punct(pattern: &str) -> Option<&str> {
+    let bytes = pattern.as_bytes();
+    let mut i = 0usize;
+    let mut best: Option<&str> = None;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == ':' || c == '(' || c == '<' {
+            // Skip any run of non-identifier chars (handles `: public Base`,
+            // `(\n   Base`, `<? extends Base`) but stop at the next ident.
+            let mut j = i + 1;
+            while j < bytes.len() {
+                // Walk forward collecting the NEXT capitalized identifier on
+                // this inheritance clause. We tolerate intervening lowercase
+                // keywords (`public`, `final`) but not another punctuation
+                // that opens a new clause.
+                let cj = bytes[j] as char;
+                if cj.is_ascii_uppercase() {
+                    let start = j;
+                    while j < bytes.len() {
+                        let cc = bytes[j] as char;
+                        if cc.is_ascii_alphanumeric() || cc == '_' {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let candidate = &pattern[start..j];
+                    if is_supertype_literal(candidate) {
+                        best = Some(candidate);
+                        break;
+                    }
+                } else if cj.is_ascii_alphabetic() || cj == '_' {
+                    // Lowercase keyword (`public`/`extends`/`with`): skip it.
+                    while j < bytes.len() {
+                        let cc = bytes[j] as char;
+                        if cc.is_ascii_alphanumeric() || cc == '_' {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                } else if cj == ':' || cj == '(' || cj == '<' {
+                    // A new clause opener resets the scan.
+                    break;
+                } else {
+                    j += 1;
+                }
+            }
+            i = i.max(j);
+        }
+        i += 1;
+    }
+    best
+}
+
+/// The matching declarations the semantic graph found for an
+/// inheritance-enumeration grep, plus provenance (which attribute prefix —
+/// `base:`/`mixin:`/`iface:` — actually matched).
+struct GraphAugment {
+    /// Lean declaration packets: `{path, line, name, kind, symbol_id,
+    /// source, matched_attribute}` — line is 1-based.
+    declarations: Vec<Value>,
+    /// True when more than `GRAPH_AUGMENT_CAP` declarations matched.
+    truncated: bool,
+    /// The attribute filter that was issued (e.g. `base:TypeAdapter`).
+    attribute: String,
+    /// Distinct attribute prefixes that actually matched a returned symbol
+    /// (e.g. `["mixin:WidgetsBindingObserver"]`). Empty when nothing matched.
+    matched_attributes: BTreeSet<String>,
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -605,10 +877,25 @@ impl ToolRegistry {
         }
 
         let content = match output_mode {
-            GrepOutputMode::Content => json!({
-                "matches": matches,
-                "metadata": metadata,
-            }),
+            GrepOutputMode::Content => {
+                let mut object = serde_json::Map::new();
+                // The model's matches are byte-identical to a plain disk
+                // grep; everything below is purely ADDITIVE sibling fields.
+                object.insert("matches".to_string(), json!(matches));
+                object.insert("metadata".to_string(), json!(metadata));
+
+                // Recall+cost augmentation: only when the grep is enumerating
+                // declarations by supertype, and only in content mode (not
+                // diff-scoped). Fails soft — graph unavailable / refresh error
+                // / no graph match leaves `matches` untouched.
+                if !diff_only
+                    && let Some(detected) = detect_inheritance_grep(&args.pattern)
+                {
+                    self.augment_inheritance_grep(&detected, &matches, &mut object)
+                        .await;
+                }
+                Value::Object(object)
+            }
             GrepOutputMode::FilesWithMatches => json!({
                 "paths": paths.into_iter().collect::<Vec<_>>(),
                 "metadata": metadata,
@@ -620,6 +907,218 @@ impl ToolRegistry {
         };
 
         make_result(call, ToolStatus::Success, content, cost, None)
+    }
+
+    /// Additively decorate a content-mode grep result with the semantic
+    /// graph's matching declarations when the model is enumerating
+    /// declarations by supertype.
+    ///
+    /// This NEVER touches `matches`. When the graph yields declarations they
+    /// are appended as `graph_declarations` (de-duped against the grep
+    /// matches by `(path, 1-based line)` so a declaration grep already found
+    /// is not double-counted) plus a `graph_hint` describing the equivalent
+    /// `decl_search`. When the language records inheritance as references
+    /// rather than `base:` attributes (C/C++, JS/TS, Go), the graph returns
+    /// nothing for an attribute query — in that case we emit ONLY a
+    /// `graph_hint` pointing at `reference_search`, claiming no completeness.
+    async fn augment_inheritance_grep(
+        &self,
+        detected: &InheritanceGrep,
+        grep_matches: &[Value],
+        object: &mut serde_json::Map<String, Value>,
+    ) {
+        let Some(augment) = self.inheritance_graph_lookup(detected.clone()).await else {
+            return;
+        };
+
+        let attribute = augment.attribute.clone();
+        if augment.declarations.is_empty() {
+            // No `base:`/`mixin:`/`iface:` attribute matched. Either the type
+            // genuinely has no declarations OR the language records
+            // inheritance as references (c_family / js_ts / go). Be honest:
+            // do NOT claim completeness — point at reference_search and
+            // augment nothing.
+            object.insert(
+                "graph_hint".to_string(),
+                json!({
+                    "reason": "inheritance_enumeration",
+                    "tool": "reference_search",
+                    "arguments": { "query": detected.base_name },
+                    "note": "grep is line-oriented; for languages that record \
+                             inheritance as references (C/C++, JS/TS, Go) run \
+                             reference_search on the supertype to find every \
+                             subtype the grep may have missed across \
+                             continuation lines.",
+                }),
+            );
+            return;
+        }
+
+        // De-dupe graph declarations against the grep's own matches by
+        // (path, 1-based line): a declaration the grep already surfaced must
+        // not be double-reported.
+        let mut grep_hits: BTreeSet<(String, u64)> = BTreeSet::new();
+        for m in grep_matches {
+            if let (Some(path), Some(line)) =
+                (m.get("path").and_then(Value::as_str), m.get("line").and_then(Value::as_u64))
+            {
+                grep_hits.insert((path.to_string(), line));
+            }
+        }
+
+        let deduped: Vec<Value> = augment
+            .declarations
+            .into_iter()
+            .filter(|decl| {
+                let key = (
+                    decl.get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    decl.get("line").and_then(Value::as_u64).unwrap_or_default(),
+                );
+                !grep_hits.contains(&key)
+            })
+            .collect();
+
+        // Every declaration was already in `matches` (e.g. a single-line
+        // `extends Base` that grep matched). Nothing additive to report and
+        // no recall gap — emit nothing so ordinary single-line greps stay
+        // unchanged.
+        if deduped.is_empty() {
+            return;
+        }
+
+        let matched = augment
+            .matched_attributes
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        object.insert("graph_declarations".to_string(), json!(deduped));
+        object.insert(
+            "graph_declarations_truncated".to_string(),
+            json!(augment.truncated),
+        );
+        object.insert(
+            "graph_hint".to_string(),
+            json!({
+                "reason": "inheritance_enumeration",
+                "tool": "decl_search",
+                "arguments": { "attribute": attribute },
+                "matched_attributes": matched,
+                "note": "graph declarations augment line-oriented grep, which \
+                         misses inheritance clauses that wrap onto a \
+                         continuation line or sit deep in a large file.",
+            }),
+        );
+    }
+
+    /// Run the actual graph lookup for an inheritance-enumeration grep.
+    ///
+    /// Mirrors `execute_graph_tool` exactly: bounded `wait_for_graph_ready`,
+    /// then a `spawn_blocking` closure that locks the std `Mutex`, refreshes,
+    /// and reuses the EXACT `graph_symbol_search` code path `decl_search`
+    /// uses (zero logic divergence). Returns `None` when the graph is not
+    /// ready or unavailable so the caller keeps the full grep result.
+    async fn inheritance_graph_lookup(&self, detected: InheritanceGrep) -> Option<GraphAugment> {
+        if !self.wait_for_graph_ready(graph_ready_wait()) {
+            return None;
+        }
+        let registry = self.clone();
+        tokio::task::spawn_blocking(move || registry.inheritance_graph_lookup_blocking(&detected))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn inheritance_graph_lookup_blocking(
+        &self,
+        detected: &InheritanceGrep,
+    ) -> Option<GraphAugment> {
+        let mut guard = self.graph.lock().ok()?;
+        let manager = guard.as_mut()?;
+        // A refresh error must fail soft (keep the full grep result), never
+        // surface as a grep error.
+        manager.refresh_before_query().ok()?;
+        let graph = manager.graph();
+
+        // `attribute` mirrors decl_search's prefix-free `base:|mixin:|iface:`
+        // alternation so a single search covers extends / Dart-`with` / implements.
+        let base = &detected.base_name;
+        let attribute = format!("base:{base}|mixin:{base}|iface:{base}");
+
+        // `kind` scope: pass the decl keyword for the kinds `parse_symbol_kind`
+        // understands so the search scopes correctly; for `mixin` (no such
+        // SymbolKind) and `protocol`/`interface` mismatches across languages,
+        // leave kind `None` and rely on the attribute filter. Keeping the
+        // mixin/protocol cases kind-agnostic avoids dropping a valid
+        // declaration whose graph kind differs from the source keyword.
+        let kind: Option<&str> = match detected.decl_kw {
+            "class" | "interface" | "struct" | "trait" | "enum" => Some(detected.decl_kw),
+            _ => None,
+        };
+
+        let symbols = graph_symbol_search(
+            graph,
+            None,
+            kind,
+            None,
+            None,
+            None,
+            Some(&attribute),
+        );
+
+        let truncated = symbols.len() > GRAPH_AUGMENT_CAP;
+        let mut matched_attributes = BTreeSet::new();
+        let declarations = symbols
+            .iter()
+            .take(GRAPH_AUGMENT_CAP)
+            .map(|symbol| {
+                // Provenance: which attribute prefix actually matched. Mirror
+                // the `|`-alternation matching `graph_symbol_search` used.
+                for prefix in ["base", "mixin", "iface"] {
+                    let needle = format!("{prefix}:{base}");
+                    if symbol
+                        .attributes
+                        .iter()
+                        .any(|attr| attr.eq_ignore_ascii_case(&needle) || attr.contains(&needle))
+                    {
+                        matched_attributes.insert(needle);
+                    }
+                }
+                let matched_for_symbol = symbol
+                    .attributes
+                    .iter()
+                    .find(|attr| {
+                        ["base", "mixin", "iface"]
+                            .iter()
+                            .any(|p| attr.eq_ignore_ascii_case(&format!("{p}:{base}")))
+                            || ["base", "mixin", "iface"]
+                                .iter()
+                                .any(|p| attr.contains(&format!("{p}:{base}")))
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| format!("base:{base}"));
+                json!({
+                    "path": symbol.file_id.0,
+                    // span lines are 0-based internally; the grep `matches`
+                    // and read_slice are 1-based, so convert for parity.
+                    "line": symbol.span.start.line.saturating_add(1),
+                    "name": symbol.name,
+                    "kind": symbol_kind_label(symbol.kind),
+                    "symbol_id": symbol.id.0,
+                    "source": "semantic_graph",
+                    "matched_attribute": matched_for_symbol,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Some(GraphAugment {
+            declarations,
+            truncated,
+            attribute,
+            matched_attributes,
+        })
     }
 
     /// Cross-tool "already-resident" grep dedup for a single-file target.
