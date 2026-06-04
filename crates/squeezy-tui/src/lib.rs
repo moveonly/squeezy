@@ -812,17 +812,7 @@ async fn run_inner_with_terminal(
         drain_agent_events(&mut app).await;
         if app.auto_drain_queue {
             app.auto_drain_queue = false;
-            if app.turn_rx.is_none()
-                && let Some(next) = app.prompt_queue.pop_front()
-            {
-                let remaining = app.prompt_queue.len();
-                app.status = if remaining == 0 {
-                    "running queued prompt".to_string()
-                } else {
-                    format!("running queued prompt ({remaining} more queued)")
-                };
-                start_user_turn(&mut app, &mut agent, next);
-            }
+            drain_prompt_queue_if_idle(&mut app, &mut agent).await;
         }
         drain_pending_diff(&mut app);
         drain_pending_mention_walk(&mut app);
@@ -2347,9 +2337,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 app.status = "enter a prompt first".to_string();
                 return Ok(false);
             }
-            // Slash commands always execute immediately — they're UI
-            // actions, not turn-equivalent prompts, so they shouldn't
-            // queue behind a running turn.
+            if app.turn_rx.is_some() {
+                queue_input_behind_running_turn(app, input);
+                return Ok(false);
+            }
             let before_command_input = app.input.clone();
             if handle_slash_command(app, agent, &input).await {
                 let preserve_input =
@@ -2367,23 +2358,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 return Ok(false);
             }
             if reject_unknown_slash_command(app, &input) {
-                return Ok(false);
-            }
-            if app.turn_rx.is_some() {
-                app.prune_prompt_attachments();
-                if app
-                    .prompt_attachments
-                    .iter()
-                    .any(|attachment| input.contains(&attachment.placeholder))
-                {
-                    app.status = "prompt attachments cannot be queued; wait for the current turn"
-                        .to_string();
-                    return Ok(false);
-                }
-                app.prompt_queue.push_back(input.clone());
-                clear_input(app);
-                push_input_history(app, input);
-                app.status = format!("queued ({})", app.prompt_queue.len());
                 return Ok(false);
             }
             // Stash the typed prompt before clearing so that a Ctrl-C/Esc
@@ -3934,18 +3908,34 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.transcript.clear();
                 app.selected_entry = None;
                 app.next_entry_id = 0;
+                app.render_cache_session = render::cache::next_session_id();
                 app.attachments = agent.context_attachments_snapshot().await;
+                app.context_compaction = agent.context_compaction_snapshot().await;
+                app.context_estimate = agent.context_estimate_snapshot().await;
+                app.context_compaction_nudge_shown = false;
                 app.pending_assistant.clear();
                 app.pending_reasoning.clear();
                 app.task_state = None;
                 app.task_panel_collapsed = false;
                 app.turn_rx = None;
                 app.cancel = None;
+                app.clear_prompt_attachments();
+                app.prompt_queue.clear();
+                app.prompt_queue_overlay = None;
+                app.auto_drain_queue = false;
+                app.transcript_overlay = None;
+                app.transcript_overlay_scrollbar_cache.set(None);
+                app.overlay = None;
+                app.overlay_active_id = None;
+                app.mention_popup = None;
                 app.subagent_pane = SubagentPaneState {
                     next_synthetic_id: app.subagent_pane.next_synthetic_id,
                     ..SubagentPaneState::default()
                 };
+                app.clear_active_tools();
                 app.toasts.clear();
+                app.cost = squeezy_core::CostSnapshot::default();
+                app.metrics = squeezy_core::TurnMetrics::default();
                 let note = match new_session {
                     Some(new_id) => format!(
                         "Conversation cleared. The previous conversation is saved and remains \
@@ -3955,6 +3945,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 };
                 app.status = "conversation cleared".to_string();
                 app.push_transcript_item(TranscriptItem::system(note));
+                app.request_terminal_clear();
             }
             Err(error) => app.status = format!("clear failed: {error}"),
         },
@@ -4943,6 +4934,74 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         prompt_queue::QueueDispatch::Ignored => true, // stay modal
     }
+}
+
+fn queue_input_behind_running_turn(app: &mut TuiApp, input: String) {
+    app.prune_prompt_attachments();
+    if app
+        .prompt_attachments
+        .iter()
+        .any(|attachment| input.contains(&attachment.placeholder))
+    {
+        app.status = "prompt attachments cannot be queued; wait for the current turn".to_string();
+        return;
+    }
+    app.prompt_queue.push_back(input.clone());
+    clear_input(app);
+    push_input_history(app, input);
+    app.input_history_index = None;
+    app.input_history_draft.clear();
+    app.slash_menu_index = 0;
+    app.status = format!("queued ({})", app.prompt_queue.len());
+}
+
+async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
+    while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
+        let Some(next) = app.prompt_queue.pop_front() else {
+            return;
+        };
+        let remaining = app.prompt_queue.len();
+        app.status = if remaining == 0 {
+            "running queued prompt".to_string()
+        } else {
+            format!("running queued prompt ({remaining} more queued)")
+        };
+        submit_queued_input(app, agent, next).await;
+    }
+}
+
+fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
+    app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.transcript_overlay.is_some()
+        || app.overlay.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        || app.pending_request_user_input.is_some()
+        || app.pending_plan_choice.is_some()
+        || app.pending_feedback.is_some()
+}
+
+async fn submit_queued_input(app: &mut TuiApp, agent: &mut Agent, raw_input: String) {
+    let input = raw_input.trim().to_string();
+    if input.is_empty() {
+        app.status = "skipped empty queued prompt".to_string();
+        return;
+    }
+    if handle_slash_command(app, agent, &input).await {
+        app.input_history_index = None;
+        app.input_history_draft.clear();
+        app.slash_menu_index = 0;
+        return;
+    }
+    if handle_inline_slash_command(app, agent, &raw_input).await {
+        return;
+    }
+    if reject_unknown_slash_command(app, &input) {
+        return;
+    }
+    app.cancelled_prompt = Some(input.clone());
+    start_user_turn(app, agent, input);
 }
 
 /// Kick off a user-driven turn. Drains any pending config swap, consumes a
@@ -13068,7 +13127,7 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         };
         let dimmed_span = if dimmed {
             Some(Span::styled(
-                "  (unavailable during turn)",
+                "  (queues after turn)",
                 Style::default()
                     .fg(crate::render::theme::quiet())
                     .add_modifier(Modifier::ITALIC),
@@ -14668,6 +14727,10 @@ pub(crate) struct TuiApp {
     /// the inline viewport before ratatui's autoresize scrolls stale frame
     /// content up into the scrollback above the new viewport.
     pub(crate) pending_resize: bool,
+    /// Set by `/clear` after the app transcript has been reset. The next
+    /// terminal draw purges the visible screen and scrollback before any
+    /// fresh-session transcript rows are flushed.
+    pub(crate) terminal_clear_pending: bool,
     pub(crate) terminal_title_state: TerminalTitleState,
     /// Last OSC title we wrote, so that repeated identical writes are
     /// suppressed and emitter logic stays idempotent across redraws.
@@ -14886,6 +14949,11 @@ impl TuiApp {
         self.prompt_attachments.clear();
     }
 
+    pub(crate) fn request_terminal_clear(&mut self) {
+        self.terminal_clear_pending = true;
+        self.needs_redraw = true;
+    }
+
     /// Clear the click-target registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
     pub(crate) fn begin_frame_clickables(&self) {
@@ -15071,6 +15139,7 @@ impl TuiApp {
             turn_started_at: None,
             last_turn_duration: None,
             pending_resize: false,
+            terminal_clear_pending: false,
             terminal_title_state: TerminalTitleState::Cleared,
             last_terminal_title: None,
             animation_tick: 0,
@@ -16452,6 +16521,7 @@ struct TerminalGuard {
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
+    fresh_inline_origin_pending: bool,
     /// Resolved DEC 2026 synchronized-output flag. Computed once at
     /// startup from the user's [`TuiSynchronizedOutput`] policy plus
     /// terminal-capability detection; consulted around every frame
@@ -16536,6 +16606,7 @@ impl TerminalGuard {
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
+            fresh_inline_origin_pending: false,
             synchronized_output,
         })
     }
@@ -16611,6 +16682,10 @@ impl TerminalGuard {
         // `render` (fullscreen draw, with the overlay branch picking
         // the right widget).
         let use_fullscreen_render = self.overlay_screen_active;
+        if app.terminal_clear_pending && !use_fullscreen_render {
+            self.clear_scrollback_and_visible()?;
+            app.terminal_clear_pending = false;
+        }
         if !use_fullscreen_render {
             self.flush_history(app)?;
         }
@@ -16832,6 +16907,27 @@ impl TerminalGuard {
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
+    fn clear_scrollback_and_visible(&mut self) -> Result<()> {
+        if self.overlay_screen_active {
+            return Ok(());
+        }
+        {
+            let terminal = self.term();
+            execute!(terminal.backend_mut(), Print(CLEAR_SCROLLBACK_AND_VISIBLE))
+                .and_then(|()| terminal.backend_mut().flush())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            terminal
+                .clear()
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        reset_inline_flush_after_hard_clear(
+            &mut self.startup_flushed,
+            &mut self.transcript_flushed_len,
+        );
+        self.fresh_inline_origin_pending = true;
+        Ok(())
+    }
+
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
         if self.overlay_screen_active {
             return Ok(());
@@ -16854,7 +16950,12 @@ impl TerminalGuard {
         );
         self.startup_flushed = true;
         self.transcript_flushed_len = flush_to;
-        self.insert_before(lines, width)
+        if self.fresh_inline_origin_pending {
+            self.fresh_inline_origin_pending = false;
+            self.insert_fresh_history_after_hard_clear(lines, width)
+        } else {
+            self.insert_before(lines, width)
+        }
     }
 
     fn insert_before(&mut self, lines: Vec<Line<'static>>, width: u16) -> Result<()> {
@@ -16866,6 +16967,84 @@ impl TerminalGuard {
             .insert_before(height, |buffer| render_lines_to_buffer(buffer, lines))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
+
+    fn insert_fresh_history_after_hard_clear(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        width: u16,
+    ) -> Result<()> {
+        let screen_height = self
+            .term()
+            .size()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?
+            .height;
+        let visual_height = visual_line_count(&lines, width);
+        let history_height = fresh_inline_history_height(visual_height, screen_height);
+        {
+            let terminal = self.term();
+            draw_lines_at_top(terminal.backend_mut(), lines, width, history_height)
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            execute!(
+                terminal.backend_mut(),
+                MoveTo(0, fresh_inline_cursor_row(history_height, screen_height))
+            )
+            .and_then(|()| terminal.backend_mut().flush())
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        self.rebuild_inline_terminal_from_cursor()
+    }
+
+    fn rebuild_inline_terminal_from_cursor(&mut self) -> Result<()> {
+        drop(self.terminal.take());
+        let writer = TerminalWriter::from_env(io::stdout());
+        let backend = CrosstermBackend::new(writer);
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+            },
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.terminal = Some(terminal);
+        Ok(())
+    }
+}
+
+fn reset_inline_flush_after_hard_clear(
+    startup_flushed: &mut bool,
+    transcript_flushed_len: &mut usize,
+) {
+    *startup_flushed = false;
+    *transcript_flushed_len = 0;
+}
+
+fn fresh_inline_history_height(visual_height: u16, screen_height: u16) -> u16 {
+    visual_height.min(screen_height.saturating_sub(1))
+}
+
+fn fresh_inline_cursor_row(history_height: u16, screen_height: u16) -> u16 {
+    history_height.min(screen_height.saturating_sub(1))
+}
+
+fn draw_lines_at_top<B: ratatui::backend::Backend>(
+    backend: &mut B,
+    lines: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
+) -> std::result::Result<(), B::Error> {
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    render_lines_to_buffer(&mut buffer, lines);
+    let width = width as usize;
+    backend.draw(buffer.content.iter().enumerate().map(|(index, cell)| {
+        let x = (index % width) as u16;
+        let y = (index / width) as u16;
+        (x, y, cell)
+    }))?;
+    backend.flush()
 }
 
 impl Drop for TerminalGuard {
