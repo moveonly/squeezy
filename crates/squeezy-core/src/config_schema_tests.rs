@@ -4,8 +4,15 @@ use super::*;
 fn every_section_has_at_least_one_field() {
     for section in CONFIG_SECTIONS {
         // `Reset` is a synthetic action-only section — the TUI renders
-        // tier-delete rows instead of `FieldMeta` entries.
-        if matches!(section.id, SectionId::Reset | SectionId::Themes) {
+        // tier-delete rows instead of `FieldMeta` entries. `Themes`
+        // and `McpServers` likewise render their own row layout (theme
+        // palette / per-server status grid) and route writes through
+        // dedicated TUI handlers, so they intentionally carry no
+        // `FieldMeta` entries here.
+        if matches!(
+            section.id,
+            SectionId::Reset | SectionId::Themes | SectionId::McpServers
+        ) {
             continue;
         }
         assert!(
