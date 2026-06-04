@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use super::{
     HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
-    matches_squeezy_help_input,
+    matches_squeezy_help_input, relevant_docs_for_input,
 };
 
 #[test]
@@ -395,6 +395,52 @@ fn bundled_docs_are_complete_external_corpus() {
 }
 
 #[test]
+fn slash_help_theme_answers_locally() {
+    let help = SqueezyHelp::new("");
+    let answer = help.answer_for_input("/help /theme").expect("theme answer");
+    assert_eq!(answer.status, HelpStatus::Answered);
+    assert_eq!(answer.topic, "/theme");
+    let body = answer.render_markdown();
+    assert!(body.contains("## /theme"), "{body}");
+    assert!(body.contains("Syntax:"), "{body}");
+    assert!(body.contains("starlight"), "{body}");
+}
+
+#[test]
+fn slash_help_router_answers_locally() {
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /router")
+        .expect("router answer");
+    assert_eq!(answer.status, HelpStatus::Answered);
+    assert_eq!(answer.topic, "/router");
+    let body = answer.render_markdown();
+    assert!(body.contains("routing"), "{body}");
+}
+
+#[test]
+fn slash_help_unknown_command_suggests_closest() {
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /them")
+        .expect("answer for unknown command");
+    let body = answer.render_markdown();
+    assert!(
+        body.contains("/theme"),
+        "should suggest /theme for /them: {body}"
+    );
+}
+
+#[test]
+fn slash_help_index_shows_grouped_topics() {
+    let help = SqueezyHelp::new("");
+    let answer = help.answer_for_input("/help").expect("index answer");
+    let body = answer.render_markdown();
+    assert!(body.contains("Getting started"), "{body}");
+    assert!(body.contains("Navigation"), "{body}");
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = bundled_doc_paths().into_iter().collect::<BTreeSet<_>>();
     let topics = [
@@ -426,4 +472,39 @@ fn squeezy_help_doc_citations_are_bundled_paths() {
             }
         }
     }
+}
+
+#[test]
+fn relevant_docs_for_input_scopes_corpus() {
+    // Known topic (/help providers): must include PROVIDERS.md, must NOT include SESSIONS.md.
+    let providers_docs = relevant_docs_for_input("/help providers");
+    let providers_paths: Vec<&str> = providers_docs.iter().map(|d| d.path).collect();
+    assert!(
+        providers_paths.contains(&"docs/external/PROVIDERS.md"),
+        "providers corpus must include PROVIDERS.md: {providers_paths:?}"
+    );
+    assert!(
+        !providers_paths.contains(&"docs/external/SESSIONS.md"),
+        "providers corpus must NOT include unrelated SESSIONS.md: {providers_paths:?}"
+    );
+    assert!(
+        providers_docs.len() < bundled_docs().len(),
+        "providers corpus ({}) must be smaller than full corpus ({})",
+        providers_docs.len(),
+        bundled_docs().len()
+    );
+
+    // Unknown topic falls back to full corpus.
+    let unknown_docs = relevant_docs_for_input("/help quantum billing rules");
+    assert_eq!(
+        unknown_docs.len(),
+        bundled_docs().len(),
+        "unknown-topic corpus must be the full corpus so DocHelp has maximum coverage"
+    );
+    assert!(
+        unknown_docs
+            .iter()
+            .any(|d| d.path == "docs/external/AGENT_APPROACH.md"),
+        "full corpus must contain AGENT_APPROACH.md"
+    );
 }

@@ -20,7 +20,7 @@ pub mod render;
 pub use help::{
     APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp,
     bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
-    relevant_docs_for_input,
+    relevant_docs_for_input, slash_command_help_names,
 };
 pub use prompt_templates::{
     PROJECT_PROMPTS_DIR, PromptTemplate, PromptTemplateCatalog, PromptTemplateSource,

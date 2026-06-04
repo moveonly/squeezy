@@ -2777,9 +2777,7 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert!(
-        request
-            .instructions
-            .contains("hidden documentation subagent"),
+        request.instructions.contains("doc-help subagent"),
         "{:?}",
         request.instructions
     );
@@ -2805,18 +2803,32 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
             _ => None,
         })
         .expect("subagent user prompt");
-    // Unknown topics fall back to the minimal corpus (README + AGENT_APPROACH).
-    // Check for something present in that fallback set rather than PROVIDERS.md,
-    // which is only included when the curated topic cites it.
+    // Unknown topics (no curated match) get the full corpus so DocHelp has
+    // maximum coverage.  Both a providers-related doc and a sessions-related doc
+    // must be present; neither is topic-specific for "quantum billing rules".
     assert!(
         user_prompt.contains("PATH: docs/external/AGENT_APPROACH.md"),
-        "subagent prompt must inline at least the fallback docs: {user_prompt:?}"
+        "unknown-topic corpus must include AGENT_APPROACH.md: {user_prompt:?}"
+    );
+    assert!(
+        user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
+        "unknown-topic corpus must include PROVIDERS.md (full corpus, not scoped): {user_prompt:?}"
+    );
+    assert!(
+        user_prompt.contains("PATH: docs/external/SESSIONS.md"),
+        "unknown-topic corpus must include SESSIONS.md (full corpus, not scoped): {user_prompt:?}"
     );
 
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("quantum-billing"), "{completed}");
     assert!(!completed.contains("No local help coverage"), "{completed}");
 }
+
+// NOTE: doc_help_subagent_scopes_corpus_to_matching_topic was removed because
+// `/help <known-topic>` is always handled by the curated layer (Answered), so
+// DocHelp never fires for known topics — the assertion `requests.len() == 1`
+// was always false.  Corpus scoping is tested as a pure unit test in
+// crates/squeezy-skills/src/help_tests.rs (relevant_docs_for_input_scopes_corpus).
 
 #[tokio::test]
 async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {

@@ -71,19 +71,37 @@ impl SqueezyHelp {
     }
 
     pub fn topic_index(&self) -> HelpAnswer {
-        let mut topics = String::new();
-        for topic in TOPICS {
-            if !topics.is_empty() {
-                topics.push('\n');
-            }
-            let _ = write!(topics, "- `{}`: {}", topic.id, topic.title);
+        const GROUPS: &[(&str, &[&str])] = &[
+            ("Getting started", &["install", "doctor"]),
+            ("Models and providers", &["providers", "config"]),
+            ("Permissions and sandbox", &["permissions"]),
+            ("Files and sessions", &["sessions", "checkpoints"]),
+            ("Context and cost", &["cost", "agent"]),
+            ("UI and interface", &["tui", "cancel"]),
+            ("Navigation", &["navigation"]),
+            (
+                "Skills and extension",
+                &["skills", "hooks", "prompt-templates"],
+            ),
+            ("Feedback", &["feedback", "telemetry"]),
+            ("MCP and web", &["mcp-web"]),
+        ];
+        let mut body = String::from("Available `/help` topics:\n");
+        for (group, ids) in GROUPS {
+            let topic_list = ids
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let _ = write!(body, "\n**{group}**  {topic_list}");
         }
+        body.push_str(
+            "\n\nUse `/help <topic>` for a local answer. For slash command help use `/help /theme`, `/help /router`, etc.\nFor broader coverage: https://squeezyagent.com/docs/",
+        );
         HelpAnswer {
             topic: "index".to_string(),
             status: HelpStatus::Answered,
-            body: format!(
-                "Available `/help` topics:\n{topics}\n\nUse `/help <topic>` for a local answer grounded in bundled docs. For broader coverage: https://squeezyagent.com/docs/"
-            ),
+            body,
             citations: vec![
                 HelpCitation::DocsPath("docs/external/README.md".to_string()),
                 HelpCitation::DocsPath("docs/external/SKILLS.md".to_string()),
@@ -105,6 +123,8 @@ impl SqueezyHelp {
         if let Some(topic) = parse_help_command(trimmed) {
             return Some(if topic.is_empty() {
                 self.topic_index()
+            } else if topic.starts_with('/') {
+                answer_slash_command(topic).unwrap_or_else(|| self.answer_topic(topic))
             } else {
                 self.answer_topic(topic)
             });
@@ -175,12 +195,12 @@ impl SqueezyHelp {
     }
 
     fn unsupported(&self, topic: &str) -> HelpAnswer {
-        let mut suggestions = String::new();
+        let mut topic_list = String::new();
         for t in TOPICS {
-            if !suggestions.is_empty() {
-                suggestions.push_str(", ");
+            if !topic_list.is_empty() {
+                topic_list.push_str(", ");
             }
-            suggestions.push_str(t.id);
+            topic_list.push_str(t.id);
         }
         let did_you_mean = {
             let candidates = top_topics_for_text(topic, 3);
@@ -191,11 +211,26 @@ impl SqueezyHelp {
                 format!("\n\nDid you mean: {}?", ids.join(" or "))
             }
         };
+        let slash_did_you_mean = if topic.trim().starts_with('/') {
+            let matches = suggest_slash_commands(topic.trim());
+            if matches.is_empty() {
+                String::new()
+            } else {
+                let listed = matches
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("\n\nDid you mean: {listed}?")
+            }
+        } else {
+            String::new()
+        };
         HelpAnswer {
             topic: topic.trim().to_string(),
             status: HelpStatus::Unsupported,
             body: format!(
-                "No local help coverage for `{}`.{did_you_mean}\n\nTry one of these topics: {suggestions}.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
+                "No local help coverage for `{}`.{did_you_mean}{slash_did_you_mean}\n\nTry one of these topics: {topic_list}.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
                 topic.trim()
             ),
             citations: Vec::new(),
@@ -279,8 +314,17 @@ const TOPICS: &[TopicDefinition] = &[
             "/statusline",
             "/model",
             "/permissions",
+            "/plans",
+            "/diff",
+            "/keymap",
+            "/spinner",
+            "/tasks",
+            "/verbosity",
+            "/effort",
+            "/fork",
+            "/cheap",
         ],
-        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Slash commands cover: `/help`, `/plan`, `/build`, `/router`, `/model`, `/permissions`, `/config`, `/cost`, `/context`, `/compact`, `/pin`, `/unpin`, `/pins`, `/attach`, `/attachments`, `/detach`, `/sessions`, `/session`, `/resume`, `/clear`, `/feedback`, `/report`, `/verbosity`, `/tool-verbosity`, `/tasks`, `/skill`, `/theme`, `/reviewer`, `/diff`, `/checkpoints`, `/undo`, `/revert-turn`. Use `/theme <name>` to switch the color theme; built-in themes are `default`, `bright`, `fun`, and `starlight`. Use `/router on|off` to toggle cheap-model turn routing. Typing any `/` in the composer opens the slash suggestion menu; arrow keys navigate it.",
+        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Slash commands: `/help`, `/plan`, `/build`, `/router`, `/model`, `/permissions`, `/config`, `/cost`, `/context`, `/compact`, `/pin`, `/unpin`, `/pins`, `/attach`, `/attachments`, `/detach`, `/sessions`, `/session`, `/resume`, `/clear`, `/feedback`, `/report`, `/verbosity`, `/tool-verbosity`, `/tasks`, `/task`, `/task-cancel`, `/skill`, `/theme`, `/reviewer`, `/diff`, `/plans`, `/fork`, `/keymap`, `/spinner`, `/effort`, `/cheap`, `/checkpoints`, `/undo`, `/revert-turn`. Use `/theme <name>` to switch the color theme; built-ins are `default`, `bright`, `fun`, and `starlight`. Use `/router on|off` to toggle cheap-model turn routing. Use `/keymap` to view the active key bindings. Typing any `/` opens the slash suggestion menu; arrow keys navigate it.",
         docs: &["docs/external/AGENT_APPROACH.md", "docs/external/TOOLS.md"],
         config: &["tui", "session"],
     },
@@ -468,11 +512,21 @@ const TOPICS: &[TopicDefinition] = &[
             "javascript",
             "typescript",
             "java",
+            "kotlin",
             "go",
             "c++",
+            "c#",
+            "csharp",
+            ".net",
+            "dotnet",
+            "php",
+            "ruby",
+            "scala",
+            "swift",
+            "dart",
             "unsupported language",
         ],
-        summary: "Squeezy uses tree-sitter backed semantic graph operations for declarations, references, hierarchy, flow, dependency paths, impact, and exact read slices. Unsupported languages fall back to ordinary bounded tools and must not fabricate graph confidence.",
+        summary: "Squeezy uses tree-sitter backed semantic graph operations for declarations, references, hierarchy, flow, dependency paths, impact, and exact read slices. Supported language families: Rust, Python, Java, Kotlin, C#/.NET, Go, C/C++, JavaScript/TypeScript, PHP, Ruby, Scala, Swift, and Dart. Unsupported languages fall back to ordinary bounded tools and must not fabricate graph confidence.",
         docs: &[
             "docs/external/AGENT_APPROACH.md",
             "docs/external/TOOLS.md",
@@ -546,7 +600,7 @@ const TOPICS: &[TopicDefinition] = &[
             "uninstall",
             "upgrade",
         ],
-        summary: "Squeezy can be installed with the one-line installer (`curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh`), from the `esqueezy/tap` Homebrew tap, with `cargo install squeezy --locked`, or from GitHub release archives for macOS and Linux. Run `squeezy doctor` after install, initialize user settings with `squeezy config init --user`, and remove the binary plus optional `~/.squeezy` state when uninstalling.",
+        summary: "Squeezy can be installed with the one-line installer (`curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh`), from the `esqueezy/tap` Homebrew tap, with `cargo install squeezy --locked`, or from GitHub release archives for macOS, Linux, and Windows (x86_64). Run `squeezy doctor` after install, initialize user settings with `squeezy config init --user`, and remove the binary plus optional `~/.squeezy` state when uninstalling.",
         docs: &[
             "docs/external/INSTALL.md",
             "docs/external/PLATFORMS.md",
@@ -566,11 +620,12 @@ const TOPICS: &[TopicDefinition] = &[
             "platforms",
             "macos",
             "linux",
+            "windows",
             "startup",
             "troubleshooting",
             "troubleshoot",
         ],
-        summary: "`squeezy doctor` validates configuration without opening the TUI and reports on the configured provider credential, repo profile, session store, and shell-sandbox availability. The first supported platforms are macOS and Linux. For startup, provider, permission, graph, or local-help issues, run `squeezy doctor` and `squeezy config inspect` first.",
+        summary: "`squeezy doctor` validates configuration without opening the TUI and reports on the configured provider credential, repo profile, session store, and shell-sandbox availability. Supported platforms are macOS, Linux, and Windows (x86_64). For startup, provider, permission, graph, or local-help issues, run `squeezy doctor` and `squeezy config inspect` first.",
         docs: &[
             "docs/external/PLATFORMS.md",
             "docs/external/TROUBLESHOOTING.md",
@@ -805,6 +860,413 @@ fn contains_code_navigation_indicator(input: &str) -> bool {
     false
 }
 
+struct SlashCommandHelp {
+    name: &'static str,
+    what: &'static str,
+    syntax: &'static str,
+    examples: &'static [&'static str],
+    available_during_turn: bool,
+    capability_note: Option<&'static str>,
+    related: &'static [&'static str],
+}
+
+static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
+    SlashCommandHelp {
+        name: "/theme",
+        what: "Switch the TUI color theme. Omit the name to list available themes.",
+        syntax: "/theme [name]",
+        examples: &[
+            "/theme          — list available themes",
+            "/theme default  — switch to the default theme",
+            "/theme bright   — switch to the bright theme",
+            "/theme fun      — switch to the fun theme",
+            "/theme starlight — switch to the starlight theme",
+        ],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["tui"],
+    },
+    SlashCommandHelp {
+        name: "/router",
+        what: "Toggle cheap-model turn routing on or off. Omit the argument to open the router config screen.",
+        syntax: "/router [on|off]",
+        examples: &[
+            "/router on   — enable cheap-model routing",
+            "/router off  — disable cheap-model routing",
+            "/router      — open router configuration",
+        ],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
+        name: "/config",
+        what: "Open the configuration screen. Pass a section name to jump directly to that section.",
+        syntax: "/config [section]",
+        examples: &[
+            "/config           — open full config screen",
+            "/config model     — jump to model/provider section",
+            "/config tui       — jump to TUI display section",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
+        name: "/model",
+        what: "Open the config screen focused on provider and model selection.",
+        syntax: "/model",
+        examples: &["/model  — open provider/model selection screen"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
+        name: "/permissions",
+        what: "Open the config screen focused on the permissions and sandbox policy.",
+        syntax: "/permissions",
+        examples: &["/permissions  — open permissions configuration screen"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["permissions", "config"],
+    },
+    SlashCommandHelp {
+        name: "/plan",
+        what: "Switch to Plan mode (read/search/navigation tools only; mutating tools are not advertised). Optionally supply an initial prompt.",
+        syntax: "/plan [prompt]",
+        examples: &[
+            "/plan                   — switch to Plan mode",
+            "/plan where is Foo used — switch to Plan mode and send a prompt",
+        ],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["agent", "tui"],
+    },
+    SlashCommandHelp {
+        name: "/build",
+        what: "Switch to Build mode (all tools available under the configured permission policy). Optionally supply an initial prompt.",
+        syntax: "/build [prompt]",
+        examples: &[
+            "/build                — switch to Build mode",
+            "/build refactor Foo   — switch to Build mode and send a prompt",
+        ],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["agent", "tui"],
+    },
+    SlashCommandHelp {
+        name: "/plans",
+        what: "Manage persisted plan-mode artifacts.",
+        syntax: "/plans [list|show|delete|set-active|open] [id]",
+        examples: &[
+            "/plans list            — list all saved plans",
+            "/plans show <id>       — show a specific plan",
+            "/plans delete <id>     — delete a plan",
+            "/plans set-active <id> — set the active plan",
+            "/plans open            — open the plans browser",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [read]"),
+        related: &["agent", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/diff",
+        what: "Show the current git change set with semantic cross-references.",
+        syntax: "/diff",
+        examples: &["/diff  — show current uncommitted changes with semantic annotations"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [read, git]"),
+        related: &["checkpoints", "agent"],
+    },
+    SlashCommandHelp {
+        name: "/keymap",
+        what: "Display the active keyboard bindings.",
+        syntax: "/keymap",
+        examples: &["/keymap  — show all active key bindings"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["tui"],
+    },
+    SlashCommandHelp {
+        name: "/attach",
+        what: "Insert a file or directory token in the prompt editor as attached context.",
+        syntax: "/attach <path>",
+        examples: &[
+            "/attach src/main.rs    — attach a specific file",
+            "/attach src/           — attach an entire directory",
+        ],
+        available_during_turn: false,
+        capability_note: Some("Requires: [read]"),
+        related: &["tui", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/compact",
+        what: "Force context compaction now — removes stale history while keeping recent turns, pins, and attachments.",
+        syntax: "/compact",
+        examples: &["/compact  — trigger compaction immediately"],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["cost", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/effort",
+        what: "Set the reasoning effort level for this session, or pass `auto` to clear a manual override.",
+        syntax: "/effort [low|medium|high|xhigh|auto]",
+        examples: &[
+            "/effort low    — minimal reasoning, fastest responses",
+            "/effort medium — balanced effort (default)",
+            "/effort high   — deeper reasoning for complex tasks",
+            "/effort xhigh  — maximum reasoning effort",
+            "/effort auto   — clear manual effort; model/provider decides",
+        ],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
+        name: "/fork",
+        what: "Branch the current conversation into a sibling session.",
+        syntax: "/fork",
+        examples: &["/fork  — create a new session branched from the current conversation"],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/cheap",
+        what: "Force the current turn to use the cheap/judge model tier.",
+        syntax: "/cheap",
+        examples: &["/cheap  — run this turn with the cheapest available model"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
+        name: "/reviewer",
+        what: "Show recent AI reviewer auto-decisions for tool approvals.",
+        syntax: "/reviewer",
+        examples: &["/reviewer  — list recent AI reviewer decisions"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["permissions"],
+    },
+    SlashCommandHelp {
+        name: "/spinner",
+        what: "Switch the working-status spinner style.",
+        syntax: "/spinner [twinkle|scintillate|drift]",
+        examples: &[
+            "/spinner twinkle     — twinkling dot spinner",
+            "/spinner scintillate — scintillating spinner",
+            "/spinner drift       — drifting bar spinner",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["tui"],
+    },
+    SlashCommandHelp {
+        name: "/verbosity",
+        what: "Set the transcript display verbosity level, or open the verbosity config screen.",
+        syntax: "/verbosity [concise|normal|verbose]",
+        examples: &[
+            "/verbosity concise  — show condensed transcript",
+            "/verbosity normal   — standard display (default)",
+            "/verbosity verbose  — show all transcript detail",
+            "/verbosity          — open verbosity config screen",
+        ],
+        available_during_turn: false,
+        capability_note: Some("Requires: [edit]"),
+        related: &["tui"],
+    },
+    SlashCommandHelp {
+        name: "/tool-verbosity",
+        what: "Set the tool output preview verbosity level.",
+        syntax: "/tool-verbosity [compact|normal|verbose]",
+        examples: &[
+            "/tool-verbosity compact  — minimal tool output preview",
+            "/tool-verbosity normal   — standard preview (default)",
+            "/tool-verbosity verbose  — full tool output in transcript",
+        ],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["tui"],
+    },
+    SlashCommandHelp {
+        name: "/sessions",
+        what: "List recent sessions for the current project.",
+        syntax: "/sessions",
+        examples: &["/sessions  — show recent session list with status and cost summaries"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [read]"),
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/session",
+        what: "Show a saved session's details, or rename/label the currently active session.",
+        syntax: "/session [id]",
+        examples: &[
+            "/session          — show the active session",
+            "/session abc123   — show a specific saved session",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [read]"),
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/resume",
+        what: "Resume a previously saved session, seeding context from its stored state.",
+        syntax: "/resume <id>",
+        examples: &["/resume abc123  — resume the session with id abc123"],
+        available_during_turn: false,
+        capability_note: Some("Requires: [read]"),
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/statusline",
+        what: "Configure which items appear in the TUI status bar.",
+        syntax: "/statusline",
+        examples: &["/statusline  — open status bar configuration screen"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [edit]"),
+        related: &["tui", "config"],
+    },
+    SlashCommandHelp {
+        name: "/cost",
+        what: "Show cumulative token and cost accounting for the current session.",
+        syntax: "/cost",
+        examples: &["/cost  — display session token usage and estimated cost"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["cost", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/context",
+        what: "Show the context budget, compaction state, and transmitted request estimate.",
+        syntax: "/context",
+        examples: &["/context  — display context window usage and compaction status"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["cost", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/clear",
+        what: "Clear the current conversation (finalizes to disk and stays resumable; a new session starts).",
+        syntax: "/clear",
+        examples: &["/clear  — end the current session and start fresh"],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["sessions"],
+    },
+    SlashCommandHelp {
+        name: "/feedback",
+        what: "Prepare a redacted maintainer feedback message (shows a preview before sending).",
+        syntax: "/feedback <message>",
+        examples: &["/feedback The /cost output is confusing  — send product feedback"],
+        available_during_turn: true,
+        capability_note: Some("Requires: [net]"),
+        related: &["feedback"],
+    },
+    SlashCommandHelp {
+        name: "/report",
+        what: "Prepare a redacted bug report archive for upload.",
+        syntax: "/report [session_id]",
+        examples: &[
+            "/report                     — report current session",
+            "/report abc123              — report a specific session by id",
+        ],
+        available_during_turn: true,
+        capability_note: Some("Requires: [net]"),
+        related: &["feedback", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/pin",
+        what: "Protect the latest (or selected) transcript item from compaction.",
+        syntax: "/pin <id>",
+        examples: &["/pin 3  — pin transcript item with id 3 (see /context for ids)"],
+        available_during_turn: false,
+        capability_note: None,
+        related: &["sessions", "cost"],
+    },
+    SlashCommandHelp {
+        name: "/undo",
+        what: "Undo the most recent checkpoint (only available when checkpointing is enabled).",
+        syntax: "/undo",
+        examples: &["/undo  — revert files to the state before the last checkpoint"],
+        available_during_turn: false,
+        capability_note: Some("Requires: [edit, destructive]"),
+        related: &["checkpoints"],
+    },
+];
+
+/// Return the slash command names that have a curated local help entry.
+/// Used by the drift test in `squeezy-tui` to verify coverage against the
+/// live `SLASH_COMMANDS` registry.
+pub fn slash_command_help_names() -> impl Iterator<Item = &'static str> {
+    SLASH_COMMAND_HELP_TABLE.iter().map(|e| e.name)
+}
+
+/// Return the local help answer for a slash command (e.g. `"/theme"`, `"/router"`).
+///
+/// `topic` is the stripped argument after `/help` — only the first token (the
+/// command name including the leading `/`) is used for lookup.
+pub fn answer_slash_command(topic: &str) -> Option<HelpAnswer> {
+    let name = topic.trim().to_ascii_lowercase();
+    let name = name.split_whitespace().next().unwrap_or("");
+    let entry = SLASH_COMMAND_HELP_TABLE.iter().find(|e| e.name == name)?;
+
+    let mut body = format!(
+        "## {}\n\n{}\n\n**Syntax:** `{}`\n\n**Examples:**\n",
+        entry.name, entry.what, entry.syntax
+    );
+    for example in entry.examples {
+        let _ = writeln!(body, "- {example}");
+    }
+    if !entry.available_during_turn {
+        body.push_str("\n**Note:** Cannot run while a turn is in progress.\n");
+    }
+    if let Some(note) = entry.capability_note {
+        let _ = write!(body, "\n**Capability:** {note}\n");
+    }
+    let related = entry
+        .related
+        .iter()
+        .map(|r| format!("`{r}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = write!(body, "\n**Related:** {related}");
+
+    Some(HelpAnswer {
+        topic: entry.name.to_string(),
+        status: HelpStatus::Answered,
+        body,
+        citations: vec![HelpCitation::DocsPath("docs/external/TOOLS.md".to_string())],
+        config_sections: Vec::new(),
+    })
+}
+
+/// Suggest slash commands from `SLASH_COMMAND_HELP_TABLE` that are close to
+/// `topic` (which should start with `/`). Returns up to 3 matches.
+///
+/// Prefers prefix matches; falls back to substring matches on the portion
+/// after the leading `/`.
+fn suggest_slash_commands(topic: &str) -> Vec<&'static str> {
+    let prefix_matches: Vec<&'static str> = SLASH_COMMAND_HELP_TABLE
+        .iter()
+        .filter(|e| e.name.starts_with(topic))
+        .map(|e| e.name)
+        .take(3)
+        .collect();
+    if !prefix_matches.is_empty() {
+        return prefix_matches;
+    }
+    let stripped = topic.strip_prefix('/').unwrap_or(topic);
+    SLASH_COMMAND_HELP_TABLE
+        .iter()
+        .filter(|e| e.name.contains(stripped))
+        .map(|e| e.name)
+        .take(3)
+        .collect()
+}
+
 fn find_topic(input: &str) -> Option<&'static TopicDefinition> {
     let normalized = normalize(input);
     TOPICS.iter().find(|topic| {
@@ -875,7 +1337,7 @@ fn top_topics_for_text(input: &str, n: usize) -> Vec<&'static TopicDefinition> {
             scored.push((score, topic));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     scored.into_iter().take(n).map(|(_, topic)| topic).collect()
 }
 
@@ -1059,10 +1521,13 @@ fn extract_doc_intro(content: &str, max_chars: usize) -> &str {
 /// includes README and AGENT_APPROACH so the subagent has core orientation.
 pub fn relevant_docs_for_input(input: &str) -> Vec<BundledDoc> {
     let trimmed = input.trim();
-    let topic = parse_help_command(trimmed)
-        .filter(|t| !t.is_empty())
+    // Extract the stripped topic string when the input is an explicit /help command.
+    // Pass ONLY the stripped part (not the full "/help …" string) to best_topic_for_text
+    // so the "/help" alias on the skills topic does not spuriously match every /help query.
+    let explicit = parse_help_command(trimmed).filter(|t| !t.is_empty());
+    let topic = explicit
         .and_then(find_topic)
-        .or_else(|| best_topic_for_text(trimmed));
+        .or_else(|| best_topic_for_text(explicit.unwrap_or(trimmed)));
 
     let Some(topic) = topic else {
         return bundled_docs();

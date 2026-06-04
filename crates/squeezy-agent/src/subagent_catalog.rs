@@ -444,9 +444,9 @@ fn is_valid_subagent_name(value: &str) -> bool {
 ///
 /// Names match the dispatch tool names (`delegate`, `explore`, `plan`,
 /// `review`) so users see the same identifier in the catalog and in the
-/// tool call. The hidden `doc_help` subagent is intentionally omitted —
-/// it is an internal `/help` mechanism, not a kind users can route to
-/// directly. Built-in entries carry no `file_path`; the dispatch logic
+/// tool call. DocHelp is an internal help mechanism; users cannot route
+/// to it explicitly, but it appears in the subagent pane like other
+/// subagents. Built-in entries carry no `file_path`; the dispatch logic
 /// in `lib.rs` is the source of truth for their behavior.
 fn builtin_entries() -> Vec<SubagentDefinition> {
     vec![
