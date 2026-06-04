@@ -780,6 +780,46 @@ fn spawn_without_tokio_runtime_buffers_event() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn store_session_id_is_stamped_on_every_event_after_set() {
+    let root = telemetry_temp_root();
+    let path = root.join("install_id");
+    let config = AppConfig {
+        telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, &path);
+
+    client.record(TelemetryEvent::app_started(&config)).await;
+    let before = client.pending_events_snapshot().await;
+    assert!(
+        before[0].properties.store_session_id.is_none(),
+        "store_session_id must be absent before set"
+    );
+
+    client.set_store_session_id("22222222-2222-4222-8222-222222222222");
+    client
+        .record(TelemetryEvent::failure_seen(ErrorKind::Io))
+        .await;
+
+    let after = client.pending_events_snapshot().await;
+    assert_eq!(after.len(), 2);
+    assert!(
+        after[0].properties.store_session_id.is_none(),
+        "already-enqueued event must not be retroactively stamped"
+    );
+    assert_eq!(
+        after[1].properties.store_session_id.as_deref(),
+        Some("22222222-2222-4222-8222-222222222222"),
+        "event after set must carry store_session_id"
+    );
+
+    let disabled = TelemetryClient::disabled();
+    disabled.set_store_session_id("should-not-panic");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn graph_event_carries_timing_counts_and_language_distribution() {
     let event = TelemetryEvent::graph_build_completed(GraphPerfReport {

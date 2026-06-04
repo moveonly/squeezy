@@ -52,6 +52,11 @@ struct TelemetryState {
     /// [`TelemetryClient::begin_turn`] and [`TelemetryClient::end_turn`].
     /// `None` outside an active turn (e.g. `app_started`). 16-hex-char string.
     current_span_id: std::sync::Mutex<Option<String>>,
+    /// Durable on-disk session ID from `SessionHandle::session_id()`. Set
+    /// once by the agent layer after building the session log, then stamped
+    /// on every subsequent event so any individual PostHog event can be
+    /// joined back to the session file without needing the summary.
+    store_session_id: std::sync::Mutex<Option<String>>,
     next_event_sequence: AtomicU64,
     queue: Mutex<TelemetryQueue>,
     /// Serializes concurrent calls to `send_pending_summaries` so that the
@@ -133,6 +138,7 @@ impl TelemetryClient {
             session_started_at_ms: now_ms(),
             session_registered: std::sync::Mutex::new(false),
             current_span_id: std::sync::Mutex::new(None),
+            store_session_id: std::sync::Mutex::new(None),
             next_event_sequence: AtomicU64::new(1),
             queue: Mutex::new(TelemetryQueue::default()),
             flush_lock: Mutex::new(()),
@@ -186,6 +192,20 @@ impl TelemetryClient {
     /// reports in PostHog are correlated with the product session summary.
     pub fn session_id(&self) -> Option<String> {
         self.state.as_ref().map(|state| state.session_id.clone())
+    }
+
+    /// Bind the durable on-disk session ID to this client. Once set, every
+    /// subsequent event is stamped with `store_session_id` so any individual
+    /// PostHog event can be correlated with the session file without needing
+    /// the summary. Called by the agent layer immediately after the session
+    /// log is opened.
+    pub fn set_store_session_id(&self, id: &str) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        if let Ok(mut guard) = state.store_session_id.lock() {
+            *guard = Some(id.to_string());
+        }
     }
 
     pub fn spawn(&self, event: TelemetryEvent) {
@@ -279,6 +299,7 @@ impl TelemetryClient {
             session_started_at_ms: now_ms(),
             session_registered: std::sync::Mutex::new(false),
             current_span_id: std::sync::Mutex::new(None),
+            store_session_id: std::sync::Mutex::new(None),
             next_event_sequence: AtomicU64::new(1),
             queue: Mutex::new(TelemetryQueue::default()),
             flush_lock: Mutex::new(()),
@@ -1901,6 +1922,7 @@ fn build_summary_from_events(
         event_sequence: 0,
         properties: TelemetryProperties {
             trace_id: Some(session.trace_id.clone()),
+            store_session_id: accumulator.store_session_id,
             started_at_ms: Some(u128_to_u64(started_at_ms)),
             ended_at_ms: Some(u128_to_u64(ended_at_ms)),
             source_records: Some(events.len() as u64),
@@ -1967,6 +1989,7 @@ struct SummaryAccumulator {
     model_family: Option<ModelFamily>,
     startup_route: Option<StartupRoute>,
     session_status: Option<SessionStatusKind>,
+    store_session_id: Option<String>,
     turn_count: u64,
     tool_calls: u64,
     turn_tool_calls: u64,
@@ -2117,6 +2140,7 @@ impl SummaryAccumulator {
             }
             TelemetryEventName::SessionEnded => {
                 self.session_status = props.session_status;
+                self.store_session_id = props.store_session_id.clone();
                 self.turn_count = self.turn_count.max(props.turn_count.unwrap_or(0));
                 self.tool_calls = self.tool_calls.max(props.tool_calls.unwrap_or(0));
                 self.tool_successes = self.tool_successes.max(props.tool_successes.unwrap_or(0));
@@ -2733,6 +2757,12 @@ fn stamp_trace_ids(state: &TelemetryState, event: &mut TelemetryEvent) {
         && let Some(span_id) = guard.as_ref()
     {
         event.properties.span_id = Some(span_id.clone());
+    }
+    if event.properties.store_session_id.is_none()
+        && let Ok(guard) = state.store_session_id.lock()
+        && let Some(id) = guard.as_ref()
+    {
+        event.properties.store_session_id = Some(id.clone());
     }
 }
 

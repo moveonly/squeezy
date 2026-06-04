@@ -1775,7 +1775,7 @@ impl Agent {
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         let (event_broadcast, _) = broadcast::channel(64);
-        Self {
+        let agent = Self {
             telemetry,
             session_started_at: Instant::now(),
             prior_metrics,
@@ -1803,7 +1803,11 @@ impl Agent {
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
+        };
+        if let Some(log) = agent.session_log.as_ref() {
+            agent.telemetry.set_store_session_id(log.session_id());
         }
+        agent
     }
 
     /// Borrow the current effective config.
