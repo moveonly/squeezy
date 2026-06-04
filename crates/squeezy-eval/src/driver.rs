@@ -2382,6 +2382,20 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::SubagentToolResult {
+                    turn_id,
+                    id,
+                    agent,
+                    result,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::SubagentEvent {
+                            event: json!({"kind": "tool_result", "id": id, "agent": agent, "tool": result.tool_name, "status": format!("{:?}", result.status)}),
+                        },
+                    )?;
+                }
                 AgentEvent::SubagentCompleted {
                     turn_id,
                     id,

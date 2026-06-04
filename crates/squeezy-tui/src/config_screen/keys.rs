@@ -6,21 +6,21 @@ use squeezy_core::{
 };
 
 use super::{
-    ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome, ModelPickerState,
-    SearchOverlayState, SecretEntryState, ThemeEditor, ThemeRow, clear_scope_override,
-    clear_scope_override_silent, compute_search_matches, cycle_to_next_registry_model,
-    discard_all_session_writes, handle_editor_key, model_field_meta, open_editor_for,
-    perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
-    provider_section_name, save_field, save_field_silent, save_inline_provider_api_key,
-    save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
-    save_theme_snapshot, undo_last_write, unset_theme_color,
+    ConfigFeedback, ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome,
+    ModelPickerState, SearchOverlayState, SecretEntryState, Severity as NotifySeverity,
+    ThemeEditor, ThemeRow, clear_scope_override, clear_scope_override_silent,
+    compute_search_matches, cycle_to_next_registry_model, discard_all_session_writes,
+    handle_editor_key, model_field_meta, open_editor_for, perform_reset, picker_matches,
+    provider_api_key_env, provider_inline_api_key, provider_section_name, save_field,
+    save_field_silent, save_inline_provider_api_key, save_theme_color, save_theme_delete,
+    save_theme_rename, save_theme_selection, save_theme_snapshot, undo_last_write,
+    unset_theme_color,
 };
-use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 
 pub(crate) fn handle_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     // Sub-modes take precedence over the regular browse keymap.
@@ -464,7 +464,7 @@ pub(crate) fn handle_key(
 fn handle_reset_confirm_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     let scope = state.reset_confirm.expect("checked by caller");
@@ -485,7 +485,7 @@ fn handle_reset_confirm_key(
 fn handle_discard_confirm_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     match (key.code, key.modifiers) {
@@ -505,7 +505,7 @@ fn handle_discard_confirm_key(
 fn handle_picker_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     let picker = state.picker.as_mut().expect("checked by caller");
@@ -580,7 +580,7 @@ fn handle_picker_key(
 fn commit_model_picker(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     model_id: String,
 ) {
     state.picker = None;
@@ -649,7 +649,7 @@ fn commit_model_picker(
 fn handle_theme_row_action(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Theme(name)) => {
@@ -676,7 +676,7 @@ fn handle_theme_row_action(
 fn handle_theme_clear(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Color(token)) => {
@@ -692,7 +692,7 @@ fn handle_theme_clear(
     }
 }
 
-fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut NotificationQueue) {
+fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut ConfigFeedback) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Theme(name)) => open_theme_rename_editor(state, notifications, name),
         Some(ThemeRow::Color(_)) => {
@@ -713,7 +713,7 @@ fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut Notifi
 fn handle_theme_delete(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Theme(name)) => {
@@ -751,7 +751,7 @@ fn open_theme_name_editor(state: &mut ConfigScreenState) {
 
 fn open_theme_rename_editor(
     state: &mut ConfigScreenState,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     name: String,
 ) {
     if is_builtin_tui_theme_name(&name) {
@@ -786,7 +786,7 @@ fn next_theme_name(state: &ConfigScreenState) -> String {
 fn handle_theme_editor_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     if key.code == KeyCode::Esc {
@@ -819,7 +819,7 @@ fn handle_theme_editor_key(
 fn commit_theme_editor(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     let Some(editor) = state.theme_editor.take() else {
         return;
@@ -934,7 +934,7 @@ fn parse_rgb_draft(draft: &str) -> Option<[u8; 3]> {
 
 fn open_api_key_entry_for_current_provider(
     state: &mut ConfigScreenState,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match provider_api_key_env(&state.effective.provider) {
         Some((label, env_var)) => {
@@ -967,7 +967,7 @@ fn open_api_key_entry_for_current_provider(
 fn handle_secret_entry_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     let entry = state.secret_entry.as_mut().expect("checked by caller");

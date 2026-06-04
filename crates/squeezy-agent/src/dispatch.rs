@@ -150,6 +150,11 @@ pub enum DispatchCommand {
     Theme {
         theme: Option<String>,
     },
+    /// `/spinner [twinkle|scintillate|drift]` — set the working-status
+    /// spinner. `None` reports the current spinner and the options.
+    Spinner {
+        spinner: Option<String>,
+    },
     Keymap,
     /// `/cheap` — force the next turn onto the provider's small-fast
     /// tier even when the router would not have routed it cheap.
@@ -211,6 +216,7 @@ impl DispatchCommand {
             Self::Detach { .. } => "/detach",
             Self::Statusline => "/statusline",
             Self::Theme { .. } => "/theme",
+            Self::Spinner { .. } => "/spinner",
             Self::Keymap => "/keymap",
             Self::Cheap => "/cheap",
             Self::Parent => "/parent",
@@ -375,6 +381,9 @@ impl DispatchCommand {
             "/statusline" => Self::Statusline,
             "/theme" => Self::Theme {
                 theme: rest.split_whitespace().next().map(str::to_string),
+            },
+            "/spinner" => Self::Spinner {
+                spinner: rest.split_whitespace().next().map(str::to_string),
             },
             "/keymap" => Self::Keymap,
             "/cheap" => Self::Cheap,

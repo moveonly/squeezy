@@ -10,8 +10,10 @@ use squeezy_core::{
     settings_writer::{EditOp, SettingsEdit, SettingsScope, WriteOutcome, apply_edits},
 };
 
-use super::{ConfigScope, ConfigScreenState, model_field_meta, provider_variant_label, tier_path};
-use crate::notification::{NotificationQueue, Severity as NotifySeverity};
+use super::{
+    ConfigFeedback, ConfigScope, ConfigScreenState, Severity as NotifySeverity, model_field_meta,
+    provider_variant_label, tier_path,
+};
 
 /// Persist an inline `[providers.<section>] api_key = "..."` into the active
 /// scope's TOML and rebuild the provider client so the next turn picks it
@@ -23,7 +25,7 @@ use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 pub(crate) fn save_inline_provider_api_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     section: &str,
     env_var: &str,
     value: &str,
@@ -141,7 +143,7 @@ fn set_effective_provider_api_key(cfg: &mut AppConfig, value: &str) {
 pub(crate) fn save_theme_selection(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
 ) {
     let (target_path, scope_target) = scope_write_target(state);
@@ -177,7 +179,7 @@ pub(crate) fn save_theme_selection(
 pub(crate) fn save_theme_snapshot(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
 ) {
     let snapshot =
@@ -235,7 +237,7 @@ pub(crate) fn save_theme_snapshot(
 pub(crate) fn save_theme_color(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
     token: String,
     rgb: [u8; 3],
@@ -284,7 +286,7 @@ pub(crate) fn save_theme_color(
 pub(crate) fn save_theme_rename(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     old_theme: String,
     new_theme: String,
 ) {
@@ -365,7 +367,7 @@ pub(crate) fn save_theme_rename(
 pub(crate) fn save_theme_delete(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
 ) {
     if !state.effective.tui.themes.contains_key(&theme) {
@@ -424,7 +426,7 @@ pub(crate) fn save_theme_delete(
 pub(crate) fn unset_theme_color(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
     token: String,
 ) {
@@ -494,7 +496,7 @@ fn scope_write_target(state: &ConfigScreenState) -> (std::path::PathBuf, Setting
 fn finish_theme_save(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     state.dirty = true;
     match load_separated_settings_sources() {
@@ -513,7 +515,7 @@ fn finish_theme_save(
 pub(crate) fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
     value: FieldValue,
 ) {
@@ -526,7 +528,7 @@ pub(crate) fn save_field(
 pub(crate) fn save_field_silent(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
     value: FieldValue,
 ) {
@@ -536,7 +538,7 @@ pub(crate) fn save_field_silent(
 fn save_field_inner(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
     value: FieldValue,
     silent: bool,
@@ -618,7 +620,7 @@ fn is_permission_detail_field(field: &'static FieldMeta) -> bool {
 fn apply_by_tier(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
     outcome: &WriteOutcome,
     silent: bool,
@@ -822,7 +824,7 @@ fn clear_field_edits(field: &'static FieldMeta) -> Vec<SettingsEdit> {
 pub(crate) fn undo_last_write(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     let Some((path, pre_bytes)) = state.undo_stack.pop() else {
         notifications.push("Nothing to undo this session.", NotifySeverity::Info);
@@ -849,7 +851,7 @@ pub(crate) fn undo_last_write(
 pub(crate) fn discard_all_session_writes(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     if state.undo_stack.is_empty() {
         notifications.push(
@@ -923,7 +925,7 @@ pub(crate) fn restore_path(path: &std::path::Path, bytes: Option<&[u8]>) -> std:
 pub(crate) fn reload_sources_and_agent(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     if let Ok(reloaded) = load_separated_settings_sources() {
         state.sources = reloaded;
@@ -980,7 +982,7 @@ pub(crate) fn reload_sources_and_agent(
 /// notification that would otherwise pile up.
 pub(crate) fn clear_scope_override_silent(
     state: &mut ConfigScreenState,
-    _notifications: &mut NotificationQueue,
+    _notifications: &mut ConfigFeedback,
 ) {
     let field = state.current_field();
     let (path, scope_target) = match state.scope {
@@ -1013,7 +1015,7 @@ pub(crate) fn clear_scope_override_silent(
 
 pub(crate) fn clear_scope_override(
     state: &mut ConfigScreenState,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     let field = state.current_field();
     let (path, scope_target) = match state.scope {
@@ -1066,7 +1068,7 @@ pub(crate) fn clear_scope_override(
 pub(crate) fn perform_reset(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     scope: ConfigScope,
 ) {
     let path = tier_path(state, scope);

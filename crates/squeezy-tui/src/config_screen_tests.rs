@@ -74,7 +74,7 @@ fn opens_at_models_when_no_focus() {
 fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // Default scope is User (leftmost tab) — Tab walks
     // User → Repo → Local → User and BackTab reverses.
     assert_eq!(state.scope, ConfigScope::User);
@@ -119,7 +119,7 @@ async fn themes_section_selects_builtin_theme_immediately() {
     let mut state = temp_config_state(Some(SectionId::Themes));
     let settings_path = state.sources.user_path_default.clone();
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective)
         .iter()
         .position(|name| name == "bright")
@@ -143,7 +143,7 @@ async fn themes_section_edits_active_theme_rgb_token() {
     let mut state = temp_config_state(Some(SectionId::Themes));
     let settings_path = state.sources.user_path_default.clone();
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     let token = crate::render::theme::token::PALETTE_ACCENT;
     let color_row = crate::render::theme::available_theme_names(&state.effective).len()
         + 1
@@ -199,7 +199,7 @@ async fn themes_section_edits_active_theme_rgb_token() {
 async fn themes_section_creates_custom_theme_snapshot() {
     let mut state = temp_config_state(Some(SectionId::Themes));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective).len();
 
     handle_key(
@@ -256,7 +256,7 @@ async fn themes_section_renames_custom_theme() {
         },
     );
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective)
         .iter()
         .position(|name| name == "ocean")
@@ -317,7 +317,7 @@ async fn themes_section_deletes_custom_theme_and_falls_back_when_active() {
         },
     );
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective)
         .iter()
         .position(|name| name == "ocean")
@@ -342,7 +342,7 @@ async fn themes_section_deletes_custom_theme_and_falls_back_when_active() {
 fn arrow_keys_navigate_sections_and_fields() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert_eq!(state.field_index, 0);
     handle_key(
         &mut state,
@@ -368,7 +368,7 @@ fn space_toggles_bool_field() {
     // SQUEEZY_TELEMETRY in parallel.
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     let before = state.effective.tui.show_reasoning_usage;
@@ -426,7 +426,7 @@ fn string_list_editor_round_trips_via_commit() {
 async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // Layout: provider at row 0, model at row 1, synthetic API-key at row 2.
     state.field_index = 1;
     handle_key(
@@ -474,7 +474,7 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
 async fn esc_on_model_picker_closes_picker_only() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1; // model row (synthetic API-key now lives at row 2)
     handle_key(
         &mut state,
@@ -506,7 +506,7 @@ async fn space_cycles_model_field_to_next_registry_entry() {
     }
     let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1; // model row (synthetic API-key now lives at row 2)
     let before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
         FieldValue::String(s) => s,
@@ -533,7 +533,7 @@ async fn space_on_non_cyclable_field_emits_hint() {
     use squeezy_core::config_schema::SectionId as SId;
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Limits));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // max_parallel_tools is Integer — Space should surface a hint, not silently no-op.
     state.field_index = 0;
     handle_key(
@@ -559,7 +559,7 @@ async fn space_cycles_enum_field_to_next_option() {
     }
     let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = 0; // provider (Enum)
     let before = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
@@ -586,7 +586,7 @@ async fn space_cycles_enum_field_to_next_option() {
 async fn slash_opens_search_and_enter_jumps_to_field() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // Open search with `/`.
     handle_key(
         &mut state,
@@ -627,7 +627,7 @@ async fn search_enter_lands_on_models_field_past_synthetic_key_row() {
     // resolve back to the intended field, not one display row too high.
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
 
     let models_sidx = CONFIG_SECTIONS
         .iter()
@@ -689,7 +689,7 @@ async fn ctrl_r_resets_field_to_default() {
     // robust against other tests setting SQUEEZY_* env vars in parallel.
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = field_index(SectionId::Verbosity, &["tui", "response_verbosity"]);
     state.effective.tui.response_verbosity = squeezy_core::ResponseVerbosity::Verbose;
     handle_key(
@@ -711,7 +711,7 @@ async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
     unsafe { std::env::set_var("SQUEEZY_TELEMETRY", "off") };
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Telemetry));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     handle_key(
         &mut state,
         &mut agent,
@@ -731,20 +731,6 @@ async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
     unsafe { std::env::remove_var("SQUEEZY_TELEMETRY") };
 }
 
-#[test]
-fn notification_dismiss_current_and_clear_all() {
-    let mut q = NotificationQueue::new();
-    q.push("a", crate::notification::Severity::Info);
-    q.push("b", crate::notification::Severity::Info);
-    q.push("c", crate::notification::Severity::Info);
-    assert_eq!(q.len(), 3);
-    assert!(q.dismiss_current());
-    assert_eq!(q.len(), 2);
-    let removed = q.clear_all();
-    assert_eq!(removed, 2);
-    assert!(q.is_empty());
-}
-
 #[tokio::test]
 async fn space_cycling_provider_resets_model_in_memory() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
@@ -755,7 +741,7 @@ async fn space_cycling_provider_resets_model_in_memory() {
     }
     let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     // provider is row 0
     state.field_index = 0;
@@ -847,7 +833,7 @@ async fn reset_section_enter_arms_confirmation_and_n_cancels() {
     use squeezy_core::config_schema::SectionId as SId;
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Reset));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert_eq!(state.field_index, 0);
     handle_key(
         &mut state,
@@ -948,7 +934,7 @@ fn default_scope_is_user() {
 async fn shift_x_arms_discard_confirmation_then_n_cancels() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
@@ -992,7 +978,7 @@ async fn shift_x_arms_discard_confirmation_then_n_cancels() {
 async fn shift_x_on_empty_undo_stack_short_circuits_without_confirm() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert!(state.undo_stack.is_empty());
     handle_key(
         &mut state,
@@ -1016,7 +1002,7 @@ async fn shift_x_on_empty_undo_stack_short_circuits_without_confirm() {
 async fn discard_confirm_y_wipes_session_writes() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
@@ -1159,7 +1145,7 @@ async fn model_picker_provider_swap_writes_once_not_twice() {
     }
     let mut state = temp_config_state(Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1;
     handle_key(
         &mut state,
@@ -1256,7 +1242,7 @@ fn model_picker_clips_with_scroll_indicators() {
 async fn ctrl_s_message_includes_undo_hint() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     handle_key(
         &mut state,
         &mut agent,
@@ -1275,7 +1261,7 @@ async fn ctrl_s_message_includes_undo_hint() {
 async fn picker_open_path_locates_provider_field_by_toml_path() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1;
     handle_key(
         &mut state,
@@ -1307,7 +1293,7 @@ async fn picker_open_path_locates_provider_field_by_toml_path() {
 async fn discard_confirm_overlay_renders_with_file_list() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
@@ -1380,7 +1366,7 @@ fn field_pane_keeps_active_row_visible_when_clipped() {
 async fn tab_from_default_user_scope_advances_to_repo() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert_eq!(state.scope, ConfigScope::User);
     handle_key(
         &mut state,
@@ -1407,7 +1393,7 @@ async fn tab_from_default_user_scope_advances_to_repo() {
 async fn immediate_tier_bool_save_propagates_to_agent() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     let before = agent.config_snapshot().tui.show_reasoning_usage;
@@ -1429,7 +1415,7 @@ async fn immediate_tier_enum_save_propagates_to_agent() {
     use squeezy_core::ResponseVerbosity;
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "response_verbosity"]);
     state.effective.tui.response_verbosity = ResponseVerbosity::Normal;
@@ -1453,7 +1439,7 @@ async fn immediate_tier_permission_save_propagates_to_agent() {
     use squeezy_core::{PermissionMode, PermissionPolicyMode};
     let mut state = temp_config_state(Some(SectionId::Permissions));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.effective.permissions.mode = PermissionPolicyMode::Custom;
     state.field_index = field_index(SectionId::Permissions, &["permissions", "read"]);
@@ -1523,7 +1509,7 @@ async fn next_prompt_tier_save_arms_pending_swap() {
     unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
     let mut state = temp_config_state(Some(SectionId::Subagents));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     let section = CONFIG_SECTIONS
         .iter()
@@ -1565,7 +1551,7 @@ async fn next_prompt_swap_applies_on_drain() {
     unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
     let mut state = temp_config_state(Some(SectionId::Subagents));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     let section = CONFIG_SECTIONS
         .iter()

@@ -335,6 +335,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[default|bright|fun|catppuccin|high-contrast|<custom>]",
         &[PermissionCapability::Edit],
     ),
+    slash_args_caps(
+        "/spinner",
+        "set the working-status spinner",
+        true,
+        "[twinkle|scintillate|drift]",
+        &[PermissionCapability::Edit],
+    ),
     slash("/keymap", "list current key bindings"),
 ];
 
@@ -855,14 +862,21 @@ pub(crate) fn reject_unknown_slash_command(app: &mut TuiApp, input: &str) -> boo
     true
 }
 
-pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
+/// Returns `true` when the keypress was consumed by history recall — the
+/// composer text or history index changed, or the recall deliberately
+/// stepped out of history mode back to the draft. Returns `false` when
+/// there was nothing to recall in the requested direction, so the caller
+/// can treat the arrow as "fall through" (e.g. Down then focuses the
+/// subagent pane instead of dead-ending in the composer).
+pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) -> bool {
     if app.input_history.is_empty() {
         app.status = "no prompt history".to_string();
-        return;
+        return false;
     }
-    if app.input_history_index.is_none() && !app.input.trim().is_empty() {
-        return;
-    }
+    // Plain Up/Down iterate history even with a half-typed draft in the
+    // composer — the draft is stashed into `input_history_draft` (see the
+    // `(None, Previous)` arm) and restored when the user steps back down past
+    // the newest entry, matching shell history behaviour.
     let last = app.input_history.len() - 1;
     let next = match (app.input_history_index, direction) {
         (None, HistoryDirection::Previous) => {
@@ -873,7 +887,7 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
             };
             Some(last)
         }
-        (None, HistoryDirection::Next) => return,
+        (None, HistoryDirection::Next) => return false,
         (Some(0), HistoryDirection::Previous) => Some(0),
         (Some(index), HistoryDirection::Previous) => Some(index - 1),
         (Some(index), HistoryDirection::Next) if index >= last => {
@@ -881,7 +895,7 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
             set_input(app, draft);
             app.input_history_index = None;
             app.slash_menu_index = 0;
-            return;
+            return true;
         }
         (Some(index), HistoryDirection::Next) => Some(index + 1),
     };
@@ -893,6 +907,7 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         app.selected_entry = None;
         app.slash_menu_index = 0;
     }
+    true
 }
 
 #[cfg(test)]

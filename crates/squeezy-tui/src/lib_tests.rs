@@ -11,7 +11,7 @@ use squeezy_core::{
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
     StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen, TuiConfig,
+    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiConfig,
     TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
@@ -308,131 +308,73 @@ fn subagent_pane_overflow_marks_hidden_and_keeps_newest_reachable() {
 }
 
 #[tokio::test]
-async fn subagent_pane_selects_subagent_conversation_and_returns_to_main() {
+async fn inline_down_midsentence_focuses_subagent_pane() {
+    // Down with a half-typed single-line draft (cursor mid-line) must reach the
+    // pane in inline mode — it used to require an empty composer.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
-    app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
-
+    app.note_subagent_started(9, "delegate".to_string(), "x".to_string());
+    app.input = "hello world".to_string();
+    app.input_cursor = 5;
     handle_key(
         &mut app,
         &mut agent,
         KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
     )
     .await
-    .expect("focus pane");
-    assert!(app.subagent_pane.focused);
-    assert_eq!(app.subagent_pane.selected, 1);
-    // Highlighting a row previews its conversation live — no Enter required.
-    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("commit selection");
-    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
+    .unwrap();
     assert!(
-        !app.subagent_pane.focused,
-        "Enter should release selector focus so scroll keys target the transcript"
+        app.subagent_pane.focused,
+        "down mid-sentence must focus the pane"
     );
-    let subagent_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(80), false));
-    assert!(
-        subagent_view.contains("delegate subagent"),
-        "{subagent_view}"
-    );
-    assert!(subagent_view.contains("running grep"), "{subagent_view}");
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("return to main");
-    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
-    assert!(!app.subagent_pane.focused);
+    assert_eq!(app.input, "hello world", "draft must be preserved");
 }
 
 #[tokio::test]
-async fn subagent_pane_does_not_steal_down_scroll_when_main_transcript_is_scrolled() {
+async fn inline_plain_updown_iterate_history_even_with_a_draft() {
+    // Plain Up/Down iterate prompt history; a half-typed draft is stashed and
+    // restored when stepping back past the newest entry (shell-style).
     let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
-    app.transcript_scroll_from_bottom = 6;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll down");
-
+    let mut app = test_app(SessionMode::Build);
+    push_input_history(&mut app, "first".to_string());
+    push_input_history(&mut app, "second".to_string());
+    app.input = "draft".to_string();
+    app.input_cursor = app.input.len();
+    let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, up()).await.unwrap();
+    assert_eq!(app.input, "second", "Up recalls newest even with a draft");
+    handle_key(&mut app, &mut agent, up()).await.unwrap();
+    assert_eq!(app.input, "first", "Up recalls older");
+    handle_key(&mut app, &mut agent, down()).await.unwrap();
+    assert_eq!(app.input, "second", "Down recalls newer");
+    handle_key(&mut app, &mut agent, down()).await.unwrap();
     assert_eq!(
-        app.transcript_scroll_from_bottom, 3,
-        "plain Down from terminal wheel translation should keep scrolling the main transcript"
+        app.input, "draft",
+        "Down past newest restores the stashed draft"
     );
-    assert!(
-        !app.subagent_pane.focused,
-        "subagent selector must not steal scrollback while the main transcript is scrolled"
-    );
-    assert_eq!(app.subagent_pane.active, ConversationSource::Main);
-    assert_eq!(app.subagent_pane.selected, 0);
 }
 
 #[tokio::test]
-async fn selected_subagent_scroll_does_not_mutate_main_transcript_scroll() {
+async fn inline_down_in_history_steps_forward_not_into_pane() {
+    // While iterating history (not at the newest entry), Down steps forward
+    // through prompts; it must not jump into the subagent pane.
     let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.note_subagent_started(7, "delegate".to_string(), "Inspect src".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("focus pane");
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("select subagent");
-    app.transcript_scroll_from_bottom = 9;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll subagent");
-
-    assert_eq!(
-        app.transcript_scroll_from_bottom, 9,
-        "subagent transcript scroll must not overwrite main transcript scroll"
-    );
-    let record = app
-        .subagent_pane
-        .records
-        .iter()
-        .find(|record| record.id == 7)
-        .expect("subagent record");
-    assert_eq!(record.scroll_from_bottom, 3);
-    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(7));
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "x".to_string());
+    push_input_history(&mut app, "a".to_string());
+    push_input_history(&mut app, "b".to_string());
+    push_input_history(&mut app, "c".to_string());
+    let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, up()).await.unwrap(); // c
+    handle_key(&mut app, &mut agent, up()).await.unwrap(); // b
+    assert_eq!(app.input, "b");
+    handle_key(&mut app, &mut agent, down()).await.unwrap(); // -> c, NOT pane
+    assert_eq!(app.input, "c", "Down mid-history steps forward");
     assert!(
         !app.subagent_pane.focused,
-        "scroll keys should target the selected subagent transcript, not the selector"
+        "Down mid-history must not focus the pane"
     );
 }
 
@@ -604,6 +546,253 @@ async fn delete_clears_finished_subagents_and_keeps_running_ones() {
     assert_eq!(app.status, "cleared finished subagents");
 }
 
+#[tokio::test]
+async fn subagent_pane_folds_to_summary_when_all_finished_and_expands_on_down() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string());
+
+    // While a subagent is still running the pane stays fully expanded (live).
+    assert!(!subagent_pane_collapsed(&app));
+    assert!(subagent_pane_height(&app) > 1);
+
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_completed(
+        2,
+        "explore".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+
+    // All finished, unfocused, viewing main → fold to a one-line summary.
+    assert!(subagent_pane_collapsed(&app));
+    assert_eq!(subagent_pane_height(&app), 1);
+    let rendered = render_subagent_pane_to_string(&app, 80, 1);
+    assert!(rendered.contains("2 subagents"), "{rendered}");
+    assert!(rendered.contains("review"), "{rendered}");
+
+    // Down re-expands the list for review.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("expand pane");
+    assert!(app.subagent_pane.focused);
+    assert!(!subagent_pane_collapsed(&app));
+    assert!(subagent_pane_height(&app) > 1);
+
+    // Esc returns to main and the pane folds back down.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("collapse again");
+    assert!(!app.subagent_pane.focused);
+    assert!(subagent_pane_collapsed(&app));
+}
+
+#[test]
+fn subagent_pane_summary_reports_failures() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string());
+    app.note_subagent_failed(
+        2,
+        "explore".to_string(),
+        "boom".to_string(),
+        TurnMetrics::default(),
+    );
+
+    assert!(subagent_pane_collapsed(&app));
+    let rendered = render_subagent_pane_to_string(&app, 80, 1);
+    assert!(rendered.contains("1 done"), "{rendered}");
+    assert!(rendered.contains("1 failed"), "{rendered}");
+}
+
+#[tokio::test]
+async fn enter_opens_full_screen_subagent_overlay_in_inline_mode() {
+    // The conversation lives in terminal scrollback that can't be repainted, so
+    // Enter on a selected subagent must open the full-screen overlay for the
+    // subagent's conversation to be visible — the original bug was that
+    // selecting did nothing.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.note_subagent_activity(9, "delegate".to_string(), "running grep".to_string());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("focus pane");
+    assert_eq!(app.subagent_pane.selected, 1);
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "inline highlighting must not hijack the shown conversation (keyboard scroll stays on main)"
+    );
+    assert!(
+        app.transcript_overlay.is_none(),
+        "highlighting alone should not open the overlay yet"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open overlay");
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(9));
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Enter must open the full-screen view in inline mode"
+    );
+    assert!(!app.subagent_pane.focused);
+    let overlay = render_to_string(&app, 90, 16);
+    assert!(overlay.contains("delegate subagent"), "{overlay}");
+    assert!(overlay.contains("running grep"), "{overlay}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("close overlay");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc closes the overlay in one press"
+    );
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "Esc backs all the way out to the main conversation"
+    );
+    assert!(!app.subagent_pane.focused);
+}
+
+#[tokio::test]
+async fn down_focuses_subagent_pane_with_a_nonempty_composer() {
+    // Regression: Down used to focus the pane only when the composer was
+    // empty, so any draft text trapped the selector below it.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    app.input = "half-typed prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+
+    assert!(
+        app.subagent_pane.focused,
+        "Down should reach the pane even with draft text in the composer"
+    );
+    assert_eq!(app.subagent_pane.selected, 1);
+    assert_eq!(
+        app.subagent_pane.active,
+        ConversationSource::Main,
+        "inline highlighting keeps the shown conversation on main until Enter"
+    );
+    assert_eq!(
+        app.input, "half-typed prompt",
+        "focusing the pane must not disturb the draft"
+    );
+}
+
+#[tokio::test]
+async fn down_reaches_pane_after_prompt_history_is_exhausted() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(9, "delegate".to_string(), "Inspect src".to_string());
+    push_input_history(&mut app, "first".to_string());
+    push_input_history(&mut app, "second".to_string());
+
+    // Up walks back into history, Down walks forward; the final Down past the
+    // newest entry steps out of history, and the next Down should fall through
+    // to the pane rather than dead-ending.
+    let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, up()).await.expect("up");
+    assert_eq!(app.input, "second");
+    handle_key(&mut app, &mut agent, up()).await.expect("up");
+    assert_eq!(app.input, "first");
+    handle_key(&mut app, &mut agent, down())
+        .await
+        .expect("down");
+    assert_eq!(app.input, "second");
+    handle_key(&mut app, &mut agent, down())
+        .await
+        .expect("down");
+    assert!(app.input.is_empty(), "stepped out of history to the draft");
+    assert!(
+        !app.subagent_pane.focused,
+        "leaving history should not also jump straight into the pane"
+    );
+    handle_key(&mut app, &mut agent, down())
+        .await
+        .expect("down");
+    assert!(
+        app.subagent_pane.focused,
+        "Down once history is exhausted should focus the pane"
+    );
+}
+
+#[test]
+fn clearing_finished_subagents_keeps_highlight_on_shown_conversation() {
+    // Regression: `selected` (a row index) and `active` (a record id) are
+    // sourced independently. Dropping finished rows above the shown subagent
+    // shifts the vector, which used to leave the bold highlight on a different
+    // row than the ● "shown" marker.
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "a".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "b".to_string()); // running
+    app.note_subagent_started(3, "explore".to_string(), "c".to_string()); // running
+
+    // View the middle (running) subagent #2, highlighted on row 2.
+    app.subagent_pane.active = ConversationSource::Subagent(2);
+    app.subagent_pane.selected = 2;
+
+    app.clear_finished_subagents();
+
+    assert_eq!(app.subagent_pane.records.len(), 2);
+    assert_eq!(app.subagent_pane.active, ConversationSource::Subagent(2));
+    assert_eq!(
+        app.subagent_pane.selected, 1,
+        "highlight must follow #2 to its new row after #1 was dropped"
+    );
+}
+
 #[test]
 fn prune_caps_retained_subagent_records() {
     let mut app = test_app(SessionMode::Build);
@@ -726,6 +915,8 @@ async fn rejected_subagent_event_renders_human_reason_not_raw_token() {
     );
 
     // The pane row on screen carries the human phrasing, not the token.
+    // Expand the pane first — an all-finished pane folds to a one-line summary.
+    app.subagent_pane.focused = true;
     let output = render_to_string(&app, 120, 18);
     let pane_row = output
         .lines()
@@ -752,8 +943,33 @@ fn subagent_row_shows_lifecycle_word_for_accessibility() {
     assert!(output.contains("failed"), "{output}");
 }
 
+#[test]
+fn subagent_marker_fills_on_cursor_and_rings_carry_status() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(2, "explore".to_string(), "look".to_string()); // running
+    let record = app.subagent_pane.records[0].clone();
+
+    // Cursor on the subagent (row 1): its ring fills amber; main empties.
+    app.subagent_pane.selected = 1;
+    let sub = subagent_record_row(&app, 0, &record, 120);
+    assert_eq!(sub.spans[0].content.as_ref(), "●");
+    assert_eq!(sub.spans[0].style.fg, Some(crate::render::theme::accent()));
+    let main = subagent_main_row(&app, 120);
+    assert_eq!(main.spans[0].content.as_ref(), "○");
+
+    // Cursor on main (row 0): main fills amber; the running subagent is an
+    // empty silver ring (status colour, not amber).
+    app.subagent_pane.selected = 0;
+    let main = subagent_main_row(&app, 120);
+    assert_eq!(main.spans[0].content.as_ref(), "●");
+    assert_eq!(main.spans[0].style.fg, Some(crate::render::theme::accent()));
+    let sub = subagent_record_row(&app, 0, &record, 120);
+    assert_eq!(sub.spans[0].content.as_ref(), "○");
+    assert_eq!(sub.spans[0].style.fg, Some(crate::render::theme::muted()));
+}
+
 #[tokio::test]
-async fn subagent_lifecycle_logs_are_neutral_and_compact() {
+async fn subagent_lifecycle_logs_are_distinct_and_compact() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
@@ -802,16 +1018,16 @@ async fn subagent_lifecycle_logs_are_neutral_and_compact() {
         .collect::<Vec<_>>();
     assert_eq!(lifecycle_logs.len(), 2);
 
-    // Neutral (Info/cyan), never an alarming colour.
+    // Distinct subagent identity: a magenta `◆` node (never an alarming red),
+    // so delegated work is recognisable on the rail.
     for log in &lifecycle_logs {
-        assert_eq!(log.kind, LogKind::Info);
+        assert_eq!(log.kind, LogKind::Subagent);
         let lines = format_log_entry(log, true, false);
+        let marker = lines.first().and_then(|line| line.spans.get(1));
+        assert_eq!(marker.map(|span| span.content.as_ref()), Some("◆ "));
         assert_eq!(
-            lines
-                .first()
-                .and_then(|line| line.spans.get(1))
-                .and_then(|span| span.style.fg),
-            Some(crate::render::theme::cyan())
+            marker.and_then(|span| span.style.fg),
+            Some(crate::render::theme::magenta())
         );
     }
 
@@ -820,6 +1036,15 @@ async fn subagent_lifecycle_logs_are_neutral_and_compact() {
     let main_view = lines_to_plain_text(&transcript_lines_for_render(&app, Some(120), false));
     assert!(
         main_view.contains("subagent completed · 51 tools"),
+        "{main_view}"
+    );
+    // Threaded on the rail with the magenta `◆` subagent marker.
+    assert!(
+        main_view.contains("◆ delegate subagent started"),
+        "{main_view}"
+    );
+    assert!(
+        main_view.contains("◆ delegate subagent completed"),
         "{main_view}"
     );
     assert!(!main_view.contains(summary_tail), "{main_view}");
@@ -1432,10 +1657,8 @@ async fn begin_frame_clickables_clears_registry() {
 #[tokio::test]
 async fn wheel_scroll_works_in_inline_mode() {
     let mut app = test_app(SessionMode::Build);
-    // Inline mode → alternate_scroll_enabled is false. Pre-fix this
-    // dropped wheel events entirely. After the fix, wheel scrolls the
+    // Inline mode used to drop wheel events entirely; the wheel must scroll the
     // transcript regardless.
-    app.alternate_scroll_enabled = false;
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     assert_eq!(app.transcript_scroll_from_bottom, 0);
     handle_mouse(
@@ -1449,7 +1672,7 @@ async fn wheel_scroll_works_in_inline_mode() {
     );
     assert_eq!(
         app.transcript_scroll_from_bottom, 3,
-        "wheel must scroll transcript even when alternate_scroll_enabled is false",
+        "wheel must scroll the transcript in inline mode",
     );
     handle_mouse(
         &mut app,
@@ -1472,6 +1695,7 @@ async fn wheel_scroll_targets_transcript_overlay_when_open() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
 
     handle_mouse(
@@ -3393,8 +3617,7 @@ fn keyboard_enhancement_flags_enable_modified_key_reporting() {
 #[tokio::test]
 async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Never;
+    let config = test_config(SessionMode::Build);
     let mut app = test_app_with_config(&config, SessionMode::Build);
     push_input_history(&mut app, "first prompt".to_string());
     push_input_history(&mut app, "second prompt".to_string());
@@ -3437,116 +3660,6 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
     assert!(app.input.is_empty());
 }
 
-#[tokio::test]
-async fn alternate_screen_arrows_scroll_transcript_when_prompt_is_empty() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "first prompt".to_string());
-    push_input_history(&mut app, "second prompt".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll up");
-
-    assert!(app.input.is_empty());
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-    assert!(app.input_history_index.is_none());
-}
-
-#[tokio::test]
-async fn alternate_screen_alt_arrows_recall_history_when_prompt_is_empty() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "first prompt".to_string());
-    push_input_history(&mut app, "second prompt".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
-    )
-    .await
-    .expect("history up");
-
-    assert_eq!(app.input, "second prompt");
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-}
-
-#[tokio::test]
-async fn alternate_screen_arrows_scroll_transcript_when_draft_is_not_empty() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    set_input(&mut app, "hi".to_string());
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "previous prompt".to_string());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll up");
-
-    assert_eq!(app.input, "hi");
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll down");
-
-    assert_eq!(app.input, "hi");
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
-    )
-    .await
-    .expect("history up keeps draft");
-
-    assert_eq!(app.input, "hi");
-}
-
-#[tokio::test]
-async fn alternate_screen_arrows_keep_scrolling_when_transcript_is_already_scrolled() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "previous prompt".to_string());
-    app.transcript_scroll_from_bottom = 3;
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("scroll down");
-
-    assert!(app.input.is_empty());
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-}
-
 #[test]
 fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
     // Wheel events scroll the transcript in BOTH inline and alt-screen
@@ -3570,41 +3683,6 @@ fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
     assert_eq!(app.transcript_scroll_from_bottom, 3);
     assert!(app.input.is_empty());
     assert!(app.input_history_index.is_none());
-}
-
-#[test]
-fn explicit_alternate_screen_mouse_wheel_scrolls_transcript_without_prompt_history() {
-    let mut config = test_config(SessionMode::Build);
-    config.tui.alternate_screen = TuiAlternateScreen::Always;
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
-    push_input_history(&mut app, "previous prompt".to_string());
-
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-    assert!(app.input.is_empty());
-
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-    assert!(app.input.is_empty());
 }
 
 #[tokio::test]
@@ -4610,6 +4688,9 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
         .collect::<Vec<_>>()
         .join("\n");
     app.push_tool_result(sample_tool_result("grep", &payload));
+    // A freshly-pushed work node settle-folds from its expanded form for
+    // ~600ms; rest it collapsed so this asserts the post-settle preview.
+    app.finalize_settles_for_test();
 
     assert!(app.transcript[0].collapsed);
     let collapsed = render_to_string(&app, 100, 24);
@@ -4719,6 +4800,32 @@ fn failed_tool_rows_show_actionable_error_detail() {
 }
 
 #[test]
+fn failed_shell_stderr_renders_once_not_duplicated() {
+    // Regression: a failed shell command rendered its stderr twice — once in
+    // the combined stdout+stderr block and again under a separate "stderr"
+    // header. The auto-expanded error must appear exactly once.
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "rustfmt --check src/cli.rs",
+        "workdir": ".",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "Diff in src/cli.rs:5: UNIQUE_FMT_MARKER_XYZ",
+    });
+    app.push_tool_result(result);
+    assert!(!app.transcript[0].collapsed, "failure auto-expands");
+
+    let output = render_to_string(&app, 140, 30);
+    assert_eq!(
+        output.matches("UNIQUE_FMT_MARKER_XYZ").count(),
+        1,
+        "stderr should render exactly once, not duplicated: {output}"
+    );
+}
+
+#[test]
 fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("shell", "");
@@ -4767,7 +4874,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "{output}"
     );
     assert!(
-        output.contains("│ cargo test -p squeezy-tui in .:"),
+        output.contains("│   cargo test -p squeezy-tui in .:"),
         "{output}"
     );
     assert!(
@@ -4875,7 +4982,7 @@ fn read_only_shell_rows_render_codex_style_output_block() {
         "{output}"
     );
     assert!(
-        output.contains("│ inspect workspace --details in /tmp/project:"),
+        output.contains("│   inspect workspace --details in /tmp/project:"),
         "{output}"
     );
     assert!(
@@ -6102,7 +6209,7 @@ fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
     assert!(!rendered.contains("▏ second thought"), "{rendered}");
 
     app.transcript_overlay = Some(TranscriptOverlayState::default());
-    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(100)));
+    let overlay = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(100), true));
     assert!(overlay.contains("▾ reasoning"), "{overlay}");
     assert!(overlay.contains("▏ first thought"), "{overlay}");
     assert!(overlay.contains("▏ second thought"), "{overlay}");
@@ -6405,7 +6512,7 @@ fn render_keeps_header_when_transcript_has_content() {
     // provider:model moved out of the banner into the live status line;
     // see `render_uses_two_line_status_footer` for the reason.
     assert!(output.contains("hello"), "{output}");
-    assert!(output.contains("● answer"), "{output}");
+    assert!(output.contains("☽ answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
 }
 
@@ -6464,25 +6571,6 @@ fn compact_viewport_hides_attachment_panel_before_prompt_footer() {
     assert!(output.contains('┃'), "{output}");
     assert!(output.contains("Enter send"), "{output}");
     assert!(!output.contains("att-0001"), "{output}");
-}
-
-#[test]
-fn auto_mode_uses_inline_scrollback_like_codex() {
-    let config = test_config(SessionMode::Build);
-
-    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
-    assert_eq!(
-        TerminalMode::from(config.tui.alternate_screen),
-        TerminalMode::Inline
-    );
-    assert_eq!(
-        TerminalMode::from(TuiAlternateScreen::Never),
-        TerminalMode::Inline
-    );
-    assert_eq!(
-        TerminalMode::from(TuiAlternateScreen::Always),
-        TerminalMode::AlternateScreen
-    );
 }
 
 #[test]
@@ -6604,15 +6692,43 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
     app.push_transcript_item(TranscriptItem::user("find getFoo"));
     app.push_transcript_item(TranscriptItem::assistant("No definition found."));
 
-    let first = inline_history_lines_for_flush(&app, 100, true, 0);
+    let len = app.transcript.len();
+    let first = inline_history_lines_for_flush(&app, 100, true, 0, len);
     let rendered = lines_to_plain_text(&first);
 
     assert!(rendered.contains("Squeezy v0.1.0"), "{rendered}");
     assert!(rendered.contains("find getFoo"), "{rendered}");
-    assert!(rendered.contains("● No definition found."), "{rendered}");
+    assert!(rendered.contains("☽ No definition found."), "{rendered}");
 
-    let next = inline_history_lines_for_flush(&app, 100, false, app.transcript.len());
+    let next = inline_history_lines_for_flush(&app, 100, false, len, len);
     assert!(next.is_empty());
+}
+
+#[test]
+fn settling_node_is_held_from_flush_and_folds_in_live_region() {
+    let mut app = test_app(SessionMode::Build);
+    // A success tool result arms a settle-fold (it rests collapsed).
+    app.push_tool_result(sample_tool_result("grep", "match-1\nmatch-2"));
+    assert!(app.transcript[0].settle.is_some(), "a success tool folds");
+
+    // The scrollback flush stops before the settling node — it is held back.
+    let boundary = settling_flush_boundary(&app);
+    assert_eq!(boundary, 0);
+    let flushed = inline_history_lines_for_flush(&app, 100, false, 0, boundary);
+    assert!(flushed.is_empty(), "settling node must not flush yet");
+
+    // Meanwhile it renders folding on the rail in the live region.
+    let live = lines_to_plain_text(&live_settling_lines(&app, 100));
+    assert!(live.contains("grep"), "{live}");
+    assert!(
+        live.contains("├─") || live.contains("╰─"),
+        "rail gutter: {live}"
+    );
+
+    // Once the fold finishes the node becomes flushable and leaves the live region.
+    app.finalize_settles_for_test();
+    assert_eq!(settling_flush_boundary(&app), app.transcript.len());
+    assert!(live_settling_lines(&app, 100).is_empty());
 }
 
 #[test]
@@ -6656,7 +6772,8 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
     app.turn_visual = TurnVisualState::Running;
 
     let output = render_to_string(&app, 100, 12);
-    assert!(output.contains("●  ship it┃"), "{output}");
+    let coin = prompt_coin_frame(&app);
+    assert!(output.contains(&format!("{coin}  ship it┃")), "{output}");
 }
 
 #[test]
@@ -6672,12 +6789,14 @@ fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
     app.transcript.clear();
 
     app.animation_tick = 0;
+    let coin_first = prompt_coin_frame(&app);
     let first = render_to_string(&app, 100, 12);
-    app.animation_tick = 4;
+    app.animation_tick = 8;
+    let coin_second = prompt_coin_frame(&app);
     let second = render_to_string(&app, 100, 12);
 
-    assert!(first.contains("●  ┃"), "{first}");
-    assert!(second.contains("◕  ┃"), "{second}");
+    assert!(first.contains(&format!("{coin_first}  ┃")), "{first}");
+    assert!(second.contains(&format!("{coin_second}  ┃")), "{second}");
     assert_ne!(
         first, second,
         "first-turn spinner frame should repaint before any assistant delta"
@@ -6691,8 +6810,9 @@ fn render_prompt_places_cursor_inside_input_text() {
     app.input_cursor = 2;
 
     let output = render_to_string(&app, 100, 12);
-    assert!(output.contains("●  ab┃cd"), "{output}");
-    assert!(!output.contains("●  abcd┃"), "{output}");
+    let coin = prompt_coin_frame(&app);
+    assert!(output.contains(&format!("{coin}  ab┃cd")), "{output}");
+    assert!(!output.contains(&format!("{coin}  abcd┃")), "{output}");
 }
 
 #[test]
@@ -6762,7 +6882,8 @@ fn active_prompt_cursor_is_vertically_centered() {
 
     // Composer at min height: top rule + top pad + content + bottom pad = 4 rows.
     assert_eq!(lines.len(), 4);
-    let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains('●'));
+    let coin = prompt_coin_frame(&app);
+    let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains(coin));
     assert!(!has_coin(&lines[0]), "{lines:?}");
     assert!(!has_coin(&lines[1]), "{lines:?}");
     assert!(has_coin(&lines[2]), "{lines:?}");
@@ -6775,7 +6896,7 @@ fn assistant_marker_uses_answer_color() {
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
 
-    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(crate::render::theme::green())
@@ -6800,7 +6921,7 @@ fn failed_assistant_marker_uses_error_color() {
 
     let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
 
-    assert_eq!(lines[0].spans[1].content.as_ref(), "●");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(crate::render::theme::red())
@@ -6898,7 +7019,7 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
 }
 
 #[test]
-fn pending_assistant_uses_rotating_coin_marker() {
+fn pending_assistant_uses_static_moon_marker() {
     let mut app = test_app(SessionMode::Build);
     app.pending_assistant.push_delta("streaming");
     app.turn_visual = TurnVisualState::Running;
@@ -6906,7 +7027,9 @@ fn pending_assistant_uses_rotating_coin_marker() {
 
     let lines = transcript_lines_for_render(&app, Some(80), false);
 
-    assert_eq!(lines[0].spans[1].content.as_ref(), prompt_coin_frame(&app));
+    // The assistant reply marker is a static full moon (never timer-animated
+    // or input-driven); the working-line star carries the motion instead.
+    assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
         lines[0].spans[1].style.fg,
         Some(app.turn_visual.color(app.animation_tick))
@@ -6930,7 +7053,7 @@ fn completed_task_panel_is_hidden_after_answer() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("● Because."), "{output}");
+    assert!(output.contains("☽ Because."), "{output}");
     assert!(!output.contains("Answered"), "{output}");
     assert!(
         !output.contains("• Done"),
@@ -6962,7 +7085,7 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
     let output = render_to_string(&app, 120, 18);
 
     assert!(output.contains("why?"), "{output}");
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
     assert!(!output.contains("active Start turn"), "{output}");
@@ -6978,7 +7101,7 @@ fn completed_turn_shows_worked_duration_divider() {
     let output = render_to_string(&app, 120, 18);
 
     assert!(output.contains("─ Worked for 13m 23s"), "{output}");
-    assert!(!output.contains("• Working"), "{output}");
+    assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
 }
 
@@ -7055,7 +7178,7 @@ fn active_prompt_content_stays_centered_after_submitted_prompt() {
     let lines = output.lines().collect::<Vec<_>>();
     let working_line = lines
         .iter()
-        .position(|line| line.contains("• Working"))
+        .position(|line| line.contains("Working ("))
         .expect("working line");
 
     assert!(
@@ -7083,7 +7206,7 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
         .expect("submitted prompt");
     let working_line = lines
         .iter()
-        .position(|line| line.contains("• Working"))
+        .position(|line| line.contains("Working ("))
         .expect("working line");
 
     assert!(!output.contains("Asked ship it"), "{output}");
@@ -7124,9 +7247,17 @@ fn submitted_prompt_renders_bubble_around_text() {
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(content.starts_with("  "), "{content}");
     assert!(content.ends_with("find getFoo"), "{content}");
-    assert!(bottom.starts_with("  ╰─◖"), "{bottom}");
+    assert!(bottom.starts_with("  ╰☾"), "{bottom}");
     assert!(bottom.ends_with('╯'), "{bottom}");
-    assert_eq!(lines.last().expect("separator").spans.len(), 0);
+    // The prompt threads a gutter connector down into the turn.
+    let connector = lines
+        .last()
+        .expect("connector")
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert_eq!(connector, "   │");
 }
 
 #[test]
@@ -7151,14 +7282,14 @@ fn submitted_prompt_preserves_empty_lines() {
         })
         .collect::<Vec<_>>();
 
-    // Open bubble: 4 content rows ("one", "", "three", "") + bottom edge + separator.
+    // Open bubble: 4 content rows ("one", "", "three", "") + bottom edge + connector.
     assert_eq!(lines.len(), 6);
     assert!(rendered[0].contains("one"), "{rendered:?}");
     assert_eq!(rendered[1].trim(), "");
     assert!(rendered[2].contains("three"), "{rendered:?}");
     assert_eq!(rendered[3].trim(), "");
-    assert!(rendered[4].starts_with("  ╰─◖"), "{rendered:?}");
-    assert_eq!(rendered[5], "");
+    assert!(rendered[4].starts_with("  ╰☾"), "{rendered:?}");
+    assert_eq!(rendered[5], "   │");
 }
 
 #[test]
@@ -7189,7 +7320,7 @@ fn active_tool_surfaces_current_work_in_working_line() {
 
     let output = render_to_string(&app, 120, 16);
 
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(output.contains("Definition: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
@@ -7217,7 +7348,7 @@ async fn queued_tool_event_updates_visible_working_status_without_transcript_row
     assert_eq!(app.active_tool.as_deref(), Some("grep"));
     assert!(app.transcript.is_empty());
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
     assert!(output.contains("Grep: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
@@ -7272,7 +7403,7 @@ fn working_cell_shows_current_tool() {
 
     let output = render_to_string(&app, 140, 16);
 
-    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Working ("), "{output}");
     assert!(output.contains("Shell: cargo test --workspace"), "{output}");
 }
 
@@ -10778,11 +10909,10 @@ fn json_patch_preview_parser_emits_events_per_patch() {
 
 #[tokio::test]
 async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
-    // F3-4: the TUI must surface the silent sandbox degradation
-    // through the notification banner AND a transcript notice on the
-    // first fallback; the agent's once-per-session gate means this
-    // event only ever fires once, so we assert both surfaces hold a
-    // single entry afterwards.
+    // F3-4: the TUI must surface the silent sandbox degradation as a
+    // durable transcript warning on the first fallback; the agent's
+    // once-per-session gate means this event only ever fires once, so we
+    // assert the transcript holds a single naming entry afterwards.
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
@@ -10796,34 +10926,30 @@ async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
     drop(tx);
     drain_agent_events(&mut app).await;
 
-    let banner_message = app
-        .app_notifications
-        .current()
-        .map(|notification| notification.message.clone())
-        .expect("banner notification should be queued");
-    assert!(
-        banner_message.contains("shell sandbox degraded"),
-        "banner text mismatch: {banner_message}"
-    );
-    assert!(
-        banner_message.contains("macos-sandbox-exec"),
-        "banner must name the degraded backend: {banner_message}"
-    );
-
     let needle = "shell sandbox degraded";
-    let occurrences = app
+    let matching: Vec<&str> = app
         .transcript
         .iter()
-        .filter(|entry| match &entry.kind {
-            TranscriptEntryKind::Message(item) => item.content.contains(needle),
-            TranscriptEntryKind::Log(LogEntry { message, .. }) => message.contains(needle),
-            _ => false,
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) if item.content.contains(needle) => {
+                Some(item.content.as_str())
+            }
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains(needle) => {
+                Some(message.as_str())
+            }
+            _ => None,
         })
-        .count();
+        .collect();
     assert_eq!(
-        occurrences, 1,
+        matching.len(),
+        1,
         "fallback warning must render exactly once; transcript: {:?}",
         app.transcript
+    );
+    assert!(
+        matching[0].contains("macos-sandbox-exec"),
+        "fallback warning must name the degraded backend: {}",
+        matching[0]
     );
 }
 
@@ -10929,6 +11055,9 @@ fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
+    // Rest the freshly-pushed node past its settle-fold so this asserts the
+    // collapsed head-tail preview rather than the mid-fold expanded body.
+    app.finalize_settles_for_test();
 
     let output = render_to_string(&app, 140, 18);
     // First and last lines must survive head-tail truncation; middle is elided.
@@ -11160,6 +11289,7 @@ fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     let changed = handle_mouse(
@@ -11191,6 +11321,7 @@ fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
     let events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11243,6 +11374,7 @@ fn input_batch_prioritizes_key_before_transcript_drag_flood() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
     let mut events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11331,6 +11463,7 @@ fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     assert_eq!(
@@ -11346,6 +11479,7 @@ fn input_batch_does_not_coalesce_drags_outside_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
     let events = vec![
         Event::Mouse(crossterm::event::MouseEvent {
@@ -11377,6 +11511,7 @@ fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
     app.transcript_overlay_scrollbar_cache
         .set(Some(TranscriptOverlayScrollbarCache {
@@ -11421,6 +11556,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
 
     handle_key(
@@ -11453,6 +11589,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
     let quit = handle_key(
         &mut app,
@@ -11480,6 +11617,7 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
         mode: TranscriptOverlayMode::NativeSelection,
+        detail: OverlayDetail::Expanded,
     });
 
     handle_key(
@@ -11541,6 +11679,7 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     tx.send(AgentEvent::Completed {
@@ -11576,6 +11715,7 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     tx.send(AgentEvent::Completed {
@@ -11616,6 +11756,7 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         mode: TranscriptOverlayMode::ScrollbarDrag,
+        detail: OverlayDetail::Expanded,
     });
 
     tx.send(AgentEvent::Completed {
@@ -11697,7 +11838,7 @@ fn transcript_overlay_includes_pending_assistant_mid_turn() {
     app.pending_assistant.push_delta("Once the lantern woke,");
     app.transcript_overlay = Some(TranscriptOverlayState::default());
 
-    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let lines = transcript_lines_for_overlay(&app, Some(100), true);
     let rendered = lines_to_plain_text(&lines);
 
     assert!(
@@ -11895,7 +12036,7 @@ fn transcript_overlay_tool_cards_are_expanded_and_plain() {
     };
     app.push_tool_result_with_call(result, Some(call));
 
-    let lines = transcript_lines_for_overlay(&app, Some(100));
+    let lines = transcript_lines_for_overlay(&app, Some(100), true);
     let rendered = lines_to_plain_text(&lines);
 
     assert!(
@@ -12156,6 +12297,201 @@ fn idle_app_reports_no_active_animation() {
 }
 
 #[test]
+fn settle_visible_line_count_eases_from_expanded_to_collapsed() {
+    // The pure fold-height helper is time-injected, so its full curve can
+    // be asserted without a clock: it starts at the expanded height, never
+    // increases, and lands exactly on the collapsed height at 600ms.
+    let from = 20u16;
+    let collapsed = 5u16;
+
+    assert_eq!(
+        settle_visible_line_count(from, collapsed, 0),
+        from,
+        "at elapsed 0 the fold has not moved off the expanded height"
+    );
+    assert_eq!(
+        settle_visible_line_count(from, collapsed, SETTLE_DURATION_MS),
+        collapsed,
+        "at exactly 600ms the fold rests on the collapsed height"
+    );
+    assert_eq!(
+        settle_visible_line_count(from, collapsed, SETTLE_DURATION_MS + 5_000),
+        collapsed,
+        "past 600ms the fold stays pinned to the collapsed height"
+    );
+
+    // Monotonically non-increasing across the whole window, and strictly
+    // inside the [collapsed, from] band before it finishes.
+    let mut prev = from;
+    for elapsed in (0..=SETTLE_DURATION_MS).step_by(20) {
+        let visible = settle_visible_line_count(from, collapsed, elapsed);
+        assert!(
+            visible <= prev,
+            "fold height must not grow: {visible} > {prev} at {elapsed}ms"
+        );
+        assert!(
+            (collapsed..=from).contains(&visible),
+            "fold height {visible} escaped the [{collapsed}, {from}] band at {elapsed}ms"
+        );
+        prev = visible;
+    }
+
+    // A node already at or below its collapsed height has nothing to fold.
+    assert_eq!(settle_visible_line_count(3, 5, 0), 3);
+    assert_eq!(settle_visible_line_count(5, 5, 0), 5);
+}
+
+#[test]
+fn armed_settle_renders_more_lines_than_after_it_finishes() {
+    // A freshly-armed work node renders its expanded block (folding down),
+    // so it occupies more rows than the same node once the settle finishes
+    // and it rests collapsed. The early-frame count is asserted via the
+    // pure helper to keep the test independent of the wall clock.
+    let mut app = test_app(SessionMode::Build);
+    let payload = (0..30)
+        .map(|i| format!("row-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
+
+    let settle = app.transcript[0]
+        .settle
+        .expect("a finished tool result must arm a settle-fold");
+    assert!(
+        settle.from_lines > 1,
+        "expanded grep output should seed a multi-line fold start, got {}",
+        settle.from_lines
+    );
+
+    // Render the just-armed (folding) node and count its rows. The exact
+    // count drifts with the few microseconds elapsed between push and
+    // render, so the strict "more lines early than late" inequality is
+    // asserted via the pure helper below; here we only require the folding
+    // frame to be taller than the resting collapsed frame.
+    let folding = transcript_lines_for_render(&app, Some(100), false);
+    let folding_count = folding.len();
+
+    // After the settle finalizes the node rests collapsed.
+    app.finalize_settles_for_test();
+    assert!(app.transcript[0].settle.is_none());
+    assert!(app.transcript[0].collapsed);
+    let settled = transcript_lines_for_render(&app, Some(100), false);
+    let settled_count = settled.len();
+
+    assert!(
+        folding_count > settled_count,
+        "a folding node ({folding_count} rows) must be taller than the same node \
+         once settled collapsed ({settled_count} rows)"
+    );
+
+    // The pure helper carries the strict monotonic claim independent of the
+    // clock: shortly after arming the visible height exceeds the 600ms one.
+    let early = settle_visible_line_count(settle.from_lines, settled_count as u16, 30);
+    let done =
+        settle_visible_line_count(settle.from_lines, settled_count as u16, SETTLE_DURATION_MS);
+    assert!(
+        early > done,
+        "fold height shortly after arming ({early}) must exceed the settled height ({done})"
+    );
+    assert_eq!(
+        done, settled_count as u16,
+        "the fold's 600ms height must equal the resting collapsed row count"
+    );
+}
+
+#[test]
+fn failed_tool_does_not_settle_fold_and_stays_expanded() {
+    // An auto-expanded failure must NOT arm a settle-fold: the fold finalizes
+    // by force-collapsing, which would hide the error after 600ms — the exact
+    // opposite of the "show the failure reason inline" behaviour.
+    let mut app = test_app(SessionMode::Build);
+    let mut failed = sample_tool_result("delegate", "missing required string field: prompt");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+
+    assert!(
+        app.transcript[0].settle.is_none(),
+        "a failed (auto-expanded) tool result must not arm a settle-fold"
+    );
+    assert!(!app.transcript[0].collapsed);
+    app.finalize_settles_for_test();
+    assert!(
+        !app.transcript[0].collapsed,
+        "a failed tool result must stay expanded, never fold collapsed"
+    );
+}
+
+#[test]
+fn settling_node_threads_the_rail_gutter() {
+    // While folding, a node stays on the Quiet Rail (├─/╰─ elbow) instead of
+    // rendering off-rail and jumping onto it when the fold finalizes.
+    let mut app = test_app(SessionMode::Build);
+    let payload = (0..30)
+        .map(|i| format!("row-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
+    assert!(
+        app.transcript[0].settle.is_some(),
+        "success tool should fold"
+    );
+
+    let folding = lines_to_plain_text(&transcript_lines_for_render(&app, Some(100), false));
+    assert!(
+        folding.contains("├─") || folding.contains("╰─"),
+        "folding node must thread the rail gutter: {folding}"
+    );
+}
+
+#[test]
+fn settling_entry_keeps_animation_tick_alive_then_idles_when_settled() {
+    // The fold must keep repaints flowing frame to frame while a node is
+    // settling, then return to idle (no perpetual repaint) once every
+    // settle finalizes.
+    let mut app = test_app(SessionMode::Build);
+    app.focused = false;
+    app.needs_redraw = false;
+    assert!(
+        !should_advance_animation_tick(&app),
+        "an idle, unfocused transcript with no settles and no turn must not tick"
+    );
+
+    app.push_tool_result(sample_tool_result("grep", "alpha\nbeta\ngamma"));
+    assert!(app.has_settling_entry(), "the pushed node arms a settle");
+    // The tick keeps advancing while settling regardless of focus, so the
+    // loop keeps cycling to finalize the fold.
+    assert!(
+        should_advance_animation_tick(&app),
+        "a node mid settle-fold must keep the animation tick alive"
+    );
+    // A focused window also keeps `draw_app` running so the fold actually
+    // animates frame to frame; an unfocused background window does not
+    // repaint a fold it cannot show (it still finalizes via the tick loop).
+    app.focused = true;
+    assert!(
+        app.has_active_animation(),
+        "a focused settling node must keep draw_app running so the fold animates"
+    );
+    app.focused = false;
+    assert!(
+        !app.has_active_animation(),
+        "an unfocused settling node must not repaint the background window"
+    );
+
+    app.focused = false;
+    app.finalize_settles_for_test();
+    assert!(!app.has_settling_entry());
+    assert!(
+        !should_advance_animation_tick(&app),
+        "once every settle finalizes the tick returns to its idle behavior"
+    );
+    assert!(
+        !app.has_active_animation(),
+        "a fully settled idle transcript must not advertise active animation"
+    );
+}
+
+#[test]
 fn note_turn_started_marks_dirty_and_animation_active() {
     let mut app = test_app(SessionMode::Build);
     app.needs_redraw = false;
@@ -12235,11 +12571,11 @@ fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
         app.animation_tick = tick * 50; // ~160 frames worth of motion
         assert_eq!(
             prompt_coin_frame(&app),
-            "●",
-            "idle prompt coin glyph must stay '●' at tick {tick}"
+            "☽",
+            "idle prompt coin glyph must stay '☽' at tick {tick}"
         );
         let span = prompt_coin_span(&app);
-        assert_eq!(span.content.as_ref(), "●");
+        assert_eq!(span.content.as_ref(), "☽");
         assert_eq!(span.style.fg, Some(crate::render::theme::accent()));
     }
 }
@@ -12803,14 +13139,25 @@ async fn unknown_config_slug_emits_warning_then_opens_default() {
     .await
     .expect("handle key");
     assert!(app.config_screen.is_some(), "screen should still open");
-    let recent = (0..app.app_notifications.len())
-        .filter_map(|_| app.app_notifications.current())
-        .next();
-    let message = recent.map(|n| n.message.clone()).unwrap_or_default();
+    let message = transcript_log_text(&app);
     assert!(
         message.contains("nosuchsection") && message.contains("not a navigable section"),
         "unknown slug should surface a warning naming the bad slug, got: {message}"
     );
+}
+
+/// Concatenate every `Log` entry's message in the transcript. Tests use it
+/// to assert that a notice landed in the durable transcript instead of the
+/// removed rotating notification pane.
+fn transcript_log_text(app: &TuiApp) -> String {
+    app.transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(LogEntry { message, .. }) => Some(message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -12825,8 +13172,7 @@ async fn config_slug_for_unregistered_meta_warns() {
     )
     .await
     .expect("handle key");
-    let recent = app.app_notifications.current();
-    let message = recent.map(|n| n.message.clone()).unwrap_or_default();
+    let message = transcript_log_text(&app);
     assert!(
         message.contains("skills"),
         "skills slug (SectionId variant w/o ConfigSectionMeta) should warn, got: {message}"
@@ -12845,8 +13191,7 @@ async fn config_with_no_arg_does_not_emit_unknown_slug_warning() {
     )
     .await
     .expect("handle key");
-    let note = app.app_notifications.current();
-    let message = note.map(|n| n.message.clone()).unwrap_or_default();
+    let message = transcript_log_text(&app);
     assert!(
         !message.contains("not a navigable section"),
         "no-arg /config must not warn about a missing slug, got: {message}"
@@ -12886,4 +13231,409 @@ async fn config_and_options_alias_open_the_same_screen() {
         after_config, after_options,
         "/config and /options must land on the same starting section"
     );
+}
+
+#[test]
+fn rail_head_spans_are_seven_cells() {
+    use rail::RailMarker::*;
+    for marker in [Settled, Queued, Plan, Ok, Fail, Warn, Live("✦".to_string())] {
+        let cells: usize = rail::head_spans(&marker, false)
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(
+            cells, 7,
+            "{marker:?} head must be 7 cells (indent + elbow + marker)"
+        );
+    }
+}
+
+#[test]
+fn rail_apply_gutter_is_noop_on_empty_block() {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    rail::apply_gutter(&mut lines, rail::RailMarker::Ok, false);
+    assert!(
+        lines.is_empty(),
+        "an empty block must leave no orphan connector"
+    );
+}
+
+#[test]
+fn rail_apply_gutter_heads_first_line_connects_the_rest() {
+    let mut lines = vec![
+        Line::from(vec![Span::raw("  "), Span::raw("header")]),
+        Line::from(vec![Span::raw("  "), Span::raw("body")]),
+    ];
+    rail::apply_gutter(&mut lines, rail::RailMarker::Ok, false);
+    // Header line: indent + ├─ elbow + ✓ marker replace the leading margin.
+    assert_eq!(lines[0].spans[0].content.as_ref(), "   ");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "├─");
+    assert_eq!(lines[0].spans[2].content.as_ref(), "✓ ");
+    assert_eq!(lines[0].spans[3].content.as_ref(), "header");
+    // Continuation line: indent + dim connector replaces the margin.
+    assert_eq!(lines[1].spans[0].content.as_ref(), "   │   ");
+    assert_eq!(lines[1].spans[1].content.as_ref(), "body");
+}
+
+#[test]
+fn rail_apply_gutter_last_node_uses_the_close_elbow() {
+    let mut lines = vec![Line::from(vec![Span::raw("  "), Span::raw("x")])];
+    rail::apply_gutter(&mut lines, rail::RailMarker::Settled, true);
+    assert_eq!(lines[0].spans[0].content.as_ref(), "   ");
+    assert_eq!(lines[0].spans[1].content.as_ref(), "╰─");
+    assert_eq!(lines[0].spans[2].content.as_ref(), "◦ ");
+}
+
+#[test]
+fn rail_chrome_lights_special_nodes() {
+    use crate::render::theme;
+    let subagent = TranscriptEntryKind::Log(LogEntry {
+        message: "delegate subagent started: x".to_string(),
+        kind: LogKind::Subagent,
+    });
+    let plain = TranscriptEntryKind::Log(LogEntry {
+        message: "note".to_string(),
+        kind: LogKind::Normal,
+    });
+    // Plain work is dim; a subagent breadcrumb glows magenta; a normal log is
+    // not a rail node at all, but if asked it stays dim.
+    assert_eq!(rail_chrome(&subagent, false), theme::magenta());
+    assert_eq!(rail_chrome(&plain, false), rail::dim());
+    // Inside a subagent's own transcript the whole rail turns magenta.
+    assert_eq!(rail_chrome(&plain, true), theme::magenta());
+    // Only subagent logs thread the rail; other logs flow off it.
+    assert!(is_rail_work_node(&subagent));
+    assert!(!is_rail_work_node(&plain));
+}
+
+/// Fixture: a full turn (reasoning → tool → subagent breadcrumbs → a failed
+/// tool → answer) rendered on the inline Quiet Rail. Guards the combined
+/// look — every work node threads the rail, the failure's stderr is not
+/// duplicated, and the answer leaves the rail set off by a blank line.
+#[test]
+fn rail_gallery_renders_a_full_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user(
+        "Refactor the auth module and run the workspace tests",
+    ));
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-1".to_string(),
+            summary: vec!["Plan: read auth.rs, delegate an audit, then run the tests.".to_string()],
+            encrypted_content: None,
+        },
+    ));
+    app.push_tool_result(sample_tool_result(
+        "grep",
+        "src/auth.rs:12: fn login(\nsrc/auth.rs:40: fn logout(",
+    ));
+    app.push_subagent_note("delegate subagent started: Audit auth.rs".to_string());
+    app.push_subagent_note(
+        "delegate subagent completed · 5 tools · Found 2 issues: missing rate-limit, weak password hash"
+            .to_string(),
+    );
+    let mut failed = sample_tool_result("shell", "");
+    failed.status = ToolStatus::Error;
+    failed.content = serde_json::json!({
+        "command": "cargo test --workspace",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "error[E0308]: mismatched types\n  --> src/auth.rs:12:5\n   |\n12 |     login(user)\n   |     ^^^^^ expected String, found &str",
+    });
+    app.push_tool_result(failed);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Found 2 auth issues; the test failure is a type mismatch in login().",
+    ));
+    app.finalize_settles_for_test();
+
+    let len = app.transcript.len();
+    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 96, true, 0, len));
+
+    // Every work node threads the rail.
+    assert!(scrollback.contains("├─▸ reasoning · Plan:"), "{scrollback}");
+    assert!(
+        scrollback.contains("├─◆ delegate subagent started"),
+        "{scrollback}"
+    );
+    assert!(
+        scrollback.contains("├─◆ delegate subagent completed · 5 tools"),
+        "{scrollback}"
+    );
+    assert!(scrollback.contains("├─✖ Failed cargo test"), "{scrollback}");
+    // The auto-expanded stderr renders exactly once (no duplication).
+    assert_eq!(
+        scrollback.matches("expected String, found &str").count(),
+        1,
+        "{scrollback}"
+    );
+    // The gutter threads into the answer: a `│` connector then the `☽` answer,
+    // whose crescent sits in the gutter column (col 3) so the line is unbroken.
+    assert!(
+        scrollback.contains("exit 1\n   │\n   ☽ Found 2 auth issues"),
+        "{scrollback}"
+    );
+}
+
+#[test]
+fn prompt_coin_iterates_full_moon_cycle_while_typing() {
+    let mut app = test_app(SessionMode::Build);
+    // An empty composer rests on a steady crescent.
+    app.input.clear();
+    assert_eq!(prompt_coin_frame(&app), "☽");
+    // Each character advances exactly one phase, walking the full lunar cycle.
+    // The live typing coin is not restricted to the sent prompt's half-moons.
+    for (typed, expected) in [
+        (1usize, "◑"),
+        (2, "●"),
+        (3, "◐"),
+        (4, "☾"),
+        (5, "○"),
+        (6, "☽"),
+    ] {
+        set_input(&mut app, "x".repeat(typed));
+        assert_eq!(
+            prompt_coin_frame(&app),
+            expected,
+            "{typed} characters typed"
+        );
+    }
+}
+
+#[test]
+fn routing_note_threads_the_rail_as_a_dim_dot() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Succeeded;
+    app.push_transcript_item(TranscriptItem::user("hey"));
+    app.push_note("routed `sonnet` → `haiku` (llm_judge)".to_string());
+    app.push_transcript_item(TranscriptItem::assistant("Hey!"));
+    app.finalize_settles_for_test();
+    let len = app.transcript.len();
+    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 70, false, 0, len));
+    // The note threads the gutter as `├─◦` (one note pipeline) — never the old
+    // off-rail `• Noted` line that severed the coin→answer gutter.
+    assert!(
+        scrollback.contains("├─◦ routed `sonnet` → `haiku` (llm_judge)"),
+        "{scrollback}"
+    );
+    assert!(!scrollback.contains("• Noted"), "{scrollback}");
+}
+
+#[test]
+fn warning_threads_the_rail_as_a_warn_node() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Succeeded;
+    app.push_transcript_item(TranscriptItem::user("hey"));
+    app.push_warn("config key `foo` ignored (unknown)".to_string());
+    app.push_transcript_item(TranscriptItem::assistant("Done."));
+    app.finalize_settles_for_test();
+    let len = app.transcript.len();
+    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 70, false, 0, len));
+    // A warning threads the gutter (├─⚠) instead of floating off-rail.
+    assert!(
+        scrollback.contains("├─⚠ config key `foo` ignored (unknown)"),
+        "{scrollback}"
+    );
+}
+
+#[test]
+fn warn_log_marker_is_cyan_not_amber() {
+    // warn = cyan (frees rationed amber); the ⚠ never reuses the plan-amber
+    // family that secondary() belongs to.
+    let entry = LogEntry {
+        message: "x".to_string(),
+        kind: LogKind::Warn,
+    };
+    let lines = format_log_entry(&entry, false, false);
+    let glyph = &lines[0].spans[1];
+    assert_eq!(glyph.content.as_ref(), "⚠ ");
+    assert_eq!(glyph.style.fg, Some(crate::render::theme::cyan()));
+    assert_ne!(glyph.style.fg, Some(crate::render::theme::secondary()));
+}
+
+#[test]
+fn denied_and_cancelled_read_as_the_cyan_warn_tier() {
+    // A user-initiated block/stop is the warn tier (cyan), distinct from a hard
+    // failure (red), and never spends rationed amber.
+    assert_eq!(
+        status_color(ToolStatus::Denied),
+        crate::render::theme::cyan()
+    );
+    assert_eq!(
+        status_color(ToolStatus::Cancelled),
+        crate::render::theme::cyan()
+    );
+    assert_eq!(status_color(ToolStatus::Error), crate::render::theme::red());
+    assert_ne!(
+        status_color(ToolStatus::Denied),
+        crate::render::theme::secondary()
+    );
+}
+
+#[test]
+fn turn_failure_is_red_error_warning_is_cyan() {
+    // A hard failure reads as a red ✖ error node; a warning stays a cyan ⚠.
+    let err = LogEntry {
+        message: "turn failed: boom".to_string(),
+        kind: LogKind::Error,
+    };
+    let err_lines = format_log_entry(&err, false, false);
+    assert_eq!(err_lines[0].spans[1].content.as_ref(), "✖ ");
+    assert_eq!(
+        err_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::red())
+    );
+    let warn = LogEntry {
+        message: "config ignored".to_string(),
+        kind: LogKind::Warn,
+    };
+    let warn_lines = format_log_entry(&warn, false, false);
+    assert_eq!(warn_lines[0].spans[1].content.as_ref(), "⚠ ");
+    assert_eq!(
+        warn_lines[0].spans[1].style.fg,
+        Some(crate::render::theme::cyan())
+    );
+}
+
+#[test]
+fn overlay_wraps_long_lines_keeping_the_gutter() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("explore"));
+    let long = "I'll analyze the Rust codebase for modernization opportunities and \
+                report the concrete findings here."
+        .to_string();
+    app.push_tool_result(sample_tool_result("explore", &long));
+    if let Some(e) = app.transcript.last_mut() {
+        e.collapsed = false;
+    }
+    let rows = transcript_overlay_rows_for_render(&app, 60);
+    let text = lines_to_plain_text(&rows);
+    // Every wrapped row of the long body keeps the `│` gutter — none spill to
+    // column 0 the way the old hard char-wrap did.
+    let body_rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("analyze") || l.contains("opportunities") || l.contains("findings"))
+        .collect();
+    assert!(
+        body_rows.len() >= 2,
+        "long body should wrap into >=2 rows:\n{text}"
+    );
+    for row in &body_rows {
+        assert!(
+            row.starts_with("   │"),
+            "wrapped row lost the gutter: {row:?}"
+        );
+    }
+    // The break lands on a word boundary, not mid-word.
+    assert!(text.contains("for modernization"), "{text}");
+    assert!(text.contains("│   opportunities"), "{text}");
+}
+
+#[test]
+fn rail_prefix_and_continuation_track_the_gutter() {
+    assert_eq!(rail_prefix_width("   ├─✔ Ran explore"), 7);
+    assert_eq!(rail_prefix_width("   │   details"), 7);
+    assert_eq!(rail_prefix_width("  settings reloaded"), 2);
+    // A tee continues the rail as `│`; a close elbow blanks out (rail ended);
+    // nested bars are both preserved.
+    assert_eq!(rail_continuation_prefix("   ├─✔ "), "   │   ");
+    assert_eq!(rail_continuation_prefix("   ╰─✖ "), "       ");
+    assert_eq!(rail_continuation_prefix("   │   │   "), "   │   │   ");
+}
+
+#[test]
+fn overlay_collapsed_folds_long_output_expanded_shows_all() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("explore"));
+    let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+    app.push_tool_result(sample_tool_result("explore", &body));
+    let shown = |expand_all: bool| {
+        lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(80), expand_all))
+            .lines()
+            .filter(|l| l.contains("line "))
+            .count()
+    };
+    let collapsed = shown(false);
+    let expanded = shown(true);
+    assert!(
+        collapsed < expanded,
+        "collapsed ({collapsed}) should fold below expanded ({expanded})"
+    );
+    assert_eq!(expanded, 40, "expanded shows every body line");
+}
+
+#[test]
+fn subagent_overlay_opens_collapsed_default_is_expanded() {
+    // Pressing a subagent opens it folded (formatted like the main inline view);
+    // the main-transcript Ctrl-T opens straight to expanded.
+    let mut app = test_app(SessionMode::Build);
+    open_subagent_transcript_overlay(&mut app);
+    assert_eq!(
+        app.transcript_overlay.unwrap().detail,
+        OverlayDetail::Collapsed
+    );
+    assert_eq!(
+        TranscriptOverlayState::default().detail,
+        OverlayDetail::Expanded
+    );
+}
+
+#[tokio::test]
+async fn ctrl_t_expands_then_closes_a_collapsed_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    open_subagent_transcript_overlay(&mut app);
+    assert_eq!(
+        app.transcript_overlay.unwrap().detail,
+        OverlayDetail::Collapsed
+    );
+    // First Ctrl-T unfolds in place (does not close).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(
+        app.transcript_overlay.unwrap().detail,
+        OverlayDetail::Expanded
+    );
+    // Second Ctrl-T closes the (already expanded) overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.transcript_overlay.is_none());
+}
+
+#[test]
+fn subagent_view_renders_tool_results_as_rail_cards() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(
+        7,
+        "explore".to_string(),
+        "Discover the codebase".to_string(),
+    );
+    app.note_subagent_tool_result(
+        7,
+        "explore".to_string(),
+        sample_tool_result("repo_map", "crate a\ncrate b"),
+    );
+    app.note_subagent_tool_result(
+        7,
+        "explore".to_string(),
+        sample_tool_result("glob", "a.rs\nb.rs"),
+    );
+    app.subagent_pane.active = ConversationSource::Subagent(7);
+    let view = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(70), false));
+    // The subagent's tools thread the rail as ├─✔ cards, not the flat off-rail
+    // `completed X` lifecycle line they used to render as.
+    assert!(view.contains("├─✔ Explored repo map"), "{view}");
+    assert!(view.contains("├─✔ Explored list files"), "{view}");
+    assert!(!view.contains("completed repo_map"), "{view}");
+    // The lifecycle breadcrumb threads the rail too (a ◦ note).
+    assert!(view.contains("├─◦ explore subagent started"), "{view}");
 }

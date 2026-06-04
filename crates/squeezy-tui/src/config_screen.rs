@@ -22,9 +22,6 @@ use squeezy_core::{
     load_separated_settings_sources,
 };
 
-#[cfg(test)]
-use crate::notification::NotificationQueue;
-
 mod keys;
 mod render;
 mod save;
@@ -37,6 +34,64 @@ pub(crate) use save::{
     save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
     save_theme_snapshot, undo_last_write, unset_theme_color,
 };
+
+/// Severity tag for a single feedback line emitted by the config screen.
+/// The host maps it onto the transcript: `Error` / `Warn` render a `⚠`
+/// warning line, `Info` / `Success` render dim operational chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Severity {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+/// One accumulated feedback line, carrying the message and its severity so
+/// the host can route it to the right transcript surface.
+#[derive(Debug, Clone)]
+pub(crate) struct FeedbackEntry {
+    pub message: String,
+    pub severity: Severity,
+}
+
+/// Feedback sink threaded through the config screen's key/save handlers.
+///
+/// The screen used to push fire-and-forget lines into a rotating
+/// notification pane; that pane is gone. Handlers now accumulate their
+/// feedback here and the host (`lib.rs`) drains it into the durable
+/// transcript after each key press.
+#[derive(Debug, Default)]
+pub(crate) struct ConfigFeedback {
+    entries: Vec<FeedbackEntry>,
+}
+
+impl ConfigFeedback {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a feedback line. Mirrors the old queue's `push` signature so
+    /// the handler bodies stay unchanged.
+    pub(crate) fn push(&mut self, message: impl Into<String>, severity: Severity) {
+        self.entries.push(FeedbackEntry {
+            message: message.into(),
+            severity,
+        });
+    }
+
+    /// Drain every accumulated line in emission order, leaving the sink
+    /// empty. The host forwards each to the transcript.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = FeedbackEntry> + '_ {
+        self.entries.drain(..)
+    }
+
+    /// The most recently pushed line, if any. Used by tests to assert on
+    /// the feedback a handler emitted.
+    #[cfg(test)]
+    pub(crate) fn current(&self) -> Option<&FeedbackEntry> {
+        self.entries.last()
+    }
+}
 
 /// Synthetic row index in the Models section that exposes the API-key
 /// editor for the currently selected provider. Sits right after `model`

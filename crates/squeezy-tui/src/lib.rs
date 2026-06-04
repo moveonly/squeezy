@@ -46,9 +46,8 @@ use squeezy_core::{
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
     PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
-    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiAlternateScreen,
-    TuiSynchronizedOutput, TurnMetrics, context_attachment_storage_text,
-    detect_context_attachment_kind, detect_image_mime,
+    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiSynchronizedOutput, TurnMetrics,
+    context_attachment_storage_text, detect_context_attachment_kind, detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
 use squeezy_skills::PromptTemplateCatalog;
@@ -120,7 +119,7 @@ use input::{
     reject_unknown_slash_command,
 };
 
-use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
+use notification::DesktopNotifier;
 use render::palette::{self, blend_color};
 use terminal_writer::TerminalWriter;
 use toast::ToastQueue;
@@ -542,7 +541,7 @@ pub struct StartupRunResult {
 
 pub fn enter_startup_terminal(config: &AppConfig) -> Result<StartupTerminal> {
     apply_theme_overrides(config);
-    let guard = TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    let guard = TerminalGuard::enter(config.tui.synchronized_output)?;
     Ok(StartupTerminal { guard })
 }
 
@@ -641,8 +640,7 @@ async fn run_inner(
     startup: StartupProfile,
 ) -> Result<StartupRunOutcome> {
     apply_theme_overrides(&config);
-    let terminal =
-        TerminalGuard::enter(config.tui.alternate_screen, config.tui.synchronized_output)?;
+    let terminal = TerminalGuard::enter(config.tui.synchronized_output)?;
     let (outcome, _) =
         run_inner_with_terminal(config, provider, resume_session_id, startup, terminal).await?;
     Ok(outcome)
@@ -829,7 +827,11 @@ async fn run_inner_with_terminal(
         if should_advance_animation_tick(&app) {
             app.animation_tick = app.animation_tick.wrapping_add(1);
         }
-        if app.app_notifications.tick() {
+        // Settle-fold mutation pass: the render path is read-only, so the
+        // loop owns finalizing folds whose 600ms has elapsed (rest the node
+        // collapsed and invalidate its cached lines). A finalize is a
+        // visible state change, so request a repaint.
+        if app.finalize_elapsed_settles() {
             app.needs_redraw = true;
         }
         if app.toasts.tick() {
@@ -1187,13 +1189,10 @@ async fn apply_plan_choice(
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
-    use crate::notification::Severity;
-
     let new_cfg = match AppConfig::from_env_and_settings() {
         Ok(cfg) => cfg,
         Err(err) => {
-            app.app_notifications
-                .push(format!("settings reload failed: {err}"), Severity::Warn);
+            app.push_warn(format!("settings reload failed: {err}"));
             return;
         }
     };
@@ -1211,8 +1210,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     app.apply_config_change(&new_cfg);
     if old_provider == new_provider {
         agent.replace_config(new_cfg);
-        app.app_notifications
-            .push("settings reloaded from disk".to_string(), Severity::Info);
+        app.push_status("settings reloaded from disk".to_string());
         return;
     }
     let provider_cfg = new_cfg.provider.clone();
@@ -1226,28 +1224,34 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
                     "provider {old_provider} → {new_provider} (applies on next prompt)"
                 )),
             });
-            app.app_notifications.push(
-                format!(
-                    "settings reloaded — provider {old_provider} → {new_provider} arms on next prompt"
-                ),
-                Severity::Info,
-            );
+            app.push_status(format!(
+                "settings reloaded — provider {old_provider} → {new_provider} arms on next prompt"
+            ));
         }
         Ok(Err(err)) => {
             agent.replace_config(new_cfg);
-            app.app_notifications.push(
-                format!(
-                    "settings reloaded, but the new {new_provider} client failed to build: {err}"
-                ),
-                Severity::Error,
-            );
+            app.push_warn(format!(
+                "settings reloaded, but the new {new_provider} client failed to build: {err}"
+            ));
         }
         Err(_) => {
             agent.replace_config(new_cfg);
-            app.app_notifications.push(
-                "settings reloaded, but the provider client thread panicked".to_string(),
-                Severity::Error,
-            );
+            app.push_warn("settings reloaded, but the provider client thread panicked".to_string());
+        }
+    }
+}
+
+/// Drain the config screen's accumulated feedback into the durable
+/// transcript. Errors and warnings render as `⚠` warning lines; info and
+/// success notes render as dim operational chrome.
+fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::ConfigFeedback) {
+    use config_screen::Severity;
+    for entry in feedback.drain() {
+        match entry.severity {
+            Severity::Error | Severity::Warn => {
+                app.push_warn(entry.message);
+            }
+            Severity::Info | Severity::Success => app.push_status(entry.message),
         }
     }
 }
@@ -1543,21 +1547,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         dispatch_click_action(app, action);
         return true;
     }
-    // Wheel scroll always scrolls the transcript. The previous
-    // `alternate_scroll_enabled` gate dropped wheel events in
-    // inline-viewport mode (where the terminal's native
-    // wheel-to-arrow translation is disabled), which left the user
-    // with no way to scroll at all once mouse capture was on.
+    // Wheel scroll always scrolls the transcript — the inline viewport
+    // disables the terminal's native wheel-to-arrow translation, so without
+    // this the user would have no way to scroll once mouse capture was on.
+    // Compare the *active* conversation's scroll (subagent records carry
+    // their own offset), not always main's, so wheeling a selected subagent
+    // transcript still reports the change and triggers a redraw.
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            let before = app.transcript_scroll_from_bottom;
+            let before = active_transcript_scroll_from_bottom(app);
             scroll_transcript_up(app, 3);
-            app.transcript_scroll_from_bottom != before
+            active_transcript_scroll_from_bottom(app) != before
         }
         MouseEventKind::ScrollDown => {
-            let before = app.transcript_scroll_from_bottom;
+            let before = active_transcript_scroll_from_bottom(app);
             scroll_transcript_down(app, 3);
-            app.transcript_scroll_from_bottom != before
+            active_transcript_scroll_from_bottom(app) != before
         }
         _ => false,
     }
@@ -1793,11 +1798,10 @@ fn debug_log_key_event(key: &KeyEvent) {
     );
 }
 
-/// Switch the shown conversation to the currently highlighted pane row and
-/// reset its scroll, so moving the selection previews the conversation live
-/// instead of only committing on Enter.
-fn select_subagent_row(app: &mut TuiApp) {
-    app.subagent_pane.active = if app.subagent_pane.selected == 0 {
+/// The conversation source addressed by the current pane highlight (row 0 is
+/// `main`; record N lives on row N + 1).
+fn selected_conversation_source(app: &TuiApp) -> ConversationSource {
+    if app.subagent_pane.selected == 0 {
         ConversationSource::Main
     } else {
         app.subagent_pane
@@ -1805,12 +1809,67 @@ fn select_subagent_row(app: &mut TuiApp) {
             .get(app.subagent_pane.selected - 1)
             .map(|record| ConversationSource::Subagent(record.id))
             .unwrap_or(ConversationSource::Main)
-    };
+    }
+}
+
+/// Commit the highlighted row as the shown conversation and reset its scroll.
+/// Used by Enter (both modes) and by alternate-screen live preview.
+fn select_subagent_row(app: &mut TuiApp) {
+    app.subagent_pane.active = selected_conversation_source(app);
     set_active_transcript_scroll_from_bottom(app, 0);
     app.status = match app.subagent_pane.active {
         ConversationSource::Main => "main conversation".to_string(),
         ConversationSource::Subagent(_) => "subagent conversation".to_string(),
     };
+}
+
+/// Move the pane highlight. In alternate-screen mode the transcript region
+/// re-renders in place, so highlighting previews the conversation live. In the
+/// default inline mode the conversation lives in terminal scrollback that the
+/// pane can't repaint, so highlighting must NOT hijack the shown conversation
+/// or its scroll — the inline view stays on `main` and a subagent is only
+/// surfaced by the full-screen overlay on Enter. This keeps keyboard scrolling
+/// pointed at the main/terminal conversation while you browse the pane.
+fn highlight_selected_subagent_row(app: &mut TuiApp) {
+    // Inline mode: the conversation lives in terminal scrollback the pane
+    // can't repaint, so highlighting only previews the selection in the
+    // status line — a subagent is surfaced by the full-screen overlay on
+    // Enter, never by hijacking the shown conversation here.
+    app.status = match selected_conversation_source(app) {
+        ConversationSource::Main => "main conversation".to_string(),
+        ConversationSource::Subagent(_) => "subagent pane".to_string(),
+    };
+}
+
+/// Move keyboard focus into the subagent pane and preview the first
+/// subagent, mirroring the empty-composer Down arm. Used both by that arm
+/// and as the terminal fallback of the Down keypath so the pane is
+/// reachable even when the composer holds draft text or a recalled prompt.
+fn focus_subagent_pane_from_composer(app: &mut TuiApp) {
+    if app.subagent_pane.focused || app.subagent_pane.records.is_empty() {
+        return;
+    }
+    app.subagent_pane.focused = true;
+    if app.subagent_pane.selected == 0 {
+        app.subagent_pane.selected = 1;
+    }
+    highlight_selected_subagent_row(app);
+}
+
+/// Open the full-screen transcript overlay on the currently-active
+/// conversation. In the default inline terminal mode the committed
+/// transcript lives in terminal scrollback that can't be repainted in
+/// place, so a selected subagent's conversation can only be surfaced by
+/// this overlay (which renders the active conversation source).
+fn open_subagent_transcript_overlay(app: &mut TuiApp) {
+    app.transcript_overlay_scrollbar_cache.set(None);
+    // Open folded, formatted like the main inline conversation; Ctrl-T then
+    // expands every body, Esc closes.
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        detail: OverlayDetail::Collapsed,
+        ..TranscriptOverlayState::default()
+    });
+    app.status = "subagent conversation — Ctrl-T to expand, Esc to close".to_string();
 }
 
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -1822,20 +1881,16 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Down if app.subagent_pane.focused => {
             app.subagent_pane.selected = (app.subagent_pane.selected + 1).min(row_count - 1);
-            select_subagent_row(app);
+            highlight_selected_subagent_row(app);
             true
         }
         KeyCode::Down if app.input.is_empty() => {
-            app.subagent_pane.focused = true;
-            if row_count > 1 && app.subagent_pane.selected == 0 {
-                app.subagent_pane.selected = 1;
-            }
-            select_subagent_row(app);
+            focus_subagent_pane_from_composer(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused && app.subagent_pane.selected > 0 => {
             app.subagent_pane.selected -= 1;
-            select_subagent_row(app);
+            highlight_selected_subagent_row(app);
             true
         }
         KeyCode::Up if app.subagent_pane.focused => {
@@ -1844,14 +1899,21 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter if app.subagent_pane.focused => {
-            // Selection already previews live (see `select_subagent_row`);
-            // Enter just releases pane focus so the arrow keys scroll the
-            // now-active transcript instead of moving the selector.
+            // Commit the highlighted row as the shown conversation (inline
+            // highlighting leaves `active` on main until now).
+            select_subagent_row(app);
             app.subagent_pane.focused = false;
-            app.status = match app.subagent_pane.active {
-                ConversationSource::Main => "main conversation selected".to_string(),
-                ConversationSource::Subagent(_) => "subagent conversation selected".to_string(),
-            };
+            // The conversation lives in scrollback that can't be repainted, so
+            // open the full-screen overlay (which honours the active source) to
+            // surface the selected subagent's transcript.
+            match app.subagent_pane.active {
+                ConversationSource::Subagent(_) => {
+                    open_subagent_transcript_overlay(app);
+                }
+                ConversationSource::Main => {
+                    app.status = "main conversation selected".to_string();
+                }
+            }
             true
         }
         KeyCode::Esc
@@ -1966,10 +2028,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // While the config screen is open, route all other keys to it.
     if app.config_screen.is_some() {
         let state = app.config_screen.as_mut().expect("checked above");
-        let outcome = config_screen::handle_key(state, agent, &mut app.app_notifications, key);
+        let mut feedback = config_screen::ConfigFeedback::new();
+        let outcome = config_screen::handle_key(state, agent, &mut feedback, key);
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             app.config_screen = None;
         }
+        forward_config_feedback(app, feedback);
         return Ok(false);
     }
 
@@ -1992,26 +2056,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             }
         }
         return Ok(false);
-    }
-
-    // `n` dismisses the current notification, `N` clears all. Only fires
-    // when the prompt is empty so we don't eat keystrokes the user is
-    // typing into the input area.
-    if app.transcript_overlay.is_none()
-        && app.input.is_empty()
-        && !app.app_notifications.is_empty()
-        && key.modifiers.is_empty()
-    {
-        if key.code == KeyCode::Char('n') {
-            if app.app_notifications.dismiss_current() {
-                return Ok(false);
-            }
-        } else if key.code == KeyCode::Char('N') {
-            let removed = app.app_notifications.clear_all();
-            if removed > 0 {
-                return Ok(false);
-            }
-        }
     }
 
     if app.exit_confirm_armed
@@ -2145,12 +2189,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
 
     // A focused subagent pane owns Esc (to close itself); don't let Esc
     // cancel an in-flight turn out from under the user while they're
-    // navigating the pane.
-    if key.code == KeyCode::Esc
-        && !app.subagent_pane.focused
-        && matches!(app.subagent_pane.active, ConversationSource::Main)
-        && request_turn_interrupt(app)
-    {
+    // navigating the pane. But once focus is released, an interruptible
+    // turn wins over the pane's "back to main" Esc even while a subagent is
+    // the shown conversation — `request_turn_interrupt` only returns true
+    // when there is actually something to interrupt, so a bare Esc with
+    // nothing running still falls through to reset the pane view.
+    if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
         return Ok(false);
     }
 
@@ -2163,15 +2207,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if app.mention_popup.is_some() && handle_mention_popup_key(app, key) {
-        return Ok(false);
-    }
-
-    if should_route_plain_arrow_to_scroll_before_subagent_pane(app, key) {
-        match key.code {
-            KeyCode::Up => scroll_transcript_up(app, 3),
-            KeyCode::Down => scroll_transcript_down(app, 3),
-            _ => {}
-        }
         return Ok(false);
     }
 
@@ -2229,10 +2264,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 recall_prompt_history(app, HistoryDirection::Previous);
             } else if move_input_cursor_up(app) {
                 // Multi-line input: step the cursor up one line. Falls
-                // through to history/scroll when the cursor is already on
-                // the first line so the single-line behaviour is intact.
-            } else if should_route_plain_arrow_to_scroll(app) {
-                scroll_transcript_up(app, 3);
+                // through to history when the cursor is already on the
+                // first line so the single-line behaviour is intact.
             } else {
                 recall_prompt_history(app, HistoryDirection::Previous);
             }
@@ -2249,11 +2282,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             } else if move_input_cursor_down(app) {
                 // Same as Up — when there's a next line in the composer
                 // step into it; only when on the last line do we fall
-                // through to history/scroll.
-            } else if should_route_plain_arrow_to_scroll(app) {
-                scroll_transcript_down(app, 3);
-            } else {
-                recall_prompt_history(app, HistoryDirection::Next);
+                // through to history.
+            } else if !recall_prompt_history(app, HistoryDirection::Next) {
+                // Nothing left to step forward to in the prompt history and
+                // the transcript is already at the bottom: chain Down into
+                // the subagent pane so a non-empty composer (draft text or a
+                // recalled prompt) no longer traps the selector below it.
+                focus_subagent_pane_from_composer(app);
             }
             Ok(false)
         }
@@ -2570,15 +2605,26 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             app.transcript_overlay_scrollbar_cache.set(None);
-            app.transcript_overlay = if app.transcript_overlay.is_some() {
-                None
-            } else {
-                Some(TranscriptOverlayState::default())
-            };
-            app.status = if app.transcript_overlay.is_some() {
-                "transcript overlay (Esc to close)".to_string()
-            } else {
-                "transcript overlay closed".to_string()
+            // This toggle action is dispatched up top even while the overlay is
+            // open, so it runs the full cycle: a folded subagent view unfolds to
+            // Expanded in place, an already-expanded overlay closes (backing out
+            // to the main conversation when it was a subagent), and opening from
+            // nothing goes straight to expanded — the "see everything" view.
+            app.status = match app.transcript_overlay.map(|state| state.detail) {
+                Some(OverlayDetail::Collapsed) => {
+                    if let Some(state) = app.transcript_overlay.as_mut() {
+                        state.detail = OverlayDetail::Expanded;
+                    }
+                    "transcript expanded — Esc to close".to_string()
+                }
+                Some(OverlayDetail::Expanded) => {
+                    close_transcript_overlay(app);
+                    return true;
+                }
+                None => {
+                    app.transcript_overlay = Some(TranscriptOverlayState::default());
+                    "transcript overlay (Esc to close)".to_string()
+                }
             };
             true
         }
@@ -2693,29 +2739,6 @@ fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
     set_active_transcript_scroll_from_bottom(app, scroll);
 }
 
-fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
-    app.alternate_scroll_enabled
-        && app.input_history_index.is_none()
-        && !active_transcript_entries(app).is_empty()
-}
-
-fn should_route_plain_arrow_to_scroll_before_subagent_pane(app: &TuiApp, key: KeyEvent) -> bool {
-    if app.subagent_pane.focused
-        || app.input_history_index.is_some()
-        || !app.input.is_empty()
-        || !key.modifiers.is_empty()
-        || !app.alternate_scroll_enabled
-        || active_transcript_entries(app).is_empty()
-    {
-        return false;
-    }
-    match key.code {
-        KeyCode::Up => true,
-        KeyCode::Down => active_transcript_scroll_from_bottom(app) > 0,
-        _ => false,
-    }
-}
-
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     let mut interrupted = false;
     if let Some(cancel) = &app.cancel {
@@ -2773,6 +2796,7 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
 /// render caches observe the same generation.
 pub(crate) fn apply_theme_overrides(config: &AppConfig) {
     render::theme::set_active_theme(config);
+    render::spinner::set_active_spinner(config);
 }
 
 /// Apply a `/theme` switch: flip the runtime palette override, mirror the
@@ -2796,16 +2820,39 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
     }];
     match apply_edits(&scope_target, &edits) {
         Ok(_) => {
-            app.app_notifications
-                .push(format!("theme → {theme}"), NotifySeverity::Success);
+            app.push_status(format!("theme → {theme}"));
             app.status = format!("theme saved to {}", target_path.display());
         }
         Err(err) => {
-            app.app_notifications.push(
-                format!("theme switched but save failed: {err}"),
-                NotifySeverity::Warn,
-            );
+            app.push_warn(format!("theme switched but save failed: {err}"));
             app.status = format!("theme switched (not persisted): {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
+fn apply_spinner_change(app: &mut TuiApp, agent: &mut Agent, spinner: String) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let mut next = agent.config_snapshot();
+    next.tui.spinner = spinner.clone();
+    crate::render::spinner::set_active_spinner(&next);
+    agent.replace_config(next);
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edits = [SettingsEdit {
+        path: &["tui", "spinner"],
+        op: EditOp::SetString(spinner.clone()),
+    }];
+    match apply_edits(&scope_target, &edits) {
+        Ok(_) => {
+            app.push_status(format!("spinner → {spinner}"));
+            app.status = format!("spinner saved to {}", target_path.display());
+        }
+        Err(err) => {
+            app.push_warn(format!("spinner switched but save failed: {err}"));
+            app.status = format!("spinner switched (not persisted): {err}");
         }
     }
     app.needs_redraw = true;
@@ -3097,13 +3144,10 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 && !raw.is_empty()
                 && id.is_none()
             {
-                app.app_notifications.push(
-                    format!(
-                        "/config: '{raw}' is not a navigable section — opening the default view. \
-                         Press / to search field labels."
-                    ),
-                    NotifySeverity::Warn,
-                );
+                app.push_warn(format!(
+                    "/config: '{raw}' is not a navigable section — opening the default view. \
+                     Press / to search field labels."
+                ));
             }
             toggle_config_screen(app, agent, id);
         }
@@ -3393,6 +3437,31 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 return;
             }
             apply_theme_change(app, agent, parsed);
+        }
+        DispatchCommand::Spinner { spinner: None } => {
+            let current = agent.config_snapshot().tui.spinner.clone();
+            let options = squeezy_core::BUILTIN_TUI_SPINNER_NAMES.join(", ");
+            set_status_with_notice(
+                app,
+                format!("spinner: {current} (options: {options})"),
+                format!(
+                    "Working-status spinner is {current:?}. Set one with `/spinner <name>` — options: {options}."
+                ),
+            );
+        }
+        DispatchCommand::Spinner {
+            spinner: Some(spinner),
+        } => {
+            let Some(parsed) = squeezy_core::normalize_tui_spinner_name(&spinner) else {
+                let options = squeezy_core::BUILTIN_TUI_SPINNER_NAMES.join(", ");
+                set_status_with_notice(
+                    app,
+                    format!("unknown spinner {spinner:?}; options: {options}"),
+                    format!("Unknown spinner {spinner:?}. Options: {options}."),
+                );
+                return;
+            };
+            apply_spinner_change(app, agent, parsed);
         }
         DispatchCommand::Keymap => {
             let body = keymap::format_keymap_command(&app.keymap);
@@ -4317,10 +4386,7 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
     // for these session-scoped switches.
     app.status = format!("reasoning effort → {label}");
     if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
-        app.app_notifications.push(
-            "SQUEEZY_REASONING_EFFORT overrides this on next load".to_string(),
-            NotifySeverity::Warn,
-        );
+        app.push_warn("SQUEEZY_REASONING_EFFORT overrides this on next load".to_string());
     }
 }
 
@@ -4423,6 +4489,14 @@ fn handle_slash_tool_verbosity(app: &mut TuiApp, agent: &mut Agent, value: Optio
 fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     let mut changed = 0;
     for entry in &mut app.transcript {
+        // An explicit collapse/expand toggle is the user taking manual
+        // control of the node's height, which cancels any in-flight
+        // settle-fold so the requested state sticks instead of being
+        // overridden by the animation's folded render.
+        if entry.settle.take().is_some() {
+            entry.bump_revision();
+            changed += 1;
+        }
         if entry.collapsed != collapsed {
             entry.collapsed = collapsed;
             entry.bump_revision();
@@ -4461,6 +4535,23 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 /// Handle a keystroke while the full-screen transcript overlay is open.
 /// Returns `true` when the key was consumed so the caller does not also
 /// dispatch it to the normal input/turn paths.
+/// Close the transcript overlay. When it was surfacing a subagent conversation
+/// (opened from the pane via Enter), back all the way out to the main
+/// conversation in one step, mirroring the pane's own Esc.
+fn close_transcript_overlay(app: &mut TuiApp) {
+    app.transcript_overlay_scrollbar_cache.set(None);
+    app.transcript_overlay = None;
+    if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
+        app.subagent_pane.focused = false;
+        app.subagent_pane.active = ConversationSource::Main;
+        app.subagent_pane.selected = 0;
+        set_active_transcript_scroll_from_bottom(app, 0);
+        app.status = "main conversation selected".to_string();
+    } else {
+        app.status = "transcript overlay closed".to_string();
+    }
+}
+
 fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.transcript_overlay.is_none() {
         return false;
@@ -4468,9 +4559,7 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     const PAGE: usize = 10;
     match key.code {
         KeyCode::Esc => {
-            app.transcript_overlay_scrollbar_cache.set(None);
-            app.transcript_overlay = None;
-            app.status = "transcript overlay closed".to_string();
+            close_transcript_overlay(app);
             true
         }
         KeyCode::PageUp => {
@@ -4594,8 +4683,7 @@ fn start_user_turn_prepared(app: &mut TuiApp, agent: &mut Agent, prompt: Prepare
             .display_note
             .clone()
             .unwrap_or_else(|| "config applied".to_string());
-        app.app_notifications
-            .push(format!("✓ applied: {note}"), NotifySeverity::Success);
+        app.push_status(format!("✓ applied: {note}"));
     }
     let cancel = CancellationToken::new();
     app.task_state = None;
@@ -5497,7 +5585,7 @@ fn format_request_user_input_menu_lines(
             .add_modifier(Modifier::BOLD);
         let label_style = Style::default().fg(crate::render::theme::magenta());
         let cursor_style = Style::default()
-            .fg(Color::Black)
+            .fg(crate::render::theme::background())
             .bg(crate::render::theme::magenta());
         let mut spans = vec![
             Span::styled(marker, marker_style),
@@ -5565,35 +5653,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         return;
     }
     if let Some(state) = &app.status_line_setup {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        status_line_setup::render(frame, chunks[0], state, app);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        status_line_setup::render(frame, area, state, app);
         return;
     }
     if let Some(state) = &app.config_screen {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        config_screen::render(frame, chunks[0], state);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        config_screen::render(frame, area, state);
         return;
     }
     let include_startup_card = area.height >= 16;
@@ -5655,10 +5719,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
     }
-    let notification_height = app.app_notifications.height();
-    if notification_height > 0 {
-        constraints.push(Constraint::Length(notification_height));
-    }
     constraints.push(Constraint::Length(2));
     if subagent_height > 0 {
         constraints.push(Constraint::Length(subagent_height));
@@ -5694,10 +5754,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         render_approval(frame, chunks[index], app);
         index += 1;
     }
-    if notification_height > 0 {
-        render_notification_pane(frame, chunks[index], app);
-        index += 1;
-    }
     render_status(frame, chunks[index], app);
     index += 1;
     if subagent_height > 0 {
@@ -5708,51 +5764,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
     render_toast_overlay(frame, area, app);
-}
-
-fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    use ratatui::{
-        style::{Modifier, Style},
-        text::{Line, Span},
-        widgets::Paragraph,
-    };
-    let Some(current) = app.app_notifications.current() else {
-        return;
-    };
-    let remaining_secs = current.remaining().as_secs();
-    let mut spans = vec![
-        Span::styled(
-            current.severity.glyph(),
-            Style::default()
-                .fg(current.severity.color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            current.message.as_str(),
-            Style::default().fg(palette::muted_fg()),
-        ),
-    ];
-    if let Some(hint) = current.action_hint {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            hint,
-            Style::default().fg(crate::render::theme::quiet()),
-        ));
-    }
-    if app.app_notifications.len() > 1 {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("({}+)", app.app_notifications.len() - 1),
-            Style::default().fg(crate::render::theme::quiet()),
-        ));
-    }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("· {remaining_secs}s"),
-        Style::default().fg(crate::render::theme::quiet()),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Overlay the corner-toast stack on the top-right of `area`. Each visible
@@ -5806,35 +5817,11 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         return;
     }
     if let Some(state) = &app.status_line_setup {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        status_line_setup::render(frame, chunks[0], state, app);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        status_line_setup::render(frame, area, state, app);
         return;
     }
     if let Some(state) = &app.config_screen {
-        let notif_h = app.app_notifications.height();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(if notif_h > 0 {
-                vec![Constraint::Min(0), Constraint::Length(notif_h)]
-            } else {
-                vec![Constraint::Min(0)]
-            })
-            .split(area);
-        config_screen::render(frame, chunks[0], state);
-        if notif_h > 0 {
-            render_notification_pane(frame, chunks[1], app);
-        }
+        config_screen::render(frame, area, state);
         return;
     }
     let input_height = input_panel_height(app, area.width);
@@ -5843,7 +5830,11 @@ pub(crate) fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
     let subagent_height = subagent_pane_height(app);
-    let live_lines = pending_assistant_lines(app);
+    // Just-finished work nodes that are still folding render here in the live
+    // region (held back from scrollback) above the streaming answer, then flush
+    // collapsed once their 600ms settle finishes.
+    let mut live_lines = live_settling_lines(app, area.width);
+    live_lines.extend(pending_assistant_lines(app));
     let live_visual_height = visual_line_count(&live_lines, area.width);
     let live_gap = if live_visual_height > 0 { 1 } else { 0 };
     let required_height = task_height
@@ -5955,9 +5946,26 @@ fn task_panel_height(app: &TuiApp) -> u16 {
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    // A subagent's live work threads its rail in magenta, matching the
+    // settled subagent nodes; the main agent's stays dim.
+    let live_chrome = if active_subagent_record(app).is_some() {
+        crate::render::theme::magenta()
+    } else {
+        rail::dim()
+    };
     let mut lines = if turn_in_progress(app) {
-        let mut rows = vec![working_line(app)];
-        if let Some(detail) = working_detail_line(app) {
+        let mut working = working_line(app);
+        let detail = working_detail_line(app);
+        // The active tool is the live rail node (its spinner star is the
+        // marker); close the rail here unless a queued-tail row follows.
+        rail::set_elbow(&mut working, detail.is_none(), live_chrome);
+        let mut rows = vec![working];
+        if let Some(mut detail) = detail {
+            rail::apply_gutter(
+                std::slice::from_mut(&mut detail),
+                rail::RailMarker::Queued,
+                true,
+            );
             rows.push(detail);
         }
         rows
@@ -5966,7 +5974,9 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else if let Some(snapshot) = app.task_state.as_ref() {
         vec![compact_task_state_line(snapshot)]
     } else {
-        vec![working_line(app)]
+        let mut working = working_line(app);
+        rail::set_elbow(&mut working, true, live_chrome);
+        vec![working]
     };
     if lines.len() < area.height as usize {
         // Pad so the bottom row doesn't shift when the detail goes away.
@@ -5987,10 +5997,13 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     // Highest priority: a `/diff` snapshot is running on the blocking
     // pool. The user typed `/diff` and is waiting for git to finish.
     if app.pending_diff.is_some() {
-        return Some(Line::from(Span::styled(
-            "    ↳ computing diff…",
-            Style::default().fg(crate::render::theme::quiet()),
-        )));
+        return Some(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "computing diff…",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]));
     }
     if let Some(snapshot) = app.mcp_status.as_ref() {
         let mut starting = 0usize;
@@ -6005,11 +6018,11 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
             }
         }
         if starting > 0 && total > 0 {
-            let text = format!("    ↳ mcp: starting {ready}/{total} servers");
-            return Some(Line::from(Span::styled(
-                text,
-                Style::default().fg(crate::render::theme::quiet()),
-            )));
+            let text = format!("mcp: starting {ready}/{total} servers");
+            return Some(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+            ]));
         }
     }
 
@@ -6022,13 +6035,13 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     if visible_tools > 1 {
         let extra = visible_tools - 1;
         let text = format!(
-            "    ↳ +{extra} more tool call{} queued",
+            "+{extra} more tool call{} queued",
             if extra == 1 { "" } else { "s" }
         );
-        return Some(Line::from(Span::styled(
-            text,
-            Style::default().fg(crate::render::theme::quiet()),
-        )));
+        return Some(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+        ]));
     }
     None
 }
@@ -6045,20 +6058,28 @@ fn turn_in_progress(app: &TuiApp) -> bool {
 }
 
 fn should_advance_animation_tick(app: &TuiApp) -> bool {
-    app.focused || turn_in_progress(app)
+    // Keep ticking while a node is mid settle-fold so the fold advances
+    // frame to frame; this naturally stops once every settle finalizes
+    // (`finalize_elapsed_settles` clears them), so an idle transcript with
+    // no settling entries and no active turn returns to its prior behavior
+    // and does not perpetually repaint.
+    app.focused || turn_in_progress(app) || app.has_settling_entry()
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
     let interrupting = app.status == "interrupting";
+    // The live agent is a cool-silver star (the moon motif is reserved
+    // for the header band and the prompt coin); red only when interrupting.
     let activity_color = if interrupting {
         crate::render::theme::red()
     } else {
-        render::palette::accent_primary()
+        crate::render::theme::foreground()
     };
+    let live_marker = crate::render::spinner::active_style().rail_marker(prompt_elapsed_ms(app));
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "• ",
+            format!("{live_marker} "),
             Style::default()
                 .fg(activity_color)
                 .add_modifier(Modifier::BOLD),
@@ -6326,13 +6347,30 @@ impl TranscriptOverlayMode {
     }
 }
 
-/// State for the full-screen transcript overlay (Ctrl+T). All transcript
-/// entries are rendered in their fully-expanded form regardless of each
-/// entry's collapsed flag; the user scrolls with PgUp/PgDn/arrows.
+/// How much of each entry the overlay shows. `Collapsed` mirrors the main
+/// inline view — tool cards folded, reasoning trimmed — so a subagent opens
+/// formatted like the main conversation; `Expanded` unfolds every body for the
+/// "read everything" view. Ctrl-T steps Collapsed → Expanded → closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OverlayDetail {
+    Collapsed,
+    Expanded,
+}
+
+impl OverlayDetail {
+    fn expand_all(self) -> bool {
+        matches!(self, Self::Expanded)
+    }
+}
+
+/// State for the full-screen transcript overlay (Ctrl+T). `detail` selects
+/// whether entries render folded (like the inline view) or fully expanded; the
+/// user scrolls with PgUp/PgDn/arrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranscriptOverlayState {
     pub(crate) scroll: usize,
     pub(crate) mode: TranscriptOverlayMode,
+    pub(crate) detail: OverlayDetail,
 }
 
 impl Default for TranscriptOverlayState {
@@ -6340,6 +6378,7 @@ impl Default for TranscriptOverlayState {
         Self {
             scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
             mode: TranscriptOverlayMode::NativeSelection,
+            detail: OverlayDetail::Expanded,
         }
     }
 }
@@ -6355,6 +6394,7 @@ struct TranscriptOverlayRenderKey {
     coalesce_tool_runs: bool,
     animation_tick: u64,
     palette_generation: u64,
+    detail: OverlayDetail,
 }
 
 #[derive(Debug, Default)]
@@ -6447,11 +6487,21 @@ fn with_transcript_overlay_rows<R>(
     let key = transcript_overlay_render_key(app, width);
     let mut cache = app.transcript_overlay_render_cache.borrow_mut();
     if cache.key != Some(key) {
-        let logical_lines = transcript_lines_for_overlay(app, Some(width));
+        let logical_lines =
+            transcript_lines_for_overlay(app, Some(width), overlay_detail(app).expand_all());
         cache.rows = wrap_transcript_overlay_rows(&logical_lines, width);
         cache.key = Some(key);
     }
     f(&cache.rows)
+}
+
+/// The detail level the transcript overlay is currently showing, defaulting to
+/// `Expanded` when no overlay is open (the value the render cache keys on).
+fn overlay_detail(app: &TuiApp) -> OverlayDetail {
+    app.transcript_overlay
+        .as_ref()
+        .map(|state| state.detail)
+        .unwrap_or(OverlayDetail::Expanded)
 }
 
 fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
@@ -6479,6 +6529,7 @@ fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayR
         coalesce_tool_runs: app.coalesce_tool_runs,
         animation_tick: app.animation_tick,
         palette_generation: render::palette::palette_generation(),
+        detail: overlay_detail(app),
     }
 }
 
@@ -6491,35 +6542,156 @@ fn wrap_transcript_overlay_rows(lines: &[Line<'static>], width: u16) -> Vec<Line
     rows
 }
 
-fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
-    let mut row_spans: Vec<Span<'static>> = Vec::new();
-    let mut row_width = 0usize;
-    let mut saw_content = false;
+/// Characters that make up a rail line's leading gutter — the indent spaces,
+/// the vertical bars, the tee/close elbows, and the connecting dashes.
+const RAIL_GUTTER_CHARS: [char; 5] = [' ', '│', '├', '╰', '─'];
 
-    for span in &line.spans {
-        let style = span.style;
-        let mut chunk = String::new();
-        for ch in span.content.chars() {
-            if row_width >= width {
-                if !chunk.is_empty() {
-                    row_spans.push(Span::styled(std::mem::take(&mut chunk), style));
-                }
-                rows.push(Line::from(std::mem::take(&mut row_spans)));
-                row_width = 0;
-            }
-            chunk.push(ch);
-            row_width += 1;
-            saw_content = true;
+/// Width (in cells) of a rail line's leading gutter: the indent + `│`/`├`/`╰─`
+/// run, plus the node's marker glyph and its trailing space when the run opened
+/// with an elbow. Everything after that is the node's content.
+fn rail_prefix_width(text: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && RAIL_GUTTER_CHARS.contains(&chars[i]) {
+        i += 1;
+    }
+    let opened_with_elbow = chars[..i].iter().any(|&c| c == '├' || c == '╰');
+    if opened_with_elbow && i < chars.len() && chars[i] != ' ' {
+        // A header is `…├─<marker> content`; fold the marker glyph and the
+        // space after it into the gutter so the wrapped text hangs under the
+        // content, not under the marker.
+        let marker = i;
+        i += 1;
+        let mut saw_space = false;
+        while i < chars.len() && chars[i] == ' ' {
+            saw_space = true;
+            i += 1;
         }
-        if !chunk.is_empty() {
-            row_spans.push(Span::styled(chunk, style));
+        if !saw_space {
+            i = marker;
         }
     }
+    i
+}
 
-    if saw_content {
-        rows.push(Line::from(row_spans));
-    } else {
-        rows.push(Line::from(""));
+/// The gutter to repeat on a wrapped continuation row: a vertical bar (`│`) and
+/// a tee (`├`, whose run continues to the next node) stay as `│`; the close
+/// elbow `╰`, the dashes, and the marker glyph blank out, so the wrapped text
+/// hangs under the node's content with the rail still threading past it.
+fn rail_continuation_prefix(prefix: &str) -> String {
+    prefix
+        .chars()
+        .map(|c| {
+            if matches!(c, '│' | '├') {
+                '│'
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+/// Split a line's spans at display column `col`, preserving styles (splitting a
+/// span when the boundary falls inside it).
+fn split_spans_at_column(
+    spans: &[Span<'static>],
+    col: usize,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut consumed = 0usize;
+    for span in spans {
+        let len = span.content.chars().count();
+        if consumed >= col {
+            right.push(span.clone());
+        } else if consumed + len <= col {
+            left.push(span.clone());
+            consumed += len;
+        } else {
+            let at = col - consumed;
+            let head: String = span.content.chars().take(at).collect();
+            let tail: String = span.content.chars().skip(at).collect();
+            left.push(Span::styled(head, span.style));
+            right.push(Span::styled(tail, span.style));
+            consumed = col;
+        }
+    }
+    (left, right)
+}
+
+/// Wrap styled content to `width` cells, breaking at the last space inside each
+/// row when there is one (word wrap) and hard-breaking an over-long token
+/// otherwise. Unlike [`wrap_styled_words`] this preserves every character —
+/// runs of spaces and JSON/code indentation survive — so it is the right tool
+/// for the mixed tool output shown in the transcript overlay.
+fn wrap_cells_preserving(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let cells: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+        .collect();
+    if cells.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        if cells.len() - start <= width {
+            rows.push(coalesce_cells_to_spans(cells[start..].to_vec()));
+            break;
+        }
+        let hard = start + width;
+        // Prefer the last space inside the row so words stay intact; the space
+        // itself stays at the end of this row, never leading the next one.
+        let mut brk = hard;
+        let mut k = hard;
+        while k > start {
+            if cells[k - 1].0 == ' ' {
+                brk = k;
+                break;
+            }
+            k -= 1;
+        }
+        if k == start {
+            brk = hard;
+        }
+        rows.push(coalesce_cells_to_spans(cells[start..brk].to_vec()));
+        start = brk;
+    }
+    rows
+}
+
+fn wrap_transcript_overlay_line(line: &Line<'static>, width: usize, rows: &mut Vec<Line<'static>>) {
+    let width = width.max(1);
+    let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if full.chars().count() <= width {
+        // Fits as-is — pass it through untouched so the gutter and any inner
+        // whitespace are preserved exactly.
+        rows.push(line.clone());
+        return;
+    }
+    // Over-long: keep the gutter, word-wrap only the content past it.
+    let prefix_w = rail_prefix_width(&full).min(width.saturating_sub(1));
+    let (prefix_spans, content_spans) = split_spans_at_column(&line.spans, prefix_w);
+    let prefix_text: String = prefix_spans.iter().map(|s| s.content.as_ref()).collect();
+    let cont_text = rail_continuation_prefix(&prefix_text);
+    let chrome = prefix_spans.iter().rev().find_map(|s| s.style.fg);
+    let text_width = width.saturating_sub(prefix_w).max(1);
+    for (index, segment) in wrap_cells_preserving(&content_spans, text_width)
+        .into_iter()
+        .enumerate()
+    {
+        let mut spans: Vec<Span<'static>> = if index == 0 {
+            prefix_spans.clone()
+        } else {
+            let mut bar = Span::raw(cont_text.clone());
+            if let Some(color) = chrome {
+                bar.style = Style::default().fg(color);
+            }
+            vec![bar]
+        };
+        spans.extend(segment);
+        rows.push(Line::from(spans));
     }
 }
 
@@ -6693,12 +6865,20 @@ fn render_transcript_overlay_scrollbar(
 /// Build the per-entry line list for the overlay: every committed entry is
 /// forced to its expanded form, and the live assistant tail is appended so
 /// opening Ctrl-T mid-turn does not look frozen.
-fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
-    // The overlay is the "Ctrl-T for full transcript" escape hatch — body
-    // content blocks (e.g. read_tool_output payloads, shell stdout/stderr)
-    // honour this verbosity, so pin Verbose to defeat the per-mode line cap
-    // even when the user has `/verbosity compact` set for inline cards.
-    let overlay_verbosity = ToolOutputVerbosity::Verbose;
+fn transcript_lines_for_overlay(
+    app: &TuiApp,
+    width: Option<u16>,
+    expand_all: bool,
+) -> Vec<Line<'static>> {
+    // Expanded is the "Ctrl-T for full transcript" escape hatch — body content
+    // blocks (read_tool_output payloads, shell stdout/stderr) honour this
+    // verbosity, so pin Verbose to defeat the per-mode line cap. Collapsed
+    // mirrors the inline view, so it honours the user's configured verbosity.
+    let overlay_verbosity = if expand_all {
+        ToolOutputVerbosity::Verbose
+    } else {
+        app.tool_output_verbosity
+    };
     let mut lines = Vec::new();
     if let Some(title) = active_conversation_title(app) {
         lines.push(title);
@@ -6706,6 +6886,8 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
     }
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
+    let mut prev_work = false;
+    let subagent_view = active_subagent_record(app).is_some();
     for (index, entry) in entries.iter().enumerate() {
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -6713,13 +6895,18 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
                 if app.show_reasoning_usage
                     && let TranscriptEntryKind::Reasoning(snapshot) = &entry.kind
                 {
-                    lines.extend(reasoning_block_lines_with_extras(
+                    let mut block = reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         false,
                         selected_entry == Some(index),
                         extras,
-                    ));
-                    lines.push(Line::from(""));
+                    );
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&entry.kind, subagent_view),
+                    );
                 }
                 continue;
             }
@@ -6729,21 +6916,28 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(entries, index, extras);
-                // Overlay always forces expanded form so users browsing
-                // the full transcript can read every member's body.
-                lines.extend(format_grouped_tool_result_entry(
+                // Expanded forces every member's body open so the full
+                // transcript reads end to end; Collapsed honours the lead's
+                // folded state so the view matches the inline conversation.
+                let mut block = format_grouped_tool_result_entry(
                     &members,
-                    false,
+                    !expand_all && entry.collapsed,
                     selected_entry == Some(index),
                     overlay_verbosity,
                     width,
                     ToolCardSurface::Plain,
-                ));
+                );
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&entry.kind, subagent_view),
+                );
                 continue;
             }
             None => {}
         }
-        lines.extend(cached_transcript_entry_lines(
+        let mut block = cached_transcript_entry_lines(
             app.render_cache_session,
             entry,
             selected_entry == Some(index),
@@ -6751,8 +6945,25 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             message_outcome(entries, index),
             width,
             app.show_reasoning_usage,
-            true,
-        ));
+            expand_all,
+        );
+        if is_rail_work_node(&entry.kind) {
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&entry.kind, subagent_view),
+            );
+        } else {
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter down into the conclusion, whose own
+            // marker sits in the gutter column.
+            if prev_work {
+                lines.push(rail::connector_line(rail::dim()));
+            }
+            lines.append(&mut block);
+            prev_work = false;
+        }
     }
     let pending = active_pending_assistant_lines(app);
     if !pending.is_empty() {
@@ -7009,6 +7220,80 @@ fn active_conversation_title(app: &TuiApp) -> Option<Line<'static>> {
     ]))
 }
 
+/// True for transcript entries that render as Quiet Rail work nodes (reasoning,
+/// tool results, plans). Messages, diffs, logs and slash echoes flow at the
+/// normal margin, off the rail.
+fn is_rail_work_node(kind: &TranscriptEntryKind) -> bool {
+    match kind {
+        TranscriptEntryKind::ToolResult(_)
+        | TranscriptEntryKind::PlanCard(_)
+        | TranscriptEntryKind::Reasoning(_) => true,
+        // Subagent breadcrumbs, notes, warnings, and errors thread on the rail;
+        // operational chrome and plain logs flow off it.
+        TranscriptEntryKind::Log(entry) => {
+            matches!(
+                entry.kind,
+                LogKind::Subagent | LogKind::Note | LogKind::Warn | LogKind::Error
+            )
+        }
+        _ => false,
+    }
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
+}
+
+/// The gutter tint that gives a rail node its identity at a glance: plans glow
+/// amber (a decision to read), reasoning runs cool blue (thinking, set apart
+/// from the work), warnings turn cyan (attention without spending amber),
+/// errors turn red (a real failure, set apart from a warning), and everything
+/// in a subagent's transcript turns magenta so the delegated context is
+/// unmistakable. Plain tool work and notes stay dim.
+fn rail_chrome(kind: &TranscriptEntryKind, subagent_view: bool) -> Color {
+    if subagent_view {
+        return crate::render::theme::magenta();
+    }
+    match kind {
+        TranscriptEntryKind::PlanCard(_) => crate::render::theme::accent(),
+        TranscriptEntryKind::Reasoning(_) => crate::render::theme::blue(),
+        TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Subagent => {
+            crate::render::theme::magenta()
+        }
+        TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Warn => {
+            crate::render::theme::cyan()
+        }
+        TranscriptEntryKind::Log(entry) if entry.kind == LogKind::Error => {
+            crate::render::theme::red()
+        }
+        _ => rail::dim(),
+    }
+}
+
+/// Append a settled work-entry block to the transcript on the Quiet Rail: trim
+/// its trailing blank, drop a `│` connector above it when it follows another
+/// rail node, gutter it, then extend. An empty block is skipped entirely so a
+/// hidden (reasoning-off) entry leaves no stray connector on the rail.
+fn push_rail_work_block(
+    lines: &mut Vec<Line<'static>>,
+    block: &mut Vec<Line<'static>>,
+    prev_work: &mut bool,
+    chrome: Color,
+) {
+    while block.last().is_some_and(line_is_blank) {
+        block.pop();
+    }
+    if block.is_empty() {
+        return;
+    }
+    if *prev_work {
+        lines.push(rail::connector_line(chrome));
+    }
+    rail::apply_block_gutter(block, false, chrome);
+    lines.append(block);
+    *prev_work = true;
+}
+
 fn transcript_lines_for_render(
     app: &TuiApp,
     width: Option<u16>,
@@ -7025,20 +7310,51 @@ fn transcript_lines_for_render(
     }
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
+    let mut prev_work = false;
+    let subagent_view = active_subagent_record(app).is_some();
     for (index, item) in entries.iter().enumerate() {
+        // A finished work node that is mid settle-fold renders folded —
+        // its expanded block truncated to an eased height that descends to
+        // the collapsed preview — instead of from the line cache (whose key
+        // does not carry the per-frame fold height). It still threads the
+        // Quiet Rail gutter so the folding node stays on the rail it will
+        // rest on, rather than jumping onto it when the fold finalizes.
+        if let Some(settle) = item.settle {
+            let mut block = settle_folded_entry_lines(
+                item,
+                selected_entry == Some(index),
+                app.tool_output_verbosity,
+                message_outcome(entries, index),
+                width,
+                app.show_reasoning_usage,
+                settle,
+            );
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, subagent_view),
+            );
+            continue;
+        }
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
                 if app.show_reasoning_usage
                     && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
                 {
-                    lines.extend(reasoning_block_lines_with_extras(
+                    let mut block = reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         item.collapsed,
                         selected_entry == Some(index),
                         extras,
-                    ));
-                    lines.push(Line::from(""));
+                    );
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&item.kind, subagent_view),
+                    );
                 }
                 continue;
             }
@@ -7048,19 +7364,25 @@ fn transcript_lines_for_render(
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(entries, index, extras);
-                lines.extend(format_grouped_tool_result_entry(
+                let mut block = format_grouped_tool_result_entry(
                     &members,
                     item.collapsed,
                     selected_entry == Some(index),
                     app.tool_output_verbosity,
                     width,
                     ToolCardSurface::Tinted,
-                ));
+                );
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&item.kind, subagent_view),
+                );
                 continue;
             }
             None => {}
         }
-        lines.extend(cached_transcript_entry_lines(
+        let mut block = cached_transcript_entry_lines(
             app.render_cache_session,
             item,
             selected_entry == Some(index),
@@ -7069,7 +7391,24 @@ fn transcript_lines_for_render(
             width,
             app.show_reasoning_usage,
             false,
-        ));
+        );
+        if is_rail_work_node(&item.kind) {
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, subagent_view),
+            );
+        } else {
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter down into the conclusion, whose own
+            // marker sits in the gutter column.
+            if prev_work {
+                lines.push(rail::connector_line(rail::dim()));
+            }
+            lines.append(&mut block);
+            prev_work = false;
+        }
     }
     let pending_reasoning = active_pending_reasoning(app);
     if app.show_reasoning_usage && !pending_reasoning.trim().is_empty() {
@@ -7083,10 +7422,70 @@ fn transcript_lines_for_render(
             turn_coin_span(app),
             &pending_assistant,
             Style::default(),
+            None,
         ));
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Render a finished work node mid settle-fold: its expanded block,
+/// truncated to an eased height that descends from the captured expanded
+/// height down to the collapsed preview over [`SETTLE_DURATION_MS`].
+///
+/// Computed fresh (outside the per-entry render cache) because the fold
+/// height changes every frame and is not part of the cache key. The
+/// collapsed-preview height is measured at the real render width so the
+/// fold lands exactly on the resting collapsed block; the expanded block
+/// it truncates is likewise measured fresh at that width. Once the elapsed
+/// time reaches `SETTLE_DURATION_MS` the eased count equals the collapsed
+/// height, so the last animated frame already matches the post-settle
+/// collapsed render the cache will serve afterward.
+#[allow(clippy::too_many_arguments)]
+fn settle_folded_entry_lines(
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+    settle: SettleState,
+) -> Vec<Line<'static>> {
+    let collapsed = format_transcript_entry_with_width(
+        entry,
+        selected,
+        tool_output_verbosity,
+        outcome,
+        width,
+        show_reasoning,
+    );
+    let collapsed_lines = collapsed.len().min(u16::MAX as usize) as u16;
+    let elapsed_ms = settle
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let visible = settle_visible_line_count(settle.from_lines, collapsed_lines, elapsed_ms);
+    // Once the fold has reached (or passed) the collapsed height there is
+    // nothing left to animate — serve the collapsed block directly so the
+    // animated tail frame is pixel-identical to the resting state.
+    if visible <= collapsed_lines {
+        return collapsed;
+    }
+    let expanded = format_transcript_entry_expanded(
+        entry,
+        selected,
+        tool_output_verbosity,
+        outcome,
+        width,
+        show_reasoning,
+    );
+    let take = (visible as usize).min(expanded.len());
+    if take >= expanded.len() {
+        expanded
+    } else {
+        expanded.into_iter().take(take).collect()
+    }
 }
 
 fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
@@ -7110,6 +7509,7 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
             turn_coin_span(app),
             &content,
             Style::default(),
+            None,
         ));
     }
     lines
@@ -7124,21 +7524,33 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
-    const FULL: &[&str] = &["◌", "◔", "◑", "◕", "●"];
-    const COMPACT: &[&str] = &["◔", "◑", "◕", "●"];
-    const TIGHT: &[&str] = &["◑", "◕", "●"];
-    const MINIMAL: &[&str] = &["●"];
+    // Waxing phases (new → full) on the left, waning phases (full → new)
+    // on the right, so the strip reads as one true lunar cycle rather than
+    // a mirror of the same glyphs.
+    const WAX_FULL: &[&str] = &["○", "☽", "◑", "●"];
+    const WANE_FULL: &[&str] = &["●", "◐", "☾", "○"];
+    const WAX_COMPACT: &[&str] = &["☽", "◑", "●"];
+    const WANE_COMPACT: &[&str] = &["●", "◐", "☾"];
+    const WAX_TIGHT: &[&str] = &["◑", "●"];
+    const WANE_TIGHT: &[&str] = &["●", "◐"];
+    const WAX_MINIMAL: &[&str] = &["●"];
+    const WANE_MINIMAL: &[&str] = &["●"];
 
     let title = "Squeezy";
     let version_text = format!(" v{version}");
     let title_total = title.chars().count() + version_text.chars().count();
 
-    for glyphs in [FULL, COMPACT, TIGHT, MINIMAL] {
-        let strip_chars = glyphs.len() * 2 - 1;
+    for (wax, wane) in [
+        (WAX_FULL, WANE_FULL),
+        (WAX_COMPACT, WANE_COMPACT),
+        (WAX_TIGHT, WANE_TIGHT),
+        (WAX_MINIMAL, WANE_MINIMAL),
+    ] {
+        let strip_chars = wax.len() * 2 - 1;
         let content_total = strip_chars + 2 + title_total + 2 + strip_chars;
         if content_total <= card_width {
-            let left_strip = glyphs.join(" ");
-            let right_strip = glyphs.iter().rev().copied().collect::<Vec<_>>().join(" ");
+            let left_strip = wax.join(" ");
+            let right_strip = wane.join(" ");
             let pad_total = card_width.saturating_sub(content_total);
             let pad_left = pad_total / 2;
             let pad_right = pad_total.saturating_sub(pad_left);
@@ -7926,7 +8338,14 @@ fn format_message_entry_with_width(
         return format_user_prompt_entry(item, selected, width);
     }
     if item.role == Role::Assistant {
-        return format_assistant_message_entry(item, collapsed, selected, outcome, show_reasoning);
+        return format_assistant_message_entry(
+            item,
+            collapsed,
+            selected,
+            outcome,
+            width,
+            show_reasoning,
+        );
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
@@ -8031,11 +8450,14 @@ fn format_user_prompt_entry(
     let amber = Style::default().fg(crate::render::theme::accent());
     let bullet_style = amber.add_modifier(Modifier::BOLD);
     const INDENT: &str = "  ";
-    // Cycle through the moon-phase set so consecutive prompts get a
-    // visually different bullet — content-hashed (not index-based) so
-    // the marker is stable per message even when prompts are
-    // reordered/collapsed in the transcript.
-    const BULLETS: &[&str] = &["◌", "◔", "◑", "◕", "◒", "◓"];
+    // The sent prompt's bullet is a half-moon — first- or last-quarter,
+    // content-hashed (not index-based) so it stays stable per message yet
+    // alternates between consecutive prompts. It is deliberately held to the
+    // half phases so it never collides with the crescents `☾`/`☽` that mark the
+    // prompt coin and the answer; the three moon roles stay visually distinct.
+    // (The live typing coin, by contrast, walks the full cycle — see
+    // `prompt_coin_frame`.)
+    const BULLETS: &[&str] = &["◑", "◐"];
     let bullet_idx = item
         .content
         .bytes()
@@ -8076,10 +8498,12 @@ fn format_user_prompt_entry(
 
     let bottom = Line::from(vec![
         Span::raw(INDENT.to_string()),
-        Span::styled(format!("╰─◖{}╯", "─".repeat(max_text_width)), amber),
+        Span::styled(format!("╰☾{}╯", "─".repeat(max_text_width)), amber),
     ]);
     lines.push(bottom);
-    lines.push(Line::from(""));
+    // Thread the gutter out of the coin: a `│` connector (same column as the
+    // coin's `╰─`) leads down into the turn's first rail node / the answer.
+    lines.push(rail::connector_line(rail::dim()));
     lines
 }
 
@@ -8108,6 +8532,7 @@ fn format_assistant_message_entry(
     collapsed: bool,
     selected: bool,
     outcome: MessageOutcome,
+    width: Option<u16>,
     show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
@@ -8139,6 +8564,7 @@ fn format_assistant_message_entry(
             assistant_static_span(color),
             &item.content,
             Style::default(),
+            width,
         ));
     }
     lines.push(Line::from(""));
@@ -8658,16 +9084,43 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
             Span::styled(preview, style),
         ])];
     }
-    if entry.kind == LogKind::Info {
-        return detail_text_lines(selected, crate::render::theme::cyan(), message);
+    if entry.kind == LogKind::Subagent {
+        // Subagent breadcrumb: a single magenta `◆` node (pairs with the
+        // plan's hollow `◇`). The gutter pass turns the leading margin into
+        // `├─`/`╰─` in magenta, so the whole node reads as delegated work.
+        let marker = if selected { "> " } else { "  " };
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled(
+                "◆ ",
+                Style::default()
+                    .fg(crate::render::theme::magenta())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
+        ])];
+    }
+    if entry.kind == LogKind::Note {
+        // Informational note (routing notice, system note): a dim `◦` node —
+        // the same glyph as a settled step, because a note is just a quiet
+        // settled node. The gutter pass turns the leading margin into `├─`/`╰─`
+        // so it threads the rail without competing with the agent's own work.
+        let marker = if selected { "> " } else { "  " };
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled("◦ ", Style::default().fg(rail::dim())),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
+        ])];
     }
     if entry.kind == LogKind::Warn {
-        // `⚠ message` rendering for warnings so the user can spot
-        // config issues and turn failures at a glance. Newlines are flattened to spaces so
-        // the whole error reads as one bullet, and the transcript
-        // paragraph's `Wrap { trim: false }` line-wraps anything long —
-        // errors from providers can be hundreds of characters and need to
-        // stay fully visible rather than being cut off with `…`.
+        // `⚠ message` rendering for warnings so the user can spot config issues
+        // and turn failures at a glance. Cyan — the one cool hue not otherwise on
+        // the rail — keeps amber rationed while still drawing the eye. Newlines
+        // are flattened to spaces so the whole warning reads as one node, and the
+        // gutter pass turns the leading margin into `├─`/`╰─` so it threads the
+        // rail. Long provider warnings stay fully visible (wrap, not truncate).
         let marker = if selected { "> " } else { "  " };
         let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
@@ -8675,7 +9128,24 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
             Span::styled(
                 "⚠ ",
                 Style::default()
-                    .fg(crate::render::theme::secondary())
+                    .fg(crate::render::theme::cyan())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
+        ])];
+    }
+    if entry.kind == LogKind::Error {
+        // Hard failure: a red `✖` node, distinct from a cyan `⚠` warning. The
+        // full reason rides on the line (newlines flattened) and the gutter pass
+        // threads it on the rail so a turn failure always shows what broke.
+        let marker = if selected { "> " } else { "  " };
+        let preview = message.replace('\n', " ");
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled(
+                "✖ ",
+                Style::default()
+                    .fg(crate::render::theme::red())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(preview, Style::default().fg(palette::muted_fg())),
@@ -8693,15 +9163,13 @@ fn role_action(role: &Role) -> (&'static str, Color) {
     match role {
         Role::User => ("Asked", crate::render::theme::accent()),
         Role::Assistant => ("Answered", crate::render::theme::green()),
-        Role::System => ("Noted", crate::render::theme::secondary()),
+        Role::System => ("Noted", crate::render::theme::muted()),
     }
 }
 
 fn message_content_style(role: &Role) -> Style {
     match role {
-        Role::User => Style::default()
-            .fg(palette::muted_fg())
-            .bg(crate::render::theme::prompt_bg()),
+        Role::User => Style::default().fg(palette::muted_fg()),
         Role::Assistant | Role::System => Style::default(),
     }
 }
@@ -8788,6 +9256,171 @@ fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line
     ])
 }
 
+/// Quiet Rail gutter primitives — the tree-rail prefix (`├─◦`, `╰─` for the
+/// last node, `│` connectors) applied to an entry's already-built lines. Wired
+/// into the live work cell and the transcript in the following rail increments;
+/// until then these are dormant and exercised only by their unit tests.
+#[allow(dead_code)]
+pub(crate) mod rail {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    /// A node's state on the Quiet Rail. The marker is dim chrome except where
+    /// state carries meaning — results, a plan, and the live agent get colour.
+    /// The moon set stays the prompt/header identity and never appears here.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RailMarker {
+        Settled,
+        Queued,
+        Plan,
+        Ok,
+        Fail,
+        Warn,
+        Live(String),
+    }
+
+    impl RailMarker {
+        fn glyph_and_color(&self) -> (&str, Color) {
+            match self {
+                RailMarker::Settled => ("◦", crate::render::theme::muted()),
+                RailMarker::Queued => ("◌", crate::render::theme::quiet()),
+                RailMarker::Plan => ("◇", crate::render::theme::accent()),
+                RailMarker::Ok => ("✓", crate::render::theme::green()),
+                RailMarker::Fail => ("✖", crate::render::theme::red()),
+                RailMarker::Warn => ("⚠", crate::render::theme::cyan()),
+                RailMarker::Live(glyph) => (glyph.as_str(), crate::render::theme::accent()),
+            }
+        }
+    }
+
+    /// Style for the rail's structural connectors (`│ ├ ╰ ─`). Normally dim
+    /// `quiet`; callers pass an accent (a lit-up plan) or the subagent tint to
+    /// give whole runs special treatment.
+    fn chrome_style(color: Color) -> Style {
+        Style::default().fg(color)
+    }
+
+    pub(crate) fn dim() -> Color {
+        crate::render::theme::quiet()
+    }
+
+    /// Three-cell left indent so the rail gutter lands in the same column as
+    /// the prompt-echo coin's crescent `☾` (column 3), letting the turn thread
+    /// as one continuous gutter straight out of the crescent.
+    const INDENT: &str = "   ";
+
+    /// The spans opening a node's header line: the two-cell indent, the
+    /// tee/close elbow (dim), and the state marker (coloured), e.g. `  ├─◦ `,
+    /// so the gutter is column-stable and wrap math stays predictable.
+    pub(crate) fn head_spans(marker: &RailMarker, is_last: bool) -> Vec<Span<'static>> {
+        let elbow = if is_last { "╰─" } else { "├─" };
+        let (glyph, color) = marker.glyph_and_color();
+        vec![
+            Span::raw(INDENT.to_string()),
+            Span::styled(elbow.to_string(), chrome_style(dim())),
+            Span::styled(
+                format!("{glyph} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]
+    }
+
+    /// The body/continuation prefix that keeps a node's wrapped lines aligned
+    /// under its header content: the indent plus a single connector (`  │   `).
+    pub(crate) fn body_span(chrome: Color) -> Span<'static> {
+        Span::styled(format!("{INDENT}│   "), chrome_style(chrome))
+    }
+
+    /// A standalone connector row drawn on the gutter between rail nodes.
+    pub(crate) fn connector_line(chrome: Color) -> Line<'static> {
+        Line::from(Span::styled(format!("{INDENT}│"), chrome_style(chrome)))
+    }
+
+    /// Replace a line's leading two-cell margin with just the tree elbow
+    /// (`├─`/`╰─`), keeping whatever marker span the caller already placed after
+    /// it. Used by the live work cell, whose marker is its own spinner star, so
+    /// `elbow + star` lands content in the same column as `elbow + marker`.
+    fn is_margin_span(span: &Span<'_>) -> bool {
+        matches!(span.content.as_ref(), "  " | "> ")
+    }
+
+    pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool, chrome: Color) {
+        let indent = Span::raw(INDENT.to_string());
+        let elbow = Span::styled(
+            if is_last { "╰─" } else { "├─" }.to_string(),
+            chrome_style(chrome),
+        );
+        // Land the indent + elbow at the gutter column. A leading content
+        // margin (tool/live rows) is consumed by the indent; reasoning rows
+        // embed their own marker and have no margin, so we just prepend.
+        if line.spans.first().is_some_and(is_margin_span) {
+            line.spans.splice(0..1, vec![indent, elbow]);
+        } else if line.spans.is_empty() {
+            line.spans = vec![indent, elbow];
+        } else {
+            line.spans.splice(0..0, vec![indent, elbow]);
+        }
+    }
+
+    /// Thread a settled work-entry's already-built block onto the gutter: the
+    /// header keeps its own status marker and just gains the tee/close elbow;
+    /// every body row gets the dim `│` connector. A body row's existing margin
+    /// and `│ ` detail bar are collapsed into the gutter so it never doubles.
+    /// No-op on an empty block (reasoning-off leaves no orphan connector).
+    pub(crate) fn apply_block_gutter(lines: &mut [Line<'static>], is_last: bool, chrome: Color) {
+        let Some((first, rest)) = lines.split_first_mut() else {
+            return;
+        };
+        set_elbow(first, is_last, chrome);
+        for line in rest {
+            if line.spans.is_empty() {
+                line.spans = vec![body_span(chrome)];
+                continue;
+            }
+            let mut drop = 0;
+            if is_margin_span(&line.spans[0]) {
+                drop += 1;
+            }
+            if line
+                .spans
+                .get(drop)
+                .is_some_and(|s| s.content.as_ref() == "│ ")
+            {
+                drop += 1;
+            }
+            if drop == 0 {
+                line.spans.insert(0, body_span(chrome));
+            } else {
+                line.spans.splice(0..drop, vec![body_span(chrome)]);
+            }
+        }
+    }
+
+    /// Rewrite an entry's already-built lines onto the rail gutter: the first
+    /// line gets the node's tee + marker, every following line gets the dim
+    /// connector. Replaces each line's leading two-cell margin span. No-op on an
+    /// empty block, so a hidden entry (e.g. reasoning off) never leaves an
+    /// orphan connector on the rail.
+    pub(crate) fn apply_gutter(lines: &mut [Line<'static>], marker: RailMarker, is_last: bool) {
+        let Some((first, rest)) = lines.split_first_mut() else {
+            return;
+        };
+        splice_prefix(first, head_spans(&marker, is_last));
+        for line in rest {
+            splice_prefix(line, vec![body_span(dim())]);
+        }
+    }
+
+    /// Replace a line's leading margin span with the rail prefix spans.
+    fn splice_prefix(line: &mut Line<'static>, prefix: Vec<Span<'static>>) {
+        if line.spans.is_empty() {
+            line.spans = prefix;
+        } else {
+            line.spans.splice(0..1, prefix);
+        }
+    }
+}
+
 fn action_text_lines_styled(
     selected: bool,
     label: &'static str,
@@ -8838,7 +9471,10 @@ fn assistant_line(
     content: impl Into<String>,
     content_style: Style,
 ) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
+    // Three-cell margin lands the answer marker in the rail's gutter column so
+    // the `│` connector threads straight down into it; selection shows `>` at
+    // the far left without disturbing that column.
+    let marker = if selected { ">  " } else { "   " };
     let content = content.into();
     let spacer = if content.is_empty() { "" } else { " " };
     Line::from(vec![
@@ -8854,29 +9490,138 @@ fn assistant_text_lines(
     status: Span<'static>,
     content: &str,
     content_style: Style,
+    width: Option<u16>,
 ) -> Vec<Line<'static>> {
+    // The marker (3 cells) + status glyph (1) + a space (1) push the answer text
+    // to column 5; every wrapped/continuation row hangs to that same column so a
+    // long answer reads as one indented block under the marker rather than
+    // spilling back to column 0 when the terminal soft-wraps it.
+    let marker = if selected { ">  " } else { "   " };
+    let hang = "     ";
+    let marker_head = |seg: Vec<Span<'static>>| {
+        let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
+        spans.extend(seg);
+        Line::from(spans)
+    };
     if content.is_empty() {
-        return vec![assistant_line(selected, status, "", content_style)];
+        return vec![marker_head(Vec::new())];
     }
-    render::markdown::render_markdown(content)
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            for span in &mut line.spans {
-                span.style = content_style.patch(span.style);
-            }
-            if index == 0 {
-                let marker = if selected { "> " } else { "  " };
-                let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
-                spans.extend(line.spans);
-                Line::from(spans)
+    // Reserve the 5-cell margin from the usable width so wrapped text fits inside
+    // the terminal; with no known width (tests/overlay) leave the markdown lines
+    // intact and let the caller's renderer wrap.
+    let text_width = width
+        .map(|w| usize::from(w).saturating_sub(hang.len()).max(8))
+        .unwrap_or(usize::MAX);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for mut line in render::markdown::render_markdown(content) {
+        for span in &mut line.spans {
+            span.style = content_style.patch(span.style);
+        }
+        for seg in wrap_styled_words(&line.spans, text_width) {
+            if first {
+                out.push(marker_head(seg));
+                first = false;
+            } else if seg.is_empty() {
+                out.push(Line::from(""));
             } else {
-                let mut spans = vec![Span::raw("    ")];
-                spans.extend(line.spans);
-                Line::from(spans)
+                let mut spans = vec![Span::raw(hang)];
+                spans.extend(seg);
+                out.push(Line::from(spans));
             }
-        })
-        .collect()
+        }
+    }
+    if out.is_empty() {
+        out.push(marker_head(Vec::new()));
+    }
+    out
+}
+
+/// Greedy word-wrap a styled line to `width` display cells, preserving each
+/// span's style. Words longer than the width are hard-broken; runs of spaces
+/// collapse to one at a wrap point. A `usize::MAX` width returns the line as a
+/// single row (no wrapping). Width is measured in `char`s, matching the rest of
+/// the transcript layout.
+fn wrap_styled_words(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut word: Vec<(char, Style)> = Vec::new();
+    for span in spans {
+        for ch in span.content.chars() {
+            if ch == ' ' {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            } else {
+                word.push((ch, span.style));
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row: Vec<(char, Style)> = Vec::new();
+    let mut row_w = 0usize;
+    for word in words {
+        let wl = word.len();
+        if row_w != 0 && row_w + 1 + wl > width {
+            rows.push(std::mem::take(&mut row));
+            row_w = 0;
+        }
+        if row_w != 0 {
+            row.push((' ', Style::default()));
+            row_w += 1;
+        }
+        if wl <= width {
+            row.extend(word);
+            row_w += wl;
+        } else {
+            for cell in word {
+                if row_w >= width {
+                    rows.push(std::mem::take(&mut row));
+                    row_w = 0;
+                }
+                row.push(cell);
+                row_w += 1;
+            }
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows.into_iter().map(coalesce_cells_to_spans).collect()
+}
+
+/// Merge a row of per-`char` styled cells back into the fewest `Span`s, joining
+/// runs that share a style.
+fn coalesce_cells_to_spans(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (ch, style) in cells {
+        if cur == Some(style) {
+            buf.push(ch);
+        } else {
+            if let Some(prev) = cur.take() {
+                spans.push(Span::styled(std::mem::take(&mut buf), prev));
+            }
+            buf.push(ch);
+            cur = Some(style);
+        }
+    }
+    if let Some(style) = cur {
+        spans.push(Span::styled(buf, style));
+    }
+    spans
 }
 
 fn detail_text_lines(selected: bool, color: Color, content: &str) -> Vec<Line<'static>> {
@@ -10029,22 +10774,8 @@ fn expanded_shell_detail_lines(
             format!("exit {exit_code}"),
         ));
     }
-    if tool.result.status != ToolStatus::Success {
-        lines.extend(output_block_lines(
-            "stdout",
-            string_arg(&tool.result.content, "stdout")
-                .as_deref()
-                .unwrap_or(""),
-            verbosity,
-        ));
-        lines.extend(output_block_lines(
-            "stderr",
-            string_arg(&tool.result.content, "stderr")
-                .as_deref()
-                .unwrap_or(""),
-            verbosity,
-        ));
-    }
+    // stdout and stderr already appear once, merged, in the combined block
+    // above — there are no separate per-stream blocks.
     if lines.is_empty() {
         lines.extend(expanded_generic_tool_detail_lines(tool, verbosity));
     }
@@ -11544,13 +12275,16 @@ fn status_color(status: ToolStatus) -> Color {
     match status {
         ToolStatus::Success => crate::render::theme::green(),
         ToolStatus::Error | ToolStatus::Stale => crate::render::theme::red(),
-        ToolStatus::Denied | ToolStatus::Cancelled => crate::render::theme::secondary(),
+        // A user-initiated block/stop is the warn tier (cyan ⚠), distinct from a
+        // hard failure (red ✖) — and keeps amber rationed.
+        ToolStatus::Denied | ToolStatus::Cancelled => crate::render::theme::cyan(),
     }
 }
 
 fn tool_result_display_color(tool: &ToolTranscript) -> Color {
     if tool_result_not_run(tool) || is_retryable_tool_result(&tool.result) {
-        crate::render::theme::secondary()
+        // "Not run" / "Retried" are warn-tier ⚠ outcomes — cyan, not amber.
+        crate::render::theme::cyan()
     } else {
         status_color(tool.result.status)
     }
@@ -11634,8 +12368,12 @@ impl TurnVisualState {
 }
 
 fn turn_coin_span(app: &TuiApp) -> Span<'static> {
+    // A crescent moon marking the assistant's reply — softer than a full disc
+    // and on-theme with the prompt's moon bullets. Static (never input-driven
+    // or timer-animated; the working-line star carries motion), and tinted by
+    // outcome: green when the turn succeeded, red when it failed.
     Span::styled(
-        prompt_coin_frame(app),
+        "☽",
         Style::default()
             .fg(app.turn_visual.color(app.animation_tick))
             .add_modifier(Modifier::BOLD),
@@ -11643,46 +12381,27 @@ fn turn_coin_span(app: &TuiApp) -> Span<'static> {
 }
 
 fn assistant_static_span(color: Color) -> Span<'static> {
-    Span::styled("●", Style::default().fg(color).add_modifier(Modifier::BOLD))
+    // Crescent moon marking a settled assistant reply (scrollback / overlay);
+    // the colour carries the turn outcome. Mirrors `turn_coin_span`.
+    Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    // At idle the coin is a steady crate::render::theme::accent() ●. Animating it forced a real
-    // cell change every 320 ms, which kept terminal-emulator per-tab
-    // activity indicators buzzing forever even though the agent was
-    // doing nothing.
-    if app.turn_visual == TurnVisualState::Idle {
-        return Span::styled(
-            "●",
-            Style::default()
-                .fg(crate::render::theme::accent())
-                .add_modifier(Modifier::BOLD),
-        );
-    }
-    let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
-        crate::render::theme::secondary()
-    } else {
-        crate::render::theme::accent()
-    };
     Span::styled(
         prompt_coin_frame(app),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
     )
 }
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
-    const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
-    if app.turn_visual == TurnVisualState::Idle {
-        return FRAMES[0];
-    }
-    let elapsed_ms = prompt_elapsed_ms(app);
-    let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
-    let frame_index = ((elapsed_ms / 320) as usize) % FRAMES.len();
-    if direction_reversed {
-        FRAMES[FRAMES.len() - 1 - frame_index]
-    } else {
-        FRAMES[frame_index]
-    }
+    // The prompt coin is a typing indicator: it advances one moon phase per
+    // character in the composer and never animates on a timer, so it only
+    // ever turns when you do — waxing as you add text, waning as you delete.
+    // The resting state (an empty composer) is a steady crescent.
+    const FRAMES: [&str; 6] = ["☽", "◑", "●", "◐", "☾", "○"];
+    FRAMES[app.input.chars().count() % FRAMES.len()]
 }
 
 fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
@@ -12243,7 +12962,7 @@ fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
     let left_width = left.chars().count();
     let padding = " ".repeat((width as usize).saturating_sub(left_width + right_width));
     Line::from(vec![
-        Span::styled(left, Style::default().fg(Color::Gray)),
+        Span::styled(left, Style::default().fg(crate::render::theme::muted())),
         Span::raw(padding),
         Span::styled(right, Style::default().fg(mode_status_color(app.mode))),
     ])
@@ -12386,15 +13105,101 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
+/// Once every subagent has finished and the user is neither navigating the
+/// pane nor viewing a subagent, the pane folds to a one-line summary so it
+/// stops holding the bottom rows of the screen. The records stay in memory —
+/// Down re-expands the list to review them, Del (while expanded) clears them.
+fn subagent_pane_collapsed(app: &TuiApp) -> bool {
+    !app.subagent_pane.records.is_empty()
+        && !app.subagent_pane.focused
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
+        && !app
+            .subagent_pane
+            .records
+            .iter()
+            .any(|record| matches!(record.lifecycle, SubagentLifecycle::Running))
+}
+
 fn subagent_pane_height(app: &TuiApp) -> u16 {
     if app.subagent_pane.records.is_empty() {
         return 0;
     }
+    if subagent_pane_collapsed(app) {
+        return 1;
+    }
     (1 + app.subagent_pane.records.len()).min(7) as u16
+}
+
+/// One-line fold shown in place of the full pane when every subagent is done.
+/// Mirrors the row grammar (marker · label · quiet detail) used by the live
+/// rows so the surface reads consistently.
+fn subagent_pane_summary_row(app: &TuiApp, width: u16) -> Line<'static> {
+    let records = &app.subagent_pane.records;
+    let done = records
+        .iter()
+        .filter(|r| matches!(r.lifecycle, SubagentLifecycle::Completed))
+        .count();
+    let failed = records
+        .iter()
+        .filter(|r| matches!(r.lifecycle, SubagentLifecycle::Failed))
+        .count();
+    let capped = records
+        .iter()
+        .filter(|r| matches!(r.lifecycle, SubagentLifecycle::Rejected))
+        .count();
+    let total = records.len();
+
+    let (glyph, glyph_color) = if failed > 0 {
+        ("✗", crate::render::theme::red())
+    } else if done > 0 {
+        ("✓", crate::render::theme::green())
+    } else {
+        ("·", crate::render::theme::quiet())
+    };
+
+    let detail = if failed == 0 && capped == 0 {
+        "done · ↓ review".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if done > 0 {
+            parts.push(format!("{done} done"));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        if capped > 0 {
+            parts.push(format!("{capped} capped"));
+        }
+        format!("{} · ↓ review", parts.join(" · "))
+    };
+
+    let label = if total == 1 {
+        "1 subagent".to_string()
+    } else {
+        format!("{total} subagents")
+    };
+
+    subagent_pane_row(
+        glyph,
+        Style::default()
+            .fg(glyph_color)
+            .add_modifier(Modifier::BOLD),
+        &label,
+        Style::default().fg(crate::render::theme::foreground()),
+        &detail,
+        width,
+    )
 }
 
 fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if area.height == 0 {
+        return;
+    }
+    if subagent_pane_collapsed(app) {
+        frame.render_widget(
+            Paragraph::new(subagent_pane_summary_row(app, area.width)),
+            area,
+        );
         return;
     }
     let visible = usize::from(area.height);
@@ -12458,13 +13263,20 @@ fn subagent_pane_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// Hint shown on the focused/selected pane row. `Enter` opens the
+/// full-screen overlay — the only way to read a subagent's transcript when
+/// the conversation lives in terminal scrollback.
+fn subagent_pane_focused_hint(_app: &TuiApp) -> &'static str {
+    "↑/↓ switch · Enter open · Esc back"
+}
+
 fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
     let selected = app.subagent_pane.selected == 0;
     let active = matches!(app.subagent_pane.active, ConversationSource::Main);
-    // Glyph encodes selection only: ● = the conversation currently shown,
-    // ○ = the others. Run status (for subagent rows) rides on colour + the
-    // leading lifecycle word, so the marker no longer conflates the two.
-    let glyph = if active { "●" } else { "○" };
+    // The filled ● marks the selected (cursor) row in amber + bold; ○ marks
+    // the rest. The currently-shown conversation is called out by the "active"
+    // hint text, not the fill, so the marker tracks where your cursor is.
+    let glyph = if selected { "●" } else { "○" };
     let style = if selected {
         Style::default()
             .fg(crate::render::theme::accent())
@@ -12473,7 +13285,7 @@ fn subagent_main_row(app: &TuiApp, width: u16) -> Line<'static> {
         Style::default().fg(crate::render::theme::quiet())
     };
     let hint = if selected && app.subagent_pane.focused {
-        "↑/↓ switch · Enter scroll · Esc back"
+        subagent_pane_focused_hint(app)
     } else if active {
         "active"
     } else {
@@ -12497,19 +13309,20 @@ fn subagent_record_row(
 ) -> Line<'static> {
     let row = index + 1;
     let selected = app.subagent_pane.selected == row;
-    let active = app.subagent_pane.active == ConversationSource::Subagent(record.id);
-    // ● = shown conversation, ○ = others (selection). The lifecycle colour
-    // below and the leading lifecycle word carry run status separately.
-    let glyph = if active { "●" } else { "○" };
-    let glyph_style = Style::default()
-        .fg(record.lifecycle.color())
-        .add_modifier(if selected {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
+    // The filled ● marks the selected (cursor) row in amber + bold; unselected
+    // rows are a ○ ring tinted by lifecycle (silver running, green done, red
+    // failed). The leading lifecycle word carries run status either way, and
+    // the "active" hint marks the shown conversation.
+    let glyph = if selected { "●" } else { "○" };
+    let glyph_style = if selected {
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(record.lifecycle.color())
+    };
     let detail = if selected && app.subagent_pane.focused {
-        "↑/↓ switch · Enter scroll · Esc back".to_string()
+        subagent_pane_focused_hint(app).to_string()
     } else if !record.latest.trim().is_empty() {
         record.latest.clone()
     } else {
@@ -12808,13 +13621,9 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         // recovery affordance before the regular hint set.
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
-    let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-T full transcript · /help"
-            .to_string()
-    } else {
+    let mut base =
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
-            .to_string()
-    };
+            .to_string();
     if app.context_compaction_threshold > 0
         && context_window_pct(
             app.context_estimate.estimated_tokens,
@@ -13347,7 +14156,9 @@ impl SubagentLifecycle {
 
     fn color(self) -> Color {
         match self {
-            Self::Running => crate::render::theme::accent(),
+            // Silver while running — amber is reserved for the selected
+            // (cursor) row, so a running subagent reads as a calm silver ring.
+            Self::Running => crate::render::theme::muted(),
             Self::Completed => crate::render::theme::green(),
             Self::Failed => crate::render::theme::red(),
             Self::Rejected => crate::render::theme::quiet(),
@@ -13458,7 +14269,6 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay_scrollbar_cache:
         std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
-    pub(crate) alternate_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
     /// Token threshold above which auto-compaction triggers. Captured at
@@ -13617,12 +14427,10 @@ pub(crate) struct TuiApp {
     pub(crate) pending_feedback: Option<PreparedFeedback>,
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
-    pub(crate) app_notifications: NotificationQueue,
     /// Corner toast stack — short-lived overlays for fire-and-forget
-    /// status events (telemetry flush, MCP connect, index ready). Kept
-    /// separate from `app_notifications` because that surface is an
-    /// inline rotating banner; toasts overlay the top-right and stack up
-    /// to three at a time.
+    /// status events (telemetry flush, MCP connect, index ready). Toasts
+    /// overlay the top-right and stack up to three at a time; durable
+    /// notices land in the transcript instead.
     pub(crate) toasts: ToastQueue,
     /// Opt-in OSC 9 / BEL emitter for off-tab attention. Disabled by
     /// default; flips on via `[tui].desktop_notifications`.
@@ -13916,8 +14724,6 @@ impl TuiApp {
             transcript_overlay_render_cache: std::cell::RefCell::new(
                 TranscriptOverlayRenderCache::default(),
             ),
-            alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
-                == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
             context_compaction_threshold: config.context_compaction.estimated_tokens,
@@ -13987,7 +14793,6 @@ impl TuiApp {
             pending_feedback: None,
             pending_report: None,
             clipboard,
-            app_notifications: NotificationQueue::new(),
             toasts: ToastQueue::new(),
             desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,
@@ -14177,6 +14982,12 @@ impl TuiApp {
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
             || self.pending_diff.is_some()
+            // A settle-fold is wall-clock driven, so each repaint advances
+            // it; keep `draw_app` running while any node is folding. Gated by
+            // the unfocused early-return above so a background window does
+            // not repaint a fold it cannot show — the fold still finalizes
+            // collapsed via `finalize_elapsed_settles` when focus returns.
+            || self.has_settling_entry()
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -14221,7 +15032,7 @@ impl TuiApp {
             }
         }
         let id = self.next_id();
-        let entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
+        let mut entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
         if let Some(last) = self.transcript.last_mut()
             && coalesce_tool_transcript_entry(last, &entry)
         {
@@ -14233,6 +15044,9 @@ impl TuiApp {
                 if matches!(t.result.tool_name.as_str(), "apply_patch" | "write_file")
                     && t.result.status == ToolStatus::Error
         );
+        // Arm the settle-fold only past the coalesce early-return so a
+        // retry that folds into the prior row does not re-arm an animation.
+        entry.arm_settle();
         self.push_entry(entry);
         if is_edit_failure {
             for path in edit_paths {
@@ -14246,12 +15060,27 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
-    pub(crate) fn push_info(&mut self, message: String) {
+    /// Push an informational note — a model-routing notice, a system note — as
+    /// a dim `◦` node threaded on the rail. One note pipeline: never the
+    /// off-rail `• Noted` line, never amber.
+    pub(crate) fn push_note(&mut self, message: String) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::log_with_kind(
             id,
             message,
-            LogKind::Info,
+            LogKind::Note,
+            self.transcript_default,
+        ));
+    }
+
+    /// Push a subagent lifecycle breadcrumb (started / completed) — a magenta
+    /// `◆` node on the rail so delegated work stands out from the main flow.
+    pub(crate) fn push_subagent_note(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Subagent,
             self.transcript_default,
         ));
     }
@@ -14275,6 +15104,19 @@ impl TuiApp {
             self.transcript_default,
         ));
         true
+    }
+
+    /// Push a hard-failure log (red `✖`) — a turn that errored out, distinct
+    /// from a cyan `⚠` warning. The reason rides on the same line and the node
+    /// threads the rail so a failure is never lost in the periphery.
+    pub(crate) fn push_error(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Error,
+            self.transcript_default,
+        ));
     }
 
     /// Append a transcript entry tagged as operational chrome — used for
@@ -14302,7 +15144,7 @@ impl TuiApp {
             TranscriptEntry::log_with_kind(
                 start_entry_id,
                 format!("{agent} subagent started"),
-                LogKind::Operational,
+                LogKind::Note,
                 self.transcript_default,
             ),
         ];
@@ -14350,6 +15192,46 @@ impl TuiApp {
             // Keep the seed prompt + "started" log (the first two entries);
             // drop the oldest activity beyond the cap so a long-running
             // subagent's stored transcript stays bounded.
+            const MAX_SUBAGENT_TRANSCRIPT: usize = 256;
+            if record.transcript.len() > MAX_SUBAGENT_TRANSCRIPT {
+                let overflow = record.transcript.len() - MAX_SUBAGENT_TRANSCRIPT;
+                record.transcript.drain(2..2 + overflow);
+            }
+        }
+    }
+
+    /// Record a subagent's completed tool call as a real `ToolResult` rail node
+    /// in its transcript, so the subagent view renders `├─✔ Ran X` cards
+    /// (folded by default, body unfolded by Ctrl-T) exactly like the main
+    /// conversation — not the flat off-rail lifecycle line it used to show.
+    pub(crate) fn note_subagent_tool_result(
+        &mut self,
+        id: SubagentId,
+        agent: String,
+        result: ToolResult,
+    ) {
+        if tool_result_hidden_by_default(&result) {
+            return;
+        }
+        let latest = compact_text(&tool_result_status_text(&result), 120);
+        let entry_id = self.next_id();
+        let entry = TranscriptEntry::tool_result(entry_id, result, None, self.transcript_default);
+        if let Some(record) = self.subagent_pane.records.iter_mut().find(|r| r.id == id) {
+            record.agent = agent;
+            record.latest = latest;
+            // Fold an immediately-repeated identical call into the prior card,
+            // mirroring the main transcript's coalescing.
+            if record
+                .transcript
+                .last_mut()
+                .is_some_and(|last| coalesce_tool_transcript_entry(last, &entry))
+            {
+                return;
+            }
+            record.transcript.push(entry);
+            // Keep the seed prompt + "started" log (the first two entries); drop
+            // the oldest cards beyond the cap so the stored transcript stays
+            // bounded.
             const MAX_SUBAGENT_TRANSCRIPT: usize = 256;
             if record.transcript.len() > MAX_SUBAGENT_TRANSCRIPT {
                 let overflow = record.transcript.len() - MAX_SUBAGENT_TRANSCRIPT;
@@ -14439,17 +15321,40 @@ impl TuiApp {
         self.clamp_subagent_selection();
     }
 
+    /// Reconcile `selected` (a row index) with `active` (a record id) after
+    /// any records mutation. The highlight (`selected`) and the shown
+    /// conversation (`active`) are sourced independently, so a positional
+    /// change — appending, pruning, or clearing finished rows — can shift the
+    /// record `active` points at out from under the raw index. Re-deriving
+    /// `selected` from `active` here keeps the bold highlight on the same row
+    /// as the ● "shown" marker no matter how the vector was edited.
     fn clamp_subagent_selection(&mut self) {
-        let max = self.subagent_pane.records.len();
-        self.subagent_pane.selected = self.subagent_pane.selected.min(max);
-        if let ConversationSource::Subagent(id) = self.subagent_pane.active
-            && !self
-                .subagent_pane
-                .records
-                .iter()
-                .any(|record| record.id == id)
-        {
-            self.subagent_pane.active = ConversationSource::Main;
+        match self.subagent_pane.active {
+            ConversationSource::Subagent(id) => {
+                if let Some(pos) = self
+                    .subagent_pane
+                    .records
+                    .iter()
+                    .position(|record| record.id == id)
+                {
+                    // Row 0 is `main`; record N lives on row N + 1.
+                    self.subagent_pane.selected = pos + 1;
+                } else {
+                    // The shown subagent is gone — fall back to main and just
+                    // bound the stale index.
+                    self.subagent_pane.active = ConversationSource::Main;
+                    self.subagent_pane.selected = self
+                        .subagent_pane
+                        .selected
+                        .min(self.subagent_pane.records.len());
+                }
+            }
+            ConversationSource::Main => {
+                self.subagent_pane.selected = self
+                    .subagent_pane
+                    .selected
+                    .min(self.subagent_pane.records.len());
+            }
         }
     }
 
@@ -14486,12 +15391,10 @@ impl TuiApp {
             self.subagent_pane.focused = false;
             self.subagent_pane.active = ConversationSource::Main;
             self.subagent_pane.selected = 0;
-        } else {
-            self.subagent_pane.selected = self
-                .subagent_pane
-                .selected
-                .min(self.subagent_pane.records.len());
         }
+        // `clamp_subagent_selection` re-derives `selected` from `active` so
+        // the highlight follows the shown conversation through the positional
+        // shift left by dropping the finished rows above it.
         self.clamp_subagent_selection();
         self.status = "cleared finished subagents".to_string();
     }
@@ -14537,8 +15440,63 @@ impl TuiApp {
         ));
     }
 
-    fn push_entry(&mut self, entry: TranscriptEntry) {
+    fn push_entry(&mut self, mut entry: TranscriptEntry) {
+        // Arm the settle-fold for the finished work nodes that flow through
+        // the generic push path: reasoning blocks and plan cards. Tool
+        // results are armed in `push_tool_result_with_call` after their
+        // coalesce early-return, so they are deliberately excluded here to
+        // avoid re-arming (and resetting the clock on) a tool row.
+        if matches!(
+            entry.kind,
+            TranscriptEntryKind::Reasoning(_) | TranscriptEntryKind::PlanCard(_)
+        ) {
+            entry.arm_settle();
+        }
         self.transcript.push(entry);
+    }
+
+    /// Whether any transcript entry is currently mid settle-fold. Drives the
+    /// animation-tick / repaint loop so the fold advances frame to frame and
+    /// stops repainting once every node has settled. Only the main
+    /// transcript can hold armed nodes — subagent transcripts only ever push
+    /// messages and logs, which never settle.
+    fn has_settling_entry(&self) -> bool {
+        self.transcript.iter().any(|entry| entry.settle.is_some())
+    }
+
+    /// Finalize any settle-fold that has run its full [`SETTLE_DURATION_MS`]:
+    /// clear the animation state, rest the node collapsed, and bump its
+    /// revision so the render cache re-renders it in its collapsed form.
+    /// Returns `true` when at least one entry finalized (so the caller can
+    /// request a repaint). Run from the main loop's mutation pass — the
+    /// render path is read-only and cannot mutate.
+    fn finalize_elapsed_settles(&mut self) -> bool {
+        let mut changed = false;
+        for entry in &mut self.transcript {
+            if let Some(settle) = entry.settle
+                && settle.started_at.elapsed().as_millis() as u64 >= SETTLE_DURATION_MS
+            {
+                entry.settle = None;
+                entry.collapsed = true;
+                entry.bump_revision();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Force every in-flight settle-fold to its resting collapsed state
+    /// immediately, as if 600ms had elapsed. Test-only affordance so render
+    /// assertions can observe the post-settle collapsed card without waiting
+    /// on the wall clock.
+    #[cfg(test)]
+    fn finalize_settles_for_test(&mut self) {
+        for entry in &mut self.transcript {
+            if entry.settle.take().is_some() {
+                entry.collapsed = true;
+                entry.bump_revision();
+            }
+        }
     }
 
     pub(crate) fn remember_active_tool_call(&mut self, call: ToolCall) {
@@ -14587,6 +15545,65 @@ struct TranscriptEntry {
     /// MUST call `bump_revision`; the cache's correctness contract
     /// depends on it (F09 finding).
     revision: u64,
+    /// When `Some`, the entry is mid "settle-fold": its rendered height is
+    /// easing from its just-finished expanded form down to its collapsed
+    /// preview over ~600ms. Armed at push time for finished work nodes
+    /// (`ToolResult`, `Reasoning`, `PlanCard`) only. The render path
+    /// (`transcript_lines_for_render`) draws the entry folded while this is
+    /// `Some`; the mutation pass in the main loop clears it (and sets
+    /// `collapsed = true`, bumping the revision) once 600ms has elapsed.
+    /// Absolute `Instant` so the fold clock is independent of the per-frame
+    /// `animation_tick`.
+    settle: Option<SettleState>,
+}
+
+/// Animation state for a finished work node easing from its expanded
+/// height down to its collapsed preview. `started_at` is absolute so the
+/// fold progresses across redraws regardless of `animation_tick`;
+/// `from_lines` is the entry's expanded rendered height captured at arm
+/// time (the curtain's starting position).
+#[derive(Debug, Clone, Copy)]
+struct SettleState {
+    started_at: std::time::Instant,
+    from_lines: u16,
+}
+
+/// Duration of the settle-fold animation. A finished work node folds from
+/// its expanded height to its collapsed preview over this window, then
+/// rests collapsed.
+const SETTLE_DURATION_MS: u64 = 600;
+
+/// Representative width used to seed the settle-fold's starting height at
+/// arm time. The exact viewport width isn't available at push time, and
+/// this value only sets the curtain's initial position before the render
+/// path takes over at the real width.
+const SETTLE_MEASURE_WIDTH: u16 = 80;
+
+/// Ease a finished work node's visible height from `from_lines` down to
+/// `collapsed_lines` over [`SETTLE_DURATION_MS`]. Pure and time-injected
+/// (`elapsed_ms`) so it is unit-testable without a clock: returns
+/// `from_lines` at `elapsed_ms == 0`, decreases monotonically, and returns
+/// `collapsed_lines` for any `elapsed_ms >= SETTLE_DURATION_MS`. Uses a
+/// quadratic ease-out so the fold starts quickly and settles gently.
+///
+/// In practice `from_lines >= collapsed_lines` (a node's expanded height is
+/// never shorter than its collapsed preview). The degenerate `from_lines <
+/// collapsed_lines` case has nothing to fold and resolves by resting at
+/// `from_lines` so the height never grows.
+fn settle_visible_line_count(from_lines: u16, collapsed_lines: u16, elapsed_ms: u64) -> u16 {
+    // The fold's floor is the collapsed height, but never above the
+    // starting height — a node already at/below its collapsed preview has
+    // nothing to fold, so it rests at `from_lines` without ever growing.
+    let floor = collapsed_lines.min(from_lines);
+    if elapsed_ms >= SETTLE_DURATION_MS || from_lines <= floor {
+        return floor;
+    }
+    let span = (from_lines - floor) as f32;
+    let t = elapsed_ms as f32 / SETTLE_DURATION_MS as f32;
+    // Quadratic ease-out: fast collapse up front, gentle landing.
+    let eased = 1.0 - (1.0 - t) * (1.0 - t);
+    let remaining = span * (1.0 - eased);
+    floor + remaining.round() as u16
 }
 
 impl TranscriptEntry {
@@ -14610,6 +15627,7 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::Message(item),
             collapsed,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14642,6 +15660,7 @@ impl TranscriptEntry {
             })),
             collapsed: collapsed_default,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14663,6 +15682,7 @@ impl TranscriptEntry {
             collapsed: kind != LogKind::Operational
                 && transcript_default == TranscriptDefault::Compact,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14678,6 +15698,7 @@ impl TranscriptEntry {
             // — the whole point of the card is to show the plan body.
             collapsed: false,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14689,6 +15710,7 @@ impl TranscriptEntry {
             // Ctrl-E to fold the body if it's huge.
             collapsed: false,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14698,6 +15720,7 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::SlashEcho(data),
             collapsed: false,
             revision: 0,
+            settle: None,
         }
     }
 
@@ -14714,7 +15737,52 @@ impl TranscriptEntry {
             // a concise chip. Ctrl-T opens the full transcript with details.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
+            settle: None,
         }
+    }
+
+    /// True for the finished work nodes that settle-fold on completion:
+    /// tool results, reasoning blocks, and plan cards. Messages, logs,
+    /// diffs, and slash echoes snap collapsed instantly (no fold).
+    fn is_settleable_work_node(&self) -> bool {
+        matches!(
+            self.kind,
+            TranscriptEntryKind::ToolResult(_)
+                | TranscriptEntryKind::Reasoning(_)
+                | TranscriptEntryKind::PlanCard(_)
+        )
+    }
+
+    /// Arm the settle-fold for a finished work node: record `started_at`
+    /// and the entry's expanded rendered height so the renderer can ease
+    /// the height down to the collapsed preview over [`SETTLE_DURATION_MS`].
+    /// No-op for non-work-node kinds. The expanded height is measured at a
+    /// representative width (the exact viewport width isn't known at push
+    /// time and only seeds the fold's starting position).
+    fn arm_settle(&mut self) {
+        // Only fold nodes that come to rest collapsed. A node that stays
+        // expanded — an auto-expanded failed tool, a plan card, a `/diff` —
+        // has nothing to fold down to, and force-collapsing it on finalize
+        // would hide content the user is meant to keep seeing.
+        if !self.is_settleable_work_node() || !self.collapsed {
+            return;
+        }
+        // Measure the expanded block with reasoning shown so reasoning
+        // nodes have a body to fold from; verbosity/outcome/selection do
+        // not change the line count materially for the fold's start.
+        let expanded = format_transcript_entry_expanded(
+            self,
+            false,
+            ToolOutputVerbosity::Normal,
+            MessageOutcome::Normal,
+            Some(SETTLE_MEASURE_WIDTH),
+            true,
+        );
+        let from_lines = expanded.len().min(u16::MAX as usize) as u16;
+        self.settle = Some(SettleState {
+            started_at: Instant::now(),
+            from_lines,
+        });
     }
 
     fn assistant_content(&self) -> Option<String> {
@@ -14803,16 +15871,26 @@ fn system_message_can_collapse(item: &TranscriptItem) -> bool {
 pub(crate) enum LogKind {
     /// Standard log line — rendered with `└` and a status-color marker.
     Normal,
-    /// Non-error operational event with useful payload. Rendered neutral and
-    /// left untruncated so lifecycle details stay inspectable.
-    Info,
+    /// An informational note — a model-routing notice, a system note — rendered
+    /// as a dim `◦` rail node so it threads the gutter like a quiet settled
+    /// step. One note pipeline: never the off-rail `• Noted` line, never amber.
+    Note,
     /// Operational chrome (turn-complete markers, compaction notices,
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.
     Operational,
-    /// Warning chrome — turn cancellations, turn failures. Rendered with
-    /// a `⚠ ` prefix so the user can spot turn-ending events at a glance.
+    /// Warning chrome — turn cancellations, config issues, recoverable
+    /// problems. Rendered as a cyan `⚠ ` rail node so attention is drawn
+    /// without spending rationed amber.
     Warn,
+    /// Error chrome — a hard turn failure (provider error, aborted turn).
+    /// Rendered as a red `✖ ` rail node, distinct from a cyan `⚠` warning, so a
+    /// real failure stands out and its reason stays visible.
+    Error,
+    /// A subagent lifecycle breadcrumb (delegate started / completed).
+    /// Rendered as a magenta `◆` rail node so delegated work is
+    /// unmistakable in the main flow and threads on the gutter.
+    Subagent,
 }
 
 #[derive(Debug, Clone)]
@@ -15022,28 +16100,10 @@ fn exit_hint(session_id: Option<&str>) -> Option<String> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalMode {
-    Inline,
-    AlternateScreen,
-}
-
-impl From<TuiAlternateScreen> for TerminalMode {
-    fn from(value: TuiAlternateScreen) -> Self {
-        match value {
-            TuiAlternateScreen::Auto => Self::Inline,
-            TuiAlternateScreen::Never => Self::Inline,
-            TuiAlternateScreen::Always => Self::AlternateScreen,
-        }
-    }
-}
-
 struct TerminalGuard {
-    /// `Option` so we can drop and rebuild the ratatui `Terminal`
-    /// Primary terminal in the user-configured mode. For inline
-    /// mode this is a `Viewport::Inline(N)` terminal pinned to the
-    /// bottom N rows of the main buffer; for alt-screen mode it's
-    /// a fullscreen terminal. Always `Some` after `enter`.
+    /// `Option` so we can drop and rebuild the ratatui `Terminal`.
+    /// Inline `Viewport::Inline(N)` terminal pinned to the bottom N
+    /// rows of the main buffer. Always `Some` after `enter`.
     terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
     /// Secondary fullscreen terminal used only when the configured
     /// mode is inline and the transcript overlay is open. Built
@@ -15055,14 +16115,8 @@ struct TerminalGuard {
     /// Terminal construction (the bug that ghosted the pre-overlay
     /// viewport above the new one on overlay close).
     overlay_terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
-    /// User-configured mode (`Inline` or `AlternateScreen`). Stays
-    /// constant for the session — overlay-screen swaps only flip
-    /// `overlay_screen_active`, not `mode`.
-    mode: TerminalMode,
-    /// True while the inline guard is currently routing draws to
-    /// the alt-screen overlay terminal. Always `false` when
-    /// `mode == AlternateScreen` (that mode is already fullscreen —
-    /// no swap needed).
+    /// True while the inline guard is currently routing draws to the
+    /// alt-screen overlay terminal (the transcript overlay is open).
     overlay_screen_active: bool,
     /// True after we have applied the transcript overlay's mouse policy
     /// to the terminal. Needed because the overlay temporarily overrides
@@ -15104,11 +16158,7 @@ impl TerminalGuard {
 }
 
 impl TerminalGuard {
-    fn enter(
-        alternate_screen: TuiAlternateScreen,
-        synchronized_output: TuiSynchronizedOutput,
-    ) -> Result<Self> {
-        let mode = TerminalMode::from(alternate_screen);
+    fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         // Wrap stdout in the env-gated debug-tap writer so every
@@ -15132,55 +16182,34 @@ impl TerminalGuard {
         let mouse_capture = std::env::var_os("SQUEEZY_MOUSE_CAPTURE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
-        match mode {
-            TerminalMode::Inline => {
-                execute!(
-                    writer,
-                    Print(CLEAR_SCROLLBACK_AND_VISIBLE),
-                    Print(DISABLE_MOUSE_MODES),
-                    DisableAlternateScroll,
-                    EnableBracketedPaste,
-                    EnableFocusChange
-                )
+        // Inline viewport: the TUI pins itself to the bottom rows and flushes
+        // finished output up into the terminal's own scrollback. Full-screen
+        // surfaces (the transcript overlay, config screen) are transient
+        // alt-screen swaps, handled by `sync_overlay_screen`.
+        execute!(
+            writer,
+            Print(CLEAR_SCROLLBACK_AND_VISIBLE),
+            Print(DISABLE_MOUSE_MODES),
+            DisableAlternateScroll,
+            EnableBracketedPaste,
+            EnableFocusChange
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        if mouse_capture {
+            execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                if mouse_capture {
-                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
-                        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                }
-            }
-            TerminalMode::AlternateScreen => {
-                execute!(
-                    writer,
-                    EnterAlternateScreen,
-                    Print(DISABLE_MOUSE_MODES),
-                    EnableAlternateScroll,
-                    Clear(ClearType::All),
-                    MoveTo(0, 0),
-                    EnableBracketedPaste,
-                    EnableFocusChange
-                )
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                if mouse_capture {
-                    execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
-                        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                }
-            }
         }
         let backend = CrosstermBackend::new(writer);
-        let terminal = match mode {
-            TerminalMode::Inline => Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
-                },
-            ),
-            TerminalMode::AlternateScreen => Terminal::new(backend),
-        }
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
+            },
+        )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
             terminal: Some(terminal),
             overlay_terminal: None,
-            mode,
             overlay_screen_active: false,
             overlay_mouse_override_active: false,
             overlay_mouse_capture: false,
@@ -15262,8 +16291,7 @@ impl TerminalGuard {
         // over scrollback). Alt-screen mode OR overlay-screen swap =
         // `render` (fullscreen draw, with the overlay branch picking
         // the right widget).
-        let use_fullscreen_render =
-            self.mode == TerminalMode::AlternateScreen || self.overlay_screen_active;
+        let use_fullscreen_render = self.overlay_screen_active;
         if !use_fullscreen_render {
             self.flush_history(app)?;
         }
@@ -15329,9 +16357,6 @@ impl TerminalGuard {
     ///   then build a fresh `Viewport::Inline` `Terminal` to resume
     ///   painting the bottom-anchored TUI viewport.
     fn sync_overlay_screen(&mut self, want_overlay_full: bool) -> Result<()> {
-        if self.mode != TerminalMode::Inline {
-            return Ok(());
-        }
         match (self.overlay_screen_active, want_overlay_full) {
             (false, true) => self.enter_overlay_screen(),
             (true, false) => self.leave_overlay_screen(),
@@ -15472,7 +16497,7 @@ impl TerminalGuard {
     /// scroll to pull up. Alternate-screen mode handles resize cleanly via
     /// the terminal itself, so the work is inline-only.
     fn wipe_inline_viewport_for_resize(&mut self) -> Result<()> {
-        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
+        if self.overlay_screen_active {
             return Ok(());
         }
         let viewport_top = self.term().get_frame().area().y;
@@ -15489,7 +16514,7 @@ impl TerminalGuard {
     }
 
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
-        if self.mode != TerminalMode::Inline || self.overlay_screen_active {
+        if self.overlay_screen_active {
             return Ok(());
         }
         let width = self
@@ -15497,14 +16522,19 @@ impl TerminalGuard {
             .size()
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?
             .width;
+        // Hold the still-settling tail back from scrollback: those nodes are
+        // animating their fold in the live region and only flush (collapsed)
+        // once the fold finishes and `finalize_elapsed_settles` clears them.
+        let flush_to = settling_flush_boundary(app);
         let lines = inline_history_lines_for_flush(
             app,
             width,
             !self.startup_flushed,
             self.transcript_flushed_len,
+            flush_to,
         );
         self.startup_flushed = true;
-        self.transcript_flushed_len = app.transcript.len();
+        self.transcript_flushed_len = flush_to;
         self.insert_before(lines, width)
     }
 
@@ -15542,38 +16572,18 @@ impl Drop for TerminalGuard {
         let Some(terminal) = self.terminal.as_mut() else {
             return;
         };
-        match self.mode {
-            TerminalMode::Inline => {
-                let _ = execute!(
-                    terminal.backend_mut(),
-                    PopKeyboardEnhancementFlags,
-                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
-                    DisableModifyOtherKeys,
-                    DisableBracketedPaste,
-                    DisableFocusChange,
-                    DisableAlternateScroll,
-                    Print(DISABLE_MOUSE_MODES),
-                    Print("\x1b]0;\x07"),
-                    Print(CLEAR_SCROLLBACK_AND_VISIBLE)
-                );
-            }
-            TerminalMode::AlternateScreen => {
-                let _ = execute!(
-                    terminal.backend_mut(),
-                    PopKeyboardEnhancementFlags,
-                    Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
-                    DisableModifyOtherKeys,
-                    DisableBracketedPaste,
-                    DisableFocusChange,
-                    DisableAlternateScroll,
-                    Print(DISABLE_MOUSE_MODES),
-                    Print("\x1b]0;\x07"),
-                    Clear(ClearType::All),
-                    MoveTo(0, 0),
-                    LeaveAlternateScreen
-                );
-            }
-        }
+        let _ = execute!(
+            terminal.backend_mut(),
+            PopKeyboardEnhancementFlags,
+            Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+            DisableModifyOtherKeys,
+            DisableBracketedPaste,
+            DisableFocusChange,
+            DisableAlternateScroll,
+            Print(DISABLE_MOUSE_MODES),
+            Print("\x1b]0;\x07"),
+            Print(CLEAR_SCROLLBACK_AND_VISIBLE)
+        );
         let _ = terminal.show_cursor();
         if let Some(hint) = &self.exit_hint {
             let _ = writeln!(terminal.backend_mut(), "{hint}");
@@ -15587,31 +16597,94 @@ fn render_lines_to_buffer(buffer: &mut Buffer, lines: Vec<Line<'static>>) {
         .render(buffer.area, buffer);
 }
 
+/// Index of the first transcript entry still animating its settle-fold. Those
+/// trailing nodes are held in the live region until the fold finishes, so the
+/// inline scrollback flush stops here. Returns `transcript.len()` when nothing
+/// is settling (the whole transcript is flushable).
+fn settling_flush_boundary(app: &TuiApp) -> usize {
+    app.transcript
+        .iter()
+        .position(|entry| entry.settle.is_some())
+        .unwrap_or(app.transcript.len())
+}
+
+/// The still-settling tail rendered for the inline live region: each held node
+/// folds in place there, then flushes to scrollback collapsed once its fold
+/// finishes. Empty when nothing is settling.
+fn live_settling_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let boundary = settling_flush_boundary(app);
+    if boundary >= app.transcript.len() {
+        return Vec::new();
+    }
+    inline_history_lines_for_flush(app, width, false, boundary, app.transcript.len())
+}
+
 fn inline_history_lines_for_flush(
     app: &TuiApp,
     width: u16,
     include_startup_card: bool,
     transcript_from: usize,
+    transcript_to: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if include_startup_card {
         lines.extend(startup_card_lines(app, width));
         lines.push(Line::from(""));
     }
-    for (index, item) in app.transcript.iter().enumerate().skip(transcript_from) {
+    // Seed the rail-connector state from the entry just before this flush so a
+    // `│` threads across the incremental scrollback flushes, not just within one.
+    let mut prev_work = transcript_from > 0
+        && app
+            .transcript
+            .get(transcript_from - 1)
+            .is_some_and(|prev| is_rail_work_node(&prev.kind));
+    for (index, item) in app
+        .transcript
+        .iter()
+        .enumerate()
+        .take(transcript_to)
+        .skip(transcript_from)
+    {
+        // A finished work node mid settle-fold renders folded in the live
+        // region (it is held back from the scrollback flush until the fold
+        // finishes), then flushes collapsed. Checked before run-coalescing so
+        // each settling node folds standalone.
+        if let Some(settle) = item.settle {
+            let mut block = settle_folded_entry_lines(
+                item,
+                false,
+                app.tool_output_verbosity,
+                message_outcome(&app.transcript, index),
+                Some(width),
+                app.show_reasoning_usage,
+                settle,
+            );
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, false),
+            );
+            continue;
+        }
         match reasoning_run_info(&app.transcript, index) {
             Some(ReasoningRun::Suppressed) => continue,
             Some(ReasoningRun::Lead { extras }) => {
                 if app.show_reasoning_usage
                     && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
                 {
-                    lines.extend(reasoning_block_lines_with_extras(
+                    let mut block = reasoning_block_lines_with_extras(
                         &snapshot.display_text,
                         item.collapsed,
                         false,
                         extras,
-                    ));
-                    lines.push(Line::from(""));
+                    );
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&item.kind, false),
+                    );
                 }
                 continue;
             }
@@ -15621,26 +16694,49 @@ fn inline_history_lines_for_flush(
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(&app.transcript, index, extras);
-                lines.extend(format_grouped_tool_result_entry(
+                let mut block = format_grouped_tool_result_entry(
                     &members,
                     item.collapsed,
                     false,
                     app.tool_output_verbosity,
                     Some(width),
                     ToolCardSurface::Tinted,
-                ));
+                );
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&item.kind, false),
+                );
                 continue;
             }
             None => {}
         }
-        lines.extend(format_transcript_entry_with_width(
+        let mut block = format_transcript_entry_with_width(
             item,
             false,
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             Some(width),
             app.show_reasoning_usage,
-        ));
+        );
+        if is_rail_work_node(&item.kind) {
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&item.kind, false),
+            );
+        } else {
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter down into the conclusion, whose own
+            // marker sits in the gutter column.
+            if prev_work {
+                lines.push(rail::connector_line(rail::dim()));
+            }
+            lines.append(&mut block);
+            prev_work = false;
+        }
     }
     lines
 }

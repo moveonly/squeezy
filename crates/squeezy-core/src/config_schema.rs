@@ -21,11 +21,11 @@ use crate::{
     DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
-    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_THEME_NAME,
-    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode,
-    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, SessionResumePicker,
-    StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
-    TuiSynchronizedOutput, normalize_tui_theme_name,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
+    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
+    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -382,7 +382,6 @@ pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
-pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
 pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
     &["default", "auto_review", "full_access", "custom"];
@@ -783,21 +782,6 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
-                label: "alternate_screen",
-                toml_path: &["tui", "alternate_screen"],
-                kind: FieldKind::Enum {
-                    options: ALTERNATE_SCREEN_OPTIONS,
-                },
-                tier: ApplyTier::Restart,
-                get: get_alternate_screen,
-                set: set_alternate_screen,
-                default_display: "auto",
-                default: || FieldValue::Enum("auto"),
-                help: "Whether to use native terminal scrollback (`auto`/`never`) or take over the full alternate screen (`always`).",
-                env_override: None,
-                secret: false,
-            },
-            FieldMeta {
                 label: "synchronized_output",
                 toml_path: &["tui", "synchronized_output"],
                 kind: FieldKind::Enum {
@@ -865,6 +849,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "default",
                 default: || FieldValue::String(DEFAULT_TUI_THEME_NAME.to_string()),
                 help: "Active named theme. Configure colors in the Themes section or via /theme.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "spinner",
+                toml_path: &["tui", "spinner"],
+                kind: FieldKind::Enum {
+                    options: crate::BUILTIN_TUI_SPINNER_NAMES,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_spinner,
+                set: set_spinner,
+                default_display: "scintillate",
+                default: || FieldValue::Enum(DEFAULT_TUI_SPINNER_NAME),
+                help: "Working-status spinner shape: twinkle, scintillate, or drift.",
                 env_override: None,
                 secret: false,
             },
@@ -2092,23 +2091,6 @@ fn set_persist_prompt_history(cfg: &mut AppConfig, value: FieldValue) -> Result<
     }
 }
 
-fn get_alternate_screen(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Enum(cfg.tui.alternate_screen.as_str())
-}
-fn set_alternate_screen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    let s = match value {
-        FieldValue::Enum(s) => s,
-        _ => return Err("expects enum"),
-    };
-    cfg.tui.alternate_screen = match s {
-        "auto" => TuiAlternateScreen::Auto,
-        "never" => TuiAlternateScreen::Never,
-        "always" => TuiAlternateScreen::Always,
-        _ => return Err("invalid alternate_screen"),
-    };
-    Ok(())
-}
-
 fn get_synchronized_output(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.tui.synchronized_output.as_str())
 }
@@ -2132,6 +2114,24 @@ fn set_theme(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str>
         _ => return Err("expects theme name"),
     };
     cfg.tui.theme = normalize_tui_theme_name(&s).ok_or("invalid theme")?;
+    Ok(())
+}
+
+fn get_spinner(cfg: &AppConfig) -> FieldValue {
+    let name = crate::BUILTIN_TUI_SPINNER_NAMES
+        .iter()
+        .copied()
+        .find(|s| *s == cfg.tui.spinner)
+        .unwrap_or(DEFAULT_TUI_SPINNER_NAME);
+    FieldValue::Enum(name)
+}
+fn set_spinner(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        FieldValue::Enum(s) => s.to_string(),
+        _ => return Err("expects spinner name"),
+    };
+    cfg.tui.spinner = normalize_tui_spinner_name(&s).ok_or("invalid spinner")?;
     Ok(())
 }
 

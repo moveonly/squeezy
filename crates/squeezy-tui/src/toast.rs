@@ -1,16 +1,15 @@
 //! Corner toast notifications with auto-dismiss.
 //!
-//! Distinct from [`crate::notification::NotificationQueue`], which rotates a
-//! single inline pane above the status bar. Toasts overlay the top-right of
-//! the frame, stack up to three at a time (newest at top), and disappear on
-//! their own after a few seconds. They are intended for fire-and-forget
-//! status events — telemetry flushed, MCP server connected, index updated —
-//! that should be visible at a glance without stealing space from the
-//! transcript or the prompt.
+//! Toasts overlay the top-right of the frame, stack up to three at a time
+//! (newest at top), and disappear on their own after a few seconds. They
+//! are intended for fire-and-forget status events — telemetry flushed, MCP
+//! server connected, index updated — that should be visible at a glance
+//! without stealing space from the transcript or the prompt. Durable
+//! notices land in the transcript instead.
 //!
 //! The queue itself is layout-agnostic: callers push toasts, call [`tick`]
-//! from the same animation loop that drives the inline notification queue,
-//! and consult [`ToastQueue::visible`] when rendering.
+//! from the animation loop, and consult [`ToastQueue::visible`] when
+//! rendering.
 //!
 //! [`tick`]: ToastQueue::tick
 
@@ -32,8 +31,8 @@ pub(crate) const DEFAULT_TOAST_TTL: Duration = Duration::from_secs(5);
 pub(crate) const MAX_VISIBLE_TOASTS: usize = 3;
 
 /// Visual variant. Maps directly to a palette colour for the leading glyph
-/// and border, matching the [`crate::notification::Severity`] vocabulary so
-/// call sites can use whichever surface fits the event.
+/// and border, using the standard info / success / warning / error
+/// vocabulary so call sites can use whichever surface fits the event.
 //
 // `allow(dead_code)`: variants are constructed by the test suite and by
 // future consumers (telemetry flush, MCP connect, index ready) wired in
@@ -50,9 +49,13 @@ pub(crate) enum ToastVariant {
 impl ToastVariant {
     pub(crate) fn color(self) -> Color {
         match self {
-            Self::Info => crate::render::theme::accent(),
+            // Mirror the rail's message taxonomy so a toast reads the same as its
+            // on-rail equivalent and amber stays rationed: info = blue (cool,
+            // not gold), warning = cyan (the warn tier), success = green,
+            // error = red.
+            Self::Info => crate::render::theme::blue(),
             Self::Success => crate::render::theme::green(),
-            Self::Warning => crate::render::theme::secondary(),
+            Self::Warning => crate::render::theme::cyan(),
             Self::Error => crate::render::theme::red(),
         }
     }

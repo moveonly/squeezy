@@ -3079,6 +3079,7 @@ impl Agent {
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
+            | DispatchCommand::Spinner { .. }
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
@@ -8865,15 +8866,18 @@ async fn run_subagent(
             let Some(id) = activity_id else {
                 continue;
             };
-            let Some(message) = subagent_activity_message(event) else {
-                continue;
-            };
-            let _ = parent_tx.try_send(AgentEvent::SubagentActivity {
-                turn_id: parent_turn_id,
-                id,
-                agent: activity_agent.clone(),
-                message,
-            });
+            // A completed tool's structured result is forwarded so the parent
+            // can render it as a real rail card in the subagent's transcript
+            // view; other intermediate events stay hidden to keep the parent's
+            // own transcript clean.
+            if let AgentEvent::ToolCallCompleted { result, .. } = event {
+                let _ = parent_tx.try_send(AgentEvent::SubagentToolResult {
+                    turn_id: parent_turn_id,
+                    id,
+                    agent: activity_agent.clone(),
+                    result,
+                });
+            }
         }
     });
     let local_jobs = JobRegistry::new();
@@ -8997,22 +9001,6 @@ fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
             other => json!({ "role": "other", "kind": format!("{other:?}") }),
         })
         .collect()
-}
-
-fn subagent_activity_message(event: AgentEvent) -> Option<String> {
-    match event {
-        AgentEvent::ToolCallStarted { call, .. } => {
-            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-            let args = compact_text(&args, 140);
-            Some(format!("running {} {}", call.name, args))
-        }
-        AgentEvent::ToolCallCompleted { result, .. } => Some(format!(
-            "completed {} {}",
-            result.tool_name,
-            tool_status_label(result.status)
-        )),
-        _ => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14823,6 +14811,15 @@ pub enum AgentEvent {
         id: SubagentId,
         agent: String,
         message: String,
+    },
+    /// A subagent's completed tool result, forwarded with its full structure so
+    /// the parent can render it as a rail card in the subagent's transcript
+    /// view (rather than the flat `completed X` line `SubagentActivity` carried).
+    SubagentToolResult {
+        turn_id: TurnId,
+        id: SubagentId,
+        agent: String,
+        result: ToolResult,
     },
     SubagentCompleted {
         turn_id: TurnId,

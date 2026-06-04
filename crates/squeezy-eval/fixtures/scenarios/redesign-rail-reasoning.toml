@@ -1,0 +1,59 @@
+id = "redesign-rail-reasoning"
+title = "Quiet Rail renders a reasoning + answer turn (inline)"
+description = """
+Drives a single reasoning turn through the inline TUI so the redesign's
+Quiet Rail rendering is captured (reasoning chip on the rail, then the
+off-rail answer). The transcript lives in terminal scrollback in inline
+mode, so the rail is visible in `replay.tui`; the live viewport frame
+carries the streamed answer. Mock provider, no tool execution.
+
+Run:
+
+    cargo run -p squeezy-eval --bin squeezy-eval -- run \\
+      crates/squeezy-eval/fixtures/scenarios/redesign-rail-reasoning.toml \\
+      --no-triage
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 120
+height = 40
+
+[[steps]]
+kind = "prompt"
+text = "Hash map vs B-tree for a small keyed cache — one sentence."
+wait_for = "turn_completed"
+
+# The streamed answer is in the live viewport when the turn completes.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "hash map"
+
+[expect]
+max_wall_clock_seconds = 30
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+deltas = [
+  { kind = "reasoning", content = "Weigh point-lookup speed against ordered range scans for ~100 entries.", reasoning_kind = "text" },
+  { kind = "text", content = "A hash map wins on point lookups; a B-tree keeps keys ordered for range scans." },
+]
+input_tokens = 40

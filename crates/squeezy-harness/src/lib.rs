@@ -667,6 +667,7 @@ async fn run_agent_with_config(
             | AgentEvent::ContextCompacted { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentActivity { .. }
+            | AgentEvent::SubagentToolResult { .. }
             | AgentEvent::SubagentCompleted { .. }
             | AgentEvent::SubagentFailed { .. }
             | AgentEvent::SubagentRejected { .. }

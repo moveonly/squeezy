@@ -228,6 +228,10 @@ pub(crate) fn foreground() -> Color {
     color(token::UI_FOREGROUND)
 }
 
+pub(crate) fn background() -> Color {
+    color(token::UI_BACKGROUND)
+}
+
 pub(crate) fn muted() -> Color {
     color(token::UI_MUTED)
 }
@@ -238,14 +242,6 @@ pub(crate) fn quiet() -> Color {
 
 pub(crate) fn footer() -> Color {
     color(token::UI_FOOTER)
-}
-
-pub(crate) fn surface() -> Color {
-    color(token::UI_SURFACE)
-}
-
-pub(crate) fn prompt_bg() -> Color {
-    color(token::UI_PROMPT_BG)
 }
 
 pub(crate) fn shimmer() -> Color {
@@ -281,50 +277,56 @@ fn builtin_theme(name: &str) -> Theme {
     }
 }
 
+// "Starlight" — the default night-sky theme. A deep indigo sky, cool
+// silver starlight text tiered across a four-step slate ramp, and a
+// single warm undertone (amber) reserved for the live agent and the
+// brand glyphs so gold reads as the rare star rather than chrome. All
+// structural and semantic tones share a slate-blue undertone (hue ~228)
+// so the interface reads as one moonlight at several brightnesses.
 const DEFAULT_COLORS: &[(&str, TuiRgb)] = &[
-    (token::PALETTE_ACCENT, [252, 211, 77]),
-    (token::PALETTE_SECONDARY, [254, 240, 138]),
-    (token::PALETTE_RED, [248, 113, 113]),
-    (token::PALETTE_GREEN, [22, 101, 52]),
-    (token::PALETTE_YELLOW, [254, 240, 138]),
-    (token::PALETTE_BLUE, [96, 165, 250]),
-    (token::PALETTE_MAGENTA, [149, 117, 205]),
-    (token::PALETTE_CYAN, [64, 158, 158]),
-    (token::UI_BACKGROUND, [24, 24, 28]),
-    (token::UI_FOREGROUND, [220, 220, 220]),
-    (token::UI_BORDER, [80, 80, 80]),
-    (token::UI_MUTED, [132, 132, 140]),
-    (token::UI_QUIET, [80, 80, 80]),
-    (token::UI_FOOTER, [98, 98, 104]),
-    (token::UI_SURFACE, [31, 31, 35]),
-    (token::UI_PROMPT_BG, [31, 31, 35]),
-    (token::SYNTAX_KEYWORD, [175, 135, 215]),
-    (token::SYNTAX_STRING, [175, 175, 135]),
-    (token::SYNTAX_COMMENT, [128, 128, 128]),
-    (token::SYNTAX_LITERAL, [215, 175, 95]),
-    (token::SYNTAX_FUNCTION, [95, 215, 255]),
-    (token::SYNTAX_TYPE, [135, 175, 215]),
-    (token::SYNTAX_OPERATOR, [188, 188, 188]),
-    (token::SYNTAX_VARIABLE, [208, 208, 208]),
-    (token::STATUS_OK, [22, 101, 52]),
-    (token::STATUS_WARN, [254, 240, 138]),
-    (token::STATUS_ERR, [248, 113, 113]),
-    (token::STATUS_INFO, [96, 165, 250]),
-    (token::TRANSCRIPT_USER, [252, 211, 77]),
-    (token::TRANSCRIPT_ASSISTANT, [220, 220, 220]),
-    (token::TRANSCRIPT_TOOL, [132, 132, 140]),
-    (token::TRANSCRIPT_SYSTEM, [149, 117, 205]),
-    (token::DIFF_ADDED, [21, 128, 61]),
-    (token::DIFF_REMOVED, [252, 165, 165]),
-    (token::DIFF_ADDED_BG, [33, 58, 43]),
-    (token::DIFF_REMOVED_BG, [74, 34, 29]),
-    (token::DIFF_CONTEXT, [80, 80, 80]),
-    (token::DIFF_HUNK, [254, 240, 138]),
-    (token::EFFECTS_SHIMMER, [220, 190, 130]),
-    (token::SEPARATOR_PRIMARY, [96, 165, 250]),
-    (token::INLINE_CODE, [96, 158, 158]),
-    (token::INLINE_MODEL, [176, 110, 176]),
-    (token::PATH_HINT, [89, 86, 140]),
+    (token::PALETTE_ACCENT, [242, 199, 92]),
+    (token::PALETTE_SECONDARY, [242, 217, 160]),
+    (token::PALETTE_RED, [236, 140, 156]),
+    (token::PALETTE_GREEN, [143, 217, 176]),
+    (token::PALETTE_YELLOW, [232, 214, 154]),
+    (token::PALETTE_BLUE, [137, 180, 250]),
+    (token::PALETTE_MAGENTA, [183, 157, 224]),
+    (token::PALETTE_CYAN, [132, 206, 220]),
+    (token::UI_BACKGROUND, [15, 19, 32]),
+    (token::UI_FOREGROUND, [226, 230, 242]),
+    (token::UI_BORDER, [60, 66, 88]),
+    (token::UI_MUTED, [150, 156, 184]),
+    (token::UI_QUIET, [86, 93, 120]),
+    (token::UI_FOOTER, [114, 122, 153]),
+    (token::UI_SURFACE, [23, 27, 42]),
+    (token::UI_PROMPT_BG, [25, 29, 46]),
+    (token::SYNTAX_KEYWORD, [183, 157, 224]),
+    (token::SYNTAX_STRING, [166, 216, 160]),
+    (token::SYNTAX_COMMENT, [111, 119, 150]),
+    (token::SYNTAX_LITERAL, [232, 214, 154]),
+    (token::SYNTAX_FUNCTION, [138, 198, 245]),
+    (token::SYNTAX_TYPE, [132, 206, 220]),
+    (token::SYNTAX_OPERATOR, [167, 174, 203]),
+    (token::SYNTAX_VARIABLE, [205, 211, 230]),
+    (token::STATUS_OK, [143, 217, 176]),
+    (token::STATUS_WARN, [242, 217, 160]),
+    (token::STATUS_ERR, [236, 140, 156]),
+    (token::STATUS_INFO, [137, 180, 250]),
+    (token::TRANSCRIPT_USER, [226, 230, 242]),
+    (token::TRANSCRIPT_ASSISTANT, [226, 230, 242]),
+    (token::TRANSCRIPT_TOOL, [150, 156, 184]),
+    (token::TRANSCRIPT_SYSTEM, [183, 157, 224]),
+    (token::DIFF_ADDED, [143, 217, 176]),
+    (token::DIFF_REMOVED, [235, 169, 180]),
+    (token::DIFF_ADDED_BG, [22, 48, 31]),
+    (token::DIFF_REMOVED_BG, [52, 30, 39]),
+    (token::DIFF_CONTEXT, [86, 93, 120]),
+    (token::DIFF_HUNK, [242, 217, 160]),
+    (token::EFFECTS_SHIMMER, [232, 201, 122]),
+    (token::SEPARATOR_PRIMARY, [90, 100, 134]),
+    (token::INLINE_CODE, [132, 206, 220]),
+    (token::INLINE_MODEL, [183, 157, 224]),
+    (token::PATH_HINT, [126, 134, 196]),
 ];
 
 const BRIGHT_COLORS: &[(&str, TuiRgb)] = &[
@@ -426,7 +428,9 @@ const CATPPUCCIN_COLORS: &[(&str, TuiRgb)] = &[
     (token::PALETTE_GREEN, [166, 227, 161]),
     (token::PALETTE_YELLOW, [249, 226, 175]),
     (token::PALETTE_BLUE, [137, 180, 250]),
-    (token::PALETTE_MAGENTA, [203, 166, 247]),
+    // Pink (not Mauve) so the subagent rail stays distinct from the plan
+    // accent, which is Mauve in this theme.
+    (token::PALETTE_MAGENTA, [245, 194, 231]),
     (token::PALETTE_CYAN, [148, 226, 213]),
     (token::UI_BACKGROUND, [30, 30, 46]),
     (token::UI_FOREGROUND, [205, 214, 244]),

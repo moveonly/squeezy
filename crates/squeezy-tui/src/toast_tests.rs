@@ -69,13 +69,14 @@ fn clear_drops_everything() {
 
 #[test]
 fn variant_color_matches_palette() {
-    assert_eq!(ToastVariant::Info.color(), crate::render::theme::accent());
+    // Toasts mirror the rail message taxonomy and keep amber rationed: info is
+    // cool blue (not gold), warning is the cyan warn tier, success green, error red.
+    assert_eq!(ToastVariant::Info.color(), crate::render::theme::blue());
     assert_eq!(ToastVariant::Success.color(), crate::render::theme::green());
-    assert_eq!(
-        ToastVariant::Warning.color(),
-        crate::render::theme::secondary()
-    );
+    assert_eq!(ToastVariant::Warning.color(), crate::render::theme::cyan());
     assert_eq!(ToastVariant::Error.color(), crate::render::theme::red());
+    // Amber is reserved for the rationed identity tokens, never a toast.
+    assert_ne!(ToastVariant::Info.color(), crate::render::theme::accent());
 }
 
 #[test]
