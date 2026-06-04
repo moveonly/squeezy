@@ -2333,8 +2333,8 @@ impl ToolRegistry {
     /// `SUBAGENT_MAX_CONCURRENT` lease pool already caps total fanout, so
     /// the registry promotes them to parallel-safe explicitly. This
     /// closes the gap where multiple delegate calls in the same model
-    /// turn were serialised even though the lease pool advertised a
-    /// 4-way concurrency budget.
+    /// turn were serialised even though the lease pool supported concurrent
+    /// fanout.
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
         if SUBAGENT_PARALLEL_SAFE_TOOL_NAMES.contains(&call.name.as_str()) {
             return true;

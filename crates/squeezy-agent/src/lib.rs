@@ -10760,8 +10760,7 @@ async fn execute_tool_calls(
     // its own internal step sequence). The validation loop collects
     // these so they can run concurrently bounded by
     // `SUBAGENT_MAX_CONCURRENT` once the loop finishes, closing the gap
-    // where the lease pool advertised a 4-way budget that the
-    // single-shot dispatcher never used.
+    // where the single-shot dispatcher never used the full concurrent budget.
     let mut delegate_batch_calls: Vec<(usize, ToolCall, SubagentKind)> = Vec::new();
 
     for (index, call) in calls.iter().enumerate() {

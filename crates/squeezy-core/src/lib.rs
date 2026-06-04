@@ -9094,10 +9094,10 @@ pub fn user_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
-# max_concurrent = 4           # maximum parallel subagents per parent agent
-# max_tool_calls_per_call = 24
-# max_tool_bytes_read_per_call = 8388608
-# max_search_files_per_call = 2000
+# max_concurrent = 20          # maximum parallel subagents per parent agent
+# max_tool_calls_per_call = 10000
+# max_tool_bytes_read_per_call = 1000000000
+# max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
 
@@ -9333,10 +9333,10 @@ pub fn project_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
-# max_concurrent = 4           # maximum parallel subagents per parent agent
-# max_tool_calls_per_call = 24
-# max_tool_bytes_read_per_call = 8388608
-# max_search_files_per_call = 2000
+# max_concurrent = 20          # maximum parallel subagents per parent agent
+# max_tool_calls_per_call = 10000
+# max_tool_bytes_read_per_call = 1000000000
+# max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
 

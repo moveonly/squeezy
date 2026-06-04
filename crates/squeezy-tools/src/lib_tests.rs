@@ -115,8 +115,8 @@ fn plan_parallel_batches_coalesces_three_delegate_calls_into_one_concurrent_batc
     // `buffer_unordered(SUBAGENT_MAX_CONCURRENT)` loop can run them
     // concurrently. Before this change `is_parallel_safe` consulted only
     // the spec catalog, which has no entry for the synthetic subagent
-    // tools — so the lease pool advertised a 4-way budget that the
-    // dispatcher never used.
+    // tools — so the lease pool's concurrent budget was never used by the
+    // dispatcher.
     //
     // The mix below intentionally covers all three delegate variants
     // (plain delegate, plan, review) plus `delegate_chain`, which is also
