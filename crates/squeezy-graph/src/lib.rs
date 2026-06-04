@@ -1027,6 +1027,13 @@ impl SemanticGraph {
             if &current == to {
                 return Some(path);
             }
+            // `path.len()` counts nodes, so the chain `from -> ... -> current`
+            // has `path.len() - 1` edges. Stop expanding once that edge count
+            // would exceed `max_depth`, keeping this bound aligned with the BFS
+            // call-graph listing (which gates on `depth >= max_depth`). Using
+            // `>` here (not `>=` or `> max_depth + 1`) is deliberate: a target
+            // reachable in exactly `max_depth` edges is found, but never one
+            // edge further than the BFS listing would reach.
             if path.len() > max_depth {
                 continue;
             }
@@ -2407,6 +2414,12 @@ impl GraphManager {
             graph_batch.remove_partition(file_id);
         }
         for record in unsupported_changed_records {
+            // A file that flipped from a supported language to unsupported
+            // still has its old symbols/edges/calls/references/packages/facts
+            // in the graph. Purge all derived data for the file before
+            // recording the unsupported placeholder, otherwise the stale rows
+            // remain queryable and poison every downstream tool.
+            self.graph.remove_file_data(&record.id);
             self.graph.files.insert(record.id.clone(), record.clone());
         }
 
@@ -2457,10 +2470,20 @@ impl GraphManager {
             self.persist_resolver_cache(store);
         }
 
-        if let Ok(mut paths) = self.pending_changed_paths.lock() {
-            paths.clear();
+        // Only declare the pending set fully drained when we actually parsed
+        // every changed file. If the per-refresh budget broke the loop early,
+        // some changed paths were never reparsed; clearing the set and
+        // advancing `last_refresh` here would let the next query skip refresh
+        // for the whole idle interval and serve stale data for those files.
+        // Leave the pending paths queued (already-parsed ones become cheap
+        // no-ops on the next pass) and leave `last_refresh` untouched so the
+        // next `refresh_before_query` still picks them up immediately.
+        if !budget_exhausted {
+            if let Ok(mut paths) = self.pending_changed_paths.lock() {
+                paths.clear();
+            }
+            self.last_refresh = Instant::now();
         }
-        self.last_refresh = Instant::now();
         Ok(RefreshReport {
             refreshed: reparsed_files > 0 || !removed_files.is_empty() || metadata_refresh_needed,
             changed_files,

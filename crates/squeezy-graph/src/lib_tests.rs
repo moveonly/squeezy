@@ -1554,6 +1554,323 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
 }
 
+/// When a file that previously parsed into the graph flips to an unsupported
+/// language on refresh, `refresh_now` records the new unsupported placeholder
+/// in `graph.files`. It must also purge the file's old symbols/edges/calls/
+/// references; otherwise the stale rows stay queryable and poison every
+/// downstream tool.
+#[test]
+fn graph_manager_refresh_purges_symbols_when_file_becomes_unsupported() {
+    let root = temp_root("graph-manager-supported-to-unsupported");
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A real supported file keeps the workspace indexable so the unsupported
+    // sibling below is still returned by the crawl (as an Unsupported record)
+    // instead of being dropped from the snapshot entirely.
+    fs::write(root.join("src").join("lib.rs"), "pub fn anchor() {}\n").unwrap();
+    // `notes.txt` is unsupported by extension, so the live crawl always returns
+    // it as an unsupported FileRecord with a stable id. We then seed the graph
+    // as if that same id had previously parsed as Rust (with symbols + a call
+    // edge), reproducing a supported -> unsupported flip for one file id.
+    let seed_source = "fn seeded_symbol() { seeded_callee(); }\nfn seeded_callee() {}\n";
+    let notes = root.join("notes.txt");
+    fs::write(&notes, "plain notes\n").unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    // Fresh build keeps notes.txt as an unsupported placeholder: no symbols, but
+    // the record is present (so the seed flips an existing supported->unsupported
+    // id rather than going through the removed-file path).
+    assert!(
+        manager
+            .graph()
+            .find_symbol_by_name("seeded_symbol")
+            .is_empty()
+    );
+    assert!(
+        manager
+            .graph()
+            .files
+            .contains_key(&FileId::new("notes.txt")),
+        "unsupported sibling must be tracked in the snapshot"
+    );
+
+    // Seed the supported state for `notes.txt` directly into the graph.
+    let mut parser = LanguageParser::new().unwrap();
+    let mut seed_record = record("seed-notes.rs", seed_source);
+    seed_record.id = FileId::new("notes.txt");
+    seed_record.path = notes.clone();
+    seed_record.relative_path = "notes.txt".to_string();
+    seed_record.language = LanguageKind::Rust;
+    let parsed = parser
+        .parse_source(&seed_record, seed_source.to_string())
+        .unwrap();
+    manager.graph_mut().replace_file(parsed);
+
+    assert!(
+        !manager
+            .graph()
+            .find_symbol_by_name("seeded_symbol")
+            .is_empty(),
+        "seed should make the symbol queryable"
+    );
+    assert!(
+        !manager
+            .graph()
+            .find_symbol_by_name("seeded_callee")
+            .is_empty(),
+        "seed should make the callee queryable"
+    );
+    let notes_id = FileId::new("notes.txt");
+    let seeded_edge_count = manager
+        .graph()
+        .edges()
+        .iter()
+        .filter(|edge| {
+            manager
+                .graph()
+                .symbols
+                .get(&edge.from)
+                .map(|symbol| symbol.file_id == notes_id)
+                .unwrap_or(false)
+        })
+        .count();
+    assert!(
+        seeded_edge_count > 0,
+        "seed should create at least one edge owned by notes.txt"
+    );
+
+    // Change the on-disk file so the crawl produces a differing hash, then
+    // refresh. The graph's old record is Rust while the crawl reclassifies the
+    // file as unsupported -> it lands in the unsupported-changed path that the
+    // fix targets (the file is NOT removed, only reclassified).
+    thread::sleep(Duration::from_millis(2));
+    fs::write(&notes, "plain notes, edited\n").unwrap();
+    manager.record_changed_path(notes.clone());
+    let report = manager.refresh_now().unwrap();
+    assert!(
+        report.removed_files.is_empty(),
+        "notes.txt is reclassified, not removed; the unsupported-changed path \
+         must handle the purge"
+    );
+    assert!(
+        manager
+            .graph()
+            .files
+            .contains_key(&FileId::new("notes.txt")),
+        "the unsupported placeholder for notes.txt must remain recorded"
+    );
+    assert_eq!(
+        manager
+            .graph()
+            .files
+            .get(&FileId::new("notes.txt"))
+            .map(|file| file.language),
+        Some(LanguageKind::Unsupported),
+        "notes.txt must now be tracked as unsupported"
+    );
+
+    // The placeholder is recorded, but the stale derived data must be gone.
+    assert!(
+        manager
+            .graph()
+            .find_symbol_by_name("seeded_symbol")
+            .is_empty(),
+        "stale symbol must be purged after supported -> unsupported flip"
+    );
+    assert!(
+        manager
+            .graph()
+            .find_symbol_by_name("seeded_callee")
+            .is_empty(),
+        "stale callee must be purged after supported -> unsupported flip"
+    );
+    assert!(
+        manager
+            .graph()
+            .symbols
+            .values()
+            .all(|symbol| symbol.file_id != notes_id),
+        "no symbol may remain attached to the now-unsupported file"
+    );
+    // Every surviving edge must dangle from a still-present symbol; none may be
+    // anchored to a (now purged) notes.txt symbol.
+    assert!(
+        manager.graph().edges().iter().all(|edge| {
+            manager
+                .graph()
+                .symbols
+                .get(&edge.from)
+                .map(|symbol| symbol.file_id != notes_id)
+                .unwrap_or(true)
+        }),
+        "stale edges owned by the file must be purged"
+    );
+}
+
+/// When the per-refresh budget breaks the reparse loop before every changed
+/// file is processed, `refresh_now` must not pretend the refresh finished. The
+/// unprocessed paths have to stay pending and `last_refresh` must not advance,
+/// otherwise the next query skips refresh for the whole idle interval and
+/// serves stale data for the files that were never reparsed.
+#[test]
+fn graph_manager_refresh_keeps_pending_when_budget_exhausted() {
+    let root = temp_root("graph-manager-budget-exhausted");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let files = ["a.rs", "b.rs", "c.rs", "d.rs"];
+    for name in files {
+        fs::write(
+            root.join("src").join(name),
+            format!("fn {}_v1() {{}}\n", name.trim_end_matches(".rs")),
+        )
+        .unwrap();
+    }
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            // Large idle interval: a buggy refresh that drops the pending set
+            // and advances last_refresh would hide stale files for this long.
+            idle_refresh_interval: Duration::from_secs(600),
+            // Zero budget: the reparse loop breaks on its first iteration,
+            // before any changed file is parsed, deterministically.
+            per_tool_refresh_budget: Duration::from_millis(0),
+        },
+    )
+    .unwrap();
+    for name in files {
+        assert!(
+            !manager
+                .graph()
+                .find_symbol_by_name(&format!("{}_v1", name.trim_end_matches(".rs")))
+                .is_empty()
+        );
+    }
+
+    thread::sleep(Duration::from_millis(2));
+    let mut changed_paths = Vec::new();
+    for name in files {
+        let path = root.join("src").join(name);
+        fs::write(
+            &path,
+            format!("fn {}_v2() {{}}\n", name.trim_end_matches(".rs")),
+        )
+        .unwrap();
+        changed_paths.push(path);
+    }
+    manager.record_changed_paths(changed_paths.clone());
+
+    let report = manager.refresh_now().unwrap();
+    assert!(
+        report.budget_exhausted,
+        "zero budget must exhaust before reparsing"
+    );
+    assert_eq!(
+        report.reparsed_files, 0,
+        "zero budget breaks before parsing any file"
+    );
+
+    // The pending paths must survive so the next query still refreshes them.
+    let pending = manager.pending_changed_paths_handle();
+    assert!(
+        !pending.lock().unwrap().is_empty(),
+        "unprocessed paths must stay pending after a budget-exhausted refresh"
+    );
+
+    // Because pending is non-empty (and last_refresh was not advanced), the
+    // next refresh-before-query must NOT be skipped for the idle interval.
+    let next = manager.refresh_before_query().unwrap();
+    assert!(
+        !next.skipped_due_to_interval,
+        "stale files must not be hidden for the idle interval after a budget break"
+    );
+
+    // The stale v1 symbols are still served (nothing was reparsed yet), which is
+    // exactly why the paths must stay pending for a later pass to converge.
+    for name in files {
+        assert!(
+            !manager
+                .graph()
+                .find_symbol_by_name(&format!("{}_v1", name.trim_end_matches(".rs")))
+                .is_empty(),
+            "no file was reparsed under the zero budget"
+        );
+    }
+}
+
+/// `call_chain` must honor the same `max_depth` bound as the BFS call-graph
+/// listing (`bfs_call_packets` in squeezy-tools): a target reachable in exactly
+/// `d` call edges is found iff `max_depth >= d`, never one edge further. Locks
+/// the depth alignment so a future off-by-one in either traversal is caught.
+#[test]
+fn call_chain_depth_matches_bfs_listing_bound() {
+    let source = r#"
+fn a() { b(); }
+fn b() { c(); }
+fn c() { d(); }
+fn d() { e(); }
+fn e() {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let file = record("src/chain.rs", source);
+    let parsed = parser.parse_source(&file, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let a = graph.find_symbol_by_name("a").pop().unwrap();
+
+    // Reachability under the bfs_call_packets bound: a node at edge distance d
+    // is reached iff some edge emitted at depth+1 lands on it, gated by
+    // `depth >= max_depth { continue }`.
+    let bfs_reaches = |target: &SymbolId, max_depth: usize| -> bool {
+        if max_depth == 0 {
+            return false;
+        }
+        let mut visited = std::collections::HashSet::from([a.id.clone()]);
+        let mut frontier = std::collections::VecDeque::from([(a.id.clone(), 0usize)]);
+        while let Some((current, depth)) = frontier.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let next_depth = depth + 1;
+            for hit in graph.callees(&current) {
+                let Some(next) = hit.edge.to else { continue };
+                if &next == target {
+                    return true;
+                }
+                if next_depth < max_depth && visited.insert(next.clone()) {
+                    frontier.push_back((next, next_depth));
+                }
+            }
+        }
+        false
+    };
+
+    // Each target's exact edge distance from `a`.
+    for (target_name, distance) in [("b", 1usize), ("c", 2), ("d", 3), ("e", 4)] {
+        let target = graph.find_symbol_by_name(target_name).pop().unwrap();
+        for max_depth in 0..=5 {
+            let chain_found = graph.call_chain(&a.id, &target.id, max_depth).is_some();
+            let bfs_found = bfs_reaches(&target.id, max_depth);
+            assert_eq!(
+                chain_found, bfs_found,
+                "call_chain and BFS bound disagree for target {target_name} at max_depth {max_depth}"
+            );
+            assert_eq!(
+                chain_found,
+                max_depth >= distance,
+                "call_chain to {target_name} ({distance} edges) must require max_depth >= {distance}"
+            );
+        }
+    }
+}
+
 #[test]
 fn graph_manager_refresh_rebuilds_once_for_multiple_removed_files() {
     let root = temp_root("graph-manager-remove-many");
