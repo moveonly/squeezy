@@ -52,6 +52,11 @@ struct TelemetryState {
     /// [`TelemetryClient::begin_turn`] and [`TelemetryClient::end_turn`].
     /// `None` outside an active turn (e.g. `app_started`). 16-hex-char string.
     current_span_id: std::sync::Mutex<Option<String>>,
+    /// Durable on-disk session ID from `SessionHandle::session_id()`. Set
+    /// once by the agent layer after building the session log, then stamped
+    /// on every subsequent event so any individual PostHog event can be
+    /// joined back to the session file without needing the summary.
+    store_session_id: std::sync::Mutex<Option<String>>,
     next_event_sequence: AtomicU64,
     queue: Mutex<TelemetryQueue>,
     /// Serializes concurrent calls to `send_pending_summaries` so that the
@@ -133,6 +138,7 @@ impl TelemetryClient {
             session_started_at_ms: now_ms(),
             session_registered: std::sync::Mutex::new(false),
             current_span_id: std::sync::Mutex::new(None),
+            store_session_id: std::sync::Mutex::new(None),
             next_event_sequence: AtomicU64::new(1),
             queue: Mutex::new(TelemetryQueue::default()),
             flush_lock: Mutex::new(()),
@@ -186,6 +192,20 @@ impl TelemetryClient {
     /// reports in PostHog are correlated with the product session summary.
     pub fn session_id(&self) -> Option<String> {
         self.state.as_ref().map(|state| state.session_id.clone())
+    }
+
+    /// Bind the durable on-disk session ID to this client. Once set, every
+    /// subsequent event is stamped with `store_session_id` so any individual
+    /// PostHog event can be correlated with the session file without needing
+    /// the summary. Called by the agent layer immediately after the session
+    /// log is opened.
+    pub fn set_store_session_id(&self, id: &str) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        if let Ok(mut guard) = state.store_session_id.lock() {
+            *guard = Some(id.to_string());
+        }
     }
 
     pub fn spawn(&self, event: TelemetryEvent) {
@@ -279,6 +299,7 @@ impl TelemetryClient {
             session_started_at_ms: now_ms(),
             session_registered: std::sync::Mutex::new(false),
             current_span_id: std::sync::Mutex::new(None),
+            store_session_id: std::sync::Mutex::new(None),
             next_event_sequence: AtomicU64::new(1),
             queue: Mutex::new(TelemetryQueue::default()),
             flush_lock: Mutex::new(()),
@@ -2736,6 +2757,12 @@ fn stamp_trace_ids(state: &TelemetryState, event: &mut TelemetryEvent) {
         && let Some(span_id) = guard.as_ref()
     {
         event.properties.span_id = Some(span_id.clone());
+    }
+    if event.properties.store_session_id.is_none()
+        && let Ok(guard) = state.store_session_id.lock()
+        && let Some(id) = guard.as_ref()
+    {
+        event.properties.store_session_id = Some(id.clone());
     }
 }
 
