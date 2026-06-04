@@ -6017,6 +6017,139 @@ async fn subagent_concurrency_cap_emits_rejected_event() {
     );
 }
 
+/// Serves parent/subagent streams from a deterministic queue. Used to
+/// exercise the P1.1 whole-task delegate gate: the first `delegate` runs a
+/// real subagent, the second must be refused without spawning anything.
+struct SequencedProvider {
+    responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
+}
+
+impl LlmProvider for SequencedProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let events = self
+            .responses
+            .lock()
+            .expect("responses")
+            .pop_front()
+            .unwrap_or_default();
+        let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+            Box::pin(stream::iter(events));
+        stream
+    }
+}
+
+#[tokio::test]
+async fn second_delegate_is_refused_after_first_runs() {
+    // P1.1: a top-level task may spawn at most one `delegate` subagent. The
+    // parent scripts delegate#1 (round 1), then delegate#2 (round 2). The
+    // first runs a real subagent; the second must hit the budget gate and
+    // come back as a tool error WITHOUT a second SubagentStarted.
+    let delegate_round = |call_id: &str| {
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: call_id.to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "enumerate the tree"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some(format!("resp_{call_id}")),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ]
+    };
+    let responses = VecDeque::from(vec![
+        // Parent round 1: spawn delegate #1.
+        delegate_round("del_1"),
+        // Subagent #1: answers immediately and finishes.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("subagent answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Parent round 2: try a SECOND delegate — must be gated.
+        delegate_round("del_2"),
+        // Parent round 3: finish in-context.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("final answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]);
+    let provider = Arc::new(SequencedProvider {
+        responses: Mutex::new(responses),
+    });
+
+    let root = temp_workspace("second_delegate_refused");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn("audit the tree".to_string(), CancellationToken::new());
+    let mut subagent_started_count = 0u32;
+    let mut gate_error_seen = false;
+    let mut final_answer = String::new();
+    while let Some(event) = rx.recv().await {
+        match &event {
+            AgentEvent::SubagentStarted { agent, .. } if agent == "delegate" => {
+                subagent_started_count += 1;
+            }
+            AgentEvent::ToolCallCompleted { result, .. }
+                if result.tool_name == "delegate"
+                    && result.status == ToolStatus::Denied
+                    && result
+                        .content
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("delegate budget exhausted for this task") =>
+            {
+                gate_error_seen = true;
+            }
+            AgentEvent::Completed { message, .. } => {
+                final_answer = message.content.clone();
+                break;
+            }
+            AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+
+    assert_eq!(
+        subagent_started_count, 1,
+        "exactly one delegate subagent may start per task"
+    );
+    assert!(
+        gate_error_seen,
+        "the second delegate must be refused with the budget-exhausted tool error"
+    );
+    assert!(
+        final_answer.contains("final answer"),
+        "parent must still finish in-context after the gate: {final_answer:?}"
+    );
+}
+
 #[tokio::test]
 async fn subagent_max_concurrent_override_is_honored_by_executor() {
     const OVERRIDE_CAP: usize = 6;

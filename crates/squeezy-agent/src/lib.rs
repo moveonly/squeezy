@@ -139,6 +139,16 @@ const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
 /// research workflow without letting the model commit the entire turn
 /// budget to one chain.
 const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
+/// Hard runtime cap on whole-task `delegate` fan-out per top-level user
+/// task. On single-turn read-only enumeration audits the parent already
+/// solves the task alone; a second confirmatory `delegate` re-scans the
+/// whole tree and only burns tokens (measured: c spawned 2 overlapping
+/// subagents @ 10.5M subagent input tokens, java up to 3). The first
+/// `delegate` result stands; the parent must finish in-context. `explore`,
+/// `delegate_plan`, `delegate_review`, and `delegate_chain` are
+/// deliberately exempt — they are scoped, different-purpose surfaces, not
+/// the broad whole-task re-scan this gate targets.
+const MAX_DELEGATES_PER_TASK: u64 = 1;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -6706,7 +6716,35 @@ impl TurnRuntime {
             }
             last_tool_round_summary = tool_round_failure_summary(&results);
             if let Some(reason) = loop_guard.observe_round(&tool_calls, &results) {
-                return Err(SqueezyError::Agent(reason));
+                // P0.2 fail-soft: the loop guard tripped (repeated identical
+                // tool failure, or control-only rounds). Rather than returning
+                // an error that surfaces as a zero-character answer, finalize
+                // with whatever the model has already produced this turn plus
+                // the stop reason. Flush the in-flight assistant stream so the
+                // current round's preamble is included.
+                if let Some(tail) = self
+                    .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await
+                {
+                    self.record_replay_model_text_delta(&tail);
+                }
+                broker.metrics.redactions += assistant_stream.total_redactions();
+                let assistant_text = std::mem::take(&mut assistant_message);
+                self.finish_soft_completion(
+                    reason,
+                    assistant_text,
+                    &mut conversation,
+                    response_id.clone(),
+                    user_transcript.clone(),
+                    total_cost,
+                    &mut broker.metrics,
+                    context_compaction.clone(),
+                    broker.calibration.clone(),
+                    stop_reason.clone(),
+                    &task_title,
+                )
+                .await;
+                return Ok(());
             }
             let implicit_instructions_added = self.append_implicit_skill_instructions(
                 &results,
@@ -6986,12 +7024,37 @@ impl TurnRuntime {
             }
         }
 
+        // P0.2 fail-soft: exhausting the tool-round budget used to return an
+        // error (zero-character answer). Finalize with the best-effort text
+        // gathered across the turn instead, noting the round-budget stop.
         let suffix = last_tool_round_summary
             .map(|summary| format!(" · {summary}"))
             .unwrap_or_default();
-        Err(SqueezyError::Agent(format!(
-            "stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"
-        )))
+        if let Some(tail) = self
+            .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+            .await
+        {
+            self.record_replay_model_text_delta(&tail);
+        }
+        broker.metrics.redactions += assistant_stream.total_redactions();
+        let assistant_text = std::mem::take(&mut assistant_message);
+        self.finish_soft_completion(
+            format!("stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"),
+            assistant_text,
+            &mut conversation,
+            previous_response_id.clone(),
+            user_transcript.clone(),
+            total_cost,
+            &mut broker.metrics,
+            context_compaction.clone(),
+            broker.calibration.clone(),
+            // No per-round stop_reason at budget exhaustion — that variable is
+            // loop-scoped and the turn ended by hitting MAX_TOOL_ROUNDS.
+            None,
+            &task_title,
+        )
+        .await;
+        Ok(())
     }
 
     fn append_implicit_skill_instructions(
@@ -7293,6 +7356,96 @@ impl TurnRuntime {
                 metrics: metrics.clone(),
             })
             .await;
+    }
+
+    /// Fail soft instead of emitting a zero-character answer.
+    ///
+    /// The repeated-tool-failure guard and the round-budget exhaustion path
+    /// used to `return Err(SqueezyError::Agent(reason))`, which surfaces as
+    /// `AgentEvent::Failed` and drops every byte the model already produced —
+    /// the realworld haiku eval measured whole turns landing at 0 visible
+    /// characters this way. This finalizes with the best-effort assistant
+    /// text gathered so far (the running preamble plus a short note stating
+    /// why the turn stopped) and emits the normal `Completed` event so the
+    /// user/eval receives the partial answer rather than nothing.
+    ///
+    /// `assistant_text` is whatever was flushed from the in-flight stream at
+    /// the abort site; it may be empty, in which case only the stop note is
+    /// returned. This mirrors the success completion path (conversation push,
+    /// `persist_turn_state`, `Completed`) so resume/transcript state stays
+    /// consistent.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_soft_completion(
+        &self,
+        stop_note: String,
+        assistant_text: String,
+        conversation: &mut Vec<LlmInputItem>,
+        response_id: Option<String>,
+        user_transcript: TranscriptItem,
+        total_cost: CostSnapshot,
+        metrics: &mut TurnMetrics,
+        context_compaction: ContextCompactionState,
+        token_calibration: squeezy_llm::TokenCalibration,
+        stop_reason: Option<StopReason>,
+        task_title: &str,
+    ) {
+        // Compose the visible answer: the model's own text first (if any),
+        // then a one-line note explaining the early finish. When the model
+        // produced no text the note stands alone so the answer is never empty.
+        let trimmed = assistant_text.trim_end();
+        let answer = if trimmed.is_empty() {
+            stop_note.clone()
+        } else {
+            format!("{trimmed}\n\n_(stopped early: {stop_note})_")
+        };
+        if !assistant_text.is_empty() {
+            conversation.push(redact_input_item(
+                LlmInputItem::AssistantText(assistant_text.clone()),
+                &self.redactor,
+            ));
+        }
+        let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(&answer));
+        self.stamp_routing_savings(metrics);
+        // Surface the partial-finish as Completed, not Failed: the user got
+        // an answer, just an abbreviated one.
+        self.publish_terminal_task_state(
+            TaskStateStatus::Completed,
+            Some(stop_note.clone()),
+            task_title,
+        )
+        .await;
+        self.log_event(
+            "soft_completion",
+            Some(self.turn_id),
+            Some(stop_note.clone()),
+            json!({ "reason": stop_note, "assistant_chars": answer.len() }),
+        );
+        self.persist_turn_state(TurnPersistInput {
+            conversation,
+            response_id,
+            user: user_transcript,
+            assistant: message.clone(),
+            cost: &total_cost,
+            metrics,
+            context_compaction,
+            token_calibration,
+        })
+        .await;
+        let context_estimate = estimate_context(conversation);
+        let _ = self
+            .tx
+            .send(AgentEvent::Completed {
+                turn_id: self.turn_id,
+                message,
+                response_id: None,
+                cost: total_cost,
+                metrics: metrics.clone(),
+                context_estimate,
+                stop_reason,
+                reasoning_only_stop: false,
+            })
+            .await;
+        self.finish_turn(metrics).await;
     }
 
     /// Mirror the success path's conversation/transcript push for a turn
@@ -8941,6 +9094,51 @@ async fn run_subagent_rounds(
     let subagent_cache_key = subagent_prompt_cache_key(parent);
     for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
+        // P1.3 fail-soft subagent input-token guard. Reuses the EXISTING
+        // `max_round_input_tokens` ceiling (the same pre-flight gate the
+        // parent loop applies) instead of inventing a new cap. When the
+        // ceiling is unset (`None`, the default) `round_input_gate_status`
+        // short-circuits and this is a no-op, so default behaviour is
+        // unchanged. When a scenario/eval sets the ceiling, a subagent whose
+        // assembled request would exceed it STOPS here and returns the
+        // best-effort answer it has already gathered rather than running its
+        // round loop out to millions of input tokens (measured: 1.2M–10.5M
+        // input tokens on tasks the parent solves in ~1M). This bounds the
+        // documented runaway without touching the otherwise-unbounded
+        // `subagents.*` caps in squeezy-core.
+        if round > 0
+            && let Some(status) = round_input_gate_status(
+                config.max_round_input_tokens,
+                estimate_context(conversation).estimated_tokens,
+                parent.provider.name(),
+                &request_model,
+                CostBroker::projected_output_tokens(
+                    config.max_output_tokens,
+                    squeezy_llm::model_info_for(parent.provider.name(), &request_model)
+                        .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                ),
+            )
+        {
+            let chunk = assistant_stream.finish();
+            if !chunk.text.is_empty() {
+                assistant_message.push_str(&chunk.text);
+            }
+            broker.metrics.redactions += assistant_stream.total_redactions();
+            tracing::debug!(
+                target: "squeezy_agent::subagent_input_gate",
+                round,
+                estimated_input_tokens = status.estimated_input_tokens,
+                limit_tokens = status.limit_tokens,
+                "subagent stopped on round-input ceiling; returning best-effort result",
+            );
+            return successful_subagent_execution(
+                std::mem::take(assistant_message),
+                broker.metrics.clone(),
+                std::mem::take(supporting_receipts),
+                model,
+                config,
+            );
+        }
         let cache = CacheSpec::for_prefix_reuse(
             parent.provider.name(),
             &request_model,
@@ -10427,6 +10625,55 @@ async fn execute_tool_calls(
             _ => None,
         };
         if let Some(kind) = delegate_batch_kind {
+            // P1.1 hard whole-task `delegate` gate. Only the broad
+            // whole-task `delegate` surface is capped — `delegate_plan` and
+            // `delegate_review` (kinds Plan/Review) are scoped, different-
+            // purpose helpers and pass through. `delegate.calls` is the
+            // cumulative count across the whole task (the broker spans every
+            // round of the turn); `already_queued_delegates` adds the
+            // `delegate`s queued earlier in THIS same round so a parallel
+            // fan-out of N delegates is also capped to one (measured: a single
+            // round spawning 2-3 overlapping whole-tree re-scans is pure
+            // waste). Once the budget is spent, refuse the extra delegate with
+            // a tool error that tells the model the first subagent's result
+            // stands and to finish in-context — never spawn another.
+            if kind == SubagentKind::Delegate {
+                let already_queued_delegates = delegate_batch_calls
+                    .iter()
+                    .filter(|(_, _, queued_kind)| *queued_kind == SubagentKind::Delegate)
+                    .count() as u64;
+                let prior_delegates =
+                    broker.metrics.subagent_by_kind.delegate.calls + already_queued_delegates;
+                if prior_delegates >= MAX_DELEGATES_PER_TASK {
+                    // Surface as `Denied`, not `Error`: this is an intentional
+                    // policy refusal, not a model mistake. `Error` would also
+                    // trip the repeated-tool-failure loop guard when a parent
+                    // emits several over-budget delegates in one round, which
+                    // would (via P0.2) terminate the whole turn early.
+                    let result = control_tool_result(
+                        call,
+                        ToolStatus::Denied,
+                        json!({
+                            "ok": false,
+                            "error": "delegate budget exhausted for this task",
+                            "delegates_allowed": MAX_DELEGATES_PER_TASK,
+                            "delegates_used": prior_delegates,
+                            "guidance": "A delegate subagent has already run for this task; its result stands. Do not spawn another delegate — finish the task in-context using the result you already have. Use read_file/read_slice/grep/graph tools directly if you need more detail."
+                        }),
+                    );
+                    record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+                    let _ = context
+                        .tx
+                        .send(AgentEvent::ToolCallCompleted {
+                            turn_id: context.turn_id,
+                            result: result.clone(),
+                        })
+                        .await;
+                    results[index] = Some(result);
+                    recorded[index] = true;
+                    continue;
+                }
+            }
             // Pre-bump the `subagent_calls` counter before the future
             // is spawned so the in-flight tally stays conservative even
             // while several delegates run concurrently. Per-outcome

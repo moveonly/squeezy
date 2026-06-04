@@ -469,6 +469,72 @@ pub(crate) fn window_line_offset(
     }
     Ok(newlines)
 }
+
+/// Translate a 1-based, inclusive `[start_line, end_line]` request into the
+/// byte `(offset, limit)` window that `read_file` (which is byte-addressed)
+/// expects. `start_line` defaults to 1 and `end_line` defaults to the end of
+/// file. Streams the file in 8 KiB chunks so large files do not have to be
+/// slurped into memory. `end_line` is clamped to be at least `start_line`.
+///
+/// Returns `(byte_offset_of_start_line, byte_len_through_end_line)`. When
+/// `end_line` is omitted the limit covers the rest of the file from
+/// `start_line`. A `start_line` past EOF yields an offset at EOF with a zero
+/// limit (the handler then returns an empty—but successful—slice rather than
+/// erroring).
+pub(crate) fn byte_window_for_line_range(
+    path: &Path,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> std::result::Result<(usize, usize), std::io::Error> {
+    use std::io::{BufReader, Read};
+    let start_line = start_line.unwrap_or(1).max(1);
+    let end_line = end_line.map(|end| end.max(start_line));
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0u8; 8192];
+
+    // 1-based line we are currently inside; advances on every '\n'.
+    let mut current_line: u32 = 1;
+    let mut byte_pos: usize = 0;
+    let mut start_offset: Option<usize> = None;
+    // Byte position just past the last newline that closes `end_line`.
+    let mut end_offset: Option<usize> = None;
+
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buf[..read] {
+            if start_offset.is_none() && current_line == start_line {
+                start_offset = Some(byte_pos);
+            }
+            byte_pos += 1;
+            if byte == b'\n' {
+                if let Some(end_line) = end_line
+                    && current_line == end_line
+                    && end_offset.is_none()
+                {
+                    end_offset = Some(byte_pos);
+                }
+                current_line = current_line.saturating_add(1);
+            }
+        }
+        if start_offset.is_some() && end_offset.is_some() {
+            break;
+        }
+    }
+
+    // `start_line` may begin exactly at EOF (file ends with a newline and the
+    // request points one past the last line) — settle on the EOF position.
+    let start = start_offset.unwrap_or(byte_pos);
+    // No closing newline for `end_line` (last line unterminated, or end_line
+    // beyond EOF): read through the end of file.
+    let end = end_offset.unwrap_or(byte_pos).max(start);
+    Ok((start, end - start))
+}
+
 fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> bool {
     let Some(filter) = filter else {
         return true;

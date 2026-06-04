@@ -631,6 +631,121 @@ fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
     });
 }
 
+/// P1.3: a `delegate` subagent that crosses the configured
+/// `max_round_input_tokens` ceiling on a later round must STOP and return
+/// the best-effort answer it already gathered (fail-soft, Success — not a
+/// timeout or error), rather than running its loop out to millions of input
+/// tokens. The ceiling is set high enough that the parent's tiny
+/// conversation never trips it, but the subagent's round-1 conversation —
+/// which carries a large file read — does.
+#[test]
+fn delegate_subagent_stops_on_round_input_ceiling_with_best_effort() {
+    run_high_stack_test(async {
+        let root = temp_workspace("delegate_input_ceiling");
+        // A file with many matching lines so the subagent's round-0 `grep`
+        // returns a sizeable result. After the (preview-bounded) result lands
+        // in the subagent conversation, its round-1 request clears the 1k
+        // ceiling, while the parent's tiny conversation (user msg + the capped
+        // delegate summary) stays under it — isolating the gate to the
+        // subagent.
+        let needles = "fn needle_marker() {} // matchable line\n".repeat(400);
+        fs::write(root.join("src.rs"), needles).expect("write source");
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // Parent round 0: spawn the delegate.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_runaway".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: serde_json::json!({"prompt": "scan the tree"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Subagent round 0: emit the best-effort marker text + a grep that
+            // returns many matches, so the round-1 conversation crosses the
+            // ceiling.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("partial subagent findings".to_string())),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_grep".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "needle_marker"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("sub_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // The subagent's round 1 must be gated before it ever reaches the
+            // provider. The next response served therefore goes to the PARENT
+            // (its post-delegate round), which finishes the turn. If the gate
+            // failed to fire, the subagent would consume this response and the
+            // parent would instead see an empty stream, failing the asserts.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("parent done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+
+        let mut config = config_for(root.clone());
+        config.max_round_input_tokens = Some(1000);
+        let agent = Agent::new(config, provider.clone());
+
+        drain_turn(agent.start_turn("audit the tree".to_string(), CancellationToken::new())).await;
+
+        let requests = provider.requests();
+        // Exactly three provider hits: parent round 0, subagent round 0,
+        // parent post-delegate round. A fourth would mean the subagent ran a
+        // second (un-gated) round.
+        assert_eq!(
+            requests.len(),
+            3,
+            "subagent must be gated before its second round (got {} requests)",
+            requests.len()
+        );
+
+        // The parent's final request carries the delegate result. It must be
+        // a normal Success completion (status "completed", not "timed_out")
+        // whose best-effort summary preserves the pre-gate findings.
+        let parent_outputs = function_outputs(&requests[2]);
+        let delegate_output = parent_outputs
+            .iter()
+            .find(|(call_id, _)| *call_id == "del_runaway")
+            .map(|(_, value)| value)
+            .expect("parent final request must carry the delegate output");
+        let content = &delegate_output["content"];
+        assert_eq!(content["ok"], true, "subagent must fail soft: {content}");
+        assert_eq!(
+            content["status"], "completed",
+            "gated subagent must report a normal completion, not a timeout: {content}"
+        );
+        assert!(
+            content["summary"]
+                .as_str()
+                .expect("summary string")
+                .contains("partial subagent findings"),
+            "best-effort summary must carry the pre-gate findings: {content}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
 /// Drive a one-tool explore subagent end-to-end and return the captured
 /// provider requests. `provider_name` selects which registry capability row
 /// the agent looks up; `subagent_model` is the resolved explore model. The
@@ -906,13 +1021,21 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
 }
 
 #[test]
-fn delegate_batch_with_child_tool_fanout_runs_on_production_worker_stack() {
+fn delegate_with_child_tool_fanout_runs_on_production_worker_stack() {
     // Mirror the production runtime: `squeezy-cli` builds its multi-threaded
     // Tokio runtime with a 16 MiB worker stack (see
     // `WORKER_THREAD_STACK_SIZE` in `crates/squeezy-cli/src/main.rs`). The
-    // delegate fan-out (parent tool loop → subagent dispatch → subagent
-    // round loop → child tool fan-out) must complete without overflowing
-    // that stack on any platform.
+    // delegate path (parent tool loop → subagent dispatch → subagent round
+    // loop → child tool fan-out) must complete without overflowing that stack
+    // on any platform.
+    //
+    // The provider scripts THREE `delegate` calls in ONE parent round, but the
+    // P1.1 whole-task gate (`MAX_DELEGATES_PER_TASK = 1`) caps the task to a
+    // single `delegate` — including a same-round parallel batch, since the
+    // measured waste was exactly 2-3 overlapping whole-tree re-scans. The first
+    // delegate runs (fanning out its 8 child reads — the deep path this test
+    // guards), the other two are refused without spawning. The single deep
+    // fan-out still exercises the worker stack end to end.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(16 * 1024 * 1024)
@@ -922,13 +1045,13 @@ fn delegate_batch_with_child_tool_fanout_runs_on_production_worker_stack() {
     runtime.block_on(async {
         let root = temp_workspace("delegate_batch_production_stack");
         const TOOL_CALLS: usize = 8;
-        const SUBAGENTS: usize = 3;
+        const MAX_CONCURRENT: usize = 3;
         for index in 0..TOOL_CALLS {
             fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
         }
         let provider = Arc::new(DelegateFanoutProvider::default());
         let mut config = config_for(root.clone());
-        config.subagents.max_concurrent = SUBAGENTS;
+        config.subagents.max_concurrent = MAX_CONCURRENT;
         let agent = Agent::new(config, provider.clone());
 
         let drain = drain_turn(agent.start_turn("fan out".to_string(), CancellationToken::new()));
@@ -937,12 +1060,12 @@ fn delegate_batch_with_child_tool_fanout_runs_on_production_worker_stack() {
             .expect("delegate fanout should finish on the production worker stack");
 
         let snapshot = agent.session_accounting_snapshot().await;
-        assert_eq!(snapshot.metrics.subagent_calls, SUBAGENTS as u64);
+        // Exactly one delegate runs (the gate refuses the other two before they
+        // take a lease, so neither counts as a call or a failure), and it fans
+        // out its full child read batch.
+        assert_eq!(snapshot.metrics.subagent_calls, 1);
         assert_eq!(snapshot.metrics.subagent_failures, 0);
-        assert_eq!(
-            snapshot.metrics.subagent_tool_calls,
-            (SUBAGENTS * TOOL_CALLS) as u64
-        );
+        assert_eq!(snapshot.metrics.subagent_tool_calls, TOOL_CALLS as u64);
         assert_eq!(
             provider
                 .requests()

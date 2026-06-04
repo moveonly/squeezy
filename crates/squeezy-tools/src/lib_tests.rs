@@ -11689,6 +11689,76 @@ async fn read_file_dispatch_misspelled_alias_still_fails() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn read_file_accepts_start_line_end_line_aliases() {
+    // P0.1: Haiku frequently addresses `read_file` with the `read_slice`
+    // line-window vocabulary (`start_line`/`end_line`). Before this fix the
+    // `deny_unknown_fields` schema hard-rejected the call, the model retried
+    // identically, and the repeated-failure abort path emitted a zero-char
+    // answer. The aliases must now resolve to the correct byte window.
+    let root = temp_workspace("read_file_line_alias");
+    let body = "line one\nline two\nline three\nline four\nline five\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "line_alias".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "start_line": 2, "end_line": 4}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(
+        result.status,
+        ToolStatus::Success,
+        "start_line/end_line must not trip deny_unknown_fields: {:?}",
+        result.content
+    );
+    assert_eq!(result.content["start_line"], 2);
+    let content = result.content["content"].as_str().expect("content string");
+    // cat -n format, absolute line numbers, lines 2..=4 inclusive (the
+    // closing newline of line 4 is part of the byte window).
+    assert_eq!(content, "2\tline two\n3\tline three\n4\tline four\n");
+    assert!(
+        !content.contains("line one") && !content.contains("line five"),
+        "window must not bleed past the requested line range: {content}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_start_line_only_reads_to_end_of_file() {
+    // `start_line` without `end_line` reads from that line through EOF, the
+    // same open-ended semantics `read_slice` offers.
+    let root = temp_workspace("read_file_start_line_only");
+    let body = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "start_only".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "start_line": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["start_line"], 2);
+    let content = result.content["content"].as_str().expect("content string");
+    assert_eq!(content, "2\tbeta\n3\tgamma\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// The always-sent core tool prefix (tool name + description + serialized
 /// JSON schema for every first-party spec) is what every request pays for
 /// and what the provider prompt cache hashes. This is a byte-regression

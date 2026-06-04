@@ -120,6 +120,14 @@ pub(crate) struct ReadFileArgs {
     pub(crate) path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    /// 1-based first line to read. Haiku routinely passes `start_line`/
+    /// `end_line` (the `read_slice` line-window vocabulary) to `read_file`
+    /// even though this tool is byte-addressed. Accept them as aliases and
+    /// convert to a byte window in the handler instead of hard-rejecting
+    /// (`deny_unknown_fields`) and tripping the repeated-failure abort path.
+    start_line: Option<u32>,
+    /// 1-based last line to read, inclusive. Paired with `start_line`.
+    end_line: Option<u32>,
     diff_only: Option<bool>,
 }
 
@@ -839,8 +847,37 @@ impl ToolRegistry {
             );
         }
 
-        let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
-        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+        // Haiku frequently addresses `read_file` with the `read_slice`
+        // line-window vocabulary (`start_line`/`end_line`). When the caller
+        // supplied a line range and did not pin an explicit byte `offset`,
+        // translate the inclusive line span into the byte window this tool
+        // expects. Explicit byte `offset`/`limit` still win so existing
+        // byte-addressed callers are unchanged.
+        let (offset, limit) =
+            if args.offset.is_none() && (args.start_line.is_some() || args.end_line.is_some()) {
+                match crate::graph_tools::byte_window_for_line_range(
+                    &path,
+                    args.start_line,
+                    args.end_line,
+                ) {
+                    Ok((line_offset, line_limit)) => {
+                        let offset = line_offset.min(total_bytes as usize);
+                        // An explicit `limit` (bytes) caps the line-derived span;
+                        // otherwise the line range fully determines the window,
+                        // still bounded by MAX_READ_LIMIT for output safety.
+                        let limit = args
+                            .limit
+                            .map_or(line_limit, |explicit| line_limit.min(explicit))
+                            .min(MAX_READ_LIMIT);
+                        (offset, limit)
+                    }
+                    Err(err) => return tool_error(call, err),
+                }
+            } else {
+                let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
+                let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+                (offset, limit)
+            };
 
         // F03: dedup against the last receipt for this (path, offset, end)
         // window. Mirror the pattern used by `read_slice_last_receipt_diff`:
