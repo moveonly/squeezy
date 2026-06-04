@@ -17,12 +17,6 @@
 //! on [`classify_route`]; per-startup dispatch would lock a session to a
 //! single wire even when the user switches Grok generations mid-run.
 //!
-//! H-22 (extra_headers asymmetry): the Responses route currently drops
-//! `OpenAiCompatibleConfig::extra_headers` in `openai.rs::from_xai_config`
-//! while the Chat route honours them. Fixing the asymmetry lives in
-//! `openai.rs` (Phase 4B owns that file) and is intentionally not patched
-//! here. Coordinate with that phase before declaring the audit closed.
-//!
 //! M-31 (xAI `usage.cached_tokens` fallback): the chat-completions cost
 //! parser in `compatible.rs` only consults
 //! `prompt_tokens_details.cached_tokens` and `prompt_cache_hit_tokens`,
@@ -84,12 +78,11 @@ impl XaiProvider {
             "xai",
             api_key_source.clone(),
             resolved_base_url.clone(),
-            // The Responses route ignores `extra_headers` by design
-            // (see H-22 TODO at module head); no api_version applies to
-            // xAI's `/v1/responses` endpoint.
+            // No api_version applies to xAI's `/v1/responses` endpoint.
             None,
             config.transport,
-        );
+        )
+        .with_extra_headers(config.extra_headers.clone());
 
         // The chat route still merges any user-supplied headers on top
         // of the (empty) preset defaults so xAI requests routed through

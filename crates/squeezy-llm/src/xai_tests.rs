@@ -601,14 +601,10 @@ async fn xai_chat_sse_replay_surfaces_text_and_reasoning_cost_m30() {
 }
 
 #[tokio::test]
-async fn xai_chat_route_includes_extra_headers_responses_route_drops_them_m30() {
-    // M-30: lock in the documented H-22 asymmetry. User-supplied
-    // headers (telemetry / proxy attribution) reach the Chat route via
-    // `OpenAiCompatibleProvider`, but `from_xai_config` intentionally
-    // drops them on the Responses route. Once `openai.rs` honours
-    // `extra_headers` on both routes (H-22), this test flips its
-    // Responses-side expectation and the assertion becomes a guard
-    // against regressing the fix.
+async fn xai_chat_and_responses_routes_include_extra_headers_m30() {
+    // M-30/H-22: user-supplied headers (telemetry / proxy attribution)
+    // must reach both xAI sub-clients. Current Grok models route to
+    // Responses, so dropping headers there loses the main path.
     let mut extra = BTreeMap::new();
     extra.insert(
         "helicone-property-tag".to_string(),
@@ -659,9 +655,13 @@ async fn xai_chat_route_includes_extra_headers_responses_route_drops_them_m30() 
         Some("squeezy-xai-m30"),
         "Chat route must forward extra_headers"
     );
-    assert!(
-        !responses.headers.contains_key("helicone-property-tag"),
-        "Responses route intentionally drops extra_headers (H-22 lives in openai.rs)"
+    assert_eq!(
+        responses
+            .headers
+            .get("helicone-property-tag")
+            .map(String::as_str),
+        Some("squeezy-xai-m30"),
+        "Responses route must forward extra_headers"
     );
 }
 

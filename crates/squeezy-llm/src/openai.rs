@@ -154,10 +154,9 @@ impl OpenAiProvider {
     /// endpoint. Reuses the OpenAI request body and SSE parser because xAI
     /// implements the Responses wire as a near-drop-in for Grok 3 and Grok 4
     /// (see `https://docs.x.ai/docs/api-reference/responses`). The
-    /// `OpenAiCompatibleConfig::extra_headers` map is intentionally ignored
-    /// here — those headers (HTTP-Referer, X-Title, x-portkey-*) are
-    /// chat-completions aggregator concerns and have no analogue on a
-    /// dedicated vendor Responses endpoint.
+    /// `OpenAiCompatibleConfig::extra_headers` map is forwarded so proxy,
+    /// routing, telemetry, and attribution headers behave the same on xAI's
+    /// Responses and Chat routes.
     pub fn from_xai_config(config: &OpenAiCompatibleConfig) -> Result<Self> {
         debug_assert_eq!(config.preset, OpenAiCompatiblePreset::XAi);
         if config.base_url.trim().is_empty() {
@@ -173,7 +172,8 @@ impl OpenAiProvider {
             config.base_url.trim_end_matches('/').to_string(),
             None,
             config.transport,
-        ))
+        )
+        .with_extra_headers(config.extra_headers.clone()))
     }
 
     /// Construct the provider against an already-built credential
@@ -199,6 +199,11 @@ impl OpenAiProvider {
             None,
             transport,
         )
+    }
+
+    pub(crate) fn with_extra_headers(mut self, extra_headers: BTreeMap<String, String>) -> Self {
+        self.extra_headers = extra_headers;
+        self
     }
 
     fn with_api_key_source_and_options(
