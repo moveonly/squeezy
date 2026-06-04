@@ -7813,8 +7813,8 @@ async fn routing_judge_spend_crossing_warn_threshold_still_surfaces_cost_warning
         // the judge actually dispatches.
         small_fast_model: Some("cheap-model".to_string()),
         routing: squeezy_core::RoutingConfig {
-            auto_cheap: true,
-            auto_cheap_llm_judge: true,
+            enabled: true,
+            llm_judge: true,
             ..AppConfig::default().routing
         },
         max_session_cost_usd_micros: Some(10_000),
@@ -9959,42 +9959,6 @@ fn tool_round_path_collector_ignores_dotted_non_path_tokens() {
     assert_eq!(
         paths,
         BTreeSet::from(["lib.rs".to_string(), "src/main.rs".to_string()])
-    );
-}
-
-#[test]
-fn subagent_activity_message_maps_tool_lifecycle_events() {
-    let call = ToolCall {
-        call_id: "c1".to_string(),
-        name: "read_file".to_string(),
-        arguments: json!({"path": "src/lib.rs"}),
-    };
-    let started = subagent_activity_message(AgentEvent::ToolCallStarted {
-        turn_id: TurnId::new(1),
-        call: call.clone(),
-        origin: ToolOrigin::Model,
-    })
-    .expect("started maps to a message");
-    assert!(started.starts_with("running read_file"), "{started}");
-    assert!(started.contains("src/lib.rs"), "{started}");
-
-    let result = squeezy_tools::ToolResult::denied(&call, "capped");
-    let completed = subagent_activity_message(AgentEvent::ToolCallCompleted {
-        turn_id: TurnId::new(1),
-        result,
-    })
-    .expect("completed maps to a message");
-    assert_eq!(completed, "completed read_file denied");
-
-    // Non tool-call events carry no activity line.
-    assert!(
-        subagent_activity_message(AgentEvent::SubagentActivity {
-            turn_id: TurnId::new(1),
-            id: 1,
-            agent: "delegate".to_string(),
-            message: "x".to_string(),
-        })
-        .is_none()
     );
 }
 

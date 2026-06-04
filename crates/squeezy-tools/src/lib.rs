@@ -36,6 +36,10 @@ pub use squeezy_mcp::{
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
 use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
+use squeezy_telemetry::{
+    ErrorKind as TelemetryErrorKind, GraphPerfReport, GraphSequenceScope, LanguageDistribution,
+    OutcomeStatus, RefreshKind, TelemetryClient, TelemetryEvent,
+};
 use squeezy_vcs::{
     CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs,
     canonicalize_workspace_root, strip_verbatim_prefix,
@@ -99,7 +103,7 @@ pub(crate) use shell::{
 use shell_output::insert_content_field;
 #[cfg(test)]
 use shell_output::shape_shell_output;
-use shell_parse::analyze_shell_command;
+use shell_parse::{analyze_shell_command, extract_shell_write_targets};
 #[cfg(test)]
 use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
@@ -207,6 +211,9 @@ pub struct ToolRegistryRuntime {
     pub graph_cache_root: Option<PathBuf>,
     /// Shared redactor used by tools that surface user-visible text.
     pub redactor: Arc<Redactor>,
+    /// Best-effort anonymous telemetry sink. Disabled by default for tests and
+    /// non-agent callers.
+    pub telemetry: Option<TelemetryClient>,
 }
 
 impl ToolRegistryRuntime {
@@ -223,7 +230,92 @@ impl ToolRegistryRuntime {
             state_store,
             graph_cache_root,
             redactor,
+            telemetry: None,
         }
+    }
+
+    pub fn with_telemetry(mut self, telemetry: TelemetryClient) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+}
+
+fn emit_graph_build_telemetry(
+    telemetry: &TelemetryClient,
+    opened: &squeezy_core::Result<GraphManager>,
+) {
+    let event = match opened {
+        Ok(manager) => TelemetryEvent::graph_build_completed(graph_build_perf_report(manager)),
+        Err(_) => TelemetryEvent::graph_build_completed(GraphPerfReport {
+            refresh_kind: RefreshKind::Cold,
+            status: OutcomeStatus::Error,
+            sequence_scope: GraphSequenceScope::OneShot,
+            duration_ms: 0,
+            files_seen: 0,
+            files_changed: 0,
+            files_parsed: 0,
+            bytes_parsed: 0,
+            excluded_files: 0,
+            excluded_dirs: 0,
+            excluded_bytes: 0,
+            persisted_files_loaded: 0,
+            persisted_files_missed: 0,
+            persistence_rebuilt: false,
+            symbols: 0,
+            edges: 0,
+            language_distribution: LanguageDistribution::default(),
+            error_kind: Some(TelemetryErrorKind::Graph),
+        }),
+    };
+    telemetry.spawn(event);
+}
+
+fn graph_build_perf_report(manager: &GraphManager) -> GraphPerfReport {
+    let report = manager.build_report();
+    GraphPerfReport {
+        refresh_kind: RefreshKind::Cold,
+        status: OutcomeStatus::Success,
+        sequence_scope: GraphSequenceScope::OneShot,
+        duration_ms: report.duration_ms as u64,
+        files_seen: report.files_seen as u64,
+        files_changed: report.parsed_files as u64,
+        files_parsed: report.parsed_files as u64,
+        bytes_parsed: report.bytes_seen,
+        excluded_files: report.excluded_files as u64,
+        excluded_dirs: report.excluded_dirs as u64,
+        excluded_bytes: report.excluded_bytes,
+        persisted_files_loaded: report.persisted_files_loaded as u64,
+        persisted_files_missed: report.persisted_files_missed as u64,
+        persistence_rebuilt: report.persistence_rebuilt,
+        symbols: report.stats.symbols as u64,
+        edges: report.stats.edges as u64,
+        language_distribution: language_distribution(&report.language),
+        error_kind: None,
+    }
+}
+
+fn language_distribution(report: &LanguageReport) -> LanguageDistribution {
+    LanguageDistribution {
+        c_files: report.c_files as u64,
+        csharp_files: report.csharp_files as u64,
+        cpp_files: report.cpp_files as u64,
+        dart_files: report.dart_files as u64,
+        go_files: report.go_files as u64,
+        java_files: report.java_files as u64,
+        javascript_files: report.javascript_files as u64,
+        jsx_files: report.jsx_files as u64,
+        kotlin_files: report.kotlin_files as u64,
+        php_files: report.php_files as u64,
+        python_files: report.python_files as u64,
+        ruby_files: report.ruby_files as u64,
+        rust_files: report.rust_files as u64,
+        scala_files: report.scala_files as u64,
+        swift_files: report.swift_files as u64,
+        typescript_files: report.typescript_files as u64,
+        tsx_files: report.tsx_files as u64,
+        supported_files: report.supported_files as u64,
+        unsupported_files: report.unsupported_files as u64,
+        unknown_files: report.unknown_files as u64,
     }
 }
 
@@ -1163,6 +1255,7 @@ impl ToolRegistry {
             state_store,
             graph_cache_root,
             redactor,
+            telemetry,
         } = runtime;
         let full_access = config.full_access;
         let output_store = ToolOutputStore::new(&root, config.output)?;
@@ -1192,6 +1285,7 @@ impl ToolRegistry {
                 let crawl_options_for_graph = crawl_options.clone();
                 let graph_cache_root_for_graph = graph_cache_root.clone();
                 let persist_graph = state_store.is_some();
+                let telemetry_for_graph = telemetry.clone();
                 handle.spawn_blocking(move || {
                     let graph_store = persist_graph
                         .then(|| {
@@ -1200,13 +1294,16 @@ impl ToolRegistry {
                                 .map(Arc::new)
                         })
                         .flatten();
-                    let opened = GraphManager::open_with_store(
+                    let opened_result = GraphManager::open_with_store(
                         &root_for_graph,
                         Default::default(),
                         crawl_options_for_graph,
                         graph_store,
-                    )
-                    .ok();
+                    );
+                    if let Some(telemetry) = telemetry_for_graph.as_ref() {
+                        emit_graph_build_telemetry(telemetry, &opened_result);
+                    }
+                    let opened = opened_result.ok();
                     if let Ok(mut slot) = graph.lock() {
                         *slot = opened;
                     }
@@ -1226,13 +1323,16 @@ impl ToolRegistry {
                             .map(Arc::new)
                     })
                     .flatten();
-                let opened = GraphManager::open_with_store(
+                let opened_result = GraphManager::open_with_store(
                     &root,
                     Default::default(),
                     crawl_options.clone(),
                     graph_store,
-                )
-                .ok();
+                );
+                if let Some(telemetry) = telemetry.as_ref() {
+                    emit_graph_build_telemetry(telemetry, &opened_result);
+                }
+                let opened = opened_result.ok();
                 if let Ok(mut slot) = graph.lock() {
                     *slot = opened;
                 }
@@ -1902,6 +2002,15 @@ impl ToolRegistry {
                     .map(|args| args.command.as_str())
                     .unwrap_or("");
                 let analysis = analyze_shell_command(command);
+                // A file-mutating shell command whose write target escapes the
+                // workspace (e.g. `sed -i ~/.bashrc`, `tee /etc/hosts`,
+                // `cp secret ~/exfil`, `chmod 777 /etc/passwd`) must escalate
+                // like the structured edit tools do, rather than auto-allowing
+                // under the workspace-write `shell`/`edit` defaults. The
+                // matching gate is `path_request_targets_outside_workspace`.
+                if self.shell_command_writes_outside_workspace(command) {
+                    metadata.insert("outside_workspace".to_string(), "true".to_string());
+                }
                 let workdir = args
                     .as_ref()
                     .and_then(|args| args.workdir.as_deref())
@@ -2159,6 +2268,21 @@ impl ToolRegistry {
     fn raw_path_targets_outside_workspace(&self, raw: &str) -> bool {
         let path = Path::new(raw);
         path.is_absolute() && !path.starts_with(self.root.as_ref())
+    }
+
+    /// True when any write target extracted from `command` resolves outside
+    /// the permission-writable roots (workspace + OS temp + configured
+    /// `write_roots`). Temp dirs are treated as in-bounds so routine
+    /// `mktemp`/`/tmp` scratch writes do not prompt, matching the shell
+    /// sandbox's writable roots.
+    fn shell_command_writes_outside_workspace(&self, command: &str) -> bool {
+        extract_shell_write_targets(command).iter().any(|target| {
+            safety::path_escapes_permission_writable_roots(
+                target,
+                self.root.as_ref(),
+                &self.shell_sandbox,
+            )
+        })
     }
 
     fn call_has_outside_path_grant(&self, call_id: &str, capability: PermissionCapability) -> bool {

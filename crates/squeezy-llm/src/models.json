@@ -219,6 +219,38 @@
   },
   {
     "provider": "google",
+    "id": "gemini-3.5-flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": false,
+      "prompt_caching": true,
+      "thinking_budget_min": null,
+      "thinking_budget_max": null
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1500000,
+      "output_usd_micros_per_mtok": 9000000,
+      "cache_read_usd_micros_per_mtok": 150000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://ai.google.dev/gemini-api/docs/pricing"
+  },
+  {
+    "provider": "google",
     "id": "gemini-2.5-flash",
     "profile": "balanced",
     "capabilities": {

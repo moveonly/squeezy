@@ -126,8 +126,8 @@ fn config_with_routing() -> AppConfig {
     config.model = PARENT_MODEL.to_string();
     // Routing is opt-out in production; the integration tests opt in
     // explicitly because they want to exercise the routed path.
-    config.routing.auto_cheap = true;
-    config.routing.auto_cheap_llm_judge = true;
+    config.routing.enabled = true;
+    config.routing.llm_judge = true;
     config.routing.escalation_sticky_turns = 3;
     // Tighten the escalation thresholds so the scripted refusal triggers
     // the handoff without having to script a long stream.

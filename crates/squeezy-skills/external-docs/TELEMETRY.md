@@ -48,36 +48,37 @@ only metadata to PostHog.
 Squeezy creates one random anonymous `user_id` and stores it at
 `~/.squeezy/install_id`. The value is stable across sessions on that machine and
 is used only to count anonymous unique users. Each process also gets a random
-`session_id`. Every event has a millisecond timestamp and an increasing
-`event_sequence`, so a dashboard can reconstruct the order of events within one
-session.
+`session_id`. Local telemetry facts are written with a millisecond timestamp
+and an increasing local sequence, then reduced into one bounded session summary
+before upload.
 
 ## Events
 
-Squeezy sends typed events with allowlisted numeric counters and enum values:
+Squeezy sends one typed product telemetry event per completed session:
 
-- `squeezy_app_started`: provider family and model family.
-- `squeezy_turn_completed`: per-turn aggregate tool counts, read/search
-  counters, output bytes, receipt stub hits, budget denials, token counters,
-  cache counters, and estimated cost when available.
-- `squeezy_tool_completed`: one event per first-party Squeezy tool call with
-  `turn_index`, `tool_sequence`, tool name/family, status, duration in
-  milliseconds, files scanned, bytes read, output bytes, and matches returned.
-- `squeezy_failure_seen`: coarse error kind such as provider, tool, permission,
-  budget, graph, I/O, config, or unknown.
+- `squeezy_session_summary`: aggregate startup route/timing, session status,
+  turn/tool counts, graph build/refresh counters, slash/config/routing/failure
+  counts, token/cost counters, and capped top-count maps for sanitized tool,
+  slash-command, failure, routing, and config-field tokens.
 
-The schema also reserves `squeezy_graph_build_completed` and
-`squeezy_graph_refresh_completed` (graph build/refresh timing, file counts,
-language distribution, symbols, and edges). These names are accepted by the
-Worker but are not yet emitted by the binary; they are reserved for the
-graph runtime that will own `GraphManager` once it is wired into the session.
+The local ledger may contain detailed safe facts such as startup readiness,
+turn completion, tool completion, graph build/refresh, slash command use,
+config changes, routing decisions, and coarse failures. Those local facts are
+not uploaded individually by the product telemetry path.
 
-Telemetry is silently disabled when the install_id cannot be loaded or
-persisted (read-only `$HOME`, missing `$HOME`, ENOSPC, etc.) so that a
-degraded environment does not invent a fresh anonymous user per process.
+Safe local facts are persisted in a durable telemetry ledger before network
+delivery. On normal CLI/TUI exit, Squeezy stores the reduced summary as pending
+before attempting upload. If upload fails or the process exits before upload
+finishes, pending summaries are retried on the next startup and after explicit
+`doctor` update checks. Pending summaries and their source local facts are
+deleted only after the telemetry Worker returns success.
 
-Events are buffered locally and sent in small batches, up to 50 events per
-request. Squeezy flushes queued telemetry on normal CLI/TUI exit.
+Telemetry upload is best effort and never blocks prompt readiness. If the
+ledger cannot be opened, Squeezy falls back to process-local best-effort
+buffering for that run. Telemetry is silently disabled when the install_id
+cannot be loaded or persisted (read-only `$HOME`, missing `$HOME`, ENOSPC,
+etc.) so that a degraded environment does not invent a fresh anonymous user per
+process.
 
 ## What Is Never Sent
 
@@ -114,9 +115,11 @@ telemetry.
 
 The Squeezy binary never contains the PostHog project token. Clients send to a
 Cloudflare Worker proxy; the Worker reads `POSTHOG_PROJECT_TOKEN` from a
-Cloudflare secret, validates a strict schema, rejects unknown fields, and then
-forwards sanitized events to PostHog. Worker source lives in
-`infra/telemetry-worker/` and is written in TypeScript.
+Cloudflare secret, validates a strict batch envelope, accepts only `squeezy_*`
+product event names, and forwards bounded safe property values to PostHog.
+Unsafe product properties such as raw text, paths, URLs, arrays, and arbitrary
+nested objects are dropped. Worker source lives in `infra/telemetry-worker/`
+and is written in TypeScript.
 
 Because the endpoint is public, abuse protection belongs at the Worker and
 Cloudflare layer: request size limits, strict validation, WAF/rate limits, and

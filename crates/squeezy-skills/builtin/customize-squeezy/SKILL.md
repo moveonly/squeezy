@@ -226,8 +226,8 @@ and apply-tier (immediate / next prompt / restart required).
    confirm which source supplied each value.
 5. Run `squeezy doctor` to validate the merged config.
 6. If the field's apply tier is "restart required" (e.g. `[graph]`,
-   `[session].log_dir`, `[tui].alternate_screen`), restart the TUI; the
-   config screen also surfaces a "restart required" notification.
+   `[session].log_dir`), restart the TUI; the config screen also surfaces a
+   "restart required" notification.
 
 Unknown fields, invalid enum values, and invalid numeric limits are
 warned and stripped, not silently accepted. Provider config errors stay

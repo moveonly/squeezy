@@ -2,8 +2,11 @@
 
 This Cloudflare Worker is the only component that knows the PostHog project
 token. Squeezy clients send anonymous telemetry to `/v1/batch`; the Worker
-validates the schema and forwards only allowlisted event names, enum values,
-timestamps, and numeric counters to PostHog.
+validates the batch envelope, accepts product event names matching
+`squeezy_*`, and forwards only bounded safe properties to PostHog. Accepted
+property shapes are non-negative counters, booleans, token strings, and small
+count maps; raw text, paths, URLs, arrays, and arbitrary nested objects are
+dropped.
 
 The Worker also accepts consented maintainer-intake traffic:
 
@@ -55,19 +58,22 @@ export POSTHOG_HOST=https://eu.posthog.com
 bun run setup:posthog
 ```
 
-The setup script creates usage, cost, failure, graph, feedback, and report
-metadata insights on the `Squeezy Telemetry` dashboard.
+The setup script creates usage, cost, reliability, graph, feedback, and report
+metadata insights. Product insights are based on `squeezy_session_summary`;
+website, feedback, and report endpoints keep their separate event names.
 
 ## Smoke Test
 
-After deployment, send one synthetic telemetry batch through the Worker:
+After deployment, send one synthetic `squeezy_session_summary` batch through
+the Worker:
 
 ```sh
 export TELEMETRY_ENDPOINT=https://squeezy-telemetry.esqueezy.workers.dev/v1/batch
 bun run smoke:worker
 ```
 
-Then verify recent Squeezy events reached PostHog:
+Then verify recent session-summary events reached PostHog, including their full
+PostHog properties payload:
 
 ```sh
 export POSTHOG_PERSONAL_API_KEY=...
@@ -89,5 +95,5 @@ Recommended production controls:
 
 The endpoint intentionally has no client secret. A shipped client secret would
 not protect a public binary. The protection boundary is that the PostHog token
-never leaves the Worker, payloads are small, and arbitrary strings or unknown
-fields are rejected.
+never leaves the Worker, payloads are small, and unsafe product properties are
+dropped before forwarding.

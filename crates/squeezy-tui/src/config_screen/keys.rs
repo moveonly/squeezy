@@ -6,8 +6,9 @@ use squeezy_core::{
 };
 
 use super::{
-    ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome, ModelPickerState,
-    SearchOverlayState, SecretEntryState, ThemeEditor, ThemeRow, clear_scope_override,
+    ConfigFeedback, ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome,
+    ModelPickerState, PromptEditorState, SearchOverlayState, SecretEntryState,
+    Severity as NotifySeverity, ThemeEditor, ThemeRow, clear_scope_override,
     clear_scope_override_silent, compute_search_matches, cycle_to_next_registry_model,
     discard_all_session_writes, handle_editor_key, model_field_meta, open_editor_for,
     perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
@@ -15,12 +16,11 @@ use super::{
     save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
     save_theme_snapshot, undo_last_write, unset_theme_color,
 };
-use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 
 pub(crate) fn handle_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     // Sub-modes take precedence over the regular browse keymap.
@@ -42,6 +42,9 @@ pub(crate) fn handle_key(
     if state.picker.is_some() {
         return handle_picker_key(state, agent, notifications, key);
     }
+    if state.prompt_editor.is_some() {
+        return handle_prompt_editor_key(state, agent, notifications, key);
+    }
     if let Some(editor) = &mut state.editor {
         let commit = handle_editor_key(editor, key);
         match commit {
@@ -53,13 +56,14 @@ pub(crate) fn handle_key(
             EditorOutcome::Commit(value) => {
                 state.editor = None;
                 let field = state.current_field();
+                let previous = (field.get)(&state.effective);
                 if let Err(msg) = (field.set)(&mut state.effective, value.clone()) {
                     notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
                 } else {
                     state.dirty = true;
                     // Save immediately; the apply pipeline below routes the
                     // change to the right tier and queues notifications.
-                    save_field(state, agent, notifications, field, value);
+                    save_field(state, agent, notifications, field, previous, value);
                 }
                 return KeyOutcome::KeepOpen;
             }
@@ -207,13 +211,13 @@ pub(crate) fn handle_key(
                     _ => None,
                 };
                 if should_clear {
-                    clear_scope_override_silent(state, notifications);
+                    clear_scope_override_silent(state, agent, notifications);
                     return KeyOutcome::KeepOpen;
                 }
                 if let Some(next) = next_value {
                     if (field.set)(&mut state.effective, next.clone()).is_ok() {
                         state.dirty = true;
-                        save_field_silent(state, agent, notifications, field, next);
+                        save_field_silent(state, agent, notifications, field, current_value, next);
                     }
                     return KeyOutcome::KeepOpen;
                 }
@@ -253,7 +257,7 @@ pub(crate) fn handle_key(
             if let Some(next) = next {
                 if (field.set)(&mut state.effective, next.clone()).is_ok() {
                     state.dirty = true;
-                    save_field_silent(state, agent, notifications, field, next);
+                    save_field_silent(state, agent, notifications, field, current_value, next);
                 }
             } else {
                 notifications.push(
@@ -292,8 +296,16 @@ pub(crate) fn handle_key(
                 );
                 return KeyOutcome::KeepOpen;
             }
-            // The model field opens a registry-driven picker; every other
-            // field goes through the regular per-kind editor.
+            // Read-only info rows (e.g. the Routing provider banner) have
+            // nothing to edit.
+            if matches!(field.kind, FieldKind::Info) {
+                return KeyOutcome::KeepOpen;
+            }
+            // The model field opens a registry-driven picker; the per-provider
+            // routing model fields stay free-text (a short id/alias like
+            // "haiku" — and the picker's cross-provider switch would be wrong
+            // for a provider-scoped routing model). Everything else uses the
+            // regular per-kind editor.
             if field.toml_path == ["model", "model"] {
                 // Look up by toml_path instead of the hard-coded
                 // `CONFIG_SECTIONS[0].fields[0]` so reordering Models'
@@ -333,6 +345,15 @@ pub(crate) fn handle_key(
                     ),
                     NotifySeverity::Info,
                 );
+            } else if matches!(field.kind, FieldKind::String { multiline: true }) {
+                // Long paragraph fields (the judge prompt) open a full-screen
+                // multi-line editor — the inline single-line caret overflows
+                // the row and can't show the text being edited.
+                let initial = match (field.get)(&state.effective) {
+                    FieldValue::String(s) => s,
+                    _ => String::new(),
+                };
+                state.prompt_editor = Some(PromptEditorState::new(initial));
             } else {
                 state.editor = Some(open_editor_for(field, (field.get)(&state.effective)));
             }
@@ -397,11 +418,12 @@ pub(crate) fn handle_key(
                 return KeyOutcome::KeepOpen;
             }
             let default_val = (field.default)();
+            let previous = (field.get)(&state.effective);
             if let Err(msg) = (field.set)(&mut state.effective, default_val.clone()) {
                 notifications.push(format!("reset failed: {msg}"), NotifySeverity::Error);
             } else {
                 state.dirty = true;
-                save_field(state, agent, notifications, field, default_val);
+                save_field(state, agent, notifications, field, previous, default_val);
             }
             KeyOutcome::KeepOpen
         }
@@ -433,7 +455,7 @@ pub(crate) fn handle_key(
                     );
                 }
                 ConfigScope::Repo | ConfigScope::Local => {
-                    clear_scope_override(state, notifications);
+                    clear_scope_override(state, agent, notifications);
                 }
             }
             KeyOutcome::KeepOpen
@@ -464,7 +486,7 @@ pub(crate) fn handle_key(
 fn handle_reset_confirm_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     let scope = state.reset_confirm.expect("checked by caller");
@@ -485,7 +507,7 @@ fn handle_reset_confirm_key(
 fn handle_discard_confirm_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     match (key.code, key.modifiers) {
@@ -502,10 +524,103 @@ fn handle_discard_confirm_key(
     KeyOutcome::KeepOpen
 }
 
+/// Full-screen multi-line editor for long String fields (the judge prompt).
+/// Enter inserts a newline; Ctrl+S saves and closes; Esc cancels (discarding
+/// edits, matching the inline editor). Clearing the buffer and saving reverts
+/// the field to its built-in default (the per-provider setter stores `None`).
+fn handle_prompt_editor_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut ConfigFeedback,
+    key: KeyEvent,
+) -> KeyOutcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            state.prompt_editor = None;
+        }
+        // Ctrl+S commits. (Ctrl+Enter is unreliable across terminals.)
+        KeyCode::Char('s') if ctrl => {
+            let value = state
+                .prompt_editor
+                .take()
+                .map(|e| e.draft)
+                .unwrap_or_default();
+            let field = state.current_field();
+            let previous = (field.get)(&state.effective);
+            if let Err(msg) = (field.set)(&mut state.effective, FieldValue::String(value.clone())) {
+                notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
+            } else {
+                state.dirty = true;
+                save_field(
+                    state,
+                    agent,
+                    notifications,
+                    field,
+                    previous,
+                    FieldValue::String(value),
+                );
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.insert_char('\n');
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.insert_char(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.backspace();
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.delete();
+            }
+        }
+        KeyCode::Left => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.right();
+            }
+        }
+        KeyCode::Up => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.up();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.down();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.home();
+            }
+        }
+        KeyCode::End => {
+            if let Some(ed) = state.prompt_editor.as_mut() {
+                ed.end();
+            }
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
 fn handle_picker_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     let picker = state.picker.as_mut().expect("checked by caller");
@@ -580,7 +695,7 @@ fn handle_picker_key(
 fn commit_model_picker(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     model_id: String,
 ) {
     state.picker = None;
@@ -601,6 +716,8 @@ fn commit_model_picker(
         FieldValue::Enum(s) => s,
         _ => "openai",
     };
+    let previous_provider_value = (provider_field.get)(&state.effective);
+    let previous_model_value = (model_field_meta().get)(&state.effective);
     let picked_provider = squeezy_llm::MODEL_REGISTRY
         .iter()
         .find(|m| m.id == model_id)
@@ -634,6 +751,7 @@ fn commit_model_picker(
             agent,
             notifications,
             provider_field,
+            previous_provider_value,
             FieldValue::Enum(new_provider),
         );
     } else {
@@ -642,14 +760,21 @@ fn commit_model_picker(
             return;
         }
         state.dirty = true;
-        save_field(state, agent, notifications, model_field, model_value);
+        save_field(
+            state,
+            agent,
+            notifications,
+            model_field,
+            previous_model_value,
+            model_value,
+        );
     }
 }
 
 fn handle_theme_row_action(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Theme(name)) => {
@@ -676,7 +801,7 @@ fn handle_theme_row_action(
 fn handle_theme_clear(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Color(token)) => {
@@ -692,7 +817,7 @@ fn handle_theme_clear(
     }
 }
 
-fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut NotificationQueue) {
+fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut ConfigFeedback) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Theme(name)) => open_theme_rename_editor(state, notifications, name),
         Some(ThemeRow::Color(_)) => {
@@ -713,7 +838,7 @@ fn handle_theme_rename(state: &mut ConfigScreenState, notifications: &mut Notifi
 fn handle_theme_delete(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match state.theme_row_at(state.field_index) {
         Some(ThemeRow::Theme(name)) => {
@@ -751,7 +876,7 @@ fn open_theme_name_editor(state: &mut ConfigScreenState) {
 
 fn open_theme_rename_editor(
     state: &mut ConfigScreenState,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     name: String,
 ) {
     if is_builtin_tui_theme_name(&name) {
@@ -786,7 +911,7 @@ fn next_theme_name(state: &ConfigScreenState) -> String {
 fn handle_theme_editor_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     if key.code == KeyCode::Esc {
@@ -819,7 +944,7 @@ fn handle_theme_editor_key(
 fn commit_theme_editor(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     let Some(editor) = state.theme_editor.take() else {
         return;
@@ -934,7 +1059,7 @@ fn parse_rgb_draft(draft: &str) -> Option<[u8; 3]> {
 
 fn open_api_key_entry_for_current_provider(
     state: &mut ConfigScreenState,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     match provider_api_key_env(&state.effective.provider) {
         Some((label, env_var)) => {
@@ -967,7 +1092,7 @@ fn open_api_key_entry_for_current_provider(
 fn handle_secret_entry_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     key: KeyEvent,
 ) -> KeyOutcome {
     let entry = state.secret_entry.as_mut().expect("checked by caller");

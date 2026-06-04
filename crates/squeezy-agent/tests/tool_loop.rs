@@ -4271,7 +4271,7 @@ fn config_for(root: PathBuf) -> AppConfig {
     // expects). Turn the router off so the borderline judge call does
     // not pop a queued response that the round expected to see. Tests
     // that want to exercise the router opt back in explicitly.
-    config.routing.auto_cheap = false;
+    config.routing.enabled = false;
     // These integration tests script the parent turn exactly. Tests that
     // exercise reviewer behavior live in lib_tests.rs and opt in explicitly.
     config.permissions.ai_reviewer.enabled = false;

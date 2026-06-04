@@ -41,17 +41,88 @@ fn permission_round_trip() {
     let mut cfg = AppConfig::from_env();
     let perms = section(SectionId::Permissions).unwrap();
     for f in perms.fields {
-        let options = if f.label == "mode" {
-            PERMISSION_POLICY_MODE_OPTIONS
-        } else {
-            PERMISSION_MODE_OPTIONS
-        };
-        for option in options {
-            (f.set)(&mut cfg, FieldValue::Enum(option)).unwrap();
-            match (f.get)(&cfg) {
-                FieldValue::Enum(v) => assert_eq!(v, *option, "{}", f.label),
-                other => panic!("unexpected: {:?}", other),
+        match f.kind {
+            FieldKind::Enum { options } => {
+                for option in options {
+                    (f.set)(&mut cfg, FieldValue::Enum(option)).unwrap();
+                    match (f.get)(&cfg) {
+                        FieldValue::Enum(v) => assert_eq!(v, *option, "{}", f.label),
+                        other => panic!("unexpected: {other:?}"),
+                    }
+                }
             }
+            // The Auto-review reviewer rows (reviewer_model, reviewer_policy,
+            // reviewer_policy_extra): an explicit value round-trips, and
+            // clearing the override succeeds. (reviewer_model resolves to the
+            // provider's small/fast model when cleared, so the cleared value is
+            // not necessarily empty — assert only that clearing is accepted.)
+            FieldKind::String { .. } => {
+                (f.set)(&mut cfg, FieldValue::String("custom-value".to_string())).unwrap();
+                match (f.get)(&cfg) {
+                    FieldValue::String(v) => assert_eq!(v, "custom-value", "{}", f.label),
+                    other => panic!("unexpected: {other:?}"),
+                }
+                (f.set)(&mut cfg, FieldValue::String(String::new())).unwrap();
+                match (f.get)(&cfg) {
+                    FieldValue::String(_) => {}
+                    other => panic!("unexpected: {other:?}"),
+                }
+            }
+            // reviewer_capabilities: a list of capability names round-trips.
+            FieldKind::StringList { .. } => {
+                (f.set)(
+                    &mut cfg,
+                    FieldValue::StringList(vec!["read".to_string(), "edit".to_string()]),
+                )
+                .unwrap();
+                match (f.get)(&cfg) {
+                    FieldValue::StringList(v) => {
+                        assert_eq!(
+                            v,
+                            vec!["read".to_string(), "edit".to_string()],
+                            "{}",
+                            f.label
+                        )
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                }
+            }
+            other => panic!(
+                "unexpected permission field kind for {}: {other:?}",
+                f.label
+            ),
         }
     }
+}
+
+#[test]
+fn permission_mode_default_matches_shipped_runtime_default() {
+    // The schema's inherited-default + Ctrl+R reset target must agree with the
+    // engine default (Default — reviewer off). Otherwise the screen shows a wrong
+    // "(default)" badge and reset silently disables the reviewer.
+    let mode = section(SectionId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "mode")
+        .unwrap();
+    assert_eq!((mode.default)(), FieldValue::Enum("default"));
+    assert_eq!(mode.default_display, "default");
+    assert_eq!(
+        crate::PermissionPolicy::default().mode,
+        crate::PermissionPolicyMode::Default
+    );
+}
+
+#[test]
+fn permission_reviewer_rows_follow_mode() {
+    // The TUI config screen relies on the reviewer rows sitting immediately
+    // after `mode` so the visible Permissions rows stay a contiguous prefix
+    // (see `permissions_visible_rows`).
+    let perms = section(SectionId::Permissions).unwrap();
+    assert_eq!(perms.fields[0].label, "mode");
+    assert_eq!(perms.fields[1].label, "reviewer_model");
+    assert_eq!(perms.fields[2].label, "reviewer_policy");
+    assert_eq!(perms.fields[3].label, "reviewer_policy_extra");
+    assert_eq!(perms.fields[4].label, "reviewer_capabilities");
 }

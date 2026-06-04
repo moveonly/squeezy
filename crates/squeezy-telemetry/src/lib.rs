@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::Read,
     path::{Path, PathBuf},
@@ -9,14 +10,25 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use squeezy_core::{AppConfig, ProviderConfig, TelemetryConfig, TurnMetrics};
 use tokio::{sync::Mutex, time};
 
 const SCHEMA_VERSION: u32 = 1;
+const TELEMETRY_STORE_SCHEMA_VERSION: u64 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BATCH_EVENTS: usize = 50;
+const MAX_LOCAL_QUEUE_EVENTS: usize = 512;
+const MAX_SUMMARY_MAP_ENTRIES: usize = 16;
+const PENDING_SEND_LIMIT: usize = 20;
+const PENDING_LEASE_MS: u128 = 60_000;
+
+const STORE_META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const STORE_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
+const STORE_EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("events");
+const STORE_PENDING: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_summaries");
 
 #[derive(Debug, Clone)]
 pub struct TelemetryClient {
@@ -34,12 +46,19 @@ struct TelemetryState {
     /// and lets local `tracing` logs that record the same id pull in their
     /// matching aggregate counters.
     trace_id: String,
+    session_started_at_ms: u128,
+    session_registered: std::sync::Mutex<bool>,
     /// Per-turn span id stamped on every event enqueued between
     /// [`TelemetryClient::begin_turn`] and [`TelemetryClient::end_turn`].
     /// `None` outside an active turn (e.g. `app_started`). 16-hex-char string.
     current_span_id: std::sync::Mutex<Option<String>>,
     next_event_sequence: AtomicU64,
     queue: Mutex<TelemetryQueue>,
+    /// Serializes concurrent calls to `send_pending_summaries` so that the
+    /// startup-retry task, the periodic 5-second flush, and the exit flush
+    /// cannot simultaneously lease and double-send the same pending summary.
+    flush_lock: Mutex<()>,
+    store: Option<Arc<TelemetryStore>>,
     http: reqwest::Client,
 }
 
@@ -79,6 +98,7 @@ impl TelemetryClient {
         install_id_path: impl AsRef<Path>,
     ) -> Self {
         if !config.telemetry.enabled {
+            purge_telemetry_store_for_install_path(install_id_path.as_ref());
             return Self::disabled();
         }
         // If we cannot persist a stable install_id, treat telemetry as
@@ -95,18 +115,32 @@ impl TelemetryClient {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            state: Some(Arc::new(TelemetryState {
-                endpoint: config.telemetry.endpoint.clone(),
-                install_id,
-                session_id: random_uuid_like(),
-                trace_id: random_trace_id(),
-                current_span_id: std::sync::Mutex::new(None),
-                next_event_sequence: AtomicU64::new(1),
-                queue: Mutex::new(TelemetryQueue::default()),
-                http,
-            })),
+        let session_id = random_uuid_like();
+        let trace_id = random_trace_id();
+        let store = TelemetryStore::open(default_telemetry_store_path_for_install_path(
+            install_id_path.as_ref(),
+        ))
+        .ok()
+        .map(Arc::new);
+        if let Some(store) = store.as_ref() {
+            let _ = store.synthesize_abnormal_sessions(&session_id);
         }
+        let state = Arc::new(TelemetryState {
+            endpoint: config.telemetry.endpoint.clone(),
+            install_id,
+            session_id,
+            trace_id,
+            session_started_at_ms: now_ms(),
+            session_registered: std::sync::Mutex::new(false),
+            current_span_id: std::sync::Mutex::new(None),
+            next_event_sequence: AtomicU64::new(1),
+            queue: Mutex::new(TelemetryQueue::default()),
+            flush_lock: Mutex::new(()),
+            store,
+            http,
+        });
+        schedule_pending_retry(state.clone());
+        Self { state: Some(state) }
     }
 
     pub fn enabled(&self) -> bool {
@@ -146,13 +180,25 @@ impl TelemetryClient {
         self.state.as_ref().map(|state| state.trace_id.clone())
     }
 
+    /// The session id assigned to this telemetry client. `None` when telemetry
+    /// is disabled. Exposed so call sites can thread the same id into
+    /// `FeedbackClient::from_config_with_session` so that feedback and bug
+    /// reports in PostHog are correlated with the product session summary.
+    pub fn session_id(&self) -> Option<String> {
+        self.state.as_ref().map(|state| state.session_id.clone())
+    }
+
     pub fn spawn(&self, event: TelemetryEvent) {
         let Some(state) = self.state.clone() else {
             return;
         };
-        tokio::spawn(async move {
-            enqueue_event(state, event).await;
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                enqueue_event(state, event).await;
+            });
+        } else {
+            enqueue_event_without_runtime(&state, event);
+        }
     }
 
     pub async fn record(&self, event: TelemetryEvent) {
@@ -170,15 +216,76 @@ impl TelemetryClient {
         for event in &mut stamped {
             stamp_trace_ids(&state, event);
         }
-        send_batch(state, stamped).await
+        if stamped.is_empty() {
+            return Ok(());
+        }
+        let summary = build_summary_from_events(
+            &StoredTelemetrySession::from_state(&state),
+            stamped,
+            false,
+            Some(SessionStatusKind::Completed),
+        );
+        send_batch_for_session(state.clone(), state.session_id.clone(), vec![summary]).await
     }
 
     pub async fn flush(&self) -> Result<(), TelemetryError> {
         let Some(state) = self.state.clone() else {
             return Ok(());
         };
-        let events = drain_queued_events(&state).await;
-        send_batch(state, events).await
+        if let Some(store) = state.store.as_ref() {
+            store.finalize_session_summary(&state.session_id, false)?;
+            send_pending_summaries(state).await
+        } else {
+            let events = drain_queued_events(&state).await;
+            if events.is_empty() {
+                return Ok(());
+            }
+            let summary = build_summary_from_events(
+                &StoredTelemetrySession::from_state(&state),
+                events,
+                false,
+                Some(SessionStatusKind::Completed),
+            );
+            send_batch_for_session(state.clone(), state.session_id.clone(), vec![summary]).await
+        }
+    }
+
+    pub async fn retry_pending_from_config(config: &AppConfig) -> Result<(), TelemetryError> {
+        if !config.telemetry.enabled {
+            purge_telemetry_store_for_install_path(&default_install_id_path());
+            return Ok(());
+        }
+        let install_id = match load_or_create_install_id(&default_install_id_path()) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let store = TelemetryStore::open(default_telemetry_store_path_for_install_path(
+            &default_install_id_path(),
+        ))
+        .ok()
+        .map(Arc::new);
+        let Some(store) = store else {
+            return Ok(());
+        };
+        let state = Arc::new(TelemetryState {
+            endpoint: config.telemetry.endpoint.clone(),
+            install_id,
+            session_id: random_uuid_like(),
+            trace_id: random_trace_id(),
+            session_started_at_ms: now_ms(),
+            session_registered: std::sync::Mutex::new(false),
+            current_span_id: std::sync::Mutex::new(None),
+            next_event_sequence: AtomicU64::new(1),
+            queue: Mutex::new(TelemetryQueue::default()),
+            flush_lock: Mutex::new(()),
+            store: Some(store),
+            http,
+        });
+        send_pending_summaries(state).await
     }
 
     /// Snapshot of the events the client has accepted but not yet
@@ -252,7 +359,20 @@ impl std::error::Error for FeedbackError {}
 
 impl FeedbackClient {
     pub fn from_config(config: &AppConfig) -> Self {
-        Self::from_config_with_install_path(config, default_install_id_path())
+        Self::from_config_with_session(config, None)
+    }
+
+    /// Like [`Self::from_config`] but binds `session_id` to the caller's
+    /// telemetry session so that feedback and bug reports in PostHog are
+    /// correlated with the matching product session summary. Pass
+    /// `telemetry_client.session_id().as_deref()` at call sites that have an
+    /// active `TelemetryClient`.
+    pub fn from_config_with_session(config: &AppConfig, session_id: Option<&str>) -> Self {
+        Self::from_config_with_install_path_and_session(
+            config,
+            default_install_id_path(),
+            session_id,
+        )
     }
 
     pub fn disabled() -> Self {
@@ -262,6 +382,14 @@ impl FeedbackClient {
     pub fn from_config_with_install_path(
         config: &AppConfig,
         install_id_path: impl AsRef<Path>,
+    ) -> Self {
+        Self::from_config_with_install_path_and_session(config, install_id_path, None)
+    }
+
+    fn from_config_with_install_path_and_session(
+        config: &AppConfig,
+        install_id_path: impl AsRef<Path>,
+        session_id: Option<&str>,
     ) -> Self {
         if !config.feedback.enabled {
             return Self::disabled();
@@ -281,7 +409,9 @@ impl FeedbackClient {
                 max_feedback_bytes: config.feedback.max_feedback_bytes,
                 max_report_bytes: config.feedback.max_report_bytes,
                 install_id,
-                session_id: random_uuid_like(),
+                session_id: session_id
+                    .map(str::to_string)
+                    .unwrap_or_else(random_uuid_like),
                 http,
             })),
         }
@@ -456,18 +586,27 @@ async fn parse_submit_response(
 pub enum TelemetryError {
     Http(reqwest::Error),
     Status(reqwest::StatusCode),
+    Store(String),
+}
+
+impl From<TelemetryStoreError> for TelemetryError {
+    fn from(error: TelemetryStoreError) -> Self {
+        Self::Store(error.to_string())
+    }
 }
 
 async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
     stamp_trace_ids(&state, &mut event);
+    event.event_sequence = state.next_event_sequence.fetch_add(1, Ordering::Relaxed);
+    persist_local_event(&state, &event);
     let action = {
         let mut queue = state.queue.lock().await;
         queue.events.push(event);
-        if queue.events.len() >= MAX_BATCH_EVENTS {
-            let events = drain_event_buffer(&mut queue.events);
-            queue.flush_scheduled = false;
-            TelemetryAction::Flush(events)
-        } else if !queue.flush_scheduled {
+        if queue.events.len() > MAX_LOCAL_QUEUE_EVENTS {
+            let extra = queue.events.len() - MAX_LOCAL_QUEUE_EVENTS;
+            queue.events.drain(0..extra);
+        }
+        if !queue.flush_scheduled {
             queue.flush_scheduled = true;
             TelemetryAction::Schedule
         } else {
@@ -476,23 +615,33 @@ async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
     };
 
     match action {
-        TelemetryAction::Flush(events) => {
-            let _ = send_batch(state, events).await;
-        }
         TelemetryAction::Schedule => {
             tokio::spawn(async move {
                 time::sleep(FLUSH_INTERVAL).await;
-                let events = drain_queued_events(&state).await;
-                let _ = send_batch(state, events).await;
+                if let Ok(mut queue) = state.queue.try_lock() {
+                    queue.flush_scheduled = false;
+                }
+                let _ = send_pending_summaries(state).await;
             });
         }
         TelemetryAction::None => {}
     }
 }
 
+fn enqueue_event_without_runtime(state: &Arc<TelemetryState>, mut event: TelemetryEvent) {
+    stamp_trace_ids(state, &mut event);
+    event.event_sequence = state.next_event_sequence.fetch_add(1, Ordering::Relaxed);
+    persist_local_event(state, &event);
+    let mut queue = state.queue.blocking_lock();
+    queue.events.push(event);
+    if queue.events.len() > MAX_LOCAL_QUEUE_EVENTS {
+        let extra = queue.events.len() - MAX_LOCAL_QUEUE_EVENTS;
+        queue.events.drain(0..extra);
+    }
+}
+
 #[derive(Debug)]
 enum TelemetryAction {
-    Flush(Vec<TelemetryEvent>),
     Schedule,
     None,
 }
@@ -509,8 +658,85 @@ fn drain_event_buffer(events: &mut Vec<TelemetryEvent>) -> Vec<TelemetryEvent> {
     drained
 }
 
-async fn send_batch(
+fn persist_local_event(state: &TelemetryState, event: &TelemetryEvent) {
+    let Some(store) = state.store.as_ref() else {
+        return;
+    };
+    let registered = state
+        .session_registered
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(false);
+    if !registered {
+        if store
+            .mark_session_started(
+                &state.session_id,
+                &state.trace_id,
+                state.session_started_at_ms,
+            )
+            .is_ok()
+            && let Ok(mut guard) = state.session_registered.lock()
+        {
+            *guard = true;
+        }
+    }
+    if store.append_event(&state.session_id, event).is_err() {
+        return;
+    }
+    if event.event == TelemetryEventName::SessionEnded {
+        let _ = store.mark_session_ended(&state.session_id, event.timestamp_ms);
+    }
+}
+
+fn schedule_pending_retry(state: Arc<TelemetryState>) {
+    if state.store.is_none() {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = send_pending_summaries(state).await;
+        });
+    }
+}
+
+async fn send_pending_summaries(state: Arc<TelemetryState>) -> Result<(), TelemetryError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(());
+    };
+    // Serialise concurrent callers (startup-retry, periodic flush, exit flush)
+    // so that the read-then-write lease acquisition in `lease_due_summaries`
+    // cannot hand the same summary to two senders simultaneously.
+    let _flush_guard = state.flush_lock.lock().await;
+    let pending = store.lease_due_summaries(now_ms(), PENDING_SEND_LIMIT, PENDING_LEASE_MS)?;
+    let mut first_error: Option<TelemetryError> = None;
+    for summary in pending {
+        let result = send_batch_for_session(
+            state.clone(),
+            summary.source_session_id.clone(),
+            vec![summary.event.clone()],
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                let _ = store.mark_summary_sent(&summary);
+            }
+            Err(error) => {
+                let _ = store.mark_summary_failed(&summary.summary_id, now_ms());
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn send_batch_for_session(
     state: Arc<TelemetryState>,
+    session_id: String,
     mut events: Vec<TelemetryEvent>,
 ) -> Result<(), TelemetryError> {
     if events.is_empty() {
@@ -524,7 +750,7 @@ async fn send_batch(
         schema_version: SCHEMA_VERSION,
         user_id: state.install_id.as_str(),
         install_id: state.install_id.as_str(),
-        session_id: state.session_id.as_str(),
+        session_id: session_id.as_str(),
         app_version: env!("CARGO_PKG_VERSION"),
         os: env::consts::OS,
         arch: env::consts::ARCH,
@@ -554,6 +780,461 @@ struct TelemetryBatch<'a> {
     os: &'static str,
     arch: &'static str,
     events: Vec<TelemetryEvent>,
+}
+
+#[derive(Debug)]
+struct TelemetryStore {
+    _path: PathBuf,
+    database: Database,
+}
+
+#[derive(Debug)]
+enum TelemetryStoreError {
+    Io(std::io::Error),
+    Redb(redb::Error),
+    RedbDatabase(redb::DatabaseError),
+    RedbTable(redb::TableError),
+    RedbTransaction(redb::TransactionError),
+    RedbStorage(redb::StorageError),
+    RedbCommit(redb::CommitError),
+    Serde(serde_json::Error),
+}
+
+impl std::fmt::Display for TelemetryStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "telemetry store I/O failed: {error}"),
+            Self::Redb(error) => write!(f, "telemetry store open failed: {error}"),
+            Self::RedbDatabase(error) => write!(f, "telemetry store database failed: {error}"),
+            Self::RedbTable(error) => write!(f, "telemetry store table failed: {error}"),
+            Self::RedbTransaction(error) => {
+                write!(f, "telemetry store transaction failed: {error}")
+            }
+            Self::RedbStorage(error) => write!(f, "telemetry store storage failed: {error}"),
+            Self::RedbCommit(error) => write!(f, "telemetry store commit failed: {error}"),
+            Self::Serde(error) => write!(f, "telemetry store JSON failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for TelemetryStoreError {}
+
+impl From<std::io::Error> for TelemetryStoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<redb::Error> for TelemetryStoreError {
+    fn from(error: redb::Error) -> Self {
+        Self::Redb(error)
+    }
+}
+
+impl From<redb::DatabaseError> for TelemetryStoreError {
+    fn from(error: redb::DatabaseError) -> Self {
+        Self::RedbDatabase(error)
+    }
+}
+
+impl From<redb::TableError> for TelemetryStoreError {
+    fn from(error: redb::TableError) -> Self {
+        Self::RedbTable(error)
+    }
+}
+
+impl From<redb::TransactionError> for TelemetryStoreError {
+    fn from(error: redb::TransactionError) -> Self {
+        Self::RedbTransaction(error)
+    }
+}
+
+impl From<redb::StorageError> for TelemetryStoreError {
+    fn from(error: redb::StorageError) -> Self {
+        Self::RedbStorage(error)
+    }
+}
+
+impl From<redb::CommitError> for TelemetryStoreError {
+    fn from(error: redb::CommitError) -> Self {
+        Self::RedbCommit(error)
+    }
+}
+
+impl From<serde_json::Error> for TelemetryStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serde(error)
+    }
+}
+
+type StoreResult<T> = std::result::Result<T, TelemetryStoreError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredTelemetrySession {
+    session_id: String,
+    trace_id: String,
+    started_at_ms: u128,
+    ended_at_ms: Option<u128>,
+    clean_end: bool,
+    summary_id: Option<String>,
+}
+
+impl StoredTelemetrySession {
+    fn from_state(state: &TelemetryState) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            trace_id: state.trace_id.clone(),
+            started_at_ms: state.session_started_at_ms,
+            ended_at_ms: None,
+            clean_end: false,
+            summary_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredTelemetryEvent {
+    session_id: String,
+    sequence: u64,
+    event: TelemetryEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingTelemetrySummary {
+    summary_id: String,
+    source_session_id: String,
+    event: TelemetryEvent,
+    attempts: u32,
+    next_attempt_ms: u128,
+    leased_until_ms: u128,
+}
+
+impl TelemetryStore {
+    fn open(path: PathBuf) -> StoreResult<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let database = Database::create(&path)?;
+        let store = Self {
+            _path: path,
+            database,
+        };
+        store.initialize_schema()?;
+        Ok(store)
+    }
+
+    fn initialize_schema(&self) -> StoreResult<()> {
+        let write = self.database.begin_write()?;
+        {
+            let mut meta = write.open_table(STORE_META)?;
+            insert_store_json(&mut meta, "schema_version", &TELEMETRY_STORE_SCHEMA_VERSION)?;
+        }
+        write.open_table(STORE_SESSIONS)?;
+        write.open_table(STORE_EVENTS)?;
+        write.open_table(STORE_PENDING)?;
+        write.commit()?;
+        Ok(())
+    }
+
+    fn mark_session_started(
+        &self,
+        session_id: &str,
+        trace_id: &str,
+        started_at_ms: u128,
+    ) -> StoreResult<()> {
+        let write = self.database.begin_write()?;
+        {
+            let mut sessions = write.open_table(STORE_SESSIONS)?;
+            if sessions.get(session_id)?.is_none() {
+                let session = StoredTelemetrySession {
+                    session_id: session_id.to_string(),
+                    trace_id: trace_id.to_string(),
+                    started_at_ms,
+                    ended_at_ms: None,
+                    clean_end: false,
+                    summary_id: None,
+                };
+                insert_store_json(&mut sessions, session_id, &session)?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn mark_session_ended(&self, session_id: &str, ended_at_ms: u128) -> StoreResult<()> {
+        let Some(mut session) = self.session(session_id)? else {
+            return Ok(());
+        };
+        session.ended_at_ms = Some(ended_at_ms);
+        session.clean_end = true;
+        self.put_session(&session)
+    }
+
+    fn append_event(&self, session_id: &str, event: &TelemetryEvent) -> StoreResult<()> {
+        let write = self.database.begin_write()?;
+        {
+            let key = event_key(session_id, event.event_sequence);
+            let stored = StoredTelemetryEvent {
+                session_id: session_id.to_string(),
+                sequence: event.event_sequence,
+                event: event.clone(),
+            };
+            let mut events = write.open_table(STORE_EVENTS)?;
+            insert_store_json(&mut events, &key, &stored)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn finalize_session_summary(
+        &self,
+        session_id: &str,
+        abnormal: bool,
+    ) -> StoreResult<Option<String>> {
+        let Some(mut session) = self.session(session_id)? else {
+            return Ok(None);
+        };
+        if let Some(summary_id) = session.summary_id.clone() {
+            return Ok(Some(summary_id));
+        }
+        let events = self.session_events(session_id)?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let summary_id = random_uuid_like();
+        let summary = build_summary_from_events(&session, events, abnormal, None);
+        let pending = PendingTelemetrySummary {
+            summary_id: summary_id.clone(),
+            source_session_id: session_id.to_string(),
+            event: with_summary_id(summary, &summary_id),
+            attempts: 0,
+            next_attempt_ms: 0,
+            leased_until_ms: 0,
+        };
+        session.summary_id = Some(summary_id.clone());
+        self.put_pending_and_session(&pending, &session)?;
+        Ok(Some(summary_id))
+    }
+
+    fn synthesize_abnormal_sessions(&self, current_session_id: &str) -> StoreResult<()> {
+        for session in self.sessions()? {
+            if session.session_id == current_session_id
+                || session.clean_end
+                || session.summary_id.is_some()
+            {
+                continue;
+            }
+            let _ = self.finalize_session_summary(&session.session_id, true)?;
+        }
+        Ok(())
+    }
+
+    fn lease_due_summaries(
+        &self,
+        now_ms: u128,
+        limit: usize,
+        lease_ms: u128,
+    ) -> StoreResult<Vec<PendingTelemetrySummary>> {
+        let mut due = Vec::new();
+        {
+            let read = self.database.begin_read()?;
+            let table = match read.open_table(STORE_PENDING) {
+                Ok(table) => table,
+                Err(_) => return Ok(Vec::new()),
+            };
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                let pending: PendingTelemetrySummary = serde_json::from_slice(value.value())?;
+                if pending.next_attempt_ms <= now_ms && pending.leased_until_ms <= now_ms {
+                    due.push(pending);
+                    if due.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        if due.is_empty() {
+            return Ok(due);
+        }
+        let write = self.database.begin_write()?;
+        {
+            let mut table = write.open_table(STORE_PENDING)?;
+            for pending in &mut due {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.leased_until_ms = now_ms.saturating_add(lease_ms);
+                insert_store_json(&mut table, &pending.summary_id, pending)?;
+            }
+        }
+        write.commit()?;
+        Ok(due)
+    }
+
+    fn mark_summary_failed(&self, summary_id: &str, now_ms: u128) -> StoreResult<()> {
+        let Some(mut pending) = self.pending_summary(summary_id)? else {
+            return Ok(());
+        };
+        pending.leased_until_ms = 0;
+        pending.next_attempt_ms = now_ms.saturating_add(retry_delay_ms(pending.attempts));
+        let write = self.database.begin_write()?;
+        {
+            let mut table = write.open_table(STORE_PENDING)?;
+            insert_store_json(&mut table, summary_id, &pending)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn mark_summary_sent(&self, pending: &PendingTelemetrySummary) -> StoreResult<()> {
+        let event_keys = self.event_keys_for_session(&pending.source_session_id)?;
+        let write = self.database.begin_write()?;
+        {
+            let mut pending_table = write.open_table(STORE_PENDING)?;
+            pending_table.remove(pending.summary_id.as_str())?;
+        }
+        {
+            let mut events = write.open_table(STORE_EVENTS)?;
+            for key in &event_keys {
+                events.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut sessions = write.open_table(STORE_SESSIONS)?;
+            sessions.remove(pending.source_session_id.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn session(&self, session_id: &str) -> StoreResult<Option<StoredTelemetrySession>> {
+        let read = self.database.begin_read()?;
+        let table = match read.open_table(STORE_SESSIONS) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_store_json(&table, session_id)
+    }
+
+    fn sessions(&self) -> StoreResult<Vec<StoredTelemetrySession>> {
+        let read = self.database.begin_read()?;
+        let table = match read.open_table(STORE_SESSIONS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut sessions = Vec::new();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            sessions.push(serde_json::from_slice(value.value())?);
+        }
+        Ok(sessions)
+    }
+
+    fn put_session(&self, session: &StoredTelemetrySession) -> StoreResult<()> {
+        let write = self.database.begin_write()?;
+        {
+            let mut sessions = write.open_table(STORE_SESSIONS)?;
+            insert_store_json(&mut sessions, &session.session_id, session)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn put_pending_and_session(
+        &self,
+        pending: &PendingTelemetrySummary,
+        session: &StoredTelemetrySession,
+    ) -> StoreResult<()> {
+        let write = self.database.begin_write()?;
+        {
+            let mut pending_table = write.open_table(STORE_PENDING)?;
+            insert_store_json(&mut pending_table, &pending.summary_id, pending)?;
+        }
+        {
+            let mut sessions = write.open_table(STORE_SESSIONS)?;
+            insert_store_json(&mut sessions, &session.session_id, session)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn pending_summary(&self, summary_id: &str) -> StoreResult<Option<PendingTelemetrySummary>> {
+        let read = self.database.begin_read()?;
+        let table = match read.open_table(STORE_PENDING) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_store_json(&table, summary_id)
+    }
+
+    fn session_events(&self, session_id: &str) -> StoreResult<Vec<TelemetryEvent>> {
+        let read = self.database.begin_read()?;
+        let table = match read.open_table(STORE_EVENTS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let prefix = format!("{session_id}:");
+        let mut events = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if key.value().starts_with(&prefix) {
+                let stored: StoredTelemetryEvent = serde_json::from_slice(value.value())?;
+                events.push(stored.event);
+            }
+        }
+        events.sort_by_key(|event| (event.timestamp_ms, event.event_sequence));
+        Ok(events)
+    }
+
+    fn event_keys_for_session(&self, session_id: &str) -> StoreResult<Vec<String>> {
+        let read = self.database.begin_read()?;
+        let table = match read.open_table(STORE_EVENTS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let prefix = format!("{session_id}:");
+        let mut keys = Vec::new();
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            if key.value().starts_with(&prefix) {
+                keys.push(key.value().to_string());
+            }
+        }
+        Ok(keys)
+    }
+}
+
+fn insert_store_json<T: Serialize>(
+    table: &mut redb::Table<'_, &str, &[u8]>,
+    key: &str,
+    value: &T,
+) -> StoreResult<()> {
+    let encoded = serde_json::to_vec(value)?;
+    table.insert(key, encoded.as_slice())?;
+    Ok(())
+}
+
+fn read_store_json<T: for<'de> Deserialize<'de>>(
+    table: &redb::ReadOnlyTable<&str, &[u8]>,
+    key: &str,
+) -> StoreResult<Option<T>> {
+    let Some(value) = table.get(key)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(value.value())?))
+}
+
+fn event_key(session_id: &str, sequence: u64) -> String {
+    format!("{session_id}:{sequence:020}")
+}
+
+fn retry_delay_ms(attempts: u32) -> u128 {
+    match attempts {
+        0 | 1 => 5_000,
+        2 => 30_000,
+        3 => 5 * 60_000,
+        4 => 60 * 60_000,
+        5 => 6 * 60 * 60_000,
+        _ => 24 * 60 * 60_000,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,6 +1309,81 @@ impl TelemetryEvent {
             timestamp_ms: now_ms(),
             event_sequence: 0,
             properties: TelemetryProperties::from_graph(report),
+        }
+    }
+
+    pub fn startup_ready(config: &AppConfig, route: StartupRoute, duration: Duration) -> Self {
+        Self {
+            event: TelemetryEventName::StartupReady,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                provider: Some(ProviderKind::from_provider(&config.provider)),
+                model_family: Some(ModelFamily::from_model(&config.provider, &config.model)),
+                duration_ms: Some(duration.as_millis() as u64),
+                startup_route: Some(route),
+                status: Some(OutcomeStatus::Success),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn session_ended(config: &AppConfig, report: SessionTelemetryReport) -> Self {
+        Self {
+            event: TelemetryEventName::SessionEnded,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                provider: Some(ProviderKind::from_provider(&config.provider)),
+                model_family: Some(ModelFamily::from_model(&config.provider, &config.model)),
+                duration_ms: Some(report.duration_ms),
+                session_status: Some(report.status),
+                store_session_id: report.store_session_id,
+                turn_count: Some(report.turns),
+                tool_calls: Some(report.tool_calls),
+                tool_successes: Some(report.tool_successes),
+                tool_errors: Some(report.tool_errors),
+                tool_denials: Some(report.tool_denials),
+                tool_cancellations: Some(report.tool_cancellations),
+                budget_denials: Some(report.budget_denials),
+                subagent_calls: Some(report.subagent_calls),
+                subagent_failures: Some(report.subagent_failures),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn slash_command_used(report: SlashTelemetryReport<'_>) -> Self {
+        Self {
+            event: TelemetryEventName::SlashCommandUsed,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                slash_command: Some(slash_command_token(report.command)),
+                slash_surface: Some(report.surface),
+                slash_outcome: Some(report.outcome),
+                slash_alias_kind: Some(report.alias_kind),
+                slash_arg_shape: Some(report.arg_shape),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
+    pub fn config_change_committed(report: ConfigChangeReport<'_>) -> Self {
+        Self {
+            event: TelemetryEventName::ConfigChangeCommitted,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                config_scope: Some(report.scope),
+                config_section: Some(report.section.to_string()),
+                config_field: Some(report.field.to_string()),
+                config_apply_tier: Some(report.apply_tier),
+                config_change_kind: Some(report.change_kind),
+                config_prev_bucket: Some(report.prev_bucket.to_string()),
+                config_new_bucket: Some(report.new_bucket.to_string()),
+                ..TelemetryProperties::default()
+            },
         }
     }
 
@@ -727,6 +1483,8 @@ impl TelemetryEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryEventName {
+    #[serde(rename = "squeezy_session_summary")]
+    SessionSummary,
     #[serde(rename = "squeezy_app_started")]
     AppStarted,
     #[serde(rename = "squeezy_turn_completed")]
@@ -737,6 +1495,14 @@ pub enum TelemetryEventName {
     GraphBuildCompleted,
     #[serde(rename = "squeezy_graph_refresh_completed")]
     GraphRefreshCompleted,
+    #[serde(rename = "squeezy_startup_ready")]
+    StartupReady,
+    #[serde(rename = "squeezy_session_ended")]
+    SessionEnded,
+    #[serde(rename = "squeezy_slash_command_used")]
+    SlashCommandUsed,
+    #[serde(rename = "squeezy_config_change_committed")]
+    ConfigChangeCommitted,
     #[serde(rename = "squeezy_failure_seen")]
     FailureSeen,
     /// `approval.best_effort.fallback{tool=shell}` — emitted every time
@@ -770,6 +1536,20 @@ pub enum TelemetryEventName {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryProperties {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_records: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_buckets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abnormal_exit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_index: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -839,13 +1619,103 @@ pub struct TelemetryProperties {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_denials: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_build_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_refresh_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_command_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_change_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_routed_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_escalated_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_successes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_errors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_denials: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_cancellations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_kind: Option<RefreshKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_sequence_scope: Option<GraphSequenceScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OutcomeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_status: Option<SessionStatusKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_route: Option<StartupRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ErrorKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dart_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub java_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub javascript_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jsx_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kotlin_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub php_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ruby_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scala_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swift_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typescript_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tsx_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_dirs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_files_loaded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_files_missed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_rebuilt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_surface: Option<SlashSurface>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_outcome: Option<SlashOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_alias_kind: Option<SlashAliasKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_arg_shape: Option<SlashArgShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_scope: Option<ConfigScopeKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_section: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_apply_tier: Option<ConfigApplyTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_change_kind: Option<ConfigChangeKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_prev_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_new_bucket: Option<String>,
     /// SHA-256 of the canonical JSON arguments the model sent into this tool
     /// call. Paired with `output_sha256` and `content_sha256`, lets offline
     /// replay/dedup tooling answer "did we already pay for this exact call?"
@@ -881,6 +1751,13 @@ pub struct TelemetryProperties {
     /// `None` on every other event type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_reason: Option<String>,
+    /// The durable on-disk store session ID. Set only on `session_ended`
+    /// and `session_summary` events. Lets operators correlate a PostHog
+    /// session back to the on-disk session file and stitch together a chain
+    /// of resumes that all share the same store session (even though each
+    /// process run has a distinct telemetry `session_id` and `trace_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_session_id: Option<String>,
     /// Per-session trace id stamped by [`TelemetryClient`] on every event
     /// it accepts. W3C-trace-context-shaped 32-hex-char string. Equal
     /// across every event emitted by a single Squeezy session so an
@@ -894,6 +1771,16 @@ pub struct TelemetryProperties {
     /// emitted outside any turn (e.g. `app_started`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slash_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_counts: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_counts: Option<BTreeMap<String, u64>>,
 }
 
 impl TelemetryProperties {
@@ -927,14 +1814,31 @@ impl TelemetryProperties {
             csharp_files: Some(report.language_distribution.csharp_files),
             cpp_files: Some(report.language_distribution.cpp_files),
             go_files: Some(report.language_distribution.go_files),
+            dart_files: Some(report.language_distribution.dart_files),
+            java_files: Some(report.language_distribution.java_files),
+            javascript_files: Some(report.language_distribution.javascript_files),
+            jsx_files: Some(report.language_distribution.jsx_files),
+            kotlin_files: Some(report.language_distribution.kotlin_files),
+            php_files: Some(report.language_distribution.php_files),
             python_files: Some(report.language_distribution.python_files),
+            ruby_files: Some(report.language_distribution.ruby_files),
             rust_files: Some(report.language_distribution.rust_files),
+            scala_files: Some(report.language_distribution.scala_files),
+            swift_files: Some(report.language_distribution.swift_files),
+            typescript_files: Some(report.language_distribution.typescript_files),
+            tsx_files: Some(report.language_distribution.tsx_files),
             supported_files: Some(report.language_distribution.supported_files),
             unsupported_files: Some(report.language_distribution.unsupported_files),
             unknown_files: Some(report.language_distribution.unknown_files),
             files_changed: Some(report.files_changed),
             files_parsed: Some(report.files_parsed),
             bytes_parsed: Some(report.bytes_parsed),
+            excluded_files: Some(report.excluded_files),
+            excluded_dirs: Some(report.excluded_dirs),
+            excluded_bytes: Some(report.excluded_bytes),
+            persisted_files_loaded: Some(report.persisted_files_loaded),
+            persisted_files_missed: Some(report.persisted_files_missed),
+            persistence_rebuilt: Some(u64::from(report.persistence_rebuilt)),
             symbols: Some(report.symbols),
             edges: Some(report.edges),
             refresh_kind: Some(report.refresh_kind),
@@ -944,6 +1848,387 @@ impl TelemetryProperties {
             ..Self::default()
         }
     }
+}
+
+fn build_summary_from_events(
+    session: &StoredTelemetrySession,
+    events: Vec<TelemetryEvent>,
+    abnormal: bool,
+    fallback_status: Option<SessionStatusKind>,
+) -> TelemetryEvent {
+    let mut accumulator = SummaryAccumulator::new();
+    for event in &events {
+        accumulator.observe(event);
+    }
+    let started_at_ms = session.started_at_ms.min(
+        events
+            .first()
+            .map(|event| event.timestamp_ms)
+            .unwrap_or(u128::MAX),
+    );
+    let ended_at_ms = session
+        .ended_at_ms
+        .or_else(|| events.last().map(|event| event.timestamp_ms))
+        .unwrap_or(started_at_ms);
+    let status = if abnormal {
+        SessionStatusKind::Failed
+    } else {
+        accumulator
+            .session_status
+            .or(fallback_status)
+            .unwrap_or(SessionStatusKind::Completed)
+    };
+    let (tool_counts, tool_dropped) = capped_count_map(accumulator.tool_counts);
+    let (slash_counts, slash_dropped) = capped_count_map(accumulator.slash_counts);
+    let (failure_counts, failure_dropped) = capped_count_map(accumulator.failure_counts);
+    let (routing_counts, routing_dropped) = capped_count_map(accumulator.routing_counts);
+    let (config_counts, config_dropped) = capped_count_map(accumulator.config_counts);
+    let dropped_buckets =
+        tool_dropped + slash_dropped + failure_dropped + routing_dropped + config_dropped;
+    let truncated = dropped_buckets > 0;
+    let tool_calls = accumulator.tool_calls.max(accumulator.turn_tool_calls);
+    let files_scanned = accumulator
+        .files_scanned
+        .max(accumulator.turn_files_scanned);
+    let bytes_read = accumulator.bytes_read.max(accumulator.turn_bytes_read);
+    let output_bytes = accumulator.output_bytes.max(accumulator.turn_output_bytes);
+    let matches_returned = accumulator
+        .matches_returned
+        .max(accumulator.turn_matches_returned);
+    TelemetryEvent {
+        event: TelemetryEventName::SessionSummary,
+        timestamp_ms: ended_at_ms,
+        event_sequence: 0,
+        properties: TelemetryProperties {
+            trace_id: Some(session.trace_id.clone()),
+            started_at_ms: Some(u128_to_u64(started_at_ms)),
+            ended_at_ms: Some(u128_to_u64(ended_at_ms)),
+            source_records: Some(events.len() as u64),
+            dropped_buckets: Some(dropped_buckets),
+            abnormal_exit: Some(abnormal),
+            telemetry_truncated: Some(truncated),
+            provider: accumulator.provider,
+            model_family: accumulator.model_family,
+            duration_ms: Some(u128_to_u64(ended_at_ms.saturating_sub(started_at_ms))),
+            session_status: Some(status),
+            startup_route: accumulator.startup_route,
+            turn_count: Some(accumulator.turn_count),
+            tool_calls: Some(tool_calls),
+            tool_successes: Some(accumulator.tool_successes),
+            tool_errors: Some(accumulator.tool_errors),
+            tool_denials: Some(accumulator.tool_denials),
+            tool_cancellations: Some(accumulator.tool_cancellations),
+            files_scanned: Some(files_scanned),
+            bytes_read: Some(bytes_read),
+            output_bytes: Some(output_bytes),
+            matches_returned: Some(matches_returned),
+            input_tokens: Some(accumulator.input_tokens),
+            output_tokens: Some(accumulator.output_tokens),
+            cached_tokens: Some(accumulator.cached_tokens),
+            estimated_usd_micros: Some(accumulator.estimated_usd_micros),
+            receipt_stub_hits: Some(accumulator.receipt_stub_hits),
+            negative_receipt_hits: Some(accumulator.negative_receipt_hits),
+            budget_denials: Some(accumulator.budget_denials),
+            subagent_calls: Some(accumulator.subagent_calls),
+            subagent_failures: Some(accumulator.subagent_failures),
+            graph_build_count: Some(accumulator.graph_build_count),
+            graph_refresh_count: Some(accumulator.graph_refresh_count),
+            slash_command_count: Some(accumulator.slash_command_count),
+            config_change_count: Some(accumulator.config_change_count),
+            failure_count: Some(accumulator.failure_count),
+            routing_routed_count: Some(accumulator.routing_routed_count),
+            routing_escalated_count: Some(accumulator.routing_escalated_count),
+            symbols: Some(accumulator.symbols),
+            edges: Some(accumulator.edges),
+            bytes_parsed: Some(accumulator.bytes_parsed),
+            excluded_files: Some(accumulator.excluded_files),
+            excluded_dirs: Some(accumulator.excluded_dirs),
+            excluded_bytes: Some(accumulator.excluded_bytes),
+            persisted_files_loaded: Some(accumulator.persisted_files_loaded),
+            persisted_files_missed: Some(accumulator.persisted_files_missed),
+            tool_counts: non_empty_map(tool_counts),
+            slash_counts: non_empty_map(slash_counts),
+            failure_counts: non_empty_map(failure_counts),
+            routing_counts: non_empty_map(routing_counts),
+            config_counts: non_empty_map(config_counts),
+            ..TelemetryProperties::default()
+        },
+    }
+}
+
+fn with_summary_id(mut event: TelemetryEvent, summary_id: &str) -> TelemetryEvent {
+    event.properties.summary_id = Some(summary_id.to_string());
+    event
+}
+
+#[derive(Debug, Default)]
+struct SummaryAccumulator {
+    provider: Option<ProviderKind>,
+    model_family: Option<ModelFamily>,
+    startup_route: Option<StartupRoute>,
+    session_status: Option<SessionStatusKind>,
+    turn_count: u64,
+    tool_calls: u64,
+    turn_tool_calls: u64,
+    tool_successes: u64,
+    tool_errors: u64,
+    tool_denials: u64,
+    tool_cancellations: u64,
+    files_scanned: u64,
+    turn_files_scanned: u64,
+    bytes_read: u64,
+    turn_bytes_read: u64,
+    output_bytes: u64,
+    turn_output_bytes: u64,
+    matches_returned: u64,
+    turn_matches_returned: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    estimated_usd_micros: u64,
+    receipt_stub_hits: u64,
+    negative_receipt_hits: u64,
+    budget_denials: u64,
+    subagent_calls: u64,
+    subagent_failures: u64,
+    graph_build_count: u64,
+    graph_refresh_count: u64,
+    slash_command_count: u64,
+    config_change_count: u64,
+    failure_count: u64,
+    routing_routed_count: u64,
+    routing_escalated_count: u64,
+    symbols: u64,
+    edges: u64,
+    bytes_parsed: u64,
+    excluded_files: u64,
+    excluded_dirs: u64,
+    excluded_bytes: u64,
+    persisted_files_loaded: u64,
+    persisted_files_missed: u64,
+    tool_counts: BTreeMap<String, u64>,
+    slash_counts: BTreeMap<String, u64>,
+    failure_counts: BTreeMap<String, u64>,
+    routing_counts: BTreeMap<String, u64>,
+    config_counts: BTreeMap<String, u64>,
+}
+
+impl SummaryAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn observe(&mut self, event: &TelemetryEvent) {
+        let props = &event.properties;
+        if self.provider.is_none() {
+            self.provider = props.provider;
+        }
+        if self.model_family.is_none() {
+            self.model_family = props.model_family;
+        }
+        match event.event {
+            TelemetryEventName::AppStarted => {}
+            TelemetryEventName::StartupReady => {
+                self.startup_route = props.startup_route;
+            }
+            TelemetryEventName::TurnCompleted => {
+                self.turn_count = self.turn_count.saturating_add(1);
+                self.turn_tool_calls = self
+                    .turn_tool_calls
+                    .saturating_add(props.tool_calls.unwrap_or(0));
+                self.turn_files_scanned = self
+                    .turn_files_scanned
+                    .saturating_add(props.files_scanned.unwrap_or(0));
+                self.turn_bytes_read = self
+                    .turn_bytes_read
+                    .saturating_add(props.bytes_read.unwrap_or(0));
+                self.turn_output_bytes = self
+                    .turn_output_bytes
+                    .saturating_add(props.output_bytes.unwrap_or(0));
+                self.turn_matches_returned = self
+                    .turn_matches_returned
+                    .saturating_add(props.matches_returned.unwrap_or(0));
+                self.input_tokens = self
+                    .input_tokens
+                    .saturating_add(props.input_tokens.unwrap_or(0));
+                self.output_tokens = self
+                    .output_tokens
+                    .saturating_add(props.output_tokens.unwrap_or(0));
+                self.cached_tokens = self
+                    .cached_tokens
+                    .saturating_add(props.cached_tokens.unwrap_or(0));
+                self.estimated_usd_micros = self
+                    .estimated_usd_micros
+                    .saturating_add(props.estimated_usd_micros.unwrap_or(0));
+                self.receipt_stub_hits = self
+                    .receipt_stub_hits
+                    .saturating_add(props.receipt_stub_hits.unwrap_or(0));
+                self.negative_receipt_hits = self
+                    .negative_receipt_hits
+                    .saturating_add(props.negative_receipt_hits.unwrap_or(0));
+                self.budget_denials = self
+                    .budget_denials
+                    .saturating_add(props.budget_denials.unwrap_or(0));
+            }
+            TelemetryEventName::ToolCompleted => {
+                self.tool_calls = self.tool_calls.saturating_add(1);
+                self.files_scanned = self
+                    .files_scanned
+                    .saturating_add(props.files_scanned.unwrap_or(0));
+                self.bytes_read = self
+                    .bytes_read
+                    .saturating_add(props.bytes_read.unwrap_or(0));
+                self.output_bytes = self
+                    .output_bytes
+                    .saturating_add(props.output_bytes.unwrap_or(0));
+                self.matches_returned = self
+                    .matches_returned
+                    .saturating_add(props.matches_returned.unwrap_or(0));
+                match props.tool_status {
+                    Some(ToolStatusKind::Success) => {
+                        self.tool_successes = self.tool_successes.saturating_add(1);
+                    }
+                    Some(ToolStatusKind::Error | ToolStatusKind::Stale) => {
+                        self.tool_errors = self.tool_errors.saturating_add(1);
+                    }
+                    Some(ToolStatusKind::Denied) => {
+                        self.tool_denials = self.tool_denials.saturating_add(1);
+                    }
+                    Some(ToolStatusKind::Cancelled) => {
+                        self.tool_cancellations = self.tool_cancellations.saturating_add(1);
+                    }
+                    None => {}
+                }
+                if let Some(name) = props
+                    .tool_name
+                    .and_then(|name| serde_token(&name))
+                    .or_else(|| props.tool_family.and_then(|family| serde_token(&family)))
+                {
+                    increment_count(&mut self.tool_counts, name);
+                }
+            }
+            TelemetryEventName::GraphBuildCompleted => {
+                self.graph_build_count = self.graph_build_count.saturating_add(1);
+                self.observe_graph(props);
+            }
+            TelemetryEventName::GraphRefreshCompleted => {
+                self.graph_refresh_count = self.graph_refresh_count.saturating_add(1);
+                self.observe_graph(props);
+            }
+            TelemetryEventName::SessionEnded => {
+                self.session_status = props.session_status;
+                self.turn_count = self.turn_count.max(props.turn_count.unwrap_or(0));
+                self.tool_calls = self.tool_calls.max(props.tool_calls.unwrap_or(0));
+                self.tool_successes = self.tool_successes.max(props.tool_successes.unwrap_or(0));
+                self.tool_errors = self.tool_errors.max(props.tool_errors.unwrap_or(0));
+                self.tool_denials = self.tool_denials.max(props.tool_denials.unwrap_or(0));
+                self.tool_cancellations = self
+                    .tool_cancellations
+                    .max(props.tool_cancellations.unwrap_or(0));
+                self.budget_denials = self.budget_denials.max(props.budget_denials.unwrap_or(0));
+                self.subagent_calls = self.subagent_calls.max(props.subagent_calls.unwrap_or(0));
+                self.subagent_failures = self
+                    .subagent_failures
+                    .max(props.subagent_failures.unwrap_or(0));
+            }
+            TelemetryEventName::SlashCommandUsed => {
+                self.slash_command_count = self.slash_command_count.saturating_add(1);
+                if let Some(command) = props.slash_command.as_ref() {
+                    increment_count(&mut self.slash_counts, command.clone());
+                }
+            }
+            TelemetryEventName::ConfigChangeCommitted => {
+                self.config_change_count = self.config_change_count.saturating_add(1);
+                if let Some(field) = props.config_field.as_ref() {
+                    increment_count(&mut self.config_counts, field.clone());
+                }
+            }
+            TelemetryEventName::FailureSeen => {
+                self.failure_count = self.failure_count.saturating_add(1);
+                if let Some(kind) = props.error_kind.and_then(|kind| serde_token(&kind)) {
+                    increment_count(&mut self.failure_counts, kind);
+                }
+            }
+            TelemetryEventName::ShellSandboxBestEffortFallback => {
+                self.failure_count = self.failure_count.saturating_add(1);
+                increment_count(
+                    &mut self.failure_counts,
+                    "approval_best_effort_fallback".to_string(),
+                );
+            }
+            TelemetryEventName::AiReviewerAllowDowngrade => {
+                self.failure_count = self.failure_count.saturating_add(1);
+                increment_count(
+                    &mut self.failure_counts,
+                    "ai_reviewer_allow_downgrade".to_string(),
+                );
+            }
+            TelemetryEventName::RoutingRouted => {
+                self.routing_routed_count = self.routing_routed_count.saturating_add(1);
+                if let Some(reason) = props.routing_reason.as_ref() {
+                    increment_count(&mut self.routing_counts, format!("routed:{reason}"));
+                }
+            }
+            TelemetryEventName::RoutingEscalated => {
+                self.routing_escalated_count = self.routing_escalated_count.saturating_add(1);
+                if let Some(reason) = props.routing_reason.as_ref() {
+                    increment_count(&mut self.routing_counts, format!("escalated:{reason}"));
+                }
+            }
+            TelemetryEventName::SessionSummary => {}
+        }
+    }
+
+    fn observe_graph(&mut self, props: &TelemetryProperties) {
+        self.symbols = self.symbols.saturating_add(props.symbols.unwrap_or(0));
+        self.edges = self.edges.saturating_add(props.edges.unwrap_or(0));
+        self.bytes_parsed = self
+            .bytes_parsed
+            .saturating_add(props.bytes_parsed.unwrap_or(0));
+        self.excluded_files = self
+            .excluded_files
+            .saturating_add(props.excluded_files.unwrap_or(0));
+        self.excluded_dirs = self
+            .excluded_dirs
+            .saturating_add(props.excluded_dirs.unwrap_or(0));
+        self.excluded_bytes = self
+            .excluded_bytes
+            .saturating_add(props.excluded_bytes.unwrap_or(0));
+        self.persisted_files_loaded = self
+            .persisted_files_loaded
+            .saturating_add(props.persisted_files_loaded.unwrap_or(0));
+        self.persisted_files_missed = self
+            .persisted_files_missed
+            .saturating_add(props.persisted_files_missed.unwrap_or(0));
+    }
+}
+
+fn increment_count(map: &mut BTreeMap<String, u64>, key: String) {
+    *map.entry(key).or_default() += 1;
+}
+
+fn serde_token<T: Serialize>(value: &T) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
+fn capped_count_map(map: BTreeMap<String, u64>) -> (BTreeMap<String, u64>, u64) {
+    let original_len = map.len();
+    let mut entries = map.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    entries.truncate(MAX_SUMMARY_MAP_ENTRIES);
+    let capped = entries.into_iter().collect::<BTreeMap<_, _>>();
+    let dropped = original_len.saturating_sub(capped.len()) as u64;
+    (capped, dropped)
+}
+
+fn non_empty_map(map: BTreeMap<String, u64>) -> Option<BTreeMap<String, u64>> {
+    if map.is_empty() { None } else { Some(map) }
+}
+
+fn u128_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -982,6 +2267,12 @@ pub struct GraphPerfReport {
     pub files_changed: u64,
     pub files_parsed: u64,
     pub bytes_parsed: u64,
+    pub excluded_files: u64,
+    pub excluded_dirs: u64,
+    pub excluded_bytes: u64,
+    pub persisted_files_loaded: u64,
+    pub persisted_files_missed: u64,
+    pub persistence_rebuilt: bool,
     pub symbols: u64,
     pub edges: u64,
     pub language_distribution: LanguageDistribution,
@@ -993,12 +2284,80 @@ pub struct LanguageDistribution {
     pub c_files: u64,
     pub csharp_files: u64,
     pub cpp_files: u64,
+    pub dart_files: u64,
     pub go_files: u64,
+    pub java_files: u64,
+    pub javascript_files: u64,
+    pub jsx_files: u64,
+    pub kotlin_files: u64,
+    pub php_files: u64,
     pub python_files: u64,
+    pub ruby_files: u64,
     pub rust_files: u64,
+    pub scala_files: u64,
+    pub swift_files: u64,
+    pub typescript_files: u64,
+    pub tsx_files: u64,
     pub supported_files: u64,
     pub unsupported_files: u64,
     pub unknown_files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTelemetryReport {
+    pub duration_ms: u64,
+    pub status: SessionStatusKind,
+    /// The durable on-disk session ID (distinct from the per-process
+    /// telemetry `session_id`). Lets operators correlate PostHog sessions
+    /// back to the session store file and stitch together resume chains.
+    pub store_session_id: Option<String>,
+    pub turns: u64,
+    pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_errors: u64,
+    pub tool_denials: u64,
+    pub tool_cancellations: u64,
+    pub budget_denials: u64,
+    pub subagent_calls: u64,
+    pub subagent_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashTelemetryReport<'a> {
+    pub command: &'a str,
+    pub surface: SlashSurface,
+    pub outcome: SlashOutcome,
+    pub alias_kind: SlashAliasKind,
+    pub arg_shape: SlashArgShape,
+}
+
+impl<'a> SlashTelemetryReport<'a> {
+    pub fn new(
+        command: &'a str,
+        surface: SlashSurface,
+        outcome: SlashOutcome,
+        alias_kind: SlashAliasKind,
+        arg_shape: SlashArgShape,
+    ) -> Self {
+        Self {
+            command,
+            surface,
+            outcome,
+            alias_kind,
+            arg_shape,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigChangeReport<'a> {
+    pub scope: ConfigScopeKind,
+    pub section: &'a str,
+    pub field: &'a str,
+    pub apply_tier: ConfigApplyTier,
+    pub change_kind: ConfigChangeKind,
+    pub prev_bucket: &'a str,
+    pub new_bucket: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1219,6 +2578,96 @@ pub enum OutcomeStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SessionStatusKind {
+    Running,
+    Archived,
+    Completed,
+    Cancelled,
+    Failed,
+    Truncated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupRoute {
+    Fresh,
+    DirectResume,
+    ResumePickerFresh,
+    ResumePickerResume,
+    FirstRunSetupFresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashSurface {
+    TuiComposer,
+    TuiInline,
+    AgentRaw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashOutcome {
+    Accepted,
+    UsageError,
+    BlockedDuringTurn,
+    Unknown,
+    TemplateExpanded,
+    StartedTurn,
+    OpenedOverlay,
+    StartedJob,
+    LocalAction,
+    Skipped,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashAliasKind {
+    Canonical,
+    CompatOptions,
+    Unknown,
+    Template,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlashArgShape {
+    None,
+    Present,
+    FixedSubcommand,
+    Id,
+    Path,
+    FreeText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigScopeKind {
+    User,
+    Project,
+    Local,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplyTier {
+    Immediate,
+    NextPrompt,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigChangeKind {
+    Set,
+    Unset,
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     Provider,
     Tool,
@@ -1256,6 +2705,22 @@ fn default_install_id_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".squeezy/install_id"))
 }
 
+fn default_telemetry_store_path_for_install_path(install_id_path: &Path) -> PathBuf {
+    env::var_os("SQUEEZY_TELEMETRY_STORE_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            install_id_path
+                .parent()
+                .map(|parent| parent.join("telemetry.redb"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".squeezy/telemetry.redb"))
+}
+
+fn purge_telemetry_store_for_install_path(install_id_path: &Path) {
+    let path = default_telemetry_store_path_for_install_path(install_id_path);
+    let _ = fs::remove_file(path);
+}
+
 /// Stamp the session-scoped `trace_id` and any active per-turn `span_id`
 /// on `event`. Idempotent: a `trace_id` already present on the event
 /// (set by a caller for a span they manage themselves) is preserved.
@@ -1268,6 +2733,26 @@ fn stamp_trace_ids(state: &TelemetryState, event: &mut TelemetryEvent) {
         && let Some(span_id) = guard.as_ref()
     {
         event.properties.span_id = Some(span_id.clone());
+    }
+}
+
+fn slash_command_token(value: &str) -> String {
+    let mut token = String::new();
+    let trimmed = value.trim().trim_start_matches('/');
+    for ch in trimmed.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            token.push(ch);
+        } else {
+            return "unknown".to_string();
+        }
+        if token.len() >= 80 {
+            break;
+        }
+    }
+    if token.is_empty() {
+        "unknown".to_string()
+    } else {
+        token
     }
 }
 

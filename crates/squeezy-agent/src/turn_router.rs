@@ -476,7 +476,7 @@ pub(crate) async fn classify_turn(
     }
     // The master switch (config or `/router off`) gates implicit
     // routing but never blocks an explicit `/cheap` request.
-    let auto_disabled = inputs.overrides.session_disabled || !cfg.auto_cheap;
+    let auto_disabled = inputs.overrides.session_disabled || !cfg.enabled;
     if auto_disabled && !inputs.overrides.force_cheap {
         return ClassifyResult::parent();
     }
@@ -488,6 +488,17 @@ pub(crate) async fn classify_turn(
         // Routing to the same model would be a no-op — skip the
         // classifier and the judge call entirely.
         return ClassifyResult::parent();
+    }
+    // The reroute filter decides whether this parent is worth rerouting. The
+    // per-provider default reroutes every flagship while skipping already-cheap
+    // tiers (haiku/mini/nano/flash) by name; users can override with their own
+    // regex patterns (a leading `!` excludes). Resolved per provider, so it
+    // never crosses providers; `/cheap` bypasses it.
+    if !inputs.overrides.force_cheap {
+        let filter = squeezy_core::resolved_reroute_filter(inputs.config, inputs.provider_name);
+        if !squeezy_core::parent_is_reroute_eligible(inputs.parent_model, &filter) {
+            return ClassifyResult::parent();
+        }
     }
     let cheap: Arc<str> = Arc::from(cheap);
 
@@ -505,7 +516,15 @@ pub(crate) async fn classify_turn(
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
     }
 
-    if inputs.turn_index > 0 && inputs.prior_turn_was_hard && is_deictic_followup(inputs.user_input)
+    // Short follow-ups inherit the prior turn's route instead of paying for a
+    // judge call: an "ok"/"continue"/"that one" or any ultra-short prompt after
+    // a hard (parent) turn stays on the parent, since it's almost always a
+    // continuation of that task. Length-gated (`follow_up_max_chars`) so it
+    // doesn't depend solely on a deictic word list, and free (no judge).
+    if inputs.turn_index > 0
+        && inputs.prior_turn_was_hard
+        && (is_deictic_followup(inputs.user_input)
+            || (inputs.user_input.trim().chars().count() as u32) <= cfg.follow_up_max_chars)
     {
         return ClassifyResult::parent();
     }
@@ -514,11 +533,13 @@ pub(crate) async fn classify_turn(
         return ClassifyResult::parent();
     }
 
-    if let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg) {
+    if cfg.heuristic
+        && let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg)
+    {
         return ClassifyResult::cheap(reason, cheap);
     }
 
-    if !cfg.auto_cheap_llm_judge {
+    if !cfg.llm_judge {
         return ClassifyResult::parent();
     }
     let prompt_chars = inputs.user_input.chars().count() as u32;
@@ -526,10 +547,20 @@ pub(crate) async fn classify_turn(
         return ClassifyResult::parent();
     }
     let judge_model = judge_model_for(inputs.provider_name, inputs.config, &cheap);
+    // Custom judge prompt (per-provider override → global) falls back to the
+    // built-in per-provider instructions.
+    let instructions = inputs
+        .config
+        .providers
+        .get(inputs.provider_name)
+        .and_then(|p| p.judge_prompt.as_deref())
+        .or(cfg.judge_prompt.as_deref())
+        .unwrap_or_else(|| judge_instructions_for(inputs.provider_name));
     let (verdict, judge_cost) = run_judge(
         inputs.provider,
         inputs.provider_name,
         &judge_model,
+        instructions,
         inputs.user_input,
         cancel,
     )
@@ -550,14 +581,29 @@ pub(crate) async fn classify_turn(
 }
 
 fn judge_model_for(provider: &str, config: &AppConfig, cheap_model: &Arc<str>) -> Arc<str> {
-    let Some(model) = config.routing.judge_model.clone() else {
-        return cheap_model.clone();
-    };
-    Arc::from(
-        squeezy_core::resolve_model_alias(provider, &model)
-            .unwrap_or(&model)
-            .to_string(),
-    )
+    // Per-provider judge model wins, then the legacy global, then the
+    // per-provider built-in mini tier (routing never crosses providers).
+    let explicit = config
+        .providers
+        .get(provider)
+        .and_then(|p| p.judge_model.clone())
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| config.routing.judge_model.clone());
+    if let Some(model) = explicit {
+        return Arc::from(
+            squeezy_core::resolve_model_alias(provider, &model)
+                .unwrap_or(&model)
+                .to_string(),
+        );
+    }
+    // No explicit judge model: default to the per-provider mini tier — a notch
+    // above the cheapest reroute tier, which judges cheap-vs-parent far more
+    // reliably (the nano tier tends to hedge). Falls back to the reroute model
+    // for providers without a distinct mid tier.
+    match squeezy_core::judge_model_for_provider(provider) {
+        Some(mini) => Arc::from(mini.to_string()),
+        None => cheap_model.clone(),
+    }
 }
 
 /// Estimate the savings of running this turn on the cheap tier
@@ -594,59 +640,11 @@ pub(crate) fn estimate_routing_net_savings(
         .saturating_sub(judge_cost_usd_micros.min(i64::MAX as u64) as i64)
 }
 
-// Per-provider judge prompts. All three carry the same routing
-// guidance — short, well-specified mechanical asks go cheap;
-// architectural / exploratory / debugging asks go parent — but the
-// formatting cues differ to match what each provider's small-fast
-// tier responds best to. The default (Anthropic, Bedrock, OpenAI-
-// compatible aggregators that proxy Anthropic) emphasises the
-// single-line JSON object; the OpenAI variant adds extra weight to
-// the "no prose" constraint because OpenAI nanos otherwise lead with
-// a brief preamble; the Google variant adds explicit "no markdown"
-// because Gemini Flash Lite likes to wrap JSON in ```json fences
-// even when told not to.
-const JUDGE_INSTRUCTIONS_DEFAULT: &str = concat!(
-    "You are a routing classifier deciding which LLM should handle a coding-agent turn. ",
-    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast and ",
-    "inexpensive but weaker at ambiguous instructions and architectural judgement. ",
-    "Reply with a SINGLE JSON object on one line, no markdown, no prose: ",
-    "{\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
-    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
-    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
-    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
-    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
-);
-
-const JUDGE_INSTRUCTIONS_OPENAI: &str = concat!(
-    "You are a routing classifier. Output ONLY a single JSON object on one line. ",
-    "Do NOT include any prose, preamble, explanation, or trailing text. ",
-    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
-    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
-    "weaker at ambiguous instructions and architectural judgement. ",
-    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
-    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
-    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
-    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
-);
-
-const JUDGE_INSTRUCTIONS_GOOGLE: &str = concat!(
-    "You are a routing classifier. Reply with ONLY a single JSON object on one line — NO markdown fences, ",
-    "NO code blocks, NO prose, NO commentary. ",
-    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
-    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
-    "weaker at ambiguous instructions and architectural judgement. ",
-    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
-    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
-    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
-    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
-);
-
+// Built-in judge prompts live in squeezy-core (so the config screen can
+// display "the prompt we're using"); a `[providers.<p>].judge_prompt`
+// override is layered on at the call site in `classify_turn`.
 fn judge_instructions_for(provider_name: &str) -> &'static str {
-    match provider_name {
-        "openai" | "openai_codex" | "azure_openai" => JUDGE_INSTRUCTIONS_OPENAI,
-        "google" => JUDGE_INSTRUCTIONS_GOOGLE,
-        _ => JUDGE_INSTRUCTIONS_DEFAULT,
-    }
+    squeezy_core::default_judge_prompt(provider_name)
 }
 
 const JUDGE_TIMEOUT_MS: u64 = 10_000;
@@ -656,6 +654,7 @@ async fn run_judge(
     provider: &Arc<dyn LlmProvider>,
     provider_name: &str,
     judge_model: &Arc<str>,
+    instructions: &str,
     user_input: &str,
     cancel: CancellationToken,
 ) -> (Option<bool>, CostSnapshot) {
@@ -670,7 +669,7 @@ async fn run_judge(
         provider_honors_output_schema(provider_name, judge_model).then(judge_output_schema);
     let request = LlmRequest {
         model: judge_model.clone(),
-        instructions: Arc::from(judge_instructions_for(provider_name)),
+        instructions: Arc::from(instructions.to_string()),
         input: Arc::from(vec![LlmInputItem::UserText(user_input.to_string())]),
         max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
         response_verbosity: None,

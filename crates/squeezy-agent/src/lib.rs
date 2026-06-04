@@ -48,7 +48,9 @@ use squeezy_store::{
     SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
-    ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
+    ConfigChangeReport, ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback,
+    ReportUpload, SessionStatusKind as TelemetrySessionStatusKind, SessionTelemetryReport,
+    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, SlashTelemetryReport, StartupRoute,
     TelemetryClient, TelemetryEvent, ToolCostProperties, ToolStatusKind as TelemetryToolStatusKind,
     ToolTelemetryReport, prepare_feedback,
 };
@@ -1225,6 +1227,14 @@ pub struct Agent {
     tools: ToolRegistry,
     jobs: JobRegistry,
     telemetry: TelemetryClient,
+    session_started_at: Instant,
+    /// Metrics snapshot captured at agent-build time from `metadata.metrics`
+    /// when the agent is constructed via [`Agent::resume_with_telemetry`].
+    /// Zero for fresh sessions. Subtracted from the final `SessionMetrics`
+    /// in `finish_session` so that `session_ended` reports only the delta
+    /// contributed by this process run, preventing cumulative overcounting
+    /// across resumptions.
+    prior_metrics: SessionMetrics,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
     session_log: Option<SessionHandle>,
@@ -1303,6 +1313,15 @@ impl Agent {
         Self::new_with_session_log(config, provider, session_log)
     }
 
+    pub fn new_with_telemetry(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        telemetry: TelemetryClient,
+    ) -> Self {
+        let session_log = start_session_log(&config, provider.name());
+        Self::new_with_session_log_and_telemetry(config, provider, session_log, telemetry)
+    }
+
     /// Build an agent without opening a durable session log.
     ///
     /// This is for local harnesses that need agent state transitions but do
@@ -1316,6 +1335,16 @@ impl Agent {
         provider: Arc<dyn LlmProvider>,
         session_log: Option<SessionHandle>,
     ) -> Self {
+        let telemetry = TelemetryClient::from_config(&config);
+        Self::new_with_session_log_and_telemetry(config, provider, session_log, telemetry)
+    }
+
+    fn new_with_session_log_and_telemetry(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_log: Option<SessionHandle>,
+        telemetry: TelemetryClient,
+    ) -> Self {
         // Fresh sessions inherit the most-recent cross-session calibration so
         // the first round's estimator isn't stuck on per-provider defaults.
         // Missing or malformed files fall back to `TokenCalibration::default()`,
@@ -1324,13 +1353,31 @@ impl Agent {
             token_calibration: SessionStore::open(&config).load_global_calibration(),
             ..ConversationState::default()
         };
-        Self::build(config, provider, session_log, conversation_state, None)
+        Self::build(
+            config,
+            provider,
+            session_log,
+            conversation_state,
+            None,
+            telemetry,
+            SessionMetrics::default(),
+        )
     }
 
     pub fn resume(
         config: AppConfig,
         provider: Arc<dyn LlmProvider>,
         session_id: &str,
+    ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
+        let telemetry = TelemetryClient::from_config(&config);
+        Self::resume_with_telemetry(config, provider, session_id, telemetry)
+    }
+
+    pub fn resume_with_telemetry(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_id: &str,
+        telemetry: TelemetryClient,
     ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
         let store = SessionStore::open(&config);
         let handle = store.open_session(session_id.to_string());
@@ -1389,6 +1436,11 @@ impl Agent {
             Vec::new()
         };
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
+        // Capture the cumulative metrics from all prior runs of this session
+        // before passing conversation_state into build. finish_session subtracts
+        // this baseline so session_ended only reports the delta contributed by
+        // this process run, preventing cumulative overcounting across resumes.
+        let prior_metrics = conversation_state.metrics.clone();
         let routing_sticky_remaining = conversation_state.routing_sticky_remaining_turns();
         let routing_session_disabled = conversation_state.routing_session_disabled();
         let agent = Self::build(
@@ -1397,6 +1449,8 @@ impl Agent {
             Some(handle.clone()),
             conversation_state,
             None,
+            telemetry,
+            prior_metrics,
         );
         if routing_sticky_remaining > 0 || routing_session_disabled {
             // Honour the persisted sticky window so a follow-up
@@ -1492,6 +1546,8 @@ impl Agent {
             None,
             ConversationState::default(),
             Some(runtime.clone()),
+            TelemetryClient::disabled(),
+            SessionMetrics::default(),
         );
 
         let mut final_answer = String::new();
@@ -1526,6 +1582,8 @@ impl Agent {
         session_log: Option<SessionHandle>,
         conversation_state: ConversationState,
         replay: Option<Arc<ReplayRuntime>>,
+        telemetry: TelemetryClient,
+        prior_metrics: SessionMetrics,
     ) -> Self {
         // Arm context compaction by default. The mid-turn micro-compaction
         // tier (and the full tier) early-returns when
@@ -1610,7 +1668,8 @@ impl Agent {
             store.clone(),
             redactor.clone(),
             config.cache.root.clone(),
-        );
+        )
+        .with_telemetry(telemetry.clone());
         let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
             ToolRuntimeConfig {
@@ -1717,7 +1776,9 @@ impl Agent {
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         let (event_broadcast, _) = broadcast::channel(64);
         Self {
-            telemetry: TelemetryClient::from_config(&config),
+            telemetry,
+            session_started_at: Instant::now(),
+            prior_metrics,
             config,
             provider,
             tools,
@@ -1818,6 +1879,9 @@ impl Agent {
     /// build time (tools/MCP/redactor) are NOT rebuilt; pair this with the
     /// "restart required" badge in the UI for those.
     pub fn replace_config(&mut self, next: AppConfig) {
+        if next.telemetry != self.config.telemetry {
+            self.telemetry = TelemetryClient::from_config(&next);
+        }
         self.config = next;
     }
 
@@ -2069,6 +2133,29 @@ impl Agent {
         let _ = self.telemetry.flush().await;
     }
 
+    pub fn record_slash_command_telemetry(
+        &self,
+        command: &str,
+        surface: SlashSurface,
+        outcome: SlashOutcome,
+        alias_kind: SlashAliasKind,
+        arg_shape: SlashArgShape,
+    ) {
+        self.telemetry.spawn(TelemetryEvent::slash_command_used(
+            SlashTelemetryReport::new(command, surface, outcome, alias_kind, arg_shape),
+        ));
+    }
+
+    pub fn record_startup_ready_telemetry(&self, route: StartupRoute, duration: Duration) {
+        self.telemetry
+            .spawn(TelemetryEvent::startup_ready(&self.config, route, duration));
+    }
+
+    pub fn record_config_change_telemetry(&self, report: ConfigChangeReport<'_>) {
+        self.telemetry
+            .spawn(TelemetryEvent::config_change_committed(report));
+    }
+
     pub fn session_id(&self) -> Option<String> {
         self.session_log
             .as_ref()
@@ -2301,10 +2388,13 @@ impl Agent {
         &self,
         feedback: &PreparedFeedback,
     ) -> squeezy_core::Result<FeedbackSubmitResult> {
-        FeedbackClient::from_config(&self.config)
-            .submit_feedback(feedback)
-            .await
-            .map_err(|error| SqueezyError::Tool(error.to_string()))
+        FeedbackClient::from_config_with_session(
+            &self.config,
+            self.telemetry.session_id().as_deref(),
+        )
+        .submit_feedback(feedback)
+        .await
+        .map_err(|error| SqueezyError::Tool(error.to_string()))
     }
 
     pub fn build_bug_report(
@@ -2324,17 +2414,20 @@ impl Agent {
             .iter()
             .map(|section| section.name.clone())
             .collect::<Vec<_>>();
-        FeedbackClient::from_config(&self.config)
-            .submit_report(ReportUpload {
-                report_id: &bundle.report_id,
-                session_id: &bundle.session_id,
-                archive_bytes: &bundle.archive_bytes,
-                redactions: bundle.redactions,
-                sections,
-                source: "tui",
-            })
-            .await
-            .map_err(|error| SqueezyError::Tool(error.to_string()))
+        FeedbackClient::from_config_with_session(
+            &self.config,
+            self.telemetry.session_id().as_deref(),
+        )
+        .submit_report(ReportUpload {
+            report_id: &bundle.report_id,
+            session_id: &bundle.session_id,
+            archive_bytes: &bundle.archive_bytes,
+            redactions: bundle.redactions,
+            sections,
+            source: "tui",
+        })
+        .await
+        .map_err(|error| SqueezyError::Tool(error.to_string()))
     }
 
     pub fn resume_current(
@@ -2581,7 +2674,32 @@ impl Agent {
         };
         let state = self.conversation_state.lock().await.clone();
         let _ = session.write_resume_state(&state.to_resume_state());
+        let metrics = state.metrics.clone();
         let _ = session.finish(status, state.cost, state.metrics, state.redactions);
+        let p = &self.prior_metrics;
+        self.telemetry
+            .record(TelemetryEvent::session_ended(
+                &self.config,
+                SessionTelemetryReport {
+                    duration_ms: self.session_started_at.elapsed().as_millis() as u64,
+                    status: telemetry_session_status(status),
+                    store_session_id: Some(session.session_id().to_string()),
+                    turns: metrics.turns.saturating_sub(p.turns),
+                    tool_calls: metrics.tool_calls.saturating_sub(p.tool_calls),
+                    tool_successes: metrics.tool_successes.saturating_sub(p.tool_successes),
+                    tool_errors: metrics.tool_errors.saturating_sub(p.tool_errors),
+                    tool_denials: metrics.tool_denials.saturating_sub(p.tool_denials),
+                    tool_cancellations: metrics
+                        .tool_cancellations
+                        .saturating_sub(p.tool_cancellations),
+                    budget_denials: metrics.budget_denials.saturating_sub(p.budget_denials),
+                    subagent_calls: metrics.subagent_calls.saturating_sub(p.subagent_calls),
+                    subagent_failures: metrics
+                        .subagent_failures
+                        .saturating_sub(p.subagent_failures),
+                },
+            ))
+            .await;
     }
 
     fn flush_active_session_log(&self) {
@@ -3079,6 +3197,7 @@ impl Agent {
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
+            | DispatchCommand::Spinner { .. }
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
@@ -3095,22 +3214,68 @@ impl Agent {
     /// [`DispatchOutcome::Error`] for usage failures.
     pub async fn dispatch_command_raw(&self, raw: &str) -> DispatchOutcome {
         match DispatchCommand::parse(raw) {
-            Ok(cmd) => self.dispatch_command(cmd).await,
+            Ok(cmd) => {
+                let command = cmd.slash_name();
+                let arg_shape = telemetry_slash_arg_shape(&cmd);
+                let outcome = self.dispatch_command(cmd).await;
+                self.record_slash_command_telemetry(
+                    command,
+                    SlashSurface::AgentRaw,
+                    telemetry_slash_outcome_from_dispatch(&outcome),
+                    SlashAliasKind::Canonical,
+                    arg_shape,
+                );
+                outcome
+            }
             Err(DispatchCommandParseError::Unknown { command }) => {
+                self.record_slash_command_telemetry(
+                    "unknown",
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::Unknown,
+                    SlashAliasKind::Unknown,
+                    SlashArgShape::Present,
+                );
                 DispatchOutcome::Unsupported { command }
             }
-            Err(DispatchCommandParseError::Empty) => DispatchOutcome::Error {
-                command: String::new(),
-                message: "empty command".to_string(),
-            },
-            Err(DispatchCommandParseError::NotASlashCommand) => DispatchOutcome::Error {
-                command: raw.to_string(),
-                message: "expected a slash command".to_string(),
-            },
-            Err(DispatchCommandParseError::Usage { command, hint }) => DispatchOutcome::Error {
-                command,
-                message: hint,
-            },
+            Err(DispatchCommandParseError::Empty) => {
+                self.record_slash_command_telemetry(
+                    "unknown",
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::UsageError,
+                    SlashAliasKind::Unknown,
+                    SlashArgShape::None,
+                );
+                DispatchOutcome::Error {
+                    command: String::new(),
+                    message: "empty command".to_string(),
+                }
+            }
+            Err(DispatchCommandParseError::NotASlashCommand) => {
+                self.record_slash_command_telemetry(
+                    "unknown",
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::UsageError,
+                    SlashAliasKind::Unknown,
+                    SlashArgShape::Present,
+                );
+                DispatchOutcome::Error {
+                    command: raw.to_string(),
+                    message: "expected a slash command".to_string(),
+                }
+            }
+            Err(DispatchCommandParseError::Usage { command, hint }) => {
+                self.record_slash_command_telemetry(
+                    &command,
+                    SlashSurface::AgentRaw,
+                    SlashOutcome::UsageError,
+                    SlashAliasKind::Canonical,
+                    SlashArgShape::Present,
+                );
+                DispatchOutcome::Error {
+                    command,
+                    message: hint,
+                }
+            }
         }
     }
 
@@ -8865,15 +9030,18 @@ async fn run_subagent(
             let Some(id) = activity_id else {
                 continue;
             };
-            let Some(message) = subagent_activity_message(event) else {
-                continue;
-            };
-            let _ = parent_tx.try_send(AgentEvent::SubagentActivity {
-                turn_id: parent_turn_id,
-                id,
-                agent: activity_agent.clone(),
-                message,
-            });
+            // A completed tool's structured result is forwarded so the parent
+            // can render it as a real rail card in the subagent's transcript
+            // view; other intermediate events stay hidden to keep the parent's
+            // own transcript clean.
+            if let AgentEvent::ToolCallCompleted { result, .. } = event {
+                let _ = parent_tx.try_send(AgentEvent::SubagentToolResult {
+                    turn_id: parent_turn_id,
+                    id,
+                    agent: activity_agent.clone(),
+                    result,
+                });
+            }
         }
     });
     let local_jobs = JobRegistry::new();
@@ -8997,22 +9165,6 @@ fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
             other => json!({ "role": "other", "kind": format!("{other:?}") }),
         })
         .collect()
-}
-
-fn subagent_activity_message(event: AgentEvent) -> Option<String> {
-    match event {
-        AgentEvent::ToolCallStarted { call, .. } => {
-            let args = serde_json::to_string(&call.arguments).unwrap_or_default();
-            let args = compact_text(&args, 140);
-            Some(format!("running {} {}", call.name, args))
-        }
-        AgentEvent::ToolCallCompleted { result, .. } => Some(format!(
-            "completed {} {}",
-            result.tool_name,
-            tool_status_label(result.status)
-        )),
-        _ => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10146,10 +10298,23 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
 /// to have, so it is returned verbatim rather than pretending a separate
 /// cheap tier exists.
 pub(crate) fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
+    // Per-provider cheap (reroute target) model wins (routing never crosses
+    // providers), then the legacy global override, then the per-provider built-in.
+    if let Some(model) = config
+        .providers
+        .get(provider)
+        .and_then(|p| p.cheap_model.clone())
+        .filter(|m| !m.trim().is_empty())
+    {
+        return Some(resolve_model_alias_owned(provider, model));
+    }
     if let Some(model) = config.small_fast_model.clone() {
         return Some(resolve_model_alias_owned(provider, model));
     }
-    if let Some(model) = squeezy_core::small_fast_model_for_provider(provider) {
+    // Built-in default: the per-provider mini tier (not the nano `small_fast`
+    // tier). A notch up judges and handles easy turns far more reliably; this
+    // mirrors `default_cheap_model` in squeezy-core so the config UI agrees.
+    if let Some(model) = squeezy_core::judge_model_for_provider(provider) {
         return Some(resolve_model_alias_owned(provider, model.to_string()));
     }
     match provider {
@@ -12175,6 +12340,147 @@ fn telemetry_tool_status(status: ToolStatus) -> TelemetryToolStatusKind {
     }
 }
 
+fn telemetry_session_status(status: SessionStatus) -> TelemetrySessionStatusKind {
+    match status {
+        SessionStatus::Running => TelemetrySessionStatusKind::Running,
+        SessionStatus::Archived => TelemetrySessionStatusKind::Archived,
+        SessionStatus::Completed => TelemetrySessionStatusKind::Completed,
+        SessionStatus::Cancelled => TelemetrySessionStatusKind::Cancelled,
+        SessionStatus::Failed => TelemetrySessionStatusKind::Failed,
+        SessionStatus::Truncated => TelemetrySessionStatusKind::Truncated,
+    }
+}
+
+fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
+    match cmd {
+        DispatchCommand::Cost
+        | DispatchCommand::Context
+        | DispatchCommand::Reviewer
+        | DispatchCommand::Model
+        | DispatchCommand::Permissions
+        | DispatchCommand::Attachments
+        | DispatchCommand::Clear
+        | DispatchCommand::Diff
+        | DispatchCommand::Tasks
+        | DispatchCommand::Pins
+        | DispatchCommand::Sessions
+        | DispatchCommand::Fork
+        | DispatchCommand::Checkpoints
+        | DispatchCommand::Undo
+        | DispatchCommand::Statusline
+        | DispatchCommand::Keymap
+        | DispatchCommand::Cheap
+        | DispatchCommand::Parent => SlashArgShape::None,
+        DispatchCommand::Attach { .. } => SlashArgShape::Path,
+        DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
+            if option_has_text(prompt.as_ref()) {
+                SlashArgShape::FreeText
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Help { topic } => {
+            if option_has_text(topic.as_ref()) {
+                SlashArgShape::FreeText
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Theme { theme } => {
+            if option_has_text(theme.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Spinner { spinner } => {
+            if option_has_text(spinner.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Effort { value }
+        | DispatchCommand::Verbosity { value }
+        | DispatchCommand::ToolVerbosity { value }
+        | DispatchCommand::Router { value } => {
+            if option_has_text(value.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Config { section } => {
+            if option_has_text(section.as_ref()) {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Compact { undo } => {
+            if *undo {
+                SlashArgShape::FixedSubcommand
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Plans { args }
+        | DispatchCommand::Feedback { args }
+        | DispatchCommand::Report { args } => {
+            if args.trim().is_empty() {
+                SlashArgShape::None
+            } else {
+                SlashArgShape::FixedSubcommand
+            }
+        }
+        DispatchCommand::Task { .. }
+        | DispatchCommand::TaskCancel { .. }
+        | DispatchCommand::Unpin { .. }
+        | DispatchCommand::Resume { .. }
+        | DispatchCommand::SessionExport { .. }
+        | DispatchCommand::Checkpoint { .. }
+        | DispatchCommand::RevertTurn { .. }
+        | DispatchCommand::Detach { .. } => SlashArgShape::Id,
+        DispatchCommand::Pin { target } => {
+            if target.is_some() {
+                SlashArgShape::Id
+            } else {
+                SlashArgShape::None
+            }
+        }
+        DispatchCommand::Session { .. }
+        | DispatchCommand::SessionRename { .. }
+        | DispatchCommand::SessionLabel { .. } => SlashArgShape::FixedSubcommand,
+        DispatchCommand::SessionExportHtml { path, .. } => {
+            if path.is_some() {
+                SlashArgShape::Path
+            } else {
+                SlashArgShape::Id
+            }
+        }
+    }
+}
+
+fn option_has_text(value: Option<&String>) -> bool {
+    value.map(|value| !value.trim().is_empty()).unwrap_or(false)
+}
+
+fn telemetry_slash_outcome_from_dispatch(outcome: &DispatchOutcome) -> SlashOutcome {
+    match outcome {
+        DispatchOutcome::Error { .. } => SlashOutcome::Error,
+        DispatchOutcome::Unsupported { .. } => SlashOutcome::Unknown,
+        DispatchOutcome::TuiOnly { .. } => SlashOutcome::OpenedOverlay,
+        DispatchOutcome::ModeChanged {
+            prompt: Some(_), ..
+        } => SlashOutcome::StartedTurn,
+        DispatchOutcome::DiffSnapshot { .. } | DispatchOutcome::CheckpointUndo { .. } => {
+            SlashOutcome::StartedJob
+        }
+        DispatchOutcome::Compacted { skipped: true } => SlashOutcome::Skipped,
+        _ => SlashOutcome::LocalAction,
+    }
+}
+
 pub(crate) fn is_budget_denied(result: &ToolResult) -> bool {
     result.content.get("budget_denied").and_then(Value::as_bool) == Some(true)
 }
@@ -12280,52 +12586,70 @@ async fn permission_decision_for_request(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
-    if verdict.action == PermissionAction::Ask
-        && request.tool_name == "shell"
+    // The structural pre-classifier runs for every shell call, not just those
+    // whose policy verdict is already Ask. Its AutoDeny floor (dangerous
+    // interpreter, destructive verb, sensitive path) must be able to override a
+    // permissive `shell = Allow` default — otherwise `python -c '...'`,
+    // `sudo ...`, and sensitive-path access execute with no gate.
+    if request.tool_name == "shell"
         && let Some(command) = request.metadata.get("command")
     {
         match pre_classify_shell(command, &context.config.permissions.shell_sandbox) {
             ShellPreClassification::AutoAllow { reason } => {
-                let reason = format!("pre-classifier auto-allow: {reason}");
-                log_session_event(
-                    context.session_log.as_ref(),
-                    &context.redactor,
-                    "permission_pre_classifier_allow",
-                    Some(context.turn_id),
-                    Some(reason.clone()),
-                    json!({
-                        "reason": reason,
-                        "capability": request.capability.as_str(),
-                        "target": request.target.clone(),
-                    }),
-                );
-                verdict = PermissionVerdict {
-                    action: PermissionAction::Allow,
-                    matched_rule: None,
-                    reason,
-                    silent: false,
-                };
+                // Only relax an Ask to Allow; never re-affirm an existing Allow
+                // nor weaken a Deny.
+                if verdict.action == PermissionAction::Ask {
+                    let reason = format!("pre-classifier auto-allow: {reason}");
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_pre_classifier_allow",
+                        Some(context.turn_id),
+                        Some(reason.clone()),
+                        json!({
+                            "reason": reason,
+                            "capability": request.capability.as_str(),
+                            "target": request.target.clone(),
+                        }),
+                    );
+                    verdict = PermissionVerdict {
+                        action: PermissionAction::Allow,
+                        matched_rule: None,
+                        reason,
+                        silent: false,
+                    };
+                }
             }
             ShellPreClassification::AutoDeny { reason } => {
-                let reason = format!("pre-classifier auto-deny: {reason}");
-                log_session_event(
-                    context.session_log.as_ref(),
-                    &context.redactor,
-                    "permission_pre_classifier_deny",
-                    Some(context.turn_id),
-                    Some(reason.clone()),
-                    json!({
-                        "reason": reason,
-                        "capability": request.capability.as_str(),
-                        "target": request.target.clone(),
-                    }),
-                );
-                verdict = PermissionVerdict {
-                    action: PermissionAction::Deny,
-                    matched_rule: None,
-                    reason,
-                    silent: false,
+                // Tighten one step toward deny so the command cannot run
+                // silently: Allow -> Ask (force a human/reviewer gate),
+                // Ask -> Deny. An existing Deny is left untouched.
+                let tightened = match verdict.action {
+                    PermissionAction::Allow => PermissionAction::Ask,
+                    PermissionAction::Ask | PermissionAction::Deny => PermissionAction::Deny,
                 };
+                if tightened != verdict.action {
+                    let reason = format!("pre-classifier auto-deny: {reason}");
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_pre_classifier_deny",
+                        Some(context.turn_id),
+                        Some(reason.clone()),
+                        json!({
+                            "reason": reason,
+                            "action": tightened.as_str(),
+                            "capability": request.capability.as_str(),
+                            "target": request.target.clone(),
+                        }),
+                    );
+                    verdict = PermissionVerdict {
+                        action: tightened,
+                        matched_rule: None,
+                        reason,
+                        silent: false,
+                    };
+                }
             }
             ShellPreClassification::AskAi => {}
         }
@@ -14823,6 +15147,15 @@ pub enum AgentEvent {
         id: SubagentId,
         agent: String,
         message: String,
+    },
+    /// A subagent's completed tool result, forwarded with its full structure so
+    /// the parent can render it as a rail card in the subagent's transcript
+    /// view (rather than the flat `completed X` line `SubagentActivity` carried).
+    SubagentToolResult {
+        turn_id: TurnId,
+        id: SubagentId,
+        agent: String,
+        result: ToolResult,
     },
     SubagentCompleted {
         turn_id: TurnId,

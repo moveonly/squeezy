@@ -21,11 +21,11 @@ use crate::{
     DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
-    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_THEME_NAME,
-    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode,
-    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, SessionResumePicker,
-    StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
-    TuiSynchronizedOutput, normalize_tui_theme_name,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
+    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
+    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -123,6 +123,10 @@ pub enum FieldKind {
     Secret {
         env_var: &'static str,
     },
+    /// Read-only informational row. The `get` fn returns a `String` rendered
+    /// verbatim; there is no editor and saves never touch it. Used to surface
+    /// context like the active provider in the Routing section.
+    Info,
     /// Singleton kind used only by the `Providers` section to indicate the
     /// six per-provider sub-tabs along the right pane.
     ProviderSubTabs,
@@ -155,6 +159,7 @@ impl std::fmt::Debug for FieldKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bool => write!(f, "Bool"),
+            Self::Info => write!(f, "Info"),
             Self::Integer { min, max, suffix } => f
                 .debug_struct("Integer")
                 .field("min", min)
@@ -271,6 +276,7 @@ pub enum SectionId {
     Limits,
     Telemetry,
     Providers,
+    Routing,
     Session,
     Modes,
     Context,
@@ -302,6 +308,7 @@ impl SectionId {
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
             Self::Providers => "providers",
+            Self::Routing => "routing",
             Self::Session => "session",
             Self::Modes => "modes",
             Self::Context => "context",
@@ -382,7 +389,6 @@ pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
-pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
 pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
     &["default", "auto_review", "full_access", "custom"];
@@ -501,6 +507,117 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
         ],
     },
     ConfigSectionMeta {
+        id: SectionId::Routing,
+        label: "Routing",
+        description: "Auto-route easy turns to a cheaper model to cut cost",
+        fields: &[
+            FieldMeta {
+                label: "provider",
+                toml_path: &["routing", "_provider_info"],
+                kind: FieldKind::Info,
+                tier: ApplyTier::Immediate,
+                get: get_routing_provider_info,
+                set: set_noop,
+                default_display: "",
+                default: || FieldValue::String(String::new()),
+                help: "Routing is per-provider — the model fields below apply to the ACTIVE provider (switch it in Models). The toggles above are global. Other providers keep their own saved settings.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "enabled",
+                toml_path: &["routing", "enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_enabled,
+                set: set_routing_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_ENABLED),
+                help: "Master switch: route easy turns to the cheaper model; harder turns stay on the main model. Same as `/router on|off`. Global.",
+                env_override: Some("SQUEEZY_ROUTING_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "heuristic",
+                toml_path: &["routing", "heuristic"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_heuristic,
+                set: set_routing_heuristic,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_HEURISTIC),
+                help: "Static fast-path: instantly route obvious mechanical commands (e.g. 'run cargo test') with no judge call. Global.",
+                env_override: Some("SQUEEZY_ROUTING_HEURISTIC"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "llm_judge",
+                toml_path: &["routing", "llm_judge"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_llm_judge,
+                set: set_routing_llm_judge,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_LLM_JUDGE),
+                help: "For non-obvious turns, ask the judge model whether to route cheap. Global.",
+                env_override: Some("SQUEEZY_ROUTING_LLM_JUDGE"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "cheap_model",
+                toml_path: &["providers", "*", "cheap_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_cheap_model,
+                set: set_provider_cheap_model,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Route TO: the cheap model easy turns are sent to, for the active provider. Shows the model in effect; clear it to inherit the per-provider default mini tier (e.g. openai gpt-5.4-mini, google gemini-3.5-flash).",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "judge_model",
+                toml_path: &["providers", "*", "judge_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_judge_model,
+                set: set_provider_judge_model,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Cheap/fast model that classifies turns cheap-vs-parent, for the active provider. Must be cheap — a mini tier judges better than nano. Empty = per-provider mini default. Accepts aliases like 'haiku'.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "expensive_models",
+                toml_path: &["providers", "*", "expensive_models"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_expensive_models,
+                set: set_provider_expensive_models,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Route FROM: one regex; the parent model is rerouted when it matches. Default uses a negative lookahead to skip this provider's cheap tiers and reroute every flagship — e.g. (?i)^(?!.*(nano|mini)).* — so it's forward-compatible. Set your own regex (e.g. opus|gpt-5 to restrict, or a lookahead to exclude), or clear it (shown as 'any') to reroute every model.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "judge_prompt",
+                toml_path: &["providers", "*", "judge_prompt"],
+                kind: FieldKind::String { multiline: true },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_judge_prompt,
+                set: set_provider_judge_prompt,
+                default_display: "built-in",
+                default: || FieldValue::String(String::new()),
+                help: "Judge instructions for the active provider. Press Enter to open the full editor. Shows the built-in per-provider prompt unless you override it.",
+                env_override: None,
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
         id: SectionId::Permissions,
         label: "Permissions",
         description: "Mode first, with granular defaults in Custom",
@@ -516,7 +633,63 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_perm_mode,
                 default_display: "default",
                 default: || FieldValue::Enum("default"),
-                help: "Permission preset. Default allows workspace read/edit/local commands, Auto-review routes eligible approvals through the reviewer, Full Access removes workspace/network prompts, Custom exposes each capability.",
+                help: "Permission preset (shipped default: Default — human prompts, no LLM reviewer). Default allows workspace read/edit/shell/git/compiler and asks on web/mcp/destructive. Auto-review (opt-in) instead routes edit/shell/git/compiler/web/mcp through the reviewer, which auto-approves the safe ones (see reviewer_model / reviewer_policy). Full Access removes workspace/network prompts; Custom exposes each capability.",
+                env_override: None,
+                secret: false,
+            },
+            // Reviewer rows are shown under Auto-review (and Custom). They sit
+            // immediately after `mode` so the Permissions section's visible
+            // rows stay a contiguous prefix — see `permissions_visible_rows`
+            // in the TUI config screen.
+            FieldMeta {
+                label: "reviewer_model",
+                toml_path: &["permissions", "ai_reviewer", "model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_model,
+                set: set_ai_reviewer_model,
+                default_display: "small-fast",
+                default: || FieldValue::String(String::new()),
+                help: "Model the Auto-review reviewer uses to judge permission prompts. Empty uses the provider's small/fast tier (cheap). Distinct from the turn-routing judge_model.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "reviewer_policy",
+                toml_path: &["permissions", "ai_reviewer", "policy_file"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_policy_file,
+                set: set_ai_reviewer_policy_file,
+                default_display: "built-in",
+                default: || FieldValue::String(String::new()),
+                help: "Path to a Markdown file that replaces the built-in Auto-review judging policy (APPROVAL_POLICY.md). Empty uses the built-in policy.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "reviewer_policy_extra",
+                toml_path: &["permissions", "ai_reviewer", "policy"],
+                kind: FieldKind::String { multiline: true },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_policy_text,
+                set: set_ai_reviewer_policy_text,
+                default_display: "none",
+                help: "Extra judging instructions appended to the base Auto-review policy (the built-in one, or reviewer_policy if set). Press Enter to edit. Tightens or extends the policy without replacing it.",
+                default: || FieldValue::String(String::new()),
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "reviewer_capabilities",
+                toml_path: &["permissions", "ai_reviewer", "allow_capabilities"],
+                kind: FieldKind::StringList { min: 0, max: 9 },
+                tier: ApplyTier::NextPrompt,
+                get: get_ai_reviewer_capabilities,
+                set: set_ai_reviewer_capabilities,
+                default_display: "read, search, network, mcp, edit, shell, git, compiler",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Capabilities the Auto-review reviewer may auto-approve (read, search, edit, shell, git, compiler, network, mcp). Anything else always reaches a human; destructive is never auto-approved, and high-risk network/mcp and out-of-workspace writes always escalate. Empty = review-only.",
                 env_override: None,
                 secret: false,
             },
@@ -783,21 +956,6 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
-                label: "alternate_screen",
-                toml_path: &["tui", "alternate_screen"],
-                kind: FieldKind::Enum {
-                    options: ALTERNATE_SCREEN_OPTIONS,
-                },
-                tier: ApplyTier::Restart,
-                get: get_alternate_screen,
-                set: set_alternate_screen,
-                default_display: "auto",
-                default: || FieldValue::Enum("auto"),
-                help: "Whether to use native terminal scrollback (`auto`/`never`) or take over the full alternate screen (`always`).",
-                env_override: None,
-                secret: false,
-            },
-            FieldMeta {
                 label: "synchronized_output",
                 toml_path: &["tui", "synchronized_output"],
                 kind: FieldKind::Enum {
@@ -865,6 +1023,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "default",
                 default: || FieldValue::String(DEFAULT_TUI_THEME_NAME.to_string()),
                 help: "Active named theme. Configure colors in the Themes section or via /theme.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "spinner",
+                toml_path: &["tui", "spinner"],
+                kind: FieldKind::Enum {
+                    options: crate::BUILTIN_TUI_SPINNER_NAMES,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_spinner,
+                set: set_spinner,
+                default_display: "scintillate",
+                default: || FieldValue::Enum(DEFAULT_TUI_SPINNER_NAME),
+                help: "Working-status spinner shape: twinkle, scintillate, or drift.",
                 env_override: None,
                 secret: false,
             },
@@ -1866,6 +2039,112 @@ fn set_perm_mode(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static 
     cfg.permissions.apply_mode(mode);
     Ok(())
 }
+
+fn get_ai_reviewer_model(cfg: &AppConfig) -> FieldValue {
+    // Show the model that will actually run: the explicit override, else the
+    // provider's resolved small/fast tier, else the main model — matching the
+    // reviewer's own resolution. Clearing the override reverts the row to the
+    // resolved default rather than a blank cell.
+    let resolved = cfg
+        .permissions
+        .ai_reviewer
+        .model
+        .clone()
+        .or_else(|| cfg.resolved_small_fast_model())
+        .unwrap_or_else(|| cfg.model.clone());
+    FieldValue::String(resolved)
+}
+// Unlike the per-capability setters, this does not force mode = Custom: the
+// reviewer model is meaningful under the Auto-review preset.
+fn set_ai_reviewer_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("reviewer model expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.permissions.ai_reviewer.model = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    Ok(())
+}
+
+fn get_ai_reviewer_policy_file(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.permissions
+            .ai_reviewer
+            .policy_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    )
+}
+fn set_ai_reviewer_policy_file(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("reviewer policy file expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.permissions.ai_reviewer.policy_file = if trimmed.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    };
+    Ok(())
+}
+
+fn get_ai_reviewer_policy_text(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.permissions
+            .ai_reviewer
+            .policy
+            .clone()
+            .unwrap_or_default(),
+    )
+}
+fn set_ai_reviewer_policy_text(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("reviewer policy expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.permissions.ai_reviewer.policy = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    Ok(())
+}
+
+fn get_ai_reviewer_capabilities(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(
+        cfg.permissions
+            .ai_reviewer
+            .allow_capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect(),
+    )
+}
+fn set_ai_reviewer_capabilities(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let FieldValue::StringList(items) = value else {
+        return Err("reviewer capabilities expects string list");
+    };
+    let mut caps = Vec::new();
+    for item in items {
+        let capability =
+            crate::PermissionCapability::parse(item.trim()).ok_or("invalid reviewer capability")?;
+        if !caps.contains(&capability) {
+            caps.push(capability);
+        }
+    }
+    cfg.permissions.ai_reviewer.allow_capabilities = caps;
+    Ok(())
+}
 fn get_perm_read(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.permissions.read.as_str())
 }
@@ -2092,23 +2371,6 @@ fn set_persist_prompt_history(cfg: &mut AppConfig, value: FieldValue) -> Result<
     }
 }
 
-fn get_alternate_screen(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Enum(cfg.tui.alternate_screen.as_str())
-}
-fn set_alternate_screen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
-    let s = match value {
-        FieldValue::Enum(s) => s,
-        _ => return Err("expects enum"),
-    };
-    cfg.tui.alternate_screen = match s {
-        "auto" => TuiAlternateScreen::Auto,
-        "never" => TuiAlternateScreen::Never,
-        "always" => TuiAlternateScreen::Always,
-        _ => return Err("invalid alternate_screen"),
-    };
-    Ok(())
-}
-
 fn get_synchronized_output(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.tui.synchronized_output.as_str())
 }
@@ -2132,6 +2394,24 @@ fn set_theme(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str>
         _ => return Err("expects theme name"),
     };
     cfg.tui.theme = normalize_tui_theme_name(&s).ok_or("invalid theme")?;
+    Ok(())
+}
+
+fn get_spinner(cfg: &AppConfig) -> FieldValue {
+    let name = crate::BUILTIN_TUI_SPINNER_NAMES
+        .iter()
+        .copied()
+        .find(|s| *s == cfg.tui.spinner)
+        .unwrap_or(DEFAULT_TUI_SPINNER_NAME);
+    FieldValue::Enum(name)
+}
+fn set_spinner(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        FieldValue::Enum(s) => s.to_string(),
+        _ => return Err("expects spinner name"),
+    };
+    cfg.tui.spinner = normalize_tui_spinner_name(&s).ok_or("invalid spinner")?;
     Ok(())
 }
 
@@ -2271,6 +2551,218 @@ fn set_max_session_cost_usd_micros(
 }
 
 // Telemetry
+
+fn get_routing_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.enabled)
+}
+fn set_routing_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_heuristic(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.heuristic)
+}
+fn set_routing_heuristic(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.heuristic = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_llm_judge(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.llm_judge)
+}
+fn set_routing_llm_judge(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.llm_judge = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+// Per-provider routing model fields. They read/write `cfg.providers[<active
+// provider>]` so switching the active provider (in Models) instantly shows that
+// provider's own settings; routing never crosses providers. Persistence routes
+// through a `[providers.<slug>]` table write (see config_screen save).
+
+/// Canonical slug of the active provider — the key into `cfg.providers`.
+fn active_routing_provider(cfg: &AppConfig) -> &'static str {
+    crate::provider_kind(&cfg.provider)
+}
+
+fn set_noop(_cfg: &mut AppConfig, _value: FieldValue) -> Result<(), &'static str> {
+    Ok(())
+}
+
+fn get_routing_provider_info(cfg: &AppConfig) -> FieldValue {
+    let slug = active_routing_provider(cfg);
+    let cheap = resolved_cheap_model(cfg, slug);
+    let headline = cfg.model.trim();
+    // The cheap target and the reroute filter are shown in the rows below, so
+    // the banner only carries the pinned-provider note plus a flag when routing
+    // can't fire at all: no distinct cheaper model, or the headline is itself
+    // excluded by the filter (a cheap tier).
+    let inactive = if cheap.trim().is_empty() || cheap == headline {
+        Some("no cheaper model — set cheap_model")
+    } else if !crate::parent_is_reroute_eligible(
+        headline,
+        &crate::resolved_reroute_filter(cfg, slug),
+    ) {
+        Some("current model excluded by expensive_models")
+    } else {
+        None
+    };
+    match inactive {
+        Some(reason) => FieldValue::String(format!(
+            "{slug}  ·  routing inactive — {reason}  ·  pinned (change provider in Models)"
+        )),
+        None => FieldValue::String(format!("{slug}  ·  pinned (change provider in Models)")),
+    }
+}
+
+// Resolution helpers. `resolved_*` is what's actually used for the active
+// provider (per-provider override → legacy global → built-in). `default_*` is
+// the same chain WITHOUT the per-provider override, so a setter can store
+// `None` when the user keeps the inherited value (the field stays "default"
+// rather than pinning a redundant override).
+
+fn resolved_cheap_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.cheap_model.clone())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| default_cheap_model(cfg, slug))
+}
+fn default_cheap_model(cfg: &AppConfig, slug: &str) -> String {
+    // The reroute target defaults to the provider's mini tier (not nano): a
+    // notch above the cheapest model judges and handles easy turns far more
+    // reliably. `small_fast_model` (used for titles/summaries) stays a legacy
+    // global override. Mirrors `cheap_model_for` in squeezy-agent exactly,
+    // including the single-model `ollama` fall-through, so the config display
+    // never disagrees with what the router actually uses.
+    cfg.small_fast_model
+        .clone()
+        .or_else(|| crate::judge_model_for_provider(slug).map(str::to_string))
+        .or_else(|| (slug == "ollama").then(|| crate::DEFAULT_OLLAMA_MODEL.to_string()))
+        .unwrap_or_default()
+}
+fn resolved_judge_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.judge_model.clone())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| default_judge_model(cfg, slug))
+}
+fn default_judge_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.routing
+        .judge_model
+        .clone()
+        .or_else(|| crate::judge_model_for_provider(slug).map(str::to_string))
+        .unwrap_or_else(|| resolved_cheap_model(cfg, slug))
+}
+fn resolved_judge_prompt(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.judge_prompt.clone())
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| default_judge_prompt_for(cfg, slug))
+}
+fn default_judge_prompt_for(cfg: &AppConfig, slug: &str) -> String {
+    cfg.routing
+        .judge_prompt
+        .clone()
+        .unwrap_or_else(|| crate::default_judge_prompt(slug).to_string())
+}
+
+fn get_provider_cheap_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_cheap_model(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_cheap_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_cheap_model(cfg, slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().cheap_model = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_judge_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_judge_model(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_judge_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_judge_model(cfg, slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().judge_model = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_judge_prompt(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_judge_prompt(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_judge_prompt(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_judge_prompt_for(cfg, slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().judge_prompt = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_expensive_models(cfg: &AppConfig) -> FieldValue {
+    // The reroute filter in effect: one case-insensitive regex, a leading `!`
+    // excludes. The per-provider default (e.g. `!nano|mini`) reroutes every
+    // flagship while skipping already-cheap tiers. An explicit empty string
+    // ("reroute any") renders as "any" in the field pane.
+    FieldValue::String(crate::resolved_reroute_filter(
+        cfg,
+        active_routing_provider(cfg),
+    ))
+}
+fn set_provider_expensive_models(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let filter = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    // Store `None` (inherit) only when the value equals what would resolve
+    // anyway — the non-empty global filter, else the built-in per-provider
+    // default. Everything else (including an explicit empty "reroute any") is
+    // persisted verbatim, so the user's choice round-trips without surprise.
+    let inherited = if cfg.routing.expensive_models.is_empty() {
+        crate::default_reroute_filter(slug).to_string()
+    } else {
+        cfg.routing.expensive_models.clone()
+    };
+    let keep = filter == inherited;
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().expensive_models = (!keep).then_some(filter);
+    Ok(())
+}
 
 fn get_telemetry_enabled(cfg: &AppConfig) -> FieldValue {
     FieldValue::Bool(cfg.telemetry.enabled)

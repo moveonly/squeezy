@@ -226,7 +226,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // Keep the main transcript to a one-liner; the full prompt
                     // is the seed message of the subagent's own conversation
                     // (open it with Down / Enter to read it untruncated).
-                    app.push_info(format!(
+                    app.push_subagent_note(format!(
                         "{agent} subagent started: {}",
                         crate::compact_text(&prompt, 140)
                     ));
@@ -235,6 +235,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     id, agent, message, ..
                 } => {
                     app.note_subagent_activity(id, agent, message);
+                }
+                AgentEvent::SubagentToolResult {
+                    id, agent, result, ..
+                } => {
+                    app.note_subagent_tool_result(id, agent, result);
                 }
                 AgentEvent::SubagentCompleted {
                     id,
@@ -253,7 +258,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // One-liner in the main transcript. The full summary is
                     // stored as the final message of the subagent's own
                     // conversation (open it with Down / Enter for details).
-                    app.push_info(format!(
+                    app.push_subagent_note(format!(
                         "{agent} subagent completed · {} tools · {}",
                         metrics.subagent_tool_calls.max(metrics.tool_calls),
                         crate::compact_text(&summary, 140)
@@ -405,18 +410,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     // Fires at most once per session — the agent's
                     // `maybe_emit_shell_sandbox_fallback_warning` gates on
-                    // the tool-layer one-shot latch. Surface both the
-                    // banner (status-bar pane) and a transcript notice
-                    // so users notice mid-turn AND have a durable record.
-                    let banner = format!(
-                        "shell sandbox degraded: {backend} unavailable, running without OS isolation (best_effort)"
-                    );
-                    app.app_notifications
-                        .push(banner, crate::notification::Severity::Warn);
+                    // the tool-layer one-shot latch. Land a durable warning
+                    // in the transcript so users notice mid-turn AND keep a
+                    // record.
                     let notice = format!(
                         "shell sandbox degraded: backend `{backend}` unavailable; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
                     );
-                    app.push_transcript_item(TranscriptItem::system(notice));
+                    app.push_warn(notice);
                 }
                 AgentEvent::CostUpdate {
                     tool_count,
@@ -478,7 +478,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     app.status = status;
                     app.turn_visual = TurnVisualState::Failed;
-                    app.push_warn(format!("turn failed: {}", app.status));
+                    // A hard turn failure is the error tier (red ✖), not a cyan
+                    // ⚠ warning — it stands out and keeps its reason visible.
+                    app.push_error(format!("turn failed: {}", app.status));
                     if app.last_turn_had_edits {
                         app.last_turn_had_edits = false;
                     }
@@ -497,8 +499,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::TurnRouted {
                     from, to, reason, ..
                 } => {
-                    let notice = format!("↪ routed `{from}` → `{to}` ({reason})");
-                    app.push_transcript_item(TranscriptItem::system(notice));
+                    // A model-routing notice is TUI chrome, not turn content: push
+                    // it as a dim `◦` note on the rail (one note pipeline) rather
+                    // than a System transcript item, which rendered the off-rail
+                    // `• Noted ↪ routed …` line that severed the gutter.
+                    app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
                 }
             }
         }

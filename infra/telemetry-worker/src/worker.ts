@@ -4,8 +4,15 @@ const MAX_FEEDBACK_BODY_BYTES = 32 * 1024;
 const MAX_FEEDBACK_MESSAGE_BYTES = 16 * 1024;
 const MAX_REPORT_BYTES = 2 * 1024 * 1024;
 const MAX_EVENTS = 50;
+const MAX_PRODUCT_PROPERTIES = 128;
+const MAX_COUNT_MAP_ENTRIES = 16;
 const SCHEMA_VERSION = 1;
 const DEFAULT_POSTHOG_HOST = "https://eu.i.posthog.com";
+const PRODUCT_EVENT_RE = /^squeezy_[a-z0-9_]{1,96}$/;
+const SAFE_TOKEN_RE = /^[A-Za-z0-9._+:-]+$/;
+const SAFE_PROPERTY_KEY_RE = /^[A-Za-z0-9_]{1,80}$/;
+const TRACE_ID_RE = /^[0-9a-f]{32}$/;
+const SPAN_ID_RE = /^[0-9a-f]{16}$/;
 
 const TEXT_ENCODER = new TextEncoder();
 function utf8ByteLength(text: string): number {
@@ -19,6 +26,12 @@ interface Env {
 }
 
 type JsonObject = Record<string, unknown>;
+type SanitizedTelemetryEvent = {
+  event: string;
+  timestampMs: number;
+  eventSequence: number;
+  properties: JsonObject;
+};
 
 interface R2Bucket {
   put(
@@ -31,14 +44,6 @@ interface R2Bucket {
   ): Promise<unknown>;
 }
 
-const EVENT_NAMES = new Set([
-  "squeezy_app_started",
-  "squeezy_turn_completed",
-  "squeezy_tool_completed",
-  "squeezy_graph_build_completed",
-  "squeezy_graph_refresh_completed",
-  "squeezy_failure_seen",
-]);
 const SITE_EVENT_NAMES = new Set([
   "squeezy_site_page_view",
   "squeezy_site_cta_clicked",
@@ -47,64 +52,6 @@ const SITE_EVENT_NAMES = new Set([
 const FEEDBACK_SOURCES = new Set(["cli", "tui"]);
 const SITE_REFERRER_KINDS = new Set(["none", "internal", "search", "social", "external"]);
 const SITE_TARGET_KINDS = new Set(["internal", "github", "release", "docs", "install", "other"]);
-
-const PROVIDERS = new Set(["open_ai", "anthropic", "google", "azure_open_ai", "bedrock", "ollama"]);
-const MODEL_FAMILIES = new Set(["gpt", "claude", "gemini", "bedrock", "ollama", "other"]);
-const TOOL_NAMES = new Set([
-  "glob",
-  "grep",
-  "read_file",
-  "read_tool_output",
-  "write_file",
-  "shell",
-  "webfetch",
-  "websearch",
-  "graph",
-  "ast",
-  "other",
-]);
-const TOOL_FAMILIES = new Set(["search", "read", "write", "shell", "web", "graph", "ast", "other"]);
-const TOOL_STATUSES = new Set(["success", "error", "denied", "stale", "cancelled"]);
-const REFRESH_KINDS = new Set(["cold", "incremental"]);
-const GRAPH_SEQUENCE_SCOPES = new Set(["one_shot", "repeated"]);
-const OUTCOME_STATUSES = new Set(["success", "error", "cancelled", "skipped"]);
-const ERROR_KINDS = new Set(["provider", "tool", "permission", "budget", "graph", "io", "config", "unknown"]);
-
-const PROPERTY_SCHEMAS: Record<string, "u64" | Set<string>> = {
-  turn_index: "u64",
-  tool_sequence: "u64",
-  provider: PROVIDERS,
-  model_family: MODEL_FAMILIES,
-  tool_name: TOOL_NAMES,
-  tool_family: TOOL_FAMILIES,
-  tool_status: TOOL_STATUSES,
-  duration_ms: "u64",
-  tool_calls: "u64",
-  files_scanned: "u64",
-  rust_files: "u64",
-  supported_files: "u64",
-  unsupported_files: "u64",
-  unknown_files: "u64",
-  files_changed: "u64",
-  files_parsed: "u64",
-  bytes_read: "u64",
-  bytes_parsed: "u64",
-  output_bytes: "u64",
-  matches_returned: "u64",
-  symbols: "u64",
-  edges: "u64",
-  input_tokens: "u64",
-  output_tokens: "u64",
-  cached_tokens: "u64",
-  estimated_usd_micros: "u64",
-  receipt_stub_hits: "u64",
-  negative_receipt_hits: "u64",
-  budget_denials: "u64",
-  refresh_kind: REFRESH_KINDS,
-  graph_sequence_scope: GRAPH_SEQUENCE_SCOPES,
-  status: OUTCOME_STATUSES,
-  error_kind: ERROR_KINDS,
-};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -131,30 +78,28 @@ export default {
       return jsonResponse(404, { error: "not_found" });
     }
 
-    const contentLength = Number(request.headers.get("content-length") || "0");
-    if (contentLength > MAX_BODY_BYTES) {
-      return jsonResponse(413, { error: "body_too_large" });
-    }
-
-    const text = await request.text();
-    if (utf8ByteLength(text) > MAX_BODY_BYTES) {
+    let text: string;
+    try {
+      text = await boundedText(request, MAX_BODY_BYTES);
+    } catch {
       return jsonResponse(413, { error: "body_too_large" });
     }
 
     let batch: JsonObject;
+    let events: SanitizedTelemetryEvent[];
     try {
       batch = JSON.parse(text) as JsonObject;
       validateBatch(batch);
+      events = (batch.events as JsonObject[]).map(sanitizeEvent);
     } catch {
       return jsonResponse(400, { error: "invalid_batch" });
     }
 
-    const events = batch.events as JsonObject[];
     const response = await sendPostHogBatch(
       env,
       events.map((event) => ({
         event: event.event,
-        timestamp: new Date(event.timestamp_ms as number).toISOString(),
+        timestamp: new Date(event.timestampMs).toISOString(),
         properties: {
           distinct_id: batch.user_id,
           $process_person_profile: false,
@@ -165,8 +110,8 @@ export default {
           app_version: batch.app_version,
           os: batch.os,
           arch: batch.arch,
-          event_sequence: event.event_sequence,
-          ...(event.properties as JsonObject),
+          event_sequence: event.eventSequence,
+          ...event.properties,
         },
       })),
     );
@@ -355,7 +300,7 @@ function validateBatch(batch: JsonObject): void {
     throw new Error("events must be a non-empty bounded array");
   }
   for (const event of batch.events) {
-    validateEvent(event as JsonObject);
+    sanitizeEvent(event as JsonObject);
   }
 }
 
@@ -512,10 +457,10 @@ function validateReportHeaders(headers: Headers): ReportMetadata {
   };
 }
 
-function validateEvent(event: JsonObject): void {
+function sanitizeEvent(event: JsonObject): SanitizedTelemetryEvent {
   assertPlainObject(event, "event");
   assertKeys(event, "event", ["event", "timestamp_ms", "event_sequence", "properties"]);
-  if (typeof event.event !== "string" || !EVENT_NAMES.has(event.event)) {
+  if (!isProductEventName(event.event)) {
     throw new Error("unknown event name");
   }
   assertU64(event.timestamp_ms, "timestamp_ms");
@@ -527,22 +472,63 @@ function validateEvent(event: JsonObject): void {
   ) {
     throw new Error("timestamp_ms outside accepted window");
   }
-  validateProperties(event.properties as JsonObject);
+  return {
+    event: event.event as string,
+    timestampMs: event.timestamp_ms as number,
+    eventSequence: event.event_sequence as number,
+    properties: sanitizeProperties(event.properties as JsonObject),
+  };
 }
 
-function validateProperties(properties: JsonObject): void {
+function isProductEventName(value: unknown): value is string {
+  return typeof value === "string" && PRODUCT_EVENT_RE.test(value);
+}
+
+function sanitizeProperties(properties: JsonObject): JsonObject {
   assertPlainObject(properties, "properties");
+  const sanitized: JsonObject = {};
   for (const [key, value] of Object.entries(properties)) {
-    const schema = PROPERTY_SCHEMAS[key];
-    if (!schema) {
-      throw new Error(`unknown property: ${key}`);
+    if (Object.keys(sanitized).length >= MAX_PRODUCT_PROPERTIES) {
+      break;
     }
-    if (schema === "u64") {
-      assertU64(value, key);
-    } else if (typeof value !== "string" || !schema.has(value)) {
-      throw new Error(`invalid enum value for ${key}`);
+    if (!SAFE_PROPERTY_KEY_RE.test(key)) {
+      continue;
     }
+    const safe = sanitizePropertyValue(value, key);
+    if (safe === undefined) {
+      continue;
+    }
+    sanitized[key] = safe;
   }
+  return sanitized;
+}
+
+function sanitizePropertyValue(value: unknown, label: string): unknown {
+  try {
+    if (Number.isSafeInteger(value) && (value as number) >= 0) {
+      return value;
+    }
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") {
+      if (label === "trace_id") {
+        return TRACE_ID_RE.test(value) ? value : undefined;
+      }
+      if (label === "span_id") {
+        return SPAN_ID_RE.test(value) ? value : undefined;
+      }
+      assertString(value, label, 1, 128);
+      return value;
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      assertCountMap(value, label);
+      return value;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function assertKeys(object: JsonObject, label: string, allowed: string[]): void {
@@ -564,7 +550,7 @@ function assertString(value: unknown, label: string, min: number, max: number): 
   if (typeof value !== "string" || value.length < min || value.length > max) {
     throw new Error(`${label} must be a bounded string`);
   }
-  if (!/^[A-Za-z0-9._+:-]+$/.test(value)) {
+  if (!SAFE_TOKEN_RE.test(value)) {
     throw new Error(`${label} has invalid characters`);
   }
 }
@@ -617,6 +603,24 @@ function assertUuid(value: unknown, label: string): void {
 function assertU64(value: unknown, label: string): void {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new Error(`${label} must be a safe non-negative integer`);
+  }
+}
+
+function assertBoolean(value: unknown, label: string): void {
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be a boolean`);
+  }
+}
+
+function assertCountMap(value: unknown, label: string): void {
+  assertPlainObject(value, label);
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > MAX_COUNT_MAP_ENTRIES) {
+    throw new Error(`${label} must be a bounded count map`);
+  }
+  for (const [key, count] of entries) {
+    assertString(key, `${label}.key`, 1, 128);
+    assertU64(count, `${label}.${key}`);
   }
 }
 

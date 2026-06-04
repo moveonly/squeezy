@@ -83,6 +83,138 @@ pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
+// Default turn-routing JUDGE model per provider — one notch ABOVE the cheap
+// reroute tier. The judge classifies cheap-vs-parent, so a slightly stronger
+// "mini" tier judges far more reliably than the cheapest "nano" tier while
+// staying cheap; the reroute target stays the cheapest tier. Providers without
+// a distinct mid tier (anthropic Haiku is already the small tier) reuse their
+// small-fast model. Overridable per provider via `[providers.<p>].judge_model`.
+pub const OPENAI_JUDGE_MODEL: &str = "gpt-5.4-mini";
+pub const GOOGLE_JUDGE_MODEL: &str = "gemini-3.5-flash";
+pub const AZURE_OPENAI_JUDGE_MODEL: &str = OPENAI_JUDGE_MODEL;
+
+/// Returns the built-in default judge model id for `provider`, falling back to
+/// the small-fast (reroute) tier when no distinct mid tier exists. `None` when
+/// the provider has no cheaper tier at all (callers then judge on the parent).
+pub fn judge_model_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(OPENAI_JUDGE_MODEL),
+        "google" => Some(GOOGLE_JUDGE_MODEL),
+        "azure_openai" => Some(AZURE_OPENAI_JUDGE_MODEL),
+        other => small_fast_model_for_provider(other),
+    }
+}
+
+/// Built-in default reroute filter for `provider` — a single standard regex
+/// matched against the parent model to decide whether an easy turn is worth
+/// rerouting (the parent is rerouted when the regex matches). The defaults use a
+/// negative lookahead to reroute every flagship while skipping the provider's
+/// already-cheap tiers by NAME (not by exact model id), so they stay correct as
+/// new models ship and scale to gateway/prefixed ids (e.g. bedrock
+/// `anthropic.claude-haiku-…` still contains "haiku"). The leading `(?i)` is
+/// case-insensitive (azure deployment names can be capitalised). Override per
+/// provider via `[providers.<name>].expensive_models`, or globally via
+/// `[routing].expensive_models`, with any regex.
+pub fn default_reroute_filter(provider: &str) -> &'static str {
+    match provider {
+        // Bare tokens are safe inside a single namespace: no openai flagship
+        // contains "mini"/"nano", no anthropic flagship "haiku", no google
+        // flagship "flash".
+        "openai" | "azure_openai" => "(?i)^(?!.*(nano|mini)).*",
+        "anthropic" | "bedrock" => "(?i)^(?!.*haiku).*",
+        "google" | "vertex" => "(?i)^(?!.*flash).*",
+        // Gateways (openrouter/vercel/portkey/…) and unknown providers carry
+        // prefixed, cross-vendor ids, so exclude every cheap-tier family. Anchor
+        // each on a leading "-" so "-mini" doesn't also match "ge[mini]-2.5-pro".
+        _ => "(?i)^(?!.*(-nano|-mini|-haiku|-flash|-lite)).*",
+    }
+}
+
+/// Whether `parent` is eligible to be rerouted given `filter` — a single
+/// standard regex (lookaround supported). The parent is eligible when the regex
+/// matches; an empty filter reroutes any parent. An invalid regex falls back to
+/// a case-insensitive substring test so a plain model name always works.
+pub fn parent_is_reroute_eligible(parent: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    match fancy_regex::Regex::new(filter) {
+        // `is_match` only errs on a backtrack-limit blowup, which short model
+        // ids never hit; treat that as "not eligible" (stay on the parent).
+        Ok(re) => re.is_match(parent).unwrap_or(false),
+        Err(_) => parent.to_lowercase().contains(&filter.to_lowercase()),
+    }
+}
+
+/// The reroute filter in effect for `provider`: per-provider override
+/// (`[providers.<name>].expensive_models`, including an explicit empty string =
+/// "reroute any") → non-empty global `[routing].expensive_models` → the
+/// built-in per-provider default. Shared by the turn router and the config
+/// screen so the displayed filter always matches what the router applies.
+pub fn resolved_reroute_filter(config: &AppConfig, provider: &str) -> String {
+    if let Some(filter) = config
+        .providers
+        .get(provider)
+        .and_then(|p| p.expensive_models.clone())
+    {
+        return filter;
+    }
+    if !config.routing.expensive_models.is_empty() {
+        return config.routing.expensive_models.clone();
+    }
+    default_reroute_filter(provider).to_string()
+}
+
+// Built-in turn-routing JUDGE prompts. All carry the same routing guidance
+// (short, well-specified, mechanical → cheap; architectural / exploratory /
+// debugging → parent) but differ in formatting cues per provider tier. Lives
+// in core so the config screen can show "the prompt we're using" and the agent
+// can dispatch it. A user `[providers.<p>].judge_prompt` overrides this.
+pub const JUDGE_PROMPT_DEFAULT: &str = concat!(
+    "You are a routing classifier deciding which LLM should handle a coding-agent turn. ",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast and ",
+    "inexpensive but weaker at ambiguous instructions and architectural judgement. ",
+    "Reply with a SINGLE JSON object on one line, no markdown, no prose: ",
+    "{\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+pub const JUDGE_PROMPT_OPENAI: &str = concat!(
+    "You are a routing classifier. Output ONLY a single JSON object on one line. ",
+    "Do NOT include any prose, preamble, explanation, or trailing text. ",
+    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
+    "weaker at ambiguous instructions and architectural judgement. ",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+pub const JUDGE_PROMPT_GOOGLE: &str = concat!(
+    "You are a routing classifier. Reply with ONLY a single JSON object on one line — NO markdown fences, ",
+    "NO code blocks, NO prose, NO commentary. ",
+    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
+    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
+    "weaker at ambiguous instructions and architectural judgement. ",
+    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
+    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+);
+
+/// The built-in judge prompt for `provider`. A `[providers.<p>].judge_prompt`
+/// override takes precedence (resolved at the use-site).
+pub fn default_judge_prompt(provider: &str) -> &'static str {
+    match provider {
+        "openai" | "openai_codex" | "azure_openai" => JUDGE_PROMPT_OPENAI,
+        "google" => JUDGE_PROMPT_GOOGLE,
+        _ => JUDGE_PROMPT_DEFAULT,
+    }
+}
+
 // OpenAI-compatible aggregators (full preset tier — curated models in models.json, dedicated costly test).
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
@@ -188,7 +320,7 @@ pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> 
         ("bedrock", "sonnet") => Some(DEFAULT_BEDROCK_MODEL),
         ("bedrock", "haiku") => Some(BEDROCK_SMALL_FAST_MODEL),
         ("google", "opus" | "best") => Some(DEFAULT_GOOGLE_MODEL),
-        ("google", "sonnet") => Some("gemini-2.5-flash"),
+        ("google", "sonnet") => Some("gemini-3.5-flash"),
         ("google", "haiku") => Some("gemini-2.5-flash-lite"),
         _ => None,
     }
@@ -264,8 +396,16 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // stalls. See `crates/squeezy-agent/src/turn_router.rs` for the
 // classifier and the escalation signals; see chapter 11 of the
 // cost-saving docs for the rationale.
-pub const DEFAULT_ROUTING_AUTO_CHEAP: bool = true;
-pub const DEFAULT_ROUTING_AUTO_CHEAP_LLM_JUDGE: bool = true;
+pub const DEFAULT_ROUTING_ENABLED: bool = true;
+/// The static, deterministic verb-heuristic fast-path. Independent of the
+/// judge so users can disable one without the other.
+pub const DEFAULT_ROUTING_HEURISTIC: bool = true;
+pub const DEFAULT_ROUTING_LLM_JUDGE: bool = true;
+/// Char-budget below which a turn is treated as a short follow-up ("ok",
+/// "continue", "yes") and inherits the previous turn's routing decision
+/// instead of paying for a judge call — a follow-up to a big parent turn
+/// stays on the parent, a follow-up to a cheap turn stays cheap.
+pub const DEFAULT_ROUTING_FOLLOW_UP_MAX_CHARS: u32 = 24;
 pub const DEFAULT_ROUTING_CHEAP_ESCALATION_ERROR_THRESHOLD: u8 = 2;
 pub const DEFAULT_ROUTING_ESCALATION_STICKY_TURNS: u8 = 3;
 pub const DEFAULT_ROUTING_BYPASS_FOR_IMAGES: bool = true;
@@ -526,6 +666,12 @@ pub struct AppConfig {
     pub checkpoints_enabled: bool,
     pub tui: TuiConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    /// Raw per-provider settings (`[providers.<name>]`), retained so the
+    /// use-site routing resolvers and the config screen can read/edit
+    /// per-provider overrides (reroute/judge models, judge prompt, reroute
+    /// allowlist) without rebuilding the whole config. Routing is
+    /// provider-scoped and never crosses providers.
+    pub providers: BTreeMap<String, ProviderSettings>,
     pub hardening: HardeningConfig,
     pub config_sources: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -866,10 +1012,6 @@ impl AppConfig {
             .or(settings.model)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(default_model);
-        let small_fast_model = get_var("SQUEEZY_SMALL_FAST_MODEL")
-            .or(model_settings.small_fast_model.clone())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
         let provider_slug = match &provider {
             ProviderConfig::OpenAi(_) => "openai",
             ProviderConfig::Anthropic(_) => "anthropic",
@@ -881,6 +1023,14 @@ impl AppConfig {
             ProviderConfig::OpenAiCompatible(_) => "",
             ProviderConfig::Faux(_) => "faux",
         };
+        // Legacy GLOBAL reroute-model override (env → `[model].small_fast_model`).
+        // The per-provider override (`[providers.<slug>].cheap_model`) and the
+        // built-in per-provider default are layered on top at the use-site
+        // `cheap_model_for` in squeezy-agent, which reads `AppConfig.providers`.
+        let small_fast_model = get_var("SQUEEZY_SMALL_FAST_MODEL")
+            .or(model_settings.small_fast_model.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let model = resolve_model_alias(provider_slug, &raw_model)
             .map(str::to_string)
             .unwrap_or(raw_model);
@@ -1061,6 +1211,12 @@ impl AppConfig {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .or(budgets.max_round_input_tokens);
+        // Global routing config. Per-provider model overrides
+        // (`[providers.<slug>].cheap_model` / `judge_model` / `judge_prompt` /
+        // `expensive_models`) are layered on top at the use-site resolvers in
+        // squeezy-agent (`cheap_model_for` / `judge_model_for` / …) which read
+        // `AppConfig.providers` — that keeps live config-screen edits and
+        // provider switches resolving without rebuilding the whole config.
         let routing = RoutingConfig::from_settings_and_env(
             settings.routing.unwrap_or_default(),
             &mut get_var,
@@ -1192,6 +1348,7 @@ impl AppConfig {
             checkpoints_enabled,
             tui,
             mcp_servers,
+            providers,
             hardening: HardeningConfig::from_settings(settings.hardening.unwrap_or_default()),
             config_sources: sources,
             config_warnings,
@@ -1503,10 +1660,17 @@ impl AppConfig {
         }
 
         output.push_str("[routing]\n");
-        output.push_str(&format!("auto_cheap = {}\n", self.routing.auto_cheap));
+        output.push_str(
+            "# Global routing toggles. Per-provider model overrides (cheap_model,\n\
+             # judge_model, judge_prompt, expensive_models) live under [providers.<name>]\n\
+             # because routing never crosses providers.\n",
+        );
+        output.push_str(&format!("enabled = {}\n", self.routing.enabled));
+        output.push_str(&format!("heuristic = {}\n", self.routing.heuristic));
+        output.push_str(&format!("llm_judge = {}\n", self.routing.llm_judge));
         output.push_str(&format!(
-            "auto_cheap_llm_judge = {}\n",
-            self.routing.auto_cheap_llm_judge
+            "follow_up_max_chars = {}  # short follow-ups inherit the prior turn's route\n",
+            self.routing.follow_up_max_chars
         ));
         if self.routing.cheap_escalation_tool_calls == 0 {
             output.push_str(
@@ -1542,10 +1706,32 @@ impl AppConfig {
             "judge_max_chars = {}\n",
             self.routing.judge_max_chars
         ));
+        // judge_model / judge_prompt / expensive_models below show the value
+        // resolved for the ACTIVE provider; set them per provider under
+        // [providers.<name>] (a global [routing] value applies as a fallback).
         if let Some(judge_model) = &self.routing.judge_model {
             output.push_str(&format!("judge_model = {}\n", toml_string(judge_model)));
         } else {
-            output.push_str("# judge_model = unset  # defaults to the cheap tier\n");
+            output.push_str(
+                "# judge_model = unset  # defaults to the per-provider mini tier (must be cheap)\n",
+            );
+        }
+        if let Some(judge_prompt) = &self.routing.judge_prompt {
+            output.push_str(&format!("judge_prompt = {}\n", toml_string(judge_prompt)));
+        } else {
+            output.push_str(
+                "# judge_prompt = unset  # defaults to the built-in per-provider prompt\n",
+            );
+        }
+        if self.routing.expensive_models.is_empty() {
+            output.push_str(
+                "# expensive_models = \"(?i)^(?!.*(nano|mini)).*\"  # regex; reroute when the parent matches. Per-provider default skips cheap tiers (haiku/mini/nano/flash)\n",
+            );
+        } else {
+            output.push_str(&format!(
+                "expensive_models = {}\n",
+                toml_string(&self.routing.expensive_models)
+            ));
         }
         if self.routing.extra_heuristic_verbs.is_empty() {
             output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
@@ -1630,6 +1816,9 @@ impl AppConfig {
                 "policy_file = {}\n",
                 toml_string(&policy_file.display().to_string())
             ));
+        }
+        if let Some(policy) = &self.permissions.ai_reviewer.policy {
+            output.push_str(&format!("policy = {}\n", toml_string(policy)));
         }
         output.push_str(&format!(
             "max_transcript_tokens = {}\n",
@@ -1902,10 +2091,6 @@ impl AppConfig {
         output.push_str(&format!(
             "transcript_default = {}\n",
             toml_string(self.tui.transcript_default.as_str())
-        ));
-        output.push_str(&format!(
-            "alternate_screen = {}\n",
-            toml_string(self.tui.alternate_screen.as_str())
         ));
         output.push_str(&format!(
             "synchronized_output = {}\n",
@@ -3277,6 +3462,26 @@ pub struct ProviderSettings {
     /// (`None` to preserve the higher-precedence layer during merge,
     /// `Some(false)` to explicitly disable, `Some(true)` to enable).
     pub use_oauth: Option<bool>,
+    /// Per-provider turn-routing overrides. Routing is provider-scoped — the
+    /// cheap/judge models for `openai` make no sense under `anthropic` — so
+    /// these live here rather than in the global `[routing]` table. Each falls
+    /// back (per-provider → legacy global → built-in) when `None`; see
+    /// `cheap_model_for` / `judge_model_for` in `squeezy-agent`.
+    ///
+    /// The model easy turns are rerouted to. `None` = the per-provider built-in
+    /// (`small_fast_model_for_provider`).
+    pub cheap_model: Option<String>,
+    /// The model that classifies turns cheap-vs-parent. `None` = the
+    /// per-provider built-in mini tier (`judge_model_for_provider`). Should be a
+    /// cheap/fast model.
+    pub judge_model: Option<String>,
+    /// Custom judge instructions. `None` = the built-in per-provider prompt.
+    pub judge_prompt: Option<String>,
+    /// Reroute filter: a single case-insensitive regex selecting which parent
+    /// models to reroute (a leading `!` excludes; combine with `|`). `None` =
+    /// the built-in per-provider default (skip this provider's cheap tiers); an
+    /// explicit empty string reroutes any model.
+    pub expensive_models: Option<String>,
 }
 
 impl ProviderSettings {
@@ -3310,6 +3515,10 @@ impl ProviderSettings {
                 "deployment_id",
                 "cf_ai_gateway",
                 "use_oauth",
+                "cheap_model",
+                "judge_model",
+                "judge_prompt",
+                "expensive_models",
             ],
             source,
             path,
@@ -3546,6 +3755,20 @@ impl ProviderSettings {
             )?,
             cf_ai_gateway,
             use_oauth: bool_value(table, "use_oauth", source, &field(path, "use_oauth"))?,
+            cheap_model: string_value(table, "cheap_model", source, &field(path, "cheap_model"))?,
+            judge_model: string_value(table, "judge_model", source, &field(path, "judge_model"))?,
+            judge_prompt: string_value(
+                table,
+                "judge_prompt",
+                source,
+                &field(path, "judge_prompt"),
+            )?,
+            expensive_models: string_value(
+                table,
+                "expensive_models",
+                source,
+                &field(path, "expensive_models"),
+            )?,
         })
     }
 
@@ -3577,6 +3800,10 @@ impl ProviderSettings {
         replace_if_some(&mut self.deployment_id, next.deployment_id);
         replace_if_some(&mut self.cf_ai_gateway, next.cf_ai_gateway);
         replace_if_some(&mut self.use_oauth, next.use_oauth);
+        replace_if_some(&mut self.cheap_model, next.cheap_model);
+        replace_if_some(&mut self.judge_model, next.judge_model);
+        replace_if_some(&mut self.judge_prompt, next.judge_prompt);
+        replace_if_some(&mut self.expensive_models, next.expensive_models);
     }
 }
 
@@ -3978,8 +4205,25 @@ impl BudgetSettings {
 /// parent model after a false positive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    pub auto_cheap: bool,
-    pub auto_cheap_llm_judge: bool,
+    /// Master switch for turn routing (config `[routing].enabled`, or
+    /// `/router on|off`). Global; gates both the heuristic and the judge.
+    pub enabled: bool,
+    /// Static deterministic verb-heuristic fast-path toggle (independent of the
+    /// judge). Global; not per-provider.
+    pub heuristic: bool,
+    pub llm_judge: bool,
+    /// Char budget below which a turn inherits the previous turn's routing
+    /// decision (short follow-up) instead of calling the judge. Global.
+    pub follow_up_max_chars: u32,
+    /// Custom judge instructions. Resolved per active provider
+    /// (per-provider override → global `[routing].judge_prompt`); `None` uses
+    /// the built-in per-provider prompt.
+    pub judge_prompt: Option<String>,
+    /// Global reroute filter: a single case-insensitive regex selecting which
+    /// parent models to reroute (a leading `!` excludes; combine with `|`).
+    /// Resolved per active provider (per-provider override → this global → the
+    /// built-in per-provider default). Empty = fall through to the default.
+    pub expensive_models: String,
     /// Hard ceiling on tool calls a cheap-routed turn may issue before
     /// the escalation detector hands back to the parent model. `0`
     /// (default) means "derive at runtime as `max_tool_calls_per_turn /
@@ -4009,18 +4253,27 @@ impl RoutingConfig {
         get_var: &mut impl FnMut(&str) -> Option<String>,
     ) -> Self {
         Self {
-            auto_cheap: get_var("SQUEEZY_ROUTING_AUTO_CHEAP")
+            enabled: get_var("SQUEEZY_ROUTING_ENABLED")
                 .as_deref()
                 .map(parse_enabled_bool)
-                .unwrap_or(settings.auto_cheap.unwrap_or(DEFAULT_ROUTING_AUTO_CHEAP)),
-            auto_cheap_llm_judge: get_var("SQUEEZY_ROUTING_AUTO_CHEAP_LLM_JUDGE")
+                .unwrap_or(settings.enabled.unwrap_or(DEFAULT_ROUTING_ENABLED)),
+            heuristic: get_var("SQUEEZY_ROUTING_HEURISTIC")
                 .as_deref()
                 .map(parse_enabled_bool)
-                .unwrap_or(
-                    settings
-                        .auto_cheap_llm_judge
-                        .unwrap_or(DEFAULT_ROUTING_AUTO_CHEAP_LLM_JUDGE),
-                ),
+                .unwrap_or(settings.heuristic.unwrap_or(DEFAULT_ROUTING_HEURISTIC)),
+            follow_up_max_chars: get_var("SQUEEZY_ROUTING_FOLLOW_UP_MAX_CHARS")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .or(settings.follow_up_max_chars)
+                .unwrap_or(DEFAULT_ROUTING_FOLLOW_UP_MAX_CHARS),
+            judge_prompt: get_var("SQUEEZY_ROUTING_JUDGE_PROMPT").or(settings.judge_prompt),
+            expensive_models: get_var("SQUEEZY_ROUTING_EXPENSIVE_MODELS")
+                .or(settings.expensive_models)
+                .unwrap_or_default(),
+            llm_judge: get_var("SQUEEZY_ROUTING_LLM_JUDGE")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.llm_judge.unwrap_or(DEFAULT_ROUTING_LLM_JUDGE)),
             cheap_escalation_tool_calls: parse_u64(
                 get_var("SQUEEZY_ROUTING_CHEAP_ESCALATION_TOOL_CALLS"),
                 settings.cheap_escalation_tool_calls.unwrap_or(0),
@@ -4089,8 +4342,12 @@ impl RoutingConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RoutingSettings {
-    pub auto_cheap: Option<bool>,
-    pub auto_cheap_llm_judge: Option<bool>,
+    pub enabled: Option<bool>,
+    pub heuristic: Option<bool>,
+    pub llm_judge: Option<bool>,
+    pub follow_up_max_chars: Option<u32>,
+    pub judge_prompt: Option<String>,
+    pub expensive_models: Option<String>,
     pub cheap_escalation_tool_calls: Option<u64>,
     pub cheap_escalation_error_threshold: Option<u8>,
     pub escalation_sticky_turns: Option<u8>,
@@ -4107,8 +4364,12 @@ impl RoutingSettings {
         reject_unknown_keys(
             table,
             &[
-                "auto_cheap",
-                "auto_cheap_llm_judge",
+                "enabled",
+                "heuristic",
+                "llm_judge",
+                "follow_up_max_chars",
+                "judge_prompt",
+                "expensive_models",
                 "cheap_escalation_tool_calls",
                 "cheap_escalation_error_threshold",
                 "escalation_sticky_turns",
@@ -4123,12 +4384,26 @@ impl RoutingSettings {
             path,
         )?;
         Ok(Self {
-            auto_cheap: bool_value(table, "auto_cheap", source, &field(path, "auto_cheap"))?,
-            auto_cheap_llm_judge: bool_value(
+            enabled: bool_value(table, "enabled", source, &field(path, "enabled"))?,
+            heuristic: bool_value(table, "heuristic", source, &field(path, "heuristic"))?,
+            llm_judge: bool_value(table, "llm_judge", source, &field(path, "llm_judge"))?,
+            follow_up_max_chars: u32_value(
                 table,
-                "auto_cheap_llm_judge",
+                "follow_up_max_chars",
                 source,
-                &field(path, "auto_cheap_llm_judge"),
+                &field(path, "follow_up_max_chars"),
+            )?,
+            judge_prompt: string_value(
+                table,
+                "judge_prompt",
+                source,
+                &field(path, "judge_prompt"),
+            )?,
+            expensive_models: string_value(
+                table,
+                "expensive_models",
+                source,
+                &field(path, "expensive_models"),
             )?,
             cheap_escalation_tool_calls: u64_value(
                 table,
@@ -4183,8 +4458,12 @@ impl RoutingSettings {
     }
 
     fn merge(&mut self, next: Self) {
-        replace_if_some(&mut self.auto_cheap, next.auto_cheap);
-        replace_if_some(&mut self.auto_cheap_llm_judge, next.auto_cheap_llm_judge);
+        replace_if_some(&mut self.enabled, next.enabled);
+        replace_if_some(&mut self.heuristic, next.heuristic);
+        replace_if_some(&mut self.llm_judge, next.llm_judge);
+        replace_if_some(&mut self.follow_up_max_chars, next.follow_up_max_chars);
+        replace_if_some(&mut self.judge_prompt, next.judge_prompt);
+        replace_if_some(&mut self.expensive_models, next.expensive_models);
         replace_if_some(
             &mut self.cheap_escalation_tool_calls,
             next.cheap_escalation_tool_calls,
@@ -5348,7 +5627,10 @@ impl PermissionCapability {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Severity is ordered `Low < Medium < High < Critical` (the variant
+/// declaration order), so callers can compare against a ceiling — e.g. the AI
+/// reviewer refuses to auto-allow anything `>= High`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PermissionRisk {
     Low,
     Medium,
@@ -5697,6 +5979,7 @@ pub struct AiReviewerSettings {
     pub model: Option<String>,
     pub allow_capabilities: Option<Vec<String>>,
     pub policy_file: Option<String>,
+    pub policy: Option<String>,
     pub timeout_secs: Option<u64>,
     pub max_transcript_tokens: Option<u64>,
 }
@@ -5710,6 +5993,7 @@ impl AiReviewerSettings {
                 "model",
                 "allow_capabilities",
                 "policy_file",
+                "policy",
                 "timeout_secs",
                 "max_transcript_tokens",
             ],
@@ -5726,6 +6010,7 @@ impl AiReviewerSettings {
                 &field(path, "allow_capabilities"),
             )?,
             policy_file: string_value(table, "policy_file", source, &field(path, "policy_file"))?,
+            policy: string_value(table, "policy", source, &field(path, "policy"))?,
             timeout_secs: u64_value(table, "timeout_secs", source, &field(path, "timeout_secs"))?,
             max_transcript_tokens: u64_value(
                 table,
@@ -5741,6 +6026,7 @@ impl AiReviewerSettings {
         replace_if_some(&mut self.model, next.model);
         replace_if_some(&mut self.allow_capabilities, next.allow_capabilities);
         replace_if_some(&mut self.policy_file, next.policy_file);
+        replace_if_some(&mut self.policy, next.policy);
         replace_if_some(&mut self.timeout_secs, next.timeout_secs);
         replace_if_some(&mut self.max_transcript_tokens, next.max_transcript_tokens);
     }
@@ -5752,6 +6038,10 @@ pub struct AiReviewerConfig {
     pub model: Option<String>,
     pub allow_capabilities: Vec<PermissionCapability>,
     pub policy_file: Option<PathBuf>,
+    /// Extra instructions appended to the base judging policy (the built-in
+    /// `APPROVAL_POLICY.md` or `policy_file`). Lets a project tighten/extend the
+    /// policy without replacing it wholesale.
+    pub policy: Option<String>,
     pub timeout_secs: u64,
     /// Sliding-window transcript budget for the reviewer prompt. Keeps the most
     /// recent turns whole and compacts older entries into a single summary
@@ -5770,6 +6060,7 @@ impl Default for AiReviewerConfig {
             model: None,
             allow_capabilities: vec![PermissionCapability::Read, PermissionCapability::Search],
             policy_file: None,
+            policy: None,
             timeout_secs: 15,
             max_transcript_tokens: DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS,
         }
@@ -5795,6 +6086,12 @@ impl AiReviewerConfig {
             let policy_file = policy_file.trim();
             if !policy_file.is_empty() {
                 config.policy_file = Some(expand_home_path(PathBuf::from(policy_file)));
+            }
+        }
+        if let Some(policy) = settings.policy {
+            let policy = policy.trim();
+            if !policy.is_empty() {
+                config.policy = Some(policy.to_string());
             }
         }
         if let Some(timeout_secs) = settings.timeout_secs {
@@ -6455,18 +6752,14 @@ impl PermissionPolicy {
         let legacy_defaults = settings.has_legacy_defaults();
         let custom_defaults = settings.custom.is_some();
         let legacy_compat = legacy_defaults && settings.mode.is_none();
-        let explicit_mode = settings.mode.is_some();
         let mode = settings
             .mode
             .unwrap_or(if legacy_defaults || custom_defaults {
                 PermissionPolicyMode::Custom
             } else {
-                PermissionPolicyMode::AutoReview
+                PermissionPolicyMode::Default
             });
         let ai_reviewer_settings = settings.ai_reviewer.clone();
-        let ai_reviewer_enabled_configured = ai_reviewer_settings
-            .as_ref()
-            .is_some_and(|settings| settings.enabled.is_some());
         let ai_reviewer_allow_capabilities_configured = ai_reviewer_settings
             .as_ref()
             .is_some_and(|settings| settings.allow_capabilities.is_some());
@@ -6511,10 +6804,12 @@ impl PermissionPolicy {
         policy.ai_reviewer = AiReviewerConfig::from_settings(ai_reviewer_settings, source)?;
         match mode {
             PermissionPolicyMode::AutoReview => {
-                if explicit_mode || !ai_reviewer_enabled_configured {
-                    policy.ai_reviewer.enabled = true;
-                }
-                if explicit_mode || !ai_reviewer_allow_capabilities_configured {
+                // Selecting Auto-review enables the reviewer (toggle it off by
+                // choosing a different preset). The auto-approve set defaults to
+                // the workspace-write capabilities but is respected when the user
+                // has configured `allow_capabilities`, so the remit is tunable.
+                policy.ai_reviewer.enabled = true;
+                if !ai_reviewer_allow_capabilities_configured {
                     policy.ai_reviewer.allow_capabilities = auto_review_allow_capabilities();
                 }
             }
@@ -6650,9 +6945,15 @@ impl PermissionPolicy {
 }
 
 fn path_request_targets_outside_workspace(request: &PermissionRequest) -> bool {
+    // `Shell` is included so a file-mutating shell command writing outside the
+    // workspace (`sed -i ~/.bashrc`, `tee /etc/hosts`, `cp x /etc/y`) escalates
+    // like the structured edit tools, instead of auto-allowing under the
+    // workspace-write `shell` default. The shell permission request sets the
+    // `outside_workspace` metadata in that case (chmod/ln/mv/touch classify as
+    // `Edit`, which is already covered here).
     matches!(
         request.capability,
-        PermissionCapability::Read | PermissionCapability::Edit
+        PermissionCapability::Read | PermissionCapability::Edit | PermissionCapability::Shell
     ) && request
         .metadata
         .get("outside_workspace")
@@ -6707,7 +7008,11 @@ pub fn target_is_effectively_wildcard(target: &str) -> bool {
 
 impl Default for PermissionPolicy {
     fn default() -> Self {
-        Self::preset(PermissionPolicyMode::AutoReview)
+        // Opt-in by default: ship the human-prompt `Default` preset, matching
+        // peer agents (codex/clear-code) where the LLM reviewer is a choice the
+        // user makes, not the shipped default. Users select `AutoReview` to turn
+        // the reviewer on.
+        Self::preset(PermissionPolicyMode::Default)
     }
 }
 
@@ -6720,9 +7025,7 @@ impl PermissionPolicy {
         let mut ai_reviewer = AiReviewerConfig::default();
         let (read, search, edit, shell, ignored_search, web, mcp, git, compiler, destructive) =
             match mode {
-                PermissionPolicyMode::Default
-                | PermissionPolicyMode::AutoReview
-                | PermissionPolicyMode::Custom => (
+                PermissionPolicyMode::Default | PermissionPolicyMode::Custom => (
                     PermissionMode::Allow,
                     PermissionMode::Allow,
                     PermissionMode::Allow,
@@ -6732,6 +7035,23 @@ impl PermissionPolicy {
                     PermissionMode::Ask,
                     PermissionMode::Allow,
                     PermissionMode::Allow,
+                    PermissionMode::Ask,
+                ),
+                // Auto-review routes the workspace-write capabilities through the
+                // reviewer (Ask) rather than auto-allowing them, so the reviewer
+                // can actually adjudicate edit/shell/git/compiler. read/search stay
+                // Allow; web/mcp stay Ask; destructive stays Ask (the reviewer may
+                // deny it but never auto-approve it).
+                PermissionPolicyMode::AutoReview => (
+                    PermissionMode::Allow,
+                    PermissionMode::Allow,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Allow,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
+                    PermissionMode::Ask,
                     PermissionMode::Ask,
                 ),
                 PermissionPolicyMode::FullAccess => {
@@ -6827,12 +7147,21 @@ impl PermissionPolicy {
     }
 }
 
+/// Default set of capabilities the Auto-review reviewer may auto-approve.
+/// Includes the workspace-write capabilities (Edit/Shell/Git/Compiler) so the
+/// reviewer actually adjudicates them; Destructive is intentionally excluded
+/// (the reviewer may deny it but must never auto-approve it). Users can narrow
+/// or widen this set via `permissions.ai_reviewer.allow_capabilities`.
 fn auto_review_allow_capabilities() -> Vec<PermissionCapability> {
     vec![
         PermissionCapability::Read,
         PermissionCapability::Search,
         PermissionCapability::Network,
         PermissionCapability::Mcp,
+        PermissionCapability::Edit,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Compiler,
     ]
 }
 
@@ -8118,24 +8447,6 @@ impl TranscriptDefault {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TuiAlternateScreen {
-    Auto,
-    Never,
-    Always,
-}
-
-impl TuiAlternateScreen {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Never => "never",
-            Self::Always => "always",
-        }
-    }
-}
-
 /// Controls whether the TUI wraps each frame draw in DEC mode 2026
 /// (Begin/End Synchronized Update). Capable terminals (kitty, WezTerm,
 /// Ghostty, iTerm2, Alacritty) flip the entire frame atomically, which
@@ -8181,6 +8492,10 @@ pub const DEFAULT_TUI_THEME_NAME: &str = "default";
 
 pub const BUILTIN_TUI_THEME_NAMES: &[&str] =
     &["default", "bright", "fun", "catppuccin", "high-contrast"];
+
+pub const DEFAULT_TUI_SPINNER_NAME: &str = "scintillate";
+
+pub const BUILTIN_TUI_SPINNER_NAMES: &[&str] = &["twinkle", "scintillate", "drift"];
 
 pub const TUI_THEME_COLOR_TOKENS: &[&str] = &[
     "palette.accent",
@@ -8260,6 +8575,17 @@ pub fn is_builtin_tui_theme_name(value: &str) -> bool {
     BUILTIN_TUI_THEME_NAMES.contains(&value)
 }
 
+pub fn normalize_tui_spinner_name(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let canonical = match normalized.as_str() {
+        "twinkle" | "twinkling" | "star" => "twinkle",
+        "scintillate" | "scintillating" | "sparkle" => "scintillate",
+        "drift" | "drifting" | "shooting" | "comet" => "drift",
+        _ => return None,
+    };
+    Some(canonical.to_string())
+}
+
 pub fn is_tui_theme_color_token(value: &str) -> bool {
     TUI_THEME_COLOR_TOKENS.contains(&value)
 }
@@ -8316,7 +8642,6 @@ pub struct TuiConfig {
     pub response_verbosity: ResponseVerbosity,
     pub tool_output_verbosity: ToolOutputVerbosity,
     pub transcript_default: TranscriptDefault,
-    pub alternate_screen: TuiAlternateScreen,
     /// DEC 2026 synchronized-output policy. `Auto` flips on for known
     /// capable terminals; `Always` forces it on; `Never` disables it.
     /// See [`TuiSynchronizedOutput`] for the capability heuristic.
@@ -8337,6 +8662,8 @@ pub struct TuiConfig {
     /// Active named TUI theme. Builtins are `default`, `bright`, `fun`,
     /// `catppuccin`, and `high-contrast`; user settings may add more names.
     pub theme: String,
+    /// Working-status spinner style: `twinkle`, `scintillate`, or `drift`.
+    pub spinner: String,
     /// User-defined or overridden theme colors, merged through the normal
     /// settings precedence chain.
     pub themes: BTreeMap<String, TuiThemeSettings>,
@@ -8376,9 +8703,6 @@ impl TuiConfig {
             transcript_default: settings
                 .transcript_default
                 .unwrap_or(TranscriptDefault::Compact),
-            alternate_screen: settings
-                .alternate_screen
-                .unwrap_or(TuiAlternateScreen::Auto),
             synchronized_output: settings
                 .synchronized_output
                 .unwrap_or(TuiSynchronizedOutput::Auto),
@@ -8389,6 +8713,9 @@ impl TuiConfig {
             theme: settings
                 .theme
                 .unwrap_or_else(|| DEFAULT_TUI_THEME_NAME.to_string()),
+            spinner: settings
+                .spinner
+                .unwrap_or_else(|| DEFAULT_TUI_SPINNER_NAME.to_string()),
             themes: settings.themes.unwrap_or_default(),
             desktop_notifications: settings
                 .desktop_notifications
@@ -8413,13 +8740,13 @@ pub struct TuiSettings {
     pub response_verbosity: Option<ResponseVerbosity>,
     pub tool_output_verbosity: Option<ToolOutputVerbosity>,
     pub transcript_default: Option<TranscriptDefault>,
-    pub alternate_screen: Option<TuiAlternateScreen>,
     pub synchronized_output: Option<TuiSynchronizedOutput>,
     pub show_reasoning_usage: Option<bool>,
     pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<String>,
+    pub spinner: Option<String>,
     pub themes: Option<BTreeMap<String, TuiThemeSettings>>,
     pub desktop_notifications: Option<NotificationMethod>,
     pub persist_prompt_history: Option<bool>,
@@ -8437,13 +8764,13 @@ impl TuiSettings {
                 "response_verbosity",
                 "tool_output_verbosity",
                 "transcript_default",
-                "alternate_screen",
                 "synchronized_output",
                 "show_reasoning_usage",
                 "coalesce_tool_runs",
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+                "spinner",
                 "themes",
                 "desktop_notifications",
                 "persist_prompt_history",
@@ -8479,12 +8806,6 @@ impl TuiSettings {
                 source,
                 &field(path, "transcript_default"),
             )?,
-            alternate_screen: tui_alternate_screen_value(
-                table,
-                "alternate_screen",
-                source,
-                &field(path, "alternate_screen"),
-            )?,
             synchronized_output: tui_synchronized_output_value(
                 table,
                 "synchronized_output",
@@ -8516,6 +8837,7 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+            spinner: tui_spinner_value(table, "spinner", source, &field(path, "spinner"))?,
             themes: tui_themes_value(table, "themes", source, &field(path, "themes"))?,
             desktop_notifications: notification_method_value(
                 table,
@@ -8545,7 +8867,6 @@ impl TuiSettings {
         replace_if_some(&mut self.response_verbosity, next.response_verbosity);
         replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
         replace_if_some(&mut self.transcript_default, next.transcript_default);
-        replace_if_some(&mut self.alternate_screen, next.alternate_screen);
         replace_if_some(&mut self.synchronized_output, next.synchronized_output);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
         replace_if_some(&mut self.status_line, next.status_line);
@@ -8785,12 +9106,31 @@ pub fn user_settings_template() -> &'static str {
 # base_url = "https://api.openai.com/v1"
 # default_model = "gpt-5.5"
 # stream_idle_timeout_ms = 300000
+# Per-provider turn-routing overrides (routing never crosses providers — these
+# apply only when openai is the active provider; switching providers uses the
+# other provider's own settings/defaults). Empty/unset = built-in defaults.
+# cheap_model = "gpt-5.4-mini"   # model easy turns route TO (default: mini tier)
+# judge_model = "gpt-5.4-mini"     # classifier model (keep it cheap; mini > nano)
+# judge_prompt = "..."             # custom judge instructions (else built-in)
+# expensive_models = "(?i)^(?!.*(nano|mini)).*"  # regex; reroute when the parent matches (default: skip this provider's cheap tiers)
 
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com/v1"
 # default_model = "claude-sonnet-4-6"
 # stream_idle_timeout_ms = 300000
+# cheap_model = "claude-haiku-4-5"
+# judge_model = "claude-haiku-4-5"
+
+# [routing]
+# Auto-route easy turns to a cheaper model to cut cost. These toggles are
+# GLOBAL; the cheap/judge MODELS are per-provider under [providers.<name>].
+# Open this page in the TUI with `/router`.
+# enabled = true               # master switch (same as `/router on|off`)
+# heuristic = true             # static fast-path for obvious mechanical commands
+# llm_judge = true             # ask the judge model on non-obvious turns
+# follow_up_max_chars = 24     # short follow-ups inherit the prior turn's route
+# judge_max_chars = 6000       # skip the judge for prompts longer than this
 
 [permissions]
 # mode = "auto_review"           # default | auto_review | full_access | custom
@@ -8929,7 +9269,6 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 # persist_prompt_history = false  # mirror Up/Down prompt history to ~/.squeezy/prompt_history (XDG-compatible)
@@ -9081,7 +9420,6 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "auto"     # auto/never preserve terminal scrollback; always uses fullscreen alternate screen
 # synchronized_output = "auto"  # auto | always | never (DEC 2026 atomic redraw)
 # show_reasoning_usage = true
 
@@ -9292,6 +9630,9 @@ fn provider_setting(
         "project" => settings.project.as_ref(),
         "service_tier" => settings.service_tier.as_ref(),
         "deployment_id" => settings.deployment_id.as_ref(),
+        "cheap_model" => settings.cheap_model.as_ref(),
+        "judge_model" => settings.judge_model.as_ref(),
+        "judge_prompt" => settings.judge_prompt.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -10920,25 +11261,6 @@ fn shell_diff_inline_value(
     }
 }
 
-fn tui_alternate_screen_value(
-    table: &toml::value::Table,
-    key: &str,
-    source: &str,
-    path: &str,
-) -> Result<Option<TuiAlternateScreen>> {
-    let Some(value) = string_value(table, key, source, path)? else {
-        return Ok(None);
-    };
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(Some(TuiAlternateScreen::Auto)),
-        "never" => Ok(Some(TuiAlternateScreen::Never)),
-        "always" => Ok(Some(TuiAlternateScreen::Always)),
-        _ => Err(SqueezyError::Config(format!(
-            "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
-        ))),
-    }
-}
-
 fn tui_synchronized_output_value(
     table: &toml::value::Table,
     key: &str,
@@ -10967,6 +11289,22 @@ fn tui_theme_value(
     normalize_tui_theme_name(&value).map(Some).ok_or_else(|| {
         SqueezyError::Config(format!(
             "{source}: {path}: invalid TUI theme {value:?}; expected a theme slug"
+        ))
+    })
+}
+
+fn tui_spinner_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    normalize_tui_spinner_name(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI spinner {value:?}; expected twinkle, scintillate, or drift"
         ))
     })
 }

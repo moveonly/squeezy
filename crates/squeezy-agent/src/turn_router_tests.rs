@@ -22,8 +22,12 @@ fn heuristic_slam_dunk(input: &str, cfg: &RoutingConfig) -> Option<&'static str>
 
 fn default_routing_config() -> RoutingConfig {
     RoutingConfig {
-        auto_cheap: true,
-        auto_cheap_llm_judge: true,
+        enabled: true,
+        heuristic: true,
+        llm_judge: true,
+        follow_up_max_chars: squeezy_core::DEFAULT_ROUTING_FOLLOW_UP_MAX_CHARS,
+        judge_prompt: None,
+        expensive_models: String::new(),
         cheap_escalation_tool_calls: 0,
         cheap_escalation_error_threshold: 2,
         escalation_sticky_turns: 3,
@@ -476,6 +480,7 @@ async fn run_judge_attaches_schema_only_on_supporting_provider() {
         &provider,
         "openai",
         &model,
+        "judge instructions",
         "rename foo to bar in src/lib.rs",
         tokio_util::sync::CancellationToken::new(),
     )
@@ -494,6 +499,7 @@ async fn run_judge_attaches_schema_only_on_supporting_provider() {
         &provider,
         "anthropic",
         &model,
+        "judge instructions",
         "rename foo to bar in src/lib.rs",
         tokio_util::sync::CancellationToken::new(),
     )
@@ -807,4 +813,74 @@ fn estimate_routing_net_savings_subtracts_judge_cost() {
     let net = estimate_routing_net_savings("anthropic", "claude-opus-4-7", &cheap_cost, 100);
 
     assert_eq!(net, gross - 100);
+}
+
+// -- Per-provider resolution -----------------------------------------------
+
+fn app_config_with_providers(
+    providers: std::collections::BTreeMap<String, squeezy_core::ProviderSettings>,
+) -> squeezy_core::AppConfig {
+    squeezy_core::AppConfig {
+        providers,
+        ..squeezy_core::AppConfig::default()
+    }
+}
+
+fn provider_settings(reroute: Option<&str>, judge: Option<&str>) -> squeezy_core::ProviderSettings {
+    squeezy_core::ProviderSettings {
+        cheap_model: reroute.map(str::to_string),
+        judge_model: judge.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cheap_model_resolves_per_provider_and_never_crosses() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "openai".to_string(),
+        provider_settings(Some("my-openai-cheap"), None),
+    );
+    let cfg = app_config_with_providers(providers);
+
+    // The active provider's override wins.
+    assert_eq!(
+        crate::cheap_model_for("openai", &cfg).as_deref(),
+        Some("my-openai-cheap")
+    );
+    // A different provider does NOT inherit openai's choice — it falls back to
+    // its own built-in cheap tier.
+    assert_eq!(
+        crate::cheap_model_for("anthropic", &cfg).as_deref(),
+        Some("claude-haiku-4-5-20251001")
+    );
+}
+
+#[test]
+fn judge_model_defaults_to_per_provider_mini() {
+    let cfg = app_config_with_providers(std::collections::BTreeMap::new());
+    let cheap: std::sync::Arc<str> = std::sync::Arc::from("gpt-5.4-nano");
+    // OpenAI default judge is the mini tier, not the cheaper nano.
+    assert_eq!(
+        &*super::judge_model_for("openai", &cfg, &cheap),
+        "gpt-5.4-mini"
+    );
+    // Anthropic's mini == its small tier (haiku).
+    let cheap_a: std::sync::Arc<str> = std::sync::Arc::from("claude-haiku-4-5-20251001");
+    assert_eq!(
+        &*super::judge_model_for("anthropic", &cfg, &cheap_a),
+        "claude-haiku-4-5-20251001"
+    );
+}
+
+#[test]
+fn judge_model_per_provider_override_wins() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "openai".to_string(),
+        provider_settings(None, Some("my-judge")),
+    );
+    let cfg = app_config_with_providers(providers);
+    let cheap: std::sync::Arc<str> = std::sync::Arc::from("gpt-5.4-nano");
+    assert_eq!(&*super::judge_model_for("openai", &cfg, &cheap), "my-judge");
 }

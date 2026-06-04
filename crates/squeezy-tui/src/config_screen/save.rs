@@ -5,13 +5,16 @@ use std::sync::Arc;
 use squeezy_agent::{Agent, PendingConfigSwap};
 use squeezy_core::{
     AppConfig, TuiThemeSettings,
-    config_schema::{ApplyTier, FieldMeta, FieldValue},
+    config_schema::{ApplyTier, FieldMeta, FieldValue, SectionId},
     load_separated_settings_sources,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, WriteOutcome, apply_edits},
 };
 
-use super::{ConfigScope, ConfigScreenState, model_field_meta, provider_variant_label, tier_path};
-use crate::notification::{NotificationQueue, Severity as NotifySeverity};
+use super::{
+    ConfigFeedback, ConfigScope, ConfigScreenState, ConfigTelemetryChange,
+    ConfigTelemetryChangeKind, Severity as NotifySeverity, model_field_meta,
+    provider_variant_label, tier_path,
+};
 
 /// Persist an inline `[providers.<section>] api_key = "..."` into the active
 /// scope's TOML and rebuild the provider client so the next turn picks it
@@ -23,7 +26,7 @@ use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 pub(crate) fn save_inline_provider_api_key(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     section: &str,
     env_var: &str,
     value: &str,
@@ -51,9 +54,7 @@ pub(crate) fn save_inline_provider_api_key(
     };
 
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let edit = SettingsEdit {
         path: &[],
@@ -67,7 +68,7 @@ pub(crate) fn save_inline_provider_api_key(
     let outcome = match apply_edits(&scope_target, &[edit]) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -141,14 +142,12 @@ fn set_effective_provider_api_key(cfg: &mut AppConfig, value: &str) {
 pub(crate) fn save_theme_selection(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
 ) {
     let (target_path, scope_target) = scope_write_target(state);
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let edit = SettingsEdit {
         path: &["tui", "theme"],
@@ -157,7 +156,7 @@ pub(crate) fn save_theme_selection(
     let outcome = match apply_edits(&scope_target, &[edit]) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -177,7 +176,7 @@ pub(crate) fn save_theme_selection(
 pub(crate) fn save_theme_snapshot(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
 ) {
     let snapshot =
@@ -189,9 +188,7 @@ pub(crate) fn save_theme_snapshot(
         .collect();
     let (target_path, scope_target) = scope_write_target(state);
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let edits = [
         SettingsEdit {
@@ -209,7 +206,7 @@ pub(crate) fn save_theme_snapshot(
     let outcome = match apply_edits(&scope_target, &edits) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -235,16 +232,14 @@ pub(crate) fn save_theme_snapshot(
 pub(crate) fn save_theme_color(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
     token: String,
     rgb: [u8; 3],
 ) {
     let (target_path, scope_target) = scope_write_target(state);
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let edit = SettingsEdit {
         path: &[],
@@ -257,7 +252,7 @@ pub(crate) fn save_theme_color(
     let outcome = match apply_edits(&scope_target, &[edit]) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -284,7 +279,7 @@ pub(crate) fn save_theme_color(
 pub(crate) fn save_theme_rename(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     old_theme: String,
     new_theme: String,
 ) {
@@ -304,9 +299,7 @@ pub(crate) fn save_theme_rename(
     let active = state.effective.tui.theme == old_theme;
     let (target_path, scope_target) = scope_write_target(state);
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let mut edits = vec![
         SettingsEdit {
@@ -334,7 +327,7 @@ pub(crate) fn save_theme_rename(
     let outcome = match apply_edits(&scope_target, &edits) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -365,7 +358,7 @@ pub(crate) fn save_theme_rename(
 pub(crate) fn save_theme_delete(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
 ) {
     if !state.effective.tui.themes.contains_key(&theme) {
@@ -379,9 +372,7 @@ pub(crate) fn save_theme_delete(
     let active = state.effective.tui.theme == theme;
     let (target_path, scope_target) = scope_write_target(state);
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let mut edits = vec![SettingsEdit {
         path: &[],
@@ -400,7 +391,7 @@ pub(crate) fn save_theme_delete(
     let outcome = match apply_edits(&scope_target, &edits) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -424,15 +415,13 @@ pub(crate) fn save_theme_delete(
 pub(crate) fn unset_theme_color(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     theme: String,
     token: String,
 ) {
     let (target_path, scope_target) = scope_write_target(state);
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
     let edit = SettingsEdit {
         path: &[],
@@ -444,7 +433,7 @@ pub(crate) fn unset_theme_color(
     let outcome = match apply_edits(&scope_target, &[edit]) {
         Ok(o) => o,
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -453,7 +442,7 @@ pub(crate) fn unset_theme_color(
         }
     };
     if outcome.edits_applied == 0 {
-        state.undo_stack.pop();
+        state.pop_undo_snapshot();
         notifications.push(
             format!("{token} has no {} override to clear", state.scope.label()),
             NotifySeverity::Info,
@@ -494,7 +483,7 @@ fn scope_write_target(state: &ConfigScreenState) -> (std::path::PathBuf, Setting
 fn finish_theme_save(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     state.dirty = true;
     match load_separated_settings_sources() {
@@ -510,14 +499,50 @@ fn finish_theme_save(
     agent.replace_config(state.effective.clone());
 }
 
+/// The per-provider routing fields use a `["providers", "*", "<key>"]`
+/// placeholder `toml_path`; the `"*"` is substituted with the active provider
+/// at write time. Returns the `<key>` (`reroute_model`, `judge_model`, …).
+fn provider_routing_field_key(field: &FieldMeta) -> Option<&'static str> {
+    match field.toml_path {
+        ["providers", "*", key] => Some(key),
+        _ => None,
+    }
+}
+
+/// Canonical slug of the active provider (the `[providers.<name>]` key).
+fn active_provider_section(state: &ConfigScreenState) -> String {
+    super::active_provider_slug(&state.effective)
+}
+
+/// Build a `[providers.<active>].<key>` write. Empty values clear the override
+/// (so the field falls back to the global / built-in default).
+fn provider_routing_edit(provider: &str, key: &'static str, value: &FieldValue) -> SettingsEdit {
+    let child_op = match value {
+        FieldValue::String(s) if !s.trim().is_empty() => EditOp::SetString(s.clone()),
+        FieldValue::StringList(items) if !items.is_empty() => {
+            EditOp::SetArrayOfStrings(items.clone())
+        }
+        _ => EditOp::Unset,
+    };
+    SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["providers"],
+            key: provider.to_string(),
+            fields: vec![(key, child_op)],
+        },
+    }
+}
+
 pub(crate) fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
+    previous: FieldValue,
     value: FieldValue,
 ) {
-    save_field_inner(state, agent, notifications, field, value, false);
+    save_field_inner(state, agent, notifications, field, previous, value, false);
 }
 
 /// `silent=true` skips the per-save notification — used by Space-cycling
@@ -526,18 +551,20 @@ pub(crate) fn save_field(
 pub(crate) fn save_field_silent(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
+    previous: FieldValue,
     value: FieldValue,
 ) {
-    save_field_inner(state, agent, notifications, field, value, true);
+    save_field_inner(state, agent, notifications, field, previous, value, true);
 }
 
 fn save_field_inner(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
+    previous: FieldValue,
     value: FieldValue,
     silent: bool,
 ) {
@@ -556,11 +583,15 @@ fn save_field_inner(
     // Snapshot file bytes before the write so Ctrl+Z can revert this
     // single save. `None` means the file didn't exist before.
     let pre_write_bytes = std::fs::read(&target_path).ok();
-    state
-        .undo_stack
-        .push((target_path.clone(), pre_write_bytes));
+    state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
-    let mut edits: Vec<SettingsEdit> = vec![field_edit(field, &value)];
+    let mut edits: Vec<SettingsEdit> = vec![match provider_routing_field_key(field) {
+        // Per-provider routing fields (`[providers.*].<key>`) write to the
+        // ACTIVE provider's table via a runtime-keyed table entry — the static
+        // `toml_path` can't carry the dynamic provider name.
+        Some(key) => provider_routing_edit(&active_provider_section(state), key, &value),
+        None => field_edit(field, &value),
+    }];
     if is_permission_detail_field(field) {
         edits.push(SettingsEdit {
             path: &["permissions", "mode"],
@@ -585,7 +616,7 @@ fn save_field_inner(
         Err(err) => {
             // Roll back the bookkeeping for the failed write so Ctrl+Z
             // doesn't try to revert a write that never happened.
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to write {}: {err}", target_path.display()),
                 NotifySeverity::Error,
@@ -608,6 +639,15 @@ fn save_field_inner(
         }
     }
 
+    if outcome.edits_applied > 0 {
+        record_field_telemetry_change(
+            state,
+            field,
+            &previous,
+            &value,
+            ConfigTelemetryChangeKind::Set,
+        );
+    }
     apply_by_tier(state, agent, notifications, field, &outcome, silent);
 }
 
@@ -615,10 +655,132 @@ fn is_permission_detail_field(field: &'static FieldMeta) -> bool {
     permission_detail_write_path(field).is_some()
 }
 
+fn record_field_telemetry_change(
+    state: &mut ConfigScreenState,
+    field: &'static FieldMeta,
+    previous: &FieldValue,
+    next: &FieldValue,
+    change_kind: ConfigTelemetryChangeKind,
+) {
+    state.telemetry_changes.push(ConfigTelemetryChange {
+        scope: state.scope,
+        section: state.current_section().id.slug(),
+        field: telemetry_field_id(field),
+        apply_tier: field.tier,
+        change_kind,
+        prev_value: telemetry_value_bucket(field, previous),
+        new_value: telemetry_value_bucket(field, next),
+    });
+}
+
+fn telemetry_field_id(field: &'static FieldMeta) -> String {
+    field
+        .toml_path
+        .iter()
+        .map(|part| if *part == "*" { "star" } else { *part })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn telemetry_value_bucket(field: &'static FieldMeta, value: &FieldValue) -> String {
+    match value {
+        FieldValue::Unset => "unset".to_string(),
+        FieldValue::Bool(true) => "bool_true".to_string(),
+        FieldValue::Bool(false) => "bool_false".to_string(),
+        FieldValue::Integer(value) => integer_bucket(*value),
+        FieldValue::OptionalInteger(Some(value)) => integer_bucket(*value),
+        FieldValue::OptionalInteger(None) => "integer_none".to_string(),
+        FieldValue::Enum(value) | FieldValue::OptionalEnum(Some(value)) => {
+            if field.toml_path == ["model", "model"] {
+                "model_custom".to_string()
+            } else {
+                format!("enum_{}", sanitize_token(value))
+            }
+        }
+        FieldValue::OptionalEnum(None) => "enum_none".to_string(),
+        FieldValue::String(value) => string_bucket(field, value),
+        FieldValue::Duration(value) => duration_bucket(value.as_millis() as u64),
+        FieldValue::StringList(items) => count_bucket("list", items.len() as u64),
+        FieldValue::Path(path) => {
+            if path.as_os_str().is_empty() {
+                "path_empty".to_string()
+            } else if path.is_absolute() {
+                "path_absolute".to_string()
+            } else {
+                "path_relative".to_string()
+            }
+        }
+        FieldValue::Secret => "secret".to_string(),
+        FieldValue::SubTabs(index) => count_bucket("subtabs", *index as u64),
+        FieldValue::TableArrayKeyed(items) => count_bucket("table", items.len() as u64),
+        FieldValue::TableArrayOrdered(items) => count_bucket("table", items.len() as u64),
+    }
+}
+
+fn string_bucket(field: &'static FieldMeta, value: &str) -> String {
+    if value.trim().is_empty() {
+        return "string_empty".to_string();
+    }
+    if field.toml_path == ["model", "model"] {
+        return "model_custom".to_string();
+    }
+    if value == field.default_display {
+        return "string_default".to_string();
+    }
+    "string_custom".to_string()
+}
+
+fn integer_bucket(value: i64) -> String {
+    match value {
+        i64::MIN..=-1 => "integer_negative".to_string(),
+        0 => "integer_zero".to_string(),
+        1..=10 => "integer_1_10".to_string(),
+        11..=100 => "integer_11_100".to_string(),
+        101..=1000 => "integer_101_1000".to_string(),
+        _ => "integer_gt_1000".to_string(),
+    }
+}
+
+fn duration_bucket(ms: u64) -> String {
+    match ms {
+        0 => "duration_zero".to_string(),
+        1..=999 => "duration_lt_1s".to_string(),
+        1000..=9999 => "duration_1s_10s".to_string(),
+        10_000..=59_999 => "duration_10s_60s".to_string(),
+        _ => "duration_ge_60s".to_string(),
+    }
+}
+
+fn count_bucket(prefix: &str, count: u64) -> String {
+    match count {
+        0 => format!("{prefix}_0"),
+        1 => format!("{prefix}_1"),
+        2..=5 => format!("{prefix}_2_5"),
+        6..=20 => format!("{prefix}_6_20"),
+        _ => format!("{prefix}_gt_20"),
+    }
+}
+
+fn sanitize_token(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(64));
+    for ch in value.chars().take(64) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "custom".to_string()
+    } else {
+        out
+    }
+}
+
 fn apply_by_tier(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     field: &'static FieldMeta,
     outcome: &WriteOutcome,
     silent: bool,
@@ -660,12 +822,12 @@ fn apply_by_tier(
                     Ok(Ok(p)) => Some(p),
                     Ok(Err(err)) => {
                         let label = provider_variant_label(&state.effective.provider);
+                        // The save itself succeeded; the provider just isn't
+                        // usable yet (usually a missing API key). That's
+                        // informational, not an error — keep it neutral chrome.
                         notifications.push(
-                            format!(
-                                "saved to {} but the new provider failed to build: {err}",
-                                path_str
-                            ),
-                            NotifySeverity::Error,
+                            format!("saved to {path_str} — {label} isn't active yet: {err}"),
+                            NotifySeverity::Info,
                         );
                         Some(Arc::new(squeezy_llm::UnavailableProvider::new(
                             label,
@@ -676,11 +838,8 @@ fn apply_by_tier(
                     Err(_) => {
                         let label = provider_variant_label(&state.effective.provider);
                         notifications.push(
-                            format!(
-                                "saved to {} but the provider builder thread panicked",
-                                path_str
-                            ),
-                            NotifySeverity::Error,
+                            format!("saved to {path_str} — couldn't activate {label}"),
+                            NotifySeverity::Info,
                         );
                         Some(Arc::new(squeezy_llm::UnavailableProvider::new(
                             label,
@@ -822,9 +981,9 @@ fn clear_field_edits(field: &'static FieldMeta) -> Vec<SettingsEdit> {
 pub(crate) fn undo_last_write(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
-    let Some((path, pre_bytes)) = state.undo_stack.pop() else {
+    let Some((path, pre_bytes, marker)) = state.pop_undo_snapshot() else {
         notifications.push("Nothing to undo this session.", NotifySeverity::Info);
         return;
     };
@@ -834,9 +993,10 @@ pub(crate) fn undo_last_write(
             NotifySeverity::Error,
         );
         // Put the snapshot back so a retry is possible.
-        state.undo_stack.push((path, pre_bytes));
+        state.push_undo_snapshot(path, pre_bytes);
         return;
     }
+    state.truncate_telemetry_to(marker);
     reload_sources_and_agent(state, agent, notifications);
     notifications.push(
         format!("✓ undid last write to {}", path.display()),
@@ -849,7 +1009,7 @@ pub(crate) fn undo_last_write(
 pub(crate) fn discard_all_session_writes(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     if state.undo_stack.is_empty() {
         notifications.push(
@@ -868,6 +1028,8 @@ pub(crate) fn discard_all_session_writes(
         }
     }
     state.undo_stack.clear();
+    state.telemetry_undo_markers.clear();
+    state.telemetry_changes.clear();
     reload_sources_and_agent(state, agent, notifications);
     if failed.is_empty() {
         notifications.push(
@@ -923,7 +1085,7 @@ pub(crate) fn restore_path(path: &std::path::Path, bytes: Option<&[u8]>) -> std:
 pub(crate) fn reload_sources_and_agent(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
 ) {
     if let Ok(reloaded) = load_separated_settings_sources() {
         state.sources = reloaded;
@@ -980,9 +1142,11 @@ pub(crate) fn reload_sources_and_agent(
 /// notification that would otherwise pile up.
 pub(crate) fn clear_scope_override_silent(
     state: &mut ConfigScreenState,
-    _notifications: &mut NotificationQueue,
+    agent: &mut Agent,
+    notifications: &mut ConfigFeedback,
 ) {
     let field = state.current_field();
+    let previous = (field.get)(&state.effective);
     let (path, scope_target) = match state.scope {
         ConfigScope::Repo => {
             let p = state.sources.project_path_default.clone();
@@ -997,25 +1161,36 @@ pub(crate) fn clear_scope_override_silent(
     let edits = clear_field_edits(field);
     // Snapshot for undo before the write.
     let pre = std::fs::read(&path).ok();
-    state.undo_stack.push((path.clone(), pre));
+    state.push_undo_snapshot(path.clone(), pre);
     match apply_edits(&scope_target, &edits) {
-        Ok(_) => {
-            if let Ok(reloaded) = load_separated_settings_sources() {
-                state.sources = reloaded;
+        Ok(outcome) => {
+            if outcome.edits_applied > 0 {
+                record_field_telemetry_change(
+                    state,
+                    field,
+                    &previous,
+                    &FieldValue::Unset,
+                    ConfigTelemetryChangeKind::Unset,
+                );
+                reload_sources_and_agent(state, agent, notifications);
+            } else {
+                state.pop_undo_snapshot();
             }
         }
         Err(_) => {
             // Failed write — drop the unused snapshot so Ctrl+Z stays in sync.
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
         }
     }
 }
 
 pub(crate) fn clear_scope_override(
     state: &mut ConfigScreenState,
-    notifications: &mut NotificationQueue,
+    agent: &mut Agent,
+    notifications: &mut ConfigFeedback,
 ) {
     let field = state.current_field();
+    let previous = (field.get)(&state.effective);
     let (path, scope_target) = match state.scope {
         ConfigScope::Repo => {
             let p = state.sources.project_path_default.clone();
@@ -1029,11 +1204,18 @@ pub(crate) fn clear_scope_override(
     };
     let edits = clear_field_edits(field);
     let scope_label = state.scope.label();
+    let pre = std::fs::read(&path).ok();
+    state.push_undo_snapshot(path.clone(), pre);
     match apply_edits(&scope_target, &edits) {
         Ok(outcome) if outcome.edits_applied > 0 => {
-            if let Ok(reloaded) = load_separated_settings_sources() {
-                state.sources = reloaded;
-            }
+            record_field_telemetry_change(
+                state,
+                field,
+                &previous,
+                &FieldValue::Unset,
+                ConfigTelemetryChangeKind::Unset,
+            );
+            reload_sources_and_agent(state, agent, notifications);
             notifications.push(
                 format!(
                     "cleared {} override in {} (now inherited)",
@@ -1044,12 +1226,14 @@ pub(crate) fn clear_scope_override(
             );
         }
         Ok(_) => {
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("{} had no {} override to clear", field.label, scope_label),
                 NotifySeverity::Info,
             );
         }
         Err(err) => {
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Failed to clear override: {err}"),
                 NotifySeverity::Error,
@@ -1066,7 +1250,7 @@ pub(crate) fn clear_scope_override(
 pub(crate) fn perform_reset(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
-    notifications: &mut NotificationQueue,
+    notifications: &mut ConfigFeedback,
     scope: ConfigScope,
 ) {
     let path = tier_path(state, scope);
@@ -1082,10 +1266,21 @@ pub(crate) fn perform_reset(
     }
     // Snapshot the file bytes so Ctrl+Z can put them back.
     let pre = std::fs::read(&path).ok();
-    state.undo_stack.push((path.clone(), pre.clone()));
+    state.push_undo_snapshot(path.clone(), pre.clone());
     match restore_path(&path, None) {
         Ok(()) => {
             reload_sources_and_agent(state, agent, notifications);
+            if pre.is_some() {
+                state.telemetry_changes.push(ConfigTelemetryChange {
+                    scope,
+                    section: SectionId::Reset.slug(),
+                    field: "tier_file".to_string(),
+                    apply_tier: ApplyTier::Restart,
+                    change_kind: ConfigTelemetryChangeKind::Reset,
+                    prev_value: "file_present".to_string(),
+                    new_value: "file_absent".to_string(),
+                });
+            }
             let msg = if pre.is_some() {
                 format!(
                     "✓ reset {} settings — deleted {} (Ctrl+Z to restore)",
@@ -1096,7 +1291,7 @@ pub(crate) fn perform_reset(
                 // No file existed; nothing was actually removed, but
                 // restating it as "already at defaults" reads cleaner
                 // than a silent no-op.
-                state.undo_stack.pop();
+                state.pop_undo_snapshot();
                 format!(
                     "{} tier already at inherited / default values.",
                     scope.label()
@@ -1105,7 +1300,7 @@ pub(crate) fn perform_reset(
             notifications.push(msg, NotifySeverity::Success);
         }
         Err(err) => {
-            state.undo_stack.pop();
+            state.pop_undo_snapshot();
             notifications.push(
                 format!("Reset of {} failed: {err}", path.display()),
                 NotifySeverity::Error,

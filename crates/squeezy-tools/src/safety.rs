@@ -5,7 +5,7 @@ use squeezy_core::ShellSandboxConfig;
 use crate::shell::shell_command_references_sensitive_path;
 use crate::shell_parse::{
     expand_wrapper_segments, is_destructive_shell_segment, is_read_only_shell_segment,
-    shell_segments,
+    path_has_unresolved_var, shell_segments,
 };
 
 /// Pre-AI structural classifier for shell commands. Runs unconditionally
@@ -175,6 +175,67 @@ impl PathSafetyError {
             ),
         }
     }
+}
+
+/// Cross-platform OS temp directories treated as "safe to write" without a
+/// permission prompt. Mirrors the shell sandbox's writable temp roots and
+/// codex's workspace-write temp handling (cwd + `/tmp` + `$TMPDIR`), but is
+/// available on every target — unlike the sandbox's `shell_writable_roots`,
+/// which is compiled only on macOS/Linux.
+pub(crate) fn temp_dir_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for name in ["TMPDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            roots.push(PathBuf::from(value));
+        }
+    }
+    if cfg!(windows) {
+        // `%LOCALAPPDATA%\Temp` is the canonical per-user temp when
+        // `%TEMP%`/`%TMP%` are unset.
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("Temp"));
+        }
+    } else {
+        roots.push(PathBuf::from("/tmp"));
+        // macOS resolves `/tmp` and the per-user `$TMPDIR` under `/private`.
+        roots.push(PathBuf::from("/private/tmp"));
+        roots.push(PathBuf::from("/private/var/folders"));
+    }
+    roots
+}
+
+/// Effective set of roots a command may write to without escalating to a
+/// permission prompt: the workspace, OS temp dirs, and any configured
+/// `write_roots`. Shared notion of "local/safe" between the permission
+/// classifier and the shell sandbox so the two layers agree.
+pub(crate) fn permission_writable_roots(
+    workspace_root: &Path,
+    shell_sandbox: &ShellSandboxConfig,
+) -> Vec<PathBuf> {
+    let mut roots = vec![workspace_root.to_path_buf()];
+    roots.extend(temp_dir_roots());
+    roots.extend(shell_sandbox.write_roots.iter().cloned());
+    roots
+}
+
+/// True when `raw` resolves outside every permission-writable root
+/// (workspace + temp + configured `write_roots`). Relative paths resolve
+/// under the workspace; `..` traversal is normalized first so an in-bounds
+/// relative path that climbs out (`../../etc/x`) is still caught.
+pub(crate) fn path_escapes_permission_writable_roots(
+    raw: &str,
+    workspace_root: &Path,
+    shell_sandbox: &ShellSandboxConfig,
+) -> bool {
+    // An unresolved shell variable (`$VAR`/`${VAR}`/`%VAR%` left after env
+    // expansion) means we cannot prove the target stays in the workspace —
+    // escalate rather than silently allow it.
+    if path_has_unresolved_var(raw) {
+        return true;
+    }
+    let normalized = normalize_candidate(raw, workspace_root);
+    let roots = permission_writable_roots(workspace_root, shell_sandbox);
+    !roots.iter().any(|root| normalized.starts_with(root))
 }
 
 pub fn assess_write_path(

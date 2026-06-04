@@ -74,7 +74,7 @@ fn opens_at_models_when_no_focus() {
 fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // Default scope is User (leftmost tab) — Tab walks
     // User → Repo → Local → User and BackTab reverses.
     assert_eq!(state.scope, ConfigScope::User);
@@ -119,7 +119,7 @@ async fn themes_section_selects_builtin_theme_immediately() {
     let mut state = temp_config_state(Some(SectionId::Themes));
     let settings_path = state.sources.user_path_default.clone();
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective)
         .iter()
         .position(|name| name == "bright")
@@ -143,7 +143,7 @@ async fn themes_section_edits_active_theme_rgb_token() {
     let mut state = temp_config_state(Some(SectionId::Themes));
     let settings_path = state.sources.user_path_default.clone();
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     let token = crate::render::theme::token::PALETTE_ACCENT;
     let color_row = crate::render::theme::available_theme_names(&state.effective).len()
         + 1
@@ -199,7 +199,7 @@ async fn themes_section_edits_active_theme_rgb_token() {
 async fn themes_section_creates_custom_theme_snapshot() {
     let mut state = temp_config_state(Some(SectionId::Themes));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective).len();
 
     handle_key(
@@ -256,7 +256,7 @@ async fn themes_section_renames_custom_theme() {
         },
     );
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective)
         .iter()
         .position(|name| name == "ocean")
@@ -317,7 +317,7 @@ async fn themes_section_deletes_custom_theme_and_falls_back_when_active() {
         },
     );
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = crate::render::theme::available_theme_names(&state.effective)
         .iter()
         .position(|name| name == "ocean")
@@ -342,7 +342,7 @@ async fn themes_section_deletes_custom_theme_and_falls_back_when_active() {
 fn arrow_keys_navigate_sections_and_fields() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert_eq!(state.field_index, 0);
     handle_key(
         &mut state,
@@ -368,7 +368,7 @@ fn space_toggles_bool_field() {
     // SQUEEZY_TELEMETRY in parallel.
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     let before = state.effective.tui.show_reasoning_usage;
@@ -426,7 +426,7 @@ fn string_list_editor_round_trips_via_commit() {
 async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // Layout: provider at row 0, model at row 1, synthetic API-key at row 2.
     state.field_index = 1;
     handle_key(
@@ -474,7 +474,7 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
 async fn esc_on_model_picker_closes_picker_only() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1; // model row (synthetic API-key now lives at row 2)
     handle_key(
         &mut state,
@@ -506,7 +506,7 @@ async fn space_cycles_model_field_to_next_registry_entry() {
     }
     let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1; // model row (synthetic API-key now lives at row 2)
     let before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
         FieldValue::String(s) => s,
@@ -533,7 +533,7 @@ async fn space_on_non_cyclable_field_emits_hint() {
     use squeezy_core::config_schema::SectionId as SId;
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Limits));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // max_parallel_tools is Integer — Space should surface a hint, not silently no-op.
     state.field_index = 0;
     handle_key(
@@ -559,7 +559,7 @@ async fn space_cycles_enum_field_to_next_option() {
     }
     let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = 0; // provider (Enum)
     let before = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
@@ -586,7 +586,7 @@ async fn space_cycles_enum_field_to_next_option() {
 async fn slash_opens_search_and_enter_jumps_to_field() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     // Open search with `/`.
     handle_key(
         &mut state,
@@ -627,7 +627,7 @@ async fn search_enter_lands_on_models_field_past_synthetic_key_row() {
     // resolve back to the intended field, not one display row too high.
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
 
     let models_sidx = CONFIG_SECTIONS
         .iter()
@@ -689,7 +689,7 @@ async fn ctrl_r_resets_field_to_default() {
     // robust against other tests setting SQUEEZY_* env vars in parallel.
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = field_index(SectionId::Verbosity, &["tui", "response_verbosity"]);
     state.effective.tui.response_verbosity = squeezy_core::ResponseVerbosity::Verbose;
     handle_key(
@@ -711,7 +711,7 @@ async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
     unsafe { std::env::set_var("SQUEEZY_TELEMETRY", "off") };
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Telemetry));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     handle_key(
         &mut state,
         &mut agent,
@@ -731,20 +731,6 @@ async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
     unsafe { std::env::remove_var("SQUEEZY_TELEMETRY") };
 }
 
-#[test]
-fn notification_dismiss_current_and_clear_all() {
-    let mut q = NotificationQueue::new();
-    q.push("a", crate::notification::Severity::Info);
-    q.push("b", crate::notification::Severity::Info);
-    q.push("c", crate::notification::Severity::Info);
-    assert_eq!(q.len(), 3);
-    assert!(q.dismiss_current());
-    assert_eq!(q.len(), 2);
-    let removed = q.clear_all();
-    assert_eq!(removed, 2);
-    assert!(q.is_empty());
-}
-
 #[tokio::test]
 async fn space_cycling_provider_resets_model_in_memory() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
@@ -755,7 +741,7 @@ async fn space_cycling_provider_resets_model_in_memory() {
     }
     let mut state = temp_config_state(Some(SId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     // provider is row 0
     state.field_index = 0;
@@ -847,7 +833,7 @@ async fn reset_section_enter_arms_confirmation_and_n_cancels() {
     use squeezy_core::config_schema::SectionId as SId;
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Reset));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert_eq!(state.field_index, 0);
     handle_key(
         &mut state,
@@ -948,7 +934,7 @@ fn default_scope_is_user() {
 async fn shift_x_arms_discard_confirmation_then_n_cancels() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
@@ -992,7 +978,7 @@ async fn shift_x_arms_discard_confirmation_then_n_cancels() {
 async fn shift_x_on_empty_undo_stack_short_circuits_without_confirm() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert!(state.undo_stack.is_empty());
     handle_key(
         &mut state,
@@ -1016,7 +1002,7 @@ async fn shift_x_on_empty_undo_stack_short_circuits_without_confirm() {
 async fn discard_confirm_y_wipes_session_writes() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
@@ -1159,7 +1145,7 @@ async fn model_picker_provider_swap_writes_once_not_twice() {
     }
     let mut state = temp_config_state(Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1;
     handle_key(
         &mut state,
@@ -1256,7 +1242,7 @@ fn model_picker_clips_with_scroll_indicators() {
 async fn ctrl_s_message_includes_undo_hint() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     handle_key(
         &mut state,
         &mut agent,
@@ -1275,7 +1261,7 @@ async fn ctrl_s_message_includes_undo_hint() {
 async fn picker_open_path_locates_provider_field_by_toml_path() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.field_index = 1;
     handle_key(
         &mut state,
@@ -1307,7 +1293,7 @@ async fn picker_open_path_locates_provider_field_by_toml_path() {
 async fn discard_confirm_overlay_renders_with_file_list() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     handle_key(
@@ -1380,7 +1366,7 @@ fn field_pane_keeps_active_row_visible_when_clipped() {
 async fn tab_from_default_user_scope_advances_to_repo() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     assert_eq!(state.scope, ConfigScope::User);
     handle_key(
         &mut state,
@@ -1407,7 +1393,7 @@ async fn tab_from_default_user_scope_advances_to_repo() {
 async fn immediate_tier_bool_save_propagates_to_agent() {
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "show_reasoning_usage"]);
     let before = agent.config_snapshot().tui.show_reasoning_usage;
@@ -1429,7 +1415,7 @@ async fn immediate_tier_enum_save_propagates_to_agent() {
     use squeezy_core::ResponseVerbosity;
     let mut state = temp_config_state(Some(SectionId::Verbosity));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.field_index = field_index(SectionId::Verbosity, &["tui", "response_verbosity"]);
     state.effective.tui.response_verbosity = ResponseVerbosity::Normal;
@@ -1453,7 +1439,7 @@ async fn immediate_tier_permission_save_propagates_to_agent() {
     use squeezy_core::{PermissionMode, PermissionPolicyMode};
     let mut state = temp_config_state(Some(SectionId::Permissions));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     state.effective.permissions.mode = PermissionPolicyMode::Custom;
     state.field_index = field_index(SectionId::Permissions, &["permissions", "read"]);
@@ -1523,7 +1509,7 @@ async fn next_prompt_tier_save_arms_pending_swap() {
     unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
     let mut state = temp_config_state(Some(SectionId::Subagents));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     let section = CONFIG_SECTIONS
         .iter()
@@ -1541,9 +1527,17 @@ async fn next_prompt_tier_save_arms_pending_swap() {
         "test fixture relies on this being NextPrompt"
     );
     let before = agent.config_snapshot().subagents.max_tool_calls_per_call;
+    let previous = (max_calls_field.get)(&state.effective);
     let new_value = FieldValue::Integer((before as i64) + 1);
     (max_calls_field.set)(&mut state.effective, new_value.clone()).expect("set ok");
-    save_field(&mut state, &mut agent, &mut q, max_calls_field, new_value);
+    save_field(
+        &mut state,
+        &mut agent,
+        &mut q,
+        max_calls_field,
+        previous,
+        new_value,
+    );
     let swap = agent
         .pending_config_swap()
         .expect("NextPrompt save must arm a pending swap");
@@ -1565,7 +1559,7 @@ async fn next_prompt_swap_applies_on_drain() {
     unsafe { std::env::remove_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL") };
     let mut state = temp_config_state(Some(SectionId::Subagents));
     let mut agent = make_agent();
-    let mut q = NotificationQueue::new();
+    let mut q = ConfigFeedback::new();
     state.scope = ConfigScope::User;
     let section = CONFIG_SECTIONS
         .iter()
@@ -1579,9 +1573,10 @@ async fn next_prompt_swap_applies_on_drain() {
         .unwrap();
     state.field_index = idx;
     let before = agent.config_snapshot().subagents.max_tool_calls_per_call;
+    let previous = (field.get)(&state.effective);
     let new_value = FieldValue::Integer((before as i64) + 5);
     (field.set)(&mut state.effective, new_value.clone()).expect("set ok");
-    save_field(&mut state, &mut agent, &mut q, field, new_value);
+    save_field(&mut state, &mut agent, &mut q, field, previous, new_value);
     let drained = agent.drain_pending_swap();
     assert!(
         drained.is_some(),
@@ -1620,5 +1615,360 @@ fn local_tab_stays_visible_when_repo_subtitle_is_long() {
     assert!(
         header.contains("User") && header.contains("Repo") && header.contains("Local"),
         "all three tab labels should fit on a 140-col row; got:\n{header}"
+    );
+}
+
+#[test]
+fn routing_section_shows_resolved_per_provider_defaults() {
+    // Regression: the Routing rows rendered "—" because the render path
+    // (`displayed_value_and_source`) fell through to the empty schema default
+    // for the provider Info row and the `["providers","*",…]` fields instead of
+    // resolving them against the active provider. With AppConfig::default()
+    // (openai, nothing customized) the rows must show the built-in defaults.
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, SectionId as SId};
+    unsafe {
+        std::env::remove_var("SQUEEZY_SMALL_FAST_MODEL");
+        std::env::remove_var("SQUEEZY_ROUTING_JUDGE_MODEL");
+    }
+    let state = temp_config_state(Some(SId::Routing));
+    let section = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Routing)
+        .expect("routing section exists");
+    for field in section.fields {
+        let (value, _src) = state.displayed_value_and_source(field);
+        let shown = value.as_display();
+        match field.toml_path {
+            // The provider banner and the cheap/judge model + prompt resolve to
+            // a concrete built-in value — never the "—" placeholder.
+            ["routing", "_provider_info"]
+            | ["providers", "*", "cheap_model"]
+            | ["providers", "*", "judge_model"]
+            | ["providers", "*", "judge_prompt"] => {
+                assert_ne!(
+                    shown, "—",
+                    "Routing field {:?} must show a resolved default, got '—'",
+                    field.toml_path
+                );
+                assert!(
+                    !shown.is_empty(),
+                    "Routing field {:?} empty",
+                    field.toml_path
+                );
+            }
+            // Resolves to the per-provider default reroute filter (a real regex
+            // with a negative lookahead skipping cheap tiers) — never blank, and
+            // exactly what the router applies.
+            ["providers", "*", "expensive_models"] => {
+                assert_ne!(shown, "—", "default reroute filter should not be blank");
+                assert!(
+                    shown.contains("(?!"),
+                    "default reroute filter should be a negative-lookahead regex, got {shown}"
+                );
+            }
+            _ => {}
+        }
+        // The provider banner is the only Info row; it must be non-editable.
+        if field.toml_path == ["routing", "_provider_info"] {
+            assert!(matches!(field.kind, FieldKind::Info));
+        }
+    }
+}
+
+#[test]
+fn routing_pane_renders_default_filter_and_pinned_banner() {
+    // The default reroute filter (a negative-lookahead regex skipping cheap
+    // tiers) shows verbatim, the banner carries the pinned-provider note, and an
+    // explicit empty filter renders as the friendly "any".
+    use squeezy_core::config_schema::SectionId as SId;
+    unsafe {
+        std::env::remove_var("SQUEEZY_SMALL_FAST_MODEL");
+        std::env::remove_var("SQUEEZY_ROUTING_JUDGE_MODEL");
+        std::env::remove_var("SQUEEZY_ROUTING_EXPENSIVE_MODELS");
+    }
+    let mut state = temp_config_state(Some(SId::Routing));
+    let rendered = render_screen_to_text(&state, 120, 24);
+    assert!(
+        rendered.contains("(?!"),
+        "default reroute filter should show a negative-lookahead regex, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("pinned"),
+        "provider banner should carry the pinned note, got:\n{rendered}"
+    );
+
+    // An explicit empty filter ("reroute any") renders as "any".
+    let slug = active_provider_slug(&state.effective);
+    state
+        .effective
+        .providers
+        .entry(slug)
+        .or_default()
+        .expensive_models = Some(String::new());
+    let rendered2 = render_screen_to_text(&state, 120, 24);
+    assert!(
+        rendered2.contains("any"),
+        "explicit empty filter should render as 'any', got:\n{rendered2}"
+    );
+}
+
+#[test]
+fn prompt_editor_editing_and_line_navigation() {
+    use super::PromptEditorState;
+    let mut ed = PromptEditorState::new(String::new());
+    for c in "ab".chars() {
+        ed.insert_char(c);
+    }
+    ed.insert_char('\n');
+    for c in "cd".chars() {
+        ed.insert_char(c);
+    }
+    assert_eq!(ed.draft, "ab\ncd");
+    // Cursor sits after 'd' (byte 5). Up lands on the first line, same column.
+    ed.up();
+    assert_eq!(ed.cursor, 2);
+    ed.home();
+    assert_eq!(ed.cursor, 0);
+    ed.end();
+    assert_eq!(ed.cursor, 2);
+    ed.down();
+    assert_eq!(ed.cursor, 5);
+    ed.backspace();
+    assert_eq!(ed.draft, "ab\nc");
+    ed.left();
+    ed.delete();
+    assert_eq!(ed.draft, "ab\n");
+}
+
+#[tokio::test]
+async fn enter_on_judge_prompt_opens_full_editor_then_ctrl_s_saves() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = temp_config_state(Some(SId::Routing));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SId::Routing, &["providers", "*", "judge_prompt"]);
+
+    // Enter opens the full-screen editor pre-filled with the resolved built-in
+    // prompt — NOT the inline single-line editor.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let ed = state.prompt_editor.as_ref().expect("full editor open");
+    assert!(
+        !ed.draft.is_empty(),
+        "editor seeds with the built-in judge prompt"
+    );
+    assert!(
+        state.editor.is_none(),
+        "multiline fields must not use the inline editor"
+    );
+
+    // Append a marker and save with Ctrl+S.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+    assert!(state.prompt_editor.is_none(), "Ctrl+S closes the editor");
+    let provider = active_provider_slug(&state.effective);
+    let saved = state
+        .effective
+        .providers
+        .get(&provider)
+        .and_then(|p| p.judge_prompt.clone())
+        .expect("custom judge prompt stored as a per-provider override");
+    assert!(saved.ends_with('!'));
+}
+
+#[tokio::test]
+async fn esc_on_judge_prompt_editor_discards_edits() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = temp_config_state(Some(SId::Routing));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SId::Routing, &["providers", "*", "judge_prompt"]);
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::empty()),
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+    );
+    assert!(state.prompt_editor.is_none(), "Esc closes the editor");
+    let provider = active_provider_slug(&state.effective);
+    assert!(
+        state
+            .effective
+            .providers
+            .get(&provider)
+            .and_then(|p| p.judge_prompt.clone())
+            .is_none(),
+        "Esc must not persist the edit"
+    );
+}
+
+#[test]
+fn permissions_visible_rows_reveal_reviewer_under_auto_review() {
+    // Field count for the Permissions section (mode + 2 reviewer + caps).
+    let total = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap()
+        .fields
+        .len();
+    // Default / Full Access expose only the mode row.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::Default, total),
+        1
+    );
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::FullAccess, total),
+        1
+    );
+    // Auto-review adds the two reviewer rows.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::AutoReview, total),
+        1 + PERMISSION_REVIEWER_ROWS
+    );
+    // Custom exposes every per-capability row.
+    assert_eq!(
+        permissions_visible_rows(PermissionPolicyMode::Custom, total),
+        total
+    );
+}
+
+#[test]
+fn permission_mode_change_reveals_reviewer_rows_immediately() {
+    // State-level: flipping the effective mode changes the visible row count on
+    // the very next query — no navigation needed.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::Default
+    );
+    assert_eq!(state.row_count(), 1, "default mode shows only the mode row");
+
+    let mode_field = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "mode")
+        .unwrap();
+    (mode_field.set)(&mut state.effective, FieldValue::Enum("auto_review")).unwrap();
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::AutoReview
+    );
+    assert_eq!(state.row_count(), 1 + PERMISSION_REVIEWER_ROWS);
+}
+
+#[test]
+fn cycling_permission_mode_via_key_expands_rows() {
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    state.field_index = 0; // the `mode` row
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    assert_eq!(state.row_count(), 1);
+
+    // Space cycles the mode enum: default -> auto_review.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::AutoReview,
+        "space must cycle the mode to auto_review"
+    );
+    assert_eq!(
+        state.row_count(),
+        1 + PERMISSION_REVIEWER_ROWS,
+        "cycling mode must reveal the reviewer rows in the same frame"
+    );
+}
+
+#[test]
+fn reviewer_rows_display_resolved_values_not_dashes() {
+    // Regression: reviewer rows used to show "—" because the display fell back
+    // to the static (empty) default instead of the running effective value.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    state
+        .effective
+        .permissions
+        .apply_mode(PermissionPolicyMode::AutoReview);
+
+    let perms = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SectionId::Permissions)
+        .unwrap();
+    let field = |label: &str| perms.fields.iter().find(|f| f.label == label).unwrap();
+
+    // The capability remit shows the active set, not a bare dash.
+    let (caps, _) = state.displayed_value_and_source(field("reviewer_capabilities"));
+    let caps_str = caps.as_display();
+    assert!(
+        caps_str.contains("edit") && caps_str.contains("shell"),
+        "reviewer_capabilities should list the active set, got {caps_str:?}"
+    );
+
+    // The model shows the resolved model, never empty/dash.
+    let (model, _) = state.displayed_value_and_source(field("reviewer_model"));
+    let model_str = model.as_display();
+    assert!(
+        !model_str.is_empty() && model_str != "—",
+        "reviewer_model should resolve to a real model, got {model_str:?}"
+    );
+}
+
+#[test]
+fn reviewer_rows_visible_when_saved_mode_diverges_from_snapshot() {
+    use squeezy_core::TierSource;
+    // The agent snapshot (effective) lags at the shipped `default`, but the
+    // saved settings file says auto_review — the divergence that hid the
+    // reviewer rows on open. Row visibility tracks the displayed (saved) mode.
+    let mut state = temp_config_state(Some(SectionId::Permissions));
+    assert_eq!(
+        state.effective.permissions.mode,
+        PermissionPolicyMode::Default
+    );
+    state.sources.user = Some(TierSource {
+        path: std::path::PathBuf::from("/virtual/user.toml"),
+        doc: "[permissions]\nmode = \"auto_review\"\n"
+            .parse()
+            .expect("valid toml"),
+    });
+    assert_eq!(
+        state.row_count(),
+        1 + PERMISSION_REVIEWER_ROWS,
+        "reviewer rows must show when the saved mode is auto_review, even if the snapshot lags"
+    );
+    assert_eq!(
+        state.field_at_row(state.row_count() - 1).map(|f| f.label),
+        Some("reviewer_capabilities")
     );
 }

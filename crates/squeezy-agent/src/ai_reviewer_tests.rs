@@ -5,6 +5,51 @@ use squeezy_core::{
 };
 
 #[test]
+fn auto_allow_ceiling_is_capability_aware() {
+    use PermissionCapability::{Edit, Mcp, Network, Shell};
+    // Workspace-mutation capabilities may auto-approve up to High (blast radius
+    // is confined to the workspace; outside writes are escalated separately).
+    assert!(within_auto_allow_ceiling(Edit, PermissionRisk::High));
+    assert!(within_auto_allow_ceiling(Shell, PermissionRisk::High));
+    // Reach-out capabilities cap at Medium — a High-risk network/MCP call (e.g.
+    // `curl … -d @secret`) must reach a human.
+    assert!(within_auto_allow_ceiling(Network, PermissionRisk::Medium));
+    assert!(!within_auto_allow_ceiling(Network, PermissionRisk::High));
+    assert!(!within_auto_allow_ceiling(Mcp, PermissionRisk::High));
+    // Critical is never auto-approved, regardless of capability.
+    assert!(!within_auto_allow_ceiling(Edit, PermissionRisk::Critical));
+    assert!(!within_auto_allow_ceiling(Shell, PermissionRisk::Critical));
+}
+
+#[test]
+fn reviewer_may_auto_allow_gates_on_allowlist_workspace_and_ceiling() {
+    use PermissionCapability::{Destructive, Edit, Shell};
+    let allow = vec![Edit, Shell];
+
+    let mut edit = sample_request("write_file", "path:src/a.rs");
+    edit.capability = Edit;
+    edit.risk = PermissionRisk::High;
+    assert!(reviewer_may_auto_allow(&allow, &edit));
+
+    // Not allowlisted -> withheld.
+    let mut destructive = edit.clone();
+    destructive.capability = Destructive;
+    assert!(!reviewer_may_auto_allow(&allow, &destructive));
+
+    // Outside the workspace -> withheld even when allowlisted & within ceiling.
+    let mut outside = edit.clone();
+    outside
+        .metadata
+        .insert("outside_workspace".to_string(), "true".to_string());
+    assert!(!reviewer_may_auto_allow(&allow, &outside));
+
+    // Over the ceiling -> withheld.
+    let mut critical = edit.clone();
+    critical.risk = PermissionRisk::Critical;
+    assert!(!reviewer_may_auto_allow(&allow, &critical));
+}
+
+#[test]
 fn bounded_transcript_keeps_last_user_with_caps() {
     let mut items = (0..20)
         .map(|index| TranscriptItem::assistant(format!("assistant {index} {}", "a".repeat(2400))))
@@ -63,6 +108,24 @@ fn bounded_transcript_respects_small_budget() {
     assert!(rendered.contains("user message 39"));
     // The very first message should be folded into the summary, not printed.
     assert!(!rendered.contains("39:user: user message 0"));
+}
+
+#[test]
+fn reviewer_policy_extra_appends_to_base() {
+    let mut config = squeezy_core::AppConfig::from_env();
+    // No inline policy -> just the bundled base policy.
+    config.permissions.ai_reviewer.policy = None;
+    let base = load_policy(&config).expect("base policy");
+    assert!(!base.contains("Additional project policy"));
+
+    config.permissions.ai_reviewer.policy = Some("Never touch vendored files.".to_string());
+    let combined = load_policy(&config).expect("combined policy");
+    assert!(
+        combined.starts_with(&base),
+        "inline policy must be appended to the base, not replace it"
+    );
+    assert!(combined.contains("Additional project policy"));
+    assert!(combined.contains("Never touch vendored files."));
 }
 
 #[test]

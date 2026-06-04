@@ -133,17 +133,14 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
     assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
-    assert_eq!(config.permissions.mode, PermissionPolicyMode::AutoReview);
+    // Opt-in default: the shipped preset is Default (human prompts), with the
+    // LLM reviewer off until the user selects Auto-review.
+    assert_eq!(config.permissions.mode, PermissionPolicyMode::Default);
     assert_eq!(config.permissions.edit, PermissionMode::Allow);
-    assert!(config.permissions.ai_reviewer.enabled);
+    assert!(!config.permissions.ai_reviewer.enabled);
     assert_eq!(
         config.permissions.ai_reviewer.allow_capabilities,
-        vec![
-            PermissionCapability::Read,
-            PermissionCapability::Search,
-            PermissionCapability::Network,
-            PermissionCapability::Mcp,
-        ]
+        vec![PermissionCapability::Read, PermissionCapability::Search]
     );
     assert_eq!(
         config.permissions.shell_sandbox.protected_metadata_names,
@@ -243,6 +240,189 @@ compaction_max_summary_bytes = 4096
     assert_eq!(config.context_compaction.recent_items, 3);
     assert_eq!(config.context_compaction.max_summary_bytes, 4096);
     assert!(config.inspect_redacted().contains("[context]"));
+}
+
+#[test]
+fn per_provider_routing_settings_parse_and_stay_per_provider() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[routing]
+heuristic = false
+follow_up_max_chars = 40
+
+[providers.openai]
+cheap_model = "gpt-5.4-nano"
+judge_model = "gpt-5.4-mini"
+expensive_models = "gpt-5|codex"
+
+[providers.anthropic]
+cheap_model = "claude-haiku-4-5"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    // Global toggles land on RoutingConfig.
+    assert!(!config.routing.heuristic);
+    assert_eq!(config.routing.follow_up_max_chars, 40);
+
+    // Per-provider routing is retained per provider and never crosses over.
+    let openai = config.providers.get("openai").expect("openai entry");
+    assert_eq!(openai.judge_model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(openai.expensive_models.as_deref(), Some("gpt-5|codex"));
+    assert_eq!(
+        config
+            .providers
+            .get("anthropic")
+            .and_then(|p| p.cheap_model.as_deref()),
+        Some("claude-haiku-4-5")
+    );
+    // Anthropic carries no judge override — it inherits its own default later.
+    assert!(
+        config
+            .providers
+            .get("anthropic")
+            .and_then(|p| p.judge_model.as_deref())
+            .is_none()
+    );
+
+    // Inspect output is still valid TOML.
+    SettingsFile::from_toml_str(&config.inspect_redacted(), "round-trip")
+        .expect("inspect output parses back");
+}
+
+#[test]
+fn routing_config_fields_display_resolved_defaults_not_blanks() {
+    // On OpenAI with no per-provider overrides, the Routing /config fields show
+    // the resolved values in effect (not empty) — the provider banner, the
+    // built-in cheap and judge models (both the mini tier), and the built-in
+    // judge prompt.
+    let settings =
+        SettingsFile::from_toml_str("[model]\nprovider = \"openai\"\n", "test").expect("parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let routing = crate::config_schema::CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == crate::config_schema::SectionId::Routing)
+        .expect("routing section");
+    let display = |label: &str| -> String {
+        let f = routing
+            .fields
+            .iter()
+            .find(|f| f.label == label)
+            .unwrap_or_else(|| panic!("field {label}"));
+        (f.get)(&config).as_display()
+    };
+
+    assert!(
+        display("provider").contains("openai"),
+        "{}",
+        display("provider")
+    );
+    assert_eq!(display("cheap_model"), "gpt-5.4-mini");
+    assert_eq!(display("judge_model"), "gpt-5.4-mini");
+    assert!(
+        display("judge_prompt")
+            .to_lowercase()
+            .contains("routing classifier"),
+        "judge_prompt should show the built-in prompt in effect"
+    );
+}
+
+#[test]
+fn reroute_filter_negates_and_defaults_reflect_reality() {
+    use crate::{default_reroute_filter, parent_is_reroute_eligible};
+
+    // openai/azure: flagships reroute, the mini/nano tiers are skipped.
+    let openai = default_reroute_filter("openai");
+    assert!(parent_is_reroute_eligible("gpt-5.5", openai));
+    assert!(parent_is_reroute_eligible("gpt-5.4-codex", openai));
+    assert!(!parent_is_reroute_eligible("gpt-5.4-mini", openai));
+    assert!(!parent_is_reroute_eligible("gpt-5.4-nano", openai));
+
+    // anthropic: opus AND sonnet reroute (the dropped-opus regression), haiku
+    // is skipped — including the bedrock-prefixed id, proving name-based scales.
+    let anthropic = default_reroute_filter("anthropic");
+    assert!(parent_is_reroute_eligible("claude-opus-4-6", anthropic));
+    assert!(parent_is_reroute_eligible("claude-sonnet-4-6", anthropic));
+    assert!(!parent_is_reroute_eligible(
+        "claude-haiku-4-5-20251001",
+        anthropic
+    ));
+    let bedrock = default_reroute_filter("bedrock");
+    assert!(parent_is_reroute_eligible(
+        "anthropic.claude-opus-4-6-v1:0",
+        bedrock
+    ));
+    assert!(!parent_is_reroute_eligible(
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        bedrock
+    ));
+
+    // google/vertex: pro reroutes, flash and flash-lite are skipped.
+    let google = default_reroute_filter("google");
+    assert!(parent_is_reroute_eligible("gemini-2.5-pro", google));
+    assert!(!parent_is_reroute_eligible("gemini-2.5-flash", google));
+    assert!(!parent_is_reroute_eligible("gemini-2.5-flash-lite", google));
+
+    // A positive regex restricts to matches; a negative lookahead excludes;
+    // empty = reroute any. Plain standard regexes (lookaround supported).
+    assert!(parent_is_reroute_eligible("claude-opus-4-6", "opus|sonnet"));
+    assert!(!parent_is_reroute_eligible(
+        "claude-haiku-4-5",
+        "opus|sonnet"
+    ));
+    assert!(!parent_is_reroute_eligible(
+        "gpt-5.4-codex",
+        "^(?!.*codex).*"
+    ));
+    assert!(parent_is_reroute_eligible("gpt-5.5", "^(?!.*codex).*"));
+    assert!(parent_is_reroute_eligible("anything", ""));
+
+    // The "ge[mini]" trap: a gateway serving gemini-pro must NOT be excluded by
+    // the generic "-mini" tier filter, while the real cheap tiers still are.
+    let gateway = default_reroute_filter("openrouter");
+    assert!(parent_is_reroute_eligible("google/gemini-2.5-pro", gateway));
+    assert!(!parent_is_reroute_eligible(
+        "google/gemini-2.5-flash",
+        gateway
+    ));
+    assert!(!parent_is_reroute_eligible("openai/gpt-5.4-mini", gateway));
+    assert!(!parent_is_reroute_eligible(
+        "anthropic/claude-haiku-4-5",
+        gateway
+    ));
+    assert!(parent_is_reroute_eligible(
+        "anthropic/claude-opus-4-6",
+        gateway
+    ));
+}
+
+#[test]
+fn resolved_reroute_filter_precedence() {
+    use crate::{ProviderSettings, default_reroute_filter, resolved_reroute_filter};
+    let mut cfg = AppConfig::default();
+    // No override + empty global → built-in per-provider default.
+    assert_eq!(
+        resolved_reroute_filter(&cfg, "openai"),
+        default_reroute_filter("openai")
+    );
+    // Non-empty global overrides the built-in default.
+    cfg.routing.expensive_models = "gpt-5".to_string();
+    assert_eq!(resolved_reroute_filter(&cfg, "openai"), "gpt-5");
+    // A per-provider override wins, including an explicit empty string.
+    cfg.providers.insert(
+        "openai".to_string(),
+        ProviderSettings {
+            expensive_models: Some(String::new()),
+            ..Default::default()
+        },
+    );
+    assert!(resolved_reroute_filter(&cfg, "openai").is_empty());
 }
 
 #[test]
@@ -410,6 +590,7 @@ enabled = true
 model = "reviewer-model"
 allow_capabilities = ["read", "search", "edit"]
 policy_file = "docs/approval.md"
+policy = "Never auto-approve writes to generated files."
 timeout_secs = 7
 
 [permissions.shell_sandbox]
@@ -437,6 +618,10 @@ deny_debug_attach = false
     assert_eq!(
         config.permissions.ai_reviewer.model.as_deref(),
         Some("reviewer-model")
+    );
+    assert_eq!(
+        config.permissions.ai_reviewer.policy.as_deref(),
+        Some("Never auto-approve writes to generated files.")
     );
     assert_eq!(config.permissions.ai_reviewer.timeout_secs, 7);
     assert_eq!(
@@ -983,21 +1168,13 @@ fn permission_mode_parses_expected_values() {
 #[test]
 fn permission_policy_modes_apply_presets() {
     let implicit = AppConfig::from_env_vars(None, |_| None);
-    assert_eq!(implicit.permissions.mode, PermissionPolicyMode::AutoReview);
+    // Opt-in default: implicit config is the Default preset with the reviewer off.
+    assert_eq!(implicit.permissions.mode, PermissionPolicyMode::Default);
     assert_eq!(implicit.permissions.read, PermissionMode::Allow);
     assert_eq!(implicit.permissions.edit, PermissionMode::Allow);
     assert_eq!(implicit.permissions.shell, PermissionMode::Allow);
     assert_eq!(implicit.permissions.web, PermissionMode::Ask);
-    assert!(implicit.permissions.ai_reviewer.enabled);
-    assert_eq!(
-        implicit.permissions.ai_reviewer.allow_capabilities,
-        vec![
-            PermissionCapability::Read,
-            PermissionCapability::Search,
-            PermissionCapability::Network,
-            PermissionCapability::Mcp,
-        ]
-    );
+    assert!(!implicit.permissions.ai_reviewer.enabled);
     assert_eq!(
         implicit.permissions.shell_sandbox.network,
         ShellSandboxNetworkPolicy::AllowWhenApproved
@@ -1044,9 +1221,17 @@ mode = "auto_review"
             PermissionCapability::Search,
             PermissionCapability::Network,
             PermissionCapability::Mcp,
+            PermissionCapability::Edit,
+            PermissionCapability::Shell,
+            PermissionCapability::Git,
+            PermissionCapability::Compiler,
         ]
     );
-    assert_eq!(auto_review.permissions.shell, PermissionMode::Allow);
+    // Auto-review routes the workspace-write capabilities through the reviewer.
+    assert_eq!(auto_review.permissions.shell, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.edit, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.git, PermissionMode::Ask);
+    assert_eq!(auto_review.permissions.compiler, PermissionMode::Ask);
 
     let full_access = SettingsFile::from_toml_str(
         r#"
@@ -1088,6 +1273,79 @@ mode = "full_access"
     );
     assert_eq!(
         full_access.permissions.evaluate(&outside).action,
+        PermissionAction::Allow
+    );
+}
+
+#[test]
+fn shell_writes_outside_workspace_escalate_unless_full_access() {
+    fn policy(mode: &str) -> AppConfig {
+        let settings =
+            SettingsFile::from_toml_str(&format!("[permissions]\nmode = \"{mode}\"\n"), "test")
+                .expect("settings parse");
+        AppConfig::from_settings_and_env_vars(settings, |_| None)
+    }
+
+    fn shell_request(outside: bool) -> PermissionRequest {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("command".to_string(), "cp secret /etc/passwd".to_string());
+        if outside {
+            metadata.insert("outside_workspace".to_string(), "true".to_string());
+        }
+        PermissionRequest {
+            call_id: "call".to_string(),
+            tool_name: "shell".to_string(),
+            capability: PermissionCapability::Shell,
+            target: "shell:cp:*".to_string(),
+            risk: PermissionRisk::High,
+            summary: "shell write".to_string(),
+            metadata,
+            suggested_rules: Vec::new(),
+        }
+    }
+
+    // Default keeps shell = Allow, so an in-workspace shell write auto-allows,
+    // but an out-of-workspace write escalates to a prompt (the shell hole that
+    // previously auto-allowed `cp secret /etc/passwd`).
+    let default = policy("default");
+    assert_eq!(
+        default.permissions.evaluate(&shell_request(false)).action,
+        PermissionAction::Allow,
+        "default: in-workspace shell write should auto-allow"
+    );
+    assert_eq!(
+        default.permissions.evaluate(&shell_request(true)).action,
+        PermissionAction::Ask,
+        "default: out-of-workspace shell write should escalate"
+    );
+
+    // Auto-review routes shell through the reviewer, so both in- and
+    // out-of-workspace writes reach Ask (the reviewer adjudicates in-workspace
+    // ones; out-of-workspace is never auto-approved).
+    let auto_review = policy("auto_review");
+    assert_eq!(
+        auto_review
+            .permissions
+            .evaluate(&shell_request(false))
+            .action,
+        PermissionAction::Ask,
+        "auto_review: in-workspace shell routes to the reviewer"
+    );
+    assert_eq!(
+        auto_review
+            .permissions
+            .evaluate(&shell_request(true))
+            .action,
+        PermissionAction::Ask,
+        "auto_review: out-of-workspace shell escalates"
+    );
+
+    // Full access never prompts, even for an out-of-workspace shell write.
+    assert_eq!(
+        policy("full_access")
+            .permissions
+            .evaluate(&shell_request(true))
+            .action,
         PermissionAction::Allow
     );
 }
@@ -1216,15 +1474,14 @@ allow_capabilities = ["read"]
         auto_review.permissions.mode,
         PermissionPolicyMode::AutoReview
     );
+    // Selecting Auto-review enables the reviewer even though the TOML set
+    // enabled = false (the preset governs the toggle)...
     assert!(auto_review.permissions.ai_reviewer.enabled);
+    // ...but a configured allow_capabilities is respected (tunable remit),
+    // rather than being force-reset to the Auto-review default set.
     assert_eq!(
         auto_review.permissions.ai_reviewer.allow_capabilities,
-        vec![
-            PermissionCapability::Read,
-            PermissionCapability::Search,
-            PermissionCapability::Network,
-            PermissionCapability::Mcp,
-        ]
+        vec![PermissionCapability::Read]
     );
     assert_eq!(auto_review.permissions.web, PermissionMode::Deny);
     assert_eq!(auto_review.permissions.git, PermissionMode::Ask);
@@ -1899,7 +2156,6 @@ status_verbosity = "verbose"
 response_verbosity = "concise"
 tool_output_verbosity = "normal"
 transcript_default = "expanded"
-alternate_screen = "always"
 show_reasoning_usage = false
 
 [mcp.servers.docs]
@@ -1966,7 +2222,6 @@ reason = "docs lookups are safe"
         ToolOutputVerbosity::Normal
     );
     assert_eq!(config.tui.transcript_default, TranscriptDefault::Expanded);
-    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Always);
     assert!(!config.tui.show_reasoning_usage);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
     assert_eq!(config.mcp_servers["docs"].timeout_ms, Some(5_000));
@@ -3618,7 +3873,6 @@ url = "https://docs.example/mcp"
     assert!(inspect.contains("response_verbosity = \"normal\""));
     assert!(inspect.contains("tool_output_verbosity = \"compact\""));
     assert!(inspect.contains("transcript_default = \"compact\""));
-    assert!(inspect.contains("alternate_screen = \"auto\""));
     assert!(inspect.contains("show_reasoning_usage = true"));
     assert!(inspect.contains("transport = \"http\""));
     assert!(!inspect.contains("Balanced"));

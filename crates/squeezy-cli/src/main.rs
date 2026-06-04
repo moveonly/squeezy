@@ -500,6 +500,13 @@ async fn run() -> squeezy_core::Result<()> {
         Some(Command::Auth { command }) => return handle_auth_command(command).await,
         Some(Command::Doctor(args)) => {
             let report = doctor::run(args).await?;
+            if let Ok(config) = config_from_cli(&cli) {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    TelemetryClient::retry_pending_from_config(&config),
+                )
+                .await;
+            }
             report.print();
             let code = report.exit_code;
             if code != 0 {
@@ -687,6 +694,7 @@ async fn run() -> squeezy_core::Result<()> {
             typed_prompts,
             cli.format,
             resume_resolution.session_id,
+            telemetry.clone(),
         )
         .await;
         flush_telemetry_best_effort(&telemetry).await;
@@ -716,19 +724,21 @@ async fn run() -> squeezy_core::Result<()> {
             open_config_section: startup_open_config_section,
         };
         let run_result = if let Some(terminal) = startup_terminal.take() {
-            squeezy_tui::run_with_startup_profile_in_terminal(
+            squeezy_tui::run_with_startup_profile_in_terminal_and_telemetry(
                 terminal,
                 config.clone(),
                 provider,
                 startup_profile,
+                telemetry.clone(),
             )
             .await?
         } else {
             squeezy_tui::StartupRunResult {
-                outcome: squeezy_tui::run_with_startup_profile(
+                outcome: squeezy_tui::run_with_startup_profile_and_telemetry(
                     config.clone(),
                     provider,
                     startup_profile,
+                    telemetry.clone(),
                 )
                 .await?,
                 terminal: None,
@@ -2399,6 +2409,7 @@ async fn run_prompts(
     prompts: Vec<print_mode::PromptInput>,
     format: PromptFormat,
     resume_session_id: Option<String>,
+    telemetry: TelemetryClient,
 ) -> squeezy_core::Result<()> {
     // Print mode used to skip the agent loop entirely and stream the
     // provider response with `tools: []`, which meant the model couldn't
@@ -2410,9 +2421,9 @@ async fn run_prompts(
     // skills) is available; session persistence and redaction now live
     // inside the agent and don't need to be re-implemented here.
     let agent = if let Some(id) = resume_session_id {
-        Agent::resume(config, provider, &id)?.0
+        Agent::resume_with_telemetry(config, provider, &id, telemetry)?.0
     } else {
-        Agent::new(config, provider)
+        Agent::new_with_telemetry(config, provider, telemetry)
     };
     let stdout = io::stdout();
     let stderr = io::stderr();

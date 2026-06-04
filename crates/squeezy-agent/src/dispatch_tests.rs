@@ -373,6 +373,17 @@ fn parse_verbosity_effort_theme_detach_keymap() {
             theme: Some("dark".to_string())
         }
     );
+    assert_eq!(
+        parse("/spinner").unwrap(),
+        DispatchCommand::Spinner { spinner: None }
+    );
+    assert_eq!(
+        parse("/spinner scintillate").unwrap(),
+        DispatchCommand::Spinner {
+            spinner: Some("scintillate".to_string())
+        }
+    );
+    assert_eq!(parse("/spinner").unwrap().slash_name(), "/spinner");
 }
 
 #[test]

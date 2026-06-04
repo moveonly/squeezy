@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use squeezy_core::{
-    config_schema::{ApplyTier, CONFIG_SECTIONS, FieldSource, SectionId},
+    config_schema::{ApplyTier, CONFIG_SECTIONS, FieldSource, FieldValue, SectionId},
     is_builtin_tui_theme_name,
 };
 
@@ -61,6 +61,11 @@ fn middle_ellipsize(s: &str, max: usize) -> String {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    // The full-screen prompt editor takes over the whole config surface.
+    if state.prompt_editor.is_some() {
+        render_prompt_editor(frame, area, state);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1353,8 +1358,23 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
         match state.field_at_row(row) {
             Some(field) => {
                 let (value, source) = state.displayed_value_and_source(field);
-                let value_str = value.as_display();
-                let source_label = inheritance_label(state.scope, source);
+                let mut value_str = value.as_display();
+                // An empty reroute filter means "reroute from any parent
+                // model" — show that explicitly rather than a bare "—".
+                if field.toml_path == ["providers", "*", "expensive_models"]
+                    && matches!(&value, FieldValue::String(s) if s.is_empty())
+                {
+                    value_str = "any".to_string();
+                }
+                // Read-only info rows (e.g. the Routing provider banner) are
+                // pinned context, not a setting — render the value in the amber
+                // accent + italic and drop the inheritance badge.
+                let is_info = matches!(field.kind, squeezy_core::config_schema::FieldKind::Info);
+                let source_label = if is_info {
+                    String::new()
+                } else {
+                    inheritance_label(state.scope, source)
+                };
                 let label_style = if active {
                     Style::default()
                         .fg(crate::render::theme::secondary())
@@ -1362,20 +1382,24 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 } else {
                     Style::default().fg(muted_fg())
                 };
+                let value_style = if is_info {
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(if active {
+                        crate::render::theme::secondary()
+                    } else {
+                        muted_fg()
+                    })
+                };
                 let mut spans = vec![
                     Span::styled(prefix, prefix_style),
                     Span::styled(
                         format!("{:<width$}", field.label, width = max_label + 2),
                         label_style,
                     ),
-                    Span::styled(
-                        value_str,
-                        Style::default().fg(if active {
-                            crate::render::theme::secondary()
-                        } else {
-                            muted_fg()
-                        }),
-                    ),
+                    Span::styled(value_str, value_style),
                 ];
                 if !source_label.is_empty() {
                     spans.push(Span::raw(" "));
@@ -1822,6 +1846,142 @@ fn tier_color(tier: ApplyTier) -> Color {
         ApplyTier::NextPrompt => crate::render::theme::accent(),
         ApplyTier::Restart => crate::render::theme::secondary(),
     }
+}
+
+/// Full-screen multi-line editor surface for long String fields (the judge
+/// prompt). Soft-wraps the buffer to the pane width, draws a reversed-cell
+/// caret, and scrolls vertically to keep the cursor on screen.
+fn render_prompt_editor(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    let Some(ed) = state.prompt_editor.as_ref() else {
+        return;
+    };
+    let field = state.current_field();
+    let provider = super::active_provider_slug(&state.effective);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(crate::render::theme::quiet()))
+        .title(Span::styled(
+            format!("  Edit {} · {provider}  ", field.label),
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let text_area = chunks[0];
+    let footer_area = chunks[1];
+
+    let width = text_area.width.max(1) as usize;
+    let height = (text_area.height.max(1)) as usize;
+
+    let rows = wrap_rows(&ed.draft, width);
+    let cursor_row = cursor_display_row(&rows, ed.cursor);
+    // Anchor the viewport so the cursor row is always visible.
+    let scroll = if cursor_row < height {
+        0
+    } else {
+        cursor_row - height + 1
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    for (row_idx, &(s, e)) in rows.iter().enumerate().skip(scroll).take(height) {
+        let segment = &ed.draft[s..e];
+        if row_idx == cursor_row {
+            let col = ed.cursor.saturating_sub(s).min(segment.len());
+            let before = segment[..col].to_string();
+            let rest = &segment[col..];
+            let at = rest
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| " ".to_string());
+            let after: String = rest.chars().skip(1).collect();
+            lines.push(Line::from(vec![
+                Span::raw(before),
+                Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)),
+                Span::raw(after),
+            ]));
+        } else {
+            lines.push(Line::from(Span::raw(segment.to_string())));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), text_area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Enter newline · Ctrl+S save · Esc discards edits · ↑↓←→ move · clear+save resets to built-in",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))),
+        footer_area,
+    );
+}
+
+/// Soft-wrap `text` to `width` columns, returning the byte range `[start, end)`
+/// of each display row. A newline starts a new row; a logical line longer than
+/// `width` splits across rows; an empty logical line yields an empty row so the
+/// cursor can rest on it. Width is counted in chars (≈ columns).
+fn wrap_rows(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut line_start = 0;
+    loop {
+        let nl = text[line_start..].find('\n').map(|o| line_start + o);
+        let line_end = nl.unwrap_or(text.len());
+        let mut seg_start = line_start;
+        loop {
+            let mut seg_end = seg_start;
+            for (count, (i, ch)) in text[seg_start..line_end].char_indices().enumerate() {
+                if count == width {
+                    break;
+                }
+                seg_end = seg_start + i + ch.len_utf8();
+            }
+            rows.push((seg_start, seg_end));
+            if seg_end >= line_end {
+                break;
+            }
+            seg_start = seg_end;
+        }
+        match nl {
+            Some(pos) => {
+                line_start = pos + 1;
+                // A trailing newline leaves an empty final row for the cursor.
+                if line_start == text.len() {
+                    rows.push((line_start, line_start));
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    if rows.is_empty() {
+        rows.push((0, 0));
+    }
+    rows
+}
+
+/// Which display row the cursor sits on. At a soft-wrap boundary (cursor lands
+/// exactly where a row ends and the next begins with no newline between) prefer
+/// the next row, so the caret shows at column 0 of the continuation.
+fn cursor_display_row(rows: &[(usize, usize)], cursor: usize) -> usize {
+    for (i, &(s, e)) in rows.iter().enumerate() {
+        if cursor >= s && cursor <= e {
+            if cursor == e
+                && let Some(&(ns, _)) = rows.get(i + 1)
+                && ns == cursor
+            {
+                continue;
+            }
+            return i;
+        }
+    }
+    rows.len().saturating_sub(1)
 }
 
 #[cfg(test)]

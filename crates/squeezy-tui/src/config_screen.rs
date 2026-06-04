@@ -16,14 +16,11 @@ use squeezy_agent::Agent;
 use squeezy_core::{
     AppConfig, PermissionPolicyMode, SeparatedSources,
     config_schema::{
-        CONFIG_SECTIONS, ConfigSectionMeta, FieldKind, FieldMeta, FieldSource, FieldValue,
-        SectionId,
+        ApplyTier, CONFIG_SECTIONS, ConfigSectionMeta, FieldKind, FieldMeta, FieldSource,
+        FieldValue, SectionId,
     },
     load_separated_settings_sources,
 };
-
-#[cfg(test)]
-use crate::notification::NotificationQueue;
 
 mod keys;
 mod render;
@@ -38,12 +35,87 @@ pub(crate) use save::{
     save_theme_snapshot, undo_last_write, unset_theme_color,
 };
 
+/// Severity tag for a single feedback line emitted by the config screen.
+/// The host maps it onto the transcript: `Error` / `Warn` render a `⚠`
+/// warning line, `Info` / `Success` render dim operational chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Severity {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+/// One accumulated feedback line, carrying the message and its severity so
+/// the host can route it to the right transcript surface.
+#[derive(Debug, Clone)]
+pub(crate) struct FeedbackEntry {
+    pub message: String,
+    pub severity: Severity,
+}
+
+/// Feedback sink threaded through the config screen's key/save handlers.
+///
+/// The screen used to push fire-and-forget lines into a rotating
+/// notification pane; that pane is gone. Handlers now accumulate their
+/// feedback here and the host (`lib.rs`) drains it into the durable
+/// transcript after each key press.
+#[derive(Debug, Default)]
+pub(crate) struct ConfigFeedback {
+    entries: Vec<FeedbackEntry>,
+}
+
+impl ConfigFeedback {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a feedback line. Mirrors the old queue's `push` signature so
+    /// the handler bodies stay unchanged.
+    pub(crate) fn push(&mut self, message: impl Into<String>, severity: Severity) {
+        self.entries.push(FeedbackEntry {
+            message: message.into(),
+            severity,
+        });
+    }
+
+    /// Drain every accumulated line in emission order, leaving the sink
+    /// empty. The host forwards each to the transcript.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = FeedbackEntry> + '_ {
+        self.entries.drain(..)
+    }
+
+    /// The most recently pushed line, if any. Used by tests to assert on
+    /// the feedback a handler emitted.
+    #[cfg(test)]
+    pub(crate) fn current(&self) -> Option<&FeedbackEntry> {
+        self.entries.last()
+    }
+}
+
 /// Synthetic row index in the Models section that exposes the API-key
 /// editor for the currently selected provider. Sits right after `model`
 /// so provider + model + key read top-to-bottom as a single "what model
 /// am I talking to and with which credential" cluster. Not backed by a
 /// `FieldMeta` in `CONFIG_SECTIONS`.
 const SYNTHETIC_KEY_ROW: usize = 2;
+
+/// Number of Auto-review reviewer rows (`reviewer_model`, `reviewer_policy`,
+/// `reviewer_policy_extra`, `reviewer_capabilities`) that follow `mode` in the
+/// Permissions section's field list.
+const PERMISSION_REVIEWER_ROWS: usize = 4;
+
+/// Visible row count for the Permissions section. Rows are a contiguous
+/// prefix of the section's field list — `mode` only for Default/Full Access,
+/// plus the reviewer rows for Auto-review, plus every per-capability row for
+/// Custom. Keeping it a prefix means `field_at_row(row) == fields[row]`.
+fn permissions_visible_rows(mode: PermissionPolicyMode, field_count: usize) -> usize {
+    match mode {
+        PermissionPolicyMode::Custom => field_count,
+        PermissionPolicyMode::AutoReview => 1 + PERMISSION_REVIEWER_ROWS,
+        PermissionPolicyMode::Default | PermissionPolicyMode::FullAccess => 1,
+    }
+}
 
 /// Static row metadata for the synthetic Reset section. Each row deletes
 /// one tier's TOML file. The `Reset` section itself is declared in
@@ -123,6 +195,9 @@ pub(crate) struct ConfigScreenState {
     pub section_index: usize,
     pub field_index: usize,
     pub editor: Option<FieldEditor>,
+    /// Full-screen multi-line editor for long String fields (the routing judge
+    /// prompt). The inline single-line caret can't show or edit a paragraph.
+    pub prompt_editor: Option<PromptEditorState>,
     pub picker: Option<ModelPickerState>,
     pub search: Option<SearchOverlayState>,
     pub secret_entry: Option<SecretEntryState>,
@@ -147,6 +222,171 @@ pub(crate) struct ConfigScreenState {
     /// `Ctrl+Z` pops the last entry and rewrites the file to its
     /// pre-write contents.
     pub undo_stack: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    pub telemetry_undo_markers: Vec<usize>,
+    pub telemetry_changes: Vec<ConfigTelemetryChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigTelemetryChange {
+    pub scope: ConfigScope,
+    pub section: &'static str,
+    pub field: String,
+    pub apply_tier: ApplyTier,
+    pub change_kind: ConfigTelemetryChangeKind,
+    pub prev_value: String,
+    pub new_value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigTelemetryChangeKind {
+    Set,
+    Unset,
+    Reset,
+}
+
+/// Full-screen multi-line text editor for long String fields (e.g. the routing
+/// judge prompt). Models the buffer exactly like the main composer in
+/// `input.rs`: a flat `String` with a byte `cursor`, so newlines live in the
+/// text and the renderer soft-wraps to the pane width. Vertical scroll is
+/// derived from the cursor at render time, so it isn't stored here.
+pub(crate) struct PromptEditorState {
+    pub draft: String,
+    /// Byte index into `draft`. Always kept on a char boundary.
+    pub cursor: usize,
+}
+
+impl PromptEditorState {
+    pub(crate) fn new(draft: String) -> Self {
+        let cursor = draft.len();
+        Self { draft, cursor }
+    }
+
+    /// Snap the cursor to the nearest char boundary at or before its position.
+    fn clamp(&mut self) {
+        let mut c = self.cursor.min(self.draft.len());
+        while c > 0 && !self.draft.is_char_boundary(c) {
+            c -= 1;
+        }
+        self.cursor = c;
+    }
+
+    pub(crate) fn insert_char(&mut self, ch: char) {
+        self.clamp();
+        self.draft.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        self.clamp();
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.draft[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.draft.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    pub(crate) fn delete(&mut self) {
+        self.clamp();
+        if self.cursor >= self.draft.len() {
+            return;
+        }
+        let next = self.cursor
+            + self.draft[self.cursor..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(0);
+        self.draft.drain(self.cursor..next);
+    }
+
+    pub(crate) fn left(&mut self) {
+        self.clamp();
+        self.cursor = self.draft[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    pub(crate) fn right(&mut self) {
+        self.clamp();
+        if self.cursor >= self.draft.len() {
+            return;
+        }
+        self.cursor += self.draft[self.cursor..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+    }
+
+    fn line_start(&self) -> usize {
+        self.draft[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    fn line_end(&self) -> usize {
+        self.draft[self.cursor..]
+            .find('\n')
+            .map(|o| self.cursor + o)
+            .unwrap_or(self.draft.len())
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.cursor = self.line_start();
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.cursor = self.line_end();
+    }
+
+    /// Move up one logical line, preserving the byte column. Mirrors
+    /// `input.rs::move_input_cursor_up`.
+    pub(crate) fn up(&mut self) {
+        self.clamp();
+        let curr_start = self.line_start();
+        if curr_start == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let col = self.cursor - curr_start;
+        let prev_end = curr_start - 1;
+        let prev_start = self.draft[..prev_end]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_len = prev_end - prev_start;
+        self.cursor = prev_start + col.min(prev_len);
+        self.clamp();
+    }
+
+    /// Move down one logical line, preserving the byte column.
+    pub(crate) fn down(&mut self) {
+        self.clamp();
+        let curr_start = self.line_start();
+        let col = self.cursor - curr_start;
+        let Some(next_start) = self.draft[curr_start..]
+            .find('\n')
+            .map(|o| curr_start + o + 1)
+        else {
+            self.cursor = self.draft.len();
+            return;
+        };
+        let next_end = self.draft[next_start..]
+            .find('\n')
+            .map(|o| next_start + o)
+            .unwrap_or(self.draft.len());
+        let next_len = next_end - next_start;
+        self.cursor = next_start + col.min(next_len);
+        self.clamp();
+    }
 }
 
 /// Masked text entry for an API key. The plaintext lives only in `draft`
@@ -346,6 +586,7 @@ impl ConfigScreenState {
             section_index,
             field_index: 0,
             editor: None,
+            prompt_editor: None,
             picker: None,
             search: None,
             secret_entry: None,
@@ -357,7 +598,36 @@ impl ConfigScreenState {
             dirty: false,
             baseline,
             undo_stack: Vec::new(),
+            telemetry_undo_markers: Vec::new(),
+            telemetry_changes: Vec::new(),
         }
+    }
+
+    pub(crate) fn push_undo_snapshot(
+        &mut self,
+        path: std::path::PathBuf,
+        pre_write_bytes: Option<Vec<u8>>,
+    ) {
+        self.undo_stack.push((path, pre_write_bytes));
+        self.telemetry_undo_markers
+            .push(self.telemetry_changes.len());
+    }
+
+    pub(crate) fn pop_undo_snapshot(
+        &mut self,
+    ) -> Option<(std::path::PathBuf, Option<Vec<u8>>, usize)> {
+        let marker = self
+            .telemetry_undo_markers
+            .pop()
+            .unwrap_or(self.telemetry_changes.len());
+        self.undo_stack
+            .pop()
+            .map(|(path, pre_write_bytes)| (path, pre_write_bytes, marker))
+    }
+
+    pub(crate) fn truncate_telemetry_to(&mut self, marker: usize) {
+        self.telemetry_changes
+            .truncate(marker.min(self.telemetry_changes.len()));
     }
 
     pub(crate) fn current_section(&self) -> &'static ConfigSectionMeta {
@@ -386,19 +656,44 @@ impl ConfigScreenState {
     }
 
     /// Number of selectable rows on the active section, including the
+    /// Permission mode as shown in the `mode` row (resolved against the active
+    /// scope's saved sources). Visibility of the reviewer rows tracks this so
+    /// they stay consistent with the value the user actually sees, even when the
+    /// agent snapshot behind `effective` lags a freshly-saved settings file.
+    fn displayed_permission_mode(&self) -> Option<PermissionPolicyMode> {
+        let section = CONFIG_SECTIONS
+            .iter()
+            .find(|s| s.id == SectionId::Permissions)?;
+        let mode_field = section
+            .fields
+            .iter()
+            .find(|f| f.toml_path == ["permissions", "mode"])?;
+        match self.displayed_value_and_source(mode_field).0 {
+            FieldValue::Enum(s) => PermissionPolicyMode::parse(s),
+            _ => None,
+        }
+    }
+
+    /// Visible Permissions rows: the larger of what the running config
+    /// (`effective`) and the displayed (saved) mode would show, so the reviewer
+    /// rows appear whenever either indicates Auto-review/Custom. This keeps the
+    /// rows from disappearing when the agent snapshot and the saved file
+    /// disagree about the mode at open time.
+    fn permission_visible_rows(&self, field_count: usize) -> usize {
+        let by_effective = permissions_visible_rows(self.effective.permissions.mode, field_count);
+        match self.displayed_permission_mode() {
+            Some(mode) => by_effective.max(permissions_visible_rows(mode, field_count)),
+            None => by_effective,
+        }
+    }
+
     /// synthetic "API key" row for the Models section and the three
     /// per-tier action rows for the Reset section.
     pub(crate) fn row_count(&self) -> usize {
         let section = self.current_section();
         match section.id {
             SectionId::Models => section.fields.len() + 1,
-            SectionId::Permissions => {
-                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
-                    section.fields.len()
-                } else {
-                    1
-                }
-            }
+            SectionId::Permissions => self.permission_visible_rows(section.fields.len()),
             // The Reset section only ever surfaces the action for the active
             // scope tab — resetting another tab's file from here would be
             // confusing and the tier-tab context already disambiguates which
@@ -429,13 +724,8 @@ impl ConfigScreenState {
                 r => section.fields.get(r - 1),
             },
             SectionId::Permissions => {
-                if self.effective.permissions.mode == PermissionPolicyMode::Custom {
-                    section.fields.get(row)
-                } else if row == 0 {
-                    section.fields.first()
-                } else {
-                    None
-                }
+                let visible = self.permission_visible_rows(section.fields.len());
+                (row < visible).then(|| section.fields.get(row)).flatten()
             }
             SectionId::Reset | SectionId::Themes => None,
             _ => section.fields.get(row),
@@ -508,6 +798,11 @@ impl ConfigScreenState {
         &self,
         field: &FieldMeta,
     ) -> (FieldValue, FieldSource) {
+        // Read-only info rows are computed from the resolved config, not a TOML
+        // path — render the computed value verbatim.
+        if matches!(field.kind, FieldKind::Info) {
+            return ((field.get)(&self.effective), FieldSource::Default);
+        }
         // env always wins — render the running value with [env] regardless of tab.
         if let Some(var) = field.env_override
             && std::env::var(var).is_ok()
@@ -527,6 +822,38 @@ impl ConfigScreenState {
                 (FieldSource::User, &self.sources.user),
             ],
         };
+        // Per-provider routing fields (`["providers","*",<key>]`) resolve
+        // against the ACTIVE provider: show the resolved value (override →
+        // global → built-in) via `get`, and report the badge from whether THIS
+        // provider explicitly sets it in the active tab's chain.
+        if let ["providers", "*", key] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            let slug = active_provider_slug(&self.effective);
+            let real: [&str; 3] = ["providers", slug.as_str(), key];
+            for (src, tier) in chain {
+                if let Some(t) = tier
+                    && t.contains_path(&real)
+                {
+                    return (value, *src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
+        // AI-reviewer fields resolve against the running config so the row
+        // reflects what will actually be used (the resolved reviewer model, the
+        // active capability set) rather than a static, often-empty default. The
+        // badge still reflects whether the active tab sets the value.
+        if let ["permissions", "ai_reviewer", _] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            for (src, tier) in chain {
+                if let Some(t) = tier
+                    && tier_value_at_path(t, field).is_some()
+                {
+                    return (value, *src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
         for (src, tier) in chain {
             if let Some(t) = tier
                 && let Some(val) = tier_value_at_path(t, field)
@@ -555,6 +882,39 @@ impl ConfigScreenState {
         field: &FieldMeta,
         skip: Option<ConfigScope>,
     ) -> (FieldValue, FieldSource) {
+        // Read-only info rows are computed from the resolved config.
+        if matches!(field.kind, FieldKind::Info) {
+            return ((field.get)(&self.effective), FieldSource::Default);
+        }
+        // Per-provider routing fields (`["providers","*",<key>]`) resolve
+        // against the ACTIVE provider: show the resolved value (override →
+        // global → built-in) and report whether THIS provider explicitly sets
+        // it (so the badge reads e.g. "user" when overridden, else "default").
+        if let ["providers", "*", key] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            let slug = active_provider_slug(&self.effective);
+            let real: [&str; 3] = ["providers", slug.as_str(), key];
+            let chain = [
+                (FieldSource::Repo, ConfigScope::Local, &self.sources.repo),
+                (
+                    FieldSource::Project,
+                    ConfigScope::Repo,
+                    &self.sources.project,
+                ),
+                (FieldSource::User, ConfigScope::User, &self.sources.user),
+            ];
+            for (src, owns_scope, tier) in chain {
+                if Some(owns_scope) == skip {
+                    continue;
+                }
+                if let Some(t) = tier
+                    && t.contains_path(&real)
+                {
+                    return (value, src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
         if let Some(var) = field.env_override
             && std::env::var(var).is_ok()
         {
@@ -601,7 +961,8 @@ impl ConfigScreenState {
             for field in section.fields {
                 if matches!(
                     field.kind,
-                    FieldKind::TableArray { .. }
+                    FieldKind::Info
+                        | FieldKind::TableArray { .. }
                         | FieldKind::ProviderSubTabs
                         | FieldKind::Secret { .. }
                 ) {
@@ -719,9 +1080,10 @@ fn tier_value_at_explicit_path(
         FieldKind::Path { .. } => value
             .as_str()
             .map(|s| FieldValue::Path(std::path::PathBuf::from(s))),
-        FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. } => {
-            None
-        }
+        FieldKind::Info
+        | FieldKind::Secret { .. }
+        | FieldKind::ProviderSubTabs
+        | FieldKind::TableArray { .. } => None,
     }
 }
 
@@ -849,12 +1211,15 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
             draft: String::new(),
             cursor: 0,
         },
-        // Secret / ProviderSubTabs / TableArray drop into dedicated sub-modes
-        // (Secret entry, provider sub-tabs, table-array editor) in commit 5.
-        // Until then, opening one is a no-op handled by `handle_key` — we
-        // shouldn't have reached `open_editor_for` for these kinds.
+        // Info / Secret / ProviderSubTabs / TableArray are not opened here —
+        // Info is read-only, the others drop into dedicated sub-modes handled
+        // by `handle_key`. Reaching this arm means a kind slipped past the
+        // editability gate; fall back to a harmless empty text editor.
         (
-            FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. },
+            FieldKind::Info
+            | FieldKind::Secret { .. }
+            | FieldKind::ProviderSubTabs
+            | FieldKind::TableArray { .. },
             _,
         ) => FieldEditor::Text {
             draft: String::new(),
@@ -1088,6 +1453,26 @@ pub(crate) fn tier_path(state: &ConfigScreenState, scope: ConfigScope) -> std::p
         ConfigScope::Repo => state.sources.project_path_default.clone(),
         ConfigScope::Local => state.sources.repo_path_default.clone(),
     }
+}
+
+/// Canonical slug of the active provider (the key into `[providers.<name>]`),
+/// read off the Models `[model].provider` field — the same lookup the model
+/// picker and the per-provider save path use.
+pub(crate) fn active_provider_slug(cfg: &AppConfig) -> String {
+    squeezy_core::config_schema::CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == squeezy_core::config_schema::SectionId::Models)
+        .and_then(|s| {
+            s.fields
+                .iter()
+                .find(|f| f.toml_path == ["model", "provider"])
+        })
+        .map(|pf| match (pf.get)(cfg) {
+            squeezy_core::config_schema::FieldValue::Enum(s) => s.to_string(),
+            other => other.as_display(),
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "openai".to_string())
 }
 
 /// Human-readable name for a `ProviderConfig` variant. Used in the

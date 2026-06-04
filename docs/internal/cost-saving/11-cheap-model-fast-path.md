@@ -60,7 +60,7 @@ heuristic does not accept falls through to Layer 2.
 
 Layer 2 is the **provider-cheap-tier LLM judge**. It runs only when:
 
-- `[routing].auto_cheap_llm_judge = true` (default true),
+- `[routing].llm_judge = true` (default true),
 - prompt is non-empty and within `judge_max_chars` (default 6_000 ≈
   1500 tokens),
 - there is no image attachment and no `/parent` override,
@@ -200,7 +200,7 @@ holds for essentially any non-trivial parent turn.
 - **Cancellation**: the judge call rides the same `CancellationToken`
   as the parent turn. A user cancellation while the judge is mid-flight
   drops the judge and the turn dispatches on the parent model.
-- **Heuristic-bypass paths**: `/parent` forces parent; `auto_cheap = false`
+- **Heuristic-bypass paths**: `/parent` forces parent; `enabled = false`
   forces parent (still honors explicit `/cheap`); the escalation-sticky
   window forces parent for K turns after a recent escalation.
 - **Within-provider only**: today the cheap tier is always the same
@@ -219,8 +219,8 @@ holds for essentially any non-trivial parent turn.
 
 ```toml
 [routing]
-auto_cheap = true                     # opt-out master switch
-auto_cheap_llm_judge = true           # borderline judge call
+enabled = true                     # opt-out master switch
+llm_judge = true           # borderline judge call
 cheap_escalation_tool_calls = 0       # 0 = max_tool_calls_per_turn / 4
 cheap_escalation_error_threshold = 2
 escalation_sticky_turns = 3
@@ -230,7 +230,7 @@ judge_max_chars = 6000
 ```
 
 Each key has an `SQUEEZY_ROUTING_*` env-var equivalent matching the
-existing per-budget convention (e.g. `SQUEEZY_ROUTING_AUTO_CHEAP=0`).
+existing per-budget convention (e.g. `SQUEEZY_ROUTING_ENABLED=0`).
 
 ## Reliability: heuristic vs. judge-only
 

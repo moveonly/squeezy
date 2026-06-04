@@ -30,6 +30,7 @@ squeezy-mcp.workspace = true
 squeezy-rank.workspace = true
 squeezy-skills.workspace = true
 squeezy-store.workspace = true
+squeezy-telemetry.workspace = true
 squeezy-vcs.workspace = true
 squeezy-workspace.workspace = true
 tokio.workspace = true
