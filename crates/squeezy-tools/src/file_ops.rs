@@ -105,9 +105,12 @@ const GRAPH_AUGMENT_CAP: usize = 50;
 /// never touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InheritanceGrep {
-    /// The concrete supertype literal extracted from the pattern, with any
+    /// The concrete supertype literal(s) extracted from the pattern, with any
     /// generic argument list stripped (`TypeAdapter<T>` -> `TypeAdapter`).
-    pub(crate) base_name: String,
+    /// Usually one, but an alternation grep (`extends (A|B|C)`) yields several —
+    /// the augment must query the graph for ALL of them, not just the last, or
+    /// it silently drops subtypes of the dropped bases.
+    pub(crate) base_names: Vec<String>,
     /// The declaration keyword token found in the pattern, normalized to one
     /// of class/interface/struct/trait/mixin/enum/protocol. Used to scope the
     /// graph `kind` filter (mixin is attribute-only — see the augment path).
@@ -243,46 +246,50 @@ pub(crate) fn detect_inheritance_grep(pattern: &str) -> Option<InheritanceGrep> 
     // so a wrong default only widens, never wrongly narrows.
     let decl_kw: &'static str = decl_kw_opt.unwrap_or("class");
 
-    // (2)+(3) extract the supertype literal.
+    // (2)+(3) extract the supertype literal(s).
     //
-    // Preferred: the last Capitalized identifier appearing AFTER an
-    // inheritance operator token. This handles `extends TypeAdapter`,
-    // `with WidgetsBindingObserver`, `implements Comparable`.
-    let mut base: Option<&str> = None;
+    // Preferred: EVERY Capitalized identifier appearing AFTER the last
+    // inheritance operator token. One handles `extends TypeAdapter`,
+    // `with WidgetsBindingObserver`, `implements Comparable`; several handle an
+    // alternation `extends (A|B|C)` — which the literalizer flattens to the
+    // tokens `extends A B C`, so we must collect all of A/B/C (the old code
+    // kept only the last and silently dropped subtypes of A and B).
+    let mut base_names: Vec<String> = Vec::new();
     if let Some(op_idx) = last_op_idx {
-        base = tokens[op_idx + 1..]
-            .iter()
-            .rev()
-            .copied()
-            .find(|tok| is_supertype_literal(tok));
+        for tok in &tokens[op_idx + 1..] {
+            push_supertype(tok, &mut base_names);
+        }
     }
 
     // Fallback (covers `:`/`(`/`<`-style inheritance with no word operator):
     // python `class X(Base):`, Rust/Kotlin `: Base`, C++ `: public Base`.
     // Require a structural inheritance punctuation BEFORE a Capitalized
     // identifier so plain `class Foo` (no supertype) does not qualify.
-    if base.is_none() {
-        base = supertype_after_punct(pattern);
+    if base_names.is_empty()
+        && let Some(raw) = supertype_after_punct(pattern)
+    {
+        push_supertype(raw, &mut base_names);
     }
 
-    let base_raw = base?;
-    // Strip generic argument lists: `TypeAdapter<T>` -> `TypeAdapter`. The
-    // literalizer already turned `<`/`>` into spaces, so a token scan keeps
-    // only the head; but the punct fallback reads the raw pattern, so strip
-    // defensively here too.
-    let base_name = base_raw
-        .split(['<', '>', '(', ')'])
-        .next()
-        .unwrap_or(base_raw)
-        .trim();
-    if !is_supertype_literal(base_name) {
+    if base_names.is_empty() {
         return None;
     }
 
     Some(InheritanceGrep {
-        base_name: base_name.to_string(),
+        base_names,
         decl_kw,
     })
+}
+
+/// Strip a token down to its supertype head (`TypeAdapter<T>` -> `TypeAdapter`;
+/// the literalizer already spaced out `<`/`>` for token scans, but the punct
+/// fallback reads the raw pattern, so strip defensively here too) and append it
+/// to `out` when it is a real supertype literal and not already present.
+fn push_supertype(tok: &str, out: &mut Vec<String>) {
+    let head = tok.split(['<', '>', '(', ')']).next().unwrap_or(tok).trim();
+    if is_supertype_literal(head) && !out.iter().any(|b| b == head) {
+        out.push(head.to_string());
+    }
 }
 
 /// Extract a Capitalized supertype that directly follows a `:`, `(`, or `<`
@@ -942,7 +949,7 @@ impl ToolRegistry {
                 json!({
                     "reason": "inheritance_enumeration",
                     "tool": "reference_search",
-                    "arguments": { "query": detected.base_name },
+                    "arguments": { "query": detected.base_names.first().cloned().unwrap_or_default() },
                     "note": "grep is line-oriented; for languages that record \
                              inheritance as references (C/C++, JS/TS, Go) run \
                              reference_search on the supertype to find every \
@@ -1044,8 +1051,20 @@ impl ToolRegistry {
 
         // `attribute` mirrors decl_search's prefix-free `base:|mixin:|iface:`
         // alternation so a single search covers extends / Dart-`with` / implements.
-        let base = &detected.base_name;
-        let attribute = format!("base:{base}|mixin:{base}|iface:{base}");
+        // Each named supertype contributes its own three-prefix alternation, so an
+        // `extends (A|B|C)` grep enumerates subtypes of A, B AND C in one query.
+        let attribute = detected
+            .base_names
+            .iter()
+            .flat_map(|base| {
+                [
+                    format!("base:{base}"),
+                    format!("mixin:{base}"),
+                    format!("iface:{base}"),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join("|");
 
         // `kind` scope: pass the decl keyword for the kinds `parse_symbol_kind`
         // understands so the search scopes correctly; for `mixin` (no such
@@ -1062,13 +1081,14 @@ impl ToolRegistry {
 
         let truncated = symbols.len() > GRAPH_AUGMENT_CAP;
         let mut matched_attributes = BTreeSet::new();
-        let declarations =
-            symbols
-                .iter()
-                .take(GRAPH_AUGMENT_CAP)
-                .map(|symbol| {
-                    // Provenance: which attribute prefix actually matched. Mirror
-                    // the `|`-alternation matching `graph_symbol_search` used.
+        let declarations = symbols
+            .iter()
+            .take(GRAPH_AUGMENT_CAP)
+            .map(|symbol| {
+                // Provenance: which attribute prefix actually matched. Mirror
+                // the `|`-alternation matching `graph_symbol_search` used, across
+                // every named supertype.
+                for base in &detected.base_names {
                     for prefix in ["base", "mixin", "iface"] {
                         let needle = format!("{prefix}:{base}");
                         if symbol.attributes.iter().any(|attr| {
@@ -1077,32 +1097,33 @@ impl ToolRegistry {
                             matched_attributes.insert(needle);
                         }
                     }
-                    let matched_for_symbol = symbol
-                        .attributes
-                        .iter()
-                        .find(|attr| {
-                            ["base", "mixin", "iface"]
-                                .iter()
-                                .any(|p| attr.eq_ignore_ascii_case(&format!("{p}:{base}")))
-                                || ["base", "mixin", "iface"]
-                                    .iter()
-                                    .any(|p| attr.contains(&format!("{p}:{base}")))
+                }
+                let matched_for_symbol = symbol
+                    .attributes
+                    .iter()
+                    .find(|attr| {
+                        detected.base_names.iter().any(|base| {
+                            ["base", "mixin", "iface"].iter().any(|p| {
+                                let needle = format!("{p}:{base}");
+                                attr.eq_ignore_ascii_case(&needle) || attr.contains(&needle)
+                            })
                         })
-                        .cloned()
-                        .unwrap_or_else(|| format!("base:{base}"));
-                    json!({
-                        "path": symbol.file_id.0,
-                        // span lines are 0-based internally; the grep `matches`
-                        // and read_slice are 1-based, so convert for parity.
-                        "line": symbol.span.start.line.saturating_add(1),
-                        "name": symbol.name,
-                        "kind": symbol_kind_label(symbol.kind),
-                        "symbol_id": symbol.id.0,
-                        "source": "semantic_graph",
-                        "matched_attribute": matched_for_symbol,
                     })
+                    .cloned()
+                    .unwrap_or_else(|| format!("base:{}", detected.base_names[0]));
+                json!({
+                    "path": symbol.file_id.0,
+                    // span lines are 0-based internally; the grep `matches`
+                    // and read_slice are 1-based, so convert for parity.
+                    "line": symbol.span.start.line.saturating_add(1),
+                    "name": symbol.name,
+                    "kind": symbol_kind_label(symbol.kind),
+                    "symbol_id": symbol.id.0,
+                    "source": "semantic_graph",
+                    "matched_attribute": matched_for_symbol,
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
 
         Some(GraphAugment {
             declarations,

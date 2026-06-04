@@ -12292,25 +12292,37 @@ fn detect_inheritance_grep_positives() {
     // Dart wrapped-mixin pattern.
     let dart = detect_inheritance_grep(r"class \w+.*\bwith\b.*WidgetsBindingObserver")
         .expect("dart mixin pattern qualifies");
-    assert_eq!(dart.base_name, "WidgetsBindingObserver");
+    assert_eq!(dart.base_names, vec!["WidgetsBindingObserver"]);
     assert_eq!(dart.decl_kw, "class");
 
     // Java nested extends pattern: an explicit `extends <Capitalized>`
     // operator anchors a concrete supertype, so it qualifies even with no
     // decl keyword (the graph `kind` scope defaults to `class`).
     let java = detect_inheritance_grep("extends TypeAdapter").expect("extends Foo qualifies");
-    assert_eq!(java.base_name, "TypeAdapter");
+    assert_eq!(java.base_names, vec!["TypeAdapter"]);
     assert_eq!(java.decl_kw, "class");
 
     let java2 = detect_inheritance_grep("class \\w+ extends TypeAdapter")
         .expect("class + extends qualifies");
-    assert_eq!(java2.base_name, "TypeAdapter");
+    assert_eq!(java2.base_names, vec!["TypeAdapter"]);
     assert_eq!(java2.decl_kw, "class");
 
     let impls = detect_inheritance_grep("interface Foo implements Comparable")
         .expect("implements qualifies");
-    assert_eq!(impls.base_name, "Comparable");
+    assert_eq!(impls.base_names, vec!["Comparable"]);
     assert_eq!(impls.decl_kw, "interface");
+
+    // Alternation grep: `extends (A|B|C)` must enumerate subtypes of ALL three
+    // bases, not just the last. The old single-`base_name` extractor silently
+    // dropped A and B (and thus every subtype found only under them).
+    let alt =
+        detect_inheritance_grep(r"^export class \w+.*extends (ClientProxy|Server|BaseRpcContext)")
+            .expect("alternation extends qualifies");
+    assert_eq!(
+        alt.base_names,
+        vec!["ClientProxy", "Server", "BaseRpcContext"]
+    );
+    assert_eq!(alt.decl_kw, "class");
 }
 
 #[test]
@@ -12332,15 +12344,15 @@ fn detect_inheritance_grep_negatives() {
 fn detect_inheritance_grep_extraction() {
     // Generic args stripped.
     let g = detect_inheritance_grep("class X extends TypeAdapter<T>").expect("qualifies");
-    assert_eq!(g.base_name, "TypeAdapter");
+    assert_eq!(g.base_names, vec!["TypeAdapter"]);
 
     // Python `class X(Base):` — supertype is the Capitalized name in the
     // first parenthesized group.
     let py = detect_inheritance_grep("class X(Base):").expect("python qualifies");
-    assert_eq!(py.base_name, "Base");
+    assert_eq!(py.base_names, vec!["Base"]);
 
     // `: Base`-style (Rust/Kotlin/C#) inheritance punctuation.
     let colon = detect_inheritance_grep("struct Foo : Bar").expect("colon qualifies");
-    assert_eq!(colon.base_name, "Bar");
+    assert_eq!(colon.base_names, vec!["Bar"]);
     assert_eq!(colon.decl_kw, "struct");
 }
