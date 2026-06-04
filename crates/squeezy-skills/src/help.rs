@@ -1453,10 +1453,14 @@ fn extract_doc_intro(content: &str, max_chars: usize) -> &str {
 /// includes README and AGENT_APPROACH so the subagent has core orientation.
 pub fn relevant_docs_for_input(input: &str) -> Vec<BundledDoc> {
     let trimmed = input.trim();
-    let topic = parse_help_command(trimmed)
-        .filter(|t| !t.is_empty())
+    // Extract the stripped topic string when the input is an explicit /help command.
+    // Pass ONLY the stripped part (not the full "/help …" string) to best_topic_for_text
+    // so the "/help" alias on the skills topic does not spuriously match every /help query.
+    let explicit = parse_help_command(trimmed).filter(|t| !t.is_empty());
+    let topic = explicit
+        .as_deref()
         .and_then(find_topic)
-        .or_else(|| best_topic_for_text(trimmed));
+        .or_else(|| best_topic_for_text(explicit.as_deref().unwrap_or(trimmed)));
 
     let Some(topic) = topic else {
         return bundled_docs();

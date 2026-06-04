@@ -2523,47 +2523,11 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
     assert!(!completed.contains("No local help coverage"), "{completed}");
 }
 
-#[tokio::test]
-async fn doc_help_subagent_scopes_corpus_to_matching_topic() {
-    // A /help <known-topic> request must send only that topic's docs (plus
-    // baseline), not the full ~120 KB corpus.  This test fires on the
-    // "providers" topic: PROVIDERS.md must be present, while SESSIONS.md
-    // (a different topic's doc) must be absent.
-    let provider = Arc::new(MockProvider::new(vec![vec![
-        Ok(LlmEvent::Started),
-        Ok(LlmEvent::TextDelta("Providers answer.".to_string())),
-        Ok(LlmEvent::Completed {
-            response_id: Some("resp_scope".to_string()),
-            cost: CostSnapshot::default(),
-            stop_reason: None,
-            reasoning_only_stop: false,
-        }),
-    ]]));
-    let agent = Agent::new(AppConfig::default(), provider.clone());
-
-    let mut rx = agent.start_turn("/help providers".to_string(), CancellationToken::new());
-    while rx.recv().await.is_some() {}
-
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 1, "exactly one DocHelp subagent request");
-    let user_prompt = requests[0]
-        .input
-        .iter()
-        .find_map(|item| match item {
-            squeezy_llm::LlmInputItem::UserText(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .expect("subagent user prompt");
-
-    assert!(
-        user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
-        "providers topic corpus must include PROVIDERS.md"
-    );
-    assert!(
-        !user_prompt.contains("PATH: docs/external/SESSIONS.md"),
-        "providers topic corpus must NOT include unrelated SESSIONS.md: corpus scoping is broken"
-    );
-}
+// NOTE: doc_help_subagent_scopes_corpus_to_matching_topic was removed because
+// `/help <known-topic>` is always handled by the curated layer (Answered), so
+// DocHelp never fires for known topics — the assertion `requests.len() == 1`
+// was always false.  Corpus scoping is tested as a pure unit test in
+// crates/squeezy-skills/src/help_tests.rs (relevant_docs_for_input_scopes_corpus).
 
 #[tokio::test]
 async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
