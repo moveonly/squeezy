@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use super::{
     HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
-    matches_squeezy_help_input,
+    matches_squeezy_help_input, relevant_docs_for_input,
 };
 
 #[test]
@@ -472,4 +472,39 @@ fn squeezy_help_doc_citations_are_bundled_paths() {
             }
         }
     }
+}
+
+#[test]
+fn relevant_docs_for_input_scopes_corpus() {
+    // Known topic (/help providers): must include PROVIDERS.md, must NOT include SESSIONS.md.
+    let providers_docs = relevant_docs_for_input("/help providers");
+    let providers_paths: Vec<&str> = providers_docs.iter().map(|d| d.path).collect();
+    assert!(
+        providers_paths.contains(&"docs/external/PROVIDERS.md"),
+        "providers corpus must include PROVIDERS.md: {providers_paths:?}"
+    );
+    assert!(
+        !providers_paths.contains(&"docs/external/SESSIONS.md"),
+        "providers corpus must NOT include unrelated SESSIONS.md: {providers_paths:?}"
+    );
+    assert!(
+        providers_docs.len() < bundled_docs().len(),
+        "providers corpus ({}) must be smaller than full corpus ({})",
+        providers_docs.len(),
+        bundled_docs().len()
+    );
+
+    // Unknown topic falls back to full corpus.
+    let unknown_docs = relevant_docs_for_input("/help quantum billing rules");
+    assert_eq!(
+        unknown_docs.len(),
+        bundled_docs().len(),
+        "unknown-topic corpus must be the full corpus so DocHelp has maximum coverage"
+    );
+    assert!(
+        unknown_docs
+            .iter()
+            .any(|d| d.path == "docs/external/AGENT_APPROACH.md"),
+        "full corpus must contain AGENT_APPROACH.md"
+    );
 }
