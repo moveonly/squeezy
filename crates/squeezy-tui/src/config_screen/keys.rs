@@ -1101,7 +1101,7 @@ fn handle_secret_entry_key(
             entry.wipe();
             state.secret_entry = None;
         }
-        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+        (KeyCode::F(2), _) => {
             entry.reveal = !entry.reveal;
         }
         (KeyCode::Backspace, _) => {

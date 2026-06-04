@@ -932,7 +932,7 @@ fn secret_caret_line(display: &str, cursor: usize) -> Line<'static> {
 
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
     let display: String = if entry.reveal {
-        // Explicit Ctrl+T toggle — show the full plaintext for verification.
+        // F2 toggle — show the full plaintext for verification.
         entry.draft.clone()
     } else {
         "•".repeat(entry.char_len())
@@ -972,7 +972,7 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
             ),
             Span::styled("save  ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled(
-                "Ctrl+T ",
+                "F2 ",
                 Style::default().fg(crate::render::theme::secondary()),
             ),
             Span::styled(
