@@ -4562,7 +4562,7 @@ async fn slash_help_unsupported_points_to_public_resources() {
         transcript_message_contents(&app).contains(&"/help quantum billing"),
         "user prompt should remain in the transcript"
     );
-    assert!(content.contains("won't guess"), "{content}");
+    assert!(content.contains("No local help coverage"), "{content}");
     assert!(
         content.contains("https://squeezyagent.com/docs/"),
         "{content}"

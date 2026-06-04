@@ -2507,14 +2507,17 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
             _ => None,
         })
         .expect("subagent user prompt");
+    // Unknown topics fall back to the minimal corpus (README + AGENT_APPROACH).
+    // Check for something present in that fallback set rather than PROVIDERS.md,
+    // which is only included when the curated topic cites it.
     assert!(
-        user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
-        "subagent prompt must inline bundled docs: {user_prompt:?}"
+        user_prompt.contains("PATH: docs/external/AGENT_APPROACH.md"),
+        "subagent prompt must inline at least the fallback docs: {user_prompt:?}"
     );
 
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("quantum-billing"), "{completed}");
-    assert!(!completed.contains("won't guess"), "{completed}");
+    assert!(!completed.contains("No local help coverage"), "{completed}");
 }
 
 #[tokio::test]
@@ -2938,7 +2941,8 @@ async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure
         "help should try the doc subagent before falling back"
     );
     let completed = completed.expect("help turn should complete");
-    assert!(completed.contains("won't guess"), "{completed}");
+    // "won't guess" was replaced with "No local help coverage" in the unsupported() message.
+    assert!(completed.contains("No local help coverage"), "{completed}");
     assert!(
         completed.contains("https://squeezyagent.com/docs/"),
         "{completed}"
