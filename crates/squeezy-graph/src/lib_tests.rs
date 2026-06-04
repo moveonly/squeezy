@@ -7925,3 +7925,352 @@ fn temp_root(name: &str) -> PathBuf {
     fs::create_dir_all(&root).unwrap();
     root
 }
+
+/// Bug #4: a method call with an explicit NON-self receiver must not bind to a
+/// same-named method on the *caller's own* class. Inside `A.run`, `b.foo()`
+/// (where `b` is some other object) must NOT resolve to `A.foo` just because
+/// the caller's class also declares a `foo`. JS/TS classifies `b.foo()` as a
+/// `Method` call with receiver `b`, exercising the `same_impl_method`
+/// early-exit that the fix gates on a self/absent receiver.
+#[test]
+fn graph_receiver_method_call_does_not_bind_to_callers_own_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record(
+        "src/m.ts",
+        r#"
+class B {
+    foo() { return 2; }
+}
+
+class A {
+    foo() { return 1; }
+    run(b: B) {
+        return b.foo();
+    }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("A.run should be indexed");
+    let a_foo = graph
+        .find_symbol_by_name("foo")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "A")
+                .unwrap_or(false)
+        })
+        .expect("A.foo should be indexed");
+    let b_foo = graph
+        .find_symbol_by_name("foo")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "B")
+                .unwrap_or(false)
+        })
+        .expect("B.foo should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from A.run for b.foo()");
+    assert_ne!(
+        call_edge.to.as_ref(),
+        Some(&a_foo.id),
+        "b.foo() must NOT bind to the caller's own A.foo (reason={})",
+        call_edge.provenance.reason,
+    );
+    // It is acceptable for this to be unresolved or to land on B.foo, but
+    // never on the caller's own A.foo.
+    if let Some(to) = call_edge.to.as_ref() {
+        assert_eq!(
+            to, &b_foo.id,
+            "if b.foo() resolves at all it must target B.foo, not A.foo",
+        );
+    }
+}
+
+/// Bug #5: the global arity-uniqueness shortcut must not forge an edge for a
+/// method call that carries an explicit non-self receiver. Two unrelated
+/// `bar` methods of the same arity exist in different classes; `b.bar(1)` from
+/// an unrelated context must stay unresolved rather than binding to whichever
+/// `bar` is the unique one of that arity. The classes carry no inheritance
+/// relationship and `b`'s type is unknown to the resolver, so the ONLY way an
+/// edge could form is the (now-gated) arity shortcut.
+#[test]
+fn graph_arity_fallback_does_not_bind_receiver_call_across_types() {
+    let mut parser = LanguageParser::new().unwrap();
+    // Two unrelated `bar` methods of DIFFERENT arity, so exactly one matches
+    // the call's arity of 1 — making the global arity shortcut the only thing
+    // that could decide the binding.
+    let record = ts_record(
+        "src/m.ts",
+        r#"
+class One {
+    bar(value: number) { return value; }
+}
+
+class Two {
+    bar(left: number, right: number) { return left + right; }
+}
+
+class Caller {
+    run(thing: One) {
+        return thing.bar(1);
+    }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Caller.run should be indexed");
+    let one_bar = graph
+        .find_symbol_by_name("bar")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "One")
+                .unwrap_or(false)
+        })
+        .expect("One.bar should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Caller.run for thing.bar(1)");
+    // With an explicit non-self receiver and no type/import signal, the arity
+    // shortcut must not fire: `thing.bar(1)` is left unresolved rather than
+    // forging a hard edge to the lone arity-1 `bar`.
+    assert_ne!(
+        call_edge.to.as_ref(),
+        Some(&one_bar.id),
+        "thing.bar(1) must not bind to One.bar purely via arity uniqueness (reason={})",
+        call_edge.provenance.reason,
+    );
+}
+
+/// Bug #13: an aliased import must produce a dependency/import edge to the
+/// ORIGINAL imported symbol (`Thing`), not the local alias (`T`), and the
+/// aliased use must be discoverable via `references_to_symbol(Thing)`.
+#[test]
+fn graph_aliased_import_targets_original_symbol_and_records_reference() {
+    let mut parser = LanguageParser::new().unwrap();
+    let lib = ts_record(
+        "src/thing.ts",
+        "export class Thing {\n    run() { return 1; }\n}\n",
+    );
+    let app = ts_record(
+        "src/app.ts",
+        r#"import { Thing as T } from "./thing";
+
+export function start(): T {
+    return new T();
+}
+"#,
+    );
+    let parsed = [lib, app]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let thing = graph
+        .find_symbol_by_name("Thing")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Thing class should be indexed");
+
+    // The import edge must resolve to `Thing`, not be lost to the alias `T`.
+    let import_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| {
+            matches!(edge.kind, EdgeKind::Imports | EdgeKind::Reexports)
+                && edge.target_text.contains("Thing")
+        })
+        .expect("expected an import edge for `Thing as T`");
+    assert_eq!(
+        import_edge.to.as_ref(),
+        Some(&thing.id),
+        "aliased import `Thing as T` must target the original symbol Thing",
+    );
+
+    // The aliased use (`T`) must be discoverable as a reference to Thing.
+    let refs = graph.references_to_symbol(&thing.id);
+    assert!(
+        refs.iter().any(|hit| hit.reference.text == "T"),
+        "references_to_symbol(Thing) should include the aliased use `T`; got {:?}",
+        refs.iter()
+            .map(|hit| hit.reference.text.clone())
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Bug #14: JS/TS `this.foo()` and `super.foo()` in a subclass must bind to the
+/// inherited `Base.foo` across files, using the `base:`/`iface:` attributes.
+#[test]
+fn graph_resolves_js_ts_inherited_this_and_super_calls() {
+    let mut parser = LanguageParser::new().unwrap();
+    let base = ts_record(
+        "src/base.ts",
+        "export class Base {\n    foo() { return 1; }\n}\n",
+    );
+    let child = ts_record(
+        "src/child.ts",
+        r#"import { Base } from "./base";
+
+class Child extends Base {
+    bar() { return this.foo(); }
+    baz() { return super.foo(); }
+}
+"#,
+    );
+    let parsed = [base, child]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let base_foo = graph
+        .find_symbol_by_name("foo")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Base::foo should be indexed");
+
+    for (caller_name, label) in [("bar", "this.foo()"), ("baz", "super.foo()")] {
+        let caller = graph
+            .find_symbol_by_name(caller_name)
+            .into_iter()
+            .find(|symbol| symbol.kind == SymbolKind::Method)
+            .unwrap_or_else(|| panic!("Child::{caller_name} should be indexed"));
+        let call_edge = graph
+            .edges()
+            .iter()
+            .find(|edge| edge.from == caller.id && edge.kind == EdgeKind::Calls)
+            .unwrap_or_else(|| panic!("expected a Calls edge from Child::{caller_name}"));
+        assert_eq!(
+            call_edge.to.as_ref(),
+            Some(&base_foo.id),
+            "{label} should resolve to inherited Base::foo; got {:?}",
+            call_edge.to,
+        );
+    }
+}
+
+/// Bug #14 (skip-self): when a JS/TS subclass OVERRIDES an inherited method,
+/// `this.foo()` must bind to the subclass override while `super.foo()` skips
+/// the subclass and binds to the parent's definition.
+#[test]
+fn graph_js_ts_super_call_skips_overriding_subclass() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record(
+        "src/over.ts",
+        r#"
+class Base {
+    foo() { return 1; }
+}
+
+class Child extends Base {
+    foo() { return 2; }
+    viaThis() { return this.foo(); }
+    viaSuper() { return super.foo(); }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let foos = graph.find_symbol_by_name("foo");
+    let base_foo = foos
+        .iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "Base")
+                .unwrap_or(false)
+        })
+        .expect("Base.foo should be indexed");
+    let child_foo = foos
+        .iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "Child")
+                .unwrap_or(false)
+        })
+        .expect("Child.foo should be indexed");
+
+    let via_this = graph
+        .find_symbol_by_name("viaThis")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Child.viaThis should be indexed");
+    let via_super = graph
+        .find_symbol_by_name("viaSuper")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Child.viaSuper should be indexed");
+
+    let this_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == via_this.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from viaThis");
+    assert_eq!(
+        this_edge.to.as_ref(),
+        Some(&child_foo.id),
+        "this.foo() should bind to the subclass override Child.foo",
+    );
+
+    let super_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == via_super.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from viaSuper");
+    assert_eq!(
+        super_edge.to.as_ref(),
+        Some(&base_foo.id),
+        "super.foo() should skip the override and bind to Base.foo",
+    );
+}

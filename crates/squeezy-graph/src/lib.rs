@@ -1705,10 +1705,12 @@ impl SemanticGraph {
             if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
-            let target_name = import
-                .alias
-                .as_deref()
-                .unwrap_or_else(|| last_path_segment_str(&import.path));
+            // Bug #13: the reverse-import index must point at the symbol the
+            // import actually targets — the import path's leaf — not the local
+            // alias. `import { Thing as T }` targets the symbol named `Thing`;
+            // keying on `T` would attach the importer to no file (or the wrong
+            // one), so affected-file propagation would miss edits to `Thing`.
+            let target_name = last_path_segment_str(&import.path);
             let importer_file = import.file_id.clone();
             for symbol_id in self.symbols_by_name.get(target_name).into_iter().flatten() {
                 let Some(symbol) = self.symbols.get(symbol_id) else {
@@ -3347,6 +3349,20 @@ fn has_cfg_attribute(symbol: &GraphSymbol) -> bool {
         .attributes
         .iter()
         .any(|attr| attr.contains("#[cfg(") || attr.contains("#[cfg_attr("))
+}
+
+/// True when a method-call receiver names the caller's *own* instance/type
+/// rather than some other value — i.e. it is one of the language-level "self"
+/// keywords. Self-receiver calls (`self.foo()`, `this.foo()`) legitimately
+/// dispatch into the caller's own class/impl; a call with any *other* explicit
+/// receiver (`b.foo()`) must NOT be allowed to short-circuit to the caller's
+/// own type, or a method named `foo` on the caller's class will swallow a call
+/// that actually targets `b`'s type.
+fn is_self_receiver(receiver: Option<&str>) -> bool {
+    matches!(
+        receiver,
+        Some("self") | Some("this") | Some("cls") | Some("Self")
+    )
 }
 
 fn single_symbol(symbols: impl Iterator<Item = SymbolId>) -> Option<SymbolId> {
