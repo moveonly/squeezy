@@ -2422,6 +2422,54 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn agent_skill_hooks_default_to_disabled() {
+    let root = temp_workspace("agent_skill_hooks_off");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let config = config_with_skill_dirs(&root);
+    assert!(
+        !config.skills.hooks_enabled,
+        "default config must keep skill hooks dormant"
+    );
+    let agent = Agent::new(config, provider);
+    assert!(
+        agent.hooks().is_none(),
+        "skill hooks must stay off until [skills] hooks_enabled = true"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_skill_hooks_register_when_enabled() {
+    let root = temp_workspace("agent_skill_hooks_on");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let registry = agent.hooks().expect("hooks registry installed");
+    assert_eq!(registry.len(), 1, "one declared hook should be registered");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn known_help_topic_short_circuits_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));

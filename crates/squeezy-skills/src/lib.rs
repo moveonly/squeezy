@@ -608,6 +608,40 @@ impl SkillCatalog {
         &self.ambiguous_names
     }
 
+    /// Register `hooks:` declared in every non-disabled discovered
+    /// skill's frontmatter against `registry`. Loads each skill once
+    /// (so the existing `load`-cache picks them up for the rest of the
+    /// session) and aggregates the handler count for telemetry.
+    ///
+    /// Caller-side gating (e.g. `[skills] hooks_enabled = false`) is
+    /// expected to skip the whole call — this method intentionally has
+    /// no opinion on whether hooks should be active because that policy
+    /// belongs to the agent constructor.
+    pub fn register_hooks(&self, registry: &mut HookRegistry) -> usize {
+        let mut installed = 0;
+        for entry in self.skills.values() {
+            if entry.summary.disabled {
+                continue;
+            }
+            match self.load(&entry.summary.name) {
+                Ok(loaded) => {
+                    if !loaded.hooks.is_empty() {
+                        installed += register_skill_hooks(&loaded, registry);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        skill = %entry.summary.name,
+                        error = %error,
+                        "skipping skill hook registration: load failed"
+                    );
+                }
+            }
+        }
+        installed
+    }
+
     pub fn detect_for_command(&self, command: &str, workdir: &Path) -> Option<SkillSummary> {
         implicit::detect_for_command(
             command,

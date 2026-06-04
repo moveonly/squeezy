@@ -1775,6 +1775,32 @@ impl Agent {
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         let (event_broadcast, _) = broadcast::channel(64);
+        // Opt-in: register skill-declared `hooks:` only when the user
+        // has flipped `[skills] hooks_enabled = true`. The handler
+        // implementation shells out via `sh -c` with the same trust as
+        // the Squeezy process, so the default-off gate is the safety
+        // boundary.
+        let hooks = if config.skills.hooks_enabled {
+            let mut registry = squeezy_hooks::HookRegistry::new();
+            let installed = tools.register_skill_hooks(&mut registry);
+            if installed == 0 {
+                None
+            } else {
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "skills_hooks_enabled",
+                    None,
+                    Some(format!(
+                        "{installed} skill hook handler(s) registered for this session"
+                    )),
+                    json!({ "installed": installed }),
+                );
+                Some(Arc::new(registry))
+            }
+        } else {
+            None
+        };
         let agent = Self {
             telemetry,
             session_started_at: Instant::now(),
@@ -1797,7 +1823,7 @@ impl Agent {
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
             replay,
-            hooks: None,
+            hooks,
             agent_hook_bus: None,
             pending_swap: None,
             event_broadcast,

@@ -1980,6 +1980,7 @@ impl AppConfig {
             self.skills.preamble_budget_chars
         ));
         output.push_str(&format!("inline = {}\n", self.skills.inline));
+        output.push_str(&format!("hooks_enabled = {}\n", self.skills.hooks_enabled));
         // The mode tables follow the same inline-table shape that
         // `from_table` accepts, so the inspect output round-trips when
         // pasted back into a settings file.
@@ -7888,6 +7889,14 @@ pub struct SkillsSettings {
     /// (`None` / `Some(false)`) emits metadata-only blocks so the model
     /// pays for the body only when it explicitly calls `load_skill`.
     pub inline: Option<bool>,
+    /// Opt-in to executing `hooks:` declared in `SKILL.md` frontmatter.
+    /// `None`/`Some(false)` (the default) leaves the hook surface inert
+    /// even though the parser accepts it. Setting this to `true` is an
+    /// explicit acknowledgement that hook commands run as `sh -c` with
+    /// the same privileges as the Squeezy process — the same trust
+    /// boundary as the `shell` tool — and should only be enabled for
+    /// skill catalogs the user controls.
+    pub hooks_enabled: Option<bool>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -7906,6 +7915,7 @@ impl SkillsSettings {
                 "active_budget_mode",
                 "preamble_budget_mode",
                 "inline",
+                "hooks_enabled",
                 "config",
             ],
             source,
@@ -7962,6 +7972,12 @@ impl SkillsSettings {
                 &field(path, "preamble_budget_mode"),
             )?,
             inline: bool_value(table, "inline", source, &field(path, "inline"))?,
+            hooks_enabled: bool_value(
+                table,
+                "hooks_enabled",
+                source,
+                &field(path, "hooks_enabled"),
+            )?,
             config: skill_config_entries_value(table, source, &field(path, "config"))?,
         })
     }
@@ -7977,6 +7993,7 @@ impl SkillsSettings {
         replace_if_some(&mut self.active_budget_mode, next.active_budget_mode);
         replace_if_some(&mut self.preamble_budget_mode, next.preamble_budget_mode);
         replace_if_some(&mut self.inline, next.inline);
+        replace_if_some(&mut self.hooks_enabled, next.hooks_enabled);
         self.config.extend(next.config);
     }
 }
@@ -7989,6 +8006,11 @@ pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
 /// bodies out of the system prompt; users that want the legacy behavior
 /// of inlining each activated skill's body can set `[skills] inline = true`.
 pub const DEFAULT_SKILLS_INLINE: bool = false;
+/// Default for `[skills] hooks_enabled`. Lifecycle shell hooks declared
+/// in `SKILL.md` frontmatter are inert unless the user opts in: hook
+/// commands run with the same privileges as Squeezy itself, so this
+/// stays off until explicitly enabled for a trusted skill catalog.
+pub const DEFAULT_SKILLS_HOOKS_ENABLED: bool = false;
 /// Default fraction of `model_context_window` (in percent) consumed by the
 /// active and available-skills bundles when no explicit chars budget is set.
 /// Matches the codex reference (`SKILL_METADATA_CONTEXT_WINDOW_PERCENT=2`).
@@ -8086,6 +8108,14 @@ pub struct SkillsConfig {
     /// (`false`) emits metadata-only blocks; the model fetches a body on
     /// demand via the `load_skill` tool.
     pub inline: bool,
+    /// When `true`, `hooks:` blocks declared in skill frontmatter are
+    /// registered against the agent hook registry on session start and
+    /// fire during the matching lifecycle events. Defaults to `false`
+    /// (the parser still accepts `hooks:` but the handlers stay dormant)
+    /// because hook commands run unsandboxed via `sh -c` — the same
+    /// trust boundary as the `shell` tool. Enable per-project when the
+    /// skill catalog is fully trusted.
+    pub hooks_enabled: bool,
     /// Token budget for the active model, copied from
     /// `context_compaction.model_context_window`. `None` keeps
     /// `ContextPercent` modes dormant and forces a fall-back to
@@ -8157,6 +8187,9 @@ impl SkillsConfig {
             active_budget_mode,
             preamble_budget_mode,
             inline: settings.inline.unwrap_or(DEFAULT_SKILLS_INLINE),
+            hooks_enabled: settings
+                .hooks_enabled
+                .unwrap_or(DEFAULT_SKILLS_HOOKS_ENABLED),
             model_context_window: None,
             config: settings
                 .config
@@ -8200,6 +8233,7 @@ impl Default for SkillsConfig {
             active_budget_mode: SkillsBudgetMode::default(),
             preamble_budget_mode: SkillsBudgetMode::default(),
             inline: DEFAULT_SKILLS_INLINE,
+            hooks_enabled: DEFAULT_SKILLS_HOOKS_ENABLED,
             model_context_window: None,
             config: Vec::new(),
         }
@@ -9249,6 +9283,7 @@ pub fn user_settings_template() -> &'static str {
 # active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
 # preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
 # inline = false                      # default; emit only metadata for active skills and let the model call load_skill on demand
+# hooks_enabled = false               # default; opt in to running `hooks:` declared in SKILL.md frontmatter
 #
 # [[skills.config]]
 # name = "example-skill"

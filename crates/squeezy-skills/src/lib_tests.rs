@@ -1858,6 +1858,58 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
     assert_eq!(registry.len(), 2);
 }
 
+#[test]
+fn catalog_register_hooks_skips_disabled_and_aggregates() {
+    let root = temp_workspace("skills_catalog_register_hooks");
+    let user_dir = root.join("user");
+
+    let alpha_dir = user_dir.join("alpha");
+    fs::create_dir_all(&alpha_dir).expect("mkdir alpha");
+    fs::write(
+        alpha_dir.join("SKILL.md"),
+        "---\nname: alpha\ndescription: \"a\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# alpha\n",
+    )
+    .expect("write alpha");
+
+    let beta_dir = user_dir.join("beta");
+    fs::create_dir_all(&beta_dir).expect("mkdir beta");
+    fs::write(
+        beta_dir.join("SKILL.md"),
+        "---\nname: beta\ndescription: \"b\"\nhooks:\n  PostToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n        - type: command\n          command: \"true\"\n          once: true\n---\n# beta\n",
+    )
+    .expect("write beta");
+
+    let gamma_dir = user_dir.join("gamma");
+    fs::create_dir_all(&gamma_dir).expect("mkdir gamma");
+    fs::write(
+        gamma_dir.join("SKILL.md"),
+        "---\nname: gamma\ndescription: \"g\"\n---\n# gamma\n",
+    )
+    .expect("write gamma");
+
+    let config = SkillsConfig {
+        user_dir,
+        compat_user_dir: root.join("compat"),
+        config: vec![SkillConfigEntry {
+            name: Some("beta".to_string()),
+            path: None,
+            enabled: false,
+        }],
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let mut registry = HookRegistry::new();
+    let installed = catalog.register_hooks(&mut registry);
+    assert_eq!(
+        installed, 1,
+        "only the non-disabled skill with hooks should contribute handlers"
+    );
+    assert_eq!(registry.len(), 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn skill_hook_fires_on_matching_event_and_skips_others() {

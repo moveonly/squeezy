@@ -2614,6 +2614,14 @@ impl ToolRegistry {
         self.skills.ambiguous_names().iter().cloned().collect()
     }
 
+    /// Forwards to [`SkillCatalog::register_hooks`] so callers can build
+    /// a [`squeezy_hooks::HookRegistry`] populated with the declared
+    /// `hooks:` blocks of every non-disabled discovered skill. Returns
+    /// the total number of installed handlers.
+    pub fn register_skill_hooks(&self, registry: &mut squeezy_hooks::HookRegistry) -> usize {
+        self.skills.register_hooks(registry)
+    }
+
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
         self.execute_for_group(call, cancel, "manual".to_string())
             .await
