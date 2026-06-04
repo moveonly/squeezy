@@ -186,6 +186,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         }
 
         checks.push(mcp_check(&config.mcp_servers));
+        checks.push(skills_check(config));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
@@ -581,6 +582,50 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
             status: Status::Warn,
             detail: format!("{summary}; {issues}"),
         }
+    }
+}
+
+/// Summarize the discovered skill catalog without doing any network or
+/// long-running work: walks the configured roots, counts total /
+/// enabled / disabled skills, and downgrades to `warn` when a
+/// same-precedence name collision flips trigger activation into
+/// ambiguous mode. Pure stat work so the row stays fast and matches
+/// the rest of `doctor`'s offline-CI contract.
+fn skills_check(config: &AppConfig) -> Check {
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+    let summaries = catalog.summaries();
+    if summaries.is_empty() {
+        return Check {
+            name: "skills".to_string(),
+            status: Status::Ok,
+            detail: "no skills discovered".to_string(),
+        };
+    }
+    let disabled = summaries.iter().filter(|s| s.disabled).count();
+    let enabled = summaries.len() - disabled;
+    let ambiguous = catalog.ambiguous_names().len();
+    let mut detail = format!("enabled={enabled} disabled={disabled}");
+    if ambiguous > 0 {
+        let names = catalog
+            .ambiguous_names()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        detail.push_str(&format!("; ambiguous={ambiguous} ({names})"));
+        return Check {
+            name: "skills".to_string(),
+            status: Status::Warn,
+            detail,
+        };
+    }
+    if config.skills.hooks_enabled {
+        detail.push_str("; hooks_enabled");
+    }
+    Check {
+        name: "skills".to_string(),
+        status: Status::Ok,
+        detail,
     }
 }
 

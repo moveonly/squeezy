@@ -379,6 +379,13 @@ pub struct SkillCatalog {
     skills: BTreeMap<String, SkillEntry>,
     cache: Mutex<BTreeMap<String, LoadedSkill>>,
     ambiguous_names: BTreeSet<String>,
+    /// Normalized triggers that appear in more than one distinct
+    /// skill. A trigger that fires for an ambiguous phrase used to
+    /// activate every matching skill at once, which silently inflated
+    /// the active-skill budget. Activation now skips auto-trigger
+    /// matches against entries in this set; users disambiguate with
+    /// `/skill <name>` or `load_skill`.
+    ambiguous_triggers: BTreeSet<String>,
     implicit_by_scripts_dir: BTreeMap<PathBuf, String>,
     implicit_by_doc_path: BTreeMap<PathBuf, String>,
     active_budget_chars: usize,
@@ -399,6 +406,7 @@ impl Default for SkillCatalog {
             skills: BTreeMap::new(),
             cache: Mutex::new(BTreeMap::new()),
             ambiguous_names: BTreeSet::new(),
+            ambiguous_triggers: BTreeSet::new(),
             implicit_by_scripts_dir: BTreeMap::new(),
             implicit_by_doc_path: BTreeMap::new(),
             active_budget_chars: defaults.active_budget_effective_chars(),
@@ -467,7 +475,7 @@ impl SkillCatalog {
             }
         }
         catalog.apply_config_rules(workspace_root, &config.config);
-        catalog.warn_trigger_collisions();
+        catalog.collect_trigger_collisions();
         catalog.rebuild_implicit_indexes();
         catalog
     }
@@ -548,11 +556,17 @@ impl SkillCatalog {
             if entry.summary.disabled || self.ambiguous_names.contains(&entry.summary.name) {
                 continue;
             }
-            if entry
-                .triggers
-                .iter()
-                .any(|trigger| input_matches_trigger(&lowered, trigger))
-            {
+            // Skip any trigger that collides across skills (same
+            // normalized phrase declared by two or more distinct
+            // skills). Loading every match silently bloated the
+            // active-skill budget. Auto-activation requires a unique
+            // trigger; users disambiguate with `/skill <name>` or
+            // `load_skill`.
+            if entry.triggers.iter().any(|trigger| {
+                let normalized = trigger.trim().to_ascii_lowercase();
+                !self.ambiguous_triggers.contains(&normalized)
+                    && input_matches_trigger(&lowered, trigger)
+            }) {
                 candidates.push((entry.summary.name.clone(), SkillActivationKind::Trigger));
             }
         }
@@ -589,6 +603,18 @@ impl SkillCatalog {
         }
     }
 
+    /// Render the activated fork-mode skills (those whose frontmatter
+    /// declares `context: fork`) into a `<fork_skills>` system block.
+    /// Returns `None` when `skills` is empty.
+    ///
+    /// Fork-mode skills are intentionally rendered separately from
+    /// `<active_skills>` because the design intent is for the model to
+    /// dispatch them through a focused subagent (via the existing
+    /// `delegate` tool) rather than executing the body inline.
+    pub fn render_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        render::render_fork_skills(skills, self.active_budget_chars, self.active_body_cap_chars)
+    }
+
     pub fn render_preamble(&self) -> Option<SkillPreambleRender> {
         self.preamble_enabled
             .then(|| {
@@ -606,6 +632,47 @@ impl SkillCatalog {
 
     pub fn ambiguous_names(&self) -> &BTreeSet<String> {
         &self.ambiguous_names
+    }
+
+    /// Normalized triggers declared by more than one distinct skill.
+    /// Auto-trigger activation skips these so the parent turn does
+    /// not silently load multiple skills for the same input phrase.
+    pub fn ambiguous_triggers(&self) -> &BTreeSet<String> {
+        &self.ambiguous_triggers
+    }
+
+    /// Register `hooks:` declared in every non-disabled discovered
+    /// skill's frontmatter against `registry`. Loads each skill once
+    /// (so the existing `load`-cache picks them up for the rest of the
+    /// session) and aggregates the handler count for telemetry.
+    ///
+    /// Caller-side gating (e.g. `[skills] hooks_enabled = false`) is
+    /// expected to skip the whole call — this method intentionally has
+    /// no opinion on whether hooks should be active because that policy
+    /// belongs to the agent constructor.
+    pub fn register_hooks(&self, registry: &mut HookRegistry) -> usize {
+        let mut installed = 0;
+        for entry in self.skills.values() {
+            if entry.summary.disabled {
+                continue;
+            }
+            match self.load(&entry.summary.name) {
+                Ok(loaded) => {
+                    if !loaded.hooks.is_empty() {
+                        installed += register_skill_hooks(&loaded, registry);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        skill = %entry.summary.name,
+                        error = %error,
+                        "skipping skill hook registration: load failed"
+                    );
+                }
+            }
+        }
+        installed
     }
 
     pub fn detect_for_command(&self, command: &str, workdir: &Path) -> Option<SkillSummary> {
@@ -838,7 +905,7 @@ impl SkillCatalog {
         }
     }
 
-    fn warn_trigger_collisions(&self) {
+    fn collect_trigger_collisions(&mut self) {
         let mut by_trigger: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for entry in self.skills.values() {
             for trigger in &entry.triggers {
@@ -852,6 +919,7 @@ impl SkillCatalog {
                     .push(entry.summary.name.as_str());
             }
         }
+        let mut collisions: BTreeSet<String> = BTreeSet::new();
         for (trigger, mut names) in by_trigger {
             if names.len() < 2 {
                 continue;
@@ -865,9 +933,11 @@ impl SkillCatalog {
                 target: "squeezy_skills",
                 trigger = %trigger,
                 skills = ?names,
-                "duplicate skill trigger across skills; activation will load every match"
+                "duplicate skill trigger across skills; auto-activation requires explicit selection"
             );
+            collisions.insert(trigger);
         }
+        self.ambiguous_triggers = collisions;
     }
 
     fn apply_config_rules(&mut self, workspace_root: &Path, rules: &[SkillConfigEntry]) {
@@ -935,6 +1005,7 @@ impl Clone for SkillCatalog {
             skills: self.skills.clone(),
             cache: Mutex::new(cache),
             ambiguous_names: self.ambiguous_names.clone(),
+            ambiguous_triggers: self.ambiguous_triggers.clone(),
             implicit_by_scripts_dir: self.implicit_by_scripts_dir.clone(),
             implicit_by_doc_path: self.implicit_by_doc_path.clone(),
             active_budget_chars: self.active_budget_chars,
@@ -1398,7 +1469,7 @@ fn skill_path_matches(selector: &Path, entry: &SkillEntry) -> bool {
     selector == location || selector == base_dir
 }
 
-pub(crate) fn xml_escape(value: &str) -> String {
+pub fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -1451,6 +1522,174 @@ fn load_manifest(base_dir: &Path) -> Option<SkillManifest> {
             None
         }
     }
+}
+
+/// Materialise the in-binary [`bundled_skills`] under `user_dir` so a
+/// fresh install actually has discoverable sample skills.
+///
+/// Each bundled skill is written to `<user_dir>/<name>/SKILL.md`. If
+/// the target directory or file already exists the entry is skipped
+/// — repeat calls and partial installs stay idempotent and never
+/// clobber an edited user copy.
+///
+/// Returns the list of skill names that were written this call.
+pub fn install_bundled_skills(user_dir: &Path) -> Result<Vec<String>> {
+    fs::create_dir_all(user_dir)?;
+    let mut written = Vec::new();
+    for source in BUNDLED_SKILL_SOURCES {
+        let target_dir = user_dir.join(source.dir_name);
+        let target_file = target_dir.join(SKILL_FILE);
+        if target_file.exists() {
+            continue;
+        }
+        fs::create_dir_all(&target_dir)?;
+        fs::write(&target_file, source.content)?;
+        written.push(source.dir_name.to_string());
+    }
+    Ok(written)
+}
+
+/// Inspect a `manifest.tool_deps` list and return the subset that is
+/// not satisfied by the runtime's available tools and MCP servers.
+///
+/// A dep starting with `mcp:<server>` matches an MCP server name in
+/// `available_mcp_servers`. Any other dep is treated as a built-in
+/// tool name and matched against `available_tools`. Comparison is
+/// case-sensitive to mirror the lookup the tool registry performs.
+pub fn unmet_tool_deps(
+    deps: &[String],
+    available_tools: &BTreeSet<String>,
+    available_mcp_servers: &BTreeSet<String>,
+) -> Vec<String> {
+    deps.iter()
+        .filter(|dep| {
+            let trimmed = dep.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            if let Some(server) = trimmed.strip_prefix("mcp:") {
+                !available_mcp_servers.contains(server.trim())
+            } else {
+                !available_tools.contains(trimmed)
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Parse `SKILL.md` content and report whether it satisfies the
+/// catalog's frontmatter and naming rules.
+///
+/// Reuses the same parser the discovery walker uses, so a `Ok(name)`
+/// means the file is byte-for-byte loadable into the catalog. The
+/// returned `name` is the canonical skill name read from the
+/// frontmatter `name:` field, useful for the CLI's `validate`
+/// subcommand to surface what is being validated.
+pub fn validate_skill_md(content: &str) -> std::result::Result<String, String> {
+    let (metadata, _body) = parse_skill_file(content)?;
+    if !is_valid_skill_name(&metadata.name) {
+        return Err(format!(
+            "invalid skill name {:?}: must start with a lowercase ASCII letter and contain only lowercase letters, digits, '-', or '_'",
+            metadata.name
+        ));
+    }
+    Ok(metadata.name)
+}
+
+/// Outcome of validating a single `SKILL.md` file found in a skill root.
+#[derive(Debug, Clone)]
+pub struct SkillValidationResult {
+    /// Path to the `SKILL.md` file.
+    pub path: PathBuf,
+    /// Skill name from frontmatter, or the raw string that failed naming rules.
+    /// `None` when the file could not be read or the frontmatter had no
+    /// parseable `name:` field.
+    pub name: Option<String>,
+    /// `Ok(())` when the file parsed cleanly and the name is valid;
+    /// `Err(reason)` with a human-readable description of the first issue
+    /// found.
+    pub outcome: std::result::Result<(), String>,
+}
+
+/// Return every skill *root directory* that [`SkillCatalog::discover`] will
+/// scan for a given `(workspace_root, config)` pair, in the same order
+/// `discover` uses. This includes:
+///
+/// - User-level roots (`compat_user_dir`, `user_dir`).
+/// - `extra_roots` from config.
+/// - The current workspace's project roots (`.agents/skills`,
+///   `.squeezy/skills`).
+/// - **All ancestor project roots** up to the git root (monorepo support) —
+///   the same directories scanned by `ancestor_project_roots`.
+///
+/// [`validate_skill_dirs`] calls this so its scan is always identical to what
+/// runtime discovery will load.
+pub fn skill_scan_dirs(workspace_root: &Path, config: &squeezy_core::SkillsConfig) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(config.compat_user_dir.clone());
+    dirs.push(config.user_dir.clone());
+    dirs.extend(config.extra_roots.iter().cloned());
+    dirs.push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
+    dirs.push(workspace_root.join(PROJECT_SKILLS_DIR));
+    // Monorepo ancestor walk — mirrors discover's ancestor_project_roots loop.
+    for ancestor in ancestor_project_roots(workspace_root) {
+        dirs.push(ancestor.join(COMPAT_PROJECT_SKILLS_DIR));
+        dirs.push(ancestor.join(PROJECT_SKILLS_DIR));
+    }
+    dirs
+}
+
+/// Walk every configured skill root from `config` (the same roots that
+/// [`SkillCatalog::discover`] uses, including ancestor project roots for
+/// monorepo launches from subdirectories) and attempt to parse each
+/// `SKILL.md`.
+///
+/// Unlike discovery, this function records parse failures rather than
+/// silently skipping them, so `squeezy skills validate` can surface the
+/// errors that discovery drops. Non-existent roots and directories without
+/// a `SKILL.md` are skipped without an error, mirroring discovery behaviour.
+pub fn validate_skill_dirs(
+    workspace_root: &Path,
+    config: &squeezy_core::SkillsConfig,
+) -> Vec<SkillValidationResult> {
+    let scan_dirs = skill_scan_dirs(workspace_root, config);
+    let mut results = Vec::new();
+    for dir in &scan_dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let skill_path = path.join(SKILL_FILE);
+            if !skill_path.exists() {
+                continue;
+            }
+            let content = match fs::read_to_string(&skill_path) {
+                Ok(c) => c,
+                Err(err) => {
+                    results.push(SkillValidationResult {
+                        path: skill_path,
+                        name: None,
+                        outcome: Err(format!("could not read file: {err}")),
+                    });
+                    continue;
+                }
+            };
+            let outcome = validate_skill_md(&content).map(|_| ());
+            let name = parse_skill_file(&content).ok().map(|(meta, _)| meta.name);
+            results.push(SkillValidationResult {
+                path: skill_path,
+                name,
+                outcome,
+            });
+        }
+    }
+    results
 }
 
 pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillManifest, String> {

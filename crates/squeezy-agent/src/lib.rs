@@ -1775,6 +1775,32 @@ impl Agent {
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         let (event_broadcast, _) = broadcast::channel(64);
+        // Opt-in: register skill-declared `hooks:` only when the user
+        // has flipped `[skills] hooks_enabled = true`. The handler
+        // implementation shells out via `sh -c` with the same trust as
+        // the Squeezy process, so the default-off gate is the safety
+        // boundary.
+        let hooks = if config.skills.hooks_enabled {
+            let mut registry = squeezy_hooks::HookRegistry::new();
+            let installed = tools.register_skill_hooks(&mut registry);
+            if installed == 0 {
+                None
+            } else {
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "skills_hooks_enabled",
+                    None,
+                    Some(format!(
+                        "{installed} skill hook handler(s) registered for this session"
+                    )),
+                    json!({ "installed": installed }),
+                );
+                Some(Arc::new(registry))
+            }
+        } else {
+            None
+        };
         let agent = Self {
             telemetry,
             session_started_at: Instant::now(),
@@ -1797,7 +1823,7 @@ impl Agent {
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
             replay,
-            hooks: None,
+            hooks,
             agent_hook_bus: None,
             pending_swap: None,
             event_broadcast,
@@ -1886,7 +1912,76 @@ impl Agent {
         if next.telemetry != self.config.telemetry {
             self.telemetry = TelemetryClient::from_config(&next);
         }
+        let skills_changed = next.skills != self.config.skills;
+        let workspace_changed = next.workspace_root != self.config.workspace_root;
         self.config = next;
+        if skills_changed || workspace_changed {
+            self.rebuild_skills_catalog();
+            // A catalog rebuild must also rebuild the hook registry: the old
+            // registry could still reference handlers for skills that were
+            // disabled, removed, or had their hooks edited, and
+            // `hooks_enabled` might have been toggled. Leaving `self.hooks`
+            // stale would let old `PreToolUse`/`PostToolUse` shell-outs keep
+            // firing against the user's stated intent.
+            self.rebuild_hooks_registry();
+        }
+    }
+
+    /// Rebuild the skill catalog from the current `config.skills` and
+    /// workspace root. Called by `replace_config` when the skill
+    /// surface changed so external `settings.toml` edits — including
+    /// `[[skills.config]]` enable/disable entries and dropping a new
+    /// `SKILL.md` — take effect without a session restart.
+    pub fn rebuild_skills_catalog(&self) -> usize {
+        let count = self
+            .tools
+            .rebuild_skills(&self.config.workspace_root, &self.config.skills);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "skills_catalog_rebuilt",
+            None,
+            Some(format!(
+                "{count} skill(s) in the catalog after settings reload"
+            )),
+            json!({ "skills_count": count }),
+        );
+        count
+    }
+
+    /// Rebuild the hook registry from the current `config.skills` state.
+    ///
+    /// Called by `replace_config`/`drain_pending_swap` whenever the skills
+    /// config or workspace root changes. This enforces the trust boundary
+    /// declared by the `[skills] hooks_enabled` gate: if the flag was
+    /// toggled off, individual skills were disabled, or hook commands were
+    /// edited, the stale handlers in the old registry must not keep firing.
+    /// A fresh registry is built from the current catalog snapshot and
+    /// installed atomically; the old registry is discarded.
+    pub fn rebuild_hooks_registry(&mut self) {
+        if !self.config.skills.hooks_enabled {
+            // Gate is now off — clear any previously installed registry
+            // so existing handlers stop dispatching immediately.
+            self.hooks = None;
+            return;
+        }
+        let mut registry = squeezy_hooks::HookRegistry::new();
+        let installed = self.tools.register_skill_hooks(&mut registry);
+        self.hooks = if installed == 0 {
+            None
+        } else {
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "skills_hooks_rebuilt",
+                None,
+                Some(format!(
+                    "{installed} skill hook handler(s) re-registered after settings reload"
+                )),
+                json!({ "installed": installed }),
+            );
+            Some(Arc::new(registry))
+        };
     }
 
     /// Replace the LLM client. The in-flight turn (if any) holds a clone of
@@ -1912,9 +2007,15 @@ impl Agent {
     /// config takes effect for the very next request.
     pub fn drain_pending_swap(&mut self) -> Option<PendingConfigSwap> {
         let swap = self.pending_swap.take()?;
+        let skills_changed = swap.config.skills != self.config.skills;
+        let workspace_changed = swap.config.workspace_root != self.config.workspace_root;
         self.config = swap.config.clone();
         if let Some(provider) = swap.provider.clone() {
             self.provider = provider;
+        }
+        if skills_changed || workspace_changed {
+            self.rebuild_skills_catalog();
+            self.rebuild_hooks_registry();
         }
         Some(swap)
     }
@@ -4171,6 +4272,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
                 .to_string(),
         ),
         thoroughness: None,
+        system_override: None,
     };
     let mut all_tool_specs = core_control_tools(
         &deps.config.subagents,
@@ -5284,9 +5386,60 @@ impl TurnRuntime {
         }
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
-        let base_instructions = match self.tools.format_active_skills(&activation.skills) {
-            Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
-            None => self.config.instructions.clone(),
+        // Partition by execution-context mode declared in `SKILL.md`
+        // frontmatter. Inline-mode skills (the default) keep the
+        // existing `<active_skills>` system-prompt injection. Fork-mode
+        // skills are surfaced via a separate `<fork_skills>` block so
+        // the model treats them as candidates for a focused subagent
+        // dispatch rather than instructions for the parent turn.
+        let (inline_skills, fork_skills): (Vec<_>, Vec<_>) =
+            activation.skills.iter().cloned().partition(|skill| {
+                !matches!(
+                    skill.summary.context_mode,
+                    squeezy_skills::SkillContextMode::Fork
+                )
+            });
+        let active_block = self.tools.format_active_skills(&inline_skills);
+        let fork_block = self.tools.format_fork_skills(&fork_skills);
+        // `manifest.tool_deps` declared by an activated skill must
+        // match an advertised tool name (or `mcp:<server>` for a
+        // ready MCP). When a dep is missing the skill body would
+        // happily reference it anyway, so surface a structured
+        // refusal note in the system prompt before the LLM call.
+        let mut all_active_skills = inline_skills.clone();
+        all_active_skills.extend(fork_skills.iter().cloned());
+        let missing_deps = self.tools.audit_skill_tool_deps(&all_active_skills);
+        let dep_warnings = if missing_deps.is_empty() {
+            None
+        } else {
+            for (skill, missing) in &missing_deps {
+                tracing::warn!(
+                    target: "squeezy_skills",
+                    skill = %skill,
+                    missing = ?missing,
+                    "skill manifest declares tool_deps that are not available in this session"
+                );
+            }
+            Some(format_skill_tool_dep_warnings(&missing_deps))
+        };
+        let base_instructions = match (active_block, fork_block, dep_warnings) {
+            (Some(active), Some(fork), Some(warn)) => format!(
+                "{}\n\n{}\n\n{}\n\n{}",
+                self.config.instructions, active, fork, warn
+            ),
+            (Some(active), Some(fork), None) => {
+                format!("{}\n\n{}\n\n{}", self.config.instructions, active, fork)
+            }
+            (Some(active), None, Some(warn)) => {
+                format!("{}\n\n{}\n\n{}", self.config.instructions, active, warn)
+            }
+            (Some(active), None, None) => format!("{}\n\n{}", self.config.instructions, active),
+            (None, Some(fork), Some(warn)) => {
+                format!("{}\n\n{}\n\n{}", self.config.instructions, fork, warn)
+            }
+            (None, Some(fork), None) => format!("{}\n\n{}", self.config.instructions, fork),
+            (None, None, Some(warn)) => format!("{}\n\n{}", self.config.instructions, warn),
+            (None, None, None) => self.config.instructions.clone(),
         };
         let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
             .is_some_and(|capabilities| capabilities.text_verbosity);
@@ -7869,6 +8022,18 @@ enum SubagentKind {
     DocHelp,
     Plan,
     Review,
+    /// Bounded subagent invoked to run a fork-mode skill body in
+    /// isolation from the parent turn. The skill body is provided via
+    /// `SubagentRequest.system_override` so the subagent's system
+    /// prompt is the skill's own instructions, and the user task is
+    /// passed through the standard `prompt` field. Wired but not yet
+    /// auto-dispatched — fork-mode skills currently appear in a
+    /// `<fork_skills>` system block and rely on the parent agent
+    /// invoking `delegate` to actually run them. The `dead_code`
+    /// allowance covers the period before a `delegate`-style tool
+    /// learns to map onto this kind.
+    #[allow(dead_code)]
+    Skill,
 }
 
 impl SubagentKind {
@@ -7879,6 +8044,7 @@ impl SubagentKind {
             Self::DocHelp => "doc_help",
             Self::Plan => "plan",
             Self::Review => "review",
+            Self::Skill => "skill",
         }
     }
 
@@ -7894,6 +8060,10 @@ impl SubagentKind {
             Self::DocHelp => None,
             Self::Plan => Some(SubagentRole::Planner),
             Self::Review => Some(SubagentRole::Reviewer),
+            // Skill subagents inherit the parent model and run the
+            // skill body as their system prompt; they have no role
+            // overlay.
+            Self::Skill => None,
         }
     }
 }
@@ -8425,6 +8595,11 @@ struct SubagentRequest {
     prompt: String,
     scope: Option<String>,
     thoroughness: Option<String>,
+    /// Optional override that replaces the per-kind default system
+    /// prompt produced by [`subagent_instructions`]. Used by
+    /// [`SubagentKind::Skill`] so a fork-mode skill body becomes the
+    /// subagent's system instructions verbatim; other kinds ignore it.
+    system_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8896,7 +9071,10 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .unwrap_or_else(|| {
                 "Review the current diff. Report only actionable findings.".to_string()
             }),
-        SubagentKind::Delegate | SubagentKind::Explore | SubagentKind::DocHelp => call
+        SubagentKind::Delegate
+        | SubagentKind::Explore
+        | SubagentKind::DocHelp
+        | SubagentKind::Skill => call
             .arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -8916,6 +9094,10 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         prompt,
         scope,
         thoroughness,
+        // Tool-call-driven requests never carry a system override.
+        // Skill subagents reaching this path through `delegate`-style
+        // wiring would inherit the kind's default instructions.
+        system_override: None,
     })
 }
 
@@ -10242,6 +10424,33 @@ fn looks_path_like(text: &str, allow_bare_file: bool) -> bool {
     false
 }
 
+/// Render a `<skill_warnings>` block listing each activated skill
+/// whose `manifest.tool_deps` declares a tool or MCP server that is
+/// not available in the current registry. The block tells the model
+/// to refuse the skill rather than invent fallbacks, mirroring the
+/// "be explicit about missing dependencies" guidance already embedded
+/// in the active-skills prompt block.
+fn format_skill_tool_dep_warnings(
+    missing: &std::collections::BTreeMap<String, Vec<String>>,
+) -> String {
+    let mut body = String::from(
+        "<skill_warnings>\nOne or more activated skills declare tool dependencies that are not available in this session. Refuse to follow the dependent skill's instructions rather than improvising substitutes.\n",
+    );
+    for (skill, deps) in missing {
+        let deps_xml = deps
+            .iter()
+            .map(|dep| format!("<dep>{}</dep>", squeezy_skills::xml_escape(dep)))
+            .collect::<Vec<_>>()
+            .join("");
+        body.push_str(&format!(
+            "<skill name=\"{}\">\n<missing_tool_deps>{deps_xml}</missing_tool_deps>\n</skill>\n",
+            squeezy_skills::xml_escape(skill),
+        ));
+    }
+    body.push_str("</skill_warnings>");
+    body
+}
+
 fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> String {
     match kind {
         SubagentKind::Delegate => {
@@ -10267,6 +10476,9 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
                 "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains.\n\n{SUBAGENT_JSON_TAIL_INSTRUCTION}"
             )
         }
+        SubagentKind::Skill => request.system_override.clone().unwrap_or_else(|| {
+            "You are a Squeezy fork-mode skill subagent invoked without an explicit instruction body. Treat the user prompt as the entire task and return a concise summary for the parent agent. Do not modify files or run shell commands.".to_string()
+        }),
     }
 }
 
@@ -10292,6 +10504,11 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         (SubagentKind::DocHelp, _) => cheap_model_for(provider, config)
             .filter(|m| !m.is_empty())
             .unwrap_or(parent_model),
+        // Skill subagents run the skill author's own instructions on
+        // the parent model so the body's expectations about capability
+        // hold — falling to a cheap tier here would change behavior
+        // silently for any skill that relies on planner-grade output.
+        (SubagentKind::Skill, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
@@ -10385,6 +10602,10 @@ fn subagent_allowed_tools(
         SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::DocHelp => DOC_HELP_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        // Skill subagents reuse the Delegate read-only research toolset
+        // — fork-mode skill authors expect the same `read_file`, grep,
+        // graph, and `plan_patch` surfaces the Delegate kind offers.
+        SubagentKind::Skill => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Plan => role_config(SubagentRole::Planner)
             .allowed_tools
             .iter()

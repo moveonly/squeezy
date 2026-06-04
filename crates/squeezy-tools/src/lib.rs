@@ -961,7 +961,13 @@ pub struct ToolRegistry {
     /// clones so a swap is visible everywhere.
     pub(crate) checkpoint_provider: Arc<StdMutex<Option<Arc<dyn CheckpointProvider>>>>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
-    pub(crate) skills: Arc<SkillCatalog>,
+    /// Skill catalog snapshot. Wrapped in `Arc<StdMutex<Arc<...>>>` so a
+    /// settings hot-reload can rebuild the catalog via
+    /// [`Self::rebuild_skills`] and every existing `ToolRegistry` clone
+    /// observes the new snapshot. Reads clone the inner `Arc` once and
+    /// then operate on it lock-free, mirroring the `checkpoint_provider`
+    /// pattern below.
+    skills: Arc<StdMutex<Arc<SkillCatalog>>>,
     pub(crate) redactor: Arc<Redactor>,
     pub(crate) crawl_options: Arc<CrawlOptions>,
     compiled_policy: Arc<CompiledIndexingPolicy>,
@@ -1369,7 +1375,7 @@ impl ToolRegistry {
             checkpoints,
             checkpoint_provider: Arc::new(StdMutex::new(checkpoint_provider)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
-            skills: Arc::new(skills),
+            skills: Arc::new(StdMutex::new(Arc::new(skills))),
             redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
@@ -1421,7 +1427,7 @@ impl ToolRegistry {
             checkpoints: None,
             checkpoint_provider: Arc::new(StdMutex::new(None)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
-            skills: Arc::new(SkillCatalog::empty()),
+            skills: Arc::new(StdMutex::new(Arc::new(SkillCatalog::empty()))),
             redactor: Arc::new(Redactor::default()),
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
@@ -2594,24 +2600,115 @@ impl ToolRegistry {
         }
     }
 
+    /// Snapshot of the current skill catalog. Cloning the inner `Arc`
+    /// is cheap and lets every accessor below operate on a stable
+    /// catalog even if a settings reload swaps it mid-read.
+    fn skills_snapshot(&self) -> Arc<SkillCatalog> {
+        self.skills.lock().expect("skill catalog lock").clone()
+    }
+
     pub fn activate_skills_for_input(&self, input: &str) -> Result<SkillActivation> {
-        self.skills.activate_for_input(input)
+        self.skills_snapshot().activate_for_input(input)
     }
 
     pub fn format_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
-        self.skills.render_active_skills(skills)
+        self.skills_snapshot().render_active_skills(skills)
+    }
+
+    /// Render fork-mode skills (skills whose frontmatter declares
+    /// `context: fork`) into a separate `<fork_skills>` system block.
+    /// Returns `None` when no fork-mode skill is activated.
+    pub fn format_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        self.skills_snapshot().render_fork_skills(skills)
     }
 
     pub fn skills_preamble(&self) -> Option<SkillPreambleRender> {
-        self.skills.render_preamble()
+        self.skills_snapshot().render_preamble()
     }
 
     pub fn load_skill_for_instructions(&self, name: &str) -> Result<LoadedSkill> {
-        self.skills.load(name)
+        self.skills_snapshot().load(name)
     }
 
     pub fn ambiguous_skill_names(&self) -> Vec<String> {
-        self.skills.ambiguous_names().iter().cloned().collect()
+        self.skills_snapshot()
+            .ambiguous_names()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Forwards to [`SkillCatalog::register_hooks`] so callers can build
+    /// a [`squeezy_hooks::HookRegistry`] populated with the declared
+    /// `hooks:` blocks of every non-disabled discovered skill. Returns
+    /// the total number of installed handlers.
+    pub fn register_skill_hooks(&self, registry: &mut squeezy_hooks::HookRegistry) -> usize {
+        self.skills_snapshot().register_hooks(registry)
+    }
+
+    /// For each loaded skill that declares `manifest.tool_deps`,
+    /// return the deps that are not satisfied by the current registry
+    /// (built-in tool name or `mcp:<server>`). Skills with no manifest
+    /// or no declared deps are omitted from the result so the agent
+    /// can iterate the map and emit a warning per skill only when
+    /// there is something to say.
+    pub fn audit_skill_tool_deps(
+        &self,
+        skills: &[LoadedSkill],
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let available_tools: std::collections::BTreeSet<String> =
+            self.specs().iter().map(|spec| spec.name.clone()).collect();
+        let available_mcp_servers: std::collections::BTreeSet<String> = self
+            .mcp_status_snapshot()
+            .per_server
+            .into_iter()
+            .filter_map(|(name, status)| match status {
+                squeezy_mcp::McpServerStatus::Ready { .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let mut out = std::collections::BTreeMap::new();
+        for skill in skills {
+            let Some(manifest) = skill.summary.manifest.as_ref() else {
+                continue;
+            };
+            if manifest.tool_deps.is_empty() {
+                continue;
+            }
+            let missing = squeezy_skills::unmet_tool_deps(
+                &manifest.tool_deps,
+                &available_tools,
+                &available_mcp_servers,
+            );
+            if !missing.is_empty() {
+                out.insert(skill.summary.name.clone(), missing);
+            }
+        }
+        out
+    }
+
+    /// Rebuild the in-memory skill catalog from `skills_config`,
+    /// rediscovering every skill root under `workspace_root` and
+    /// reapplying `[[skills.config]]` enable/disable rules. Returns the
+    /// number of skills in the rebuilt catalog so callers can log a
+    /// terse status line. Existing `ToolRegistry` clones immediately
+    /// see the new catalog on the next access.
+    ///
+    /// Settings hot-reload calls this so editing `[[skills.config]]`
+    /// or dropping a new `SKILL.md` no longer requires a fresh
+    /// session. Cached `specs()` are also invalidated because skill
+    /// rebuilds can change the available-skills preamble that the
+    /// model sees.
+    pub fn rebuild_skills(
+        &self,
+        workspace_root: &std::path::Path,
+        skills_config: &squeezy_core::SkillsConfig,
+    ) -> usize {
+        let rebuilt = SkillCatalog::discover(workspace_root, skills_config);
+        let count = rebuilt.summaries().len();
+        *self.skills.lock().expect("skill catalog lock") = Arc::new(rebuilt);
+        self.invalidate_cached_specs();
+        count
     }
 
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2843,7 +2940,7 @@ impl ToolRegistry {
         make_result(
             call,
             ToolStatus::Success,
-            self.skills.summaries_json(),
+            self.skills_snapshot().summaries_json(),
             ToolCostHint::default(),
             None,
         )
@@ -3002,7 +3099,7 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        match self.skills.load(&args.name) {
+        match self.skills_snapshot().load(&args.name) {
             Ok(skill) => make_result(
                 call,
                 ToolStatus::Success,

@@ -2423,6 +2423,304 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
 }
 
 #[tokio::test]
+async fn fork_mode_skills_render_in_fork_block_not_active_block() {
+    let root = temp_workspace("agent_skill_fork_partition");
+    let inline_dir = root.join(".agents/skills/inline-skill");
+    fs::create_dir_all(&inline_dir).expect("mkdir inline");
+    fs::write(
+        inline_dir.join("SKILL.md"),
+        "---\nname: inline-skill\ndescription: \"inline desc\"\ntriggers:\n  - inline phrase\n---\n# Inline Body\n",
+    )
+    .expect("write inline skill");
+    let fork_dir = root.join(".agents/skills/fork-skill");
+    fs::create_dir_all(&fork_dir).expect("mkdir fork");
+    fs::write(
+        fork_dir.join("SKILL.md"),
+        "---\nname: fork-skill\ndescription: \"fork desc\"\ncontext: fork\ntriggers:\n  - fork phrase\n---\n# Fork Body\n",
+    )
+    .expect("write fork skill");
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "trigger inline phrase and fork phrase together".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured llm request");
+    let instructions = &request.instructions;
+    assert!(
+        instructions.contains("<active_skills>"),
+        "inline-mode skill must still render under <active_skills>: {instructions}"
+    );
+    assert!(
+        instructions.contains("inline-skill"),
+        "inline skill missing from instructions: {instructions}"
+    );
+    assert!(
+        instructions.contains("<fork_skills>"),
+        "fork-mode skill must render in a separate <fork_skills> block: {instructions}"
+    );
+    assert!(
+        instructions.contains("context_mode=\"fork\""),
+        "fork block must tag the skill with context_mode=\"fork\": {instructions}"
+    );
+    let active_segment = instructions
+        .split("<active_skills>")
+        .nth(1)
+        .and_then(|tail| tail.split("</active_skills>").next())
+        .unwrap_or("");
+    assert!(
+        !active_segment.contains("fork-skill"),
+        "fork-mode skill leaked into <active_skills>: {active_segment}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn skill_manifest_missing_tool_deps_emit_warning_block() {
+    let root = temp_workspace("agent_skill_tool_deps");
+    let skill_dir = root.join(".agents/skills/needs-things");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: needs-things\ndescription: \"depends on absent tools\"\ntriggers:\n  - needs things\n---\n# body\n",
+    )
+    .expect("write skill md");
+    fs::write(
+        skill_dir.join("skill.toml"),
+        "tool_deps = [\"mcp:nonexistent\", \"definitely_not_a_tool\"]\n",
+    )
+    .expect("write manifest");
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+    let mut rx = agent.start_turn(
+        "needs things now please".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured request");
+    assert!(
+        request.instructions.contains("<skill_warnings>"),
+        "missing skill_warnings block: {}",
+        request.instructions
+    );
+    assert!(
+        request.instructions.contains("needs-things"),
+        "warning block must name the skill: {}",
+        request.instructions
+    );
+    assert!(
+        request.instructions.contains("mcp:nonexistent")
+            && request.instructions.contains("definitely_not_a_tool"),
+        "warning block must list each missing dep: {}",
+        request.instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn replace_config_rediscovers_skill_catalog() {
+    let root = temp_workspace("agent_skill_reload");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let initial_config = config_with_skill_dirs(&root);
+    let mut agent = Agent::new(initial_config.clone(), provider.clone());
+
+    // Drop a brand-new skill onto disk after the agent has been
+    // built. Without `replace_config` rebuilding the catalog the next
+    // turn would not see this file because `SkillCatalog::discover`
+    // had already run.
+    let skill_dir = root.join(".agents/skills/late-skill");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: late-skill\ndescription: \"added after init\"\ntriggers:\n  - late phrase\n---\n# Late\n",
+    )
+    .expect("write late skill");
+
+    // Mutate the skills config (a no-op `[[skills.config]]` rule is
+    // enough to change the value so `replace_config` rebuilds) and
+    // hand it back to the agent the same way the TUI reload path
+    // would.
+    let mut next_config = initial_config;
+    next_config
+        .skills
+        .config
+        .push(squeezy_core::SkillConfigEntry {
+            name: Some("late-skill".to_string()),
+            path: None,
+            enabled: true,
+        });
+    agent.replace_config(next_config);
+
+    let mut rx = agent.start_turn("trigger late phrase".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured request");
+    assert!(
+        request.instructions.contains("late-skill"),
+        "reloaded catalog must surface late-skill: {}",
+        request.instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_skill_hooks_default_to_disabled() {
+    let root = temp_workspace("agent_skill_hooks_off");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let config = config_with_skill_dirs(&root);
+    assert!(
+        !config.skills.hooks_enabled,
+        "default config must keep skill hooks dormant"
+    );
+    let agent = Agent::new(config, provider);
+    assert!(
+        agent.hooks().is_none(),
+        "skill hooks must stay off until [skills] hooks_enabled = true"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_skill_hooks_register_when_enabled() {
+    let root = temp_workspace("agent_skill_hooks_on");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let registry = agent.hooks().expect("hooks registry installed");
+    assert_eq!(registry.len(), 1, "one declared hook should be registered");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn replace_config_clears_hooks_when_hooks_enabled_toggled_off() {
+    let root = temp_workspace("agent_skill_hooks_toggle_off");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let mut agent = Agent::new(config.clone(), provider);
+
+    assert!(
+        agent.hooks().is_some(),
+        "hooks must be installed when hooks_enabled=true"
+    );
+
+    // Simulate hot-reload that disables the gate.
+    let mut next = config;
+    next.skills.hooks_enabled = false;
+    // Trigger the skills_changed path by tweaking another skills field.
+    next.skills.inline = true;
+    agent.replace_config(next);
+
+    assert!(
+        agent.hooks().is_none(),
+        "hooks must be cleared when hooks_enabled flipped to false via replace_config"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn replace_config_rebuilds_hooks_when_hooks_remain_enabled() {
+    let root = temp_workspace("agent_skill_hooks_rebuild");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let mut agent = Agent::new(config.clone(), provider);
+
+    let old_hook_count = agent.hooks().map(|r| r.len()).unwrap_or(0);
+    assert_eq!(old_hook_count, 1);
+
+    // Disable the skill via a config rule while hooks_enabled stays true.
+    let mut next = config;
+    next.skills.config.push(squeezy_core::SkillConfigEntry {
+        name: Some("validator".to_string()),
+        path: None,
+        enabled: false,
+    });
+    agent.replace_config(next);
+
+    // After the skill is disabled the hook should vanish.
+    assert!(
+        agent.hooks().is_none(),
+        "disabling the skill via [[skills.config]] must clear its hook handlers"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn known_help_topic_short_circuits_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -7048,11 +7346,42 @@ fn parse_subagent_structured_tail_rejects_json_array_only() {
 }
 
 #[test]
+fn skill_subagent_uses_system_override_as_instructions() {
+    let request = super::SubagentRequest {
+        prompt: "explain how this skill applies to the user's task".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: Some("# Skill body\nFollow these steps exactly.".to_string()),
+    };
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
+    assert!(
+        instructions.contains("# Skill body"),
+        "skill subagent must run the supplied body as system instructions: {instructions}"
+    );
+}
+
+#[test]
+fn skill_subagent_falls_back_when_system_override_missing() {
+    let request = super::SubagentRequest {
+        prompt: "do the thing".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: None,
+    };
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
+    assert!(
+        instructions.to_lowercase().contains("fork-mode skill"),
+        "missing fallback prompt for skill subagent without override: {instructions}"
+    );
+}
+
+#[test]
 fn plan_subagent_instructions_advertise_json_tail_contract() {
     let request = super::SubagentRequest {
         prompt: "plan something".to_string(),
         scope: None,
         thoroughness: None,
+        system_override: None,
     };
     let plan = super::subagent_instructions(SubagentKind::Plan, &request);
     assert!(

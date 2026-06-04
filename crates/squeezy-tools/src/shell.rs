@@ -160,7 +160,9 @@ impl ToolRegistry {
                 );
             }
         };
-        let implicit_skill = self.skills.detect_for_command(&args.command, &workdir);
+        let implicit_skill = self
+            .skills_snapshot()
+            .detect_for_command(&args.command, &workdir);
         let _shell_guard = match self.shell_execution_guard(&workdir).await {
             Ok(guard) => guard,
             Err(err) => return tool_error(call, err),

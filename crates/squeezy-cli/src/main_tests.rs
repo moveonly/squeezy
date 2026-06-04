@@ -1253,3 +1253,62 @@ fn project_init_target_resolves_ancestor_then_falls_back_to_cwd() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn skills_upsert_entry_inserts_when_no_match() {
+    let mut entries = toml_edit::ArrayOfTables::new();
+    let selector = SkillsSelector {
+        name: Some("alpha".to_string()),
+        path: None,
+    };
+    skills_upsert_entry(&mut entries, &selector, false).expect("upsert");
+    assert_eq!(entries.len(), 1);
+    let first = entries.iter().next().expect("entry");
+    assert_eq!(first.get("name").and_then(|v| v.as_str()), Some("alpha"));
+    assert_eq!(first.get("enabled").and_then(|v| v.as_bool()), Some(false));
+}
+
+#[test]
+fn skills_upsert_entry_updates_existing_by_name() {
+    let mut entries = toml_edit::ArrayOfTables::new();
+    let mut existing = toml_edit::Table::new();
+    existing.insert(
+        "name",
+        toml_edit::Item::Value(toml_edit::Value::from("alpha")),
+    );
+    existing.insert(
+        "enabled",
+        toml_edit::Item::Value(toml_edit::Value::from(true)),
+    );
+    entries.push(existing);
+
+    let selector = SkillsSelector {
+        name: Some("alpha".to_string()),
+        path: None,
+    };
+    skills_upsert_entry(&mut entries, &selector, false).expect("upsert");
+    assert_eq!(entries.len(), 1, "must update in place, not duplicate");
+    let updated = entries.iter().next().expect("entry");
+    assert_eq!(
+        updated.get("enabled").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
+
+#[test]
+fn skills_upsert_entry_inserts_by_path_when_no_match() {
+    let mut entries = toml_edit::ArrayOfTables::new();
+    let selector = SkillsSelector {
+        name: None,
+        path: Some(PathBuf::from("/skills/alpha")),
+    };
+    skills_upsert_entry(&mut entries, &selector, true).expect("upsert");
+    assert_eq!(entries.len(), 1);
+    let first = entries.iter().next().expect("entry");
+    assert_eq!(
+        first.get("path").and_then(|v| v.as_str()),
+        Some("/skills/alpha")
+    );
+    assert_eq!(first.get("enabled").and_then(|v| v.as_bool()), Some(true));
+    assert!(first.get("name").is_none());
+}

@@ -1719,6 +1719,272 @@ fn cross_precedence_name_collision_emits_load_time_warning() {
 }
 
 #[test]
+fn install_bundled_skills_is_idempotent_and_skips_existing() {
+    let root = temp_workspace("skills_install_bundled");
+    let user_dir = root.join("user");
+
+    let first = super::install_bundled_skills(&user_dir).expect("install first");
+    assert!(
+        !first.is_empty(),
+        "first install must write at least one bundled skill"
+    );
+    let names_first: BTreeSet<String> = first.into_iter().collect();
+    let expected: BTreeSet<String> = ["customize-squeezy", "release-notes", "skill-creator"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names_first, expected);
+
+    for name in &expected {
+        let path = user_dir.join(name).join("SKILL.md");
+        assert!(path.exists(), "missing installed skill: {}", path.display());
+        let body = fs::read_to_string(&path).expect("read installed");
+        assert!(
+            body.contains(&format!("name: {name}")),
+            "frontmatter must declare the skill name verbatim: {body}"
+        );
+    }
+
+    // Second invocation is a no-op even if the user has hand-edited
+    // a SKILL.md — the installer must never clobber existing files.
+    let user_edit = user_dir.join("customize-squeezy").join("SKILL.md");
+    fs::write(
+        &user_edit,
+        "---\nname: customize-squeezy\ndescription: \"mine\"\n---\nedited\n",
+    )
+    .expect("simulate user edit");
+    let second = super::install_bundled_skills(&user_dir).expect("install second");
+    assert!(
+        second.is_empty(),
+        "second install must not rewrite any skill"
+    );
+    let preserved = fs::read_to_string(&user_edit).expect("read after second install");
+    assert!(
+        preserved.contains("edited"),
+        "user edits must survive a re-install: {preserved}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn unmet_tool_deps_flags_missing_builtin_and_mcp() {
+    let deps = vec![
+        "shell".to_string(),
+        "websearch".to_string(),
+        "mcp:exa".to_string(),
+        "mcp:parallel".to_string(),
+        "  ".to_string(),
+    ];
+    let available_tools: BTreeSet<String> = ["shell".to_string()].into_iter().collect();
+    let available_mcp: BTreeSet<String> = ["exa".to_string()].into_iter().collect();
+    let missing = super::unmet_tool_deps(&deps, &available_tools, &available_mcp);
+    assert_eq!(
+        missing,
+        vec!["websearch".to_string(), "mcp:parallel".to_string()]
+    );
+}
+
+#[test]
+fn unmet_tool_deps_empty_when_all_satisfied() {
+    let deps = vec!["shell".to_string(), "mcp:exa".to_string()];
+    let available_tools: BTreeSet<String> = ["shell".to_string()].into_iter().collect();
+    let available_mcp: BTreeSet<String> = ["exa".to_string()].into_iter().collect();
+    let missing = super::unmet_tool_deps(&deps, &available_tools, &available_mcp);
+    assert!(missing.is_empty());
+}
+
+#[test]
+fn duplicate_trigger_across_skills_skips_auto_activation() {
+    let root = temp_workspace("skills_trigger_collision_skip");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/beta"),
+        "beta",
+        "Beta skill",
+        &["graph"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    assert!(
+        catalog.ambiguous_triggers().contains("graph"),
+        "discovery must mark a cross-skill duplicate trigger as ambiguous"
+    );
+
+    let activation = catalog
+        .activate_for_input("please inspect the graph")
+        .expect("activate");
+    assert!(
+        activation.skills.is_empty(),
+        "ambiguous trigger must not auto-activate either skill, got {:?}",
+        activation
+            .skills
+            .iter()
+            .map(|s| &s.summary.name)
+            .collect::<Vec<_>>()
+    );
+
+    // Explicit `/skill <name>` still selects the requested skill.
+    let explicit = catalog
+        .activate_for_input("/skill alpha use the graph")
+        .expect("activate explicit");
+    assert_eq!(explicit.skills.len(), 1);
+    assert_eq!(explicit.skills[0].summary.name, "alpha");
+    assert_eq!(explicit.task_input, "use the graph");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_scan_dirs_includes_ancestor_project_roots() {
+    // Layout:
+    //   /root/.git            ← git root, stops the ancestor walk
+    //   /root/.squeezy/skills/ ← ancestor project root
+    //   /root/packages/foo/   ← workspace_root (launch dir)
+    let root = temp_workspace("skills_scan_ancestor");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    let ancestor_skills = root.join(".squeezy/skills");
+    fs::create_dir_all(&ancestor_skills).expect("create ancestor skills");
+    let ws_root = root.join("packages/foo");
+    fs::create_dir_all(&ws_root).expect("create workspace dir");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let dirs = super::skill_scan_dirs(&ws_root, &config);
+
+    // The ancestor's `.squeezy/skills` dir should be in the scan list.
+    let has_ancestor = dirs.iter().any(|d| d == &ancestor_skills);
+    assert!(
+        has_ancestor,
+        "skill_scan_dirs must include ancestor project skill roots; got: {dirs:?}"
+    );
+}
+
+#[test]
+fn validate_skill_dirs_includes_ancestor_malformed_skill() {
+    // Same monorepo layout, but with a malformed SKILL.md in the ancestor root.
+    let root = temp_workspace("skills_validate_ancestor_malformed");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    let bad_dir = root.join(".squeezy/skills/bad-ancestor");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad-ancestor");
+    fs::write(bad_dir.join("SKILL.md"), "this is not valid frontmatter").expect("write bad skill");
+    let ws_root = root.join("packages/foo");
+    fs::create_dir_all(&ws_root).expect("create workspace");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let results = super::validate_skill_dirs(&ws_root, &config);
+    assert!(
+        !results.is_empty(),
+        "validate must find the ancestor skill even though it is malformed"
+    );
+    let bad = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-ancestor"))
+                .unwrap_or(false)
+        })
+        .expect("bad-ancestor result must be present");
+    assert!(
+        bad.outcome.is_err(),
+        "malformed ancestor skill must produce an error: {:?}",
+        bad.outcome
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn validate_skill_dirs_catches_malformed_files_that_discovery_drops() {
+    let root = temp_workspace("skills_validate_dirs_malformed");
+    // Good skill — discovery and validate both see it.
+    let good_dir = root.join(".squeezy/skills/good-skill");
+    fs::create_dir_all(&good_dir).expect("mkdir good");
+    fs::write(
+        good_dir.join("SKILL.md"),
+        "---\nname: good-skill\ndescription: \"works\"\n---\n# Good\n",
+    )
+    .expect("write good");
+    // Malformed skill — discovery silently drops it; validate must report it.
+    let bad_dir = root.join(".squeezy/skills/bad-skill");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad");
+    fs::write(bad_dir.join("SKILL.md"), "not frontmatter at all").expect("write bad");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    // Discovery should only produce the good skill.
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert_eq!(
+        catalog.summaries().len(),
+        1,
+        "discovery must drop the bad skill"
+    );
+
+    // validate_skill_dirs must report both.
+    let results = super::validate_skill_dirs(&root, &config);
+    assert_eq!(
+        results.len(),
+        2,
+        "validator must include both SKILL.md files"
+    );
+    let bad_result = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-skill"))
+                .unwrap_or(false)
+        })
+        .expect("bad-skill result must be present");
+    assert!(
+        bad_result.outcome.is_err(),
+        "malformed SKILL.md must produce an error result: {:?}",
+        bad_result.outcome
+    );
+    let good_result = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("good-skill"))
+                .unwrap_or(false)
+        })
+        .expect("good-skill result must be present");
+    assert!(
+        good_result.outcome.is_ok(),
+        "well-formed SKILL.md must produce an ok result"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn duplicate_trigger_across_skills_emits_load_time_warning() {
     let root = temp_workspace("skills_warn_trigger_collision");
     write_skill(
@@ -1856,6 +2122,58 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
     let installed = register_skill_hooks(&skill, &mut registry);
     assert_eq!(installed, 2);
     assert_eq!(registry.len(), 2);
+}
+
+#[test]
+fn catalog_register_hooks_skips_disabled_and_aggregates() {
+    let root = temp_workspace("skills_catalog_register_hooks");
+    let user_dir = root.join("user");
+
+    let alpha_dir = user_dir.join("alpha");
+    fs::create_dir_all(&alpha_dir).expect("mkdir alpha");
+    fs::write(
+        alpha_dir.join("SKILL.md"),
+        "---\nname: alpha\ndescription: \"a\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# alpha\n",
+    )
+    .expect("write alpha");
+
+    let beta_dir = user_dir.join("beta");
+    fs::create_dir_all(&beta_dir).expect("mkdir beta");
+    fs::write(
+        beta_dir.join("SKILL.md"),
+        "---\nname: beta\ndescription: \"b\"\nhooks:\n  PostToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n        - type: command\n          command: \"true\"\n          once: true\n---\n# beta\n",
+    )
+    .expect("write beta");
+
+    let gamma_dir = user_dir.join("gamma");
+    fs::create_dir_all(&gamma_dir).expect("mkdir gamma");
+    fs::write(
+        gamma_dir.join("SKILL.md"),
+        "---\nname: gamma\ndescription: \"g\"\n---\n# gamma\n",
+    )
+    .expect("write gamma");
+
+    let config = SkillsConfig {
+        user_dir,
+        compat_user_dir: root.join("compat"),
+        config: vec![SkillConfigEntry {
+            name: Some("beta".to_string()),
+            path: None,
+            enabled: false,
+        }],
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let mut registry = HookRegistry::new();
+    let installed = catalog.register_hooks(&mut registry);
+    assert_eq!(
+        installed, 1,
+        "only the non-disabled skill with hooks should contribute handlers"
+    );
+    assert_eq!(registry.len(), 1);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
