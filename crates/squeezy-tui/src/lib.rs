@@ -7048,8 +7048,11 @@ fn is_rail_work_node(kind: &TranscriptEntryKind) -> bool {
         TranscriptEntryKind::ToolResult(_)
         | TranscriptEntryKind::PlanCard(_)
         | TranscriptEntryKind::Reasoning(_) => true,
-        // Subagent breadcrumbs thread on the rail; other logs flow off it.
-        TranscriptEntryKind::Log(entry) => entry.kind == LogKind::Subagent,
+        // Subagent breadcrumbs and informational notes thread on the rail;
+        // operational chrome and plain logs flow off it.
+        TranscriptEntryKind::Log(entry) => {
+            matches!(entry.kind, LogKind::Subagent | LogKind::Note)
+        }
         _ => false,
     }
 }
@@ -8904,6 +8907,19 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
                     .fg(crate::render::theme::magenta())
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(preview, Style::default().fg(palette::muted_fg())),
+        ])];
+    }
+    if entry.kind == LogKind::Note {
+        // Informational note (routing notice, system note): a dim `◦` node —
+        // the same glyph as a settled step, because a note is just a quiet
+        // settled node. The gutter pass turns the leading margin into `├─`/`╰─`
+        // so it threads the rail without competing with the agent's own work.
+        let marker = if selected { "> " } else { "  " };
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled("◦ ", Style::default().fg(rail::dim())),
             Span::styled(preview, Style::default().fg(palette::muted_fg())),
         ])];
     }
@@ -14833,6 +14849,19 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
+    /// Push an informational note — a model-routing notice, a system note — as
+    /// a dim `◦` node threaded on the rail. One note pipeline: never the
+    /// off-rail `• Noted` line, never amber.
+    pub(crate) fn push_note(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Note,
+            self.transcript_default,
+        ));
+    }
+
     /// Push a subagent lifecycle breadcrumb (started / completed) — a magenta
     /// `◆` node on the rail so delegated work stands out from the main flow.
     pub(crate) fn push_subagent_note(&mut self, message: String) {
@@ -15578,6 +15607,10 @@ fn system_message_can_collapse(item: &TranscriptItem) -> bool {
 pub(crate) enum LogKind {
     /// Standard log line — rendered with `└` and a status-color marker.
     Normal,
+    /// An informational note — a model-routing notice, a system note — rendered
+    /// as a dim `◦` rail node so it threads the gutter like a quiet settled
+    /// step. One note pipeline: never the off-rail `• Noted` line, never amber.
+    Note,
     /// Operational chrome (turn-complete markers, compaction notices,
     /// plan-handoff state) — rendered dim/italic with no bullet so it
     /// fades to the periphery instead of looking like a content event.

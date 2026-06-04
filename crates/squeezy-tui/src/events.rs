@@ -492,8 +492,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::TurnRouted {
                     from, to, reason, ..
                 } => {
-                    let notice = format!("↪ routed `{from}` → `{to}` ({reason})");
-                    app.push_transcript_item(TranscriptItem::system(notice));
+                    // A model-routing notice is TUI chrome, not turn content: push
+                    // it as a dim `◦` note on the rail (one note pipeline) rather
+                    // than a System transcript item, which rendered the off-rail
+                    // `• Noted ↪ routed …` line that severed the gutter.
+                    app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
                 }
             }
         }

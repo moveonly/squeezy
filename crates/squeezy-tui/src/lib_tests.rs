@@ -13385,3 +13385,22 @@ fn prompt_coin_iterates_full_moon_cycle_while_typing() {
         );
     }
 }
+
+#[test]
+fn routing_note_threads_the_rail_as_a_dim_dot() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Succeeded;
+    app.push_transcript_item(TranscriptItem::user("hey"));
+    app.push_note("routed `sonnet` → `haiku` (llm_judge)".to_string());
+    app.push_transcript_item(TranscriptItem::assistant("Hey!"));
+    app.finalize_settles_for_test();
+    let len = app.transcript.len();
+    let scrollback = lines_to_plain_text(&inline_history_lines_for_flush(&app, 70, false, 0, len));
+    // The note threads the gutter as `├─◦` (one note pipeline) — never the old
+    // off-rail `• Noted` line that severed the coin→answer gutter.
+    assert!(
+        scrollback.contains("├─◦ routed `sonnet` → `haiku` (llm_judge)"),
+        "{scrollback}"
+    );
+    assert!(!scrollback.contains("• Noted"), "{scrollback}");
+}
