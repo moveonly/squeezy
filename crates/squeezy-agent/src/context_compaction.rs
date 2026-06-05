@@ -264,9 +264,7 @@ pub(crate) fn compact_conversation(
     // request overhead the gate uses, so the two stay consistent. The
     // `after.bytes >= before.bytes` guard below still declines a fold that
     // cannot actually shrink.
-    let over_high_water = before
-        .estimated_tokens
-        .saturating_add(overhead_tokens)
+    let over_high_water = before.estimated_tokens.saturating_add(overhead_tokens)
         >= config.context_compaction.min_items_bypass_threshold();
     if (force || over_high_water) && before.items > 1 && before.items <= keep {
         keep = (before.items / 2).max(1);

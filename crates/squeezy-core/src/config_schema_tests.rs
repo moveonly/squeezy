@@ -297,7 +297,10 @@ fn context_section_integer_defaults_match_runtime_constants() {
             .trim_end_matches(|c: char| !c.is_ascii_digit())
             .parse()
             .unwrap_or_else(|_| panic!("field '{label}' default_display not parseable"));
-        assert_eq!(display_val, runtime_default, "{label} default_display mismatch");
+        assert_eq!(
+            display_val, runtime_default,
+            "{label} default_display mismatch"
+        );
     }
 }
 
@@ -309,7 +312,11 @@ fn context_section_fields_round_trip() {
         match f.kind {
             FieldKind::Info => {
                 // Read-only: get returns a non-empty string, set is a no-op.
-                assert!(matches!((f.get)(&cfg), FieldValue::String(_)), "{}", f.label);
+                assert!(
+                    matches!((f.get)(&cfg), FieldValue::String(_)),
+                    "{}",
+                    f.label
+                );
                 (f.set)(&mut cfg, FieldValue::String(String::new())).unwrap();
             }
             FieldKind::Bool => {

@@ -5,9 +5,10 @@ use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus, sha256_he
 
 use super::{
     COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, ContextCompactionTrigger,
-    PendingToolResult, SeenToolOutputs, build_compaction_summary, build_structured_compaction_prompt,
-    compact_conversation, durable_context_lines, estimate_context, is_structured_compaction_summary,
-    pack_tool_results, strip_media_for_compaction, unresolved_question_lines,
+    PendingToolResult, SeenToolOutputs, build_compaction_summary,
+    build_structured_compaction_prompt, compact_conversation, durable_context_lines,
+    estimate_context, is_structured_compaction_summary, pack_tool_results,
+    strip_media_for_compaction, unresolved_question_lines,
 };
 
 fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {

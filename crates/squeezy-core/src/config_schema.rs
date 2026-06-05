@@ -12,28 +12,28 @@ use crate::{
     AppConfig, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
     DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
-    DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES,
+    DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES, DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS,
-    DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS, DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
+    DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
     DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS, DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT,
-    DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT, DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT,
-    DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES, DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES,
-    DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV, DEFAULT_EXA_MCP_URL,
-    DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GITHUB_COPILOT_MODEL,
-    DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
-    DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV,
-    DEFAULT_PARALLEL_MCP_URL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
-    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS, DEFAULT_SESSION_LOG_RETENTION_DAYS,
-    DEFAULT_SESSION_MAX_EVENT_BYTES, DEFAULT_SESSION_MAX_SESSION_BYTES,
-    DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
-    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
-    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
-    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
-    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
-    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
-    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
-    TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
+    DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT,
+    DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT, DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES,
+    DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES, DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV,
+    DEFAULT_EXA_MCP_URL, DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES,
+    DEFAULT_GITHUB_COPILOT_MODEL, DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS,
+    DEFAULT_MAX_SEARCH_FILES_PER_TURN, DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_CODEX_MODEL,
+    DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV, DEFAULT_PARALLEL_MCP_URL,
+    DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES, DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
+    DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
+    DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
+    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
+    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
+    DEFAULT_TUI_SPINNER_NAME, DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER,
+    OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort,
+    ResponseVerbosity, SessionMode, SessionResumePicker, StatusVerbosity, ToolOutputVerbosity,
+    TranscriptDefault, TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -1277,7 +1277,9 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_context_max_summary_bytes,
                 set: set_context_max_summary_bytes,
                 default_display: "12000 bytes",
-                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES as i64),
+                default: || {
+                    FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES as i64)
+                },
                 help: "Cap on the generated extractive summary size.",
                 env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES"),
                 secret: false,
@@ -1325,7 +1327,9 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_context_threshold_percent,
                 set: set_context_threshold_percent,
                 default_display: "80 %",
-                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT as i64),
+                default: || {
+                    FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT as i64)
+                },
                 help: "% of window for mid-turn full compaction (also caps the post-turn budget).",
                 env_override: Some("SQUEEZY_CONTEXT_COMPACTION_THRESHOLD_PERCENT"),
                 secret: false,
@@ -1375,7 +1379,9 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_context_micro_keep_recent,
                 set: set_context_micro_keep_recent,
                 default_display: "5",
-                default: || FieldValue::Integer(DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT as i64),
+                default: || {
+                    FieldValue::Integer(DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT as i64)
+                },
                 help: "Newest tool outputs the micro pass keeps verbatim.",
                 env_override: Some("SQUEEZY_CONTEXT_MICRO_COMPACTION_KEEP_RECENT"),
                 secret: false,
@@ -1445,7 +1451,9 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_context_model_assisted_timeout_secs,
                 default_display: "30 s",
                 default: || {
-                    FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS as i64)
+                    FieldValue::Integer(
+                        DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS as i64,
+                    )
                 },
                 help: "Timeout before a model-assisted summary falls back to extractive.",
                 env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS"),
@@ -3012,7 +3020,10 @@ fn ctx_bool(value: FieldValue) -> Result<bool, &'static str> {
 fn get_context_compaction_enabled(cfg: &AppConfig) -> FieldValue {
     FieldValue::Bool(cfg.context_compaction.enabled)
 }
-fn set_context_compaction_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_compaction_enabled(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.enabled = ctx_bool(value)?;
     Ok(())
 }
@@ -3020,7 +3031,10 @@ fn set_context_compaction_enabled(cfg: &mut AppConfig, value: FieldValue) -> Res
 fn get_context_estimated_tokens(cfg: &AppConfig) -> FieldValue {
     FieldValue::Integer(cfg.context_compaction.estimated_tokens as i64)
 }
-fn set_context_estimated_tokens(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_estimated_tokens(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.estimated_tokens = ctx_integer(value, 1)? as u64;
     Ok(())
 }
@@ -3044,7 +3058,10 @@ fn set_context_recent_items(cfg: &mut AppConfig, value: FieldValue) -> Result<()
 fn get_context_max_summary_bytes(cfg: &AppConfig) -> FieldValue {
     FieldValue::Integer(cfg.context_compaction.max_summary_bytes as i64)
 }
-fn set_context_max_summary_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_max_summary_bytes(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.max_summary_bytes = ctx_integer(value, 256)? as usize;
     Ok(())
 }
@@ -3052,13 +3069,20 @@ fn set_context_max_summary_bytes(cfg: &mut AppConfig, value: FieldValue) -> Resu
 fn get_context_enabled_mid_turn(cfg: &AppConfig) -> FieldValue {
     FieldValue::Bool(cfg.context_compaction.enabled_mid_turn)
 }
-fn set_context_enabled_mid_turn(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_enabled_mid_turn(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.enabled_mid_turn = ctx_bool(value)?;
     Ok(())
 }
 
 fn get_context_model_window(cfg: &AppConfig) -> FieldValue {
-    FieldValue::OptionalInteger(cfg.context_compaction.model_context_window.map(|v| v as i64))
+    FieldValue::OptionalInteger(
+        cfg.context_compaction
+            .model_context_window
+            .map(|v| v as i64),
+    )
 }
 fn set_context_model_window(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
     cfg.context_compaction.model_context_window = match value {
@@ -3077,7 +3101,10 @@ fn set_context_model_window(cfg: &mut AppConfig, value: FieldValue) -> Result<()
 fn get_context_threshold_percent(cfg: &AppConfig) -> FieldValue {
     FieldValue::Integer(cfg.context_compaction.threshold_percent as i64)
 }
-fn set_context_threshold_percent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_threshold_percent(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.threshold_percent = ctx_percent(value)?;
     Ok(())
 }
@@ -3104,7 +3131,10 @@ fn set_context_micro_threshold_percent(
 fn get_context_micro_keep_recent(cfg: &AppConfig) -> FieldValue {
     FieldValue::Integer(cfg.context_compaction.micro_compaction_keep_recent as i64)
 }
-fn set_context_micro_keep_recent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_micro_keep_recent(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.micro_compaction_keep_recent = ctx_integer(value, 0)? as usize;
     Ok(())
 }
@@ -3169,21 +3199,27 @@ fn set_context_model_assisted_timeout_secs(
 }
 
 fn get_context_layered_fallback_threshold(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Integer(cfg.context_compaction.layered_fallback_extractive_threshold_tokens as i64)
+    FieldValue::Integer(
+        cfg.context_compaction
+            .layered_fallback_extractive_threshold_tokens as i64,
+    )
 }
 fn set_context_layered_fallback_threshold(
     cfg: &mut AppConfig,
     value: FieldValue,
 ) -> Result<(), &'static str> {
-    cfg.context_compaction.layered_fallback_extractive_threshold_tokens =
-        ctx_integer(value, 0)? as u32;
+    cfg.context_compaction
+        .layered_fallback_extractive_threshold_tokens = ctx_integer(value, 0)? as u32;
     Ok(())
 }
 
 fn get_context_repo_doc_max_bytes(cfg: &AppConfig) -> FieldValue {
     FieldValue::Integer(cfg.context_compaction.repo_doc_max_bytes as i64)
 }
-fn set_context_repo_doc_max_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+fn set_context_repo_doc_max_bytes(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
     cfg.context_compaction.repo_doc_max_bytes = ctx_integer(value, 0)? as usize;
     Ok(())
 }

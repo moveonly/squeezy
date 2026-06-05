@@ -94,8 +94,8 @@ use context_compaction::build_compaction_summary;
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation, compact_conversation_with_strategy,
     drop_orphan_function_call_outputs, estimate_context, estimated_tokens,
-    maybe_compact_conversation,
-    maybe_compact_mid_turn, next_context_pin_id, pack_tool_results, repair_orphan_function_calls,
+    maybe_compact_conversation, maybe_compact_mid_turn, next_context_pin_id, pack_tool_results,
+    repair_orphan_function_calls,
 };
 use cost_broker::{
     CostBroker, format_cap_reached_reason, format_pressure_gate_reason,
