@@ -35,9 +35,20 @@ The model can spawn subagents through these advertised tools:
 - `explore(prompt, scope?, thoroughness?)` — Explorer role.
 - `delegate_plan(goal, scope?)` — Planner role.
 - `delegate_review(scope?, prompt?)` — Reviewer role.
+- `delegate_chain(steps[])` — up to 16 sequential delegate steps; each step's
+  summary is substituted into the next step's prompt via `{previous}`.
 
-All four are gated on `subagents.enabled`. `explore` is additionally gated
-on `subagents.explore_enabled`.
+All five are gated on `subagents.enabled`. `explore` is additionally gated on
+`subagents.explore_enabled`. The internal `doc_help` subagent (the `/help`
+doc-lookup fallback) is also gated on `subagents.enabled` but is never
+advertised as a model-callable tool.
+
+`delegate` and `delegate_plan`/`delegate_review` have different concurrency
+characteristics: `delegate*` calls in the same model turn are fanned out
+concurrently under `buffer_unordered(max_concurrent)`; `explore` runs
+single-shot (serial within a turn) to avoid races on its exploration-state
+lock. `delegate_chain` manages its own sequential step loop and does not
+join the concurrent batch.
 
 ## Permission Derivation
 
@@ -59,9 +70,10 @@ lock this in.
 
 Subagents may never spawn other subagents. The invariant is enforced *by
 construction*: the per-role `allowed_tools` lists do not contain
-`delegate`, `explore`, `delegate_plan`, or `delegate_review`, and the
-subagent loop denies any tool the model calls that is not in its
-allow-list. Tests in `roles_tests.rs` and `lib_tests.rs` lock this in.
+`delegate`, `explore`, `delegate_plan`, `delegate_review`, or
+`delegate_chain`, and the subagent loop denies any tool the model calls that
+is not in its allow-list. Tests in `roles_tests.rs` and `lib_tests.rs` lock
+this in.
 
 If you add a new role to the catalog, the
 `no_role_advertises_subagent_control_tools` test will catch any leak of
@@ -70,7 +82,7 @@ control tools into the role's allow-list.
 ## Concurrency Cap
 
 `SubagentRegistry` enforces a per-parent breadth cap of
-`SUBAGENT_MAX_CONCURRENT` (currently 4). Each `handle_subagent_call` site
+`SUBAGENT_MAX_CONCURRENT` (default 20, overridable via `subagents.max_concurrent` in TOML or `SQUEEZY_SUBAGENT_MAX_CONCURRENT`). Each `handle_subagent_call` site
 takes a `SubagentLease` before running and drops it on completion. When
 the cap is reached, the control tool returns `ToolStatus::Denied` with
 status `"capped"` rather than queueing or blocking. This keeps fanout

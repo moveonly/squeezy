@@ -23,6 +23,8 @@ const DOCS: &[(&str, &str)] = &[
         "tool-call-saving-strategy.md",
         "docs/external/tool-call-saving-strategy.md",
     ),
+    ("HOOKS.md", "docs/external/HOOKS.md"),
+    ("PROMPT_TEMPLATES.md", "docs/external/PROMPT_TEMPLATES.md"),
 ];
 
 fn main() -> io::Result<()> {

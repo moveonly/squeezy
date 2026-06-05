@@ -381,7 +381,7 @@ buffer. The summaries become permanent parent tokens, but at ≤0.5k
 each they fit inside the parent's prompt-cache TTL and do not
 invalidate the parent prefix.
 
-Under the 4-way concurrency cap three children run simultaneously
+Under the default concurrency cap (20) three children run simultaneously
 and finish in roughly one child's wall time, not three. Tool
 subsetting + lazy schemas means each child's request payload
 advertises ~8–12 tool schemas instead of the parent's full registry

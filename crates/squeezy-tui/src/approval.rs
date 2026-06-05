@@ -1,13 +1,12 @@
 //! Per-capability approval preview blocks.
 //!
-//! The audit found that squeezy's approval prompt shows the same flat
-//! `[a]/[s]/[d]` UI for every tool. Codex specialises the preview by
-//! tool kind (shell vs apply_patch vs web vs mcp) and shows the
-//! proposed rule that "Allow Project" would create. This module
-//! provides those specialised preview lines.
+//! Renders a specialised preview above the decision menu for each tool
+//! kind (shell, apply_patch, web, mcp) and shows the proposed rule that
+//! "Allow Project" would create.
 //!
-//! Per the implementation plan, decision options stay at the existing
-//! three (`Once / Project / Deny`); only the preview block changes.
+//! Decision keys: `Y` / `Enter` approve once, `A` / `P` always approve
+//! for the project, `N` / `D` deny. The hint row surfaces Y / A / N;
+//! P and D are silent aliases kept for muscle-memory compatibility.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};

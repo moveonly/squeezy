@@ -2,17 +2,11 @@
 //!
 //! Every clickable region — the queue indicator strip today, overlay
 //! items / transcript-card actions tomorrow — paints with the same
-//! `>` / `v` disclosure glyph and dark-blue accent so users learn the
-//! pattern once.
+//! `>` / `v` disclosure glyph and the theme's `palette.blue` accent so
+//! users learn the pattern once and the color tracks the active theme.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
-
-/// Dark-blue indexed color. 33 is bright/azure across most ANSI
-/// palettes — punchy without being neon, and accessible on both
-/// light and dark themes. Matches the prior ad-hoc styling in
-/// `prompt_queue::indicator_line`.
-pub(crate) const BUTTON_FG: ratatui::style::Color = ratatui::style::Color::Indexed(33);
 
 /// Visual state of a disclosure button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,10 +26,12 @@ impl ButtonState {
     }
 }
 
-/// Standard button spans: ` > Label ` in dark blue, bold. Callers
-/// append additional `Span`s (hint text, counters) after this prefix.
+/// Standard button spans: ` > Label ` in the theme's blue accent, bold.
+/// Callers append additional `Span`s (hint text, counters) after this prefix.
 pub(crate) fn button_spans(label: &str, state: ButtonState) -> Vec<Span<'static>> {
-    let style = Style::default().fg(BUTTON_FG).add_modifier(Modifier::BOLD);
+    let style = Style::default()
+        .fg(crate::render::theme::blue())
+        .add_modifier(Modifier::BOLD);
     vec![
         Span::styled(format!(" {} ", state.glyph()), style),
         Span::styled(label.to_string(), style),

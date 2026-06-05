@@ -411,13 +411,12 @@ pub enum LlmInputItem {
     },
     /// Document attachment — PDF, DOCX, CSV, XLSX, etc. Bedrock
     /// Converse accepts document content blocks up to ~4.5 MB with a
-    /// caller-supplied `name` and a MIME-typed payload. Anthropic
-    /// Claude PDFs ride a similar `document` content block. Other
-    /// providers route this item to a debug log + skip until a Phase 4
-    /// lowering lands. `media_type` follows the same MIME convention
-    /// as `Image`; `name` is the human-facing filename (Bedrock
-    /// requires it, other providers persist it in transcript metadata).
-    /// `bytes` round-trips as base64 like `Image::bytes`.
+    /// caller-supplied `name` and a MIME-typed payload. Providers
+    /// without document lowering reject requests that contain this item
+    /// before building the wire body, so attachments do not silently
+    /// disappear. `media_type` follows the same MIME convention as
+    /// `Image`; `name` is the human-facing filename. `bytes` round-trips
+    /// as base64 like `Image::bytes`.
     Document {
         media_type: String,
         name: String,
@@ -569,6 +568,24 @@ impl LlmRequest {
         Err(SqueezyError::ProviderRequest(format!(
             "model `{model}` on provider `{provider}` does not support image inputs (capabilities.vision = false); pick a vision-capable model before attaching an image",
             model = self.model,
+        )))
+    }
+
+    /// Refuse to ship document attachments through providers that do not
+    /// have a document content-block lowering. Bedrock intentionally does
+    /// not call this helper because it maps [`LlmInputItem::Document`] to
+    /// Converse `DocumentBlock`s.
+    pub fn reject_unsupported_documents(&self, provider: &str) -> Result<()> {
+        let Some((name, media_type)) = self.input.iter().find_map(|item| match item {
+            LlmInputItem::Document {
+                name, media_type, ..
+            } => Some((name, media_type)),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        Err(SqueezyError::ProviderRequest(format!(
+            "provider `{provider}` does not support document inputs yet; attached document `{name}` ({media_type}) would otherwise be omitted. Use a provider with document support or extract the document text before retrying",
         )))
     }
 }

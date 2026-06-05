@@ -543,6 +543,19 @@ fn descend_or_create_table<'a>(root: &'a mut Table, parents: &[&str]) -> &'a mut
 
 fn write_atomic(target: &Path, bytes: &[u8], kind: &SettingsScopeKind) -> std::io::Result<()> {
     let _ = kind;
+    write_settings_atomic(target, bytes)
+}
+
+/// Write `bytes` to a settings file at `target` using the hardened
+/// path: create parent dirs `0o700`, write to a sibling tempfile,
+/// `sync_all`, chmod `0o600`, and rename into place.
+///
+/// Exposed for callers that hold a `DocumentMut` they've edited in
+/// memory (e.g. the `/mcp` config page's `mcp_settings_edit`
+/// helper) and need the same secret-safe write semantics as
+/// `apply_edits`. Settings files may contain inline provider keys
+/// and MCP env / HTTP headers, so the chmod isn't optional.
+pub fn write_settings_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
     {

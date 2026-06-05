@@ -435,6 +435,7 @@ async fn run_replay(task: &TaskSpec, tasks_dir: &Path) -> Result<RunnerOutput> {
         ))
     })?;
     let mut config = AppConfig::from_env();
+    disable_product_telemetry(&mut config);
     config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
     let provider = replay.provider.as_deref().unwrap_or("mock-openai");
     let model = replay.model.clone().unwrap_or_else(|| provider.to_string());
@@ -461,6 +462,7 @@ async fn run_planner_probe(
     })?;
     let provider = Arc::new(PlannerProbeProvider::new(task, baseline));
     let mut config = AppConfig::from_env();
+    disable_product_telemetry(&mut config);
     config.model = runner.name().to_string();
     config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
     config.exploration_compiler = exploration_compiler;
@@ -475,6 +477,7 @@ async fn run_costly(
 ) -> Result<RunnerOutput> {
     require_costly(provider_name)?;
     let mut config = AppConfig::from_env_with_provider(provider_name);
+    disable_product_telemetry(&mut config);
     config.model = costly_model(provider_name);
     config.max_output_tokens = costly_max_output_tokens()?;
 
@@ -560,6 +563,7 @@ async fn run_agent(
     provider: Arc<dyn LlmProvider>,
 ) -> Result<RunnerOutput> {
     let mut config = AppConfig::from_env();
+    disable_product_telemetry(&mut config);
     config.model = runner.name().to_string();
     config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
     run_agent_with_config(task, runner, provider, config).await
@@ -572,6 +576,7 @@ async fn run_agent_with_config(
     mut config: AppConfig,
 ) -> Result<RunnerOutput> {
     let root = materialize_workspace(task)?;
+    disable_product_telemetry(&mut config);
     config.workspace_root = root.clone();
     let workspace_note = format!(
         "\n\nWorkspace root for this task: {}",
@@ -691,6 +696,10 @@ async fn run_agent_with_config(
         metrics,
         trace,
     })
+}
+
+fn disable_product_telemetry(config: &mut AppConfig) {
+    config.telemetry.enabled = false;
 }
 
 fn trace_completed(response_id: Option<String>, cost: CostSnapshot) -> TraceEvent {

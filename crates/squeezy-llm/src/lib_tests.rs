@@ -760,6 +760,50 @@ fn ensure_vision_support_is_noop_for_text_only_request() {
 }
 
 #[test]
+fn reject_unsupported_documents_errors_with_document_metadata() {
+    let request = LlmRequest {
+        model: "gpt-5.5".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("summarize this".to_string()),
+            LlmInputItem::Document {
+                media_type: "application/pdf".to_string(),
+                name: "report.pdf".to_string(),
+                bytes: Arc::from(b"%PDF".as_slice()),
+            },
+        ]),
+        ..LlmRequest::default()
+    };
+
+    let err = request
+        .reject_unsupported_documents("openai")
+        .expect_err("unsupported provider must reject document inputs");
+    let message = err.to_string();
+    assert!(
+        message.contains("does not support document inputs"),
+        "error must explain the rejection: got {message}"
+    );
+    assert!(
+        message.contains("report.pdf") && message.contains("application/pdf"),
+        "error must name the rejected document and media type: got {message}"
+    );
+}
+
+#[test]
+fn reject_unsupported_documents_is_noop_without_documents() {
+    let request = LlmRequest {
+        model: "gpt-5.5".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        ..LlmRequest::default()
+    };
+
+    request
+        .reject_unsupported_documents("openai")
+        .expect("text-only request must skip the document check");
+}
+
+#[test]
 fn llm_input_item_image_round_trips_through_serde() {
     let original = LlmInputItem::Image {
         media_type: "image/png".to_string(),

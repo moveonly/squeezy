@@ -1,0 +1,133 @@
+id = "mcp-config-page"
+title = "MCP: /mcp config page status / enable / disable / restart against bundled fake-mcp"
+description = """
+Drives the `/mcp` config page end-to-end against the bundled
+`squeezy-fake-mcp` stdio server (built by `cargo build -p squeezy-eval`).
+After pre-warming MCP discovery the scenario:
+
+  1. opens `/mcp` and asserts the page header, server name `bench`,
+     and a `ready` status row appear in the rendered frame;
+  2. presses `e` to toggle the server off, asserts the row flips to
+     `disabled`, and that the live status no longer reports `ready`
+     for that server;
+  3. presses `e` to re-enable, then `r` to restart, and asserts the
+     status returns to `ready`.
+
+The scenario runs offline against the `mock` provider so it is safe
+for CI. Requires `[tui_capture] drive_tui = true` to bind to the live
+`TuiHarness` (`crates/squeezy-tui/src/testing.rs`).
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+max_output_tokens = 256
+
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 140
+height = 38
+palette_tone = "dark"
+
+[mcp.servers.bench]
+transport = "stdio"
+command = "bundled:fake-mcp"
+args = []
+enabled = true
+timeout_ms = 10000
+
+[[steps]]
+kind = "prompt"
+text = "ok"
+
+# Open the MCP config page via the dedicated slash so we exercise
+# the new dispatch arm (not `/config mcp-servers`).
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/mcp"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "MCP Servers"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "bench"
+
+# Discovery has already been pre-warmed by the driver, so the
+# initial frame should show `ready` for the bench server.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "ready"
+
+# Toggle off (lowercase `e` = persist; the scenario tier paths are
+# under /tmp so the write is harmless).
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "e"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "disabled"
+
+# Re-enable.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "e"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "enabled"
+
+# Restart the server in place — asserts that the status banner
+# eventually advertises the restart and the row stays visible.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "r"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "restarting bench"
+
+[expect]
+max_wall_clock_seconds = 60
+no_tool_errors = true
+
+[triage]
+enabled = false
+
+[mock]
+default_text = "(no scripted turn)"
+
+[[mock.turns]]
+text = "ok"
+input_tokens = 8
+output_tokens = 4

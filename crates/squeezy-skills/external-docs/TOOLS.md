@@ -64,6 +64,16 @@ The TUI supports local commands for common work without requiring a model turn:
   background-task controls. (`/jobs` remains a one-release alias for `/tasks`.)
 - `/checkpoints`, `/checkpoint <id>`, `/undo`, `/revert-turn <id>`:
   available when checkpointing is enabled.
+- `/router [on|off]`: toggle cheap-model turn routing for the session; without
+  args opens the routing config view.
+- `/theme [name]`: switch the TUI color theme. Built-in themes: `default`,
+  `bright`, `fun`, `starlight`. Use `/theme default` to reset.
+- `/reviewer`: show recent AI reviewer auto-decisions.
+- `/statusline`: configure the custom status line footer.
+
+Prompt templates in `~/.squeezy/prompts/` and `<workspace>/.squeezy/prompts/`
+can be activated with `/prompt-template <name>`. See
+[PROMPT_TEMPLATES.md](PROMPT_TEMPLATES.md).
 
 The exact available tool set can change with mode, configuration, permissions,
 and enabled MCP servers. Use `squeezy config inspect` to inspect the effective

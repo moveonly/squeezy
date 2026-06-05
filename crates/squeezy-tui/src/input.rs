@@ -149,6 +149,12 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         true,
         &[PermissionCapability::Edit],
     ),
+    slash_caps(
+        "/mcp",
+        "open config focused on MCP servers (status, enable, restart)",
+        true,
+        &[PermissionCapability::Edit],
+    ),
     slash_args(
         "/plan",
         "switch to Plan mode (optionally with a prompt to run)",

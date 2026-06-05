@@ -13,7 +13,7 @@ use squeezy_core::{
 use crate::{
     AnthropicProvider, BedrockProvider, FauxProvider, GoogleProvider, LlmInputItem, LlmProvider,
     LlmRequest, OllamaProvider, OpenAiCodexProvider, OpenAiCompatibleProvider, OpenAiProvider,
-    XaiProvider,
+    XaiProvider, oauth::GitHubCopilotProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -191,11 +191,13 @@ fn model_info_from_raw(raw: RawModelInfo) -> ModelInfo {
 
 fn fallback_model_info(provider: &'static str, model: &'static str) -> ModelInfo {
     let tokenizer = fallback_tokenizer(provider, model);
+    let mut capabilities = ModelCapabilities::TEXT_TOOLS;
+    capabilities.json_mode = false;
     ModelInfo {
         provider,
         id: model,
         profile: ModelProfile::Balanced,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
+        capabilities,
         pricing: None,
         limits: Some(ModelLimits {
             context_window_tokens: 272_000,
@@ -276,6 +278,7 @@ fn leak_string(value: String) -> &'static str {
 pub const PROVIDERS: &[&str] = &[
     "openai",
     "openai_codex",
+    "github_copilot",
     "anthropic",
     "google",
     "azure_openai",
@@ -292,6 +295,8 @@ pub const PROVIDERS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "deepinfra",
+    "baseten",
     "lmstudio",
     "vllm",
     "llamacpp",
@@ -425,6 +430,7 @@ pub fn provider_name(config: &ProviderConfig) -> &'static str {
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
+        ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
         ProviderConfig::Faux(_) => "faux",
     }
@@ -449,6 +455,9 @@ pub fn provider_from_config(config: &ProviderConfig) -> Result<Arc<dyn LlmProvid
         ProviderConfig::OpenAiCodex(codex) => {
             Ok(Arc::new(OpenAiCodexProvider::from_config(codex)?))
         }
+        ProviderConfig::GitHubCopilot(config) => Ok(Arc::new(
+            GitHubCopilotProvider::from_default_auth(config.transport)?,
+        )),
         ProviderConfig::OpenAiCompatible(config) => match config.preset {
             // xAI ships both Chat Completions and Responses APIs on the
             // same host; route Grok 3+ through Responses for reasoning

@@ -1,7 +1,7 @@
 //! Full-page config UI invoked via `/config` or F11.
 //!
-//! Layout: two scope tabs (User / Project) on top, a section sidebar on the
-//! left, a field editor on the right, and a footer hint row at the bottom.
+//! Layout: three scope tabs (User / Repo / Local) on top, a section sidebar on
+//! the left, a field editor on the right, and a footer hint row at the bottom.
 //! Saves write the corresponding TOML file via `squeezy_core::settings_writer`
 //! and apply changes by tier: `Immediate` → `agent.replace_config(...)`;
 //! `NextPrompt` → `agent.arm_config_swap(...)`; `Restart` → notification only.
@@ -224,6 +224,32 @@ pub(crate) struct ConfigScreenState {
     pub undo_stack: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
     pub telemetry_undo_markers: Vec<usize>,
     pub telemetry_changes: Vec<ConfigTelemetryChange>,
+    /// Snapshot of the live MCP server map. Mirrors what
+    /// `Agent::mcp_servers()` returns. Refreshed by the host after
+    /// every key + on every draw so the table reflects in-flight
+    /// toggles/restarts.
+    pub mcp_servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+    /// Live MCP status snapshot — ready/failed/cancelled/starting,
+    /// per-server tool counts. Owned by the agent; the host refreshes
+    /// this each draw.
+    pub mcp_status: squeezy_tools::McpStatusSnapshot,
+    /// Pending name awaiting `y/n` confirmation to remove from the
+    /// MCP page. Tracks the active scope at confirm-time so the
+    /// follow-up TOML write hits the right file.
+    pub mcp_pending_delete: Option<String>,
+    /// Add-server overlay state. Present when the user has pressed
+    /// `a` on the McpServers section; absent during normal browse.
+    pub mcp_add: Option<McpAddForm>,
+    /// Actions staged by sync key handlers; the host's async loop
+    /// drains them and routes to `agent.set_mcp_server_enabled` /
+    /// `restart_mcp_server` / `replace_mcp_servers` before the next
+    /// draw.
+    pub mcp_pending_actions: Vec<McpAction>,
+    /// Last successful MCP-action feedback line, e.g. `enabled bench
+    /// (session-only)`. Rendered above the server list so a user
+    /// pressing `e`/`r` sees confirmation even before discovery
+    /// completes.
+    pub mcp_last_status_line: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,6 +602,7 @@ impl ConfigScreenState {
                 std::fs::read(&sources.repo_path_default).ok(),
             ),
         ];
+        let mcp_servers = effective.mcp_servers.clone();
         Self {
             // Default to the User tab — it's the most relevant tier for
             // first-time users (and the only one writable when there is
@@ -600,9 +627,36 @@ impl ConfigScreenState {
             undo_stack: Vec::new(),
             telemetry_undo_markers: Vec::new(),
             telemetry_changes: Vec::new(),
+            mcp_servers,
+            mcp_status: Default::default(),
+            mcp_pending_delete: None,
+            mcp_add: None,
+            mcp_pending_actions: Vec::new(),
+            mcp_last_status_line: None,
         }
     }
 
+    /// Sorted list of configured server names — render path uses this
+    /// to map a row index to a server entry on the `/mcp` page.
+    pub(crate) fn mcp_server_names(&self) -> Vec<String> {
+        self.mcp_servers.keys().cloned().collect()
+    }
+
+    /// Server entry at row `row` on the `/mcp` page. Returns `None` if
+    /// the row is out of bounds (the "add new" row sits at
+    /// `mcp_server_names().len()` and has no server entry yet).
+    pub(crate) fn mcp_server_at_row(
+        &self,
+        row: usize,
+    ) -> Option<(String, &squeezy_core::McpServerConfig)> {
+        let names = self.mcp_server_names();
+        names
+            .get(row)
+            .and_then(|name| self.mcp_servers.get(name).map(|cfg| (name.clone(), cfg)))
+    }
+}
+
+impl ConfigScreenState {
     pub(crate) fn push_undo_snapshot(
         &mut self,
         path: std::path::PathBuf,
@@ -704,6 +758,9 @@ impl ConfigScreenState {
                     + 1
                     + crate::render::theme::token_rows().len()
             }
+            // Server rows + one trailing "(add)" row so the user can
+            // bring up the add overlay from the same focus loop.
+            SectionId::McpServers => self.mcp_servers.len() + 1,
             _ => section.fields.len(),
         }
     }
@@ -727,7 +784,7 @@ impl ConfigScreenState {
                 let visible = self.permission_visible_rows(section.fields.len());
                 (row < visible).then(|| section.fields.get(row)).flatten()
             }
-            SectionId::Reset | SectionId::Themes => None,
+            SectionId::Reset | SectionId::Themes | SectionId::McpServers => None,
             _ => section.fields.get(row),
         }
     }
@@ -1113,6 +1170,89 @@ pub(crate) enum KeyOutcome {
     Close,
 }
 
+/// Action staged by the synchronous `/mcp` page key handler that the
+/// outer async TUI loop drains and dispatches to the agent. We keep
+/// the dispatch out-of-band so the per-key path stays sync; the loop
+/// then runs `agent.set_mcp_server_enabled` / `restart_mcp_server` /
+/// `replace_mcp_servers` (`squeezy-agent`) and refreshes the cached
+/// snapshot via `refresh_mcp_screen_state`.
+#[derive(Debug, Clone)]
+pub(crate) enum McpAction {
+    /// Toggle `enabled`. When `persist = true`, the change is written
+    /// to settings TOML in addition to applying live; otherwise it
+    /// stays session-only and reverts on restart.
+    Toggle {
+        server: String,
+        enabled: bool,
+        persist: bool,
+    },
+    /// Tear down the live session and rediscover tools.
+    Restart { server: String },
+    /// Insert a brand-new server. Persisted to settings TOML unless
+    /// `persist = false` (session-only); always applied live. The
+    /// `server` body is boxed because `McpServerConfig` is large
+    /// (~330 bytes) and dominates the enum's size otherwise.
+    Add {
+        name: String,
+        server: Box<squeezy_core::McpServerConfig>,
+        persist: bool,
+    },
+    /// Drop a configured server. Persisted to TOML by default; the
+    /// session-only path leaves the file untouched but removes the
+    /// entry from the live registry.
+    Remove { name: String, persist: bool },
+}
+
+/// Draft state for the "add server" overlay on the `/mcp` page. The
+/// fields mirror the `[mcp.servers.<name>]` TOML block but trim to
+/// the values needed to bring a stdio/http/sse server up. Persisted
+/// fields are gated by the `transport` selector at submit time.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct McpAddForm {
+    pub name: String,
+    pub transport: McpAddTransport,
+    pub command: String,
+    pub url: String,
+    pub field_index: usize,
+    /// Free-form error rendered above the form when the most recent
+    /// submit attempt failed validation.
+    pub error: Option<String>,
+    /// When `true`, submit dispatches a session-only Add (no TOML
+    /// write). Default is persisted.
+    pub session_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum McpAddTransport {
+    #[default]
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl McpAddTransport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Sse => "sse",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Stdio => Self::Http,
+            Self::Http => Self::Sse,
+            Self::Sse => Self::Stdio,
+        }
+    }
+}
+
+/// Row indices on the add-server overlay; the field index advances
+/// through these and the `transport` selector renders inline so the
+/// arrow keys cycle through every editable knob.
+pub(crate) const MCP_ADD_FIELD_COUNT: usize = 4;
+
 #[derive(Debug)]
 pub(crate) enum EditorOutcome {
     KeepEditing,
@@ -1488,6 +1628,7 @@ pub(crate) fn provider_variant_label(provider: &squeezy_core::ProviderConfig) ->
         P::Bedrock(_) => "bedrock",
         P::Ollama(_) => "ollama",
         P::OpenAiCodex(_) => "openai_codex",
+        P::GitHubCopilot(_) => "github_copilot",
         P::OpenAiCompatible(config) => config.preset.as_str(),
         P::Faux(_) => "faux",
     }
@@ -1557,12 +1698,11 @@ pub(crate) fn provider_api_key_env(
         P::Anthropic(c) => Some(("Anthropic", c.api_key_env.clone())),
         P::Google(c) => Some(("Google", c.api_key_env.clone())),
         P::AzureOpenAi(c) => Some(("Azure OpenAI", c.api_key_env.clone())),
-        // Bedrock uses AWS SDK creds; Ollama is local; the ChatGPT
-        // Codex provider stores OAuth tokens at `~/.squeezy/auth/`;
-        // the faux provider runs in-process and has no credential —
-        // none of these have an env-var keychain entry the screen
-        // can write.
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::Faux(_) => None,
+        // Bedrock uses AWS SDK creds; Ollama is local; OAuth
+        // providers store tokens at `~/.squeezy/auth/`; the faux
+        // provider runs in-process and has no credential. None of
+        // these have an env-var keychain entry the screen can write.
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
         P::OpenAiCompatible(c) => {
             if c.api_key_env.is_empty() {
                 None
@@ -1585,12 +1725,11 @@ pub(crate) fn provider_section_name(
         P::Anthropic(_) => Some("anthropic"),
         P::Google(_) => Some("google"),
         P::AzureOpenAi(_) => Some("azure_openai"),
-        // The Codex provider's credentials live in the OAuth token
-        // file, not the providers TOML table, so there's no section
-        // to write. The faux provider exposes `script` instead of an
-        // api_key, which is handled by the field-level editor rather
-        // than the secret-entry path.
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::Faux(_) => None,
+        // OAuth provider credentials live in auth token files, not
+        // provider TOML tables. The faux provider exposes `script`
+        // instead of an api_key, which is handled by the field-level
+        // editor rather than the secret-entry path.
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
         P::OpenAiCompatible(c) => Some(c.preset.as_str()),
     }
 }
@@ -1606,7 +1745,7 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
         P::Anthropic(c) => c.api_key.clone(),
         P::Google(c) => c.api_key.clone(),
         P::AzureOpenAi(c) => c.api_key.clone(),
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
         P::OpenAiCompatible(c) => c.api_key.clone(),
     }
 }

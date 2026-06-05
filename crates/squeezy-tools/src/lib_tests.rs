@@ -115,8 +115,8 @@ fn plan_parallel_batches_coalesces_three_delegate_calls_into_one_concurrent_batc
     // `buffer_unordered(SUBAGENT_MAX_CONCURRENT)` loop can run them
     // concurrently. Before this change `is_parallel_safe` consulted only
     // the spec catalog, which has no entry for the synthetic subagent
-    // tools — so the lease pool advertised a 4-way budget that the
-    // dispatcher never used.
+    // tools — so the lease pool's concurrent budget was never used by the
+    // dispatcher.
     //
     // The mix below intentionally covers all three delegate variants
     // (plain delegate, plan, review) plus `delegate_chain`, which is also
@@ -11873,6 +11873,7 @@ fn shell_sandbox_plan_metadata_carries_best_effort_fallback_record() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let parsed = shell_best_effort_fallback_from_result(&result)
         .expect("agent helper extracts the fallback descriptor");
@@ -11902,6 +11903,7 @@ fn shell_best_effort_fallback_from_result_ignores_non_shell_tools_and_clean_runs
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     assert!(shell_best_effort_fallback_from_result(&plain_result).is_none());
 
@@ -11924,6 +11926,7 @@ fn shell_best_effort_fallback_from_result_ignores_non_shell_tools_and_clean_runs
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     assert!(
         shell_best_effort_fallback_from_result(&non_shell).is_none(),

@@ -2,6 +2,20 @@ use super::*;
 use crate::anthropic_betas::{anthropic_header_value, bedrock_extra_body_betas};
 use crate::{CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static ANTHROPIC_OAUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn temp_home(label: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "squeezy-anthropic-provider-{label}-{}-{nanos}",
+        std::process::id()
+    ))
+}
 
 #[test]
 fn request_body_uses_messages_streaming_shape() {
@@ -52,6 +66,65 @@ fn request_body_uses_messages_streaming_shape() {
     assert_eq!(body["stream"], true);
     assert!(body.get("previous_response_id").is_none());
     assert!(body.get("store").is_none());
+}
+
+#[tokio::test]
+async fn from_config_loads_oauth_when_static_key_missing() {
+    let home = temp_home("oauth-load");
+    let auth_dir = home.join(".squeezy").join("auth");
+    std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+    let auth_path = auth_dir.join("anthropic.json");
+    let tokens = crate::oauth::PersistedTokens {
+        access_token: "sk-ant-oat-provider-test".to_string(),
+        refresh_token: "sk-ant-rfr-provider-test".to_string(),
+        expires_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0)
+            + 3_600_000,
+        scope: None,
+        provider: "anthropic-oauth".to_string(),
+    };
+    crate::oauth::anthropic_write_tokens(&auth_path, &tokens).expect("write oauth token file");
+
+    let provider = {
+        let _guard = ANTHROPIC_OAUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let missing_env = "SQUEEZY_TEST_MISSING_ANTHROPIC_KEY";
+        let prev_missing = std::env::var_os(missing_env);
+        // SAFETY: ANTHROPIC_OAUTH_ENV_LOCK serializes process-env mutations in
+        // this module.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var(missing_env);
+        }
+
+        let config = AnthropicConfig {
+            api_key: None,
+            api_key_env: missing_env.to_string(),
+            base_url: squeezy_core::DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+            transport: squeezy_core::ProviderTransportConfig::default(),
+        };
+        let provider = AnthropicProvider::from_config(&config).expect("oauth provider");
+
+        unsafe {
+            match prev_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_missing {
+                Some(value) => std::env::set_var(missing_env, value),
+                None => std::env::remove_var(missing_env),
+            }
+        }
+
+        provider
+    };
+    let key = provider.api_key.current_key().await.expect("oauth key");
+    assert_eq!(key, "sk-ant-oat-provider-test");
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]

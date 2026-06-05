@@ -103,6 +103,127 @@ async fn refresh_drops_cached_tools_for_disabled_servers() {
     );
 }
 
+#[tokio::test]
+async fn set_server_enabled_toggles_and_publishes_status() {
+    // Disabled → enabled flips the live map. Discovery will fail
+    // synchronously (no command), so we only check the map mutation
+    // and the failed-status row that the refresh publishes.
+    let mut servers = BTreeMap::new();
+    servers.insert("docs".to_string(), fixture_server(false, None));
+    let registry = McpClientRegistry::new(servers);
+    assert!(registry.has_no_enabled_servers());
+
+    let outcome = registry
+        .set_server_enabled("docs", true, CancellationToken::new())
+        .await
+        .expect("known server toggles");
+    assert!(!registry.has_no_enabled_servers(), "enabled flag must flip");
+    assert!(
+        registry.servers().get("docs").is_some_and(|s| s.enabled),
+        "registry's live map must reflect the toggle"
+    );
+    // Discovery failed (no command) so we get a Failed status row.
+    let status = outcome
+        .status
+        .per_server
+        .get("docs")
+        .expect("status published");
+    assert!(
+        matches!(status, McpServerStatus::Failed { .. }),
+        "missing-command refresh should publish failed: {status:?}"
+    );
+
+    // Toggle back → the live map updates and the server stops
+    // appearing in the published per-server status.
+    let outcome = registry
+        .set_server_enabled("docs", false, CancellationToken::new())
+        .await
+        .expect("known server toggles");
+    assert!(registry.has_no_enabled_servers());
+    assert!(
+        !registry
+            .servers()
+            .get("docs")
+            .map(|s| s.enabled)
+            .unwrap_or(true)
+    );
+    assert!(
+        outcome.status.per_server.is_empty(),
+        "disabling the last server clears the status snapshot"
+    );
+}
+
+#[tokio::test]
+async fn set_server_enabled_rejects_unknown_server() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    let err = registry
+        .set_server_enabled("ghost", true, CancellationToken::new())
+        .await
+        .expect_err("unknown server must error");
+    assert!(
+        matches!(err, McpError::UnknownServer { ref server } if server == "ghost"),
+        "expected UnknownServer, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn restart_server_invalidates_session_and_runs_refresh() {
+    let mut servers = BTreeMap::new();
+    servers.insert("docs".to_string(), fixture_server(true, None));
+    let registry = McpClientRegistry::new(servers);
+
+    // No live session yet; restart should not error and the
+    // refresh should publish a Failed row (no command).
+    let outcome = registry
+        .restart_server("docs", CancellationToken::new())
+        .await
+        .expect("known server restarts");
+    let status = outcome
+        .status
+        .per_server
+        .get("docs")
+        .expect("status published");
+    assert!(matches!(status, McpServerStatus::Failed { .. }));
+
+    // Restarting an unknown server is a typed error rather than a
+    // silent no-op so the /mcp page can surface it.
+    let err = registry
+        .restart_server("ghost", CancellationToken::new())
+        .await
+        .expect_err("unknown server must error");
+    assert!(matches!(err, McpError::UnknownServer { .. }));
+}
+
+#[tokio::test]
+async fn replace_servers_swaps_map_and_drops_cached_tools_for_removed() {
+    let mut servers = BTreeMap::new();
+    servers.insert("docs".to_string(), fixture_server(true, None));
+    let registry = McpClientRegistry::new(servers);
+    registry.insert_cached_tool_for_test(fixture_tool("docs", "lookup"));
+    assert!(registry.tool("mcp__docs__lookup").is_some());
+
+    // Replace with a totally different server. Tools cached against
+    // the dropped server must not survive.
+    let mut next = BTreeMap::new();
+    next.insert("api".to_string(), fixture_server(true, None));
+    let outcome = registry
+        .replace_servers(next.clone(), CancellationToken::new())
+        .await;
+    assert_eq!(
+        registry.servers().keys().cloned().collect::<Vec<_>>(),
+        vec!["api".to_string()],
+        "live map should match the replacement"
+    );
+    assert!(
+        registry.tool("mcp__docs__lookup").is_none(),
+        "stale cached tool from the dropped server must be evicted"
+    );
+    assert!(
+        outcome.status.per_server.contains_key("api"),
+        "status snapshot tracks the new server"
+    );
+}
+
 #[test]
 fn tool_filter_applies_enabled_allowlist_before_disabled_blocklist() {
     let mut server = fixture_server(true, Some("unused"));

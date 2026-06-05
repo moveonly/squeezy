@@ -275,6 +275,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # tool_output_verbosity = "compact"
 # transcript_default = "compact"
 # show_reasoning_usage = true
+# theme = "default"           # built-in: default, bright, fun, starlight
+
+# [tui.themes.myteam]
+# [tui.themes.myteam.colors]
+# "palette.accent" = "ff9900"
+# "palette.secondary" = "5599ff"
 ```
 
 ## Sections
@@ -521,6 +527,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   rendered above each assistant message when the model emitted thinking
   (OpenAI o-series, Anthropic extended thinking, Gemini 2.5 thinking,
   Bedrock Claude reasoning).
+  `theme` selects the active color theme. Built-in themes are `default`, `bright`,
+  `fun`, and `starlight`. Custom themes can be defined under
+  `[tui.themes.<name>.colors]` with named color tokens (e.g. `"palette.accent"`,
+  `"palette.secondary"`, `"palette.red"`) mapped to 6-digit hex RGB values. Use
+  `/theme <name>` in the TUI to switch themes live.
 
 Legacy top-level `provider`, `model`, and `profile` keys remain accepted, but
 new configuration should use `[model]`.

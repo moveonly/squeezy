@@ -3,6 +3,16 @@ use squeezy_core::SessionLogConfig;
 use squeezy_llm::{LlmInputItem, LlmToolCall};
 
 #[test]
+fn harness_disables_product_telemetry() {
+    let mut config = AppConfig::default();
+    assert!(config.telemetry.enabled);
+
+    disable_product_telemetry(&mut config);
+
+    assert!(!config.telemetry.enabled);
+}
+
+#[test]
 fn parses_task_toml_with_provider_traces() {
     let task: TaskSpec = toml::from_str(
         r#"

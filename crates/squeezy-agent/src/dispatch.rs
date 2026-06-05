@@ -53,6 +53,11 @@ pub enum DispatchCommand {
     Config {
         section: Option<String>,
     },
+    /// `/mcp` — open the config screen focused on the MCP Servers
+    /// section. Same screen as `/config mcp-servers` but exposed as
+    /// a dedicated slash so it is discoverable from `/help` and the
+    /// slash autocomplete.
+    Mcp,
     Model,
     Permissions,
     Plan {
@@ -177,6 +182,7 @@ impl DispatchCommand {
         match self {
             Self::Help { .. } => "/help",
             Self::Config { .. } => "/config",
+            Self::Mcp => "/mcp",
             Self::Model => "/model",
             Self::Permissions => "/permissions",
             Self::Plan { .. } => "/plan",
@@ -251,6 +257,7 @@ impl DispatchCommand {
             "/config" | "/options" => Self::Config {
                 section: none_if_empty(rest),
             },
+            "/mcp" => Self::Mcp,
             "/model" => Self::Model,
             "/permissions" => Self::Permissions,
             "/plan" => Self::Plan {

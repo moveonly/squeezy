@@ -31,10 +31,14 @@ use squeezy_core::{
 use squeezy_graph::{CargoFactProvenance, GraphManager};
 use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 pub use squeezy_mcp::{
-    McpElicitationAction, McpElicitationHandler, McpElicitationKind, McpElicitationRequest,
-    McpElicitationResponse, McpRefreshOutcome, McpServerStatus, McpStatusSnapshot,
+    McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
+    McpElicitationHandler, McpElicitationKind, McpElicitationRequest, McpElicitationResponse,
+    McpError, McpRefreshOutcome, McpResult, McpServerStatus, McpStatusSnapshot,
 };
-use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
+use squeezy_skills::{
+    LoadedSkill, SkillActivation, SkillCatalog, SkillDiscoverySummary, SkillPreambleRender,
+    render::SkillActivationMetrics,
+};
 use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
 use squeezy_telemetry::{
     ErrorKind as TelemetryErrorKind, GraphPerfReport, GraphSequenceScope, LanguageDistribution,
@@ -313,6 +317,45 @@ fn graph_build_perf_report(manager: &GraphManager) -> GraphPerfReport {
         language_distribution: language_distribution(&report.language),
         error_kind: None,
     }
+}
+
+/// Emit `graph_refresh_completed` telemetry when a real refresh happened.
+/// Skipped for the `skipped_due_to_interval` debounce path so we only
+/// count refreshes that actually re-parsed files.
+pub(crate) fn emit_graph_refresh_telemetry(
+    telemetry: &Option<TelemetryClient>,
+    refresh: &squeezy_graph::RefreshReport,
+) {
+    if !refresh.refreshed {
+        return;
+    }
+    let Some(ref telemetry) = *telemetry else {
+        return;
+    };
+    use squeezy_telemetry::{
+        GraphPerfReport, GraphSequenceScope, OutcomeStatus, RefreshKind, TelemetryEvent,
+    };
+    let report = GraphPerfReport {
+        refresh_kind: RefreshKind::Incremental,
+        status: OutcomeStatus::Success,
+        sequence_scope: GraphSequenceScope::Repeated,
+        duration_ms: refresh.duration_ms as u64,
+        files_seen: refresh.files_seen as u64,
+        files_changed: (refresh.changed_files.len() + refresh.removed_files.len()) as u64,
+        files_parsed: refresh.reparsed_files as u64,
+        bytes_parsed: refresh.bytes_reparsed,
+        excluded_files: refresh.excluded_files as u64,
+        excluded_dirs: refresh.excluded_dirs as u64,
+        excluded_bytes: refresh.excluded_bytes,
+        persisted_files_loaded: 0,
+        persisted_files_missed: 0,
+        persistence_rebuilt: false,
+        symbols: refresh.stats.symbols as u64,
+        edges: refresh.stats.edges as u64,
+        language_distribution: language_distribution(&refresh.language),
+        error_kind: None,
+    };
+    telemetry.spawn(TelemetryEvent::graph_refresh_completed(report));
 }
 
 fn language_distribution(report: &LanguageReport) -> LanguageDistribution {
@@ -855,6 +898,33 @@ impl WebToolConfig {
     }
 }
 
+/// Coarse statistics for a web tool call (websearch or webfetch).
+/// Plain data; no `squeezy-telemetry` dependency. The agent converts
+/// this into a `WebRequestReport` and fires `TelemetryEvent::web_request`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebCallStats {
+    /// `"exa"`, `"parallel"`, or `"webfetch"` — matches `WebSearchProvider::as_str()`
+    pub provider_token: String,
+    /// `"success"`, `"error"`, or `"cancelled"`
+    pub status_token: String,
+    pub ssrf_blocked: bool,
+    pub redirect_blocked: bool,
+    /// Coarse byte bucket: `"0_1k"`, `"1k_10k"`, `"10k_100k"`, `"100k_plus"`
+    pub response_byte_bucket: String,
+    pub duration_ms: u64,
+}
+
+impl WebCallStats {
+    pub fn response_byte_bucket(bytes: usize) -> &'static str {
+        match bytes {
+            0..=1_023 => "0_1k",
+            1_024..=10_239 => "1k_10k",
+            10_240..=102_399 => "10k_100k",
+            _ => "100k_plus",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: String,
@@ -865,6 +935,8 @@ pub struct ToolResult {
     pub receipt: ToolReceipt,
     #[serde(skip)]
     pub spill_model_output: Option<String>,
+    #[serde(skip)]
+    pub web_call_stats: Option<WebCallStats>,
 }
 
 impl ToolResult {
@@ -989,7 +1061,13 @@ pub struct ToolRegistry {
     /// clones so a swap is visible everywhere.
     pub(crate) checkpoint_provider: Arc<StdMutex<Option<Arc<dyn CheckpointProvider>>>>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
-    pub(crate) skills: Arc<SkillCatalog>,
+    /// Skill catalog snapshot. Wrapped in `Arc<StdMutex<Arc<...>>>` so a
+    /// settings hot-reload can rebuild the catalog via
+    /// [`Self::rebuild_skills`] and every existing `ToolRegistry` clone
+    /// observes the new snapshot. Reads clone the inner `Arc` once and
+    /// then operate on it lock-free, mirroring the `checkpoint_provider`
+    /// pattern below.
+    skills: Arc<StdMutex<Arc<SkillCatalog>>>,
     pub(crate) redactor: Arc<Redactor>,
     pub(crate) crawl_options: Arc<CrawlOptions>,
     compiled_policy: Arc<CompiledIndexingPolicy>,
@@ -1020,6 +1098,9 @@ pub struct ToolRegistry {
     /// stub instead of re-serializing the bytes.
     pub(crate) tool_output_replay_seen:
         Arc<StdMutex<HashMap<ToolOutputReplayKey, ToolOutputReplayServed>>>,
+    /// Best-effort anonymous telemetry sink. Propagated from
+    /// [`ToolRegistryRuntime`] for graph-refresh and other per-tool events.
+    pub(crate) telemetry: Option<TelemetryClient>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1409,7 +1490,7 @@ impl ToolRegistry {
             checkpoints,
             checkpoint_provider: Arc::new(StdMutex::new(checkpoint_provider)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
-            skills: Arc::new(skills),
+            skills: Arc::new(StdMutex::new(Arc::new(skills))),
             redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
@@ -1427,6 +1508,7 @@ impl ToolRegistry {
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
             tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
+            telemetry,
         })
     }
 
@@ -1462,7 +1544,7 @@ impl ToolRegistry {
             checkpoints: None,
             checkpoint_provider: Arc::new(StdMutex::new(None)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
-            skills: Arc::new(SkillCatalog::empty()),
+            skills: Arc::new(StdMutex::new(Arc::new(SkillCatalog::empty()))),
             redactor: Arc::new(Redactor::default()),
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
@@ -1477,6 +1559,7 @@ impl ToolRegistry {
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
             tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
+            telemetry: None,
         })
     }
 
@@ -1862,8 +1945,76 @@ impl ToolRegistry {
         outcome
     }
 
+    /// Toggle an MCP server's `enabled` flag mid-session. Re-runs
+    /// discovery (via `refresh_tools`) and invalidates cached `specs()`
+    /// so the next turn advertises the updated tool palette.
+    pub async fn set_mcp_server_enabled(
+        &self,
+        server_name: &str,
+        enabled: bool,
+        cancel: CancellationToken,
+    ) -> McpResult<McpRefreshOutcome> {
+        let outcome = self
+            .mcp
+            .set_server_enabled(server_name, enabled, cancel)
+            .await?;
+        self.invalidate_cached_specs();
+        Ok(outcome)
+    }
+
+    /// Restart a single MCP server: drop its live session and re-run
+    /// discovery so the next request opens a fresh child process /
+    /// HTTP keep-alive.
+    pub async fn restart_mcp_server(
+        &self,
+        server_name: &str,
+        cancel: CancellationToken,
+    ) -> McpResult<McpRefreshOutcome> {
+        let outcome = self.mcp.restart_server(server_name, cancel).await?;
+        self.invalidate_cached_specs();
+        Ok(outcome)
+    }
+
+    /// Replace the whole configured-server map atomically. Used when
+    /// the `/mcp` config page bulk-adds/removes servers and when an
+    /// external `settings.toml` edit changes `[mcp.servers]`.
+    pub async fn replace_mcp_servers(
+        &self,
+        servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+        cancel: CancellationToken,
+    ) -> McpRefreshOutcome {
+        let outcome = self.mcp.replace_servers(servers, cancel).await;
+        self.invalidate_cached_specs();
+        outcome
+    }
+
+    /// Snapshot of the live configured-server map. Mirrors
+    /// `AppConfig.mcp_servers` but reads from the live registry so
+    /// callers see post-`replace_mcp_servers` state.
+    pub fn mcp_servers(&self) -> std::collections::BTreeMap<String, squeezy_core::McpServerConfig> {
+        self.mcp.servers()
+    }
+
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
         self.mcp.status_snapshot()
+    }
+
+    /// Aggregate MCP server capability presence booleans.
+    /// Returns (has_resources, has_elicitation, has_experimental).
+    pub async fn aggregate_mcp_capabilities(&self) -> (bool, bool, bool) {
+        self.mcp.aggregate_capabilities().await
+    }
+
+    /// Snapshot of recent MCP elicitation audit events.
+    pub fn mcp_elicitation_audit_snapshot(&self) -> Vec<McpElicitationAuditEvent> {
+        self.mcp.elicitation_audit_log()
+    }
+
+    /// Drain and clear all new MCP elicitation audit events since the last
+    /// drain. The agent calls this in `finish_turn` so each event is only
+    /// counted once across the session.
+    pub fn drain_mcp_elicitation_audit(&self) -> Vec<McpElicitationAuditEvent> {
+        self.mcp.drain_elicitation_audit_log()
     }
 
     pub fn set_mcp_elicitation_handler(&self, handler: Option<McpElicitationHandler>) {
@@ -2386,8 +2537,8 @@ impl ToolRegistry {
     /// `SUBAGENT_MAX_CONCURRENT` lease pool already caps total fanout, so
     /// the registry promotes them to parallel-safe explicitly. This
     /// closes the gap where multiple delegate calls in the same model
-    /// turn were serialised even though the lease pool advertised a
-    /// 4-way concurrency budget.
+    /// turn were serialised even though the lease pool supported concurrent
+    /// fanout.
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
         if SUBAGENT_PARALLEL_SAFE_TOOL_NAMES.contains(&call.name.as_str()) {
             return true;
@@ -2647,24 +2798,127 @@ impl ToolRegistry {
         }
     }
 
+    /// Snapshot of the current skill catalog. Cloning the inner `Arc`
+    /// is cheap and lets every accessor below operate on a stable
+    /// catalog even if a settings reload swaps it mid-read.
+    fn skills_snapshot(&self) -> Arc<SkillCatalog> {
+        self.skills.lock().expect("skill catalog lock").clone()
+    }
+
     pub fn activate_skills_for_input(&self, input: &str) -> Result<SkillActivation> {
-        self.skills.activate_for_input(input)
+        self.skills_snapshot().activate_for_input(input)
     }
 
     pub fn format_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
-        self.skills.render_active_skills(skills)
+        self.skills_snapshot().render_active_skills(skills)
+    }
+
+    /// Render fork-mode skills (skills whose frontmatter declares
+    /// `context: fork`) into a separate `<fork_skills>` system block.
+    /// Returns `None` when no fork-mode skill is activated.
+    pub fn format_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        self.skills_snapshot().render_fork_skills(skills)
+    }
+
+    pub fn format_active_skills_with_metrics(
+        &self,
+        skills: &[LoadedSkill],
+    ) -> (Option<String>, SkillActivationMetrics) {
+        self.skills_snapshot()
+            .render_active_skills_with_metrics(skills)
+    }
+
+    pub fn skill_discovery_summary(&self) -> SkillDiscoverySummary {
+        self.skills_snapshot().discovery_summary()
     }
 
     pub fn skills_preamble(&self) -> Option<SkillPreambleRender> {
-        self.skills.render_preamble()
+        self.skills_snapshot().render_preamble()
     }
 
     pub fn load_skill_for_instructions(&self, name: &str) -> Result<LoadedSkill> {
-        self.skills.load(name)
+        self.skills_snapshot().load(name)
     }
 
     pub fn ambiguous_skill_names(&self) -> Vec<String> {
-        self.skills.ambiguous_names().iter().cloned().collect()
+        self.skills_snapshot()
+            .ambiguous_names()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Forwards to [`SkillCatalog::register_hooks`] so callers can build
+    /// a [`squeezy_hooks::HookRegistry`] populated with the declared
+    /// `hooks:` blocks of every non-disabled discovered skill. Returns
+    /// the total number of installed handlers.
+    pub fn register_skill_hooks(&self, registry: &mut squeezy_hooks::HookRegistry) -> usize {
+        self.skills_snapshot().register_hooks(registry)
+    }
+
+    /// For each loaded skill that declares `manifest.tool_deps`,
+    /// return the deps that are not satisfied by the current registry
+    /// (built-in tool name or `mcp:<server>`). Skills with no manifest
+    /// or no declared deps are omitted from the result so the agent
+    /// can iterate the map and emit a warning per skill only when
+    /// there is something to say.
+    pub fn audit_skill_tool_deps(
+        &self,
+        skills: &[LoadedSkill],
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let available_tools: std::collections::BTreeSet<String> =
+            self.specs().iter().map(|spec| spec.name.clone()).collect();
+        let available_mcp_servers: std::collections::BTreeSet<String> = self
+            .mcp_status_snapshot()
+            .per_server
+            .into_iter()
+            .filter_map(|(name, status)| match status {
+                squeezy_mcp::McpServerStatus::Ready { .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let mut out = std::collections::BTreeMap::new();
+        for skill in skills {
+            let Some(manifest) = skill.summary.manifest.as_ref() else {
+                continue;
+            };
+            if manifest.tool_deps.is_empty() {
+                continue;
+            }
+            let missing = squeezy_skills::unmet_tool_deps(
+                &manifest.tool_deps,
+                &available_tools,
+                &available_mcp_servers,
+            );
+            if !missing.is_empty() {
+                out.insert(skill.summary.name.clone(), missing);
+            }
+        }
+        out
+    }
+
+    /// Rebuild the in-memory skill catalog from `skills_config`,
+    /// rediscovering every skill root under `workspace_root` and
+    /// reapplying `[[skills.config]]` enable/disable rules. Returns the
+    /// number of skills in the rebuilt catalog so callers can log a
+    /// terse status line. Existing `ToolRegistry` clones immediately
+    /// see the new catalog on the next access.
+    ///
+    /// Settings hot-reload calls this so editing `[[skills.config]]`
+    /// or dropping a new `SKILL.md` no longer requires a fresh
+    /// session. Cached `specs()` are also invalidated because skill
+    /// rebuilds can change the available-skills preamble that the
+    /// model sees.
+    pub fn rebuild_skills(
+        &self,
+        workspace_root: &std::path::Path,
+        skills_config: &squeezy_core::SkillsConfig,
+    ) -> usize {
+        let rebuilt = SkillCatalog::discover(workspace_root, skills_config);
+        let count = rebuilt.summaries().len();
+        *self.skills.lock().expect("skill catalog lock") = Arc::new(rebuilt);
+        self.invalidate_cached_specs();
+        count
     }
 
     pub async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2896,7 +3150,7 @@ impl ToolRegistry {
         make_result(
             call,
             ToolStatus::Success,
-            self.skills.summaries_json(),
+            self.skills_snapshot().summaries_json(),
             ToolCostHint::default(),
             None,
         )
@@ -3055,7 +3309,7 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        match self.skills.load(&args.name) {
+        match self.skills_snapshot().load(&args.name) {
             Ok(skill) => make_result(
                 call,
                 ToolStatus::Success,
@@ -4685,6 +4939,7 @@ impl ToolOutputStore {
             mut cost_hint,
             receipt,
             spill_model_output: _,
+            web_call_stats: _,
         } = result;
         let original_output_sha256 = receipt.output_sha256;
         let content_sha256 = receipt.content_sha256;
@@ -5855,6 +6110,7 @@ pub(crate) fn make_result(
             content_sha256,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 

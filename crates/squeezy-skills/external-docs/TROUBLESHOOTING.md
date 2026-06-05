@@ -71,3 +71,18 @@ squeezy sessions report <session_id> --preview
 
 Reports are previewed and redacted before sending. If upload fails, Squeezy
 writes the archive locally instead.
+
+## Turn Routing
+
+If the router sends an easy turn to the wrong model tier, toggle it off for the
+session with `/router off`, or disable `[routing].llm_judge` to skip the model
+classifier and use the static heuristic only. Use `squeezy config inspect` to
+see the configured `cheap_model`, `judge_model`, and `expensive_models` regex
+for the active provider.
+
+## TUI Theme Or Display Issues
+
+If the TUI looks wrong on your terminal, try `/theme default` or `/theme bright`
+to switch to a different built-in theme. Custom themes require valid 6-digit hex
+color values. `[tui.tick_rate_ms]` controls the TUI poll interval; raise it on
+slow terminals.

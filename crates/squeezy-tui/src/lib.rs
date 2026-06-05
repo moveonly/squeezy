@@ -74,6 +74,7 @@ mod history;
 mod input;
 mod keymap;
 mod keymap_config;
+mod mcp_settings_edit;
 mod mention;
 mod notification;
 mod overlay;
@@ -133,9 +134,9 @@ const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 /// Default tool-card cap for model-initiated tool calls. Aggressive on
-/// purpose — the structured detail is one keystroke (Ctrl-E / Ctrl-T)
-/// away, and a 5-line preview keeps the transcript readable even when
-/// the model fires off long commands.
+/// purpose — the structured detail is one keystroke (Ctrl+T) away, and a
+/// 5-line preview keeps the transcript readable even when the model fires
+/// off long commands.
 const TOOL_CALL_MAX_LINES: usize = 5;
 /// Larger cap for `!`-shell calls the user typed directly (those carry
 /// `direct_user_shell: true` in their arguments, set by
@@ -895,6 +896,17 @@ async fn run_inner_with_terminal(
             apply_external_settings_reload(&mut app, &mut agent);
             app.needs_redraw = true;
         }
+        // While `/mcp` is open, refresh the cached registry view each
+        // animation tick so background discovery results (status row
+        // flipping ready/failed) appear without requiring a key press.
+        if app.config_screen.is_some()
+            && app.animation_tick.is_multiple_of(settings_poll_every)
+            && let Some(state) = app.config_screen.as_ref()
+            && state.current_section().id == squeezy_core::config_schema::SectionId::McpServers
+        {
+            refresh_mcp_screen_state(&mut app, &agent);
+            app.needs_redraw = true;
+        }
         // Refresh the language-summary status item from the graph at
         // the same cadence as the settings poll. The agent call is
         // cheap when the file watcher hasn't queued changes (graph
@@ -1267,6 +1279,307 @@ async fn apply_plan_choice(
 /// Read errors are surfaced as a notification but do not interrupt the
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
+/// Drain MCP actions staged by the `/mcp` config page key handlers
+/// and dispatch them through the agent. Each action is async because
+/// it reaches into the registry to (re)open sessions and run
+/// discovery; the page handler stages them on the screen state so
+/// the per-key code stays sync.
+async fn drain_mcp_actions(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    feedback: &mut config_screen::ConfigFeedback,
+) {
+    let actions: Vec<config_screen::McpAction> = match app.config_screen.as_mut() {
+        Some(state) => std::mem::take(&mut state.mcp_pending_actions),
+        None => return,
+    };
+    for action in actions {
+        apply_mcp_action(app, agent, feedback, action).await;
+    }
+    // After every batch, refresh the cached snapshot so the next
+    // render reflects the live registry/status — even partial
+    // failures should surface the new state.
+    refresh_mcp_screen_state(app, agent);
+}
+
+async fn apply_mcp_action(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    feedback: &mut config_screen::ConfigFeedback,
+    action: config_screen::McpAction,
+) {
+    use config_screen::{McpAction, Severity};
+    match action {
+        McpAction::Toggle {
+            server,
+            enabled,
+            persist,
+        } => {
+            if persist {
+                snapshot_active_scope_for_undo(app);
+                if let Err(err) = persist_mcp_toggle(app, &server, enabled) {
+                    pop_undo_snapshot(app);
+                    feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+                }
+            }
+            match agent.set_mcp_server_enabled(&server, enabled).await {
+                Ok(_) => {}
+                Err(err) => {
+                    feedback.push(format!("mcp toggle failed: {err}"), Severity::Error);
+                }
+            }
+        }
+        McpAction::Restart { server } => match agent.restart_mcp_server(&server).await {
+            Ok(_) => {}
+            Err(err) => {
+                feedback.push(format!("mcp restart failed: {err}"), Severity::Error);
+            }
+        },
+        McpAction::Add {
+            name,
+            server,
+            persist,
+        } => {
+            if persist {
+                snapshot_active_scope_for_undo(app);
+                if let Err(err) = persist_mcp_add(app, &name, &server) {
+                    pop_undo_snapshot(app);
+                    feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+                }
+            }
+            let mut next = agent.mcp_servers();
+            next.insert(name.clone(), *server);
+            agent.replace_mcp_servers(next).await;
+        }
+        McpAction::Remove { name, persist } => {
+            if persist {
+                // Snapshot the active-scope file BEFORE the write so
+                // Ctrl+Z on the /config screen can revert this MCP
+                // remove the same way it reverts any other persisted
+                // field edit.
+                snapshot_active_scope_for_undo(app);
+                match persist_mcp_remove(app, &name) {
+                    Ok(outcome) => {
+                        if outcome.removed_from_active_scope {
+                            feedback.push(
+                                format!("removed {name} from {}", outcome.path.display()),
+                                Severity::Info,
+                            );
+                        } else {
+                            // Drop the unused undo entry: the file
+                            // never changed because the active scope
+                            // did not define the server, so a Ctrl+Z
+                            // here would needlessly rewrite a fresh
+                            // file with its baseline.
+                            pop_undo_snapshot(app);
+                            feedback.push(
+                                format!(
+                                    "active scope does not define {name}; removed from running \
+                                     session only"
+                                ),
+                                Severity::Info,
+                            );
+                        }
+                        if !outcome.other_tiers_defining.is_empty() {
+                            let paths = outcome
+                                .other_tiers_defining
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            feedback.push(
+                                format!(
+                                    "{name} is still defined in {paths}; switch tabs to remove \
+                                     it from those tiers"
+                                ),
+                                Severity::Warn,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        // Drop the unused undo entry — the write
+                        // failed so there is nothing to revert.
+                        pop_undo_snapshot(app);
+                        feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+                    }
+                }
+            }
+            let mut next = agent.mcp_servers();
+            next.remove(&name);
+            agent.replace_mcp_servers(next).await;
+        }
+    }
+}
+
+/// Refresh the `/mcp` page's cached server map and status snapshot
+/// from the live agent. Called after every MCP action and once per
+/// animation tick so the page reflects in-flight discovery.
+fn refresh_mcp_screen_state(app: &mut TuiApp, agent: &Agent) {
+    if let Some(state) = app.config_screen.as_mut() {
+        state.mcp_servers = agent.mcp_servers();
+        state.mcp_status = agent.mcp_status_snapshot();
+    }
+}
+
+/// Push a snapshot of the active scope's settings file onto the
+/// config-screen undo stack so a subsequent `Ctrl+Z` reverts the
+/// persisted MCP write. Mirrors `save::save_field`'s pre-write
+/// bookkeeping. Reads the bytes BEFORE the persist runs; `None` is
+/// recorded when the tier file did not exist on disk yet so undo
+/// can recreate the absence.
+fn snapshot_active_scope_for_undo(app: &mut TuiApp) {
+    let Some(state) = app.config_screen.as_mut() else {
+        return;
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    let pre_write_bytes = std::fs::read(&path).ok();
+    state.push_undo_snapshot(path, pre_write_bytes);
+}
+
+/// Undo the most recent `snapshot_active_scope_for_undo` push. Used
+/// when a persist fails or turns out to be a no-op (e.g. the active
+/// scope didn't define the server we tried to remove) so the undo
+/// stack stays in lockstep with what is actually on disk.
+fn pop_undo_snapshot(app: &mut TuiApp) {
+    if let Some(state) = app.config_screen.as_mut() {
+        let _ = state.pop_undo_snapshot();
+    }
+}
+
+/// Persist a single server's `enabled` toggle to the active config
+/// scope's TOML.
+///
+/// We write the **full** server table — not just the `enabled` flag
+/// — because `McpServerConfig::merge` (in `squeezy-core`)
+/// unconditionally overwrites `transport` from the higher-precedence
+/// tier. If the toggled server is inherited from a lower tier as
+/// HTTP/SSE and we wrote only `enabled = …` to the active tier, the
+/// parser would default the missing `transport` to `Stdio`, then the
+/// merge would replace the inherited HTTP/SSE transport with that
+/// `Stdio` default — silently corrupting the server config after
+/// reload. Writing the entire table preserves the running server's
+/// full identity on disk.
+fn persist_mcp_toggle(app: &TuiApp, name: &str, enabled: bool) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    // The live cached `mcp_servers` map already reflects the optimistic
+    // post-toggle `enabled` value (the `/mcp` key handler applies it
+    // before staging the action), so the table we serialize here is
+    // exactly what production should see at the next reload.
+    let server = match state.mcp_servers.get(name) {
+        Some(server) => server.clone(),
+        // Toggling a server that the cached snapshot does not know
+        // about would only happen if the registry got out of sync —
+        // a no-op persist is safer than fabricating a fresh table
+        // with default fields that could clobber other tiers.
+        None => return Ok(()),
+    };
+    debug_assert_eq!(server.enabled, enabled);
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        servers.insert(
+            name,
+            toml_edit::Item::Table(mcp_settings_edit::mcp_server_table(&server)),
+        );
+        Ok(())
+    })
+}
+
+fn persist_mcp_add(
+    app: &TuiApp,
+    name: &str,
+    server: &squeezy_core::McpServerConfig,
+) -> std::io::Result<()> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let path = config_screen::tier_path(state, state.scope);
+    mcp_settings_edit::mcp_settings_edit(&path, |servers| {
+        servers.insert(
+            name,
+            toml_edit::Item::Table(mcp_settings_edit::mcp_server_table(server)),
+        );
+        Ok(())
+    })
+}
+
+/// Outcome of a scoped persist_mcp_remove. Carries enough context
+/// for the caller to surface accurate feedback without reaching
+/// back into the screen state itself.
+struct McpRemoveOutcome {
+    /// Active scope's settings path the removal was directed at.
+    path: std::path::PathBuf,
+    /// `true` when the active scope's TOML actually had the entry
+    /// (so the write changed disk state); `false` when the active
+    /// scope inherited the entry from another tier and the persist
+    /// was effectively a no-op.
+    removed_from_active_scope: bool,
+    /// Other tier files (besides the active scope) that still
+    /// define this server. After the persisted write those tiers
+    /// will resurrect the server on the next merge — surfaced to
+    /// the user so the inheritance is not silent.
+    other_tiers_defining: Vec<std::path::PathBuf>,
+}
+
+/// Persist a server removal **scoped to the active /config tab**.
+///
+/// Earlier revisions of this helper iterated every tier file (User,
+/// Project, Local) so a remove always survived restart. That broke
+/// the `/config` model — a user on the User tab could silently
+/// edit Project/Local files for a server they didn't own. This
+/// version writes only to the active scope's TOML, mirroring the
+/// `add` and `toggle` paths. The caller still removes the server
+/// from the live registry so the running session reflects the user's
+/// intent immediately, and we surface the other tiers that still
+/// define the server so the user knows where to go to make the
+/// change durable everywhere.
+fn persist_mcp_remove(app: &TuiApp, name: &str) -> std::io::Result<McpRemoveOutcome> {
+    let state = match app.config_screen.as_ref() {
+        Some(state) => state,
+        None => {
+            // Without a screen we cannot determine the active scope;
+            // an empty outcome keeps the caller's feedback honest.
+            return Ok(McpRemoveOutcome {
+                path: std::path::PathBuf::new(),
+                removed_from_active_scope: false,
+                other_tiers_defining: Vec::new(),
+            });
+        }
+    };
+    let active_path = config_screen::tier_path(state, state.scope);
+    let mut removed_from_active_scope = false;
+    if active_path.exists() {
+        mcp_settings_edit::mcp_settings_edit(&active_path, |servers| {
+            removed_from_active_scope = servers.remove(name).is_some();
+            Ok(())
+        })?;
+    }
+    // Read-only sniff at the other tier files to spot inherited
+    // definitions. We do NOT mutate them — that's the whole point of
+    // the scope-respecting fix.
+    let mut other_tiers_defining = Vec::new();
+    for path in [
+        state.sources.user_path_default.clone(),
+        state.sources.project_path_default.clone(),
+        state.sources.repo_path_default.clone(),
+    ] {
+        if path == active_path || !path.exists() {
+            continue;
+        }
+        if mcp_settings_edit::tier_defines_mcp_server(&path, name) {
+            other_tiers_defining.push(path);
+        }
+    }
+    Ok(McpRemoveOutcome {
+        path: active_path,
+        removed_from_active_scope,
+        other_tiers_defining,
+    })
+}
+
 fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     let new_cfg = match AppConfig::from_env_and_settings() {
         Ok(cfg) => cfg,
@@ -1321,13 +1634,14 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
 }
 
 /// Drain the config screen's accumulated feedback into the durable
-/// transcript. Errors and warnings render as `⚠` warning lines; info and
-/// success notes render as dim operational chrome.
+/// transcript. Errors render as red `✖` failure lines; warnings render as
+/// cyan `⚠` lines; info and success notes render as dim operational chrome.
 fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::ConfigFeedback) {
     use config_screen::Severity;
     for entry in feedback.drain() {
         match entry.severity {
-            Severity::Error | Severity::Warn => {
+            Severity::Error => app.push_error(entry.message),
+            Severity::Warn => {
                 app.push_warn(entry.message);
             }
             Severity::Info | Severity::Success => app.push_status(entry.message),
@@ -1942,13 +2256,16 @@ fn focus_subagent_pane_from_composer(app: &mut TuiApp) {
 /// this overlay (which renders the active conversation source).
 fn open_subagent_transcript_overlay(app: &mut TuiApp) {
     app.transcript_overlay_scrollbar_cache.set(None);
-    // Open folded, formatted like the main inline conversation; Ctrl-T then
+    // Open folded, formatted like the main inline conversation; Ctrl+T then
     // expands every body, Esc closes.
     app.transcript_overlay = Some(TranscriptOverlayState {
         detail: OverlayDetail::Collapsed,
         ..TranscriptOverlayState::default()
     });
-    app.status = "subagent conversation — Ctrl-T to expand, Esc to close".to_string();
+    app.status = format!(
+        "subagent conversation — {} to expand, Esc to close",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
 }
 
 fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -2112,6 +2429,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             let state = app.config_screen.as_mut().expect("checked above");
             config_screen::handle_key(state, agent, &mut feedback, key)
         };
+        // Drain any MCP actions staged by `/mcp` key bindings before
+        // the next draw so the user sees status updates immediately
+        // rather than waiting for the next animation tick.
+        drain_mcp_actions(app, agent, &mut feedback).await;
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             close_config_screen(app, agent, "config closed");
         }
@@ -2197,9 +2518,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    // (Old `Ctrl+E` readline line-end is gone — that key now toggles
-    // expand-all unconditionally via the keymap. Use `End` /
-    // `Cmd+Right` for cursor-to-line-end.)
+    // `Ctrl+E` was removed; use `End` / `Cmd+Right` for cursor-to-line-end.
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
         delete_to_line_end(app);
@@ -2413,8 +2732,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             if reject_unknown_slash_command(app, &input) {
                 return Ok(false);
             }
-            // Stash the typed prompt before clearing so that a Ctrl-C/Esc
-            // during the turn can restore it via Ctrl-R. Completion clears
+            // Stash the typed prompt before clearing so that a Ctrl+C/Esc
+            // during the turn can restore it via Ctrl+R. Completion clears
             // this field; only Cancelled/Failed leave it set.
             app.cancelled_prompt = Some(input.clone());
             push_input_history(app, input.clone());
@@ -2847,7 +3166,12 @@ fn toggle_config_screen(
     // if the reload fails.
     let effective = squeezy_core::AppConfig::from_env_and_settings()
         .unwrap_or_else(|_| agent.config_snapshot());
-    let state = config_screen::ConfigScreenState::new(effective, focus);
+    let mut state = config_screen::ConfigScreenState::new(effective, focus);
+    // Seed the cached registry view from the live agent so the
+    // McpServers section reflects in-flight enable/disable from the
+    // moment it opens.
+    state.mcp_servers = agent.mcp_servers();
+    state.mcp_status = agent.mcp_status_snapshot();
     app.config_screen = Some(state);
     app.status = "config".to_string();
 }
@@ -3055,7 +3379,9 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
         return false;
     }
     match command {
-        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/help" => false,
+        "/config" | "/options" | "/statusline" | "/model" | "/permissions" | "/mcp" | "/help" => {
+            false
+        }
         "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
         _ => true,
     }
@@ -3195,6 +3521,7 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Cost
         | DispatchCommand::Context
         | DispatchCommand::Reviewer
+        | DispatchCommand::Mcp
         | DispatchCommand::Model
         | DispatchCommand::Permissions
         | DispatchCommand::Attachments
@@ -3457,11 +3784,15 @@ fn expand_prompt_template_or_fallthrough(
     input: &str,
     _surface: SlashSurface,
 ) -> bool {
-    let Some(expanded) = app.prompt_templates.expand(input) else {
+    let Some((expanded, source, arg_count)) = app.prompt_templates.expand_with_info(input) else {
         return false;
     };
     app.push_slash_command_echo(input);
-    if app.turn_rx.is_some() {
+    let queued = app.turn_rx.is_some();
+    // Fire prompt-template telemetry: source, arg-count bucket, and
+    // queued-vs-started outcome.
+    agent.record_prompt_template_telemetry(source.as_str(), arg_count, queued);
+    if queued {
         app.prompt_queue.push_back(expanded);
         app.status = format!("queued ({})", app.prompt_queue.len());
         return true;
@@ -3498,6 +3829,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 ));
             }
             toggle_config_screen(app, agent, id);
+        }
+        DispatchCommand::Mcp => {
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::McpServers),
+            );
         }
         DispatchCommand::Statusline => toggle_status_line_setup(app),
         DispatchCommand::Plan { prompt } => {
@@ -6777,7 +7115,7 @@ impl TranscriptOverlayMode {
 /// How much of each entry the overlay shows. `Collapsed` mirrors the main
 /// inline view — tool cards folded, reasoning trimmed — so a subagent opens
 /// formatted like the main conversation; `Expanded` unfolds every body for the
-/// "read everything" view. Ctrl-T steps Collapsed → Expanded → closed.
+/// "read everything" view. Ctrl+T steps Collapsed → Expanded → closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OverlayDetail {
     Collapsed,
@@ -6856,7 +7194,10 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Some(state) => state,
         None => return,
     };
-    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn or wheel scroll ";
+    let title = format!(
+        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll ",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -7291,21 +7632,21 @@ fn render_transcript_overlay_scrollbar(
 
 /// Build the per-entry line list for the overlay: every committed entry is
 /// forced to its expanded form, and the live assistant tail is appended so
-/// opening Ctrl-T mid-turn does not look frozen.
+/// opening Ctrl+T mid-turn does not look frozen.
 fn transcript_lines_for_overlay(
     app: &TuiApp,
     width: Option<u16>,
     expand_all: bool,
 ) -> Vec<Line<'static>> {
-    // Expanded is the "Ctrl-T for full transcript" escape hatch — body content
-    // blocks (read_tool_output payloads, shell stdout/stderr) honour this
-    // verbosity, so pin Verbose to defeat the per-mode line cap. Collapsed
-    // mirrors the inline view, so it honours the user's configured verbosity.
+    // Pin Verbose when the overlay is fully expanded so the per-mode cap is
+    // lifted. Collapsed mode mirrors the inline view verbosity.
     let overlay_verbosity = if expand_all {
         ToolOutputVerbosity::Verbose
     } else {
         app.tool_output_verbosity
     };
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let shortcut = shortcut.as_str();
     let mut lines = Vec::new();
     if let Some(title) = active_conversation_title(app) {
         lines.push(title);
@@ -7327,6 +7668,7 @@ fn transcript_lines_for_overlay(
                         false,
                         selected_entry == Some(index),
                         extras,
+                        shortcut,
                     );
                     push_rail_work_block(
                         &mut lines,
@@ -7343,9 +7685,6 @@ fn transcript_lines_for_overlay(
             Some(ToolRun::Suppressed) => continue,
             Some(ToolRun::Lead { extras }) => {
                 let members = collect_tool_run_members(entries, index, extras);
-                // Expanded forces every member's body open so the full
-                // transcript reads end to end; Collapsed honours the lead's
-                // folded state so the view matches the inline conversation.
                 let mut block = format_grouped_tool_result_entry(
                     &members,
                     !expand_all && entry.collapsed,
@@ -7353,6 +7692,7 @@ fn transcript_lines_for_overlay(
                     overlay_verbosity,
                     width,
                     ToolCardSurface::Plain,
+                    shortcut,
                 );
                 push_rail_work_block(
                     &mut lines,
@@ -7373,6 +7713,7 @@ fn transcript_lines_for_overlay(
             width,
             app.show_reasoning_usage,
             expand_all,
+            shortcut,
         );
         if is_rail_work_node(&entry.kind) {
             push_rail_work_block(
@@ -7409,11 +7750,18 @@ fn format_transcript_entry_expanded(
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
-        TranscriptEntryKind::Message(item) => {
-            format_message_entry_with_width(item, false, selected, outcome, width, show_reasoning)
-        }
+        TranscriptEntryKind::Message(item) => format_message_entry_with_width(
+            item,
+            false,
+            selected,
+            outcome,
+            width,
+            show_reasoning,
+            transcript_shortcut,
+        ),
         TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
             tool,
             false,
@@ -7421,13 +7769,19 @@ fn format_transcript_entry_expanded(
             tool_output_verbosity,
             width,
             ToolCardSurface::Plain,
+            transcript_shortcut,
         ),
         TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false, width),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
-                let mut lines = reasoning_block_lines(&snapshot.display_text, false, selected);
+                let mut lines = reasoning_block_lines(
+                    &snapshot.display_text,
+                    false,
+                    selected,
+                    transcript_shortcut,
+                );
                 lines.push(Line::from(""));
                 lines
             } else {
@@ -7470,6 +7824,7 @@ fn cached_transcript_entry_lines(
     width: Option<u16>,
     show_reasoning: bool,
     expanded: bool,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let palette_generation = render::palette::palette_generation();
     let context_hash = render_context_hash(
@@ -7479,6 +7834,7 @@ fn cached_transcript_entry_lines(
         width,
         show_reasoning,
         expanded,
+        transcript_shortcut,
     );
     render::cache::get_or_compute_entry(
         session_id,
@@ -7495,6 +7851,7 @@ fn cached_transcript_entry_lines(
                     outcome,
                     width,
                     show_reasoning,
+                    transcript_shortcut,
                 )
             } else {
                 format_transcript_entry_with_width(
@@ -7504,26 +7861,32 @@ fn cached_transcript_entry_lines(
                     outcome,
                     width,
                     show_reasoning,
+                    transcript_shortcut,
                 )
             }
         },
     )
 }
 
-/// Pack the per-render context bits into a single `u64` for the entry
-/// cache's validity check. Bits are deliberately laid out non-overlap so
-/// flipping any single dimension produces a distinct hash without a
-/// hashing pass (the cache only needs equality, not uniform
-/// distribution).
-///
-/// Layout:
+/// FNV-1a-inspired fold over the bytes of a short string.
+/// Used only to incorporate the transcript shortcut key (e.g. "Ctrl+T")
+/// into the render-cache context hash so a [tui.keymap] rebind busts
+/// cached card lines. The set of possible values is tiny, so collision
+/// probability is negligible.
+fn shortcut_hash(s: &str) -> u64 {
+    s.bytes()
+        .fold(2166136261u64, |h, b| h.wrapping_mul(16777619) ^ b as u64)
+}
+
+/// Layout (bits used):
 /// - bit 0:      selected
 /// - bit 1:      show_reasoning
 /// - bit 2:      expanded (overlay vs inline)
-/// - bits 4-5:   tool_output_verbosity (Compact=0, Normal=1, Verbose=2)
-/// - bit 8:      message outcome (Normal=0, Failed=1)
-/// - bits 16-31: width (0 when absent)
-/// - bit 32:     width-present sentinel (distinguishes `Some(0)` from `None`)
+/// - bits 4-5:   tool_output_verbosity
+/// - bit 8:      message outcome
+/// - bits 16-31: width value
+/// - bit 32:     width-present sentinel
+/// - bits 33-63: shortcut_hash(transcript_shortcut) (truncated)
 fn render_context_hash(
     selected: bool,
     verbosity: ToolOutputVerbosity,
@@ -7531,6 +7894,7 @@ fn render_context_hash(
     width: Option<u16>,
     show_reasoning: bool,
     expanded: bool,
+    transcript_shortcut: &str,
 ) -> u64 {
     let mut h: u64 = 0;
     if selected {
@@ -7557,6 +7921,7 @@ fn render_context_hash(
         h |= (w as u64) << 16;
         h |= 1u64 << 32;
     }
+    h ^= shortcut_hash(transcript_shortcut) << 33;
     h
 }
 
@@ -7735,6 +8100,8 @@ fn transcript_lines_for_render(
         lines.extend(startup_card_lines(app, card_width));
         lines.push(Line::from(""));
     }
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let shortcut = shortcut.as_str();
     let entries = active_transcript_entries(app);
     let selected_entry = active_selected_entry(app);
     let mut prev_work = false;
@@ -7755,6 +8122,7 @@ fn transcript_lines_for_render(
                 width,
                 app.show_reasoning_usage,
                 settle,
+                shortcut,
             );
             push_rail_work_block(
                 &mut lines,
@@ -7775,6 +8143,7 @@ fn transcript_lines_for_render(
                         item.collapsed,
                         selected_entry == Some(index),
                         extras,
+                        shortcut,
                     );
                     push_rail_work_block(
                         &mut lines,
@@ -7798,6 +8167,7 @@ fn transcript_lines_for_render(
                     app.tool_output_verbosity,
                     width,
                     ToolCardSurface::Tinted,
+                    shortcut,
                 );
                 push_rail_work_block(
                     &mut lines,
@@ -7818,6 +8188,7 @@ fn transcript_lines_for_render(
             width,
             app.show_reasoning_usage,
             false,
+            shortcut,
         );
         if is_rail_work_node(&item.kind) {
             push_rail_work_block(
@@ -7877,6 +8248,7 @@ fn settle_folded_entry_lines(
     width: Option<u16>,
     show_reasoning: bool,
     settle: SettleState,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let collapsed = format_transcript_entry_with_width(
         entry,
@@ -7885,6 +8257,7 @@ fn settle_folded_entry_lines(
         outcome,
         width,
         show_reasoning,
+        transcript_shortcut,
     );
     let collapsed_lines = collapsed.len().min(u16::MAX as usize) as u16;
     let elapsed_ms = settle
@@ -7893,9 +8266,6 @@ fn settle_folded_entry_lines(
         .as_millis()
         .min(u64::MAX as u128) as u64;
     let visible = settle_visible_line_count(settle.from_lines, collapsed_lines, elapsed_ms);
-    // Once the fold has reached (or passed) the collapsed height there is
-    // nothing left to animate — serve the collapsed block directly so the
-    // animated tail frame is pixel-identical to the resting state.
     if visible <= collapsed_lines {
         return collapsed;
     }
@@ -7906,6 +8276,7 @@ fn settle_folded_entry_lines(
         outcome,
         width,
         show_reasoning,
+        transcript_shortcut,
     );
     let take = (visible as usize).min(expanded.len());
     if take >= expanded.len() {
@@ -8125,7 +8496,7 @@ fn visual_line_count(lines: &[Line<'_>], width: u16) -> u16 {
 
 #[cfg(test)]
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
-    let lines = format_message_entry(item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(item, false, false, MessageOutcome::Normal, "Ctrl+T");
     let fallback = lines.first().cloned();
     lines
         .into_iter()
@@ -8144,8 +8515,17 @@ fn format_transcript_entry(
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
-    format_transcript_entry_with_width(entry, selected, tool_output_verbosity, outcome, None, true)
+    format_transcript_entry_with_width(
+        entry,
+        selected,
+        tool_output_verbosity,
+        outcome,
+        None,
+        true,
+        transcript_shortcut,
+    )
 }
 
 fn format_transcript_entry_with_width(
@@ -8155,6 +8535,7 @@ fn format_transcript_entry_with_width(
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
         TranscriptEntryKind::Message(item) => format_message_entry_with_width(
@@ -8164,6 +8545,7 @@ fn format_transcript_entry_with_width(
             outcome,
             width,
             show_reasoning,
+            transcript_shortcut,
         ),
         TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
             tool,
@@ -8172,6 +8554,7 @@ fn format_transcript_entry_with_width(
             tool_output_verbosity,
             width,
             ToolCardSurface::Tinted,
+            transcript_shortcut,
         ),
         TranscriptEntryKind::Log(entry_log) => {
             format_log_entry(entry_log, entry.collapsed, selected)
@@ -8180,8 +8563,12 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
-                let mut lines =
-                    reasoning_block_lines(&snapshot.display_text, entry.collapsed, selected);
+                let mut lines = reasoning_block_lines(
+                    &snapshot.display_text,
+                    entry.collapsed,
+                    selected,
+                    transcript_shortcut,
+                );
                 lines.push(Line::from(""));
                 lines
             } else {
@@ -8749,8 +9136,17 @@ fn format_message_entry(
     collapsed: bool,
     selected: bool,
     outcome: MessageOutcome,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
-    format_message_entry_with_width(item, collapsed, selected, outcome, None, true)
+    format_message_entry_with_width(
+        item,
+        collapsed,
+        selected,
+        outcome,
+        None,
+        true,
+        transcript_shortcut,
+    )
 }
 
 fn format_message_entry_with_width(
@@ -8760,6 +9156,7 @@ fn format_message_entry_with_width(
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     if item.role == Role::User {
         return format_user_prompt_entry(item, selected, width);
@@ -8772,6 +9169,7 @@ fn format_message_entry_with_width(
             outcome,
             width,
             show_reasoning,
+            transcript_shortcut,
         );
     }
     let (action, color) = role_action(&item.role);
@@ -8794,7 +9192,7 @@ fn format_message_entry_with_width(
             label_color,
             action,
             action_color,
-            collapsed_content_summary(&item.content),
+            collapsed_content_summary(&item.content, transcript_shortcut),
             content_style,
         )];
     }
@@ -8961,6 +9359,7 @@ fn format_assistant_message_entry(
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
         crate::render::theme::red()
@@ -8976,13 +9375,14 @@ fn format_assistant_message_entry(
             &snapshot.display_text,
             collapsed,
             false,
+            transcript_shortcut,
         ));
     }
     if collapsed {
         lines.push(assistant_line(
             selected,
             assistant_static_span(color),
-            collapsed_content_summary(&item.content),
+            collapsed_content_summary(&item.content, transcript_shortcut),
             Style::default(),
         ));
     } else {
@@ -8998,8 +9398,13 @@ fn format_assistant_message_entry(
     lines
 }
 
-fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
-    reasoning_block_lines_with_extras(text, collapsed, selected, 0)
+fn reasoning_block_lines(
+    text: &str,
+    collapsed: bool,
+    selected: bool,
+    transcript_shortcut: &str,
+) -> Vec<Line<'static>> {
+    reasoning_block_lines_with_extras(text, collapsed, selected, 0, transcript_shortcut)
 }
 
 /// `extras` is the number of additional adjacent reasoning entries this chip
@@ -9010,6 +9415,7 @@ fn reasoning_block_lines_with_extras(
     collapsed: bool,
     selected: bool,
     extras: usize,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let marker = if selected { "> " } else { "" };
@@ -9023,7 +9429,7 @@ fn reasoning_block_lines_with_extras(
             .unwrap_or_default();
         let mut suffix = if body_lines.len() > 1 {
             format!(
-                " … +{} lines (Ctrl-T for full transcript)",
+                " … +{} lines ({transcript_shortcut} for full transcript)",
                 body_lines.len() - 1
             )
         } else {
@@ -9203,12 +9609,12 @@ fn collect_tool_run_members(
     members
 }
 
-fn collapsed_content_summary(content: &str) -> String {
+fn collapsed_content_summary(content: &str, transcript_shortcut: &str) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.len() > 1 {
         let first = compact_text(lines.first().copied().unwrap_or_default(), 120);
         format!(
-            "{first} … +{} lines (Ctrl-T for full transcript)",
+            "{first} … +{} lines ({transcript_shortcut} for full transcript)",
             lines.len() - 1
         )
     } else {
@@ -9223,15 +9629,16 @@ fn format_tool_result_entry(
     tool_output_verbosity: ToolOutputVerbosity,
     width: Option<u16>,
     card_surface: ToolCardSurface,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
     let summary_spans = tool_result_summary_spans(tool);
     let header = action_line_spans(selected, marker, color, action, color, summary_spans);
     let body = if collapsed {
-        collapsed_tool_preview_lines(tool, tool_output_verbosity, width)
+        collapsed_tool_preview_lines(tool, tool_output_verbosity, width, transcript_shortcut)
     } else {
-        expanded_tool_detail_lines(tool, tool_output_verbosity)
+        expanded_tool_detail_lines(tool, tool_output_verbosity, transcript_shortcut)
     };
     render_tool_card(header, body, card_surface)
 }
@@ -9287,7 +9694,7 @@ fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'
 /// `extras + 1` consecutive same-tool same-status entries.
 ///
 /// In collapsed form the header reads `"Read 3 files"` etc., the body is
-/// one summary row per member followed by a `(Ctrl-T for full transcript)`
+/// one summary row per member followed by a `(Ctrl+T for full transcript)`
 /// affordance row. In expanded form the header is followed by each
 /// member's normal tool-card body rendered inline so the user can scan
 /// their full output.
@@ -9298,6 +9705,7 @@ fn format_grouped_tool_result_entry(
     tool_output_verbosity: ToolOutputVerbosity,
     width: Option<u16>,
     card_surface: ToolCardSurface,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     debug_assert!(members.len() >= 2, "grouped card needs at least 2 members");
     let lead = members[0];
@@ -9319,7 +9727,7 @@ fn format_grouped_tool_result_entry(
         body.push(detail_line(
             false,
             crate::render::theme::quiet(),
-            "(Ctrl-T for full transcript)".to_string(),
+            format!("({transcript_shortcut} for full transcript)"),
         ));
     } else {
         // Stack each child's full single-tool render. Each is already
@@ -9336,6 +9744,7 @@ fn format_grouped_tool_result_entry(
                 tool_output_verbosity,
                 width,
                 card_surface,
+                transcript_shortcut,
             ));
         }
     }
@@ -9456,22 +9865,27 @@ fn collapsed_tool_preview_lines(
     tool: &ToolTranscript,
     tool_output_verbosity: ToolOutputVerbosity,
     _width: Option<u16>,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     if tool_bypasses_preview_cap_for_tool(tool) {
-        return expanded_tool_detail_lines(tool, tool_output_verbosity);
+        return expanded_tool_detail_lines(tool, tool_output_verbosity, transcript_shortcut);
     }
-    let detail = expanded_tool_detail_lines(tool, tool_output_verbosity);
+    let detail = expanded_tool_detail_lines(tool, tool_output_verbosity, transcript_shortcut);
     let cap = tool_preview_line_cap(tool);
-    head_tail_truncate_lines(detail, cap)
+    head_tail_truncate_lines(detail, cap, transcript_shortcut)
 }
 
 /// Head-tail truncate a list of rendered detail lines, inserting a single
-/// "… +N lines (Ctrl-T for full transcript)" ellipsis between the head and tail
+/// "… +N lines (Ctrl+T for full transcript)" ellipsis between the head and tail
 /// when the total exceeds `2 * cap`. Cap is the maximum number of lines
 /// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
 /// wording stays consistent with the existing diff renderer
 /// (see `render::diff::head_tail`).
-fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'static>> {
+fn head_tail_truncate_lines(
+    lines: Vec<Line<'static>>,
+    cap: usize,
+    transcript_shortcut: &str,
+) -> Vec<Line<'static>> {
     if cap == 0 || lines.len() <= cap.saturating_mul(2) {
         return lines;
     }
@@ -9481,7 +9895,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out.push(detail_line(
         false,
         crate::render::theme::quiet(),
-        format!("… +{omitted} lines (Ctrl-T for full transcript)"),
+        format!("… +{omitted} lines ({transcript_shortcut} for full transcript)"),
     ));
     out.extend(
         lines
@@ -11070,25 +11484,31 @@ fn friendly_tool_name(tool_name: &str) -> String {
 fn expanded_tool_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     match tool.result.tool_name.as_str() {
-        "shell" | "verify" => expanded_shell_detail_lines(tool, verbosity),
+        "shell" | "verify" => expanded_shell_detail_lines(tool, verbosity, transcript_shortcut),
         "decl_search" => expanded_decl_search_detail_lines(tool, verbosity),
         "repo_map" => expanded_repo_map_detail_lines(tool),
         "diff_context" => expanded_diff_context_detail_lines(tool),
         "plan_patch" => expanded_plan_patch_detail_lines(tool),
-        "apply_patch" | "write_file" => expanded_edit_detail_lines(tool, verbosity),
-        "symbol_context" => expanded_symbol_context_detail_lines(tool, verbosity),
-        "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
-            expanded_read_search_detail_lines(tool, verbosity)
+        "apply_patch" | "write_file" => {
+            expanded_edit_detail_lines(tool, verbosity, transcript_shortcut)
         }
-        _ => expanded_generic_tool_detail_lines(tool, verbosity),
+        "symbol_context" => {
+            expanded_symbol_context_detail_lines(tool, verbosity, transcript_shortcut)
+        }
+        "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
+            expanded_read_search_detail_lines(tool, verbosity, transcript_shortcut)
+        }
+        _ => expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut),
     }
 }
 
 fn expanded_symbol_context_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let packet_cap = match verbosity {
         ToolOutputVerbosity::Compact => 3,
@@ -11157,7 +11577,7 @@ fn expanded_symbol_context_detail_lines(
             false,
             crate::render::theme::quiet(),
             format!(
-                "+{} more packets (Ctrl-T for full transcript)",
+                "+{} more packets ({transcript_shortcut} for full transcript)",
                 total - packet_cap
             ),
         ));
@@ -11168,8 +11588,9 @@ fn expanded_symbol_context_detail_lines(
 fn expanded_shell_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
-    let mut lines = shell_output_block_lines(tool, None);
+    let mut lines = shell_output_block_lines(tool, None, transcript_shortcut);
     if let Some(command) = tool
         .call
         .as_ref()
@@ -11204,7 +11625,11 @@ fn expanded_shell_detail_lines(
     // stdout and stderr already appear once, merged, in the combined block
     // above — there are no separate per-stream blocks.
     if lines.is_empty() {
-        lines.extend(expanded_generic_tool_detail_lines(tool, verbosity));
+        lines.extend(expanded_generic_tool_detail_lines(
+            tool,
+            verbosity,
+            transcript_shortcut,
+        ));
     }
     lines
 }
@@ -11212,6 +11637,7 @@ fn expanded_shell_detail_lines(
 fn shell_output_block_lines(
     tool: &ToolTranscript,
     preview_limit: Option<usize>,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let stdout = string_arg(&tool.result.content, "stdout").unwrap_or_default();
     let stderr = string_arg(&tool.result.content, "stderr").unwrap_or_default();
@@ -11231,15 +11657,19 @@ fn shell_output_block_lines(
     let limit = preview_limit.unwrap_or(usize::MAX);
     let is_diff = shell_text_looks_like_diff(&output);
     let mut lines = vec![shell_output_title_line(&command, &workdir)];
-    lines.extend(head_tail_lines(&output, limit).into_iter().map(|line| {
-        if line.truncated_marker {
-            detail_line(false, crate::render::theme::quiet(), line.text)
-        } else if is_diff {
-            shell_output_diff_line(&line.text)
-        } else {
-            shell_output_line(&line.text)
-        }
-    }));
+    lines.extend(
+        head_tail_lines(&output, limit, transcript_shortcut)
+            .into_iter()
+            .map(|line| {
+                if line.truncated_marker {
+                    detail_line(false, crate::render::theme::quiet(), line.text)
+                } else if is_diff {
+                    shell_output_diff_line(&line.text)
+                } else {
+                    shell_output_line(&line.text)
+                }
+            }),
+    );
     lines
 }
 
@@ -11556,6 +11986,7 @@ fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>>
 fn expanded_edit_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let files = edit_changed_files(tool);
@@ -11593,7 +12024,7 @@ fn expanded_edit_detail_lines(
         }));
     }
     if lines.is_empty() {
-        expanded_generic_tool_detail_lines(tool, verbosity)
+        expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut)
     } else {
         lines
     }
@@ -11602,16 +12033,21 @@ fn expanded_edit_detail_lines(
 fn expanded_read_search_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let lines = match tool.result.tool_name.as_str() {
         "glob" => expanded_glob_detail_lines_v(tool, verbosity),
         "grep" => expanded_grep_detail_lines_v(tool, verbosity),
-        "read_file" | "read_slice" => expanded_read_file_detail_lines(tool, verbosity),
-        "read_tool_output" => expanded_read_tool_output_detail_lines(tool, verbosity),
-        _ => expanded_generic_tool_detail_lines(tool, verbosity),
+        "read_file" | "read_slice" => {
+            expanded_read_file_detail_lines(tool, verbosity, transcript_shortcut)
+        }
+        "read_tool_output" => {
+            expanded_read_tool_output_detail_lines(tool, verbosity, transcript_shortcut)
+        }
+        _ => expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut),
     };
     if lines.is_empty() {
-        expanded_generic_tool_detail_lines(tool, verbosity)
+        expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut)
     } else {
         lines
     }
@@ -11716,6 +12152,7 @@ fn expanded_grep_detail_lines_v(
 fn expanded_read_file_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let path = string_arg(&tool.result.content, "path");
     let bytes = number_field(&tool.result.content, "bytes_returned");
@@ -11769,7 +12206,12 @@ fn expanded_read_file_detail_lines(
         ));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
-        lines.extend(output_block_lines("content", &content, verbosity));
+        lines.extend(output_block_lines(
+            "content",
+            &content,
+            verbosity,
+            transcript_shortcut,
+        ));
     }
     lines
 }
@@ -11777,6 +12219,7 @@ fn expanded_read_file_detail_lines(
 fn expanded_read_tool_output_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(handle) = string_arg(&tool.result.content, "handle") {
@@ -11811,7 +12254,11 @@ fn expanded_read_tool_output_detail_lines(
                 result,
                 repeat_count: 1,
             };
-            lines.extend(expanded_tool_detail_lines(&nested, verbosity));
+            lines.extend(expanded_tool_detail_lines(
+                &nested,
+                verbosity,
+                transcript_shortcut,
+            ));
             return lines;
         }
         if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
@@ -11839,6 +12286,7 @@ fn expanded_read_tool_output_detail_lines(
             for line in head_tail_lines(
                 &summary.messages.join("\n"),
                 saved_output_preview_limit(verbosity),
+                transcript_shortcut,
             ) {
                 if line.truncated_marker {
                     lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
@@ -11852,6 +12300,7 @@ fn expanded_read_tool_output_detail_lines(
             for line in head_tail_lines(
                 &summary.stderr.join("\n"),
                 saved_output_preview_limit(verbosity),
+                transcript_shortcut,
             ) {
                 if line.truncated_marker {
                     lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
@@ -11876,21 +12325,21 @@ fn expanded_read_tool_output_detail_lines(
         // Spilled tool payloads are routinely hundreds of lines of raw JSON,
         // so fold inline even on the expanded card — the overlay (which
         // pins Verbose) still hands the full content to anyone hitting
-        // Ctrl-T. Generic `output_block_lines` stays unbounded so the
+        // Ctrl+T. Generic `output_block_lines` stays unbounded so the
         // existing "expand grep → see every match" behaviour is preserved.
         let limit = saved_output_preview_limit(verbosity);
         let byte_limit = saved_output_line_byte_limit(verbosity);
         if !content.trim().is_empty() {
             lines.push(detail_line(false, crate::render::theme::quiet(), "content"));
-            for line in head_tail_lines(&content, limit) {
+            for line in head_tail_lines(&content, limit, transcript_shortcut) {
                 if line.truncated_marker {
                     lines.push(detail_line(false, crate::render::theme::quiet(), line.text));
                 } else {
                     // Clamp each line by bytes: spilled payloads are routinely
                     // minified single-line JSON, which the line-count cap above
                     // can't bound — one such line would otherwise wrap into
-                    // hundreds of rows. Verbose (the Ctrl-T overlay) is left
-                    // unbounded so the full content stays available.
+                    // hundreds of rows. Verbose (the overlay) is left unbounded
+                    // so the full content stays available.
                     let text = truncate_bytes(&line.text, byte_limit);
                     lines.push(detail_spans_line(styled_output_spans(&text)));
                 }
@@ -12078,20 +12527,21 @@ fn looks_like_cargo_json_line(line: &str) -> bool {
 fn expanded_generic_tool_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     // Verbose mode preserves the legacy `details {...}` JSON dump so users
     // who really want the raw payload (debugging a new tool, comparing two
     // runs) can still get it via `/verbosity verbose`.
     if matches!(verbosity, ToolOutputVerbosity::Verbose) {
         let preview = preview_tool_result(&tool.result, verbosity);
-        return output_block_lines("details", &preview, verbosity);
+        return output_block_lines("details", &preview, verbosity, transcript_shortcut);
     }
 
     // 1. If the tool surfaces plain stdout/stderr/output, render that —
     //    walls of JSON aren't useful when the tool already gives us text.
     if let Some(text) = tool_result_output_text(&tool.result) {
         let preview = truncate_bytes(&text, TOOL_PREVIEW_COMPACT_BYTES);
-        return output_block_lines("output", &preview, verbosity);
+        return output_block_lines("output", &preview, verbosity, transcript_shortcut);
     }
 
     // 2. Otherwise summarise the top-level keys of the result. Each value
@@ -12099,7 +12549,7 @@ fn expanded_generic_tool_detail_lines(
     //    summary stays scannable. Full JSON is one verbosity flip away.
     let Some(object) = tool.result.content.as_object() else {
         let preview = preview_tool_result(&tool.result, verbosity);
-        return output_block_lines("details", &preview, verbosity);
+        return output_block_lines("details", &preview, verbosity, transcript_shortcut);
     };
     if object.is_empty() {
         return Vec::new();
@@ -12129,7 +12579,7 @@ fn expanded_generic_tool_detail_lines(
             false,
             crate::render::theme::quiet(),
             format!(
-                "+{} more fields (Ctrl-T for full transcript)",
+                "+{} more fields ({transcript_shortcut} for full transcript)",
                 total_keys - shown
             ),
         ));
@@ -12180,12 +12630,13 @@ fn output_block_lines(
     label: &'static str,
     content: &str,
     _verbosity: ToolOutputVerbosity,
+    transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     if content.trim().is_empty() {
         return Vec::new();
     }
     let limit = usize::MAX;
-    let lines = head_tail_lines(content, limit);
+    let lines = head_tail_lines(content, limit, transcript_shortcut);
     let is_diff = shell_text_looks_like_diff(content);
     let mut rendered = vec![detail_line(false, crate::render::theme::quiet(), label)];
     rendered.extend(lines.into_iter().map(|line| {
@@ -12206,7 +12657,7 @@ struct PreviewLine {
     truncated_marker: bool,
 }
 
-fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
+fn head_tail_lines(content: &str, limit: usize, transcript_shortcut: &str) -> Vec<PreviewLine> {
     let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
     if lines.is_empty() {
         lines.push(content.to_string());
@@ -12233,7 +12684,7 @@ fn head_tail_lines(content: &str, limit: usize) -> Vec<PreviewLine> {
         })
         .collect::<Vec<_>>();
     preview.push(PreviewLine {
-        text: format!("… +{omitted} lines (Ctrl-T for full transcript)"),
+        text: format!("… +{omitted} lines ({transcript_shortcut} for full transcript)"),
         truncated_marker: true,
     });
     preview.extend(
@@ -12462,12 +12913,12 @@ fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript)
     //     payload was written to disk under `.squeezy/tool_outputs/<sha>`.
     //     The model gets a handle it can pass to `read_tool_output`. The
     //     card body shows a preview; the rest is NOT in the transcript
-    //     and Ctrl-T can't surface it, so name the file directly — that
+    //     and Ctrl+T can't surface it, so name the file directly — that
     //     is the only escape hatch a curious user has.
     //   * Tool-cap: the tool itself returned a partial slice (repo_map
     //     packet cap, decl_search row cap, etc.). The model needs to
     //     re-query with narrower filters to see more.
-    // The old shared "more available" label promised something Ctrl-T
+    // The old shared "more available" label promised something Ctrl+T
     // couldn't deliver — distinguish both so the affordance matches reality.
     let spilled = tool.result.content["spilled"].as_bool().unwrap_or(false);
     if spilled {
@@ -13577,7 +14028,7 @@ fn subagent_pane_summary_row(app: &TuiApp, width: u16) -> Line<'static> {
     let total = records.len();
 
     let (glyph, glyph_color) = if failed > 0 {
-        ("✗", crate::render::theme::red())
+        ("✖", crate::render::theme::red())
     } else if done > 0 {
         ("✓", crate::render::theme::green())
     } else {
@@ -13992,6 +14443,13 @@ fn format_status_hints(app: &TuiApp) -> String {
     }
 }
 
+/// Returns the display string (e.g. `"Ctrl+T"`, `"Ctrl+O"`) for a
+/// rebindable action, consulting the live resolved keymap so hints
+/// stay accurate after `[tui.keymap]` overrides.
+fn key_hint(app: &TuiApp, action: keymap::Action) -> String {
+    app.keymap.binding(action).display()
+}
+
 fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(overlay) = app.transcript_overlay.as_ref() {
         return if overlay.mode.mouse_capture() {
@@ -14025,13 +14483,16 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         }
         return "Enter accept · N decline · Esc cancel".to_string();
     } else if app.pending_approval.is_some() {
-        return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
+        return "Up/Down choose · Enter/Y approve once · A/P always approve repo · N/D deny · Esc cancel"
             .to_string();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
     } else if app.cancel.is_some() {
-        let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-T full transcript · Ctrl-Y copy · /help",
+        let mut hint = format!(
+            "Ctrl+C/Esc interrupt · Enter queue · Ctrl+J newline · {} task · {} full transcript · {} copy · /help",
+            key_hint(app, keymap::Action::ToggleTaskPanel),
+            key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+            key_hint(app, keymap::Action::CopyLastAssistant),
         );
         if !app.subagent_pane.records.is_empty() {
             hint.push_str(" · Down subagents");
@@ -14046,11 +14507,15 @@ fn format_status_hint_base(app: &TuiApp) -> String {
     if app.cancelled_prompt.is_some() && app.turn_rx.is_none() && app.input.is_empty() {
         // We're idle right after a cancelled/failed turn — surface the
         // recovery affordance before the regular hint set.
-        return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
+        return format!(
+            "{} restore last prompt · Enter send · Ctrl+J newline · /help",
+            key_hint(app, keymap::Action::RestoreCancelledPrompt)
+        );
     }
-    let mut base =
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-T full transcript · /help"
-            .to_string();
+    let mut base = format!(
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · {} full transcript · /help",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
     if app.context_compaction_threshold > 0
         && context_window_pct(
             app.context_estimate.estimated_tokens,
@@ -14846,7 +15311,7 @@ pub(crate) struct TuiApp {
     pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
     pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
-    /// or failed. Surfaced via Ctrl-R so the user can recover from a
+    /// or failed. Surfaced via Ctrl+R so the user can recover from a
     /// typo without retyping. Cleared on successful completion.
     pub(crate) cancelled_prompt: Option<String>,
     /// True when the in-flight turn has already produced a successful
@@ -15643,7 +16108,7 @@ impl TuiApp {
 
     /// Record a subagent's completed tool call as a real `ToolResult` rail node
     /// in its transcript, so the subagent view renders `├─✔ Ran X` cards
-    /// (folded by default, body unfolded by Ctrl-T) exactly like the main
+    /// (folded by default, body unfolded by Ctrl+T) exactly like the main
     /// conversation — not the flat off-rail lifecycle line it used to show.
     pub(crate) fn note_subagent_tool_result(
         &mut self,
@@ -16083,7 +16548,7 @@ impl TranscriptEntry {
         // direct `!`-shell).
         //
         // Failed tool calls are the exception. The preview hides the
-        // actual error message under "Ctrl-O to expand", which is
+        // actual error message under "Ctrl+O to expand", which is
         // exactly the failure mode the user complained about — a row
         // of red ✖ "Failed X" with no visible reason. Auto-expand on
         // failure so the diagnostic is inline, without forcing a
@@ -16147,8 +16612,7 @@ impl TranscriptEntry {
         Self {
             id,
             kind: TranscriptEntryKind::Diff(Box::new(data)),
-            // `/diff` is never truncated by default. The user can still
-            // Ctrl-E to fold the body if it's huge.
+            // `/diff` is never truncated by default.
             collapsed: false,
             revision: 0,
             settle: None,
@@ -16175,7 +16639,7 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
             // Reasoning is visible by default when `show_reasoning_usage`
             // is enabled, but compact transcript mode keeps the body under
-            // a concise chip. Ctrl-T opens the full transcript with details.
+            // a concise chip. Ctrl+T opens the full transcript with details.
             collapsed: transcript_default == TranscriptDefault::Compact,
             revision: 0,
             settle: None,
@@ -16211,6 +16675,8 @@ impl TranscriptEntry {
         // Measure the expanded block with reasoning shown so reasoning
         // nodes have a body to fold from; verbosity/outcome/selection do
         // not change the line count materially for the fold's start.
+        // Pass the default shortcut; arm_settle only needs a line count for
+        // the fold animation, not the actual rendered text.
         let expanded = format_transcript_entry_expanded(
             self,
             false,
@@ -16218,6 +16684,7 @@ impl TranscriptEntry {
             MessageOutcome::Normal,
             Some(SETTLE_MEASURE_WIDTH),
             true,
+            "Ctrl+T",
         );
         let from_lines = expanded.len().min(u16::MAX as usize) as u16;
         self.settle = Some(SettleState {
@@ -17182,6 +17649,8 @@ fn inline_history_lines_for_flush(
         lines.extend(startup_card_lines(app, width));
         lines.push(Line::from(""));
     }
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let shortcut = shortcut.as_str();
     // Seed the rail-connector state from the entry just before this flush so a
     // `│` threads across the incremental scrollback flushes, not just within one.
     let mut prev_work = transcript_from > 0
@@ -17209,6 +17678,7 @@ fn inline_history_lines_for_flush(
                 Some(width),
                 app.show_reasoning_usage,
                 settle,
+                shortcut,
             );
             push_rail_work_block(
                 &mut lines,
@@ -17229,6 +17699,7 @@ fn inline_history_lines_for_flush(
                         item.collapsed,
                         false,
                         extras,
+                        shortcut,
                     );
                     push_rail_work_block(
                         &mut lines,
@@ -17252,6 +17723,7 @@ fn inline_history_lines_for_flush(
                     app.tool_output_verbosity,
                     Some(width),
                     ToolCardSurface::Tinted,
+                    shortcut,
                 );
                 push_rail_work_block(
                     &mut lines,
@@ -17270,6 +17742,7 @@ fn inline_history_lines_for_flush(
             message_outcome(&app.transcript, index),
             Some(width),
             app.show_reasoning_usage,
+            shortcut,
         );
         if is_rail_work_node(&item.kind) {
             push_rail_work_block(

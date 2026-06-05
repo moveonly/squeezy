@@ -64,8 +64,8 @@ impl ToastVariant {
         match self {
             Self::Info => "ℹ",
             Self::Success => "✓",
-            Self::Warning => "!",
-            Self::Error => "✗",
+            Self::Warning => "⚠",
+            Self::Error => "✖",
         }
     }
 }

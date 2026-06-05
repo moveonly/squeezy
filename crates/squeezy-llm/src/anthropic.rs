@@ -17,7 +17,7 @@ use crate::{
     anthropic_betas::anthropic_header_value,
     cache_policy::{CachePolicy, CacheRetention, json_markers, should_apply_caching},
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
-    oauth::{anthropic_oauth_beta_header, is_anthropic_oauth_token},
+    oauth::{AnthropicOAuthSource, anthropic_oauth_beta_header, is_anthropic_oauth_token},
     overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
@@ -126,9 +126,15 @@ impl std::fmt::Debug for AnthropicProvider {
 impl AnthropicProvider {
     pub fn from_config(config: &AnthropicConfig) -> Result<Self> {
         let api_key =
-            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
+            match resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env) {
+                Ok(resolved) => static_api_key_source(resolved.value, "anthropic"),
+                Err(SqueezyError::ProviderNotConfigured(_)) => {
+                    Arc::new(AnthropicOAuthSource::load()?)
+                }
+                Err(err) => return Err(err),
+            };
         Ok(Self::with_api_key_source(
-            static_api_key_source(api_key, "anthropic"),
+            api_key,
             config.base_url.trim_end_matches('/').to_string(),
             config.transport,
         ))
@@ -647,6 +653,9 @@ impl LlmProvider for AnthropicProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         if let Err(err) = request.ensure_vision_support("anthropic") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
+        if let Err(err) = request.reject_unsupported_documents("anthropic") {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
         let client = self.client.clone();

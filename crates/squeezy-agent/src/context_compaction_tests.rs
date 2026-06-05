@@ -810,6 +810,7 @@ fn tool_result(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -853,6 +854,7 @@ fn grep_result(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 

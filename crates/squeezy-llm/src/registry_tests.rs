@@ -2,13 +2,16 @@ use squeezy_core::{
     DEFAULT_ANTHROPIC_MODEL, DEFAULT_BEDROCK_MODEL, DEFAULT_CEREBRAS_MODEL, DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_FIREWORKS_MODEL, DEFAULT_GOOGLE_MODEL, DEFAULT_GROQ_MODEL, DEFAULT_MISTRAL_MODEL,
     DEFAULT_OPENAI_MODEL, DEFAULT_OPENROUTER_MODEL, DEFAULT_PORTKEY_MODEL, DEFAULT_VERCEL_AI_MODEL,
-    DEFAULT_VERTEX_MODEL, DEFAULT_XAI_MODEL, resolve_model_alias,
+    DEFAULT_VERTEX_MODEL, DEFAULT_XAI_MODEL, GitHubCopilotConfig, ProviderConfig,
+    ProviderTransportConfig, resolve_model_alias,
 };
 
 use super::{
-    MODEL_REGISTRY, estimate_json_tokens, estimate_text_tokens, model_info_for,
-    provider_honors_output_schema,
+    MODEL_REGISTRY, PROVIDERS, estimate_json_tokens, estimate_text_tokens, model_info_for,
+    provider_from_config, provider_honors_output_schema,
 };
+
+static GITHUB_COPILOT_AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn resolve_opus_alias_for_anthropic() {
@@ -140,6 +143,65 @@ fn catalog_has_no_duplicate_provider_id_pairs() {
 }
 
 #[test]
+fn providers_list_includes_every_curated_model_provider() {
+    let surfaced = PROVIDERS
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let curated = MODEL_REGISTRY
+        .iter()
+        .map(|entry| entry.provider)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let missing = curated.difference(&surfaced).copied().collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "PROVIDERS omits curated models.json provider(s): {missing:?}"
+    );
+}
+
+#[test]
+fn providers_list_exposes_github_copilot_oauth_provider() {
+    assert!(PROVIDERS.contains(&"github_copilot"));
+}
+
+#[test]
+fn provider_from_config_reports_missing_github_copilot_auth_file() {
+    let _guard = GITHUB_COPILOT_AUTH_ENV_LOCK
+        .lock()
+        .expect("github copilot auth env lock");
+    let missing_path = std::env::temp_dir().join(format!(
+        "squeezy-missing-github-copilot-auth-{}.json",
+        std::process::id()
+    ));
+    let previous = std::env::var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE").ok();
+
+    // SAFETY: guarded by GITHUB_COPILOT_AUTH_ENV_LOCK in this module.
+    unsafe {
+        std::env::set_var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE", &missing_path);
+    }
+    let config = ProviderConfig::GitHubCopilot(GitHubCopilotConfig {
+        transport: ProviderTransportConfig::default(),
+    });
+    let result = provider_from_config(&config);
+    // SAFETY: guarded by GITHUB_COPILOT_AUTH_ENV_LOCK in this module.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE", value),
+            None => std::env::remove_var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE"),
+        }
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected missing github-copilot auth file to fail"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("github-copilot OAuth credentials"));
+    assert!(message.contains("squeezy auth github-copilot login"));
+}
+
+#[test]
 fn curated_default_models_resolve_without_fallback() {
     // `(provider key in models.json, DEFAULT_*_MODEL)` for every default that is
     // expected to carry curated metadata. The synthetic `faux-1` is excluded
@@ -241,8 +303,16 @@ fn provider_honors_output_schema_false_for_unknown_provider() {
     // An unknown provider has no capabilities entry beyond the synthetic
     // fallback; the gate must not panic and must default to attaching
     // nothing rather than guessing support.
-    let unknown = provider_honors_output_schema("not-a-provider", "mystery-model");
-    // Fallback model info carries json_mode, but the point is the call is
-    // total and deterministic; assert it returns a bool without panic.
-    let _ = unknown;
+    assert!(!provider_honors_output_schema(
+        "not-a-provider",
+        "mystery-model"
+    ));
+}
+
+#[test]
+fn provider_honors_output_schema_false_for_unknown_model() {
+    assert!(
+        !provider_honors_output_schema("openai", "custom-unlisted-model"),
+        "fallback metadata must not guess strict schema support for unknown models"
+    );
 }

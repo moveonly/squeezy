@@ -363,13 +363,7 @@ async fn inline_error_mid_stream_classifies_as_provider_stream() {
 /// T-53 / L4: an SSE stream ending with a `data: [DONE]` line whose
 /// preceding usage chunk lacks the blank-line boundary must still
 /// terminate cleanly with `LlmEvent::Completed`.
-///
-/// Ignored until X-02 (shared SSE decoder no-op on empty/joined data
-/// lines) ships — today the decoder concatenates the two `data:` lines
-/// and `serde_json::from_str` errors on the trailing `[DONE]`. Track
-/// via `TICKETS.md` X-02 / compatible-L4.
 #[tokio::test]
-#[ignore = "X-02 shared SSE decoder fix not yet shipped on this branch"]
 async fn done_after_usage_chunk_completes_cleanly() {
     let captured = CapturedHeaders::default();
     let addr = spawn_chat_server(SSE_DONE_AFTER_USAGE_CHUNK, captured.clone()).await;

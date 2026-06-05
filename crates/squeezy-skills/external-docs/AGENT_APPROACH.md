@@ -29,6 +29,25 @@ The active mode is part of tool advertisement and runtime permission checks, so
 a tool hidden from a mode is not only hidden from the prompt; attempts to call it
 are also rejected.
 
+## Turn Routing
+
+Squeezy can route straightforward turns to a cheaper model tier while keeping
+harder turns on the main model. The router uses a static heuristic for obvious
+mechanical commands and optionally a cheap judge model for ambiguous turns.
+Turn routing is on by default and can be toggled with `/router on|off` or
+configured under `[routing]` and per-provider settings. It never crosses
+providers.
+
+## Subagents
+
+For research and doc-help turns, Squeezy spawns isolated subagents. Explore
+subagents use read/search/navigation tools only and run on the cheap model tier.
+Delegate subagents answer research questions using the main model with the same
+navigation tool set. Doc-help subagents answer `/help` escalations from the
+inlined bundled doc corpus with no filesystem tools. Subagent tool calls and
+model rounds are capped separately from the parent; only the final structured
+summary is returned.
+
 ## Graph-First Navigation
 
 Squeezy builds a local semantic graph from tree-sitter parsers, workspace facts,

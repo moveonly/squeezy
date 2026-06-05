@@ -3219,6 +3219,7 @@ dependencies = [
  "similar",
  "squeezy-core",
  "squeezy-graph",
+ "squeezy-hooks",
  "squeezy-mcp",
  "squeezy-parse",
  "squeezy-rank",

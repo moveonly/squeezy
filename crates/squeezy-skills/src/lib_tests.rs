@@ -1297,425 +1297,6 @@ context: "inline"
 }
 
 #[test]
-fn squeezy_help_config_answer_cites_docs_and_config_sections() {
-    let help = SqueezyHelp::new(
-        r#"[model]
-provider = "openai"
-model = "gpt-test"
-
-[providers.openai]
-api_key_env = "<redacted>"
-base_url = "https://api.openai.com/v1"
-
-[skills]
-user_dir = "/tmp/skills"
-compat_user_dir = "/tmp/agent-skills"
-"#,
-    );
-
-    let answer = help.answer_topic("providers");
-
-    assert_eq!(answer.status, HelpStatus::Answered);
-    assert!(answer.config_sections.contains(&"model".to_string()));
-    assert!(
-        answer
-            .config_sections
-            .contains(&"providers.openai".to_string())
-    );
-    assert!(answer.citations.contains(&HelpCitation::DocsPath(
-        "docs/external/PROVIDERS.md".to_string()
-    )));
-    assert!(
-        answer
-            .citations
-            .contains(&HelpCitation::ConfigInspectSection("model".to_string()))
-    );
-    let rendered = answer.render_markdown();
-    assert!(rendered.contains("[providers.openai]"), "{rendered}");
-    assert!(!rendered.contains("--api-key"), "{rendered}");
-    assert!(!rendered.contains("[providers.fake]"), "{rendered}");
-}
-
-#[test]
-fn squeezy_help_refuses_unsupported_self_questions_with_public_pointers() {
-    let help = SqueezyHelp::new("");
-    let answer = help
-        .answer_for_input("/help quantum_billing")
-        .expect("explicit /help command should always produce an answer");
-
-    assert_eq!(answer.status, HelpStatus::Unsupported);
-    let rendered = answer.render_markdown();
-    assert!(rendered.contains("won't guess"), "{rendered}");
-    assert!(
-        rendered.contains("https://squeezyagent.com/docs/"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("https://github.com/esqueezy/squeezy"),
-        "{rendered}"
-    );
-}
-
-#[test]
-fn squeezy_help_falls_through_when_no_curated_topic_matches() {
-    let help = SqueezyHelp::new("");
-    // A natural-language Squeezy-self question that no curated topic answers
-    // must fall through to the model loop, not produce an `Unsupported` dump.
-    assert!(
-        help.answer_for_input("Does Squeezy support quantum billing?")
-            .is_none(),
-        "natural-language prompts without a curated topic must reach the model"
-    );
-    assert!(
-        !help::matches_squeezy_help_input("Does Squeezy support quantum billing?"),
-        "matches_squeezy_help_input must agree"
-    );
-}
-
-#[test]
-fn squeezy_help_ignores_unrelated_questions() {
-    let help = SqueezyHelp::new("");
-
-    assert!(
-        help.answer_for_input("How do I configure serde?").is_none(),
-        "unrelated coding questions should stay on the model path"
-    );
-    assert!(
-        help.answer_for_input("help me implement Squeezy features")
-            .is_none(),
-        "implementation requests should not be captured by product help"
-    );
-}
-
-#[test]
-fn squeezy_help_ignores_implementation_and_debugging_requests() {
-    let help = SqueezyHelp::new("");
-    let cases = [
-        "How do I implement a new provider in Squeezy?",
-        "refactor the squeezy graph crate",
-        "debug squeezy cache eviction",
-        "Add a new MCP server config to Squeezy",
-        "Can you fix the squeezy --health crash?",
-        "Please write a new squeezy skill for me",
-    ];
-    for input in cases {
-        assert!(
-            help.answer_for_input(input).is_none(),
-            "intercept must not capture implementation request: {input}"
-        );
-        assert!(
-            !help::matches_squeezy_help_input(input),
-            "matches_squeezy_help_input must agree: {input}"
-        );
-    }
-}
-
-#[test]
-fn matches_squeezy_help_input_agrees_with_answer_for_input() {
-    let help = SqueezyHelp::new("");
-    let positives = [
-        "/help",
-        "/help providers",
-        "/help quantum_billing",
-        "How do I configure Squeezy providers?",
-    ];
-    for input in positives {
-        assert!(
-            help::matches_squeezy_help_input(input),
-            "matches_squeezy_help_input should accept: {input}"
-        );
-        assert!(
-            help.answer_for_input(input).is_some(),
-            "answer_for_input should accept: {input}"
-        );
-    }
-    let negatives = [
-        "How do I configure serde?",
-        "build a new tool",
-        // Natural-language Squeezy question that no curated topic answers must
-        // fall through to the model, not produce a canned `Unsupported` dump.
-        "Does Squeezy support quantum billing?",
-    ];
-    for input in negatives {
-        assert!(
-            !help::matches_squeezy_help_input(input),
-            "matches_squeezy_help_input should reject: {input}"
-        );
-        assert!(
-            help.answer_for_input(input).is_none(),
-            "answer_for_input should reject: {input}"
-        );
-    }
-}
-
-#[test]
-fn squeezy_help_ignores_code_navigation_prompts() {
-    let help = SqueezyHelp::new("");
-    let cases = [
-        "where does Agent::start_turn live in Squeezy?",
-        "How does the SqueezyAgent struct route turns in Squeezy?",
-        "what does start_turn do in squeezy?",
-        "Where in squeezy is `compile_exploration_plan` defined?",
-        "find squeezy_agent.rs",
-    ];
-    for input in cases {
-        assert!(
-            help.answer_for_input(input).is_none(),
-            "code-navigation prompt must reach the model: {input}"
-        );
-        assert!(
-            !help::matches_squeezy_help_input(input),
-            "matches_squeezy_help_input must agree: {input}"
-        );
-    }
-}
-
-#[test]
-fn squeezy_help_alias_routes_to_providers_topic() {
-    let help = SqueezyHelp::new("");
-    let answer = help.answer_for_input("/help model").expect("alias answer");
-    assert_eq!(answer.status, HelpStatus::Answered);
-    assert_eq!(answer.topic, "providers");
-}
-
-#[test]
-fn squeezy_help_routes_agent_approach_and_tool_questions() {
-    let help = SqueezyHelp::new("");
-
-    let approach = help
-        .answer_for_input("How does Squeezy work?")
-        .expect("approach answer");
-    assert_eq!(approach.status, HelpStatus::Answered);
-    assert_eq!(approach.topic, "agent");
-    assert!(approach.citations.contains(&HelpCitation::DocsPath(
-        "docs/external/AGENT_APPROACH.md".to_string()
-    )));
-
-    let tools = help
-        .answer_for_input("What tools does Squeezy have?")
-        .expect("tools answer");
-    assert_eq!(tools.status, HelpStatus::Answered);
-    assert_eq!(tools.topic, "agent");
-    assert!(tools.citations.contains(&HelpCitation::DocsPath(
-        "docs/external/TOOLS.md".to_string()
-    )));
-}
-
-#[test]
-fn squeezy_help_routes_cancel_questions_to_cancel_topic() {
-    let help = SqueezyHelp::new("");
-
-    let cancel_turn = help
-        .answer_for_input("how do I cancel a squeezy turn?")
-        .expect("cancel turn answer");
-    assert_eq!(cancel_turn.status, HelpStatus::Answered);
-    assert_eq!(cancel_turn.topic, "cancel");
-    let body = cancel_turn.render_markdown();
-    assert!(body.contains("Esc"), "cancel topic must name Esc: {body}");
-    assert!(
-        body.contains("Ctrl+C") || body.contains("Ctrl-C"),
-        "cancel topic must name Ctrl+C: {body}"
-    );
-
-    // The canonical eval prompt that previously hijacked into the agent
-    // topic must now route to the cancel topic.
-    let in_flight = help
-        .answer_for_input(
-            "How do I cancel an in-flight model response in squeezy? \
-             Answer in one short sentence — name the key or command a user would press.",
-        )
-        .expect("in-flight cancel answer");
-    assert_eq!(in_flight.topic, "cancel");
-}
-
-#[test]
-fn squeezy_help_falls_through_for_wild_squeezy_questions() {
-    let help = SqueezyHelp::new("");
-    // Wild "how do I ... squeezy?" questions that no curated topic answers
-    // must return None so the model loop handles them, instead of dumping
-    // a generic topic + redacted config block.
-    let wild = [
-        "How do I make squeezy whistle?",
-        "How do I teach squeezy to bake bread?",
-    ];
-    for input in wild {
-        assert!(
-            help.answer_for_input(input).is_none(),
-            "wild squeezy prompt must reach the model: {input}"
-        );
-        assert!(
-            !help::matches_squeezy_help_input(input),
-            "matches_squeezy_help_input must agree: {input}"
-        );
-    }
-}
-
-#[test]
-fn extract_config_sections_wildcard_does_not_match_unrelated_prefix() {
-    let inspect = r#"[providers.openai]
-api_key_env = "<redacted>"
-
-[providers.anthropic]
-api_key_env = "<redacted>"
-
-[providers_extra]
-note = "should not be selected by providers.* wildcard"
-"#;
-    let help = SqueezyHelp::new(inspect);
-    let answer = help.answer_topic("providers");
-
-    assert!(
-        answer
-            .config_sections
-            .iter()
-            .any(|name| name == "providers.openai"),
-        "expected providers.openai, got {:?}",
-        answer.config_sections
-    );
-    assert!(
-        answer
-            .config_sections
-            .iter()
-            .any(|name| name == "providers.anthropic"),
-        "expected providers.anthropic, got {:?}",
-        answer.config_sections
-    );
-    assert!(
-        answer
-            .config_sections
-            .iter()
-            .all(|name| name != "providers_extra"),
-        "providers.* must not match providers_extra: {:?}",
-        answer.config_sections
-    );
-    let rendered = answer.render_markdown();
-    assert!(
-        !rendered.contains("[providers_extra]"),
-        "rendered output should not include providers_extra: {rendered}"
-    );
-}
-
-#[test]
-fn extract_config_sections_skips_array_of_tables_headers() {
-    // `[[providers.openai]]` must not be parsed as a section name; otherwise
-    // the array-of-tables body could leak into help answers untouched by the
-    // wildcard filter.
-    let inspect = r#"[[providers.openai]]
-api_key_env = "<redacted>"
-secret = "sk-should-not-leak"
-
-[providers.anthropic]
-api_key_env = "<redacted>"
-"#;
-    let help = SqueezyHelp::new(inspect);
-    let answer = help.answer_topic("providers");
-
-    assert!(
-        answer
-            .config_sections
-            .iter()
-            .all(|name| name != "providers.openai"),
-        "array-of-tables header must not register as providers.openai: {:?}",
-        answer.config_sections
-    );
-    let rendered = answer.render_markdown();
-    assert!(
-        !rendered.contains("sk-should-not-leak"),
-        "array-of-tables body must not leak into rendered help: {rendered}"
-    );
-}
-
-#[test]
-fn bundled_doc_paths_exist_on_disk() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs_dir = manifest_dir.join("external-docs");
-    for path in help::bundled_doc_paths() {
-        let file_name = path
-            .rsplit('/')
-            .next()
-            .expect("bundled doc path has filename");
-        let full = docs_dir.join(file_name);
-        assert!(
-            full.is_file(),
-            "bundled doc {path} should exist at {}",
-            full.display()
-        );
-    }
-}
-
-#[test]
-fn bundled_docs_are_complete_external_corpus() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs_dir = manifest_dir.join("external-docs");
-    let bundled = help::bundled_docs();
-    let bundled_paths = bundled.iter().map(|doc| doc.path).collect::<BTreeSet<_>>();
-
-    for doc in &bundled {
-        assert!(
-            doc.path.starts_with("docs/external/"),
-            "bundled help doc must be external: {}",
-            doc.path
-        );
-        assert!(
-            !doc.content.trim().is_empty(),
-            "bundled help doc should embed content: {}",
-            doc.path
-        );
-    }
-
-    for entry in fs::read_dir(&docs_dir).expect("read external-docs") {
-        let entry = entry.expect("external doc entry");
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-            continue;
-        }
-        let file_name = path
-            .file_name()
-            .expect("doc filename")
-            .to_string_lossy()
-            .into_owned();
-        let logical = format!("docs/external/{file_name}");
-        assert!(
-            bundled_paths.contains(logical.as_str()),
-            "external doc should be bundled for help: {logical}"
-        );
-    }
-}
-
-#[test]
-fn squeezy_help_doc_citations_are_bundled_paths() {
-    let bundled = help::bundled_doc_paths()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let topics = [
-        "agent",
-        "config",
-        "providers",
-        "permissions",
-        "skills",
-        "sessions",
-        "feedback",
-        "telemetry",
-        "navigation",
-        "checkpoints",
-        "cost",
-        "mcp-web",
-        "install",
-        "health",
-    ];
-    let help = SqueezyHelp::new("");
-
-    for topic in topics {
-        let answer = help.answer_topic(topic);
-        for citation in answer.citations {
-            if let HelpCitation::DocsPath(path) = citation {
-                assert!(bundled.contains(path.as_str()), "missing {path}");
-            }
-        }
-    }
-}
-
-#[test]
 fn discover_applies_context_percent_budget_to_catalog() {
     let root = temp_workspace("skills_budget_mode_discover");
     let skill_dir = root.join(".squeezy/skills/rust-nav");
@@ -2138,6 +1719,272 @@ fn cross_precedence_name_collision_emits_load_time_warning() {
 }
 
 #[test]
+fn install_bundled_skills_is_idempotent_and_skips_existing() {
+    let root = temp_workspace("skills_install_bundled");
+    let user_dir = root.join("user");
+
+    let first = super::install_bundled_skills(&user_dir).expect("install first");
+    assert!(
+        !first.is_empty(),
+        "first install must write at least one bundled skill"
+    );
+    let names_first: BTreeSet<String> = first.into_iter().collect();
+    let expected: BTreeSet<String> = ["customize-squeezy", "release-notes", "skill-creator"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names_first, expected);
+
+    for name in &expected {
+        let path = user_dir.join(name).join("SKILL.md");
+        assert!(path.exists(), "missing installed skill: {}", path.display());
+        let body = fs::read_to_string(&path).expect("read installed");
+        assert!(
+            body.contains(&format!("name: {name}")),
+            "frontmatter must declare the skill name verbatim: {body}"
+        );
+    }
+
+    // Second invocation is a no-op even if the user has hand-edited
+    // a SKILL.md — the installer must never clobber existing files.
+    let user_edit = user_dir.join("customize-squeezy").join("SKILL.md");
+    fs::write(
+        &user_edit,
+        "---\nname: customize-squeezy\ndescription: \"mine\"\n---\nedited\n",
+    )
+    .expect("simulate user edit");
+    let second = super::install_bundled_skills(&user_dir).expect("install second");
+    assert!(
+        second.is_empty(),
+        "second install must not rewrite any skill"
+    );
+    let preserved = fs::read_to_string(&user_edit).expect("read after second install");
+    assert!(
+        preserved.contains("edited"),
+        "user edits must survive a re-install: {preserved}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn unmet_tool_deps_flags_missing_builtin_and_mcp() {
+    let deps = vec![
+        "shell".to_string(),
+        "websearch".to_string(),
+        "mcp:exa".to_string(),
+        "mcp:parallel".to_string(),
+        "  ".to_string(),
+    ];
+    let available_tools: BTreeSet<String> = ["shell".to_string()].into_iter().collect();
+    let available_mcp: BTreeSet<String> = ["exa".to_string()].into_iter().collect();
+    let missing = super::unmet_tool_deps(&deps, &available_tools, &available_mcp);
+    assert_eq!(
+        missing,
+        vec!["websearch".to_string(), "mcp:parallel".to_string()]
+    );
+}
+
+#[test]
+fn unmet_tool_deps_empty_when_all_satisfied() {
+    let deps = vec!["shell".to_string(), "mcp:exa".to_string()];
+    let available_tools: BTreeSet<String> = ["shell".to_string()].into_iter().collect();
+    let available_mcp: BTreeSet<String> = ["exa".to_string()].into_iter().collect();
+    let missing = super::unmet_tool_deps(&deps, &available_tools, &available_mcp);
+    assert!(missing.is_empty());
+}
+
+#[test]
+fn duplicate_trigger_across_skills_skips_auto_activation() {
+    let root = temp_workspace("skills_trigger_collision_skip");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/beta"),
+        "beta",
+        "Beta skill",
+        &["graph"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    assert!(
+        catalog.ambiguous_triggers().contains("graph"),
+        "discovery must mark a cross-skill duplicate trigger as ambiguous"
+    );
+
+    let activation = catalog
+        .activate_for_input("please inspect the graph")
+        .expect("activate");
+    assert!(
+        activation.skills.is_empty(),
+        "ambiguous trigger must not auto-activate either skill, got {:?}",
+        activation
+            .skills
+            .iter()
+            .map(|s| &s.summary.name)
+            .collect::<Vec<_>>()
+    );
+
+    // Explicit `/skill <name>` still selects the requested skill.
+    let explicit = catalog
+        .activate_for_input("/skill alpha use the graph")
+        .expect("activate explicit");
+    assert_eq!(explicit.skills.len(), 1);
+    assert_eq!(explicit.skills[0].summary.name, "alpha");
+    assert_eq!(explicit.task_input, "use the graph");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_scan_dirs_includes_ancestor_project_roots() {
+    // Layout:
+    //   /root/.git            ← git root, stops the ancestor walk
+    //   /root/.squeezy/skills/ ← ancestor project root
+    //   /root/packages/foo/   ← workspace_root (launch dir)
+    let root = temp_workspace("skills_scan_ancestor");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    let ancestor_skills = root.join(".squeezy/skills");
+    fs::create_dir_all(&ancestor_skills).expect("create ancestor skills");
+    let ws_root = root.join("packages/foo");
+    fs::create_dir_all(&ws_root).expect("create workspace dir");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let dirs = super::skill_scan_dirs(&ws_root, &config);
+
+    // The ancestor's `.squeezy/skills` dir should be in the scan list.
+    let has_ancestor = dirs.iter().any(|d| d == &ancestor_skills);
+    assert!(
+        has_ancestor,
+        "skill_scan_dirs must include ancestor project skill roots; got: {dirs:?}"
+    );
+}
+
+#[test]
+fn validate_skill_dirs_includes_ancestor_malformed_skill() {
+    // Same monorepo layout, but with a malformed SKILL.md in the ancestor root.
+    let root = temp_workspace("skills_validate_ancestor_malformed");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    let bad_dir = root.join(".squeezy/skills/bad-ancestor");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad-ancestor");
+    fs::write(bad_dir.join("SKILL.md"), "this is not valid frontmatter").expect("write bad skill");
+    let ws_root = root.join("packages/foo");
+    fs::create_dir_all(&ws_root).expect("create workspace");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let results = super::validate_skill_dirs(&ws_root, &config);
+    assert!(
+        !results.is_empty(),
+        "validate must find the ancestor skill even though it is malformed"
+    );
+    let bad = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-ancestor"))
+                .unwrap_or(false)
+        })
+        .expect("bad-ancestor result must be present");
+    assert!(
+        bad.outcome.is_err(),
+        "malformed ancestor skill must produce an error: {:?}",
+        bad.outcome
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn validate_skill_dirs_catches_malformed_files_that_discovery_drops() {
+    let root = temp_workspace("skills_validate_dirs_malformed");
+    // Good skill — discovery and validate both see it.
+    let good_dir = root.join(".squeezy/skills/good-skill");
+    fs::create_dir_all(&good_dir).expect("mkdir good");
+    fs::write(
+        good_dir.join("SKILL.md"),
+        "---\nname: good-skill\ndescription: \"works\"\n---\n# Good\n",
+    )
+    .expect("write good");
+    // Malformed skill — discovery silently drops it; validate must report it.
+    let bad_dir = root.join(".squeezy/skills/bad-skill");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad");
+    fs::write(bad_dir.join("SKILL.md"), "not frontmatter at all").expect("write bad");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    // Discovery should only produce the good skill.
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert_eq!(
+        catalog.summaries().len(),
+        1,
+        "discovery must drop the bad skill"
+    );
+
+    // validate_skill_dirs must report both.
+    let results = super::validate_skill_dirs(&root, &config);
+    assert_eq!(
+        results.len(),
+        2,
+        "validator must include both SKILL.md files"
+    );
+    let bad_result = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-skill"))
+                .unwrap_or(false)
+        })
+        .expect("bad-skill result must be present");
+    assert!(
+        bad_result.outcome.is_err(),
+        "malformed SKILL.md must produce an error result: {:?}",
+        bad_result.outcome
+    );
+    let good_result = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("good-skill"))
+                .unwrap_or(false)
+        })
+        .expect("good-skill result must be present");
+    assert!(
+        good_result.outcome.is_ok(),
+        "well-formed SKILL.md must produce an ok result"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn duplicate_trigger_across_skills_emits_load_time_warning() {
     let root = temp_workspace("skills_warn_trigger_collision");
     write_skill(
@@ -2275,6 +2122,58 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
     let installed = register_skill_hooks(&skill, &mut registry);
     assert_eq!(installed, 2);
     assert_eq!(registry.len(), 2);
+}
+
+#[test]
+fn catalog_register_hooks_skips_disabled_and_aggregates() {
+    let root = temp_workspace("skills_catalog_register_hooks");
+    let user_dir = root.join("user");
+
+    let alpha_dir = user_dir.join("alpha");
+    fs::create_dir_all(&alpha_dir).expect("mkdir alpha");
+    fs::write(
+        alpha_dir.join("SKILL.md"),
+        "---\nname: alpha\ndescription: \"a\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# alpha\n",
+    )
+    .expect("write alpha");
+
+    let beta_dir = user_dir.join("beta");
+    fs::create_dir_all(&beta_dir).expect("mkdir beta");
+    fs::write(
+        beta_dir.join("SKILL.md"),
+        "---\nname: beta\ndescription: \"b\"\nhooks:\n  PostToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n        - type: command\n          command: \"true\"\n          once: true\n---\n# beta\n",
+    )
+    .expect("write beta");
+
+    let gamma_dir = user_dir.join("gamma");
+    fs::create_dir_all(&gamma_dir).expect("mkdir gamma");
+    fs::write(
+        gamma_dir.join("SKILL.md"),
+        "---\nname: gamma\ndescription: \"g\"\n---\n# gamma\n",
+    )
+    .expect("write gamma");
+
+    let config = SkillsConfig {
+        user_dir,
+        compat_user_dir: root.join("compat"),
+        config: vec![SkillConfigEntry {
+            name: Some("beta".to_string()),
+            path: None,
+            enabled: false,
+        }],
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let mut registry = HookRegistry::new();
+    let installed = catalog.register_hooks(&mut registry);
+    assert_eq!(
+        installed, 1,
+        "only the non-disabled skill with hooks should contribute handlers"
+    );
+    assert_eq!(registry.len(), 1);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]

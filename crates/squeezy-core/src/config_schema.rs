@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use crate::{
     AppConfig, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
     DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV, DEFAULT_EXA_MCP_URL,
-    DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
-    DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+    DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GITHUB_COPILOT_MODEL,
+    DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
     DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
     DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV,
     DEFAULT_PARALLEL_MCP_URL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
@@ -1358,7 +1358,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_subagents_enabled,
                 default_display: "true",
                 default: || FieldValue::Bool(true),
-                help: "Allow delegate_plan / delegate_review subagent dispatch.",
+                help: "Allow delegate / explore / delegate_plan / delegate_review / delegate_chain subagent dispatch, and the doc-help /help fallback.",
                 env_override: Some("SQUEEZY_SUBAGENTS_ENABLED"),
                 secret: false,
             },
@@ -1393,13 +1393,13 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 toml_path: &["subagents", "max_tool_calls_per_call"],
                 kind: FieldKind::Integer {
                     min: 1,
-                    max: 256,
+                    max: 100_000,
                     suffix: None,
                 },
                 tier: ApplyTier::NextPrompt,
                 get: get_subagent_max_tool_calls,
                 set: set_subagent_max_tool_calls,
-                default_display: "24",
+                default_display: "10000",
                 default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL as i64),
                 help: "Cap on tool calls within one subagent invocation.",
                 env_override: Some("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL"),
@@ -1416,7 +1416,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_subagent_max_bytes,
                 set: set_subagent_max_bytes,
-                default_display: "8388608 bytes",
+                default_display: "1000000000 bytes",
                 default: || {
                     FieldValue::Integer(DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL as i64)
                 },
@@ -1435,7 +1435,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 tier: ApplyTier::NextPrompt,
                 get: get_subagent_max_files,
                 set: set_subagent_max_files,
-                default_display: "2000 files",
+                default_display: "1000000 files",
                 default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL as i64),
                 help: "Cap on files scanned by a subagent's search tools.",
                 env_override: Some("SQUEEZY_SUBAGENT_MAX_SEARCH_FILES_PER_CALL"),
@@ -1776,6 +1776,18 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
         ],
     },
     ConfigSectionMeta {
+        id: SectionId::McpServers,
+        label: "MCP Servers",
+        // Render path: the `/mcp` page renders one row per configured
+        // server with live status, and handles toggle/restart/add/
+        // remove via dedicated key bindings rather than the generic
+        // field editor. Fields stay empty here so the regular field
+        // navigator skips the section without rendering a stub row.
+        description: "Status, enable, disable, restart, add or remove configured MCP servers \
+                      (lives behind `/mcp`).",
+        fields: &[],
+    },
+    ConfigSectionMeta {
         id: SectionId::Reset,
         label: "Reset",
         description: "Delete a tier's settings file. Inherited values from \
@@ -1799,11 +1811,12 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
         DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL,
         DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL, DEFAULT_BEDROCK_REGION,
-        DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL, DEFAULT_OLLAMA_BASE_URL,
-        DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
-        DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR, DEFAULT_OPENAI_MODEL,
-        FauxConfig, GoogleConfig, OllamaConfig, OpenAiCodexConfig, OpenAiCompatibleConfig,
-        OpenAiCompatiblePreset, OpenAiConfig, ProviderTransportConfig,
+        DEFAULT_GITHUB_COPILOT_MODEL, DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL,
+        DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL,
+        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR,
+        DEFAULT_OPENAI_MODEL, FauxConfig, GitHubCopilotConfig, GoogleConfig, OllamaConfig,
+        OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
+        ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     let (provider, default_model) = match s {
@@ -1826,6 +1839,10 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 transport,
             }),
             DEFAULT_OPENAI_CODEX_MODEL,
+        ),
+        "github-copilot" | "github_copilot" | "copilot" => (
+            ProviderConfig::GitHubCopilot(GitHubCopilotConfig { transport }),
+            DEFAULT_GITHUB_COPILOT_MODEL,
         ),
         "anthropic" => (
             ProviderConfig::Anthropic(AnthropicConfig {
@@ -1920,6 +1937,7 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
+        ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
         ProviderConfig::Faux(_) => "faux",
     }
@@ -1934,6 +1952,7 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "bedrock" => DEFAULT_BEDROCK_MODEL,
         "ollama" => DEFAULT_OLLAMA_MODEL,
         "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
+        "github_copilot" | "github-copilot" | "copilot" => DEFAULT_GITHUB_COPILOT_MODEL,
         "faux" | "mock" => crate::DEFAULT_FAUX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),

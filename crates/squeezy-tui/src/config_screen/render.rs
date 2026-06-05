@@ -308,6 +308,8 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         render_reset_section(frame, chunks[2], state);
     } else if state.current_section().id == SectionId::Themes {
         render_theme_section(frame, chunks[2], state);
+    } else if state.current_section().id == SectionId::McpServers {
+        render_mcp_section(frame, chunks[2], state);
     } else {
         render_field_pane(frame, chunks[2], state);
     }
@@ -380,6 +382,280 @@ fn render_reset_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Render the `/mcp` page: one row per configured server with a live
+/// status column, plus a trailing "(a) add new server" row. Keeps the
+/// section description inline so the user can see what the page does
+/// without flipping back to the help footer.
+fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    if let Some(form) = &state.mcp_add {
+        render_mcp_add_form(frame, area, state, form);
+        return;
+    }
+    if state.mcp_pending_delete.is_some() {
+        render_mcp_delete_confirm(frame, area, state);
+        return;
+    }
+    let section = state.current_section();
+    let names = state.mcp_server_names();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(names.len() + 8);
+    lines.push(Line::from(vec![
+        Span::styled(
+            section.label,
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            section.description,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+
+    if let Some(banner) = &state.mcp_last_status_line {
+        lines.push(Line::from(vec![Span::styled(
+            banner.clone(),
+            Style::default().fg(crate::render::theme::secondary()),
+        )]));
+        lines.push(Line::raw(""));
+    }
+
+    if names.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "No MCP servers configured.",
+            Style::default().fg(crate::render::theme::quiet()),
+        )]));
+        lines.push(Line::raw(""));
+    } else {
+        // Header row.
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<18}", "NAME"),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<10}", "STATE"),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<8}", "TRANS"),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<18}", "STATUS"),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "ENDPOINT",
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for (row, name) in names.iter().enumerate() {
+            let server = match state.mcp_servers.get(name) {
+                Some(server) => server,
+                None => continue,
+            };
+            let active = row == state.field_index;
+            let marker = if active { "▸ " } else { "  " };
+            let state_text = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let status = state
+                .mcp_status
+                .per_server
+                .get(name)
+                .map(format_mcp_row_status)
+                .unwrap_or_else(|| "—".to_string());
+            let endpoint = server
+                .command
+                .as_deref()
+                .or(server.url.as_deref())
+                .unwrap_or("-");
+            let row_style = if active {
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "{marker}{:<18}{:<10}{:<8}{:<18}{}",
+                    name,
+                    state_text,
+                    server.transport.as_str(),
+                    status,
+                    endpoint
+                ),
+                row_style,
+            )]));
+        }
+    }
+
+    // Trailing "(add new)" row.
+    let add_row = names.len();
+    let add_active = state.field_index == add_row;
+    let add_marker = if add_active { "▸ " } else { "  " };
+    let add_style = if add_active {
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(crate::render::theme::secondary())
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!("{add_marker}(a) add new MCP server"),
+        add_style,
+    )]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Enter / e   toggle enabled    r   restart    a   add    d / x   remove",
+        Style::default().fg(crate::render::theme::quiet()),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "Shift+e / Shift+a applies the change session-only (no settings.toml write); \
+         remove prompts y/s/n (y = persist · s = session-only · n / Esc = cancel)",
+        Style::default().fg(crate::render::theme::quiet()),
+    )]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn format_mcp_row_status(status: &squeezy_tools::McpServerStatus) -> String {
+    use squeezy_tools::McpServerStatus;
+    match status {
+        McpServerStatus::Starting => "starting".to_string(),
+        McpServerStatus::Ready {
+            tools_count,
+            cached,
+        } => {
+            if *cached {
+                format!("ready·cached {tools_count}")
+            } else {
+                format!("ready {tools_count}")
+            }
+        }
+        McpServerStatus::Failed { error } => {
+            // Trim long error strings so the row stays single-line;
+            // the user can still see the leading clause which is the
+            // most diagnostic part.
+            let trimmed: String = error.chars().take(20).collect();
+            format!("failed:{trimmed}")
+        }
+        McpServerStatus::Cancelled => "cancelled".to_string(),
+    }
+}
+
+fn render_mcp_add_form(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &ConfigScreenState,
+    form: &super::McpAddForm,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(12);
+    lines.push(Line::from(vec![Span::styled(
+        "Add MCP server",
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::raw(""));
+    if let Some(err) = &form.error {
+        lines.push(Line::from(vec![Span::styled(
+            format!("error: {err}"),
+            Style::default().fg(crate::render::theme::red()),
+        )]));
+        lines.push(Line::raw(""));
+    }
+
+    let rows = [
+        ("name", form.name.as_str()),
+        ("transport", form.transport.as_str()),
+        ("command", form.command.as_str()),
+        ("url", form.url.as_str()),
+    ];
+    for (idx, (label, value)) in rows.iter().enumerate() {
+        let active = idx == form.field_index;
+        let prefix = if active { "▸ " } else { "  " };
+        let val_style = if active {
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let value_display = if value.is_empty() {
+            "—".to_string()
+        } else {
+            (*value).to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::styled(
+                format!("{:<10}", label),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(value_display, val_style),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    let mode_label = if form.session_only {
+        "session-only (will not write settings.toml)"
+    } else {
+        "persisted (writes to active scope's settings.toml)"
+    };
+    lines.push(Line::from(vec![
+        Span::styled("mode: ", Style::default().fg(crate::render::theme::quiet())),
+        Span::styled(
+            mode_label,
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Up/Down move · Space cycles transport · Tab toggles session-only · \
+         Enter submits · Esc cancels",
+        Style::default().fg(crate::render::theme::quiet()),
+    )]));
+    let _ = state; // future: show the active scope path here
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_mcp_delete_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    let name = state.mcp_pending_delete.as_deref().unwrap_or("?");
+    let mut lines = Vec::with_capacity(6);
+    lines.push(Line::from(vec![Span::styled(
+        "Remove MCP server",
+        Style::default()
+            .fg(crate::render::theme::accent())
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        format!("Remove `{name}` from configured MCP servers?"),
+        Style::default(),
+    )]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "y → remove + persist to settings.toml · s → session-only · n / Esc → cancel",
+        Style::default().fg(crate::render::theme::quiet()),
+    )]));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -932,7 +1208,7 @@ fn secret_caret_line(display: &str, cursor: usize) -> Line<'static> {
 
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
     let display: String = if entry.reveal {
-        // Explicit Ctrl+T toggle — show the full plaintext for verification.
+        // F2 toggle — show the full plaintext for verification.
         entry.draft.clone()
     } else {
         "•".repeat(entry.char_len())
@@ -972,7 +1248,7 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
             ),
             Span::styled("save  ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled(
-                "Ctrl+T ",
+                "F2 ",
                 Style::default().fg(crate::render::theme::secondary()),
             ),
             Span::styled(

@@ -2647,6 +2647,7 @@ impl ToolRegistry {
             Ok(report) => report,
             Err(err) => return tool_error(call, err),
         };
+        crate::emit_graph_refresh_telemetry(&self.telemetry, &refresh);
         annotate_graph(manager, &snapshot);
         let graph = manager.graph();
 

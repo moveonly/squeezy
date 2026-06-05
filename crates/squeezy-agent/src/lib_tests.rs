@@ -28,13 +28,19 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 
 struct MockProvider {
+    name: &'static str,
     responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
     requests: Mutex<Vec<LlmRequest>>,
 }
 
 impl MockProvider {
     fn new(responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
+        Self::named("mock", responses)
+    }
+
+    fn named(name: &'static str, responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
         Self {
+            name,
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
         }
@@ -47,7 +53,7 @@ impl MockProvider {
 
 impl LlmProvider for MockProvider {
     fn name(&self) -> &'static str {
-        "mock"
+        self.name
     }
 
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
@@ -1649,6 +1655,71 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
 }
 
 #[tokio::test]
+async fn server_model_echo_drives_cost_estimation() {
+    let usage = CostSnapshot {
+        input_tokens: Some(1_000_000),
+        output_tokens: Some(0),
+        reasoning_output_tokens: None,
+        cached_input_tokens: None,
+        cache_write_input_tokens: None,
+        estimated_usd_micros: None,
+    };
+    assert_eq!(
+        squeezy_llm::estimate_cost("openai", "gpt-5.4-nano", &usage),
+        Some(200_000),
+        "fixture should price to the server model's known OpenAI rate"
+    );
+    let provider = Arc::new(MockProvider::named(
+        "openai",
+        vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ServerModel("gpt-5.4-nano".to_string())),
+            Ok(LlmEvent::TextDelta("priced by server model".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_server_model".to_string()),
+                cost: usage,
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ]],
+    ));
+    let config = AppConfig {
+        model: "gpt-5.5".to_string(),
+        routing: squeezy_core::RoutingConfig {
+            enabled: false,
+            ..AppConfig::default().routing
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+    assert_eq!(agent.provider.name(), "openai");
+
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut completed_cost = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { cost, .. } => {
+                completed_cost = Some(cost);
+            }
+            AgentEvent::Failed { error, .. } => {
+                failed = Some(error.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(failed.is_none(), "turn should complete, got: {failed:?}");
+    let completed_cost = completed_cost.expect("turn should emit AgentEvent::Completed");
+    assert_eq!(completed_cost.input_tokens, Some(1_000_000));
+    assert_eq!(
+        completed_cost.estimated_usd_micros,
+        Some(200_000),
+        "OpenAI gpt-5.4-nano input pricing should be used instead of requested gpt-5.5 pricing"
+    );
+}
+
+#[tokio::test]
 async fn shell_tool_emits_job_events_and_session_events() {
     let root = temp_workspace("agent_shell_job");
     let provider = Arc::new(MockProvider::new(vec![
@@ -2423,6 +2494,304 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
 }
 
 #[tokio::test]
+async fn fork_mode_skills_render_in_fork_block_not_active_block() {
+    let root = temp_workspace("agent_skill_fork_partition");
+    let inline_dir = root.join(".agents/skills/inline-skill");
+    fs::create_dir_all(&inline_dir).expect("mkdir inline");
+    fs::write(
+        inline_dir.join("SKILL.md"),
+        "---\nname: inline-skill\ndescription: \"inline desc\"\ntriggers:\n  - inline phrase\n---\n# Inline Body\n",
+    )
+    .expect("write inline skill");
+    let fork_dir = root.join(".agents/skills/fork-skill");
+    fs::create_dir_all(&fork_dir).expect("mkdir fork");
+    fs::write(
+        fork_dir.join("SKILL.md"),
+        "---\nname: fork-skill\ndescription: \"fork desc\"\ncontext: fork\ntriggers:\n  - fork phrase\n---\n# Fork Body\n",
+    )
+    .expect("write fork skill");
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "trigger inline phrase and fork phrase together".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured llm request");
+    let instructions = &request.instructions;
+    assert!(
+        instructions.contains("<active_skills>"),
+        "inline-mode skill must still render under <active_skills>: {instructions}"
+    );
+    assert!(
+        instructions.contains("inline-skill"),
+        "inline skill missing from instructions: {instructions}"
+    );
+    assert!(
+        instructions.contains("<fork_skills>"),
+        "fork-mode skill must render in a separate <fork_skills> block: {instructions}"
+    );
+    assert!(
+        instructions.contains("context_mode=\"fork\""),
+        "fork block must tag the skill with context_mode=\"fork\": {instructions}"
+    );
+    let active_segment = instructions
+        .split("<active_skills>")
+        .nth(1)
+        .and_then(|tail| tail.split("</active_skills>").next())
+        .unwrap_or("");
+    assert!(
+        !active_segment.contains("fork-skill"),
+        "fork-mode skill leaked into <active_skills>: {active_segment}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn skill_manifest_missing_tool_deps_emit_warning_block() {
+    let root = temp_workspace("agent_skill_tool_deps");
+    let skill_dir = root.join(".agents/skills/needs-things");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: needs-things\ndescription: \"depends on absent tools\"\ntriggers:\n  - needs things\n---\n# body\n",
+    )
+    .expect("write skill md");
+    fs::write(
+        skill_dir.join("skill.toml"),
+        "tool_deps = [\"mcp:nonexistent\", \"definitely_not_a_tool\"]\n",
+    )
+    .expect("write manifest");
+
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+    let mut rx = agent.start_turn(
+        "needs things now please".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured request");
+    assert!(
+        request.instructions.contains("<skill_warnings>"),
+        "missing skill_warnings block: {}",
+        request.instructions
+    );
+    assert!(
+        request.instructions.contains("needs-things"),
+        "warning block must name the skill: {}",
+        request.instructions
+    );
+    assert!(
+        request.instructions.contains("mcp:nonexistent")
+            && request.instructions.contains("definitely_not_a_tool"),
+        "warning block must list each missing dep: {}",
+        request.instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn replace_config_rediscovers_skill_catalog() {
+    let root = temp_workspace("agent_skill_reload");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let initial_config = config_with_skill_dirs(&root);
+    let mut agent = Agent::new(initial_config.clone(), provider.clone());
+
+    // Drop a brand-new skill onto disk after the agent has been
+    // built. Without `replace_config` rebuilding the catalog the next
+    // turn would not see this file because `SkillCatalog::discover`
+    // had already run.
+    let skill_dir = root.join(".agents/skills/late-skill");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: late-skill\ndescription: \"added after init\"\ntriggers:\n  - late phrase\n---\n# Late\n",
+    )
+    .expect("write late skill");
+
+    // Mutate the skills config (a no-op `[[skills.config]]` rule is
+    // enough to change the value so `replace_config` rebuilds) and
+    // hand it back to the agent the same way the TUI reload path
+    // would.
+    let mut next_config = initial_config;
+    next_config
+        .skills
+        .config
+        .push(squeezy_core::SkillConfigEntry {
+            name: Some("late-skill".to_string()),
+            path: None,
+            enabled: true,
+        });
+    agent.replace_config(next_config);
+
+    let mut rx = agent.start_turn("trigger late phrase".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("captured request");
+    assert!(
+        request.instructions.contains("late-skill"),
+        "reloaded catalog must surface late-skill: {}",
+        request.instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_skill_hooks_default_to_disabled() {
+    let root = temp_workspace("agent_skill_hooks_off");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let config = config_with_skill_dirs(&root);
+    assert!(
+        !config.skills.hooks_enabled,
+        "default config must keep skill hooks dormant"
+    );
+    let agent = Agent::new(config, provider);
+    assert!(
+        agent.hooks().is_none(),
+        "skill hooks must stay off until [skills] hooks_enabled = true"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_skill_hooks_register_when_enabled() {
+    let root = temp_workspace("agent_skill_hooks_on");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let registry = agent.hooks().expect("hooks registry installed");
+    assert_eq!(registry.len(), 1, "one declared hook should be registered");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn replace_config_clears_hooks_when_hooks_enabled_toggled_off() {
+    let root = temp_workspace("agent_skill_hooks_toggle_off");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let mut agent = Agent::new(config.clone(), provider);
+
+    assert!(
+        agent.hooks().is_some(),
+        "hooks must be installed when hooks_enabled=true"
+    );
+
+    // Simulate hot-reload that disables the gate.
+    let mut next = config;
+    next.skills.hooks_enabled = false;
+    // Trigger the skills_changed path by tweaking another skills field.
+    next.skills.inline = true;
+    agent.replace_config(next);
+
+    assert!(
+        agent.hooks().is_none(),
+        "hooks must be cleared when hooks_enabled flipped to false via replace_config"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn replace_config_rebuilds_hooks_when_hooks_remain_enabled() {
+    let root = temp_workspace("agent_skill_hooks_rebuild");
+    let skill_dir = root.join(".agents/skills/validator");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: validator\ndescription: \"d\"\nhooks:\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# validator\n",
+    )
+    .expect("write skill");
+
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut config = config_with_skill_dirs(&root);
+    config.skills.hooks_enabled = true;
+    let mut agent = Agent::new(config.clone(), provider);
+
+    let old_hook_count = agent.hooks().map(|r| r.len()).unwrap_or(0);
+    assert_eq!(old_hook_count, 1);
+
+    // Disable the skill via a config rule while hooks_enabled stays true.
+    let mut next = config;
+    next.skills.config.push(squeezy_core::SkillConfigEntry {
+        name: Some("validator".to_string()),
+        path: None,
+        enabled: false,
+    });
+    agent.replace_config(next);
+
+    // After the skill is disabled the hook should vanish.
+    assert!(
+        agent.hooks().is_none(),
+        "disabling the skill via [[skills.config]] must clear its hook handlers"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn known_help_topic_short_circuits_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -2479,9 +2848,7 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert!(
-        request
-            .instructions
-            .contains("hidden documentation subagent"),
+        request.instructions.contains("doc-help subagent"),
         "{:?}",
         request.instructions
     );
@@ -2507,15 +2874,32 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
             _ => None,
         })
         .expect("subagent user prompt");
+    // Unknown topics (no curated match) get the full corpus so DocHelp has
+    // maximum coverage.  Both a providers-related doc and a sessions-related doc
+    // must be present; neither is topic-specific for "quantum billing rules".
+    assert!(
+        user_prompt.contains("PATH: docs/external/AGENT_APPROACH.md"),
+        "unknown-topic corpus must include AGENT_APPROACH.md: {user_prompt:?}"
+    );
     assert!(
         user_prompt.contains("PATH: docs/external/PROVIDERS.md"),
-        "subagent prompt must inline bundled docs: {user_prompt:?}"
+        "unknown-topic corpus must include PROVIDERS.md (full corpus, not scoped): {user_prompt:?}"
+    );
+    assert!(
+        user_prompt.contains("PATH: docs/external/SESSIONS.md"),
+        "unknown-topic corpus must include SESSIONS.md (full corpus, not scoped): {user_prompt:?}"
     );
 
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("quantum-billing"), "{completed}");
-    assert!(!completed.contains("won't guess"), "{completed}");
+    assert!(!completed.contains("No local help coverage"), "{completed}");
 }
+
+// NOTE: doc_help_subagent_scopes_corpus_to_matching_topic was removed because
+// `/help <known-topic>` is always handled by the curated layer (Answered), so
+// DocHelp never fires for known topics — the assertion `requests.len() == 1`
+// was always false.  Corpus scoping is tested as a pure unit test in
+// crates/squeezy-skills/src/help_tests.rs (relevant_docs_for_input_scopes_corpus).
 
 #[tokio::test]
 async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
@@ -2869,6 +3253,15 @@ fn tool_loop_guard_stops_repeated_identical_failures() {
 }
 
 #[test]
+fn non_success_tool_statuses_are_model_errors() {
+    assert!(!tool_status_is_model_error(ToolStatus::Success));
+    assert!(tool_status_is_model_error(ToolStatus::Error));
+    assert!(tool_status_is_model_error(ToolStatus::Denied));
+    assert!(tool_status_is_model_error(ToolStatus::Stale));
+    assert!(tool_status_is_model_error(ToolStatus::Cancelled));
+}
+
+#[test]
 fn tool_loop_guard_distinguishes_shell_failures_by_command() {
     let make_shell = |call_id: &str, command: &str| {
         let call = ToolCall {
@@ -2938,7 +3331,8 @@ async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure
         "help should try the doc subagent before falling back"
     );
     let completed = completed.expect("help turn should complete");
-    assert!(completed.contains("won't guess"), "{completed}");
+    // "won't guess" was replaced with "No local help coverage" in the unsupported() message.
+    assert!(completed.contains("No local help coverage"), "{completed}");
     assert!(
         completed.contains("https://squeezyagent.com/docs/"),
         "{completed}"
@@ -6371,6 +6765,7 @@ fn mark_intra_batch_duplicates_stamps_hint_on_second_identical_call() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let calls = vec![
         make_call("g1", "\\bfn make_widget\\b"),
@@ -7044,11 +7439,42 @@ fn parse_subagent_structured_tail_rejects_json_array_only() {
 }
 
 #[test]
+fn skill_subagent_uses_system_override_as_instructions() {
+    let request = super::SubagentRequest {
+        prompt: "explain how this skill applies to the user's task".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: Some("# Skill body\nFollow these steps exactly.".to_string()),
+    };
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
+    assert!(
+        instructions.contains("# Skill body"),
+        "skill subagent must run the supplied body as system instructions: {instructions}"
+    );
+}
+
+#[test]
+fn skill_subagent_falls_back_when_system_override_missing() {
+    let request = super::SubagentRequest {
+        prompt: "do the thing".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: None,
+    };
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
+    assert!(
+        instructions.to_lowercase().contains("fork-mode skill"),
+        "missing fallback prompt for skill subagent without override: {instructions}"
+    );
+}
+
+#[test]
 fn plan_subagent_instructions_advertise_json_tail_contract() {
     let request = super::SubagentRequest {
         prompt: "plan something".to_string(),
         scope: None,
         thoroughness: None,
+        system_override: None,
     };
     let plan = super::subagent_instructions(SubagentKind::Plan, &request);
     assert!(
@@ -7359,6 +7785,71 @@ fn arm_then_drain_applies_swap_with_optional_provider() {
     assert_eq!(drained.display_note.as_deref(), Some("model swap"));
     assert_eq!(agent.config_snapshot().model, "claude-opus-4-7");
     assert!(agent.pending_config_swap().is_none());
+}
+
+/// Pin the hot-reload bridge between `PendingConfigSwap` and the MCP
+/// registry: when a settings-watcher reload changes the provider AND
+/// `[mcp.servers]` on the same beat, the swap path used to bypass
+/// `replace_config` and leave the registry stale until restart.
+/// `drain_pending_swap` now invokes the shared reload hook so the
+/// observable `mcp_servers()` snapshot reflects the new map by the
+/// time the next turn begins.
+#[tokio::test]
+async fn drain_pending_swap_picks_up_mcp_servers_drift() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![]));
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    assert!(
+        agent.mcp_servers().is_empty(),
+        "fresh agent starts with no MCP servers"
+    );
+
+    let mut next = agent.config_snapshot();
+    next.mcp_servers.insert(
+        "docs".to_string(),
+        squeezy_core::McpServerConfig {
+            enabled: true,
+            transport: squeezy_core::McpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            url: Some("https://docs.example/mcp".to_string()),
+            timeout_ms: None,
+            discovery_timeout_ms: None,
+            tool_call_timeout_ms: None,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            env: BTreeMap::new(),
+            permissions: squeezy_core::McpPermissionConfig::default(),
+            bearer_token_env_var: None,
+            http_headers: BTreeMap::new(),
+            env_http_headers: BTreeMap::new(),
+        },
+    );
+
+    agent.arm_config_swap(PendingConfigSwap {
+        config: next,
+        // No provider entry → exercises the NextPrompt swap path
+        // exactly the way a provider-changing reload would; the
+        // provider field would arrive populated, but the MCP-side
+        // assertion is identical either way.
+        provider: None,
+        display_note: None,
+    });
+    let _drained = agent.drain_pending_swap().expect("swap armed");
+
+    // Yield until the background `replace_mcp_servers` task has run
+    // and updated the registry. We poll for up to a few hundred
+    // milliseconds; the assertion fails loudly if the reload never
+    // happened (the previous bug shape).
+    for _ in 0..40 {
+        if agent.mcp_servers().contains_key("docs") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        agent.mcp_servers().contains_key("docs"),
+        "drain_pending_swap must propagate [mcp.servers] drift to the registry"
+    );
 }
 
 #[tokio::test]
@@ -8118,6 +8609,78 @@ async fn round_input_gate_noop_when_unset() {
     );
 }
 
+#[tokio::test]
+async fn provider_context_overflow_compacts_and_retries_once() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ContextOverflow {
+                provider: "mock".to_string(),
+                signal: squeezy_llm::overflow::OverflowSignal::ErrorPattern(
+                    "context_length_exceeded".to_string(),
+                ),
+            }),
+            Err(SqueezyError::ProviderStream(
+                "context_length_exceeded".to_string(),
+            )),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done after compact".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_after_compact".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled: false,
+            enabled_mid_turn: false,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    agent.conversation_state.lock().await.conversation = mid_turn_test_conversation();
+
+    let mut rx = agent.start_turn("continue".to_string(), CancellationToken::new());
+    let mut compacted = None;
+    let mut completed = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ContextCompacted { report, .. } => compacted = Some(report),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => failed = Some(error.to_string()),
+            _ => {}
+        }
+    }
+
+    assert!(
+        failed.is_none(),
+        "overflow should compact and retry once instead of failing: {failed:?}"
+    );
+    let report = compacted.expect("provider overflow should force compaction");
+    assert!(
+        report.record.after.estimated_tokens < report.record.before.estimated_tokens,
+        "overflow compaction should shrink context: {} -> {}",
+        report.record.before.estimated_tokens,
+        report.record.after.estimated_tokens,
+    );
+    assert_eq!(completed.as_deref(), Some("done after compact"));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the first overflowing call should be retried exactly once after compaction"
+    );
+}
+
 /// Drives the broker through a scripted spent sequence: after a cheap first
 /// round lands, the next round's projection must trip the cap pre-flight even
 /// though the post-hoc check is still under cap.
@@ -8235,6 +8798,7 @@ fn shell_fallback_result(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -8306,6 +8870,7 @@ async fn shell_sandbox_fallback_ignores_clean_shell_results_and_non_shell_tools(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let read_file = squeezy_tools::ToolResult {
         call_id: "call".to_string(),
@@ -8318,6 +8883,7 @@ async fn shell_sandbox_fallback_ignores_clean_shell_results_and_non_shell_tools(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
 
     maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(1), &clean_shell).await;
@@ -8396,6 +8962,7 @@ async fn shell_sandbox_fallback_counter_emits_per_call() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     emit_tool_telemetry(
         &config,
@@ -9642,6 +10209,7 @@ fn graph_indexing_fallback_result(tool_name: &str) -> squeezy_tools::ToolResult 
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -9661,6 +10229,7 @@ fn graph_success_result(tool_name: &str) -> squeezy_tools::ToolResult {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -9907,6 +10476,7 @@ fn tool_round_path_collector_counts_distinct_path_like_values() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let pending = SeenToolOutputs::default().prepare_results(vec![result]);
     let mut paths = BTreeSet::new();
@@ -9949,6 +10519,7 @@ fn tool_round_path_collector_ignores_dotted_non_path_tokens() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let pending = SeenToolOutputs::default().prepare_results(vec![result]);
     let mut paths = BTreeSet::new();

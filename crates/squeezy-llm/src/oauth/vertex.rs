@@ -249,6 +249,10 @@ impl ApiKeySource for VertexOAuthSource {
     fn provider_label(&self) -> &str {
         &self.label
     }
+
+    fn can_rotate(&self) -> bool {
+        true
+    }
 }
 
 /// Spawn `command args...`, wait up to `timeout`, return the trimmed

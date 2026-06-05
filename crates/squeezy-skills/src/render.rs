@@ -334,6 +334,73 @@ fn wrap_blocks(blocks: &[String]) -> Option<String> {
         .then(|| format!("<active_skills>\n{}\n</active_skills>", blocks.join("\n")))
 }
 
+/// Render fork-mode skills (skills whose frontmatter declares
+/// `context: fork`) as a separate `<fork_skills>` system block.
+///
+/// Fork-mode skills are kept out of `<active_skills>` so the model can
+/// tell them apart from inline skills. Their bodies ARE still present in
+/// the parent system prompt inside the `<fork_skills>` wrapper; the
+/// block carries an `<instruction>` telling the model to treat the body
+/// as input for a `delegate` subagent call rather than executing it
+/// directly in the parent turn. Returns `None` when there are no
+/// fork-mode skills or `budget_chars == 0`.
+pub fn render_fork_skills(
+    skills: &[LoadedSkill],
+    budget_chars: usize,
+    body_cap_chars: usize,
+) -> Option<String> {
+    if skills.is_empty() || budget_chars == 0 {
+        return None;
+    }
+    let mut blocks = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let body_chars = char_count(&skill.body);
+        let body_segment = if body_chars > body_cap_chars {
+            warn!(
+                target: "squeezy_skills",
+                skill = %skill.summary.name,
+                body_chars,
+                cap_chars = body_cap_chars,
+                "fork_skill_body_truncated"
+            );
+            format!(
+                "<content_truncated reason=\"body_cap\">Body omitted because it exceeds {body_cap_chars} chars; call `load_skill` for the full text.</content_truncated>"
+            )
+        } else {
+            format!(
+                "<content>\n{}\n</content>",
+                escape_body_breakouts(skill.body.trim())
+            )
+        };
+        let when_to_use = skill
+            .summary
+            .when_to_use
+            .as_ref()
+            .map(|value| format!("\n<when_to_use>{}</when_to_use>", xml_escape(value)))
+            .unwrap_or_default();
+        let instruction = "This skill declared context=\"fork\". Treat the body as instructions for a focused subagent (e.g. invoke `delegate` with the relevant slice of the user's task using this body as the subagent system prompt) instead of acting on it inline. Do not execute the body as part of the parent turn.";
+        blocks.push(format!(
+            "<skill name=\"{}\" source=\"{}\" context_mode=\"fork\">\n<description>{}</description>{when_to_use}\n<location>{}</location>\n<base_directory>{}</base_directory>\n<instruction>{}</instruction>\n{body_segment}\n</skill>",
+            xml_escape(&skill.summary.name),
+            skill.summary.source.as_str(),
+            xml_escape(&skill.summary.description),
+            skill.summary.location.display(),
+            skill.base_dir.display(),
+            xml_escape(instruction),
+        ));
+    }
+    let rendered = format!("<fork_skills>\n{}\n</fork_skills>", blocks.join("\n"));
+    if char_count(&rendered) > budget_chars {
+        warn!(
+            target: "squeezy_skills",
+            budget_chars,
+            rendered_chars = char_count(&rendered),
+            "fork_skills block exceeds budget; emitting anyway because fork-mode skills cannot be silently dropped"
+        );
+    }
+    Some(rendered)
+}
+
 fn wrap_preamble(lines: &[String]) -> String {
     format!(
         "<available_skills>\n{}\n</available_skills>",

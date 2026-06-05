@@ -442,7 +442,7 @@ fn transcript_overlay_uses_active_subagent_conversation() {
     let output = render_to_string(&app, 90, 16);
     assert!(output.contains("delegate subagent"), "{output}");
     assert!(output.contains("running repo_map"), "{output}");
-    assert!(output.contains("Ctrl-T"), "{output}");
+    assert!(output.contains("Ctrl+T"), "{output}");
 }
 
 #[tokio::test]
@@ -1966,7 +1966,7 @@ async fn slash_prompt_template_expands_unknown_head_into_user_turn() {
     assert_eq!(
         app.cancelled_prompt.as_deref(),
         Some("Review src/lib.rs for issues."),
-        "cancelled_prompt should mirror the rendered template body so Ctrl-R can restore it",
+        "cancelled_prompt should mirror the rendered template body so Ctrl+R can restore it",
     );
 }
 
@@ -4490,6 +4490,28 @@ async fn slash_attach_surfaces_unsupported_label_only_images() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Drift test: every entry in `SLASH_COMMAND_HELP_TABLE` must correspond to a real
+/// slash command in the live `SLASH_COMMANDS` registry, so stale or invented names
+/// are caught at compile time.  Adding a new command to the registry does NOT
+/// automatically fail this test; add a help entry to `SLASH_COMMAND_HELP_TABLE` to
+/// cover it.
+#[test]
+fn slash_help_table_entries_exist_in_registry() {
+    use squeezy_skills::slash_command_help_names;
+
+    // SLASH_COMMANDS is re-exported as pub(crate) from lib.rs via `use super::*`
+    let registry_names: std::collections::HashSet<&str> =
+        SLASH_COMMANDS.iter().map(|c| c.name).collect();
+
+    for help_name in slash_command_help_names() {
+        assert!(
+            registry_names.contains(help_name),
+            "SLASH_COMMAND_HELP_TABLE entry {help_name:?} does not exist in SLASH_COMMANDS; \
+             either the command was removed/renamed or the help entry was mis-typed"
+        );
+    }
+}
+
 #[tokio::test]
 async fn slash_help_lists_topics() {
     let mut agent = test_agent(SessionMode::Build);
@@ -4503,7 +4525,7 @@ async fn slash_help_lists_topics() {
         transcript_message_contents(&app).contains(&"/help"),
         "user prompt should remain in the transcript"
     );
-    assert!(content.contains("Supported topics"), "{content}");
+    assert!(content.contains("Available `/help` topics"), "{content}");
     assert!(content.contains("`providers`"), "{content}");
 }
 
@@ -4562,7 +4584,7 @@ async fn slash_help_unsupported_points_to_public_resources() {
         transcript_message_contents(&app).contains(&"/help quantum billing"),
         "user prompt should remain in the transcript"
     );
-    assert!(content.contains("won't guess"), "{content}");
+    assert!(content.contains("No local help coverage"), "{content}");
     assert!(
         content.contains("https://squeezyagent.com/docs/"),
         "{content}"
@@ -4837,7 +4859,7 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
     assert!(!collapsed.contains("receipt="), "{collapsed}");
     assert!(!collapsed.contains("B receipt"), "{collapsed}");
     assert!(
-        collapsed.contains("Ctrl-T for full transcript"),
+        collapsed.contains("Ctrl+T for full transcript"),
         "collapsed view should point at the overlay: {collapsed}"
     );
     assert!(
@@ -4846,7 +4868,7 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
     );
 
     // Force the expanded inline variant directly so this test still
-    // covers the card body rendering. The user-facing full view is Ctrl-T.
+    // covers the card body rendering. The user-facing full view is Ctrl+T.
     set_all_transcript_collapsed(&mut app, false);
 
     assert!(!app.transcript[0].collapsed);
@@ -5049,6 +5071,7 @@ fn failed_rustfmt_output_uses_diff_background_not_colored_text() {
         MessageOutcome::Normal,
         Some(140),
         true,
+        "Ctrl+T",
     );
     let rendered = lines_to_plain_text(&lines);
     assert!(
@@ -5492,6 +5515,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
         MessageOutcome::Normal,
         Some(120),
         true,
+        "Ctrl+T",
     );
     let output = lines
         .iter()
@@ -5678,6 +5702,7 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
         MessageOutcome::Normal,
         Some(120),
         true,
+        "Ctrl+T",
     );
     let rendered = lines_to_plain_text(&lines);
     assert!(!rendered.contains("diff --git"), "{rendered}");
@@ -6271,7 +6296,7 @@ fn reasoning_usage_status_is_hidden_when_disabled() {
 fn reasoning_delta_renders_with_dim_italic() {
     let expected_modifiers = Modifier::DIM | Modifier::ITALIC;
 
-    let block = reasoning_block_lines("first thought\nsecond thought", false, false);
+    let block = reasoning_block_lines("first thought\nsecond thought", false, false, "Ctrl+T");
     assert!(
         block.len() >= 2,
         "expanded reasoning emits header and at least one body line: {block:?}"
@@ -6340,6 +6365,7 @@ fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
         false,
         ToolOutputVerbosity::Compact,
         MessageOutcome::Normal,
+        "Ctrl+T",
     ));
     assert!(rendered.contains("▸ reasoning"), "{rendered}");
     assert!(rendered.contains("first thought"), "{rendered}");
@@ -7005,7 +7031,7 @@ fn footer_mentions_transcript_shortcut() {
 
     let output = render_to_string(&app, 140, 16);
 
-    assert!(output.contains("Ctrl-T full transcript"), "{output}");
+    assert!(output.contains("Ctrl+T full transcript"), "{output}");
     assert!(
         !output.contains("Ctrl-O expand") && !output.contains("Ctrl-E expand all"),
         "the removed per-entry expand keys must not be advertised: {output}"
@@ -7032,7 +7058,7 @@ fn active_prompt_cursor_is_vertically_centered() {
 fn assistant_marker_uses_answer_color() {
     let item = TranscriptItem::assistant("done");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
@@ -7057,7 +7083,7 @@ fn assistant_marker_uses_answer_color() {
 fn failed_assistant_marker_uses_error_color() {
     let item = TranscriptItem::assistant("partial answer");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Failed, "Ctrl+T");
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
@@ -7089,7 +7115,7 @@ fn ansi_system_entry_parses_escapes_into_styled_spans() {
     let content = format!("{bold_accent_header}\n  input={value_in_accent}");
     let item = TranscriptItem::system(content);
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     assert!(lines.len() >= 2, "{lines:?}");
 
     // First line: the role chrome (`• Noted`) prefix plus the parsed
@@ -7123,7 +7149,7 @@ fn ansi_system_entry_parses_escapes_into_styled_spans() {
 #[test]
 fn accounting_block_dispatch_skips_unrelated_system_messages() {
     let item = TranscriptItem::system("Random system note\nwith multiple\nlines");
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     // The unrelated content keeps the default single-style rendering: the
     // header gets the standard `• Noted` chrome, the body lines fall
     // through to `action_text_lines_styled` with no per-token coloring.
@@ -7369,6 +7395,7 @@ fn submitted_prompt_renders_bubble_around_text() {
         MessageOutcome::Normal,
         Some(40),
         true,
+        "Ctrl+T",
     );
 
     let content = lines[0]
@@ -7409,6 +7436,7 @@ fn submitted_prompt_preserves_empty_lines() {
         MessageOutcome::Normal,
         Some(30),
         true,
+        "Ctrl+T",
     );
     let rendered = lines
         .iter()
@@ -7612,6 +7640,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         false,
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
+        "Ctrl+T",
     );
     // Open bubble: lines[0] = bullet + content text.
     assert_eq!(
@@ -7634,6 +7663,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         false,
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 1),
+        "Ctrl+T",
     );
     assert_eq!(
         log_lines[0].spans[1].style.fg,
@@ -7649,7 +7679,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
 fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     let _text = lines[0]
         .spans
         .iter()
@@ -7677,7 +7707,7 @@ fn user_prompt_text_is_highlighted_in_transcript() {
 fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
     let item = TranscriptItem::user("  !ls");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     // Content row is lines[0].
     let bang = lines[0]
         .spans
@@ -7722,7 +7752,7 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
     // the regular single-bang at a glance.
     let item = TranscriptItem::user("  !!git status");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     let bang = lines[0]
         .spans
         .iter()
@@ -8687,8 +8717,8 @@ async fn cancel_preserves_pending_prompt_for_ctrl_r() {
 
     let hint = format_status_hints(&app);
     assert!(
-        hint.contains("Ctrl-R"),
-        "idle hint must advertise Ctrl-R when a cancelled prompt is stashed; got: {hint}"
+        hint.contains("Ctrl+R"),
+        "idle hint must advertise Ctrl+R when a cancelled prompt is stashed; got: {hint}"
     );
     assert!(restore_cancelled_prompt(&mut app), "restore must succeed");
     assert_eq!(app.input, "write the README");
@@ -8801,7 +8831,7 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
     assert_eq!(
         app.cancelled_prompt.as_deref(),
         Some("original"),
-        "stash stays so Ctrl-R can still recover the original prompt",
+        "stash stays so Ctrl+R can still recover the original prompt",
     );
 }
 
@@ -9882,6 +9912,7 @@ fn sample_tool_result(name: &str, output: &str) -> ToolResult {
             content_sha256: Some("0123456789abcdef".to_string()),
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -10319,6 +10350,38 @@ async fn keymap_override_redirects_transcript_overlay() {
     assert!(
         app.transcript_overlay.is_none(),
         "Ctrl+O must close the overlay on second press",
+    );
+}
+
+/// After rebinding `transcript_overlay`, collapsed tool-card truncation hints
+/// in the inline transcript and the overlay title must advertise the rebound
+/// key, not the hardcoded default "Ctrl+T".
+#[test]
+fn keymap_rebind_updates_collapsed_card_hint() {
+    let mut config = test_config(SessionMode::Build);
+    config
+        .tui
+        .keymap
+        .insert("transcript_overlay".to_string(), "Ctrl+o".to_string());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // Push a long grep result so the collapsed card needs a truncation hint.
+    let payload = (0..30)
+        .map(|i| format!("match-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
+    app.finalize_settles_for_test();
+    assert!(app.transcript[0].collapsed);
+
+    let rendered = render_to_string(&app, 100, 24);
+    assert!(
+        rendered.contains("Ctrl+O for full transcript"),
+        "collapsed card hint must use the rebound key; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Ctrl+T for full transcript"),
+        "stale default must not appear after rebind; got:\n{rendered}"
     );
 }
 
@@ -11208,7 +11271,7 @@ fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
         "middle should be elided: {output}"
     );
     assert!(
-        output.contains("Ctrl-T for full transcript"),
+        output.contains("Ctrl+T for full transcript"),
         "ellipsis hint missing: {output}"
     );
 }
@@ -11291,16 +11354,16 @@ async fn ctrl_t_opens_and_closes_transcript_overlay() {
     .expect("handle key");
     assert!(
         app.transcript_overlay.is_some(),
-        "Ctrl-T should open the overlay"
+        "Ctrl+T should open the overlay"
     );
     let overlay = app.transcript_overlay.expect("overlay");
     assert_eq!(
         overlay.scroll, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        "Ctrl-T should open anchored to the bottom/live end"
+        "Ctrl+T should open anchored to the bottom/live end"
     );
     assert!(
         !overlay.mode.mouse_capture(),
-        "Ctrl-T should preserve native text selection by default"
+        "Ctrl+T should preserve native text selection by default"
     );
 
     handle_key(
@@ -11419,7 +11482,7 @@ async fn transcript_overlay_ctrl_m_does_not_toggle_scrollbar_drag_mode() {
             .expect("overlay")
             .mode
             .mouse_capture(),
-        "Ctrl-M must not arm terminal mouse-drag reporting"
+        "Ctrl+M must not arm terminal mouse-drag reporting"
     );
 }
 
@@ -11723,7 +11786,7 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
 
     assert!(
         app.transcript_overlay.is_none(),
-        "Esc should still close Ctrl-T after scrolling back to the end"
+        "Esc should still close Ctrl+T after scrolling back to the end"
     );
 
     app.transcript_overlay = Some(TranscriptOverlayState {
@@ -11739,10 +11802,10 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     .await
     .expect("ctrl-c after end");
 
-    assert!(!quit, "first Ctrl-C should arm exit confirm, not exit");
+    assert!(!quit, "first Ctrl+C should arm exit confirm, not exit");
     assert!(
         app.exit_confirm_armed,
-        "Ctrl-C should still reach the exit-confirm path after overlay end"
+        "Ctrl+C should still reach the exit-confirm path after overlay end"
     );
 }
 
@@ -11771,11 +11834,11 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
     assert_eq!(
         app.transcript_overlay.expect("overlay").scroll,
         10,
-        "PageDown should scroll the Ctrl-T transcript overlay"
+        "PageDown should scroll the Ctrl+T transcript overlay"
     );
     assert_eq!(
         app.transcript_scroll_from_bottom, 12,
-        "PageDown must not scroll the underlying transcript while Ctrl-T is open"
+        "PageDown must not scroll the underlying transcript while Ctrl+T is open"
     );
 }
 
@@ -11803,11 +11866,11 @@ async fn transcript_overlay_swallows_ctrl_x_queue_chord() {
 
     assert!(
         app.prompt_queue_overlay.is_none(),
-        "Ctrl-X Q must not open the queue overlay behind Ctrl-T"
+        "Ctrl+X Q must not open the queue overlay behind Ctrl+T"
     );
     assert!(
         app.transcript_overlay.is_some(),
-        "Ctrl-T overlay should keep owning the key path"
+        "Ctrl+T overlay should keep owning the key path"
     );
 }
 
@@ -11883,7 +11946,7 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
 
     assert!(
         app.transcript_overlay.is_none(),
-        "Esc should close Ctrl-T after turn completion"
+        "Esc should close Ctrl+T after turn completion"
     );
 }
 
@@ -11922,10 +11985,10 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
     .await
     .expect("ctrl-c should be handled");
 
-    assert!(!quit, "first Ctrl-C should arm exit confirm, not exit");
+    assert!(!quit, "first Ctrl+C should arm exit confirm, not exit");
     assert!(
         app.exit_confirm_armed,
-        "Ctrl-C should still reach the global exit-confirm path"
+        "Ctrl+C should still reach the global exit-confirm path"
     );
 }
 
@@ -12173,6 +12236,7 @@ fn transcript_overlay_tool_cards_are_expanded_and_plain() {
             content_sha256: Some("0123456789abcdef".to_string()),
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     app.push_tool_result_with_call(result, Some(call));
 
@@ -12184,7 +12248,7 @@ fn transcript_overlay_tool_cards_are_expanded_and_plain() {
         "overlay transcript must include uncapped output: {rendered}"
     );
     assert!(
-        !rendered.contains("Ctrl-T for full transcript"),
+        !rendered.contains("Ctrl+T for full transcript"),
         "{rendered}"
     );
     assert!(
@@ -13704,7 +13768,7 @@ fn overlay_collapsed_folds_long_output_expanded_shows_all() {
 #[test]
 fn subagent_overlay_opens_collapsed_default_is_expanded() {
     // Pressing a subagent opens it folded (formatted like the main inline view);
-    // the main-transcript Ctrl-T opens straight to expanded.
+    // the main-transcript Ctrl+T opens straight to expanded.
     let mut app = test_app(SessionMode::Build);
     open_subagent_transcript_overlay(&mut app);
     assert_eq!(
@@ -13726,7 +13790,7 @@ async fn ctrl_t_expands_then_closes_a_collapsed_overlay() {
         app.transcript_overlay.unwrap().detail,
         OverlayDetail::Collapsed
     );
-    // First Ctrl-T unfolds in place (does not close).
+    // First Ctrl+T unfolds in place (does not close).
     handle_key(
         &mut app,
         &mut agent,
@@ -13738,7 +13802,7 @@ async fn ctrl_t_expands_then_closes_a_collapsed_overlay() {
         app.transcript_overlay.unwrap().detail,
         OverlayDetail::Expanded
     );
-    // Second Ctrl-T closes the (already expanded) overlay.
+    // Second Ctrl+T closes the (already expanded) overlay.
     handle_key(
         &mut app,
         &mut agent,

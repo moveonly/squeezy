@@ -45,6 +45,21 @@ pub(crate) fn handle_key(
     if state.prompt_editor.is_some() {
         return handle_prompt_editor_key(state, agent, notifications, key);
     }
+    if state.mcp_pending_delete.is_some() {
+        return handle_mcp_delete_confirm_key(state, notifications, key);
+    }
+    if state.mcp_add.is_some() {
+        return handle_mcp_add_form_key(state, notifications, key);
+    }
+    // On the McpServers section, our page-specific bindings (e/r/a/d
+    // + S+letter session-only variants, Enter to toggle) precede the
+    // regular browse keys. Navigation (arrows, Tab) still falls
+    // through so the user can move between sections.
+    if state.current_section().id == SectionId::McpServers
+        && let Some(outcome) = handle_mcp_browse_key(state, notifications, key)
+    {
+        return outcome;
+    }
     if let Some(editor) = &mut state.editor {
         let commit = handle_editor_key(editor, key);
         match commit {
@@ -1101,7 +1116,7 @@ fn handle_secret_entry_key(
             entry.wipe();
             state.secret_entry = None;
         }
-        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+        (KeyCode::F(2), _) => {
             entry.reveal = !entry.reveal;
         }
         (KeyCode::Backspace, _) => {
@@ -1295,4 +1310,284 @@ fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome
         _ => {}
     }
     KeyOutcome::KeepOpen
+}
+
+/// Handle keys on the `/mcp` page browse mode. Returns `Some(outcome)`
+/// when the key was consumed (e/r/a/d/Enter on a server row, plus
+/// session-only variants); `None` lets the caller fall through to the
+/// regular browse keymap so arrows/Tab keep working.
+fn handle_mcp_browse_key(
+    state: &mut ConfigScreenState,
+    notifications: &mut super::ConfigFeedback,
+    key: KeyEvent,
+) -> Option<KeyOutcome> {
+    use super::{McpAction, McpAddForm};
+    let names = state.mcp_server_names();
+    let add_row = names.len();
+    let is_add_row = state.field_index == add_row;
+    let server_at_focus = state.mcp_server_at_row(state.field_index);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Treat both `'A'` and `shift+a` as the shifted variant. Some
+    // terminals deliver shift+letter as `Char('A')` with `SHIFT`
+    // set, others as `Char('A')` with no modifier, and a few as
+    // `Char('a')` with `SHIFT`. We accept all three so the
+    // documented session-only modifier never silently no-ops.
+    let session_only_add = matches!(key.code, KeyCode::Char('A')) || shift;
+    match (key.code, key.modifiers) {
+        // Open the "add server" overlay. Lower-case `a` persists by
+        // default; upper-case `A` (or shift+a) flips to session-only.
+        (KeyCode::Char('a'), _) | (KeyCode::Char('A'), _) => {
+            state.mcp_add = Some(McpAddForm {
+                session_only: session_only_add,
+                ..McpAddForm::default()
+            });
+            Some(KeyOutcome::KeepOpen)
+        }
+        // Toggle enabled. Enter / e / E: persist; Shift-modified: session-only.
+        (KeyCode::Enter, _) | (KeyCode::Char('e'), _) | (KeyCode::Char('E'), _) => {
+            if is_add_row {
+                state.mcp_add = Some(McpAddForm::default());
+                return Some(KeyOutcome::KeepOpen);
+            }
+            let Some((name, server)) = server_at_focus else {
+                notifications.push("no MCP server at this row", NotifySeverity::Warn);
+                return Some(KeyOutcome::KeepOpen);
+            };
+            let persist = !shift && !matches!(key.code, KeyCode::Char('E'));
+            let next_enabled = !server.enabled;
+            let label = if next_enabled { "enable" } else { "disable" };
+            // Apply optimistically to the cached snapshot so the row
+            // flips immediately; the host's async dispatch will refresh
+            // from the agent once the registry confirms.
+            if let Some(entry) = state.mcp_servers.get_mut(&name) {
+                entry.enabled = next_enabled;
+            }
+            state.mcp_pending_actions.push(McpAction::Toggle {
+                server: name.clone(),
+                enabled: next_enabled,
+                persist,
+            });
+            state.mcp_last_status_line = Some(format!(
+                "{label} {name}{}",
+                if persist { "" } else { " (session-only)" }
+            ));
+            notifications.push(
+                format!(
+                    "{} {name}{}",
+                    label,
+                    if persist { "" } else { " — session-only" }
+                ),
+                NotifySeverity::Info,
+            );
+            Some(KeyOutcome::KeepOpen)
+        }
+        // Restart in place.
+        (KeyCode::Char('r'), _) | (KeyCode::Char('R'), _) => {
+            if is_add_row {
+                return Some(KeyOutcome::KeepOpen);
+            }
+            let Some((name, _)) = server_at_focus else {
+                notifications.push("no MCP server at this row", NotifySeverity::Warn);
+                return Some(KeyOutcome::KeepOpen);
+            };
+            state.mcp_pending_actions.push(McpAction::Restart {
+                server: name.clone(),
+            });
+            state.mcp_last_status_line = Some(format!("restarting {name}"));
+            notifications.push(format!("restarting {name}"), NotifySeverity::Info);
+            Some(KeyOutcome::KeepOpen)
+        }
+        // Stage a delete with y/n confirmation.
+        (KeyCode::Char('d'), _) | (KeyCode::Char('x'), _) | (KeyCode::Char('D'), _) => {
+            if is_add_row {
+                return Some(KeyOutcome::KeepOpen);
+            }
+            let Some((name, _)) = server_at_focus else {
+                return Some(KeyOutcome::KeepOpen);
+            };
+            state.mcp_pending_delete = Some(name);
+            Some(KeyOutcome::KeepOpen)
+        }
+        _ => None,
+    }
+}
+
+/// Handle keys while the "remove server" confirmation is open.
+fn handle_mcp_delete_confirm_key(
+    state: &mut ConfigScreenState,
+    notifications: &mut super::ConfigFeedback,
+    key: KeyEvent,
+) -> KeyOutcome {
+    use super::McpAction;
+    let Some(name) = state.mcp_pending_delete.clone() else {
+        return KeyOutcome::KeepOpen;
+    };
+    let confirm_persist = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+    let confirm_session = matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'));
+    let cancel = matches!(
+        key.code,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
+    );
+    if confirm_persist || confirm_session {
+        state.mcp_servers.remove(&name);
+        state.mcp_pending_delete = None;
+        let persist = confirm_persist;
+        state.mcp_pending_actions.push(McpAction::Remove {
+            name: name.clone(),
+            persist,
+        });
+        state.mcp_last_status_line = Some(format!(
+            "removed {name}{}",
+            if persist { "" } else { " (session-only)" }
+        ));
+        // Cap the focus so we don't dangle past the trimmed row count.
+        let max_row = state.row_count().saturating_sub(1);
+        if state.field_index > max_row {
+            state.field_index = max_row;
+        }
+        notifications.push(
+            format!(
+                "removed {name}{}",
+                if persist { "" } else { " — session-only" }
+            ),
+            NotifySeverity::Info,
+        );
+        return KeyOutcome::KeepOpen;
+    }
+    if cancel {
+        state.mcp_pending_delete = None;
+        return KeyOutcome::KeepOpen;
+    }
+    KeyOutcome::KeepOpen
+}
+
+/// Handle keys while the "add server" overlay is open.
+fn handle_mcp_add_form_key(
+    state: &mut ConfigScreenState,
+    notifications: &mut super::ConfigFeedback,
+    key: KeyEvent,
+) -> KeyOutcome {
+    use super::{MCP_ADD_FIELD_COUNT, McpAction, McpAddTransport};
+    let Some(form) = state.mcp_add.as_mut() else {
+        return KeyOutcome::KeepOpen;
+    };
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            state.mcp_add = None;
+        }
+        (KeyCode::Tab, _) => {
+            form.session_only = !form.session_only;
+        }
+        (KeyCode::Up, _) => {
+            if form.field_index == 0 {
+                form.field_index = MCP_ADD_FIELD_COUNT - 1;
+            } else {
+                form.field_index -= 1;
+            }
+        }
+        (KeyCode::Down, _) => {
+            form.field_index = (form.field_index + 1) % MCP_ADD_FIELD_COUNT;
+        }
+        (KeyCode::Char(' '), KeyModifiers::NONE) if form.field_index == 1 => {
+            form.transport = form.transport.next();
+        }
+        (KeyCode::Backspace, _) => {
+            let target = active_add_field(form);
+            target.pop();
+        }
+        (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT)
+            if form.field_index != 1 =>
+        {
+            let target = active_add_field(form);
+            target.push(c);
+        }
+        (KeyCode::Enter, _) => {
+            // Validate + stage. We rebuild a fresh `McpAddForm` if
+            // validation fails so the error line shows above the form.
+            let trimmed_name = form.name.trim().to_string();
+            if trimmed_name.is_empty() {
+                form.error = Some("name is required".to_string());
+                return KeyOutcome::KeepOpen;
+            }
+            if state.mcp_servers.contains_key(&trimmed_name) {
+                form.error = Some(format!("server {trimmed_name:?} already exists"));
+                return KeyOutcome::KeepOpen;
+            }
+            let transport = form.transport;
+            let command = form.command.trim().to_string();
+            let url = form.url.trim().to_string();
+            match transport {
+                McpAddTransport::Stdio if command.is_empty() => {
+                    form.error = Some("stdio transport needs a command".to_string());
+                    return KeyOutcome::KeepOpen;
+                }
+                McpAddTransport::Http | McpAddTransport::Sse if url.is_empty() => {
+                    form.error = Some(format!("{} transport needs a url", transport.as_str()));
+                    return KeyOutcome::KeepOpen;
+                }
+                _ => {}
+            }
+            let server = squeezy_core::McpServerConfig {
+                enabled: true,
+                transport: match transport {
+                    McpAddTransport::Stdio => squeezy_core::McpTransport::Stdio,
+                    McpAddTransport::Http => squeezy_core::McpTransport::Http,
+                    McpAddTransport::Sse => squeezy_core::McpTransport::Sse,
+                },
+                command: (!command.is_empty()).then_some(command),
+                args: Vec::new(),
+                url: (!url.is_empty()).then_some(url),
+                timeout_ms: None,
+                discovery_timeout_ms: None,
+                tool_call_timeout_ms: None,
+                enabled_tools: None,
+                disabled_tools: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                permissions: squeezy_core::McpPermissionConfig::default(),
+                bearer_token_env_var: None,
+                http_headers: std::collections::BTreeMap::new(),
+                env_http_headers: std::collections::BTreeMap::new(),
+            };
+            let persist = !form.session_only;
+            state
+                .mcp_servers
+                .insert(trimmed_name.clone(), server.clone());
+            state.mcp_pending_actions.push(McpAction::Add {
+                name: trimmed_name.clone(),
+                server: Box::new(server),
+                persist,
+            });
+            state.mcp_last_status_line = Some(format!(
+                "added {trimmed_name}{}",
+                if persist { "" } else { " (session-only)" }
+            ));
+            // Focus the newly-added row (alphabetical order).
+            let names = state.mcp_server_names();
+            if let Some(idx) = names.iter().position(|n| n == &trimmed_name) {
+                state.field_index = idx;
+            }
+            state.mcp_add = None;
+            notifications.push(
+                format!(
+                    "added {trimmed_name}{}",
+                    if persist { "" } else { " — session-only" }
+                ),
+                NotifySeverity::Info,
+            );
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
+fn active_add_field(form: &mut super::McpAddForm) -> &mut String {
+    match form.field_index {
+        0 => &mut form.name,
+        2 => &mut form.command,
+        3 => &mut form.url,
+        // The transport row uses Space to cycle (not free-form
+        // input); fall back to `name` defensively so the helper
+        // never returns a dangling reference.
+        _ => &mut form.name,
+    }
 }

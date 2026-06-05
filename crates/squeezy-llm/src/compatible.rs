@@ -34,6 +34,7 @@ use crate::{
         ApiKeySource, resolve_api_key_with_inline, resolve_api_key_with_inline_optional,
         static_api_key_source,
     },
+    oauth::VertexOAuthSource,
     openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
@@ -96,7 +97,10 @@ impl OpenAiCompatibleProvider {
         // other preset stays on the strict variant — Groq/OpenRouter/etc.
         // without a key is a real misconfiguration and the error tells
         // the user which env var to set.
-        let api_key = if is_local_preset(config.preset) {
+        let vertex_oauth = config.preset == OpenAiCompatiblePreset::Vertex && config.use_oauth;
+        let api_key = if vertex_oauth {
+            String::new()
+        } else if is_local_preset(config.preset) {
             resolve_api_key_with_inline_optional(config.api_key.as_deref(), &config.api_key_env)?
                 .value
         } else {
@@ -222,9 +226,14 @@ impl OpenAiCompatibleProvider {
         } else {
             api_key
         };
+        let api_key_source: Arc<dyn ApiKeySource> = if vertex_oauth {
+            Arc::new(VertexOAuthSource::new())
+        } else {
+            static_api_key_source(api_key, config.preset.as_str())
+        };
         Ok(Self::with_api_key_source(
             config.preset,
-            static_api_key_source(api_key, config.preset.as_str()),
+            api_key_source,
             resolved_base_url,
             headers,
             config.transport,
@@ -650,6 +659,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         if let Err(err) = request.ensure_vision_support(self.preset.as_str()) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
+        if let Err(err) = request.reject_unsupported_documents(self.preset.as_str()) {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
         let client = self.client.clone();
@@ -2139,6 +2151,7 @@ fn parse_chat_usage(usage: &Value) -> CostSnapshot {
         .get("prompt_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .or_else(|| usage.get("prompt_cache_hit_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
         .and_then(Value::as_u64);
     let reasoning_output_tokens = usage
         .get("completion_tokens_details")

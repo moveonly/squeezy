@@ -335,6 +335,9 @@ impl LlmProvider for GoogleProvider {
         if let Err(err) = request.ensure_vision_support("google") {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
+        if let Err(err) = request.reject_unsupported_documents("google") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         if let Err(err) = check_inline_image_cap(&request) {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }

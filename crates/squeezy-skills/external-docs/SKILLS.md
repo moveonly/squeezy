@@ -89,13 +89,44 @@ Skills can activate in four ways:
 - Model request: the model calls `list_skills`, then `load_skill`
 - Implicit shell use: running a script under `<skill>/scripts/` or reading that skill's `SKILL.md` with ordinary shell readers can activate the skill for the next model request in the same turn.
 
-Loaded skill bodies are cached for the lifetime of the process so repeat activations within a session do not re-read the SKILL.md from disk.
+Loaded skill bodies are cached for the lifetime of the process so repeat activations within a session do not re-read the SKILL.md from disk. Settings hot-reload (external `settings.toml` edits) rebuilds the catalog automatically — adding a new `SKILL.md` or toggling `[[skills.config]]` no longer requires a session restart.
 
 Loading a skill only injects instructions. It does not grant tools, bypass approvals, execute shell snippets, or change the session permission policy.
 
 Triggers are intentional Squeezy behavior: they let project skills activate from ordinary task phrasing without requiring users to remember exact skill names. Future mention syntax, if added, should be additive and must not replace `triggers:`.
 
-If two discovered skills with the same name have the same precedence, Squeezy logs a warning and skips trigger activation for that name. Use `/skill <name> ...` or `load_skill` to select the exposed skill explicitly.
+If two discovered skills with the same name have the same precedence, Squeezy logs a warning and skips trigger activation for that name. The same is true when two distinct skills declare the same trigger phrase — auto-activation is skipped for that ambiguous trigger. Use `/skill <name> ...` or `load_skill` to select the exposed skill explicitly.
+
+## Fork-mode skills
+
+A skill that declares `context: fork` in its frontmatter is surfaced in a separate `<fork_skills>` system block rather than merged into `<active_skills>`. The block includes the full skill body with an instruction telling the model to dispatch it as a focused `delegate` subagent task rather than executing the body as direct guidance for the parent turn. The body is still present in the parent system prompt inside `<fork_skills>`; it is structurally separated and accompanied by an explicit instruction not to act on it inline. Inline-mode (the default) is unchanged.
+
+## `tool_deps` enforcement
+
+When a `skill.toml` sidecar declares `tool_deps`, activation now checks each entry against the advertised tool list and the live MCP status snapshot. Missing entries are reported in a `<skill_warnings>` system block that tells the model to refuse the skill rather than improvise. A `mcp:<server>` prefix matches against the MCP status snapshot's ready servers.
+
+## Hooks (opt-in)
+
+`hooks:` blocks declared in skill frontmatter only fire when the user sets `[skills] hooks_enabled = true`. Hook commands run via `sh -c` with the same privileges as the Squeezy process — treat enabling hooks for a skill catalog as equivalent to letting that catalog run the `shell` tool, and keep the gate off for untrusted skills.
+
+## CLI
+
+```sh
+# Inspect the discovered catalog (add --json for machine-readable output).
+squeezy skills list
+squeezy skills validate
+
+# Enable or disable a discovered skill via [[skills.config]]. Selector is
+# --name XOR --path; scope is --user or --project.
+squeezy skills enable --name rust-code-navigation --project
+squeezy skills disable --path /shared/catalog/risky-skill --user
+
+# Install the in-binary bundled sample skills under the user skills directory.
+squeezy skills install
+squeezy config init --user --with-bundled-skills
+```
+
+`squeezy doctor` includes a `skills` row that reports enabled/disabled counts, flags ambiguous same-precedence names as a warning, and notes when `hooks_enabled` is on.
 
 ## Built-In Squeezy Help
 

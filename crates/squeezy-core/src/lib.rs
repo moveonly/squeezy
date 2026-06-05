@@ -28,6 +28,7 @@ pub const DEFAULT_OPENAI_CODEX_MODEL: &str = DEFAULT_OPENAI_MODEL;
 /// Originator tag stamped on every Codex request so OpenAI can attribute
 /// traffic to squeezy in their dashboards.
 pub const DEFAULT_OPENAI_CODEX_ORIGINATOR: &str = "squeezy";
+pub const DEFAULT_GITHUB_COPILOT_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -954,6 +955,14 @@ impl AppConfig {
                     transport: provider_transport_settings(&providers, &["openai_codex"]),
                 })
             }
+            "github-copilot" | "github_copilot" | "copilot" => {
+                ProviderConfig::GitHubCopilot(GitHubCopilotConfig {
+                    transport: provider_transport_settings(
+                        &providers,
+                        &["github_copilot", "github-copilot", "copilot"],
+                    ),
+                })
+            }
             "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
                 script: get_var("SQUEEZY_FAUX_SCRIPT")
                     .or_else(|| provider_setting(&providers, "faux", "script")),
@@ -994,6 +1003,12 @@ impl AppConfig {
                 provider_setting(&providers, "openai_codex", "default_model")
                     .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_MODEL.to_string())
             }
+            ProviderConfig::GitHubCopilot(_) => {
+                provider_setting(&providers, "github_copilot", "default_model")
+                    .or_else(|| provider_setting(&providers, "github-copilot", "default_model"))
+                    .or_else(|| provider_setting(&providers, "copilot", "default_model"))
+                    .unwrap_or_else(|| DEFAULT_GITHUB_COPILOT_MODEL.to_string())
+            }
             ProviderConfig::OpenAiCompatible(config) => {
                 provider_setting(&providers, config.preset.as_str(), "default_model")
                     .unwrap_or_else(|| config.preset.default_model().to_string())
@@ -1020,6 +1035,7 @@ impl AppConfig {
             ProviderConfig::Bedrock(_) => "bedrock",
             ProviderConfig::Ollama(_) => "ollama",
             ProviderConfig::OpenAiCodex(_) => "openai_codex",
+            ProviderConfig::GitHubCopilot(_) => "github_copilot",
             ProviderConfig::OpenAiCompatible(_) => "",
             ProviderConfig::Faux(_) => "faux",
         };
@@ -1980,6 +1996,7 @@ impl AppConfig {
             self.skills.preamble_budget_chars
         ));
         output.push_str(&format!("inline = {}\n", self.skills.inline));
+        output.push_str(&format!("hooks_enabled = {}\n", self.skills.hooks_enabled));
         // The mode tables follow the same inline-table shape that
         // `from_table` accepts, so the inspect output round-trips when
         // pasted back into a settings file.
@@ -2218,6 +2235,7 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
+        ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
         ProviderConfig::Faux(_) => "faux",
     }
@@ -2318,6 +2336,10 @@ pub enum ProviderConfig {
     /// key. The credential is never carried inline in the TOML — the
     /// settings only describe the endpoint and originator.
     OpenAiCodex(OpenAiCodexConfig),
+    /// GitHub Copilot Chat subscription. Auth is a GitHub device-flow
+    /// token persisted under `~/.squeezy/auth/github-copilot.json`;
+    /// the request host is derived from the Copilot token at runtime.
+    GitHubCopilot(GitHubCopilotConfig),
     /// Deterministic in-process faux provider for tests and the eval
     /// harness. The wire protocol is local: each `stream_response` call
     /// pops the next scripted response from an internal queue and replays
@@ -2791,6 +2813,11 @@ pub struct OpenAiConfig {
 pub struct OpenAiCodexConfig {
     pub base_url: String,
     pub originator: String,
+    pub transport: ProviderTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubCopilotConfig {
     pub transport: ProviderTransportConfig,
 }
 
@@ -7888,6 +7915,14 @@ pub struct SkillsSettings {
     /// (`None` / `Some(false)`) emits metadata-only blocks so the model
     /// pays for the body only when it explicitly calls `load_skill`.
     pub inline: Option<bool>,
+    /// Opt-in to executing `hooks:` declared in `SKILL.md` frontmatter.
+    /// `None`/`Some(false)` (the default) leaves the hook surface inert
+    /// even though the parser accepts it. Setting this to `true` is an
+    /// explicit acknowledgement that hook commands run as `sh -c` with
+    /// the same privileges as the Squeezy process — the same trust
+    /// boundary as the `shell` tool — and should only be enabled for
+    /// skill catalogs the user controls.
+    pub hooks_enabled: Option<bool>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -7906,6 +7941,7 @@ impl SkillsSettings {
                 "active_budget_mode",
                 "preamble_budget_mode",
                 "inline",
+                "hooks_enabled",
                 "config",
             ],
             source,
@@ -7962,6 +7998,12 @@ impl SkillsSettings {
                 &field(path, "preamble_budget_mode"),
             )?,
             inline: bool_value(table, "inline", source, &field(path, "inline"))?,
+            hooks_enabled: bool_value(
+                table,
+                "hooks_enabled",
+                source,
+                &field(path, "hooks_enabled"),
+            )?,
             config: skill_config_entries_value(table, source, &field(path, "config"))?,
         })
     }
@@ -7977,6 +8019,7 @@ impl SkillsSettings {
         replace_if_some(&mut self.active_budget_mode, next.active_budget_mode);
         replace_if_some(&mut self.preamble_budget_mode, next.preamble_budget_mode);
         replace_if_some(&mut self.inline, next.inline);
+        replace_if_some(&mut self.hooks_enabled, next.hooks_enabled);
         self.config.extend(next.config);
     }
 }
@@ -7989,6 +8032,11 @@ pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
 /// bodies out of the system prompt; users that want the legacy behavior
 /// of inlining each activated skill's body can set `[skills] inline = true`.
 pub const DEFAULT_SKILLS_INLINE: bool = false;
+/// Default for `[skills] hooks_enabled`. Lifecycle shell hooks declared
+/// in `SKILL.md` frontmatter are inert unless the user opts in: hook
+/// commands run with the same privileges as Squeezy itself, so this
+/// stays off until explicitly enabled for a trusted skill catalog.
+pub const DEFAULT_SKILLS_HOOKS_ENABLED: bool = false;
 /// Default fraction of `model_context_window` (in percent) consumed by the
 /// active and available-skills bundles when no explicit chars budget is set.
 /// Matches the codex reference (`SKILL_METADATA_CONTEXT_WINDOW_PERCENT=2`).
@@ -8086,6 +8134,14 @@ pub struct SkillsConfig {
     /// (`false`) emits metadata-only blocks; the model fetches a body on
     /// demand via the `load_skill` tool.
     pub inline: bool,
+    /// When `true`, `hooks:` blocks declared in skill frontmatter are
+    /// registered against the agent hook registry on session start and
+    /// fire during the matching lifecycle events. Defaults to `false`
+    /// (the parser still accepts `hooks:` but the handlers stay dormant)
+    /// because hook commands run unsandboxed via `sh -c` — the same
+    /// trust boundary as the `shell` tool. Enable per-project when the
+    /// skill catalog is fully trusted.
+    pub hooks_enabled: bool,
     /// Token budget for the active model, copied from
     /// `context_compaction.model_context_window`. `None` keeps
     /// `ContextPercent` modes dormant and forces a fall-back to
@@ -8157,6 +8213,9 @@ impl SkillsConfig {
             active_budget_mode,
             preamble_budget_mode,
             inline: settings.inline.unwrap_or(DEFAULT_SKILLS_INLINE),
+            hooks_enabled: settings
+                .hooks_enabled
+                .unwrap_or(DEFAULT_SKILLS_HOOKS_ENABLED),
             model_context_window: None,
             config: settings
                 .config
@@ -8200,6 +8259,7 @@ impl Default for SkillsConfig {
             active_budget_mode: SkillsBudgetMode::default(),
             preamble_budget_mode: SkillsBudgetMode::default(),
             inline: DEFAULT_SKILLS_INLINE,
+            hooks_enabled: DEFAULT_SKILLS_HOOKS_ENABLED,
             model_context_window: None,
             config: Vec::new(),
         }
@@ -9094,10 +9154,10 @@ pub fn user_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
-# max_concurrent = 4           # maximum parallel subagents per parent agent
-# max_tool_calls_per_call = 24
-# max_tool_bytes_read_per_call = 8388608
-# max_search_files_per_call = 2000
+# max_concurrent = 20          # maximum parallel subagents per parent agent
+# max_tool_calls_per_call = 10000
+# max_tool_bytes_read_per_call = 1000000000
+# max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
 
@@ -9249,6 +9309,7 @@ pub fn user_settings_template() -> &'static str {
 # active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
 # preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
 # inline = false                      # default; emit only metadata for active skills and let the model call load_skill on demand
+# hooks_enabled = false               # default; opt in to running `hooks:` declared in SKILL.md frontmatter
 #
 # [[skills.config]]
 # name = "example-skill"
@@ -9333,10 +9394,10 @@ pub fn project_settings_template() -> &'static str {
 # enabled = true
 # explore_enabled = true
 # explore_model = "gpt-5-nano" # optional cheap model override for the current provider
-# max_concurrent = 4           # maximum parallel subagents per parent agent
-# max_tool_calls_per_call = 24
-# max_tool_bytes_read_per_call = 8388608
-# max_search_files_per_call = 2000
+# max_concurrent = 20          # maximum parallel subagents per parent agent
+# max_tool_calls_per_call = 10000
+# max_tool_bytes_read_per_call = 1000000000
+# max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
 
@@ -9726,6 +9787,7 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
         ProviderConfig::AzureOpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "azure_openai"),
         ProviderConfig::Ollama(cfg) => check_base_url_scheme(&cfg.base_url, "ollama"),
         ProviderConfig::OpenAiCodex(cfg) => check_base_url_scheme(&cfg.base_url, "openai_codex"),
+        ProviderConfig::GitHubCopilot(_) => Ok(()),
         ProviderConfig::OpenAiCompatible(cfg) => {
             check_base_url_scheme(&cfg.base_url, cfg.preset.as_str())
         }
@@ -10111,6 +10173,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
         ProviderConfig::Bedrock(_) => &["bedrock"],
         ProviderConfig::Ollama(_) => &["ollama"],
         ProviderConfig::OpenAiCodex(_) => &["openai_codex"],
+        ProviderConfig::GitHubCopilot(_) => &["github_copilot", "github-copilot", "copilot"],
         ProviderConfig::OpenAiCompatible(config) => match config.preset {
             OpenAiCompatiblePreset::OpenRouter => &["openrouter"],
             OpenAiCompatiblePreset::Vercel => &["vercel"],
@@ -12435,6 +12498,25 @@ pub struct TurnMetrics {
     /// means judge/cheap overhead exceeded the estimated parent cost.
     #[serde(default)]
     pub routing_estimated_net_savings_usd_micros: i64,
+    /// Normalized stop reason token for the most recent LLM completion in this
+    /// turn (e.g. `"end_turn"`, `"max_tokens"`, `"refusal"`). `None` when the
+    /// turn did not complete normally or no event was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_token: Option<String>,
+    /// True when the provider's completion carried `reasoning_only_stop`: the
+    /// model spent the round on hidden reasoning and produced no visible output.
+    #[serde(default)]
+    pub reasoning_only_stop: bool,
+    /// Whether prompt caching was supported for this turn (true if either
+    /// `cached_input_tokens` or `cache_write_input_tokens` was non-zero).
+    #[serde(default)]
+    pub cache_supported: bool,
+    /// Cache-write (creation) tokens for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Reasoning output tokens for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 impl TurnMetrics {
