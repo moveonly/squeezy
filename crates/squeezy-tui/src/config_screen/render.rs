@@ -525,7 +525,7 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
     )]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![Span::styled(
-        "Enter / e   toggle enabled    r   restart    a   add    d / x   remove",
+        "Enter / Space / e   toggle enabled    r   restart    a   add    d / x   remove",
         Style::default().fg(crate::render::theme::quiet()),
     )]));
     lines.push(Line::from(vec![Span::styled(
