@@ -63,6 +63,9 @@ fn detect_skill_doc_read(
         if token.starts_with('-') {
             continue;
         }
+        if !doc_token_may_match_indexed_path(token, by_doc_path) {
+            continue;
+        }
         let path = Path::new(token);
         let candidate_path = if path.is_absolute() {
             normalize_path(path)
@@ -74,6 +77,15 @@ fn detect_skill_doc_read(
         }
     }
     None
+}
+
+fn doc_token_may_match_indexed_path(token: &str, by_doc_path: &BTreeMap<PathBuf, String>) -> bool {
+    let Some(file_name) = Path::new(token).file_name() else {
+        return false;
+    };
+    by_doc_path
+        .keys()
+        .any(|path| path.file_name() == Some(file_name))
 }
 
 fn script_run_token(tokens: &[String]) -> Option<&str> {

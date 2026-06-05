@@ -25,3 +25,30 @@ fn tokenizer_preserves_quoted_paths() {
     let tokens = tokenize_command("python3 \"scripts/my tool.py\"");
     assert_eq!(tokens, vec!["python3", "scripts/my tool.py"]);
 }
+
+#[test]
+fn doc_prefilter_rejects_unrelated_reader_tokens() {
+    let mut by_doc_path = BTreeMap::new();
+    by_doc_path.insert(
+        PathBuf::from("/repo/.squeezy/skills/nav/SKILL.md"),
+        "nav".to_string(),
+    );
+
+    assert!(!doc_token_may_match_indexed_path("a.rs", &by_doc_path));
+    assert!(!doc_token_may_match_indexed_path("README.md", &by_doc_path));
+}
+
+#[test]
+fn doc_prefilter_keeps_plausible_skill_doc_tokens() {
+    let mut by_doc_path = BTreeMap::new();
+    by_doc_path.insert(
+        PathBuf::from("/repo/.squeezy/skills/nav/SKILL.md"),
+        "nav".to_string(),
+    );
+
+    assert!(doc_token_may_match_indexed_path("SKILL.md", &by_doc_path));
+    assert!(doc_token_may_match_indexed_path(
+        ".squeezy/skills/nav/SKILL.md",
+        &by_doc_path
+    ));
+}
