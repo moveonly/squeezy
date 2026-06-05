@@ -154,6 +154,14 @@ const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
 /// explores has both counters near zero and is intentionally exempt. Only the
 /// broad `Delegate` kind is gated; scoped `delegate_plan`/`delegate_review`
 /// pass through.
+///
+/// The byte threshold measures context actually INGESTED
+/// (`TurnMetrics::output_bytes`), NOT bytes scanned (`bytes_read`): a directory
+/// grep over `*.c` scans ~MBs but pulls only the matched lines into context, so
+/// keying on scanned bytes wrongly denied a delegate that held almost no real
+/// context and forced the parent into a grep/read storm. `output_bytes` is the
+/// context the cold subagent would have to re-derive, which is what the
+/// threshold was always meant to approximate.
 const REDUNDANT_DELEGATE_EXPLORE_CALLS: u64 = 8;
 const REDUNDANT_DELEGATE_READ_BYTES: u64 = 32_768;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
@@ -10492,6 +10500,7 @@ fn chain_accumulate_metrics(total: &mut TurnMetrics, step: &TurnMetrics) {
     total.tool_cancellations += step.tool_cancellations;
     total.files_scanned += step.files_scanned;
     total.bytes_read += step.bytes_read;
+    total.output_bytes += step.output_bytes;
     total.matches_returned += step.matches_returned;
     total.model_output_bytes += step.model_output_bytes;
     total.receipt_stub_hits += step.receipt_stub_hits;
@@ -11467,6 +11476,37 @@ fn tool_failure_detail(result: &ToolResult) -> String {
     "tool failed".to_string()
 }
 
+/// Outcome of the anti-redundant-delegation gate for a single `delegate`
+/// call. Extracted as a pure decision so the policy is unit-testable
+/// without standing up a full tool-execution context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateGateDecision {
+    /// Let the delegate run.
+    Allow,
+    /// Deny: the parent has already ingested substantial context for this
+    /// task, so a cold subagent would only re-derive it (pure overhead).
+    DenyRedundant,
+}
+
+/// Decide whether a broad `delegate` should be denied as redundant given the
+/// parent's turn-spanning, parent-only exploration metrics.
+///
+/// Keyed on `output_bytes` (context actually pulled into the parent's
+/// conversation) rather than `bytes_read` (bytes *scanned*): a directory grep
+/// scans megabytes but ingests only the matched lines, and re-deriving those
+/// matches is cheap, so a grep-heavy / low-ingest parent must NOT be denied.
+/// The `tool_calls` clause still catches a parent that has churned through many
+/// exploration calls regardless of byte volume.
+fn redundant_delegate_decision(tool_calls: u64, output_bytes: u64) -> DelegateGateDecision {
+    if output_bytes >= REDUNDANT_DELEGATE_READ_BYTES
+        || tool_calls >= REDUNDANT_DELEGATE_EXPLORE_CALLS
+    {
+        DelegateGateDecision::DenyRedundant
+    } else {
+        DelegateGateDecision::Allow
+    }
+}
+
 async fn execute_tool_calls(
     calls: Vec<ToolCall>,
     context: ToolExecutionContext<'_>,
@@ -11586,10 +11626,12 @@ async fn execute_tool_calls(
             // gate and keeps every read/grep/graph tool), and `Denied` is ignored
             // by the repeated-failure loop guard so it cannot abort the turn. An
             // early/context-isolating delegate (counters near zero) is exempt.
-            if kind == SubagentKind::Delegate
-                && (broker.metrics.bytes_read >= REDUNDANT_DELEGATE_READ_BYTES
-                    || broker.metrics.tool_calls >= REDUNDANT_DELEGATE_EXPLORE_CALLS)
-            {
+            let gate_decision = if kind == SubagentKind::Delegate {
+                redundant_delegate_decision(broker.metrics.tool_calls, broker.metrics.output_bytes)
+            } else {
+                DelegateGateDecision::Allow
+            };
+            if gate_decision == DelegateGateDecision::DenyRedundant {
                 let result = control_tool_result(
                     call,
                     ToolStatus::Denied,
@@ -11597,7 +11639,7 @@ async fn execute_tool_calls(
                         "ok": false,
                         "error": "delegate is redundant: substantial context for this task is already gathered in-context",
                         "parent_tool_calls": broker.metrics.tool_calls,
-                        "parent_bytes_read": broker.metrics.bytes_read,
+                        "parent_output_bytes": broker.metrics.output_bytes,
                         "guidance": "You have already read/searched substantial relevant context in this task. A delegate subagent starts cold and re-reads the same files — pure overhead. Finish in-context using what you have; use read_file/read_slice/grep and the graph tools directly for any remaining detail."
                     }),
                 );

@@ -388,6 +388,13 @@ impl CostBroker {
         }
         self.metrics.files_scanned += result.cost_hint.files_scanned;
         self.metrics.bytes_read += result.cost_hint.bytes_read;
+        // `output_bytes` is the slice of the result actually pulled into the
+        // parent's context (matched lines, file bodies), distinct from
+        // `bytes_read`, which is the volume *scanned*. The
+        // anti-redundant-delegation gate keys on this so a grep that scans
+        // megabytes but ingests kilobytes is not treated as "substantial
+        // context already gathered".
+        self.metrics.output_bytes += result.cost_hint.output_bytes;
         self.metrics.matches_returned += result.cost_hint.matches_returned;
         self.metrics.redactions += result.cost_hint.redactions;
         if result.content.get("spilled").and_then(Value::as_bool) == Some(true) {

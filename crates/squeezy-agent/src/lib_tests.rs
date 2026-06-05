@@ -10662,3 +10662,59 @@ fn collect_successful_edits_skips_create_delete_move_ops() {
     );
     assert_eq!(edits[0].changed_spans, vec!["stale span here".to_string()]);
 }
+
+// --- Anti-redundant-delegation gate: ingested-bytes calibration (COMMIT 1) ---
+
+#[test]
+fn grep_heavy_low_output_parent_is_not_denied_delegate() {
+    // The grep case: the parent has scanned a large directory (high
+    // `bytes_read`) but pulled almost nothing into context (low
+    // `output_bytes`). Keying on ingested bytes, this parent holds little real
+    // context for a cold subagent to re-derive, so the delegate must be
+    // ALLOWED. Fail-before (gate keyed on `bytes_read`) this was denied.
+    let tool_calls = 2; // a couple of greps, well under the call threshold
+    let output_bytes = 1_024; // ~1KB of matched lines actually ingested
+    assert_eq!(
+        redundant_delegate_decision(tool_calls, output_bytes),
+        DelegateGateDecision::Allow,
+        "a grep-heavy parent that ingested only ~1KB of matches must keep its delegate",
+    );
+}
+
+#[test]
+fn read_heavy_high_output_parent_is_denied_delegate() {
+    // The parent has read real file bodies into context (>= 32KB ingested), so
+    // a cold subagent would re-read the same files for pure overhead: DENY.
+    let tool_calls = 3;
+    let output_bytes = REDUNDANT_DELEGATE_READ_BYTES; // exactly at the ingest cap
+    assert_eq!(
+        redundant_delegate_decision(tool_calls, output_bytes),
+        DelegateGateDecision::DenyRedundant,
+        "a parent that ingested >= 32KB of file bodies should be denied a redundant delegate",
+    );
+}
+
+#[test]
+fn explore_call_count_still_trips_gate_regardless_of_output_bytes() {
+    // The call-count clause is independent of byte volume: a parent that has
+    // churned through many exploration calls is denied even if each call
+    // ingested little.
+    let tool_calls = REDUNDANT_DELEGATE_EXPLORE_CALLS;
+    let output_bytes = 0;
+    assert_eq!(
+        redundant_delegate_decision(tool_calls, output_bytes),
+        DelegateGateDecision::DenyRedundant,
+        "reaching the exploration-call threshold denies the delegate even at zero ingest",
+    );
+}
+
+#[test]
+fn early_low_ingest_low_call_delegate_is_allowed() {
+    // A context-isolating delegate fired before the parent explores: both
+    // counters near zero, so it is intentionally exempt.
+    assert_eq!(
+        redundant_delegate_decision(0, 0),
+        DelegateGateDecision::Allow,
+        "an early delegate with both counters near zero stays exempt",
+    );
+}

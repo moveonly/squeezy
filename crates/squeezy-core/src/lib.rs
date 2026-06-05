@@ -12342,6 +12342,14 @@ pub struct SessionMetrics {
     pub tool_cancellations: u64,
     pub files_scanned: u64,
     pub bytes_read: u64,
+    /// Bytes of tool output actually pulled into the parent's context this
+    /// session (the `output_bytes` cost-hint), as opposed to `bytes_read`,
+    /// which counts bytes *scanned* (e.g. a directory grep scans megabytes
+    /// but returns only the matched lines). Tracked in parallel so the
+    /// anti-redundant-delegation gate can key on context actually ingested
+    /// rather than I/O volume scanned.
+    #[serde(default)]
+    pub output_bytes: u64,
     pub matches_returned: u64,
     pub model_output_bytes: u64,
     pub receipt_stub_hits: u64,
@@ -12397,6 +12405,7 @@ impl SessionMetrics {
         self.tool_cancellations += turn.tool_cancellations;
         self.files_scanned += turn.files_scanned;
         self.bytes_read += turn.bytes_read;
+        self.output_bytes += turn.output_bytes;
         self.matches_returned += turn.matches_returned;
         self.model_output_bytes += turn.model_output_bytes;
         self.receipt_stub_hits += turn.receipt_stub_hits;
@@ -12445,6 +12454,14 @@ pub struct TurnMetrics {
     pub tool_cancellations: u64,
     pub files_scanned: u64,
     pub bytes_read: u64,
+    /// Bytes of tool output actually pulled into context this turn (the
+    /// `output_bytes` cost-hint), as opposed to `bytes_read`, which counts
+    /// bytes *scanned*. The anti-redundant-delegation gate reads this
+    /// parent-only counter so a grep that scans megabytes but ingests
+    /// kilobytes does not trip the "already gathered substantial context"
+    /// deny.
+    #[serde(default)]
+    pub output_bytes: u64,
     pub matches_returned: u64,
     pub model_output_bytes: u64,
     pub receipt_stub_hits: u64,
