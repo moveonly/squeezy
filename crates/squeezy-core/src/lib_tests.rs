@@ -1132,6 +1132,16 @@ fn config_can_select_azure_bedrock_and_ollama_defaults() {
 }
 
 #[test]
+fn config_can_select_github_copilot_oauth_provider() {
+    let config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("github-copilot".to_string()),
+        _ => None,
+    });
+    assert!(matches!(config.provider, ProviderConfig::GitHubCopilot(_)));
+    assert_eq!(config.model, DEFAULT_GITHUB_COPILOT_MODEL);
+}
+
+#[test]
 fn config_resolves_opus_alias_to_full_id() {
     let anthropic = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),

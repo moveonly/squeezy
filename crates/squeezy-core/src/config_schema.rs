@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use crate::{
     AppConfig, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
     DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV, DEFAULT_EXA_MCP_URL,
-    DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
-    DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+    DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GITHUB_COPILOT_MODEL,
+    DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
     DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
     DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV,
     DEFAULT_PARALLEL_MCP_URL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
@@ -1811,11 +1811,12 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
         DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL,
         DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL, DEFAULT_BEDROCK_REGION,
-        DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL, DEFAULT_OLLAMA_BASE_URL,
-        DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
-        DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR, DEFAULT_OPENAI_MODEL,
-        FauxConfig, GoogleConfig, OllamaConfig, OpenAiCodexConfig, OpenAiCompatibleConfig,
-        OpenAiCompatiblePreset, OpenAiConfig, ProviderTransportConfig,
+        DEFAULT_GITHUB_COPILOT_MODEL, DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL,
+        DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL,
+        DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR,
+        DEFAULT_OPENAI_MODEL, FauxConfig, GitHubCopilotConfig, GoogleConfig, OllamaConfig,
+        OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
+        ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     let (provider, default_model) = match s {
@@ -1838,6 +1839,10 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 transport,
             }),
             DEFAULT_OPENAI_CODEX_MODEL,
+        ),
+        "github-copilot" | "github_copilot" | "copilot" => (
+            ProviderConfig::GitHubCopilot(GitHubCopilotConfig { transport }),
+            DEFAULT_GITHUB_COPILOT_MODEL,
         ),
         "anthropic" => (
             ProviderConfig::Anthropic(AnthropicConfig {
@@ -1932,6 +1937,7 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
+        ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
         ProviderConfig::Faux(_) => "faux",
     }
@@ -1946,6 +1952,7 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "bedrock" => DEFAULT_BEDROCK_MODEL,
         "ollama" => DEFAULT_OLLAMA_MODEL,
         "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
+        "github_copilot" | "github-copilot" | "copilot" => DEFAULT_GITHUB_COPILOT_MODEL,
         "faux" | "mock" => crate::DEFAULT_FAUX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),

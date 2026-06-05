@@ -2,13 +2,16 @@ use squeezy_core::{
     DEFAULT_ANTHROPIC_MODEL, DEFAULT_BEDROCK_MODEL, DEFAULT_CEREBRAS_MODEL, DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_FIREWORKS_MODEL, DEFAULT_GOOGLE_MODEL, DEFAULT_GROQ_MODEL, DEFAULT_MISTRAL_MODEL,
     DEFAULT_OPENAI_MODEL, DEFAULT_OPENROUTER_MODEL, DEFAULT_PORTKEY_MODEL, DEFAULT_VERCEL_AI_MODEL,
-    DEFAULT_VERTEX_MODEL, DEFAULT_XAI_MODEL, resolve_model_alias,
+    DEFAULT_VERTEX_MODEL, DEFAULT_XAI_MODEL, GitHubCopilotConfig, ProviderConfig,
+    ProviderTransportConfig, resolve_model_alias,
 };
 
 use super::{
     MODEL_REGISTRY, PROVIDERS, estimate_json_tokens, estimate_text_tokens, model_info_for,
-    provider_honors_output_schema,
+    provider_from_config, provider_honors_output_schema,
 };
+
+static GITHUB_COPILOT_AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn resolve_opus_alias_for_anthropic() {
@@ -155,6 +158,47 @@ fn providers_list_includes_every_curated_model_provider() {
         missing.is_empty(),
         "PROVIDERS omits curated models.json provider(s): {missing:?}"
     );
+}
+
+#[test]
+fn providers_list_exposes_github_copilot_oauth_provider() {
+    assert!(PROVIDERS.contains(&"github_copilot"));
+}
+
+#[test]
+fn provider_from_config_reports_missing_github_copilot_auth_file() {
+    let _guard = GITHUB_COPILOT_AUTH_ENV_LOCK
+        .lock()
+        .expect("github copilot auth env lock");
+    let missing_path = std::env::temp_dir().join(format!(
+        "squeezy-missing-github-copilot-auth-{}.json",
+        std::process::id()
+    ));
+    let previous = std::env::var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE").ok();
+
+    // SAFETY: guarded by GITHUB_COPILOT_AUTH_ENV_LOCK in this module.
+    unsafe {
+        std::env::set_var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE", &missing_path);
+    }
+    let config = ProviderConfig::GitHubCopilot(GitHubCopilotConfig {
+        transport: ProviderTransportConfig::default(),
+    });
+    let result = provider_from_config(&config);
+    // SAFETY: guarded by GITHUB_COPILOT_AUTH_ENV_LOCK in this module.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE", value),
+            None => std::env::remove_var("SQUEEZY_GITHUB_COPILOT_AUTH_FILE"),
+        }
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected missing github-copilot auth file to fail"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("github-copilot OAuth credentials"));
+    assert!(message.contains("squeezy auth github-copilot login"));
 }
 
 #[test]

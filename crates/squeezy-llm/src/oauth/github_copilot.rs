@@ -1018,16 +1018,11 @@ pub struct GitHubCopilotProvider {
 }
 
 impl GitHubCopilotProvider {
-    /// Build from a fully-constructed OAuth source. The base URL is
-    /// extracted from the currently-cached Copilot token; if the
-    /// proxy rotates between refreshes the user must re-log in (the
-    /// per-account host is stable in normal operation).
-    pub async fn from_source(
+    fn from_source_and_base_url(
         source: Arc<GitHubCopilotOAuthSource>,
+        base_url: String,
         transport: ProviderTransportConfig,
-    ) -> Result<Self> {
-        let tokens = source.persisted_tokens().await;
-        let base_url = resolve_base_url(&tokens.copilot_token, tokens.enterprise_domain.as_deref());
+    ) -> Self {
         let inner = OpenAiCompatibleProvider::with_api_key_source(
             // `Custom` is the right preset for an OpenAI-compatible
             // host with no curated model registry on the squeezy
@@ -1043,15 +1038,43 @@ impl GitHubCopilotProvider {
             copilot_headers(),
             transport,
         );
-        Ok(Self { inner })
+        Self { inner }
+    }
+
+    /// Build from a fully-constructed OAuth source. The base URL is
+    /// extracted from the currently-cached Copilot token; if the
+    /// proxy rotates between refreshes the user must re-log in (the
+    /// per-account host is stable in normal operation).
+    pub async fn from_source(
+        source: Arc<GitHubCopilotOAuthSource>,
+        transport: ProviderTransportConfig,
+    ) -> Result<Self> {
+        let tokens = source.persisted_tokens().await;
+        let base_url = resolve_base_url(&tokens.copilot_token, tokens.enterprise_domain.as_deref());
+        Ok(Self::from_source_and_base_url(source, base_url, transport))
     }
 
     /// Convenience: build a provider against the default
     /// `~/.squeezy/auth/github-copilot.json` token set. Returns
     /// `ProviderNotConfigured` if no tokens have been persisted yet.
-    pub async fn from_default_auth(transport: ProviderTransportConfig) -> Result<Self> {
-        let source = Arc::new(GitHubCopilotOAuthSource::load()?);
-        Self::from_source(source, transport).await
+    pub fn from_default_auth(transport: ProviderTransportConfig) -> Result<Self> {
+        let path = auth_file_path().ok_or_else(|| {
+            SqueezyError::Config(
+                "could not determine ~/.squeezy auth directory; \
+                 set SQUEEZY_GITHUB_COPILOT_AUTH_FILE or HOME"
+                    .to_string(),
+            )
+        })?;
+        let tokens = read_tokens(&path)?.ok_or_else(|| {
+            SqueezyError::ProviderNotConfigured(format!(
+                "no github-copilot OAuth credentials at {}; \
+                 run `squeezy auth github-copilot login`",
+                path.display()
+            ))
+        })?;
+        let base_url = resolve_base_url(&tokens.copilot_token, tokens.enterprise_domain.as_deref());
+        let source = Arc::new(GitHubCopilotOAuthSource::from_tokens(tokens, path));
+        Ok(Self::from_source_and_base_url(source, base_url, transport))
     }
 }
 

@@ -15,7 +15,7 @@ use squeezy_core::{
     DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_BEDROCK_REGION, DEFAULT_GOOGLE_BASE_URL,
     DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL, OpenAiCompatiblePreset, Result, SqueezyError,
 };
-use squeezy_llm::{ModelInfo, models_for_provider};
+use squeezy_llm::{ModelInfo, github_copilot_auth_file_path, models_for_provider};
 
 #[derive(Debug, Subcommand)]
 pub enum ProvidersCommand {
@@ -204,7 +204,11 @@ pub(crate) fn registry_entries(env_lookup: &dyn Fn(&str) -> Option<String>) -> V
         display_name: entry.display_name,
         base_url: entry.base_url,
         api_key_env: entry.api_key_env,
-        configured: env_set(env_lookup, entry.api_key_env),
+        configured: if entry.name == "github_copilot" {
+            github_copilot_auth_file_path().is_some_and(|path| path.exists())
+        } else {
+            env_set(env_lookup, entry.api_key_env)
+        },
         full_tier: true,
         model_count: models_for_provider(entry.name).count(),
     }));
@@ -286,6 +290,13 @@ const BASE_PROVIDERS: &[BaseProvider] = &[
         // for users running behind a reverse proxy.
         api_key_env: "OLLAMA_API_KEY",
         aliases: &["ollama"],
+    },
+    BaseProvider {
+        name: "github_copilot",
+        display_name: "GitHub Copilot",
+        base_url: "(token-derived)",
+        api_key_env: "squeezy auth github-copilot login",
+        aliases: &["github_copilot", "github-copilot", "copilot"],
     },
 ];
 

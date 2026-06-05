@@ -6,7 +6,9 @@ use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
     SettingsFile, default_settings_path,
 };
-use squeezy_llm::{KeySource, fallback_env_var, resolve_api_key_with_inline};
+use squeezy_llm::{
+    KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
+};
 use squeezy_store::{
     SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
 };
@@ -245,6 +247,7 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
             ),
         ),
         ProviderConfig::OpenAiCodex(_) => ("openai_codex", openai_codex_auth_check()),
+        ProviderConfig::GitHubCopilot(_) => ("github_copilot", github_copilot_auth_check()),
         ProviderConfig::OpenAiCompatible(c) => (
             c.preset.as_str(),
             credential_check(c.api_key.as_deref(), &c.api_key_env),
@@ -280,6 +283,28 @@ fn openai_codex_auth_check() -> (Status, String) {
             Status::Warn,
             format!(
                 "no token at {}; run `squeezy auth openai-codex login` to authenticate",
+                path.display()
+            ),
+        )
+    }
+}
+
+fn github_copilot_auth_check() -> (Status, String) {
+    let Some(path) = github_copilot_auth_file_path() else {
+        return (
+            Status::Warn,
+            "could not determine auth file path; \
+             run `squeezy auth github-copilot login` to authenticate"
+                .to_string(),
+        );
+    };
+    if path.exists() {
+        (Status::Ok, format!("token present at {}", path.display()))
+    } else {
+        (
+            Status::Warn,
+            format!(
+                "no token at {}; run `squeezy auth github-copilot login` to authenticate",
                 path.display()
             ),
         )
@@ -743,6 +768,12 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
             Status::Warn,
             "probe not implemented for ChatGPT Codex \
              (the backend does not expose a list-models endpoint)"
+                .to_string(),
+        ),
+        ProviderConfig::GitHubCopilot(_) => (
+            Status::Warn,
+            "probe not implemented for GitHub Copilot \
+             (the chat backend does not expose a stable list-models endpoint)"
                 .to_string(),
         ),
         ProviderConfig::Faux(_) => (

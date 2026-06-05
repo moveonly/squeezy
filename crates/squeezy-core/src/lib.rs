@@ -28,6 +28,7 @@ pub const DEFAULT_OPENAI_CODEX_MODEL: &str = DEFAULT_OPENAI_MODEL;
 /// Originator tag stamped on every Codex request so OpenAI can attribute
 /// traffic to squeezy in their dashboards.
 pub const DEFAULT_OPENAI_CODEX_ORIGINATOR: &str = "squeezy";
+pub const DEFAULT_GITHUB_COPILOT_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -954,6 +955,14 @@ impl AppConfig {
                     transport: provider_transport_settings(&providers, &["openai_codex"]),
                 })
             }
+            "github-copilot" | "github_copilot" | "copilot" => {
+                ProviderConfig::GitHubCopilot(GitHubCopilotConfig {
+                    transport: provider_transport_settings(
+                        &providers,
+                        &["github_copilot", "github-copilot", "copilot"],
+                    ),
+                })
+            }
             "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
                 script: get_var("SQUEEZY_FAUX_SCRIPT")
                     .or_else(|| provider_setting(&providers, "faux", "script")),
@@ -994,6 +1003,12 @@ impl AppConfig {
                 provider_setting(&providers, "openai_codex", "default_model")
                     .unwrap_or_else(|| DEFAULT_OPENAI_CODEX_MODEL.to_string())
             }
+            ProviderConfig::GitHubCopilot(_) => {
+                provider_setting(&providers, "github_copilot", "default_model")
+                    .or_else(|| provider_setting(&providers, "github-copilot", "default_model"))
+                    .or_else(|| provider_setting(&providers, "copilot", "default_model"))
+                    .unwrap_or_else(|| DEFAULT_GITHUB_COPILOT_MODEL.to_string())
+            }
             ProviderConfig::OpenAiCompatible(config) => {
                 provider_setting(&providers, config.preset.as_str(), "default_model")
                     .unwrap_or_else(|| config.preset.default_model().to_string())
@@ -1020,6 +1035,7 @@ impl AppConfig {
             ProviderConfig::Bedrock(_) => "bedrock",
             ProviderConfig::Ollama(_) => "ollama",
             ProviderConfig::OpenAiCodex(_) => "openai_codex",
+            ProviderConfig::GitHubCopilot(_) => "github_copilot",
             ProviderConfig::OpenAiCompatible(_) => "",
             ProviderConfig::Faux(_) => "faux",
         };
@@ -2219,6 +2235,7 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
+        ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
         ProviderConfig::Faux(_) => "faux",
     }
@@ -2319,6 +2336,10 @@ pub enum ProviderConfig {
     /// key. The credential is never carried inline in the TOML — the
     /// settings only describe the endpoint and originator.
     OpenAiCodex(OpenAiCodexConfig),
+    /// GitHub Copilot Chat subscription. Auth is a GitHub device-flow
+    /// token persisted under `~/.squeezy/auth/github-copilot.json`;
+    /// the request host is derived from the Copilot token at runtime.
+    GitHubCopilot(GitHubCopilotConfig),
     /// Deterministic in-process faux provider for tests and the eval
     /// harness. The wire protocol is local: each `stream_response` call
     /// pops the next scripted response from an internal queue and replays
@@ -2792,6 +2813,11 @@ pub struct OpenAiConfig {
 pub struct OpenAiCodexConfig {
     pub base_url: String,
     pub originator: String,
+    pub transport: ProviderTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubCopilotConfig {
     pub transport: ProviderTransportConfig,
 }
 
@@ -9761,6 +9787,7 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
         ProviderConfig::AzureOpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "azure_openai"),
         ProviderConfig::Ollama(cfg) => check_base_url_scheme(&cfg.base_url, "ollama"),
         ProviderConfig::OpenAiCodex(cfg) => check_base_url_scheme(&cfg.base_url, "openai_codex"),
+        ProviderConfig::GitHubCopilot(_) => Ok(()),
         ProviderConfig::OpenAiCompatible(cfg) => {
             check_base_url_scheme(&cfg.base_url, cfg.preset.as_str())
         }
@@ -10146,6 +10173,7 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
         ProviderConfig::Bedrock(_) => &["bedrock"],
         ProviderConfig::Ollama(_) => &["ollama"],
         ProviderConfig::OpenAiCodex(_) => &["openai_codex"],
+        ProviderConfig::GitHubCopilot(_) => &["github_copilot", "github-copilot", "copilot"],
         ProviderConfig::OpenAiCompatible(config) => match config.preset {
             OpenAiCompatiblePreset::OpenRouter => &["openrouter"],
             OpenAiCompatiblePreset::Vercel => &["vercel"],
