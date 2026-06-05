@@ -211,7 +211,10 @@ pub(crate) fn classify_route(model: &str) -> XaiRoute {
     if id.starts_with("grok-4") || id.starts_with("grok-build") || id.starts_with("grok-code") {
         return XaiRoute::Responses;
     }
-    if id.starts_with("grok-2") || id.starts_with("grok-1") || id.starts_with("grok-beta") {
+    if matches_grok_family(id, "grok-2")
+        || matches_grok_family(id, "grok-1")
+        || id.starts_with("grok-beta")
+    {
         return XaiRoute::Chat;
     }
     if id.starts_with("grok-") {
@@ -222,6 +225,13 @@ pub(crate) fn classify_route(model: &str) -> XaiRoute {
         return XaiRoute::Responses;
     }
     XaiRoute::Chat
+}
+
+fn matches_grok_family(id: &str, family: &str) -> bool {
+    id == family
+        || id
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with(['-', '.']))
 }
 
 /// `true` when the model id should be dispatched against xAI's Responses

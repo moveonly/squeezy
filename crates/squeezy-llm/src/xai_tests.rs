@@ -120,6 +120,22 @@ fn xai_strips_multi_segment_aggregator_prefix_low() {
 }
 
 #[test]
+fn xai_legacy_grok_two_match_is_family_delimited() {
+    for legacy in ["grok-2", "grok-2.5", "grok-2-latest", "xai/grok-2"] {
+        assert_eq!(
+            classify_route(legacy),
+            XaiRoute::Chat,
+            "{legacy} must remain on Chat"
+        );
+    }
+    assert_eq!(
+        classify_route("grok-21"),
+        XaiRoute::Responses,
+        "future grok-21 must not be trapped by the grok-2 legacy Chat route"
+    );
+}
+
+#[test]
 fn xai_classify_route_covers_new_grok_families_c09() {
     // C-09: explicit allow-list of Grok families xAI ships on Responses
     // as of the May 2026 catalog refresh. The parser must classify each
