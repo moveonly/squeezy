@@ -202,9 +202,9 @@ fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
                     json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
                 ),
                 tool_call(
-                    "planner_upstream_flow",
-                    "upstream_flow",
-                    json!({"query": query.clone(), "max_depth": 3, "max_results": 25}),
+                    "planner_reference_search",
+                    "reference_search",
+                    json!({"query": query.clone(), "max_results": PLANNER_GRAPH_MAX_RESULTS}),
                 ),
             ],
             guard_raw_reads: true,
@@ -630,10 +630,39 @@ fn is_prompt_noise_word(token: &str) -> bool {
 }
 
 fn looks_like_path(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        ".rs"
+            | ".py"
+            | ".java"
+            | ".cs"
+            | ".go"
+            | ".cpp"
+            | ".hpp"
+            | ".cc"
+            | ".cxx"
+            | ".h++"
+            | ".c"
+            | ".h"
+            | ".js"
+            | ".ts"
+            | ".tsx"
+            | ".jsx"
+            | ".rb"
+            | ".php"
+            | ".kt"
+            | ".kts"
+            | ".swift"
+            | ".scala"
+            | ".sc"
+            | ".dart"
+    ) {
+        return true;
+    }
     if token.contains('/') {
         return true;
     }
-    let lower = token.to_ascii_lowercase();
     matches!(
         std::path::Path::new(lower.as_str())
             .extension()

@@ -42,12 +42,21 @@ fn what_methods_does_have_phrasing_also_compiles_to_method_listing() {
 }
 
 #[test]
-fn callers_prompt_uses_upstream_flow() {
+fn callers_prompt_uses_reference_search() {
     let plan = compile_exploration_plan("Who calls Runner::run?").expect("plan");
 
     assert_eq!(plan.intent, ExplorationIntent::FindCallers);
     assert_eq!(plan.query.as_deref(), Some("Runner::run"));
-    assert!(plan.calls.iter().any(|call| call.name == "upstream_flow"));
+    assert!(
+        plan.calls
+            .iter()
+            .any(|call| call.name == "reference_search"),
+        "direct caller lookup should preflight references, not a transitive flow search"
+    );
+    assert!(
+        plan.calls.iter().all(|call| call.name != "upstream_flow"),
+        "direct caller lookup should not preflight transitive upstream flow"
+    );
 }
 
 #[test]
@@ -177,6 +186,23 @@ fn source_file_extension_token_does_not_trigger_planner_preflight() {
     // rejected by the same gate.
     assert!(compile_exploration_plan("Which file defines main.go?").is_none());
 }
+
+#[test]
+fn quoted_extension_literals_do_not_drive_planner_query() {
+    // File-extension filters in benchmark/user prompts are scope constraints,
+    // not symbols. A leading-dot token like `.cpp` is a hidden-file-looking
+    // path to std::path and does not expose `cpp` as an extension, so pin it
+    // explicitly to avoid planner preflights against extension names.
+    for ext in [".cpp", ".hpp", ".cc", ".cxx", ".h++"] {
+        let prompt = format!(
+            "Ignore files with extension `{ext}`; find callers of `ngx_http_process_request`."
+        );
+        let plan = compile_exploration_plan(&prompt).expect("callers plan");
+        assert_eq!(plan.intent, ExplorationIntent::FindCallers);
+        assert_eq!(plan.query.as_deref(), Some("ngx_http_process_request"));
+    }
+}
+
 #[test]
 fn prompt_noise_words_are_rejected_by_is_useful_query() {
     // Capitalized English prompt scaffolding (`ONLY`, `OUTPUT`, `EXPECTED`,
