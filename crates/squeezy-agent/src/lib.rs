@@ -4285,6 +4285,7 @@ fn active_turn_is_current(
         .is_some_and(|active| active.turn_id == turn_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_observed_turn<F>(
     turn_id: TurnId,
     done: Arc<Notify>,
