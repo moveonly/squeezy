@@ -150,13 +150,6 @@ pub async fn run_scenario(
     };
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
     apply_mcp_overlay(&mut config, &scenario.mcp)?;
-    // Fully disable product telemetry for every eval run. Benchmark runs must
-    // not emit anonymous usage events: it keeps the telemetry store open + the
-    // 5 s flush task off the eval's hot path, and avoids any telemetry I/O
-    // perturbing the measured token/cost accounting. Forced here (after the env
-    // load + scenario overlay) so no user setting, `SQUEEZY_TELEMETRY` env, or
-    // scenario overlay can re-enable it inside the eval framework.
-    config.telemetry.enabled = false;
     let provider = if scenario.squeezy.provider.as_deref() == Some("mock") {
         crate::mock_provider::MockProvider::shared(scenario.mock.clone())
     } else {
