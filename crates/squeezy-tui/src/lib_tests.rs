@@ -9978,31 +9978,6 @@ fn sample_attachment(id: &str) -> ContextAttachment {
     }
 }
 
-// ---- /verbosity inline back-compat ----
-//
-// `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
-// `/config` screen focused on the matching section; the original overlay
-// flow was replaced by the full editor. Section-routing coverage lives in
-// `slash_model_opens_config_at_models_section` and friends below.
-
-#[tokio::test]
-async fn slash_verbosity_with_inline_arg_applies_immediately() {
-    let mut agent = test_agent_without_session_log(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.response_verbosity = ResponseVerbosity::Normal;
-    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
-    assert!(ran);
-    assert!(
-        app.config_screen.is_none(),
-        "inline form should not open the screen"
-    );
-    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
-    assert_eq!(
-        agent.config_snapshot().tui.response_verbosity,
-        ResponseVerbosity::Verbose
-    );
-}
-
 // ---- /effort session-level reasoning-effort setter ----
 
 #[tokio::test]
@@ -10052,36 +10027,6 @@ async fn slash_effort_rejects_unknown_value() {
         app.status.contains("unknown effort"),
         "expected error status, got {}",
         app.status,
-    );
-}
-
-#[tokio::test]
-async fn slash_verbosity_without_arg_prints_current_value_and_usage_hint() {
-    // squeezy-3ys0 (audit U2): bare /verbosity no longer diverts into
-    // the config_screen modal. It prints the current value + usage
-    // hint into the transcript (matching /effort's surface) so users
-    // get consistent shape between bare and arg-form invocations.
-    let mut agent = test_agent_without_session_log(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
-    assert!(ran);
-    assert!(
-        app.config_screen.is_none(),
-        "bare /verbosity should not open config_screen"
-    );
-    assert!(
-        app.status.starts_with("response verbosity:"),
-        "status should report the current verbosity; got {:?}",
-        app.status
-    );
-    let body = last_message_content(&app).expect("transcript usage hint");
-    assert!(
-        body.contains("response verbosity"),
-        "transcript should include the usage hint; got {body:?}"
-    );
-    assert!(
-        body.contains("/verbosity [concise|normal|verbose]"),
-        "transcript should include the usage line; got {body:?}"
     );
 }
 
@@ -10983,7 +10928,6 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/undo",
         "/revert-turn",
         "/effort",
-        "/verbosity",
         "/tool-verbosity",
     ];
     for command in SLASH_COMMANDS {
@@ -11083,13 +11027,25 @@ async fn slash_help_is_allowed_during_turn() {
 #[test]
 fn slash_parameter_hint_appears_in_render() {
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/verbosity".to_string());
+    set_input(&mut app, "/tool-verbosity".to_string());
     let output = render_to_string(&app, 120, 16);
     assert!(
-        output.contains("concise|normal|verbose"),
-        "expected parameter hint to render the response-verbosity options actually accepted \
-         by `/verbosity`: {output}"
+        output.contains("compact|normal|verbose"),
+        "expected parameter hint to render the tool-verbosity options actually accepted \
+         by `/tool-verbosity`: {output}"
     );
+}
+
+#[test]
+fn slash_menu_omits_low_value_config_shortcuts() {
+    let commands = SLASH_COMMANDS
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+
+    assert!(!commands.contains(&"/verbosity"), "{commands:?}");
+    assert!(!commands.contains(&"/spinner"), "{commands:?}");
+    assert!(commands.contains(&"/config"), "{commands:?}");
 }
 
 #[test]

@@ -315,13 +315,6 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[on|off]",
     ),
     slash_args_caps(
-        "/verbosity",
-        "open config focused on response verbosity (or set inline)",
-        false,
-        "[concise|normal|verbose]",
-        &[PermissionCapability::Edit],
-    ),
-    slash_args_caps(
         "/tool-verbosity",
         "open config focused on tool output verbosity (or set inline)",
         false,
@@ -339,13 +332,6 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "open theme config or switch theme",
         true,
         "[default|bright|fun|catppuccin|high-contrast|<custom>]",
-        &[PermissionCapability::Edit],
-    ),
-    slash_args_caps(
-        "/spinner",
-        "set the working-status spinner",
-        true,
-        "[twinkle|scintillate|drift]",
         &[PermissionCapability::Edit],
     ),
     slash("/keymap", "list current key bindings"),

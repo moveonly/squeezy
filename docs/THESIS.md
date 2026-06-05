@@ -26,7 +26,7 @@ Every model token is a budgeted resource.
 
 - **Context receipts** let re-reads return stubs that reference an
   earlier result instead of resending bytes.
-- An **exploration compiler** translates model intent into a
+- An **exploration graph** translates model intent into a
   deterministic local query plan; only the final compact evidence
   packet ships to the model.
 - A **cost broker** enforces per-turn caps on `grep`, raw reads, tool

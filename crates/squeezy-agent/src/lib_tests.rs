@@ -9835,7 +9835,6 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             "report",
         ),
         (DispatchCommand::Effort { value: None }, "effort"),
-        (DispatchCommand::Verbosity { value: None }, "verbosity"),
         (
             DispatchCommand::ToolVerbosity { value: None },
             "tool-verbosity",

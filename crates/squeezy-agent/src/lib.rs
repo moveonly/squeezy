@@ -3528,11 +3528,9 @@ impl Agent {
             | DispatchCommand::Feedback { .. }
             | DispatchCommand::Report { .. }
             | DispatchCommand::Effort { .. }
-            | DispatchCommand::Verbosity { .. }
             | DispatchCommand::ToolVerbosity { .. }
             | DispatchCommand::Statusline
             | DispatchCommand::Theme { .. }
-            | DispatchCommand::Spinner { .. }
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
@@ -6105,7 +6103,7 @@ impl TurnRuntime {
         );
         let exploration_plan = self
             .config
-            .exploration_compiler
+            .exploration_graph
             .then(|| compile_exploration_plan(&input))
             .flatten();
         let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(
@@ -6270,7 +6268,7 @@ impl TurnRuntime {
                     "tool_result",
                     Some(self.turn_id),
                     tool_output_summary(output),
-                    json!({ "output": resume_item_for_json(output.clone()), "source": "exploration_compiler" }),
+                    json!({ "output": resume_item_for_json(output.clone()), "source": "exploration_graph" }),
                 );
             }
             if self.config.store_responses {
@@ -13362,15 +13360,7 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
                 SlashArgShape::None
             }
         }
-        DispatchCommand::Spinner { spinner } => {
-            if option_has_text(spinner.as_ref()) {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
         DispatchCommand::Effort { value }
-        | DispatchCommand::Verbosity { value }
         | DispatchCommand::ToolVerbosity { value }
         | DispatchCommand::Router { value } => {
             if option_has_text(value.as_ref()) {

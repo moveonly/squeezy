@@ -651,7 +651,7 @@ pub struct AppConfig {
     pub context_compaction: ContextCompactionConfig,
     pub subagents: SubagentConfig,
     pub store_responses: bool,
-    pub exploration_compiler: bool,
+    pub exploration_graph: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
     pub tool_preview_bytes: usize,
@@ -1175,18 +1175,18 @@ impl AppConfig {
                 ProviderConfig::OpenAi(_) | ProviderConfig::AzureOpenAi(_)
             );
         let agent_settings = settings.agent.unwrap_or_default();
-        // The exploration compiler defaults to on, and the documented env-var
-        // override is `SQUEEZY_EXPLORATION_COMPILER=off|false|...`. Treating
+        // Exploration graph prefetch defaults to on, and the documented env-var
+        // override is `SQUEEZY_EXPLORATION_GRAPH=off|false|...`. Treating
         // the variable as a disable-only override keeps the documented values
         // working without silently flipping the default off on typos or empty
         // strings, matching how `SQUEEZY_TELEMETRY` and `SQUEEZY_FEEDBACK`
         // handle their own default-on flags.
-        let settings_exploration_compiler = agent_settings.exploration_compiler.unwrap_or(true);
-        let exploration_compiler_var = get_var("SQUEEZY_EXPLORATION_COMPILER");
-        let exploration_compiler = if parse_disabled_bool(exploration_compiler_var.as_deref()) {
+        let settings_exploration_graph = agent_settings.exploration_graph.unwrap_or(true);
+        let exploration_graph_var = get_var("SQUEEZY_EXPLORATION_GRAPH");
+        let exploration_graph = if parse_disabled_bool(exploration_graph_var.as_deref()) {
             false
         } else {
-            settings_exploration_compiler
+            settings_exploration_graph
         };
         let budgets = settings.budgets.unwrap_or_default();
         let max_parallel_tools = get_var("SQUEEZY_MAX_PARALLEL_TOOLS")
@@ -1366,7 +1366,7 @@ impl AppConfig {
             context_compaction,
             subagents,
             store_responses,
-            exploration_compiler,
+            exploration_graph,
             max_parallel_tools,
             tool_spill_threshold_bytes,
             tool_preview_bytes,
@@ -1581,8 +1581,8 @@ impl AppConfig {
 
         output.push_str("[agent]\n");
         output.push_str(&format!(
-            "exploration_compiler = {}\n\n",
-            self.exploration_compiler
+            "exploration_graph = {}\n\n",
+            self.exploration_graph
         ));
 
         output.push_str("[session]\n");
@@ -4409,24 +4409,30 @@ impl ModelSettings {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct AgentSettings {
-    pub exploration_compiler: Option<bool>,
+    pub exploration_graph: Option<bool>,
 }
 
 impl AgentSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["exploration_compiler"], source, path)?;
+        if table.contains_key("exploration_compiler") {
+            return Err(SqueezyError::Config(format!(
+                "{source}: {}: renamed to exploration_graph",
+                field(path, "exploration_compiler")
+            )));
+        }
+        reject_unknown_keys(table, &["exploration_graph"], source, path)?;
         Ok(Self {
-            exploration_compiler: bool_value(
+            exploration_graph: bool_value(
                 table,
-                "exploration_compiler",
+                "exploration_graph",
                 source,
-                &field(path, "exploration_compiler"),
+                &field(path, "exploration_graph"),
             )?,
         })
     }
 
     fn merge(&mut self, next: Self) {
-        replace_if_some(&mut self.exploration_compiler, next.exploration_compiler);
+        replace_if_some(&mut self.exploration_graph, next.exploration_graph);
     }
 }
 
@@ -9532,7 +9538,7 @@ pub fn user_settings_template() -> &'static str {
 # selection_version = 1        # maintained by the startup provider/model selector
 
 [agent]
-# exploration_compiler = true  # graph-first planner for common navigation prompts
+# exploration_graph = true  # graph-first planner for common navigation prompts
 
 [session]
 # mode = "build"              # build | plan
@@ -9787,7 +9793,7 @@ pub fn project_settings_template() -> &'static str {
 # max_round_input_tokens = 200000  # pre-flight per-round input-token ceiling; unset = off (compact-first, then gate)
 
 [agent]
-# exploration_compiler = true  # graph-first planner for common navigation prompts
+# exploration_graph = true  # graph-first planner for common navigation prompts
 
 [session]
 # mode = "build"              # build | plan

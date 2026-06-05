@@ -42,6 +42,39 @@ fn absent_field_values_render_as_dash() {
 }
 
 #[test]
+fn context_trigger_info_distinguishes_dormant_from_disabled() {
+    let ctx = section(SectionId::Context).expect("Context section must be registered");
+    let triggers = ctx
+        .fields
+        .iter()
+        .find(|field| field.label == "triggers")
+        .expect("Context section exposes trigger summary");
+
+    let default_summary = (triggers.get)(&AppConfig::default()).as_display();
+    assert!(
+        default_summary.contains("window — (unknown; mid-turn dormant)"),
+        "{default_summary}"
+    );
+    assert!(
+        default_summary.contains("micro on (dormant @60%)"),
+        "{default_summary}"
+    );
+    assert!(
+        default_summary.contains("full on (dormant @80%)"),
+        "{default_summary}"
+    );
+    assert!(!default_summary.contains("micro off"), "{default_summary}");
+    assert!(!default_summary.contains("full off"), "{default_summary}");
+
+    let mut disabled = AppConfig::default();
+    disabled.context_compaction.micro_compaction_enabled = false;
+    disabled.context_compaction.enabled_mid_turn = false;
+    let disabled_summary = (triggers.get)(&disabled).as_display();
+    assert!(disabled_summary.contains("micro off"), "{disabled_summary}");
+    assert!(disabled_summary.contains("full off"), "{disabled_summary}");
+}
+
+#[test]
 fn provider_setter_swaps_default_model() {
     let mut cfg = AppConfig::from_env();
     let original = cfg.model.clone();

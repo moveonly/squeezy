@@ -197,7 +197,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert!(config.hardening.disable_core_dumps);
     assert!(config.hardening.deny_debug_attach);
     assert!(!config.store_responses);
-    assert!(config.exploration_compiler);
+    assert!(config.exploration_graph);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
@@ -991,33 +991,49 @@ fn config_can_select_anthropic_provider_defaults() {
 }
 
 #[test]
-fn config_disables_exploration_compiler_via_env_var() {
+fn config_disables_exploration_graph_via_env_var() {
     for value in ["off", "false", "0", "no", "disabled"] {
         let config = AppConfig::from_env_vars(None, |name| match name {
-            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            "SQUEEZY_EXPLORATION_GRAPH" => Some(value.to_string()),
             _ => None,
         });
         assert!(
-            !config.exploration_compiler,
-            "SQUEEZY_EXPLORATION_COMPILER={value:?} must disable the planner",
+            !config.exploration_graph,
+            "SQUEEZY_EXPLORATION_GRAPH={value:?} must disable graph exploration",
         );
     }
 }
 
 #[test]
-fn config_keeps_exploration_compiler_default_on_for_unknown_env_values() {
+fn config_keeps_exploration_graph_default_on_for_unknown_env_values() {
     // The planner defaults to on, so non-disabling env-var values (typos, empty
     // strings, or aliases like `enabled`) must not silently flip the default.
     for value in ["", "enabled", "on", "yes", "true", "1", "garbage"] {
         let config = AppConfig::from_env_vars(None, |name| match name {
-            "SQUEEZY_EXPLORATION_COMPILER" => Some(value.to_string()),
+            "SQUEEZY_EXPLORATION_GRAPH" => Some(value.to_string()),
             _ => None,
         });
         assert!(
-            config.exploration_compiler,
-            "SQUEEZY_EXPLORATION_COMPILER={value:?} should not silently disable the planner",
+            config.exploration_graph,
+            "SQUEEZY_EXPLORATION_GRAPH={value:?} should not silently disable graph exploration",
         );
     }
+}
+
+#[test]
+fn config_rejects_old_exploration_compiler_setting_key() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[agent]
+exploration_compiler = false
+"#,
+        "test",
+    )
+    .expect_err("old exploration_compiler key must be rejected");
+    assert!(
+        err.to_string().contains("exploration_compiler"),
+        "error should name the rejected key: {err}"
+    );
 }
 
 #[test]
@@ -2452,7 +2468,7 @@ selection_version = 1
 stream_idle_timeout_ms = 1234
 
 [agent]
-exploration_compiler = false
+exploration_graph = false
 
 [budgets]
 max_parallel_tools = 3
@@ -2549,7 +2565,7 @@ reason = "docs lookups are safe"
     assert_eq!(config.max_output_tokens, Some(512));
     assert_eq!(config.stream_idle_timeout, Duration::from_millis(1234));
     assert!(config.store_responses);
-    assert!(!config.exploration_compiler);
+    assert!(!config.exploration_graph);
     assert_eq!(config.session_mode, SessionMode::Plan);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.tool_spill_threshold_bytes, 1000);

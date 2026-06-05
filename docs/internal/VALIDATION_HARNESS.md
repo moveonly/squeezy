@@ -35,7 +35,7 @@ cargo run -p squeezy-harness -- run \
   --jsonl target/planner-probe.jsonl
 ```
 
-`planner-probe` uses the normal agent with `[agent].exploration_compiler=true`.
+`planner-probe` uses the normal agent with `[agent].exploration_graph=true`.
 `planner-probe-no-planner` disables that setting for the same task fixtures.
 Both runners report `planner_turns`, `planner_tool_calls`,
 `planner_refusals`, and the usual read/tool metrics in JSONL output.

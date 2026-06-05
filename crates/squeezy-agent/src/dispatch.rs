@@ -142,9 +142,6 @@ pub enum DispatchCommand {
     Effort {
         value: Option<String>,
     },
-    Verbosity {
-        value: Option<String>,
-    },
     ToolVerbosity {
         value: Option<String>,
     },
@@ -154,11 +151,6 @@ pub enum DispatchCommand {
     Statusline,
     Theme {
         theme: Option<String>,
-    },
-    /// `/spinner [twinkle|scintillate|drift]` — set the working-status
-    /// spinner. `None` reports the current spinner and the options.
-    Spinner {
-        spinner: Option<String>,
     },
     Keymap,
     /// `/cheap` — force the next turn onto the provider's small-fast
@@ -217,12 +209,10 @@ impl DispatchCommand {
             Self::Undo => "/undo",
             Self::RevertTurn { .. } => "/revert-turn",
             Self::Effort { .. } => "/effort",
-            Self::Verbosity { .. } => "/verbosity",
             Self::ToolVerbosity { .. } => "/tool-verbosity",
             Self::Detach { .. } => "/detach",
             Self::Statusline => "/statusline",
             Self::Theme { .. } => "/theme",
-            Self::Spinner { .. } => "/spinner",
             Self::Keymap => "/keymap",
             Self::Cheap => "/cheap",
             Self::Parent => "/parent",
@@ -376,9 +366,6 @@ impl DispatchCommand {
             "/effort" => Self::Effort {
                 value: first_token(rest),
             },
-            "/verbosity" => Self::Verbosity {
-                value: first_token(rest),
-            },
             "/tool-verbosity" => Self::ToolVerbosity {
                 value: first_token(rest),
             },
@@ -388,9 +375,6 @@ impl DispatchCommand {
             "/statusline" => Self::Statusline,
             "/theme" => Self::Theme {
                 theme: rest.split_whitespace().next().map(str::to_string),
-            },
-            "/spinner" => Self::Spinner {
-                spinner: rest.split_whitespace().next().map(str::to_string),
             },
             "/keymap" => Self::Keymap,
             "/cheap" => Self::Cheap,

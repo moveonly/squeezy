@@ -1,8 +1,8 @@
 //! Interactive overlay for `/model`.
 //!
 //! Today this is the only inline list-of-options picker reachable from
-//! a slash command. `/verbosity`, `/tool-verbosity`, and `/permissions`
-//! all route through `toggle_config_screen` instead — their former
+//! a slash command. `/permissions` routes through `toggle_config_screen`;
+//! `/tool-verbosity` is handled inline for the operational output knob. Their former
 //! Overlay variants were removed in the 2026-05 slash-command audit
 //! cleanup (see `squeezy-h2ab`).
 

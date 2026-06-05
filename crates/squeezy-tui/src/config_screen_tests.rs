@@ -813,6 +813,29 @@ async fn enter_on_env_shadowed_field_emits_warning_instead_of_opening_editor() {
 }
 
 #[tokio::test]
+async fn enter_on_info_row_emits_hint_instead_of_silent_noop() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Context));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SectionId::Context, &["context", "_trigger_info"]);
+
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert!(state.editor.is_none(), "info row should not open an editor");
+    let current = q.current().expect("info notification queued");
+    assert!(
+        current.message.contains("triggers is informational"),
+        "expected info-row hint, got: {}",
+        current.message
+    );
+}
+
+#[tokio::test]
 async fn space_cycling_provider_resets_model_in_memory() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
     // SAFETY: tests in this module run single-threaded.

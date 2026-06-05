@@ -69,7 +69,7 @@ work is:
 Focused validation:
 
 ```sh
-cargo test -p squeezy-agent exploration_compiler
+cargo test -p squeezy-agent exploration_graph
 ```
 
 ### Go before/after and confirmation

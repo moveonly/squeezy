@@ -36,7 +36,7 @@ pub(crate) struct ExplorationPlan {
     pub(crate) guard_raw_reads: bool,
 }
 
-pub(crate) const RAW_READ_DENIAL_REASON: &str = "exploration compiler refused raw read before graph context; call repo_map, definition_search, symbol_context, or another graph navigation tool first";
+pub(crate) const RAW_READ_DENIAL_REASON: &str = "exploration graph refused raw read before graph context; call repo_map, definition_search, symbol_context, or another graph navigation tool first";
 /// Cap on `max_results` for graph-tool calls the planner emits before the
 /// model has run. A real-world subclass/hierarchy fan-out (e.g. all
 /// `WidgetsBindingObserver` subclasses in a Flutter app) routinely exceeds

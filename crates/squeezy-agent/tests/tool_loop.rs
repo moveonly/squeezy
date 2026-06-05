@@ -303,7 +303,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
 }
 
 #[tokio::test]
-async fn exploration_compiler_prefetches_graph_context_before_model_request() {
+async fn exploration_graph_prefetches_graph_context_before_model_request() {
     let root = temp_workspace("exploration_preflight");
     write_rust_crate(&root, "pub fn make_widget() {}\n");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![

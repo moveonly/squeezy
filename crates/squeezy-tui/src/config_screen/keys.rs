@@ -312,8 +312,15 @@ pub(crate) fn handle_key(
                 return KeyOutcome::KeepOpen;
             }
             // Read-only info rows (e.g. the Routing provider banner) have
-            // nothing to edit.
+            // nothing to edit, but Enter should still acknowledge the row.
             if matches!(field.kind, FieldKind::Info) {
+                notifications.push(
+                    format!(
+                        "{} is informational; edit the fields below to change behavior.",
+                        field.label
+                    ),
+                    NotifySeverity::Info,
+                );
                 return KeyOutcome::KeepOpen;
             }
             // The model field opens a registry-driven picker; the per-provider

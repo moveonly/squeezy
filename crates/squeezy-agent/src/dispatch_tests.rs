@@ -339,7 +339,7 @@ fn parse_checkpoint_family() {
 }
 
 #[test]
-fn parse_verbosity_effort_theme_detach_keymap() {
+fn parse_effort_theme_detach_keymap() {
     assert_eq!(
         parse("/effort").unwrap(),
         DispatchCommand::Effort { value: None }
@@ -348,12 +348,6 @@ fn parse_verbosity_effort_theme_detach_keymap() {
         parse("/effort high").unwrap(),
         DispatchCommand::Effort {
             value: Some("high".to_string())
-        }
-    );
-    assert_eq!(
-        parse("/verbosity verbose").unwrap(),
-        DispatchCommand::Verbosity {
-            value: Some("verbose".to_string())
         }
     );
     assert_eq!(
@@ -382,17 +376,14 @@ fn parse_verbosity_effort_theme_detach_keymap() {
             theme: Some("dark".to_string())
         }
     );
-    assert_eq!(
-        parse("/spinner").unwrap(),
-        DispatchCommand::Spinner { spinner: None }
-    );
-    assert_eq!(
-        parse("/spinner scintillate").unwrap(),
-        DispatchCommand::Spinner {
-            spinner: Some("scintillate".to_string())
-        }
-    );
-    assert_eq!(parse("/spinner").unwrap().slash_name(), "/spinner");
+    assert!(matches!(
+        parse("/verbosity verbose").unwrap_err(),
+        DispatchCommandParseError::Unknown { .. }
+    ));
+    assert!(matches!(
+        parse("/spinner scintillate").unwrap_err(),
+        DispatchCommandParseError::Unknown { .. }
+    ));
 }
 
 #[test]
