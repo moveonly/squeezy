@@ -12,7 +12,9 @@ from pathlib import Path
 
 ALL = ["c","cpp","csharp","dart","go","java","js","kotlin","php",
        "python","ruby","rust","scala","swift","ts"]
-HTH = "/tmp/hth/hth.py"
+HARNESS = Path(__file__).resolve().parent
+HTH = str(HARNESS / "hth.py")
+HTH_ROOT = Path(os.environ.get("SQUEEZY_REALWORLD_SCRATCH", "/tmp/hth"))
 
 
 def med(xs):
@@ -60,17 +62,17 @@ def main():
         tier, n = sys.argv[2], int(sys.argv[3])
         if mode == "squeezy":
             label = sys.argv[4]; rest = sys.argv[5:]
-            outfile = f"/tmp/hth/results-sqz-{tier}-{label}.jsonl"
+            outfile = HTH_ROOT / f"results-sqz-{tier}-{label}.jsonl"
         else:
             rest = sys.argv[4:]
-            outfile = f"/tmp/hth/results-rival-{tier}.jsonl"
+            outfile = HTH_ROOT / f"results-rival-{tier}.jsonl"
         langs = (rest[0].split(",") if rest and rest[0] != "all" else ALL)
         lc = int(rest[1]) if len(rest) > 1 else (3 if tier == "mini" else 2)
         sweep(tier, mode, n, langs, lc, outfile)
     elif mode == "verdict":
         tier, label = sys.argv[2], sys.argv[3]
-        sqz = {json.loads(l)["lang"]: json.loads(l) for l in open(f"/tmp/hth/results-sqz-{tier}-{label}.jsonl")}
-        riv = {json.loads(l)["lang"]: json.loads(l) for l in open(f"/tmp/hth/results-rival-{tier}.jsonl")}
+        sqz = {json.loads(l)["lang"]: json.loads(l) for l in open(HTH_ROOT / f"results-sqz-{tier}-{label}.jsonl")}
+        riv = {json.loads(l)["lang"]: json.loads(l) for l in open(HTH_ROOT / f"results-rival-{tier}.jsonl")}
         wins = 0
         print(f"=== VERDICT {tier} (sqz={label} vs rival medians) ===")
         for l in ALL:

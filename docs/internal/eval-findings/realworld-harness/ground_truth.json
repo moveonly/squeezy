@@ -418,93 +418,52 @@
     ]
   },
   "go": {
-    "count": 14,
-    "methods": {
-      "UseLine": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "VisitParents": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go"
-      ],
-      "InitDefaultHelpCmd": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "CommandPath": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "IsAvailableCommand": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "Parent": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "IsAdditionalHelpTopicCommand": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "Name": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go"
-      ],
-      "HasParent": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "Commands": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "util.go",
-        "yaml_docs.go"
-      ],
-      "InitDefaultHelpFlag": [
-        "man_docs.go",
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "NonInheritedFlags": [
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "InheritedFlags": [
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ],
-      "Runnable": [
-        "md_docs.go",
-        "rest_docs.go",
-        "yaml_docs.go"
-      ]
-    }
+    "count": 43,
+    "rows": [
+      ["ApplyCommand", ["Meta"]],
+      ["CloudCommand", ["Meta"]],
+      ["ConsoleCommand", ["Meta"]],
+      ["FmtCommand", ["Meta"]],
+      ["GetCommand", ["Meta"]],
+      ["GraphCommand", ["Meta"]],
+      ["ImportCommand", ["Meta"]],
+      ["InitCommand", ["Meta"]],
+      ["LoginCommand", ["Meta"]],
+      ["LogoutCommand", ["Meta"]],
+      ["MetadataCommand", ["Meta"]],
+      ["MetadataFunctionsCommand", ["Meta"]],
+      ["ModulesCommand", ["Meta"]],
+      ["OutputCommand", ["Meta"]],
+      ["PlanCommand", ["Meta"]],
+      ["ProvidersCommand", ["Meta"]],
+      ["ProvidersLockCommand", ["Meta"]],
+      ["ProvidersMirrorCommand", ["Meta"]],
+      ["ProvidersSchemaCommand", ["Meta"]],
+      ["PushCommand", ["Meta"]],
+      ["RefreshCommand", ["Meta"]],
+      ["ShowCommand", ["Meta"]],
+      ["StateCommand", ["StateMeta"]],
+      ["StateListCommand", ["Meta", "StateMeta"]],
+      ["StateMeta", ["Meta"]],
+      ["StateMvCommand", ["StateMeta"]],
+      ["StatePullCommand", ["Meta", "StateMeta"]],
+      ["StatePushCommand", ["Meta", "StateMeta"]],
+      ["StateReplaceProviderCommand", ["StateMeta"]],
+      ["StateRmCommand", ["StateMeta"]],
+      ["StateShowCommand", ["Meta", "StateMeta"]],
+      ["TaintCommand", ["Meta"]],
+      ["TestCommand", ["Meta"]],
+      ["UnlockCommand", ["Meta"]],
+      ["UntaintCommand", ["Meta"]],
+      ["ValidateCommand", ["Meta"]],
+      ["VersionCommand", ["Meta"]],
+      ["WorkspaceCommand", ["Meta"]],
+      ["WorkspaceDeleteCommand", ["Meta"]],
+      ["WorkspaceListCommand", ["Meta"]],
+      ["WorkspaceNewCommand", ["Meta"]],
+      ["WorkspaceSelectCommand", ["Meta"]],
+      ["WorkspaceShowCommand", ["Meta"]]
+    ]
   },
   "java": {
     "count": 18,

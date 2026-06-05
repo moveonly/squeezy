@@ -17,16 +17,26 @@ import json, os, re, statistics, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-sys.path.insert(0, "/tmp/codex-runs/realworld")
+HARNESS = Path(__file__).resolve().parent
+REPO = HARNESS.parents[3]
+sys.path.insert(0, str(HARNESS))
 import grade
 from grade import GRADERS, GT, cost_micro
 
-NEW = Path("/Users/abbassabra/esqueezy/new")
+NEW = Path(os.environ.get("SQUEEZY_REALWORLD_REPO", str(REPO))).resolve()
 SC = NEW / "crates/squeezy-eval/fixtures/scenarios/benchmarks/natural"
-HAIKU_TOML = Path("/tmp/hth/haiku-toml")
-REPOS = Path("/tmp/hth/repos")
+HTH_ROOT = Path(os.environ.get("SQUEEZY_REALWORLD_SCRATCH", "/tmp/hth"))
+HAIKU_TOML = Path(os.environ.get("SQUEEZY_REALWORLD_HAIKU_TOML", str(HTH_ROOT / "haiku-toml")))
+REPOS = Path(os.environ.get("SQUEEZY_REALWORLD_REPOS", str(HTH_ROOT / "repos")))
 BIN = os.environ.get("BIN", str(NEW / "target/release/squeezy-eval"))
-CODEX_PROMPTS = Path("/tmp/codex-runs/realworld/prompts")
+CODEX_PROMPTS = Path(os.environ.get(
+    "SQUEEZY_REALWORLD_CODEX_PROMPTS",
+    str(HTH_ROOT / "prompts" / "codex"),
+))
+CC_PROMPTS = Path(os.environ.get(
+    "SQUEEZY_REALWORLD_CC_PROMPTS",
+    str(HTH_ROOT / "prompts" / "cc"),
+))
 REPOS.mkdir(parents=True, exist_ok=True)
 
 CC_SCRUB = ["-u","CLAUDECODE","-u","CLAUDE_CODE_SESSION_ID","-u","CLAUDE_CODE_ENTRYPOINT",
@@ -125,7 +135,7 @@ def run_squeezy(lang, tier, variant):
 # ---------------- codex (mini rival) ----------------
 def run_codex(lang, repodir, rep):
     prompt = (CODEX_PROMPTS / f"{lang}.txt").read_text()
-    ev = Path(f"/tmp/hth/out/codex-{lang}-r{rep}.jsonl")
+    ev = HTH_ROOT / "out" / f"codex-{lang}-r{rep}.jsonl"
     ev.parent.mkdir(parents=True, exist_ok=True)
     cap = 1500 if lang == "dart" else 700
     for attempt in range(3):
@@ -176,8 +186,8 @@ def parse_codex(ev):
 
 # ---------------- claude code (haiku rival) ----------------
 def run_cc(lang, repodir, rep):
-    prompt_file = Path(f"/tmp/cc-baseline-realworld/prompts/{lang}.txt")
-    stream = Path(f"/tmp/hth/out/cc-{lang}-r{rep}.jsonl")
+    prompt_file = CC_PROMPTS / f"{lang}.txt"
+    stream = HTH_ROOT / "out" / f"cc-{lang}-r{rep}.jsonl"
     stream.parent.mkdir(parents=True, exist_ok=True)
     cap = 1500 if lang == "dart" else 700
     for attempt in range(3):

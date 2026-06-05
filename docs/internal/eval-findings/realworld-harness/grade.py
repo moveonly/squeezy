@@ -13,7 +13,8 @@ import os
 import sys
 from pathlib import Path
 
-OUT = Path("/tmp/codex-runs/realworld")
+HARNESS = Path(__file__).resolve().parent
+OUT = Path(os.environ.get("SQUEEZY_REALWORLD_CODEX_OUT", "/tmp/codex-runs/realworld"))
 RES = OUT / "results.json"
 
 # gpt-5.4-mini pricing in micro-USD per token
@@ -21,7 +22,7 @@ P_IN = 0.75   # per million
 P_CACHED = 0.075
 P_OUT = 4.50
 
-GT = json.loads((OUT / "ground_truth.json").read_text())
+GT = json.loads((HARNESS / "ground_truth.json").read_text())
 
 
 def cost_micro(usage):
@@ -171,14 +172,34 @@ def grade_dart(text, gt):
 
 
 def grade_go(text, gt):
-    methods = gt["methods"]
-    # methods = {name: [doc files]}
-    # Need codex to emit each method name
+    if "rows" not in gt:
+        methods = gt["methods"]
+        found = 0
+        for name in methods:
+            if re.search(r"\b" + re.escape(name) + r"\b", text):
+                found += 1
+        return found, len(methods)
+
+    rows = gt["rows"]
+    expected = {name: tuple(bases) for name, bases in rows}
+    seen = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip("`")
+        m = re.match(r"^([A-Za-z_]\w*)\s+embeds\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        name = m.group(1)
+        bases = tuple(
+            part.strip().strip("`")
+            for part in re.split(r"\s*,\s*", m.group(2))
+            if part.strip()
+        )
+        seen[name] = bases
     found = 0
-    for name in methods:
-        if re.search(r"\b" + re.escape(name) + r"\b", text):
+    for name, bases in expected.items():
+        if seen.get(name) == bases:
             found += 1
-    return found, len(methods)
+    return found, len(expected)
 
 
 def grade_java(text, gt):

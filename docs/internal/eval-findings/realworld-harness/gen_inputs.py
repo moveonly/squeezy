@@ -5,17 +5,28 @@ Eliminates the java/python/php prompt drift found in the audit: rival prompt ==
 the exact `[[steps]] text` the squeezy scenario uses. Haiku toml == committed
 with-graph/no-graph toml with only provider/model/id swapped to Anthropic Haiku.
 """
-import re, sys
+import os
+import re
+import sys
 from pathlib import Path
 
-NEW = Path("/Users/abbassabra/esqueezy/new")
+HARNESS = Path(__file__).resolve().parent
+REPO = HARNESS.parents[3]
+NEW = Path(os.environ.get("SQUEEZY_REALWORLD_REPO", str(REPO))).resolve()
 SC = NEW / "crates/squeezy-eval/fixtures/scenarios/benchmarks/natural"
 LANGS = ["c","cpp","csharp","dart","go","java","js","kotlin","php",
          "python","ruby","rust","scala","swift","ts"]
 
-CODEX_PROMPTS = Path("/tmp/codex-runs/realworld/prompts")
-CC_PROMPTS = Path("/tmp/cc-baseline-realworld/prompts")
-HAIKU_TOML = Path("/tmp/hth/haiku-toml")
+HTH_ROOT = Path(os.environ.get("SQUEEZY_REALWORLD_SCRATCH", "/tmp/hth"))
+CODEX_PROMPTS = Path(os.environ.get(
+    "SQUEEZY_REALWORLD_CODEX_PROMPTS",
+    str(HTH_ROOT / "prompts" / "codex"),
+))
+CC_PROMPTS = Path(os.environ.get(
+    "SQUEEZY_REALWORLD_CC_PROMPTS",
+    str(HTH_ROOT / "prompts" / "cc"),
+))
+HAIKU_TOML = Path(os.environ.get("SQUEEZY_REALWORLD_HAIKU_TOML", str(HTH_ROOT / "haiku-toml")))
 for d in (CODEX_PROMPTS, CC_PROMPTS, HAIKU_TOML):
     d.mkdir(parents=True, exist_ok=True)
 

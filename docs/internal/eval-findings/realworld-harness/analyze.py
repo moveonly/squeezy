@@ -33,7 +33,16 @@ if haiku:
     c_raw, c_cr, c_cw, c_out = raw*H_IN, cr*H_CR, cw*H_CW, out*H_OUT
 else:
     c_raw, c_cr, c_cw, c_out = raw*M_IN, cr*M_CR, 0.0, out*M_OUT
-tot = (c_raw + c_cr + c_cw + c_out) / 1e6
+parent_micro = c_raw + c_cr + c_cw + c_out
+manifest_totals = rj.get("totals", {})
+headline_micro = manifest_totals.get("cost_micro_usd")
+parent_manifest_micro = manifest_totals.get("parent_cost_micro_usd")
+subagent_micro = manifest_totals.get("subagent_cost_micro_usd", 0) or 0
+if headline_micro is None:
+    headline_micro = parent_micro + subagent_micro
+if parent_manifest_micro is None:
+    parent_manifest_micro = parent_micro
+tot = headline_micro / 1e6
 
 # tool calls (name from tool_call_started.call.name)
 tools = Counter()
@@ -48,10 +57,13 @@ reasoning = sum(1 for e in ev if e.get("kind") in ("reasoning_delta", "reasoning
 
 print(f"=== {rd.name} ({model}) ===")
 print(f"cost ${tot:.4f}  turns={turns} tool_calls={ntool} assistant_deltas={deltas} reasoning={reasoning}")
+print(f"  headline=${headline_micro/1e6:.4f} parent=${parent_manifest_micro/1e6:.4f} subagent=${subagent_micro/1e6:.4f}")
 print(f"tokens: input={inp} cache_read={cr} cache_write={cw} output={out} (raw_in={raw})")
 print(f"  $ raw_in={c_raw/1e6:.4f}  cache_read={c_cr/1e6:.4f}  cache_write={c_cw/1e6:.4f}  output={c_out/1e6:.4f}")
-pct = lambda x: f"{100*x/(tot*1e6):.0f}%" if tot else "0%"
-print(f"  %: raw_in={pct(c_raw)} cache_read={pct(c_cr)} cache_write={pct(c_cw)} output={pct(c_out)}")
+headline_pct = lambda x: f"{100*x/headline_micro:.0f}%" if headline_micro else "0%"
+parent_pct = lambda x: f"{100*x/parent_micro:.0f}%" if parent_micro else "0%"
+print(f"  % headline: parent={headline_pct(parent_manifest_micro)} subagent={headline_pct(subagent_micro)}")
+print(f"  % parent: raw_in={parent_pct(c_raw)} cache_read={parent_pct(c_cr)} cache_write={parent_pct(c_cw)} output={parent_pct(c_out)}")
 print(f"tool breakdown: {dict(tools.most_common())}")
 for f in rj.get("findings", []):
     print(f"  FINDING: {f}")
