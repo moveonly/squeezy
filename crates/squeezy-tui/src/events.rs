@@ -329,6 +329,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     app.status = format_mcp_elicitation_status_line(&request);
                     app.mcp_elicitation_selection_index = 0;
+                    crate::seed_mcp_elicitation_form_input(app, &request);
                     app.pending_mcp_elicitation = Some(PendingMcpElicitation {
                         request,
                         response_tx,

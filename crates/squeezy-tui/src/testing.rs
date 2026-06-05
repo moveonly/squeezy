@@ -319,6 +319,7 @@ impl TuiHarness {
         }
         self.app.status = format_mcp_elicitation_status_line(&request);
         self.app.mcp_elicitation_selection_index = 0;
+        crate::seed_mcp_elicitation_form_input(&mut self.app, &request);
         self.app.pending_mcp_elicitation = Some(PendingMcpElicitation {
             request,
             response_tx,

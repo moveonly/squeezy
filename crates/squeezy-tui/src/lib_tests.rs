@@ -10738,6 +10738,95 @@ fn mcp_status_summary_reports_stale_cached_servers() {
 }
 
 #[test]
+fn mcp_form_template_uses_required_schema_fields() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["name", "count", "enabled"],
+        "properties": {
+            "name": { "type": "string" },
+            "count": { "type": "integer", "default": 3 },
+            "enabled": { "type": "boolean" },
+            "optional": { "type": "string" }
+        }
+    });
+
+    let template = super::mcp_elicitation_form_template(Some(&schema));
+    let value: serde_json::Value = serde_json::from_str(&template).expect("template JSON");
+    assert_eq!(value["name"], "");
+    assert_eq!(value["count"], 3);
+    assert_eq!(value["enabled"], false);
+    assert!(value.get("optional").is_none(), "{value}");
+}
+
+#[test]
+fn mcp_form_menu_renders_full_pretty_schema() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["long_field"],
+        "properties": {
+            "long_field": {
+                "type": "string",
+                "description": "this description is intentionally far longer than the old compact schema limit so the test proves the full pretty schema is rendered"
+            }
+        }
+    });
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(schema),
+        url: None,
+        elicitation_id: None,
+    };
+
+    let text = format_mcp_elicitation_menu_lines(&request, 0, "{}")
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("schema"), "{text}");
+    assert!(text.contains("long_field"), "{text}");
+    assert!(
+        text.contains("intentionally far longer than the old compact schema limit"),
+        "{text}"
+    );
+}
+
+#[test]
+fn mcp_form_input_is_seeded_without_overwriting_user_text() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string" } }
+    });
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(schema),
+        url: None,
+        elicitation_id: None,
+    };
+    let mut app = test_app(SessionMode::Build);
+
+    seed_mcp_elicitation_form_input(&mut app, &request);
+    assert!(app.input.contains("\"name\""), "{}", app.input);
+    assert_eq!(app.input_cursor, app.input.len());
+
+    app.input = "{\"custom\": true}".to_string();
+    app.input_cursor = app.input.len();
+    seed_mcp_elicitation_form_input(&mut app, &request);
+    assert_eq!(app.input, "{\"custom\": true}");
+}
+
+#[test]
 fn terminal_title_for_clears_when_idle() {
     assert_eq!(
         terminal_title_for(TerminalTitleState::Cleared, "~/proj", 0),

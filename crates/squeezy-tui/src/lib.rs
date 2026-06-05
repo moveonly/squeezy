@@ -5764,6 +5764,64 @@ fn mcp_elicitation_options() -> &'static [McpElicitationOption] {
     &[MCP_ELICITATION_ACCEPT, MCP_ELICITATION_DECLINE]
 }
 
+pub(crate) fn seed_mcp_elicitation_form_input(app: &mut TuiApp, request: &McpElicitationRequest) {
+    if request.kind != McpElicitationKind::Form || !app.input.trim().is_empty() {
+        return;
+    }
+    app.input = mcp_elicitation_form_template(request.schema.as_ref());
+    app.input_cursor = app.input.len();
+}
+
+fn mcp_elicitation_form_template(schema: Option<&serde_json::Value>) -> String {
+    let mut object = serde_json::Map::new();
+    if let Some(schema) = schema {
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(properties) = properties {
+            let names: Vec<&str> = if required.is_empty() {
+                properties.keys().map(String::as_str).collect()
+            } else {
+                required
+            };
+            for name in names {
+                let value = properties
+                    .get(name)
+                    .map(schema_placeholder_value)
+                    .unwrap_or(serde_json::Value::Null);
+                object.insert(name.to_string(), value);
+            }
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn schema_placeholder_value(schema: &serde_json::Value) -> serde_json::Value {
+    if let Some(default) = schema.get("default") {
+        return default.clone();
+    }
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => serde_json::Value::String(String::new()),
+        Some("integer") => serde_json::json!(0),
+        Some("number") => serde_json::json!(0.0),
+        Some("boolean") => serde_json::json!(false),
+        Some("array") => serde_json::Value::Array(Vec::new()),
+        Some("object") => serde_json::Value::Object(serde_json::Map::new()),
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     let Some(pending) = app.pending_approval.take() else {
         return false;
@@ -6038,15 +6096,21 @@ fn format_mcp_elicitation_menu_lines(
     match request.kind {
         McpElicitationKind::Form => {
             if let Some(schema) = request.schema.as_ref() {
-                let schema = serde_json::to_string(schema)
+                let schema = serde_json::to_string_pretty(schema)
                     .unwrap_or_else(|_| "<schema unavailable>".to_string());
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(
-                        format!("schema {}", compact_text(&schema, 160)),
-                        Style::default().fg(crate::render::theme::quiet()),
-                    ),
+                    Span::styled("schema", Style::default().fg(crate::render::theme::quiet())),
                 ]));
+                for line in schema.lines() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            line.to_string(),
+                            Style::default().fg(crate::render::theme::quiet()),
+                        ),
+                    ]));
+                }
             }
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -6967,22 +7031,14 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
             width,
         )
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
-        match pending.request.kind {
-            McpElicitationKind::Form => {
-                if pending.request.schema.is_some() {
-                    6
-                } else {
-                    5
-                }
-            }
-            McpElicitationKind::Url => {
-                if pending.request.url.is_some() {
-                    5
-                } else {
-                    4
-                }
-            }
-        }
+        visual_line_count(
+            &format_mcp_elicitation_menu_lines(
+                &pending.request,
+                app.mcp_elicitation_selection_index,
+                &app.input,
+            ),
+            width,
+        )
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
         visual_line_count(
             &format_request_user_input_menu_lines(
