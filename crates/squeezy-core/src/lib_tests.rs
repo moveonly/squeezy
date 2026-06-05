@@ -4927,12 +4927,12 @@ fn memory_scope_doc_records_deferred_tool_decision() {
         "scope doc must anchor to the existing config field"
     );
     assert!(
-        body.contains("declines to ship a tool-mediated memory pipeline"),
-        "scope doc must state the deferred decision in absolute terms"
+        body.contains("A separate `memory_append` tool name"),
+        "scope doc must record memory_append as out of scope"
     );
     assert!(
-        body.contains("memory_append"),
-        "scope doc must name the staged tool surface for future adoption"
+        body.contains("notes_remember"),
+        "scope doc must describe the implemented store-backed observation tools"
     );
 }
 
