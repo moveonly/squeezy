@@ -5071,6 +5071,7 @@ fn failed_rustfmt_output_uses_diff_background_not_colored_text() {
         MessageOutcome::Normal,
         Some(140),
         true,
+        "Ctrl+T",
     );
     let rendered = lines_to_plain_text(&lines);
     assert!(
@@ -5514,6 +5515,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
         MessageOutcome::Normal,
         Some(120),
         true,
+        "Ctrl+T",
     );
     let output = lines
         .iter()
@@ -5700,6 +5702,7 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
         MessageOutcome::Normal,
         Some(120),
         true,
+        "Ctrl+T",
     );
     let rendered = lines_to_plain_text(&lines);
     assert!(!rendered.contains("diff --git"), "{rendered}");
@@ -6293,7 +6296,7 @@ fn reasoning_usage_status_is_hidden_when_disabled() {
 fn reasoning_delta_renders_with_dim_italic() {
     let expected_modifiers = Modifier::DIM | Modifier::ITALIC;
 
-    let block = reasoning_block_lines("first thought\nsecond thought", false, false);
+    let block = reasoning_block_lines("first thought\nsecond thought", false, false, "Ctrl+T");
     assert!(
         block.len() >= 2,
         "expanded reasoning emits header and at least one body line: {block:?}"
@@ -6362,6 +6365,7 @@ fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
         false,
         ToolOutputVerbosity::Compact,
         MessageOutcome::Normal,
+        "Ctrl+T",
     ));
     assert!(rendered.contains("▸ reasoning"), "{rendered}");
     assert!(rendered.contains("first thought"), "{rendered}");
@@ -7054,7 +7058,7 @@ fn active_prompt_cursor_is_vertically_centered() {
 fn assistant_marker_uses_answer_color() {
     let item = TranscriptItem::assistant("done");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
@@ -7079,7 +7083,7 @@ fn assistant_marker_uses_answer_color() {
 fn failed_assistant_marker_uses_error_color() {
     let item = TranscriptItem::assistant("partial answer");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Failed);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Failed, "Ctrl+T");
 
     assert_eq!(lines[0].spans[1].content.as_ref(), "☽");
     assert_eq!(
@@ -7111,7 +7115,7 @@ fn ansi_system_entry_parses_escapes_into_styled_spans() {
     let content = format!("{bold_accent_header}\n  input={value_in_accent}");
     let item = TranscriptItem::system(content);
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     assert!(lines.len() >= 2, "{lines:?}");
 
     // First line: the role chrome (`• Noted`) prefix plus the parsed
@@ -7145,7 +7149,7 @@ fn ansi_system_entry_parses_escapes_into_styled_spans() {
 #[test]
 fn accounting_block_dispatch_skips_unrelated_system_messages() {
     let item = TranscriptItem::system("Random system note\nwith multiple\nlines");
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     // The unrelated content keeps the default single-style rendering: the
     // header gets the standard `• Noted` chrome, the body lines fall
     // through to `action_text_lines_styled` with no per-token coloring.
@@ -7391,6 +7395,7 @@ fn submitted_prompt_renders_bubble_around_text() {
         MessageOutcome::Normal,
         Some(40),
         true,
+        "Ctrl+T",
     );
 
     let content = lines[0]
@@ -7431,6 +7436,7 @@ fn submitted_prompt_preserves_empty_lines() {
         MessageOutcome::Normal,
         Some(30),
         true,
+        "Ctrl+T",
     );
     let rendered = lines
         .iter()
@@ -7634,6 +7640,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         false,
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 0),
+        "Ctrl+T",
     );
     // Open bubble: lines[0] = bullet + content text.
     assert_eq!(
@@ -7656,6 +7663,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         false,
         app.tool_output_verbosity,
         message_outcome(&app.transcript, 1),
+        "Ctrl+T",
     );
     assert_eq!(
         log_lines[0].spans[1].style.fg,
@@ -7671,7 +7679,7 @@ fn failed_user_turn_marks_status_not_prompt_text() {
 fn user_prompt_text_is_highlighted_in_transcript() {
     let item = TranscriptItem::user("find getFoo");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     let _text = lines[0]
         .spans
         .iter()
@@ -7699,7 +7707,7 @@ fn user_prompt_text_is_highlighted_in_transcript() {
 fn submitted_bang_prompt_marks_first_nonempty_bang_dark_red() {
     let item = TranscriptItem::user("  !ls");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     // Content row is lines[0].
     let bang = lines[0]
         .spans
@@ -7744,7 +7752,7 @@ fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
     // the regular single-bang at a glance.
     let item = TranscriptItem::user("  !!git status");
 
-    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal, "Ctrl+T");
     let bang = lines[0]
         .spans
         .iter()
@@ -10342,6 +10350,38 @@ async fn keymap_override_redirects_transcript_overlay() {
     assert!(
         app.transcript_overlay.is_none(),
         "Ctrl+O must close the overlay on second press",
+    );
+}
+
+/// After rebinding `transcript_overlay`, collapsed tool-card truncation hints
+/// in the inline transcript and the overlay title must advertise the rebound
+/// key, not the hardcoded default "Ctrl+T".
+#[test]
+fn keymap_rebind_updates_collapsed_card_hint() {
+    let mut config = test_config(SessionMode::Build);
+    config
+        .tui
+        .keymap
+        .insert("transcript_overlay".to_string(), "Ctrl+o".to_string());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // Push a long grep result so the collapsed card needs a truncation hint.
+    let payload = (0..30)
+        .map(|i| format!("match-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
+    app.finalize_settles_for_test();
+    assert!(app.transcript[0].collapsed);
+
+    let rendered = render_to_string(&app, 100, 24);
+    assert!(
+        rendered.contains("Ctrl+O for full transcript"),
+        "collapsed card hint must use the rebound key; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Ctrl+T for full transcript"),
+        "stale default must not appear after rebind; got:\n{rendered}"
     );
 }
 
