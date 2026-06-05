@@ -33,7 +33,7 @@ use crate::languages::{
     },
     java::{
         java_build_metadata_provider, java_configured_source_facts, java_dependency_facts,
-        java_paths_signature, java_source_root_facts,
+        java_paths_signature, java_source_root_facts, symbol_is_top_level_for_imports,
     },
     js_ts::{JsTsResolver, is_js_ts_language},
     kotlin::{
@@ -1697,41 +1697,117 @@ impl SemanticGraph {
         }
     }
 
-    /// Populate the reverse-import index by walking every parsed import and
-    /// attaching the importing file to each candidate target file the
-    /// existing legacy machinery resolves the import to. Subsequent items
-    /// will replace the candidate scan with a phased lookup once that
-    /// pipeline is online.
+    /// Populate the reverse-import index (target file → files that import it)
+    /// used by incremental affected-set propagation.
+    ///
+    /// Bug #9: the index must point at the file the import *actually resolves
+    /// to*, not at every file that merely declares a same-leaf symbol. An
+    /// `import a/b/Thing` must not attach an unrelated `c/d/Thing`. Two kinds of
+    /// imports need different treatment:
+    ///
+    /// * Symbol-naming imports (Java/Python/Go dotted paths, JS named imports,
+    ///   …) name a symbol leaf. We resolve those through the symbol index,
+    ///   narrowing each candidate with [`Self::import_matches_symbol`] — the
+    ///   same per-language visibility check the call resolver uses (module /
+    ///   package suffix).
+    /// * Path-naming imports (Dart `package:foo/a/b/thing.dart`, C `#include
+    ///   "a/b/thing.h"`, JS-relative `./a/b/thing`) name a *file*, so their leaf
+    ///   is a filename rather than a symbol; resolving them through the symbol
+    ///   index would miss them entirely. We resolve those directly to the file
+    ///   whose workspace path matches the import's directory+stem suffix.
+    ///
+    /// Glob imports (`import a.b.*`, `from pkg import *`) name no leaf symbol;
+    /// they are handled in a single bounded pass that tests each glob against
+    /// the top-level symbols.
+    ///
+    /// Remaining gap: this still relies on `import_matches_symbol` / path-suffix
+    /// matching rather than a fully wired module-resolution pipeline, so
+    /// re-export chains and config path-mappings beyond what those model are not
+    /// yet followed.
     fn rebuild_importers_by_file(&mut self) {
         self.importers_by_file.clear();
         // Compute first into a local map so we can borrow `self` immutably
         // while walking imports without mutating `importers_by_file` in
         // the same loop.
         let mut updates: HashMap<FileId, Vec<FileId>> = HashMap::new();
+        let mut attach = |target: &FileId, importer: &FileId| {
+            if target == importer {
+                return;
+            }
+            updates
+                .entry(target.clone())
+                .or_default()
+                .push(importer.clone());
+        };
+
+        let mut glob_imports: Vec<&ParsedImport> = Vec::new();
         for import in &self.imports {
             if crate::is_package_marker_alias(import.alias.as_deref()) {
                 continue;
             }
+            if import.is_glob {
+                glob_imports.push(import);
+                continue;
+            }
+
+            let mut attached_any = false;
             // Bug #13: the reverse-import index must point at the symbol the
             // import actually targets — the import path's leaf — not the local
             // alias. `import { Thing as T }` targets the symbol named `Thing`;
             // keying on `T` would attach the importer to no file (or the wrong
             // one), so affected-file propagation would miss edits to `Thing`.
             let target_name = last_path_segment_str(&import.path);
-            let importer_file = import.file_id.clone();
             for symbol_id in self.symbols_by_name.get(target_name).into_iter().flatten() {
                 let Some(symbol) = self.symbols.get(symbol_id) else {
                     continue;
                 };
-                if symbol.file_id == importer_file {
+                if symbol.file_id == import.file_id {
                     continue;
                 }
-                updates
-                    .entry(symbol.file_id.clone())
-                    .or_default()
-                    .push(importer_file.clone());
+                if !self.import_matches_symbol(import, symbol) {
+                    continue;
+                }
+                if !import_path_dir_matches_file(&import.path, &symbol.file_id, &self.files) {
+                    continue;
+                }
+                attach(&symbol.file_id, &import.file_id);
+                attached_any = true;
+            }
+
+            // Path-naming imports: the leaf is a filename, not a symbol, so the
+            // symbol scan above found nothing. Resolve the import path's
+            // directory+stem suffix directly against file paths.
+            if !attached_any && let Some(suffix) = import_path_filesystem_suffix(&import.path) {
+                for (target_id, file) in &self.files {
+                    if *target_id == import.file_id {
+                        continue;
+                    }
+                    if file_path_matches_import_suffix(&file.relative_path, &suffix) {
+                        attach(target_id, &import.file_id);
+                    }
+                }
             }
         }
+
+        // Glob imports: one bounded pass over every symbol, testing each
+        // top-level symbol against every glob import. Globs are typically few,
+        // so this stays O(symbols × globs) without a per-glob full rescan.
+        if !glob_imports.is_empty() {
+            for symbol in self.symbols.values() {
+                if !symbol_is_top_level_for_imports(symbol) {
+                    continue;
+                }
+                for import in &glob_imports {
+                    if symbol.file_id == import.file_id {
+                        continue;
+                    }
+                    if self.import_matches_symbol(import, symbol) {
+                        attach(&symbol.file_id, &import.file_id);
+                    }
+                }
+            }
+        }
+
         for (target, mut importers) in updates {
             importers.sort_by(|left, right| left.0.cmp(&right.0));
             importers.dedup();
@@ -3048,6 +3124,90 @@ fn symbol_is_exported(symbol: &GraphSymbol) -> bool {
 
 fn last_path_segment(path: &str) -> String {
     last_path_segment_str(path).to_string()
+}
+
+/// Reverse-import narrowing guard (Bug #9) for path-like imports.
+///
+/// Languages with a dedicated `import_matches_symbol` matcher (Java/Kotlin/
+/// Scala/JS-TS/Swift/Python/Go) already validate module/package visibility, so
+/// this guard leaves them untouched. The remaining languages fall through
+/// `import_matches_symbol`'s default leaf-only check, so an `import a/b/Thing`
+/// would still attach an unrelated `c/d/Thing` that merely shares the leaf.
+/// When such an import path carries a directory portion (`#include
+/// "a/b/thing.h"`, Dart `package:foo/service.dart`, `./base`), require the
+/// candidate symbol's file path (extension-stripped) to actually end with the
+/// import's directory+stem suffix. Imports with no directory separator
+/// (dotted/bare module ids) pass through.
+fn import_path_dir_matches_file(
+    import_path: &str,
+    symbol_file_id: &FileId,
+    files: &HashMap<FileId, FileRecord>,
+) -> bool {
+    let Some(file) = files.get(symbol_file_id) else {
+        return true;
+    };
+    if !language_uses_default_import_match(file.language) {
+        return true;
+    }
+    let Some(suffix) = import_path_filesystem_suffix(import_path) else {
+        return true;
+    };
+    file_path_matches_import_suffix(&file.relative_path, &suffix)
+}
+
+/// True when a workspace-relative file path is the resolution target of a
+/// path-like import whose directory+stem suffix is `suffix` (both already
+/// extension-stripped). Accepts an exact suffix match or a `dir/index` /
+/// `dir/mod` directory-style resolution.
+fn file_path_matches_import_suffix(relative_path: &str, suffix: &str) -> bool {
+    let file_stem = strip_source_extension(relative_path);
+    let file_stem = file_stem.trim_start_matches("./");
+    file_stem == suffix
+        || file_stem.ends_with(&format!("/{suffix}"))
+        // Some ecosystems point an import at a directory's index/mod file.
+        || file_stem.ends_with(&format!("/{suffix}/index"))
+        || file_stem.ends_with(&format!("/{suffix}/mod"))
+}
+
+/// True for languages that fall through to `import_matches_symbol`'s default
+/// leaf-name-only branch (no dedicated per-language matcher). These are the
+/// only ones the path-suffix guard above tightens.
+fn language_uses_default_import_match(language: squeezy_core::LanguageKind) -> bool {
+    use squeezy_core::LanguageKind as L;
+    !matches!(
+        language,
+        L::Java | L::Kotlin | L::Scala | L::Swift | L::Python | L::Go
+    ) && !is_js_ts_language(language)
+}
+
+/// If `import_path` is a filesystem-style path with a directory component,
+/// return its normalized `dir/stem` suffix (leading `./`, `../`, `package:pkg/`
+/// and trailing extension stripped). Returns `None` for dotted/bare imports.
+fn import_path_filesystem_suffix(import_path: &str) -> Option<String> {
+    let mut path = import_path.trim();
+    // Drop a `package:<pkg>/` URI prefix, keeping the in-package path.
+    if let Some(rest) = path.strip_prefix("package:") {
+        path = rest.split_once('/').map(|(_, rest)| rest).unwrap_or(rest);
+    }
+    let path = path.trim_start_matches("./");
+    if !path.contains('/') {
+        return None;
+    }
+    let normalized = strip_source_extension(path);
+    let normalized = normalized.trim_start_matches('/');
+    // Re-check after extension stripping that a directory component survives;
+    // a bare `foo.h` would not, but `a/b/foo.h` does.
+    if !normalized.contains('/') {
+        return None;
+    }
+    Some(normalized.to_string())
+}
+
+fn strip_source_extension(path: &str) -> &str {
+    match path.rsplit_once('.') {
+        Some((stem, ext)) if !ext.contains('/') && !stem.is_empty() => stem,
+        _ => path,
+    }
 }
 
 fn last_path_segment_str(path: &str) -> &str {

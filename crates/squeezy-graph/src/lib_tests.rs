@@ -8591,3 +8591,207 @@ class Child extends Base {
         "super.foo() should skip the override and bind to Base.foo",
     );
 }
+
+/// Bug #3: Python inheritance resolution must scope the base-class lookup by the
+/// subclass file's imports. Two modules each define `Base.foo`; the subclass
+/// imports `Base` from module B (the sort-LATER module), so a global name-first
+/// resolver would wrongly bind `self.foo()` to module A's `Base.foo`. The
+/// scope-aware resolver must bind to B's `Base.foo` — the one actually imported.
+#[test]
+fn graph_python_inherited_call_scopes_base_to_imported_module() {
+    let mut parser = LanguageParser::new().unwrap();
+    let base_a = python_record(
+        "pkg_a/base.py",
+        "class Base:\n    def foo(self):\n        return 1\n",
+    );
+    let base_b = python_record(
+        "pkg_b/base.py",
+        "class Base:\n    def foo(self):\n        return 2\n",
+    );
+    // The subclass lives in pkg_a but imports Base from pkg_b — so a resolver
+    // that prefers the first global match (id-sorted: pkg_a) misresolves.
+    let child = python_record(
+        "pkg_a/child.py",
+        r#"from pkg_b.base import Base
+
+
+class Child(Base):
+    def bar(self):
+        return self.foo()
+"#,
+    );
+    let parsed = [base_a, base_b, child]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let foo_in = |graph: &SemanticGraph, path: &str| {
+        graph
+            .find_symbol_by_name("foo")
+            .into_iter()
+            .find(|symbol| {
+                symbol.kind == SymbolKind::Method
+                    && graph
+                        .files
+                        .get(&symbol.file_id)
+                        .map(|file| file.relative_path == path)
+                        .unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("{path} Base.foo should be indexed"))
+    };
+    let foo_a = foo_in(&graph, "pkg_a/base.py");
+    let foo_b = foo_in(&graph, "pkg_b/base.py");
+    let bar = graph
+        .find_symbol_by_name("bar")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Child.bar should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == bar.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Child.bar");
+    assert_eq!(
+        call_edge.to.as_ref(),
+        Some(&foo_b.id),
+        "self.foo() must resolve to the imported pkg_b Base.foo, not pkg_a's; got {:?}",
+        call_edge.to,
+    );
+    assert_ne!(
+        call_edge.to.as_ref(),
+        Some(&foo_a.id),
+        "self.foo() must not bind to the unrelated pkg_a Base.foo",
+    );
+}
+
+/// Bug #4: Dart typed-local dispatch must scope the class lookup by the calling
+/// file's imports. Two libraries each declare `class Service { run() }`; the
+/// caller imports library B (the sort-LATER library), so a resolver that blindly
+/// takes the first global match (id-sorted: lib/a) misresolves. The scope-aware
+/// resolver must bind `s.run()` to library B's `Service.run`.
+#[test]
+fn graph_dart_typed_local_scopes_class_to_imported_library() {
+    let mut parser = LanguageParser::new().unwrap();
+    let service_a = dart_record(
+        "lib/a/service.dart",
+        "class Service {\n  void run() {}\n}\n",
+    );
+    let service_b = dart_record(
+        "lib/b/service.dart",
+        "class Service {\n  void run() {}\n}\n",
+    );
+    let caller = dart_record(
+        "lib/caller.dart",
+        r#"import 'package:fixture/b/service.dart';
+
+class Caller {
+  void go() {
+    Service s = Service();
+    s.run();
+  }
+}
+"#,
+    );
+    let parsed = [service_a, service_b, caller]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run_in = |graph: &SemanticGraph, path: &str| {
+        graph
+            .find_symbol_by_name("run")
+            .into_iter()
+            .find(|symbol| {
+                symbol.kind == SymbolKind::Method
+                    && graph
+                        .files
+                        .get(&symbol.file_id)
+                        .map(|file| file.relative_path == path)
+                        .unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("{path} Service.run should be indexed"))
+    };
+    let run_a = run_in(&graph, "lib/a/service.dart");
+    let run_b = run_in(&graph, "lib/b/service.dart");
+    let go = graph
+        .find_symbol_by_name("go")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Caller.go should be indexed");
+
+    // `s.run()` must resolve to the imported library B's Service.run.
+    assert!(
+        graph.edges().iter().any(|edge| edge.from == go.id
+            && edge.kind == EdgeKind::Calls
+            && edge.to.as_ref() == Some(&run_b.id)),
+        "s.run() must resolve to the imported lib/b Service.run",
+    );
+    // And must never bind to library A's unrelated same-named Service.run.
+    assert!(
+        !graph.edges().iter().any(|edge| edge.from == go.id
+            && edge.kind == EdgeKind::Calls
+            && edge.to.as_ref() == Some(&run_a.id)),
+        "s.run() must NOT bind to the unrelated lib/a Service.run",
+    );
+}
+
+/// Bug #9: the reverse-import index must point at the file the import actually
+/// resolves to, not at every same-leaf file. An `import 'a/b/thing.dart'` must
+/// attach the importer to `a/b/thing.dart` only, never to an unrelated
+/// `c/d/thing.dart` that merely shares the leaf filename.
+#[test]
+fn graph_reverse_import_index_excludes_unrelated_same_leaf_file() {
+    let mut parser = LanguageParser::new().unwrap();
+    let wanted = dart_record("lib/a/b/thing.dart", "class Thing {\n  void run() {}\n}\n");
+    let unrelated = dart_record("lib/c/d/thing.dart", "class Thing {\n  void run() {}\n}\n");
+    let importer = dart_record(
+        "lib/app.dart",
+        r#"import 'package:fixture/a/b/thing.dart';
+
+void main() {
+  Thing().run();
+}
+"#,
+    );
+    let parsed = [wanted, unrelated, importer]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let app = FileId::new("lib/app.dart");
+    let wanted_file = FileId::new("lib/a/b/thing.dart");
+    let unrelated_file = FileId::new("lib/c/d/thing.dart");
+
+    assert!(
+        graph
+            .importers_by_file
+            .get(&wanted_file)
+            .map(|importers| importers.contains(&app))
+            .unwrap_or(false),
+        "app.dart must be recorded as an importer of the resolved a/b/thing.dart",
+    );
+    assert!(
+        !graph
+            .importers_by_file
+            .get(&unrelated_file)
+            .map(|importers| importers.contains(&app))
+            .unwrap_or(false),
+        "app.dart must NOT attach to the unrelated c/d/thing.dart that only shares the leaf",
+    );
+}
