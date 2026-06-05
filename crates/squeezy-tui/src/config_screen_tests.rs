@@ -1002,6 +1002,40 @@ fn render_screen_to_text(state: &ConfigScreenState, width: u16, height: u16) -> 
 }
 
 #[test]
+fn model_absent_sampling_rows_render_dash() {
+    let cfg = AppConfig {
+        temperature: None,
+        top_p: None,
+        seed: None,
+        stop: Vec::new(),
+        frequency_penalty: None,
+        presence_penalty: None,
+        ..AppConfig::default()
+    };
+    let mut state = temp_config_state(Some(SectionId::Models));
+    state.effective = cfg;
+    let rendered = render_screen_to_text(&state, 120, 40);
+
+    for label in [
+        "temperature",
+        "top_p",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    ] {
+        let row = rendered
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("missing {label} row:\n{rendered}"));
+        assert!(
+            row.contains('—') && !row.contains("(unset)"),
+            "{label} should render the absent value as a dash, got:\n{row}"
+        );
+    }
+}
+
+#[test]
 fn default_scope_is_user() {
     let state = ConfigScreenState::new(AppConfig::default(), None);
     assert_eq!(

@@ -32,6 +32,16 @@ fn section_lookup_is_consistent() {
 }
 
 #[test]
+fn absent_field_values_render_as_dash() {
+    assert_eq!(FieldValue::OptionalInteger(None).as_display(), "—");
+    assert_eq!(FieldValue::OptionalFloat(None).as_display(), "—");
+    assert_eq!(FieldValue::OptionalEnum(None).as_display(), "—");
+    assert_eq!(FieldValue::String(String::new()).as_display(), "—");
+    assert_eq!(FieldValue::StringList(Vec::new()).as_display(), "—");
+    assert_eq!(FieldValue::Unset.as_display(), "—");
+}
+
+#[test]
 fn provider_setter_swaps_default_model() {
     let mut cfg = AppConfig::from_env();
     let original = cfg.model.clone();
