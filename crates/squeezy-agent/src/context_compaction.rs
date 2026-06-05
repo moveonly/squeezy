@@ -179,6 +179,9 @@ pub(crate) async fn maybe_compact_mid_turn(
         config,
         ContextCompactionTrigger::Auto,
         true,
+        // Forced mid-turn path shrinks via the `force` branch; overhead is
+        // already reflected in the provider-reported `last_total_tokens` gate.
+        0,
     )
     .await
 }
@@ -232,10 +235,12 @@ pub(crate) async fn maybe_compact_conversation(
         config,
         trigger,
         false,
+        overhead_tokens,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compact_conversation(
     conversation: &mut Vec<LlmInputItem>,
     state: &mut ContextCompactionState,
@@ -244,19 +249,27 @@ pub(crate) fn compact_conversation(
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
     force: bool,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     let before = estimate_context(conversation);
     let mut keep = config.context_compaction.recent_items.max(1);
-    if !force
-        && before.estimated_tokens >= config.context_compaction.min_items_bypass_threshold()
-    {
-        // Few-but-enormous: with the default `recent_items` (10) a conversation
-        // of a handful of huge items keeps everything verbatim and folds
-        // nothing, so the post-turn `min_items` bypass (finding #3) would be a
-        // no-op. Once over the high-water mark, cap `keep` so at least half the
-        // items form a foldable older slice. The `after.bytes >= before.bytes`
-        // guard below still declines if the fold cannot actually shrink.
-        keep = keep.min(before.items / 2).max(1);
+    // Few-but-enormous (finding #3): with the default `recent_items` (10) a
+    // handful of huge items keeps everything verbatim and folds nothing, so the
+    // post-turn `min_items` bypass would be a no-op and — worse — a forced
+    // overflow/mid-turn retry could fail to shrink at all. When compaction is
+    // genuinely warranted (forced, or the conversation crossed the high-water
+    // mark) but `recent_items` would swallow the whole conversation, cap `keep`
+    // so a foldable older slice exists. Gated on `items <= keep` so larger
+    // conversations are untouched. The high-water check folds in the same
+    // request overhead the gate uses, so the two stay consistent. The
+    // `after.bytes >= before.bytes` guard below still declines a fold that
+    // cannot actually shrink.
+    let over_high_water = before
+        .estimated_tokens
+        .saturating_add(overhead_tokens)
+        >= config.context_compaction.min_items_bypass_threshold();
+    if (force || over_high_water) && before.items > 1 && before.items <= keep {
+        keep = (before.items / 2).max(1);
     }
     if !force && before.items <= keep {
         return None;
@@ -657,13 +670,15 @@ pub(crate) fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate
         .fold(0usize, usize::saturating_add);
     ContextEstimate {
         bytes,
-        estimated_tokens: estimated_tokens(bytes),
+        estimated_tokens: estimated_tokens(bytes as u64),
         items: conversation.len(),
     }
 }
 
-fn estimated_tokens(bytes: usize) -> u64 {
-    bytes.saturating_add(3).saturating_div(4) as u64
+/// Byte → token heuristic (`bytes / 4`, rounding up). Shared so the post-turn
+/// gate's request-overhead conversion matches `estimate_context` exactly.
+pub(crate) fn estimated_tokens(bytes: u64) -> u64 {
+    bytes.saturating_add(3).saturating_div(4)
 }
 
 fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
@@ -735,6 +750,7 @@ pub(crate) async fn compact_conversation_with_strategy(
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
     force: bool,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     // Capture the prior compaction's summary BEFORE `compact_conversation`
     // overwrites `state.summary` with the new extractive blob. The
@@ -754,6 +770,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         config,
         trigger,
         force,
+        overhead_tokens,
     )?;
     let strategy = config.context_compaction.strategy;
     if strategy == squeezy_core::CompactionStrategy::Extractive {

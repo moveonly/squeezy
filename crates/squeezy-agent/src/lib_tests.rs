@@ -6603,6 +6603,7 @@ async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_ti
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("compaction should fire even when model assist times out");
@@ -6728,6 +6729,7 @@ fn compaction_persists_checkpoint_and_stamps_replacement_id() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .expect("compaction");
     assert!(conversation.len() < original_len);
@@ -6764,6 +6766,7 @@ fn compaction_without_store_leaves_replacement_id_none() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .expect("compaction");
     assert!(report.record.replacement_id.is_none());
@@ -6822,6 +6825,7 @@ fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .expect("compaction should run");
 
@@ -7081,6 +7085,7 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("compaction should still produce extractive output");
@@ -7144,6 +7149,7 @@ async fn compact_with_strategy_accepts_structured_template_output() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("structured compaction should accept the model output");
@@ -7231,6 +7237,7 @@ async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("compaction should still produce extractive output");
@@ -7457,6 +7464,7 @@ async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compac
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("first compaction");
@@ -7474,6 +7482,7 @@ async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compac
         &config,
         ContextCompactionTrigger::Manual,
         true,
+        0,
     )
     .await
     .expect("second compaction");
@@ -8654,6 +8663,7 @@ async fn round_input_gate_compacts_then_proceeds_when_over_limit() {
         &probe_config,
         ContextCompactionTrigger::Auto,
         true,
+        0,
     )
     .expect("forced compaction must produce a report on the seed conversation");
     let compacted_floor = super::estimate_context(&probe_conversation).estimated_tokens;

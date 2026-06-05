@@ -93,7 +93,8 @@ use cancel::{CancelErr, OrCancelExt};
 use context_compaction::build_compaction_summary;
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation, compact_conversation_with_strategy,
-    drop_orphan_function_call_outputs, estimate_context, maybe_compact_conversation,
+    drop_orphan_function_call_outputs, estimate_context, estimated_tokens,
+    maybe_compact_conversation,
     maybe_compact_mid_turn, next_context_pin_id, pack_tool_results, repair_orphan_function_calls,
 };
 use cost_broker::{
@@ -3196,6 +3197,7 @@ impl Agent {
             &self.config,
             ContextCompactionTrigger::Manual,
             true,
+            0,
         )
         .await
         else {
@@ -5740,6 +5742,7 @@ impl TurnRuntime {
             &self.config,
             ContextCompactionTrigger::Auto,
             true,
+            0,
         )
         .await
         else {
@@ -6525,6 +6528,7 @@ impl TurnRuntime {
                     &self.config,
                     ContextCompactionTrigger::Auto,
                     true,
+                    0,
                 )
                 .await;
                 if let Some(report) = gate_report {
@@ -6709,10 +6713,11 @@ impl TurnRuntime {
             let request_input_bytes = llm_request_input_bytes(&request);
             // Carry the fixed request overhead (system instructions + tool
             // schemas) into the next turn's post-turn compaction gate so it
-            // does not under-count the real input size (finding #2). The
-            // bytes→tokens conversion mirrors `estimate_context`.
+            // does not under-count the real input size (finding #2). Uses the
+            // shared `estimated_tokens` helper so the conversion matches
+            // `estimate_context` exactly.
             self.last_request_overhead_tokens.store(
-                llm_request_overhead_bytes(&request).saturating_add(3) / 4,
+                estimated_tokens(llm_request_overhead_bytes(&request)),
                 Ordering::Relaxed,
             );
             self.record_replay_request(&request);
@@ -10167,6 +10172,7 @@ async fn run_subagent_rounds(
                             config,
                             ContextCompactionTrigger::Auto,
                             true,
+                            0,
                         )
                         .is_some()
                     {
@@ -10220,6 +10226,7 @@ async fn run_subagent_rounds(
                                 config,
                                 ContextCompactionTrigger::Auto,
                                 true,
+                                0,
                             )
                             .is_some()
                         {

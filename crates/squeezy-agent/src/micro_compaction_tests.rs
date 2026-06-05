@@ -138,6 +138,7 @@ fn micro_compact_then_full_compact_works() {
         &config,
         squeezy_core::ContextCompactionTrigger::Auto,
         true,
+        0,
     )
     .expect("full compaction should fire");
     assert!(matches!(

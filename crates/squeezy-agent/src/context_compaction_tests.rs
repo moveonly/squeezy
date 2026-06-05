@@ -1172,6 +1172,7 @@ fn few_but_huge_folds_over_high_water_with_capped_recent_items() {
         &config,
         ContextCompactionTrigger::Auto,
         false,
+        0,
     )
     .expect("few-but-huge over high-water should fold");
     assert!(report.record.after.bytes < report.record.before.bytes);
@@ -1195,9 +1196,38 @@ fn few_but_huge_does_not_fold_below_high_water() {
         &config,
         ContextCompactionTrigger::Auto,
         false,
+        0,
     );
     assert!(
         report.is_none(),
         "below high-water a few-item conversation must not fold post-turn"
     );
+}
+
+#[test]
+fn forced_few_but_huge_folds_even_below_high_water() {
+    // Forced paths (overflow retry / mid-turn / manual) must shrink a
+    // few-but-huge conversation even when the local estimate is below the
+    // high-water mark — the provider rejected it, so the local estimate is an
+    // under-count. Without the force branch on the keep cap, compact_conversation
+    // returned None (initial_split == 0 with the default recent_items), leaving
+    // the conversation unchanged and re-overflowing on retry.
+    let mut conversation = few_but_huge_conversation();
+    let config = config_with_window(Some(1_000_000)); // high-water far above payload
+    let before = estimate_context(&conversation);
+    assert!(before.items <= 10, "scenario must sit under recent_items");
+    let mut state = ContextCompactionState::default();
+    let report = compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        ContextCompactionTrigger::Auto,
+        true, // forced (overflow retry)
+        0,
+    )
+    .expect("forced compaction must fold a few-but-huge conversation");
+    assert!(report.record.after.bytes < report.record.before.bytes);
+    assert!(conversation.len() < before.items);
 }
