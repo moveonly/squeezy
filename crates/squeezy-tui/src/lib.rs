@@ -6757,7 +6757,7 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
         rows
     } else if let Some(duration) = app.last_turn_duration {
-        vec![worked_divider_line(duration, area.width)]
+        vec![last_turn_divider_line(app, duration, area.width)]
     } else if let Some(snapshot) = app.task_state.as_ref() {
         vec![compact_task_state_line(snapshot)]
     } else {
@@ -6962,6 +6962,31 @@ fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
         text,
         Style::default().fg(crate::render::theme::quiet()),
     ))
+}
+
+fn last_turn_divider_line(app: &TuiApp, duration: Duration, width: u16) -> Line<'static> {
+    if app.turn_visual != TurnVisualState::Failed {
+        return worked_divider_line(duration, width);
+    }
+    let label = format!("☽ Failed after {}", format_turn_duration(duration));
+    let label_width = label.chars().count();
+    let fill_width = (width as usize).saturating_sub(label_width + 1);
+    Line::from(vec![
+        Span::styled(
+            "☽",
+            Style::default()
+                .fg(crate::render::theme::red())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " Failed after {} {}",
+                format_turn_duration(duration),
+                "─".repeat(fill_width)
+            ),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ])
 }
 
 fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
@@ -7762,7 +7787,11 @@ fn transcript_lines_for_overlay(
         }
         lines.extend(pending);
     }
-    lines
+    if let Some(width) = width {
+        wrap_transcript_overlay_rows(&lines, width)
+    } else {
+        lines
+    }
 }
 
 fn format_transcript_entry_expanded(
@@ -8246,7 +8275,11 @@ fn transcript_lines_for_render(
         ));
         lines.push(Line::from(""));
     }
-    lines
+    if let Some(width) = width {
+        wrap_transcript_overlay_rows(&lines, width)
+    } else {
+        lines
+    }
 }
 
 /// Render a finished work node mid settle-fold: its expanded block,

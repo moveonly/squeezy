@@ -7270,6 +7270,25 @@ fn completed_turn_shows_worked_duration_divider() {
 }
 
 #[test]
+fn failed_turn_shows_red_moon_duration_row() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Failed;
+    app.last_turn_duration = Some(Duration::from_secs(7));
+
+    let line = last_turn_divider_line(&app, Duration::from_secs(7), 80);
+
+    assert_eq!(line.spans[0].content.as_ref(), "☽");
+    assert_eq!(line.spans[0].style.fg, Some(crate::render::theme::red()));
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("Failed after 7s"), "{text}");
+    assert!(!text.contains("Worked for"), "{text}");
+}
+
+#[test]
 fn working_shimmer_sweeps_left_to_right() {
     let left = shimmer_word_spans("Working", 1_200);
     let right = shimmer_word_spans("Working", 2_200);
@@ -7471,6 +7490,27 @@ fn failure_log_renders_as_detail_under_user_turn() {
         "{output}"
     );
     assert!(!output.contains("chars  turn failed"), "{output}");
+}
+
+#[test]
+fn long_error_log_wraps_on_the_rail() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("yo"));
+    app.push_error(
+        "turn failed: provider request failed: Unsupported parameter temperature for this model"
+            .to_string(),
+    );
+
+    let output = render_to_string(&app, 48, 16);
+    let wrapped = output
+        .lines()
+        .find(|line| line.contains("temperature"))
+        .unwrap_or_else(|| panic!("missing wrapped error continuation:\n{output}"));
+
+    assert!(
+        wrapped.trim_start().starts_with('│'),
+        "wrapped error continuation must stay on the rail:\n{output}"
+    );
 }
 
 #[test]
