@@ -21,6 +21,6 @@
   <text x="96" y="210" fill="#969cb8" font-family="Menlo, monospace" font-size="30" letter-spacing="2">coding agent</text>
   <text x="96" y="304" fill="#e2e6f2" font-family="Inter, Arial, sans-serif" font-size="60" font-weight="800">The CPU does the repetitive work.</text>
   <text x="96" y="384" fill="#f2c75c" font-family="Inter, Arial, sans-serif" font-size="60" font-weight="800">Your tokens do the thinking.</text>
-  <text x="96" y="456" fill="#cdd3e6" font-family="Inter, Arial, sans-serif" font-size="34">15 languages. 18 providers. Bring your own model.</text>
+  <text x="96" y="456" fill="#cdd3e6" font-family="Inter, Arial, sans-serif" font-size="34">15 languages. 27 providers. Bring your own model.</text>
   <text x="96" y="540" fill="#969cb8" font-family="Menlo, monospace" font-size="28">☽ squeezyagent.com</text>
 </svg>
