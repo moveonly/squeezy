@@ -60,6 +60,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SQUEEZY_TELEMETRY: off
   SQUEEZY_TYPESCRIPT_VERSION: ${{ inputs.typescript-version || '6.0.3' }}
   SQUEEZY_TYPESCRIPT_PATH: ${{ github.workspace }}/target/js-ts-oracle/node_modules/typescript
 

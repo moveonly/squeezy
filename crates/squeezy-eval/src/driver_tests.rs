@@ -1,6 +1,16 @@
 use super::*;
 use crate::scenario::SqueezyOverlay;
 
+#[test]
+fn eval_driver_disables_product_telemetry() {
+    let mut config = AppConfig::default();
+    assert!(config.telemetry.enabled);
+
+    disable_product_telemetry(&mut config);
+
+    assert!(!config.telemetry.enabled);
+}
+
 /// `permission_mode = "allow"` in a scenario overlay propagates to every
 /// capability gate — including `read` and `ignored_search`. Read-capability
 /// tools like `read_tool_output` (called by the model to recover a spilled

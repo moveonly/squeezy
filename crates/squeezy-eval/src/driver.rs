@@ -148,6 +148,7 @@ pub async fn run_scenario(
         None => AppConfig::from_env_and_settings()
             .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?,
     };
+    disable_product_telemetry(&mut config);
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
     apply_mcp_overlay(&mut config, &scenario.mcp)?;
     let provider = if scenario.squeezy.provider.as_deref() == Some("mock") {
@@ -523,6 +524,10 @@ fn read_line_count(path: &Path) -> Result<u64, EvalError> {
         }
     }
     Ok(count)
+}
+
+fn disable_product_telemetry(config: &mut AppConfig) {
+    config.telemetry.enabled = false;
 }
 
 fn apply_overlay(
