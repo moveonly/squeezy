@@ -31,7 +31,7 @@ export const productPosition = {
 export const heroMetrics = [
   { label: "Languages", value: "15", detail: "with local code understanding" },
   { label: "Saving layers", value: "4", detail: "working together on every turn" },
-  { label: "Providers", value: "18", detail: "presets, plus any compatible endpoint" },
+  { label: "Providers", value: "27", detail: "ids, plus any compatible endpoint" },
   { label: "Platforms", value: "3", detail: "macOS, Linux, Windows" }
 ];
 
@@ -286,40 +286,51 @@ export const languageRows: MatrixRow[] = [
 
 export const providerGroups: MatrixRow[] = [
   {
-    name: "Native providers",
+    name: "First-party & subscription",
     detail:
-      "OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, and Ollama have dedicated or local runtime paths.",
-    status: "API keys or local config"
+      "OpenAI, Anthropic, and Google Gemini by API key, plus subscription OAuth through OpenAI Codex and GitHub Copilot.",
+    status: "API key or OAuth"
   },
   {
-    name: "Compatible APIs",
+    name: "Aggregators & gateways",
     detail:
-      "OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, and any other OpenAI-compatible endpoint.",
-    status: "bring an endpoint"
+      "One key, many models: OpenRouter, Vercel AI Gateway, PortKey, and Cloudflare AI Gateway.",
+    status: "one key, many models"
   },
   {
-    name: "Local runtimes",
+    name: "Cloud platforms & open-weight hosts",
     detail:
-      "Use local or self-hosted routes such as Ollama, LM Studio, vLLM, llama.cpp-style servers, or custom compatible base URLs.",
-    status: "local when configured"
+      "Cloud IAM via AWS Bedrock, Azure OpenAI, and Google Vertex; open-weight hosts Groq, Cerebras, DeepSeek, Together, Fireworks, DeepInfra, Baseten, Mistral, xAI, and Cloudflare Workers AI.",
+    status: "IAM or API key"
+  },
+  {
+    name: "Local & custom",
+    detail:
+      "Run locally with Ollama, LM Studio, vLLM, or llama.cpp, or point the OpenAI-compatible preset at any other endpoint.",
+    status: "local or custom"
   }
 ];
 
 export const aggregatorRows: MatrixRow[] = [
   {
     name: "OpenRouter",
-    detail: "OpenAI-compatible aggregator route with many hosted models. Pricing and cache support depend on the selected model and registry metadata.",
+    detail: "OpenAI-compatible aggregator with many hosted models under one key. Pricing and cache support depend on the selected model.",
     status: "OPENROUTER_API_KEY"
   },
   {
     name: "Vercel AI Gateway",
-    detail: "OpenAI-compatible gateway route for hosted model access through Vercel.",
+    detail: "OpenAI-compatible gateway for hosted model access through Vercel.",
     status: "AI_GATEWAY_API_KEY"
   },
   {
     name: "PortKey",
-    detail: "OpenAI-compatible gateway route for virtual keys, routing, and observability.",
+    detail: "OpenAI-compatible gateway for virtual keys, routing, and observability.",
     status: "PORTKEY_API_KEY"
+  },
+  {
+    name: "Cloudflare AI Gateway",
+    detail: "Org-wide proxy with rate limiting and routing in front of your chosen models.",
+    status: "Cloudflare gateway"
   }
 ];
 
@@ -331,7 +342,7 @@ export const providerRows: MatrixRow[] = [
   },
   {
     name: "Anthropic",
-    detail: "Native Anthropic route with API-key and OAuth credential paths plus cache read/write accounting where exposed.",
+    detail: "Native Anthropic route with API-key and OAuth paths plus cache read/write accounting where exposed.",
     status: "ANTHROPIC_API_KEY"
   },
   {
@@ -341,47 +352,62 @@ export const providerRows: MatrixRow[] = [
   }
 ];
 
+export const subscriptionRows: MatrixRow[] = [
+  {
+    name: "OpenAI Codex",
+    detail: "Use an OpenAI Codex subscription through its OAuth sign-in instead of a metered API key.",
+    status: "Codex OAuth"
+  },
+  {
+    name: "GitHub Copilot",
+    detail: "Use a GitHub Copilot subscription through its OAuth sign-in.",
+    status: "Copilot OAuth"
+  }
+];
+
 export const cloudPlatformRows: MatrixRow[] = [
   {
     name: "Amazon Bedrock",
-    detail: "AWS-hosted provider route using the AWS credential chain and Bedrock runtime APIs.",
+    detail: "AWS-hosted models using the AWS credential chain and Bedrock runtime APIs.",
     status: "AWS credentials"
   },
   {
     name: "Azure OpenAI",
-    detail: "Azure-hosted OpenAI route with deployment-specific endpoint and API-key or bearer-token configuration.",
+    detail: "Azure-hosted OpenAI with a deployment-specific endpoint and API-key or bearer-token configuration.",
     status: "AZURE_OPENAI_API_KEY"
   },
   {
     name: "Google Vertex AI",
-    detail: "Google Cloud route through an OpenAI-compatible endpoint with access-token or service-account OAuth support.",
+    detail: "Google Cloud route via an OpenAI-compatible endpoint with access-token or service-account OAuth.",
     status: "Google Cloud auth"
   }
 ];
 
+export const openWeightRows: MatrixRow[] = [
+  { name: "Groq", detail: "Open-weight models at very high tokens-per-second.", status: "GROQ_API_KEY" },
+  { name: "Cerebras", detail: "Open-weight models at very high tokens-per-second.", status: "CEREBRAS_API_KEY" },
+  { name: "DeepSeek", detail: "DeepSeek's own DeepSeek-V3 and R1 models.", status: "DEEPSEEK_API_KEY" },
+  { name: "Together", detail: "Hosted open-weight inference (Llama, Qwen, Mixtral).", status: "TOGETHER_API_KEY" },
+  { name: "Fireworks", detail: "Hosted open-weight inference.", status: "FIREWORKS_API_KEY" },
+  { name: "DeepInfra", detail: "Hosted open-weight inference.", status: "DEEPINFRA_API_KEY" },
+  { name: "Baseten", detail: "Hosted open-weight inference.", status: "BASETEN_API_KEY" },
+  { name: "Mistral", detail: "Mistral La Plateforme hosted models.", status: "MISTRAL_API_KEY" },
+  { name: "xAI", detail: "xAI Grok models over the OpenAI-compatible API.", status: "XAI_API_KEY" },
+  { name: "Cloudflare Workers AI", detail: "Open-weight models served on Cloudflare's edge.", status: "Cloudflare API token" }
+];
+
 export const localRuntimeRows: MatrixRow[] = [
-  {
-    name: "Ollama",
-    detail: "Local runtime route for models served by Ollama. Context and model availability are runtime-defined.",
-    status: "local runtime"
-  }
+  { name: "Ollama", detail: "Local models served by Ollama. Context and availability are runtime-defined.", status: "local runtime" },
+  { name: "LM Studio", detail: "Local models served by LM Studio's OpenAI-compatible server.", status: "local runtime" },
+  { name: "vLLM", detail: "Self-hosted vLLM OpenAI-compatible server.", status: "local runtime" },
+  { name: "llama.cpp", detail: "Self-hosted llama.cpp-style OpenAI-compatible server.", status: "local runtime" }
 ];
 
 export const openAiCompatibleRows: MatrixRow[] = [
   {
-    name: "Groq, xAI, DeepSeek",
-    detail: "Hosted OpenAI-compatible presets with API-key configuration and curated registry entries where available.",
-    status: "API key"
-  },
-  {
-    name: "Mistral, Together, Fireworks, Cerebras",
-    detail: "OpenAI-compatible hosted inference presets. Dollar estimates require matching pricing metadata.",
-    status: "API key"
-  },
-  {
-    name: "Custom and local compatible endpoints",
-    detail: "Custom OpenAI-compatible base URLs, plus local LM Studio, vLLM, and llama.cpp style routes.",
-    status: "preset"
+    name: "Any OpenAI-compatible endpoint",
+    detail: "Point the openai_compatible preset at any other endpoint that speaks the OpenAI Chat Completions API, including a self-hosted LiteLLM proxy.",
+    status: "custom base URL"
   }
 ];
 

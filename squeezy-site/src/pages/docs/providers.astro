@@ -5,7 +5,9 @@ import {
   cloudPlatformRows,
   localRuntimeRows,
   openAiCompatibleRows,
-  providerRows
+  openWeightRows,
+  providerRows,
+  subscriptionRows
 } from "../../facts";
 ---
 
@@ -21,8 +23,9 @@ import {
     <div class="doc-prose">
       <h2>Choosing a route</h2>
       <p>
-        The quickest start is an aggregator: one API key reaches many hosted
-        models. If you prefer a vendor's own API, a cloud platform's catalog, or
+        Squeezy ships 27 provider ids. The quickest start is an aggregator: one
+        API key reaches many hosted models. If you prefer a vendor's own API, a
+        subscription sign-in, a cloud platform's catalog, an open-weight host, or
         a model running on your own machine, Squeezy supports those too. Set the
         provider and supply its credential; the tables below list the
         environment variable for each.
@@ -57,9 +60,35 @@ import {
   </section>
 
   <section class="doc-block">
+    <h2>Subscription sign-in (OAuth)</h2>
+    <div class="matrix compact-matrix">
+      {subscriptionRows.map((row) => (
+        <article class="matrix-row">
+          <h3>{row.name}</h3>
+          <p>{row.detail}</p>
+          {row.status && <span class="status-pill">{row.status}</span>}
+        </article>
+      ))}
+    </div>
+  </section>
+
+  <section class="doc-block">
     <h2>Cloud-platform hosts</h2>
     <div class="matrix compact-matrix">
       {cloudPlatformRows.map((row) => (
+        <article class="matrix-row">
+          <h3>{row.name}</h3>
+          <p>{row.detail}</p>
+          {row.status && <span class="status-pill">{row.status}</span>}
+        </article>
+      ))}
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Open-weight hosts</h2>
+    <div class="matrix compact-matrix">
+      {openWeightRows.map((row) => (
         <article class="matrix-row">
           <h3>{row.name}</h3>
           <p>{row.detail}</p>

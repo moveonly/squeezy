@@ -5,10 +5,12 @@ citizens. Squeezy parses repositories into a persistent local semantic graph and
 queries that graph through structured tools that return compact evidence
 packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-> **Status:** early v0 development. The CLI/TUI is runnable; graph-backed
-> navigation, deterministic validation harnesses, local help, sessions/resume,
-> checkpoints, provider routing, MCP, skills, hooks, feedback/reporting, and
-> telemetry are implemented and still evolving. Provider and language support
+> **Status:** early access. The CLI/TUI is runnable and installable, with
+> provider presets, a persistent semantic graph, release automation, and an
+> evaluation harness. Graph-backed navigation, deterministic validation
+> harnesses, local help, sessions/resume, checkpoints, provider routing, MCP,
+> skills, hooks, feedback/reporting, and telemetry are implemented and still
+> evolving, so expect rough edges. Provider and language support
 > change faster than this README, so use
 > [`PROVIDERS.md`](crates/squeezy-skills/external-docs/PROVIDERS.md) for exact
 > provider ids, defaults, environment variables, and model metadata, and
