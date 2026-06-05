@@ -3581,6 +3581,45 @@ async fn explicit_skill_activation_injects_body_and_rewrites_task() {
 }
 
 #[tokio::test]
+async fn unknown_explicit_skill_warns_and_continues_turn() {
+    let root = temp_workspace("agent_skill_unknown_explicit");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "/skill rust-nva inspect main".to_string(),
+        CancellationToken::new(),
+    );
+    let mut saw_warning = false;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::SkillActivationWarning { name, message, .. } = event {
+            saw_warning = true;
+            assert_eq!(name, "rust-nva");
+            assert!(message.contains("skill not found"), "{message}");
+        }
+    }
+
+    assert!(saw_warning, "unknown explicit skill must surface a warning");
+    let request = provider.requests().pop().expect("request");
+    assert!(!request.instructions.contains("<active_skills>"));
+    assert_eq!(
+        request.input.as_ref(),
+        vec![LlmInputItem::UserText("inspect main".to_string())].as_slice()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn trigger_skill_activation_injects_body() {
     let root = temp_workspace("agent_skill_trigger");
     write_skill(

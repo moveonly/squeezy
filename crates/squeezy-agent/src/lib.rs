@@ -5826,6 +5826,28 @@ impl TurnRuntime {
         }
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
+        for warning in &activation.warnings {
+            self.log_event(
+                "skill_activation_warning",
+                Some(self.turn_id),
+                Some(format!(
+                    "skill {} skipped: {}",
+                    warning.name, warning.message
+                )),
+                json!({
+                    "skill": warning.name,
+                    "message": warning.message,
+                }),
+            );
+            let _ = self
+                .tx
+                .send(AgentEvent::SkillActivationWarning {
+                    turn_id: self.turn_id,
+                    name: warning.name.clone(),
+                    message: warning.message.clone(),
+                })
+                .await;
+        }
         // Partition by execution-context mode declared in `SKILL.md`
         // frontmatter. Inline-mode skills (the default) keep the
         // existing `<active_skills>` system-prompt injection. Fork-mode
@@ -16189,6 +16211,11 @@ pub enum AgentEvent {
         turn_id: TurnId,
         request: RequestUserInputRequest,
         response_tx: oneshot::Sender<RequestUserInputResponse>,
+    },
+    SkillActivationWarning {
+        turn_id: TurnId,
+        name: String,
+        message: String,
     },
     JobUpdated {
         job: JobSnapshot,

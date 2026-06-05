@@ -355,6 +355,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     });
                     break;
                 }
+                AgentEvent::SkillActivationWarning { name, message, .. } => {
+                    app.status = format!("skill {name} skipped");
+                    app.push_note(format!("skill `{name}` skipped: {message}"));
+                }
                 AgentEvent::Completed {
                     message,
                     cost,

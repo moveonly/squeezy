@@ -706,6 +706,71 @@ fn explicit_and_trigger_activation_loads_lazily() {
 }
 
 #[test]
+fn unknown_explicit_skill_warns_and_preserves_task() {
+    let root = temp_workspace("skills_unknown_explicit");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let activation = catalog
+        .activate_for_input("/skill rust-nva inspect main")
+        .expect("unknown explicit skill must not abort activation");
+    assert_eq!(activation.task_input, "inspect main");
+    assert!(activation.skills.is_empty());
+    assert!(activation.kinds.is_empty());
+    assert_eq!(activation.warnings.len(), 1);
+    assert_eq!(activation.warnings[0].name, "rust-nva");
+    assert!(
+        activation.warnings[0].message.contains("skill not found"),
+        "{:?}",
+        activation.warnings
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn disabled_explicit_skill_warns_and_preserves_task() {
+    let root = temp_workspace("skills_disabled_explicit");
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Rust nav",
+        &["rust symbol"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        config: vec![SkillConfigEntry {
+            name: Some("rust-nav".to_string()),
+            enabled: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    let activation = catalog
+        .activate_for_input("/skill rust-nav inspect main")
+        .expect("disabled explicit skill must not abort activation");
+    assert_eq!(activation.task_input, "inspect main");
+    assert!(activation.skills.is_empty());
+    assert!(activation.kinds.is_empty());
+    assert_eq!(activation.warnings.len(), 1);
+    assert_eq!(activation.warnings[0].name, "rust-nav");
+    assert!(
+        activation.warnings[0].message.contains("skill disabled"),
+        "{:?}",
+        activation.warnings
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn activation_kind_serializes_as_snake_case() {
     let cases = [
         (SkillActivationKind::Explicit, "\"explicit\""),

@@ -578,16 +578,29 @@ impl SkillCatalog {
         let mut seen = BTreeSet::new();
         let mut loaded = Vec::new();
         let mut kinds = Vec::new();
+        let mut warnings = Vec::new();
         for (name, kind) in candidates {
             if seen.insert(name.clone()) {
-                loaded.push(self.load(&name)?);
-                kinds.push(kind);
+                match self.load(&name) {
+                    Ok(skill) => {
+                        loaded.push(skill);
+                        kinds.push(kind);
+                    }
+                    Err(error) if matches!(kind, SkillActivationKind::Explicit) => {
+                        warnings.push(SkillActivationWarning {
+                            name: name.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(SkillActivation {
             task_input: task,
             skills: loaded,
             kinds,
+            warnings,
         })
     }
 
@@ -1077,6 +1090,16 @@ pub struct SkillActivation {
     /// callers emit `skill.activation.kind` telemetry so trigger-vs-explicit
     /// hit rates are observable without re-deriving from the input.
     pub kinds: Vec<SkillActivationKind>,
+    /// Non-fatal issues encountered while activating skills. Explicit
+    /// `/skill <name>` requests use this path so a typo does not discard the
+    /// user's trailing task.
+    pub warnings: Vec<SkillActivationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillActivationWarning {
+    pub name: String,
+    pub message: String,
 }
 
 /// Why a skill was activated for a turn. Stays in sync with the
