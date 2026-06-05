@@ -10,52 +10,152 @@ export type MatrixRow = {
   status?: string;
 };
 
-export const productPosition = {
-  eyebrow: "Local-first coding agent",
-  title: "Understand the repo before you ask the model.",
-  lead:
-    "Squeezy is a terminal coding agent that builds a local semantic graph of your codebase, then answers navigation, reference, and impact questions from that graph instead of from paid model context."
+export type BenchmarkRow = {
+  lang: string;
+  squeezyCost: number;
+  baselineCost: number;
+  ratio: number;
+  recall: number;
+  verdict: "WIN" | "LOSS";
 };
 
-export const homepageCards: FactCard[] = [
+export const productPosition = {
+  eyebrow: "Rust coding agent",
+  title: "Spend local code understanding before model context.",
+  lead:
+    "Squeezy is a terminal coding agent that builds a local semantic graph, uses focused tools, and keeps long sessions bounded so paid model tokens are spent on judgment instead of rediscovering the repo."
+};
+
+export const heroMetrics = [
+  { label: "Measured suite", value: "20% lower total spend", detail: "15-language Mini benchmark" },
+  { label: "Languages", value: "13 families", detail: "17 source variants with graph navigation" },
+  { label: "Runtime", value: "Rust TUI", detail: "local graph, store, tools, and sessions" },
+  { label: "Providers", value: "BYO model", detail: "native, OAuth, local, and compatible routes" }
+];
+
+export const costPillars: FactCard[] = [
   {
-    label: "Local first",
-    title: "Static analysis does the repetitive work",
+    label: "graph first",
+    title: "Navigate structure before reading files",
     body:
-      "Squeezy maps the repository locally, then answers common navigation questions from the graph before the model touches source text."
+      "Declarations, references, callers, callees, hierarchy, body hits, and exact slices come from a local tree-sitter graph for supported languages."
   },
   {
-    label: "Token budget",
-    title: "Less context sent without losing the trail",
+    label: "bounded evidence",
+    title: "Small packets with recovery paths",
     body:
-      "Graph tools return paths, spans, hashes, confidence labels, provenance, and next actions. Raw reads stay available, narrowed to the exact slice when structure is enough."
+      "Tool outputs are capped, shaped, deduped, or spilled behind handles so the model sees useful evidence without carrying bulk forever."
   },
   {
-    label: "Terminal app",
-    title: "Fast local agent loop",
+    label: "cache-aware",
+    title: "Stable prompt bytes when providers support it",
     body:
-      "Squeezy runs as a single Rust binary with deterministic local work, explicit verification, and bounded tool output."
+      "Provider adapters wire cache hints and parse cache usage where available, while lazy schemas and skills keep rarely used instructions out of normal turns."
+  },
+  {
+    label: "dynamic context",
+    title: "Compact the transcript before it becomes baggage",
+    body:
+      "Long sessions use compaction and micro-compaction to summarize stale context while preserving receipts and ways to fetch exact detail again."
+  },
+  {
+    label: "routing",
+    title: "Use cheaper models for narrow mechanical turns",
+    body:
+      "The router can choose a provider-local small-fast model for obvious tasks, then escalate back to the parent model when the cheap path shows stress."
+  },
+  {
+    label: "subagents",
+    title: "Isolate exploration from the parent context",
+    body:
+      "Short-lived read-oriented subagents can research, plan, review, or answer docs questions and return compact evidence instead of a full child transcript."
   }
 ];
 
-export const optimizationCards: FactCard[] = [
+export const productSubjects: FactCard[] = [
   {
-    label: "static graph",
-    title: "Semantic navigation before file reads",
+    label: "coding first",
+    title: "Graph-backed tools for code work",
     body:
-      "repo_map, declaration search, references, hierarchy, symbol context, upstream/downstream flow, and read_slice work from local graph state and return narrowed results with paths, spans, and confidence."
+      "The core tool surface is declarations, references, flow, hierarchy, diff context, read slices, patch planning, shell verification, and session accounting."
   },
   {
-    label: "read shaping",
-    title: "Exact slices, diff reads, and receipts",
+    label: "tui workflows",
+    title: "Built for repeated terminal sessions",
     body:
-      "Read tools return bounded slices, changed ranges, receipt stubs for unchanged content, and spill handles for large output. The model gets enough to act without paying for repeated bytes."
+      "First-run setup, config screens, prompt queues, resume picker, plan/build modes, cost/context commands, and keymap controls live in the TUI."
   },
   {
-    label: "tool budget",
-    title: "Budget counters visible in the session",
+    label: "permissions",
+    title: "Reviewable actions around local work",
     body:
-      "Per-turn counters track tool calls, read bytes, search hits, receipt hits, spills, denials, provider tokens, cache usage, and estimated cost when a provider exposes enough data."
+      "File edits, shell commands, web fetches, MCP calls, destructive actions, and outside-workspace access flow through configurable permissions."
+  },
+  {
+    label: "sessions",
+    title: "Local work can be resumed and audited",
+    body:
+      "Session logs, resume state, labels, forks, exports, feedback, reports, and optional checkpoints make longer work inspectable after restarts."
+  },
+  {
+    label: "mcp and web",
+    title: "External tools stay explicit",
+    body:
+      "Web and MCP tools are configured, permissioned, bounded, and separated from local code evidence instead of being implicit background access."
+  },
+  {
+    label: "validation",
+    title: "Benchmarks check the graph against oracles",
+    body:
+      "Release benchmarks compare local graph output with language-specific compiler or language-service oracles while production navigation stays local."
+  }
+];
+
+export const benchmarkRows: BenchmarkRow[] = [
+  { lang: "C", squeezyCost: 0.0454, baselineCost: 0.0504, ratio: 0.9, recall: 100, verdict: "WIN" },
+  { lang: "C++", squeezyCost: 0.0557, baselineCost: 0.0689, ratio: 0.81, recall: 100, verdict: "WIN" },
+  { lang: "C#", squeezyCost: 0.0636, baselineCost: 0.0525, ratio: 1.21, recall: 100, verdict: "LOSS" },
+  { lang: "Dart", squeezyCost: 0.1049, baselineCost: 0.1802, ratio: 0.58, recall: 100, verdict: "WIN" },
+  { lang: "Go", squeezyCost: 0.0479, baselineCost: 0.0486, ratio: 0.99, recall: 100, verdict: "LOSS" },
+  { lang: "Java", squeezyCost: 0.1441, baselineCost: 0.1499, ratio: 0.96, recall: 100, verdict: "LOSS" },
+  { lang: "JS", squeezyCost: 0.0552, baselineCost: 0.065, ratio: 0.85, recall: 100, verdict: "WIN" },
+  { lang: "Kotlin", squeezyCost: 0.0271, baselineCost: 0.0416, ratio: 0.65, recall: 100, verdict: "WIN" },
+  { lang: "PHP", squeezyCost: 0.0261, baselineCost: 0.0418, ratio: 0.62, recall: 100, verdict: "WIN" },
+  { lang: "Python", squeezyCost: 0.0155, baselineCost: 0.0193, ratio: 0.81, recall: 100, verdict: "WIN" },
+  { lang: "Ruby", squeezyCost: 0.0617, baselineCost: 0.0607, ratio: 1.02, recall: 100, verdict: "LOSS" },
+  { lang: "Rust", squeezyCost: 0.0278, baselineCost: 0.0355, ratio: 0.78, recall: 100, verdict: "WIN" },
+  { lang: "Scala", squeezyCost: 0.0202, baselineCost: 0.0611, ratio: 0.33, recall: 100, verdict: "WIN" },
+  { lang: "Swift", squeezyCost: 0.0134, baselineCost: 0.0181, ratio: 0.74, recall: 100, verdict: "WIN" },
+  { lang: "TS", squeezyCost: 0.0378, baselineCost: 0.0424, ratio: 0.89, recall: 100, verdict: "WIN" }
+];
+
+export const benchmarkSummary = {
+  totalDelta: "20%",
+  wins: 11,
+  losses: 4,
+  medianRatio: "0.81",
+  suite:
+    "15 real-world code-navigation tasks using gpt-5.4-mini, n=3 medians, identical pricing and grader, Squeezy graph-enabled agent versus Codex baseline."
+};
+
+export const accuracyRows: MatrixRow[] = [
+  {
+    name: "Rust",
+    detail:
+      "Five pinned repos and 25,000 mixed-workload scenarios. Comparable declaration symbols matched rust-analyzer with 20,320 TP / 0 FP / 0 FN in the recorded run.",
+    status: "oracle checked"
+  },
+  {
+    name: "Java",
+    detail:
+      "Five external Java repos checked against JDK compiler-tree declaration oracles: 107,063 TP / 4 FP / 8 FN aggregated.",
+    status: "declaration oracle"
+  },
+  {
+    name: "Go",
+    detail:
+      "Five external Go repos checked against Go parser/types oracle: 29,038 TP / 0 FP / 0 FN, with refresh probes reparsing only edited files.",
+    status: "declaration oracle"
   }
 ];
 
@@ -64,141 +164,79 @@ export const operatingLoop: FactCard[] = [
     label: "1",
     title: "Index local code",
     body:
-      "Squeezy parses supported files, discovers workspace facts, stores graph/cache partitions, and refreshes graph state as the workspace changes."
+      "Parse supported files, classify workspace facts, build graph/cache partitions, and refresh changed files as the repo moves."
   },
   {
     label: "2",
-    title: "Compile a focused evidence plan",
+    title: "Plan with graph evidence",
     body:
-      "Common navigation prompts are routed through graph-first plans so the model starts with declarations, references, callers, hierarchy, and exact next actions."
+      "Route navigation prompts through declarations, references, callers, hierarchy, body hits, diff context, and exact next reads."
   },
   {
     label: "3",
-    title: "Escalate only when needed",
+    title: "Spend model context selectively",
     body:
-      "If graph evidence is incomplete, Squeezy falls back to bounded grep, glob, read_file, web, shell, or compiler tools behind the configured permission policy."
+      "Send focused evidence and escalate to raw reads, shell, web, MCP, or compiler tools only when local structure is not enough."
   },
   {
     label: "4",
-    title: "Verify with local tools",
+    title: "Account and compact",
     body:
-      "Builds, tests, formatters, linters, and benchmark commands provide compiler-backed evidence when the task needs it."
-  }
-];
-
-export const toolSurface: FactCard[] = [
-  {
-    label: "navigation",
-    title: "Graph-backed code tools",
-    body:
-      "Architecture maps, declarations, definitions, references, call candidates, hierarchy, symbol context, dependency flow, diff context, and exact read slices."
-  },
-  {
-    label: "mutation",
-    title: "Plan, patch, verify",
-    body:
-      "Plan mode hides mutation. Build mode exposes edit, shell, compiler, and git-style actions through capability checks, output shaping, and optional checkpoints."
-  },
-  {
-    label: "support",
-    title: "Local help, sessions, reports",
-    body:
-      "Squeezy can answer questions about itself from bundled docs before provider work, resume sessions, export/replay session logs, and prepare redacted feedback or report bundles."
+      "Track provider tokens, cache counters, tool bytes, spills, subagent cost, and compact stale transcript bulk during longer work."
   }
 ];
 
 export const languageRows: MatrixRow[] = [
+  { name: "Rust", detail: "Modules, traits, impls, macros, tests, calls, references, and Cargo facts.", status: "strong" },
+  { name: "Python", detail: "Classes, functions, imports, decorators, bases, annotations, calls, exports, and references.", status: "solid" },
+  { name: "Java", detail: "Packages, types, members, constructors, inheritance, implements edges, calls, references, and Maven/Gradle facts.", status: "solid" },
+  { name: "Kotlin", detail: "Packages, imports, classes, objects, companion objects, sealed/data types, extension receivers, and Gradle facts.", status: "solid" },
+  { name: "Scala", detail: "Packages, classes, traits, objects, case classes, enums, extension methods, givens, and references.", status: "emerging" },
+  { name: "C#/.NET", detail: "Namespaces, usings, types, members, attributes, calls, references, partial links, inheritance, and project facts.", status: "strong" },
+  { name: "Go", detail: "Packages, imports, structs, interfaces, aliases, functions, methods, receivers, calls, tests, and references.", status: "strong" },
+  { name: "C/C++", detail: "Includes, namespaces, classes, structs, unions, enums, typedefs, functions, methods, templates, macros, and references.", status: "strong" },
+  { name: "JavaScript/TypeScript", detail: "Imports, exports, CommonJS aliases, functions, classes, interfaces, types, JSX/TSX declarations, member calls, and references.", status: "strong" },
+  { name: "PHP", detail: "Namespaces, use imports, classes, interfaces, traits, enums, methods, properties, attributes, calls, references, and trait edges.", status: "strong" },
+  { name: "Ruby", detail: "Classes, modules, methods, singleton methods, attr accessors, require/import hints, mixins, calls, and references.", status: "solid" },
+  { name: "Swift", detail: "Classes, structs, actors, protocols, enums, extensions, generics, property wrappers, imports, and module hints.", status: "emerging" },
+  { name: "Dart", detail: "Libraries, parts, classes, mixins, extensions, extension types, sealed types, enums, constructors, imports, calls, and type refs.", status: "emerging" }
+];
+
+export const providerGroups: MatrixRow[] = [
   {
-    name: "Rust",
-    detail: "Modules, traits, impls, references, calls, tests, and crate facts from cargo metadata.",
-    status: "first-class graph"
+    name: "Native APIs",
+    detail:
+      "OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, and Ollama have dedicated runtime paths or local runtime handling.",
+    status: "first-party routes"
   },
   {
-    name: "Python",
-    detail: "Classes, functions, imports, decorators, bases, annotations, exports, and references.",
-    status: "first-class graph"
+    name: "OAuth subscriptions",
+    detail:
+      "Anthropic, OpenAI Codex/ChatGPT subscription, and GitHub Copilot auth flows are represented in the CLI and provider registry.",
+    status: "login flows"
   },
   {
-    name: "Java",
-    detail: "Packages, types, members, inheritance, implements edges, calls, references, and Maven/Gradle facts.",
-    status: "first-class graph"
-  },
-  {
-    name: "Kotlin",
-    detail: "Packages, imports (aliased/wildcard), classes, objects, companion objects, data/sealed types, extension functions, suspend, typealiases, and Gradle facts.",
-    status: "first-class graph"
-  },
-  {
-    name: "Scala",
-    detail: "Packages, classes, traits, case classes, enums, companion objects, extension methods, given declarations, top-level defs, and Scala 3 imports.",
-    status: "first-class graph"
-  },
-  {
-    name: "C#",
-    detail: "Namespaces, types, members, partial links, inheritance, references, and .csproj/.sln project facts.",
-    status: "first-class graph"
-  },
-  {
-    name: "Go",
-    detail: "Packages, structs, interfaces, methods, receivers, tests, calls, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "C",
-    detail: "Includes, structs, unions, enums, typedefs, functions, macros, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "C++",
-    detail: "Includes, namespaces, classes, methods, constructors, destructors, templates, operators, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "JavaScript",
-    detail: "Imports, exports, CommonJS aliases, functions, classes, member references, calls, and JSX declarations.",
-    status: "first-class graph"
-  },
-  {
-    name: "TypeScript",
-    detail: "Imports, exports, classes, interfaces, type aliases, enums, decorators, type references, calls, and TSX declarations.",
-    status: "first-class graph"
-  },
-  {
-    name: "PHP",
-    detail: "Namespaces, use imports (named/aliased/group/function/const), classes, interfaces, traits, enums, backed enums, methods, properties, attributes, calls, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "Ruby",
-    detail: "Classes, modules, methods, singleton methods, attr_* synthesis, require_relative imports, include/extend/prepend mixins, calls, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "Swift",
-    detail: "Imports, classes, structs, actors, protocols, enums with associated cases, extensions, generics with constraints, property wrappers, and module hints.",
-    status: "first-class graph"
-  },
-  {
-    name: "Dart",
-    detail: "Libraries, parts, classes, mixins, extensions, extension types, sealed classes, enums, named and factory constructors, getters/setters, async modifiers, and prefix imports with show/hide combinators.",
-    status: "first-class graph"
+    name: "OpenAI-compatible services",
+    detail:
+      "OpenRouter, Vercel, PortKey, Groq, xAI, DeepSeek, Vertex, Mistral, Together, Fireworks, Cerebras, DeepInfra, Baseten, Cloudflare Workers AI, local LM Studio/vLLM/llama.cpp, and custom compatible endpoints.",
+    status: "presets"
   }
 ];
 
 export const aggregatorRows: MatrixRow[] = [
   {
     name: "OpenRouter",
-    detail: "One credit, every frontier model. OpenAI-compatible Chat Completions streaming, function tools, usage metadata, reasoning passthrough, Anthropic cache_control forwarding. Default model: anthropic/claude-opus-4-7.",
+    detail: "OpenAI-compatible aggregator route with many hosted models. Pricing and cache support depend on the selected model and registry metadata.",
     status: "OPENROUTER_API_KEY"
   },
   {
     name: "Vercel AI Gateway",
-    detail: "Vercel's routing proxy for OpenAI, Anthropic, Google, xAI, and more. Default model: anthropic/claude-opus-4-7.",
+    detail: "OpenAI-compatible gateway route for hosted model access through Vercel.",
     status: "AI_GATEWAY_API_KEY"
   },
   {
     name: "PortKey",
-    detail: "Gateway with virtual keys, caching, and observability. Configure a virtual key via x-portkey-virtual-key header.",
+    detail: "OpenAI-compatible gateway route for virtual keys, routing, and observability.",
     status: "PORTKEY_API_KEY"
   }
 ];
@@ -206,130 +244,100 @@ export const aggregatorRows: MatrixRow[] = [
 export const providerRows: MatrixRow[] = [
   {
     name: "OpenAI",
-    detail: "Responses streaming, function tools, cached-token usage. Default model: gpt-5.5, 400K context.",
+    detail: "Native OpenAI route with usage parsing and cache-related request metadata where supported.",
     status: "OPENAI_API_KEY"
   },
   {
     name: "Anthropic",
-    detail: "Messages streaming, function tools, cache read/write usage. Default model: claude-opus-4-7, 200K context.",
+    detail: "Native Anthropic route with API-key and OAuth credential paths plus cache read/write accounting where exposed.",
     status: "ANTHROPIC_API_KEY"
   },
   {
     name: "Google Gemini",
-    detail: "streamGenerateContent SSE, function declarations, usage metadata. Default model: gemini-2.5-pro, 1M context.",
-    status: "GEMINI_API_KEY"
+    detail: "Native Gemini route with API-key configuration and streaming usage metadata where available.",
+    status: "GOOGLE_API_KEY"
   }
 ];
 
 export const cloudPlatformRows: MatrixRow[] = [
   {
     name: "Amazon Bedrock",
-    detail: "AWS multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability). Bedrock Runtime ConverseStream over the AWS default credential chain. Default model: Claude Haiku 4.5, 200K context.",
+    detail: "AWS-hosted provider route using the AWS credential chain and Bedrock runtime APIs.",
     status: "AWS credentials"
   },
   {
     name: "Azure OpenAI",
-    detail: "OpenAI models hosted on Microsoft Azure (single-vendor slice of the broader Azure model catalog). Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context. For Azure AI Foundry's multi-vendor catalog use the openai_compatible preset with the Foundry serverless endpoint.",
+    detail: "Azure-hosted OpenAI route with deployment-specific endpoint and API-key or bearer-token configuration.",
     status: "AZURE_OPENAI_API_KEY"
   },
   {
     name: "Google Vertex AI",
-    detail: "Gemini and other models on Google Cloud Vertex AI's OpenAI-compatible endpoint. OAuth2 access token (refresh every ~50 min) or service-account JSON, project + location templated into base_url. Default model: gemini-2.5-pro.",
-    status: "VERTEX_ACCESS_TOKEN"
+    detail: "Google Cloud route through an OpenAI-compatible endpoint with access-token or service-account OAuth support.",
+    status: "Google Cloud auth"
   }
 ];
 
 export const localRuntimeRows: MatrixRow[] = [
   {
     name: "Ollama",
-    detail: "Local /api/chat NDJSON streaming with function tool schemas. Default model: qwen3-coder, runtime-defined context.",
+    detail: "Local runtime route for models served by Ollama. Context and model availability are runtime-defined.",
     status: "local runtime"
   }
 ];
 
 export const openAiCompatibleRows: MatrixRow[] = [
   {
-    name: "Groq",
-    detail: "Fast OpenAI-compatible inference of open models. Curated registry: llama-3.3-70b-versatile, llama-3.1-8b-instant, moonshotai/kimi-k2-instruct.",
-    status: "GROQ_API_KEY"
+    name: "Groq, xAI, DeepSeek",
+    detail: "Hosted OpenAI-compatible presets with API-key configuration and curated registry entries where available.",
+    status: "API key"
   },
   {
-    name: "xAI",
-    detail: "Grok family via OpenAI-compatible API. Curated registry: grok-4, grok-4-fast-reasoning, grok-code-fast-1.",
-    status: "XAI_API_KEY"
+    name: "Mistral, Together, Fireworks, Cerebras",
+    detail: "OpenAI-compatible hosted inference presets. Dollar estimates require matching pricing metadata.",
+    status: "API key"
   },
   {
-    name: "DeepSeek",
-    detail: "DeepSeek Chat and Reasoner via OpenAI-compatible API. Curated registry: deepseek-chat, deepseek-reasoner.",
-    status: "DEEPSEEK_API_KEY"
-  },
-  {
-    name: "Mistral La Plateforme",
-    detail: "Mistral's OpenAI-compatible Chat Completions endpoint. Default model: mistral-large-latest (light preset — no curated registry entries).",
-    status: "MISTRAL_API_KEY"
-  },
-  {
-    name: "Together AI",
-    detail: "Hosted open models via OpenAI-compatible API. Default model: meta-llama/Llama-3.3-70B-Instruct-Turbo (light preset).",
-    status: "TOGETHER_API_KEY"
-  },
-  {
-    name: "Fireworks AI",
-    detail: "Production OpenAI-compatible inference. Default model: accounts/fireworks/models/llama-v3p3-70b-instruct (light preset).",
-    status: "FIREWORKS_API_KEY"
-  },
-  {
-    name: "Cerebras",
-    detail: "Cerebras Cloud OpenAI-compatible endpoint. Default model: llama-3.3-70b (light preset).",
-    status: "CEREBRAS_API_KEY"
-  },
-  {
-    name: "Custom OpenAI-compatible",
-    detail: "Any endpoint that speaks POST /chat/completions with a Bearer token. Microsoft Foundry (Azure AI Studio) serverless deployments, Cloudflare Workers AI, self-hosted LiteLLM, and similar services use this preset.",
-    status: "openai_compatible preset"
+    name: "Custom and local compatible endpoints",
+    detail: "Custom OpenAI-compatible base URLs, plus local LM Studio, vLLM, and llama.cpp style routes.",
+    status: "preset"
   }
 ];
 
 export const installRows: MatrixRow[] = [
   {
     name: "macOS",
-    detail: "Release targets: aarch64-apple-darwin for Apple Silicon and x86_64-apple-darwin for Intel. Primary install path: one-line curl installer.",
-    status: "curl installer"
+    detail: "Release targets for Apple Silicon and Intel. Primary path is the one-line installer; Homebrew tap support is scripted.",
+    status: "aarch64 + x86_64"
   },
   {
     name: "Linux",
-    detail: "x86_64-unknown-linux-musl static binary. Primary install path: one-line curl installer.",
-    status: "curl installer"
+    detail: "x86_64 musl static binary target plus source install when the Rust toolchain is already present.",
+    status: "x86_64"
   },
   {
     name: "Windows",
-    detail: "x86_64-pc-windows-msvc archive. Primary install path: Winget.",
-    status: "winget"
-  },
-  {
-    name: "Source build",
-    detail: "Cargo install is available when you already have the required Rust toolchain.",
-    status: "cargo"
+    detail: "x86_64 MSVC archive and Winget manifest update path. Shell sandboxing is Job-Object-only on Windows.",
+    status: "x86_64"
   }
 ];
 
-export const benchmarkFacts: FactCard[] = [
+export const trustRows: MatrixRow[] = [
   {
-    label: "scope",
-    title: "Cost-saving benchmark page is under construction",
-    body:
-      "The public page will report how much context Squeezy avoids by using graph navigation, exact reads, receipts, and output shaping before model turns."
+    name: "Permissions",
+    detail:
+      "Configurable policies cover edits, shell, web, MCP, destructive actions, and outside-workspace paths. Defaults keep external access reviewable.",
+    status: "reviewable"
   },
   {
-    label: "method",
-    title: "Benchmarks need quality and cost together",
-    body:
-      "The benchmark method will pair navigation quality with measured read bytes, tool calls, receipt hits, spills, provider tokens, and baseline discovery effort."
+    name: "Telemetry",
+    detail:
+      "Website events go through a Cloudflare Worker to PostHog. Product telemetry is bounded and opt-controlled; reports and feedback are explicit.",
+    status: "worker proxy"
   },
   {
-    label: "status",
-    title: "No public savings number yet",
-    body:
-      "Until the report is ready, the page should explain the measurement plan without publishing unsupported percentages or cost claims."
+    name: "Rollback",
+    detail:
+      "Optional checkpoints can record mutating tool calls and support call-level or turn-level rollback when a provider is configured.",
+    status: "optional"
   }
 ];

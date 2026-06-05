@@ -2,7 +2,7 @@ export const SITE = {
   name: "Squeezy",
   url: "https://squeezyagent.com",
   description:
-    "A terminal coding agent built on a local semantic graph. Answer navigation, reference, and impact questions before spending model tokens.",
+    "A Rust terminal coding agent that spends local code understanding before paid model context.",
   repoUrl: "https://github.com/esqueezy/squeezy",
   issuesUrl: "https://github.com/esqueezy/squeezy/issues",
   discussionsUrl: "https://github.com/esqueezy/squeezy/discussions",

@@ -596,6 +596,14 @@ small {
   font-size: 1.38rem;
 }
 
+.metric-strip small {
+  display: block;
+  margin-top: 4px;
+  color: var(--faint);
+  font-family: var(--sans);
+  font-size: 0.94rem;
+}
+
 .section {
   padding: clamp(68px, 9vw, 128px) clamp(18px, 5vw, 72px);
 }
@@ -610,6 +618,10 @@ small {
   gap: 16px;
   max-width: 900px;
   margin-bottom: clamp(30px, 5vw, 56px);
+}
+
+.section-header.wide {
+  max-width: 1040px;
 }
 
 .section-header p {
@@ -789,6 +801,94 @@ small {
 .flow-step p {
   margin-top: 8px;
   font-size: 1rem;
+}
+
+.cost-chart {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: clamp(16px, 3vw, 24px);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: rgba(13, 12, 10, 0.94);
+  box-shadow: 0 22px 70px var(--shadow);
+}
+
+.chart-axis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding-left: 112px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.chart-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 74px;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+}
+
+.chart-label,
+.chart-value {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.chart-label strong,
+.chart-value strong {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.94rem;
+}
+
+.chart-label span,
+.chart-value span {
+  overflow: hidden;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chart-track {
+  position: relative;
+  min-width: 0;
+  height: 16px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    rgba(8, 8, 7, 0.76);
+  background-size: 25% 100%;
+}
+
+.chart-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.34);
+  background: linear-gradient(90deg, rgba(124, 215, 181, 0.32), rgba(124, 215, 181, 0.82));
+}
+
+.chart-row.loss .chart-bar {
+  background: linear-gradient(90deg, rgba(242, 191, 88, 0.34), rgba(242, 191, 88, 0.92));
+}
+
+.parity-line {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  left: 80%;
+  z-index: 1;
+  width: 1px;
+  background: rgba(244, 238, 230, 0.62);
 }
 
 .page-hero {
@@ -1123,6 +1223,27 @@ small {
 
   .button {
     width: 100%;
+  }
+
+  .chart-axis {
+    display: none;
+  }
+
+  .chart-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .chart-row:last-child {
+    border-bottom: 0;
+  }
+
+  .chart-label,
+  .chart-value {
+    grid-template-columns: auto 1fr;
+    gap: 8px;
   }
 
   .terminal-line {

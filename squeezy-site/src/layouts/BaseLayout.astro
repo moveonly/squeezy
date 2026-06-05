@@ -35,7 +35,7 @@ const navItems = [
   { href: "/how-it-works/", label: "How it works", key: "how" },
   { href: "/languages/", label: "Languages", key: "languages" },
   { href: "/providers/", label: "Providers", key: "providers" },
-  { href: "/benchmarks/", label: "Benchmark", key: "benchmarks" },
+  { href: "/benchmarks/", label: "Benchmarks", key: "benchmarks" },
   { href: "/install/", label: "Install", key: "install" },
   { href: "/docs/", label: "Docs", key: "docs" }
 ];
@@ -215,10 +215,19 @@ const navItems = [
         document.addEventListener("click", (event) => {
           const target = event.target instanceof Element ? event.target.closest("[data-track-click]") : null;
           if (!target) return;
+          const href = target instanceof HTMLAnchorElement ? target.href : undefined;
+          const external = href ? new URL(href, location.href).hostname !== location.hostname : false;
+          const targetKind = target.getAttribute("data-track-target") || (external ? "other" : "internal");
           send("squeezy_site_cta_clicked", {
             cta_id: target.getAttribute("data-track-click"),
-            target_kind: target.getAttribute("data-track-target") || "internal"
+            target_kind: targetKind
           });
+          if (external) {
+            send("squeezy_site_outbound_clicked", {
+              cta_id: target.getAttribute("data-track-click"),
+              target_kind: targetKind
+            });
+          }
         });
       })();
     </script>

@@ -2,7 +2,7 @@
 import BaseLayout from "../layouts/BaseLayout.astro";
 import TerminalWindow from "../components/TerminalWindow.astro";
 import EvidenceLoop from "../components/EvidenceLoop.astro";
-import { operatingLoop, toolSurface } from "../facts";
+import { costPillars, operatingLoop, productSubjects } from "../facts";
 ---
 
 <BaseLayout
@@ -13,11 +13,11 @@ import { operatingLoop, toolSurface } from "../facts";
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">agent architecture</span>
-      <h1>Static analysis first. Model judgment second.</h1>
+      <h1>Local structure first. Model judgment second.</h1>
       <p class="lead">
-        Squeezy uses local repository understanding, graph navigation, and
-        output shaping to prepare a narrowed task before asking a model to
-        reason about the code.
+        Squeezy uses local repository understanding, graph navigation, output
+        shaping, compaction, and routing to prepare a narrower task before
+        asking a model to reason about code.
       </p>
     </div>
   </section>
@@ -78,12 +78,35 @@ import { operatingLoop, toolSurface } from "../facts";
 
   <section class="section">
     <div class="section-header">
-      <span class="eyebrow">tools</span>
-      <h2>The local tool surface is designed to reduce repeated paid context.</h2>
+      <span class="eyebrow">cost levers</span>
+      <h2>The saving happens across several local mechanisms.</h2>
     </div>
     <div class="grid-3">
       {
-        toolSurface.map((fact) => (
+        costPillars.map((fact) => (
+          <article class="card">
+            <span class="label">{fact.label}</span>
+            <h3>{fact.title}</h3>
+            <p>{fact.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">product surface</span>
+      <h2>Convenience features support the coding loop.</h2>
+      <p>
+        Squeezy is still a coding agent. Permissions, sessions, provider
+        routing, local skills, MCP/web access, and validation workflows exist to
+        keep the graph-first loop usable in real work.
+      </p>
+    </div>
+    <div class="grid-3">
+      {
+        productSubjects.slice(0, 6).map((fact) => (
           <article class="card">
             <span class="label">{fact.label}</span>
             <h3>{fact.title}</h3>

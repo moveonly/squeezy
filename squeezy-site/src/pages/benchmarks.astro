@@ -1,86 +1,106 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
-import TerminalWindow from "../components/TerminalWindow.astro";
-import Wip from "../components/Wip.astro";
-import { benchmarkFacts } from "../facts";
+import CostChart from "../components/CostChart.astro";
+import { accuracyRows, benchmarkRows, benchmarkSummary } from "../facts";
 ---
 
 <BaseLayout
-  title="Benchmark methodology · Squeezy"
-  description="How Squeezy will measure cost savings from graph navigation, exact reads, receipts, and output shaping."
+  title="Benchmarks · Squeezy"
+  description="Measured Squeezy cost, graph accuracy, and benchmark caveats from checked-in repository data."
   active="benchmarks"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
-      <span class="eyebrow">benchmark methodology</span>
-      <h1>How we'll measure cost savings.</h1>
+      <span class="eyebrow">benchmarks</span>
+      <h1>Show the savings and the losses.</h1>
       <p class="lead">
-        This page documents the method for measuring how much provider context
-        Squeezy avoids by doing code discovery locally first. Numbers ship once
-        the report is reproducible end-to-end.
+        The public benchmark story is intentionally narrow: one checked-in
+        Mini suite, every language row visible, and accuracy caveats next to
+        the charts.
       </p>
     </div>
   </section>
 
   <section class="section">
-    <div class="grid-2 align-center">
-      <TerminalWindow title="planned report shape">
-        <div class="terminal-body">
-          <div class="terminal-line">
-            <span class="green">quality</span>
-            <span>navigation accuracy, missed symbols, false positives</span>
-          </div>
-          <div class="terminal-line">
-            <span class="cyan">local work</span>
-            <span>graph queries, exact reads, receipt hits, output spills</span>
-          </div>
-          <div class="terminal-line">
-            <span class="amber">cost</span>
-            <span>model-visible bytes, provider tokens, repeated context avoided</span>
-          </div>
-          <div class="terminal-line">
-            <span class="muted">baseline</span>
-            <span>graph-first discovery compared with ordinary search and reads</span>
-          </div>
-          <div class="terminal-line">
-            <Wip label="WIP" />
-            <span>numbers pending the first reproducible report</span>
-          </div>
-        </div>
-      </TerminalWindow>
-      <div class="list">
-        {
-          benchmarkFacts.map((fact) => (
-            <div class="list-item">
-              <span class="num">{fact.label.slice(0, 2)}</span>
-              <div>
-                <h3>{fact.title}</h3>
-                <p>{fact.body}</p>
-              </div>
-            </div>
-          ))
-        }
-      </div>
+    <div class="section-header wide">
+      <span class="eyebrow">cost data</span>
+      <h2>{benchmarkSummary.totalDelta} lower total spend across the measured Mini suite.</h2>
+      <p>
+        {benchmarkSummary.suite} Squeezy was cheaper on {benchmarkSummary.wins}
+        rows and at parity or more expensive on {benchmarkSummary.losses} rows.
+        A win requires 100% measured recall and at least a 5% lower cost.
+      </p>
     </div>
+    <CostChart rows={benchmarkRows} />
+    <p class="footnote">
+      Source: <code>docs/internal/eval-findings/mini-vs-codex-realworld.csv</code>.
+      Squeezy cost includes parent and delegate subagent spend. This is not a
+      universal provider-independent savings claim.
+    </p>
   </section>
 
   <section class="section band">
     <div class="section-header">
-      <span class="eyebrow">publish criteria</span>
-      <h2>The page stays under construction until the benchmark is reproducible.</h2>
+      <span class="eyebrow">what the chart means</span>
+      <h2>The graph helps when code discovery would otherwise become context-heavy.</h2>
       <p>
-        Public results should include the corpus, the baseline, the commands,
-        the measured token or byte counters, and the quality checks. A savings
-        number without that evidence should not ship.
+        The best public reading is practical: graph navigation can lower model
+        spend on multi-file code-navigation tasks, but the graph is not free.
+        Small or read-heavy tasks can sit near parity or lose.
       </p>
-      <div class="actions">
-        <a class="button" href="/docs/cost-receipts/" data-track-click="benchmark_cost_docs">
-          Cost &amp; receipts
-        </a>
-        <a class="button secondary" href="/docs/semantic-navigation/" data-track-click="benchmark_graph_docs">
-          Graph docs
-        </a>
-      </div>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">include losses</span>
+        <h3>Four rows are not wins</h3>
+        <p>C#, Go, Java, and Ruby are shown as losses or near-parity rows in the checked-in CSV. Hiding them would overstate the product.</p>
+      </article>
+      <article class="card">
+        <span class="label">quality first</span>
+        <h3>Cost alone is not enough</h3>
+        <p>The benchmark only counts a win when recall holds. Cheaper wrong answers are not treated as product wins.</p>
+      </article>
+      <article class="card">
+        <span class="label">task scope</span>
+        <h3>This is code navigation data</h3>
+        <p>The suite measures real-world navigation prompts across languages. It does not claim every editing, debugging, or creative task is cheaper.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">graph validation</span>
+      <h2>Benchmarks also measure whether local graph evidence is accurate.</h2>
+      <p>
+        Squeezy uses compiler and language-service oracles in benchmark mode to
+        check local tree-sitter graph output. Those oracles are validation
+        tools, not production navigation dependencies.
+      </p>
+    </div>
+    <div class="matrix">
+      {
+        accuracyRows.map((row) => (
+          <article class="matrix-row">
+            <div><h3>{row.name}</h3></div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill ok">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section compact band">
+    <div class="section-header">
+      <span class="eyebrow">methodology guardrails</span>
+      <h2>What not to infer from this page.</h2>
+      <p>
+        Do not read this as "Squeezy is always cheaper" or "the graph has
+        perfect code understanding." The current safe claim is that Squeezy has
+        a measured cost-saving path for code navigation, with the data and
+        losses published beside the claim.
+      </p>
     </div>
   </section>
 </BaseLayout>

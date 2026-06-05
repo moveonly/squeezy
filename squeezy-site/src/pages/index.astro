@@ -1,14 +1,26 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
+import CostChart from "../components/CostChart.astro";
+import EvidenceLoop from "../components/EvidenceLoop.astro";
 import GitHubIcon from "../components/GitHubIcon.astro";
 import TerminalWindow from "../components/TerminalWindow.astro";
-import EvidenceLoop from "../components/EvidenceLoop.astro";
 import { SITE } from "../config";
-import { homepageCards, optimizationCards, operatingLoop, productPosition, toolSurface } from "../facts";
+import {
+  accuracyRows,
+  benchmarkRows,
+  benchmarkSummary,
+  costPillars,
+  heroMetrics,
+  operatingLoop,
+  productPosition,
+  productSubjects,
+  providerGroups,
+  trustRows
+} from "../facts";
 ---
 
 <BaseLayout
-  title="Squeezy · Local-first coding agent"
+  title="Squeezy · Local code understanding before model context"
   description={SITE.description}
   active="home"
   jsonLd={true}
@@ -19,11 +31,10 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
       <h1>{productPosition.title}</h1>
       <p class="lead">{productPosition.lead}</p>
       <div class="hero-actions">
-        <a class="button" href="/install/" data-track-click="hero_install">
-          Install Squeezy
-        </a>
-        <a class="button secondary" href="/docs/" data-track-click="hero_docs">
-          Read technical docs
+        <a class="button" href="/install/" data-track-click="hero_install">Install Squeezy</a>
+        <a class="button secondary" href="/benchmarks/" data-track-click="hero_benchmarks">See measured data</a>
+        <a class="button secondary" href={SITE.repoUrl} data-track-click="hero_github" data-track-target="github">
+          <GitHubIcon /> GitHub
         </a>
       </div>
     </div>
@@ -33,38 +44,31 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
   </section>
 
   <section class="metric-strip" aria-label="Squeezy product facts">
-    <div>
-      <span>Runtime</span>
-      <strong>Rust TUI</strong>
-    </div>
-    <div>
-      <span>Languages</span>
-      <strong>9 with native graph</strong>
-    </div>
-    <div>
-      <span>Providers</span>
-      <strong>6, BYO key</strong>
-    </div>
-    <div>
-      <span>License</span>
-      <strong>Apache 2.0</strong>
-    </div>
+    {
+      heroMetrics.map((metric) => (
+        <div>
+          <span>{metric.label}</span>
+          <strong>{metric.value}</strong>
+          <small>{metric.detail}</small>
+        </div>
+      ))
+    }
   </section>
 
   <section class="section">
-    <div class="section-header">
-      <span class="eyebrow">why it exists</span>
-      <h2>Code discovery should not be the most expensive part of an agent turn.</h2>
+    <div class="section-header wide">
+      <span class="eyebrow">cost strategy</span>
+      <h2>The saving is a method, not a magic discount.</h2>
       <p>
-        Large repositories create a predictable failure mode: the model spends
-        paid context reading, searching, and re-reading files before it knows
-        what matters. Squeezy moves that work to local analysis, then uses the
-        model for judgment, synthesis, and edits.
+        Squeezy tries to avoid the expensive default loop where a model searches,
+        reads, re-reads, and accumulates file dumps before it understands the
+        task. It spends local CPU first, sends compact evidence, and keeps enough
+        accounting to see where tokens went.
       </p>
     </div>
     <div class="grid-3">
       {
-        homepageCards.map((fact) => (
+        costPillars.map((fact) => (
           <article class="card">
             <span class="label">{fact.label}</span>
             <h3>{fact.title}</h3>
@@ -75,63 +79,31 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
     </div>
   </section>
 
-  <section class="section compact">
-    <div class="section-header">
-      <span class="eyebrow">how it differs</span>
-      <h2>A CLI/TUI agent that adds a persistent local graph.</h2>
-      <p>
-        Squeezy is a terminal agent, not an editor extension. It works with the
-        model providers you already use, and it adds a persistent local
-        semantic graph that other agents recompute from raw files every turn.
-        The graph is the cost mechanism: when an agent can answer a question
-        from local structure, it does, and the tokens stay available for the
-        work that actually needs a model.
-      </p>
-    </div>
-  </section>
-
   <section class="section band">
     <div class="grid-2 align-center">
       <div class="section-header">
-        <span class="eyebrow">agent loop</span>
-        <h2>Static analysis narrows the question before the model sees code.</h2>
+        <span class="eyebrow">measured data</span>
+        <h2>{benchmarkSummary.totalDelta} lower total model spend on the checked-in Mini suite.</h2>
         <p>
-          Squeezy builds and refreshes a local semantic graph from supported
-          languages. The model receives a narrowed task: symbols, callers,
-          references, spans, confidence, and the exact next read.
+          {benchmarkSummary.suite} The benchmark shows {benchmarkSummary.wins}
+          wins and {benchmarkSummary.losses} losses; the losses stay visible
+          because the graph is not always the cheapest path for every task.
         </p>
         <div class="actions">
-          <a class="button" href="/how-it-works/" data-track-click="home_how">How it works</a>
-          <a class="button secondary" href="/languages/" data-track-click="home_languages">Language coverage</a>
+          <a class="button" href="/benchmarks/" data-track-click="home_cost_data">Benchmark details</a>
+          <a class="button secondary" href="/docs/cost-receipts/" data-track-click="home_cost_docs">
+            Cost controls
+          </a>
         </div>
       </div>
-      <TerminalWindow title="squeezy session">
-        <div class="terminal-body">
-          <div class="terminal-line">
-            <span class="green">repo_map</span>
-            <span>language counts, graph coverage, source groups, next actions</span>
-          </div>
-          <div class="terminal-line">
-            <span class="cyan">symbol_context</span>
-            <span>path, span, confidence, freshness, provenance</span>
-          </div>
-          <div class="terminal-line">
-            <span class="amber">read_slice</span>
-            <span>exact code range after the graph narrows the target</span>
-          </div>
-          <div class="terminal-line">
-            <span class="muted">tools</span>
-            <span>bounded grep, glob, shell, web, and compiler tools when needed</span>
-          </div>
-        </div>
-      </TerminalWindow>
+      <CostChart rows={benchmarkRows} />
     </div>
   </section>
 
   <section class="section">
     <div class="section-header">
-      <span class="eyebrow">what changes</span>
-      <h2>The model receives a focused task, not a repo to skim.</h2>
+      <span class="eyebrow">agent loop</span>
+      <h2>Local graph evidence narrows the question before the model sees code.</h2>
     </div>
     <div class="flow">
       {
@@ -147,132 +119,139 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
   </section>
 
   <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">in the terminal</span>
-      <h2>What a Squeezy turn actually looks like.</h2>
-      <p>
-        Hand-authored transcript. The status line on every turn reports tool
-        calls, read bytes, receipt hits, spills, provider tokens, cache usage,
-        and estimated cost when the provider exposes enough data.
-      </p>
-    </div>
-    <TerminalWindow title="~/work/payments · squeezy">
-      <div class="terminal-body">
-        <div class="terminal-line">
-          <span class="prompt">&gt;</span>
-          <span class="command">find every caller of PaymentRouter::settle across the workspace</span>
+    <div class="grid-2 align-center">
+      <TerminalWindow title="squeezy session">
+        <div class="terminal-body">
+          <div class="terminal-line">
+            <span class="prompt">&gt;</span>
+            <span class="command">trace the call path for OrderRouter::settle</span>
+          </div>
+          <div class="terminal-line">
+            <span class="green">repo_map</span>
+            <span>Rust graph hot · changed files indexed · unsupported paths reported</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">decl_search</span>
+            <span>OrderRouter::settle -> crates/orders/src/router.rs:184</span>
+          </div>
+          <div class="terminal-line">
+            <span class="cyan">upstream_flow</span>
+            <span>7 callers · resolved=5 · candidate=2 · next: read_slice</span>
+          </div>
+          <div class="terminal-line">
+            <span class="amber">status</span>
+            <span>tools 4 · read bytes 1,284 · spills 0 · cached tokens tracked</span>
+          </div>
         </div>
-        <div class="terminal-line">
-          <span class="green">repo_map</span>
-          <span>4 crates · 312 modules · Rust first-class · graph hot</span>
-        </div>
-        <div class="terminal-line">
-          <span class="cyan">decl_search</span>
-          <span>PaymentRouter::settle → crates/payments/src/router.rs:184 (resolved)</span>
-        </div>
-        <div class="terminal-line">
-          <span class="cyan">upstream_flow</span>
-          <span>7 callers across 3 crates · confidence: resolved=5, candidate=2</span>
-        </div>
-        <div class="terminal-line">
-          <span class="amber">read_slice</span>
-          <span>router.rs:178-212 · 34 lines · hash dd1f0a</span>
-        </div>
-        <div class="terminal-line">
-          <span class="muted">status</span>
-          <span>tools 4 · bytes 1,284 · receipts 0 · spills 0 · tokens 2,150 · ~$0.006</span>
+      </TerminalWindow>
+      <div class="section-header">
+        <span class="eyebrow">coding first</span>
+        <h2>The product is a coding agent, not only a cost meter.</h2>
+        <p>
+          Cost reduction works because Squeezy treats languages as first-class
+          inputs. The graph can answer code navigation questions directly and
+          gives the model exact slices, confidence, provenance, and next actions.
+        </p>
+        <div class="actions">
+          <a class="button" href="/languages/" data-track-click="home_languages">Language support</a>
+          <a class="button secondary" href="/how-it-works/" data-track-click="home_how">How it works</a>
         </div>
       </div>
-    </TerminalWindow>
+    </div>
   </section>
 
   <section class="section">
-    <div class="section-header">
-      <span class="eyebrow">example tasks</span>
-      <h2>What you'd actually use it for.</h2>
+    <div class="section-header wide">
+      <span class="eyebrow">more than navigation</span>
+      <h2>The surrounding features make real sessions easier to operate.</h2>
       <p>
-        Three prompts that route through graph navigation first. The model only
-        sees the narrowed answer.
+        The graph is the core. Around it, Squeezy adds the pieces a coding agent
+        needs in practice: permissions, resumable state, provider flexibility,
+        local skills, MCP/web boundaries, and evaluation discipline.
       </p>
     </div>
     <div class="grid-3">
-      <article class="card">
-        <span class="label">navigation</span>
-        <h3>Find every caller of a function across a large monorepo.</h3>
-        <p class="example-prompt">"Where is PaymentRouter::settle called?"</p>
-        <p>Squeezy resolves the declaration from the graph, then walks upstream_flow. The model never sees full call-site files.</p>
-      </article>
-      <article class="card">
-        <span class="label">refactor</span>
-        <h3>Plan an API surface change and see what breaks.</h3>
-        <p class="example-prompt">"Rename `Tools` to `ToolRegistry` across crates/squeezy-tools."</p>
-        <p>Plan-mode uses plan_patch with graph impact context, then a bounded verify run reports compile failures without dumping each file.</p>
-      </article>
-      <article class="card">
-        <span class="label">review</span>
-        <h3>Review a diff and explain the risky changes.</h3>
-        <p class="example-prompt">"Review the current branch and flag anything load-bearing."</p>
-        <p>diff_context plus symbol_context return changed ranges with their callers and references. Whole-file dumps stay out of the prompt.</p>
-      </article>
+      {
+        productSubjects.map((fact) => (
+          <article class="card">
+            <span class="label">{fact.label}</span>
+            <h3>{fact.title}</h3>
+            <p>{fact.body}</p>
+          </article>
+        ))
+      }
     </div>
   </section>
 
   <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">optimization</span>
-      <h2>The cost work happens before the model call.</h2>
-      <p>
-        Squeezy avoids unnecessary provider work by design. The optimization
-        lives in local indexes, tool output shaping, receipt reuse, lazy schemas,
-        and explicit verification.
-      </p>
-    </div>
-    <div class="grid-3">
-      {
-        optimizationCards.map((fact) => (
-          <article class="card">
-            <span class="label">{fact.label}</span>
-            <h3>{fact.title}</h3>
-            <p>{fact.body}</p>
-          </article>
-        ))
-      }
+    <div class="grid-2">
+      <div>
+        <div class="section-header">
+          <span class="eyebrow">providers</span>
+          <h2>Bring your own model and keep the optimization local.</h2>
+          <p>
+            Squeezy is multi-provider, but routing and cost accounting stay
+            conservative: pricing depends on registry metadata, and cheap-model
+            routing stays within the configured provider.
+          </p>
+        </div>
+        <div class="matrix compact-matrix">
+          {
+            providerGroups.map((row) => (
+              <article class="matrix-row">
+                <h3>{row.name}</h3>
+                <p>{row.detail}</p>
+                {row.status && <span class="status-pill">{row.status}</span>}
+              </article>
+            ))
+          }
+        </div>
+      </div>
+      <div>
+        <div class="section-header">
+          <span class="eyebrow">trust surface</span>
+          <h2>Keep external actions visible.</h2>
+          <p>
+            The site should not pretend a terminal agent is magic or invisible.
+            Squeezy makes model calls, tools, reports, and telemetry explicit
+            surfaces with local controls and documented platform limits.
+          </p>
+        </div>
+        <div class="matrix compact-matrix">
+          {
+            trustRows.map((row) => (
+              <article class="matrix-row">
+                <h3>{row.name}</h3>
+                <p>{row.detail}</p>
+                {row.status && <span class="status-pill">{row.status}</span>}
+              </article>
+            ))
+          }
+        </div>
+      </div>
     </div>
   </section>
 
   <section class="section">
     <div class="section-header">
-      <span class="eyebrow">product surface</span>
-      <h2>A tool surface designed for code work, not chat.</h2>
+      <span class="eyebrow">validation</span>
+      <h2>The graph is tested against language-specific oracles.</h2>
+      <p>
+        Production navigation stays tree-sitter/local-analysis first. Benchmarks
+        use slower compiler or language-service oracles to measure where the
+        local graph is accurate and where caveats still matter.
+      </p>
     </div>
-    <div class="grid-3">
+    <div class="matrix">
       {
-        toolSurface.map((fact) => (
-          <article class="card">
-            <span class="label">{fact.label}</span>
-            <h3>{fact.title}</h3>
-            <p>{fact.body}</p>
+        accuracyRows.map((row) => (
+          <article class="matrix-row">
+            <div><h3>{row.name}</h3></div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill ok">{row.status}</span>}
           </article>
         ))
       }
-    </div>
-  </section>
-
-  <section class="section compact band">
-    <div class="section-header">
-      <span class="eyebrow">next</span>
-      <h2>Review the technical details.</h2>
-      <p>
-        Read the graph design, optimization controls, language coverage,
-        provider support, install flow, and issue-reporting path.
-      </p>
-      <div class="actions">
-        <a class="button" href="/docs/" data-track-click="home_docs">Technical docs</a>
-        <a class="button secondary" href="/providers/" data-track-click="home_providers">Providers</a>
-        <a class="button secondary" href={SITE.repoUrl} data-track-click="home_repo" data-track-target="github">
-          <GitHubIcon /> GitHub
-        </a>
-      </div>
     </div>
   </section>
 </BaseLayout>
