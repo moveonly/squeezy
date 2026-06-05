@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -1583,7 +1583,7 @@ impl ClientHandler for SqueezyMcpClientHandler {
                     },
                 );
                 let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
-                let _pause = self.pause_state.enter();
+                let _pause = self.pause_state.enter(&self.server_name);
                 let response = handler(ui_request).await;
                 Ok(CreateElicitationResult {
                     action: match response.action {
@@ -1736,46 +1736,66 @@ impl ClientHandler for SqueezyMcpClientHandler {
 
 #[derive(Clone)]
 struct ElicitationPauseState {
-    active: Arc<AtomicUsize>,
-    tx: Arc<watch::Sender<usize>>,
+    active: Arc<Mutex<BTreeMap<String, usize>>>,
+    sequence: Arc<AtomicU64>,
+    tx: Arc<watch::Sender<u64>>,
 }
 
 impl Default for ElicitationPauseState {
     fn default() -> Self {
-        let (tx, _) = watch::channel(0usize);
+        let (tx, _) = watch::channel(0u64);
         Self {
-            active: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            sequence: Arc::new(AtomicU64::new(0)),
             tx: Arc::new(tx),
         }
     }
 }
 
 impl ElicitationPauseState {
-    fn enter(&self) -> ElicitationPauseGuard {
-        let next = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.tx.send(next);
+    fn enter(&self, server_name: &str) -> ElicitationPauseGuard {
+        if let Ok(mut active) = self.active.lock() {
+            *active.entry(server_name.to_string()).or_default() += 1;
+        }
+        self.notify();
         ElicitationPauseGuard {
             state: self.clone(),
+            server_name: server_name.to_string(),
         }
     }
 
-    fn subscribe(&self) -> watch::Receiver<usize> {
+    fn is_paused(&self, server_name: &str) -> bool {
+        self.active
+            .lock()
+            .is_ok_and(|active| active.get(server_name).copied().unwrap_or_default() > 0)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
         self.tx.subscribe()
+    }
+
+    fn notify(&self) {
+        let next = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.tx.send(next);
     }
 }
 
 struct ElicitationPauseGuard {
     state: ElicitationPauseState,
+    server_name: String,
 }
 
 impl Drop for ElicitationPauseGuard {
     fn drop(&mut self) {
-        let next = self
-            .state
-            .active
-            .fetch_sub(1, Ordering::SeqCst)
-            .saturating_sub(1);
-        let _ = self.state.tx.send(next);
+        if let Ok(mut active) = self.state.active.lock()
+            && let Some(count) = active.get_mut(&self.server_name)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.server_name);
+            }
+        }
+        self.state.notify();
     }
 }
 
@@ -2068,10 +2088,10 @@ async fn with_timeout<T>(
     future: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
     let mut pause_rx = pause_state.subscribe();
-    let timeout = Duration::from_millis(timeout_ms);
+    let mut remaining = Duration::from_millis(timeout_ms);
     let mut future = Box::pin(future);
     loop {
-        if *pause_rx.borrow() > 0 {
+        if pause_state.is_paused(server_name) {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(McpError::Cancelled { server: server_name.to_string() }),
                 changed = pause_rx.changed() => {
@@ -2085,9 +2105,16 @@ async fn with_timeout<T>(
                 result = &mut future => return result,
             }
         } else {
+            if remaining.is_zero() {
+                return Err(McpError::Timeout {
+                    server: server_name.to_string(),
+                    timeout_ms,
+                });
+            }
+            let started = Instant::now();
             tokio::select! {
                 _ = cancel.cancelled() => return Err(McpError::Cancelled { server: server_name.to_string() }),
-                _ = tokio::time::sleep(timeout) => return Err(McpError::Timeout {
+                _ = tokio::time::sleep(remaining) => return Err(McpError::Timeout {
                     server: server_name.to_string(),
                     timeout_ms,
                 }),
@@ -2098,6 +2125,7 @@ async fn with_timeout<T>(
                             message: "MCP timeout pause watcher closed".to_string(),
                         });
                     }
+                    remaining = remaining.saturating_sub(started.elapsed());
                 }
                 result = &mut future => return result,
             }

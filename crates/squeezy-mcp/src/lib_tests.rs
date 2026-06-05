@@ -325,6 +325,82 @@ fn separate_startup_and_tool_timeouts_apply() {
     assert_eq!(tool_call_timeout_ms(&server), 120_000);
 }
 
+#[tokio::test]
+async fn timeout_pause_does_not_affect_other_servers() {
+    let pause_state = ElicitationPauseState::default();
+    let _pause = pause_state.enter("docs");
+    let error = with_timeout(
+        "other",
+        20,
+        CancellationToken::new(),
+        pause_state,
+        std::future::pending::<McpResult<()>>(),
+    )
+    .await
+    .expect_err("other server must still time out");
+
+    assert!(matches!(error, McpError::Timeout { server, .. } if server == "other"));
+}
+
+#[tokio::test]
+async fn timeout_pause_suspends_same_server_until_guard_drops() {
+    let pause_state = ElicitationPauseState::default();
+    let pause = pause_state.enter("docs");
+    let task_state = pause_state.clone();
+    let handle = tokio::spawn(async move {
+        with_timeout(
+            "docs",
+            20,
+            CancellationToken::new(),
+            task_state,
+            std::future::pending::<McpResult<()>>(),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !handle.is_finished(),
+        "same-server pause must suspend timeout"
+    );
+    drop(pause);
+
+    let error = tokio::time::timeout(Duration::from_millis(100), handle)
+        .await
+        .expect("timeout should resume after pause")
+        .expect("task should not panic")
+        .expect_err("pending future must time out");
+    assert!(matches!(error, McpError::Timeout { server, .. } if server == "docs"));
+}
+
+#[tokio::test]
+async fn timeout_pause_preserves_elapsed_budget() {
+    let pause_state = ElicitationPauseState::default();
+    let task_state = pause_state.clone();
+    let handle = tokio::spawn(async move {
+        with_timeout(
+            "docs",
+            80,
+            CancellationToken::new(),
+            task_state,
+            std::future::pending::<McpResult<()>>(),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let pause = pause_state.enter("docs");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    drop(pause);
+
+    let error = tokio::time::timeout(Duration::from_millis(70), handle)
+        .await
+        .expect("timeout should use remaining budget, not restart")
+        .expect("task should not panic")
+        .expect_err("pending future must time out");
+    assert!(matches!(error, McpError::Timeout { server, .. } if server == "docs"));
+}
+
 #[test]
 fn tool_cache_key_changes_when_timeout_split_changes() {
     let mut server = fixture_server(true, Some("unused"));
