@@ -1,0 +1,51 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import { leverGroups } from "../../facts";
+
+const slugs: Record<string, string> = {
+  understand: "/docs/cost-saving/understand/",
+  reuse: "/docs/cost-saving/reuse/",
+  "right-size": "/docs/cost-saving/right-size/",
+  "see-the-bill": "/docs/cost-saving/see-the-bill/"
+};
+---
+
+<DocsLayout
+  title="Cost-saving strategies · Squeezy docs"
+  description="The four layers Squeezy uses to keep model spend down: understand the code first, don't pay for the same bytes twice, right-size every turn, and see the bill."
+  activeDoc="/docs/cost-saving/"
+  eyebrow="cost"
+  heading="Cost-saving strategies."
+  lead="Squeezy lowers spend with four independent layers that stack on a single turn. Local code understanding is the first layer, not the whole story. Each layer has its own page with the full detail."
+>
+  {
+    leverGroups.map((group, index) => (
+      <section class="doc-block">
+        <div class="doc-prose">
+          <h2>{`${index + 1}. ${group.title}`}</h2>
+          <p>{group.why}</p>
+          <ul>
+            {group.levers.map((lever) => (
+              <li><strong>{lever.title}.</strong> {lever.body}</li>
+            ))}
+          </ul>
+          <p><a href={slugs[group.id]}>Read more: {group.title} →</a></p>
+        </div>
+      </section>
+    ))
+  }
+
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>What this does not promise</h2>
+      <p>
+        Squeezy is not always cheaper on every task. Model choice, provider
+        pricing, cache support, task shape, and codebase size all affect the
+        result. The point is that there are several independent ways to cut
+        waste, and the <a href="/docs/cost-saving/see-the-bill/">accounting</a>
+        to show what actually happened, see the <a href="/benchmarks/">benchmarks</a>
+        for measured numbers.
+      </p>
+    </div>
+  </section>
+</DocsLayout>

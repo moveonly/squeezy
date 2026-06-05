@@ -1,69 +1,18 @@
 ---
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import DocSections from "../../components/DocSections.astro";
+import { docPages } from "../../docContent";
+
+const page = docPages.permissions;
 ---
 
 <DocsLayout
-  title="Permissions · Squeezy"
-  description="Squeezy permission policy, shell sandboxing, checkpoints, and verification controls."
+  title="Permissions & safety · Squeezy docs"
+  description="Choose the permission mode that fits the situation, and understand what the shell sandbox protects on macOS, Linux, and Windows."
   activeDoc="/docs/permissions/"
-  eyebrow="permissions"
-  heading="Local power is gated by local policy."
-  lead="Squeezy can read, edit, run shell commands, call compilers, fetch web content, and use MCP tools, but those capabilities go through explicit policy checks."
+  eyebrow="policy"
+  heading={page.title}
+  lead={page.intro}
 >
-  <section class="doc-block">
-    <h2>Policy modes</h2>
-    <div class="doc-card-grid">
-      <article class="card">
-        <span class="label">default</span>
-        <h3>Workspace write</h3>
-        <p>Allows workspace reads, searches, edits, local shell, git, and compiler commands. Web, MCP, destructive actions, and outside-workspace paths still ask.</p>
-      </article>
-      <article class="card">
-        <span class="label">auto_review</span>
-        <h3>Reviewer-assisted</h3>
-        <p>Uses the same workspace defaults, but eligible read, search, network, and MCP prompts can be handled by the AI reviewer. The preset fixes that reviewer allowlist.</p>
-      </article>
-      <article class="card">
-        <span class="label">full_access</span>
-        <h3>Trusted work</h3>
-        <p>Allows all capability defaults, permits outside-workspace file paths, and turns off the local shell OS sandbox.</p>
-      </article>
-      <article class="card">
-        <span class="label">custom</span>
-        <h3>Granular defaults</h3>
-        <p>Exposes per-capability allow, ask, and deny defaults for read, search, edit, shell, ignored search, network, MCP, git, compiler, and destructive operations.</p>
-      </article>
-    </div>
-  </section>
-
-  <section class="doc-block">
-    <h2>Capability classes</h2>
-    <div class="doc-card-grid">
-      <article class="card">
-        <span class="label">read</span>
-        <h3>Filesystem and graph reads</h3>
-        <p>Graph reads are local and read-only. Raw file reads, grep, glob, and tool-output reads are bounded and receipt-backed.</p>
-      </article>
-      <article class="card">
-        <span class="label">mutate</span>
-        <h3>Edits and commands</h3>
-        <p>Plan mode hides mutating tools. Build mode exposes them behind the configured permission engine and optional checkpoints.</p>
-      </article>
-      <article class="card">
-        <span class="label">network</span>
-        <h3>Web and MCP</h3>
-        <p>Web search/fetch and MCP tools are routed through capability checks, output caps, redaction, and remote-evidence labels.</p>
-      </article>
-      <article class="card">
-        <span class="label">verify</span>
-        <h3>Compiler and test evidence</h3>
-        <p>Verification commands provide build, test, lint, and compiler evidence when the task calls for it.</p>
-      </article>
-    </div>
-  </section>
-
-  <section class="doc-block">
-    <h2>Sandbox note</h2>
-    <p>Default and auto-review modes use `network = "allow_when_approved"` unless shell sandbox network policy is explicitly configured: approved network-classified shell commands can open the network namespace, while other shell commands still run with network denied. macOS and Linux can use stronger filesystem and network sandboxing. On Windows, shell sandboxing is Job-Object-only and filesystem/network isolation degrades to best-effort-unavailable; required mode denies before spawn.</p>
-  </section>
+  <DocSections page={page} />
 </DocsLayout>

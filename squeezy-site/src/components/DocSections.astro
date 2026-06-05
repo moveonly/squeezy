@@ -1,0 +1,43 @@
+---
+import type { DocPage } from "../docContent";
+
+const { page } = Astro.props as { page: DocPage };
+---
+
+{
+  page.sections.map((section) => (
+    <section class="doc-block">
+      <div class="doc-prose">
+        <h2>{section.heading}</h2>
+        {section.paragraphs.map((p) => (
+          <p>{p}</p>
+        ))}
+        {section.bullets && (
+          <ul>
+            {section.bullets.map((b) => (
+              <li>{b}</li>
+            ))}
+          </ul>
+        )}
+        {section.code && (
+          <pre><code>{section.code}</code></pre>
+        )}
+      </div>
+    </section>
+  ))
+}
+
+{
+  page.related && page.related.length > 0 && (
+    <section class="doc-block">
+      <div class="doc-prose">
+        <h2>Related</h2>
+        <ul>
+          {page.related.map((link) => (
+            <li><a href={link.href}>{link.label}</a></li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  )
+}

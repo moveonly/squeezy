@@ -1,0 +1,18 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import DocSections from "../../components/DocSections.astro";
+import { docPages } from "../../docContent";
+
+const page = docPages.howItWorks;
+---
+
+<DocsLayout
+  title="How it works · Squeezy docs"
+  description="How Squeezy works: do the cheap, repetitive work locally and spend model tokens on the hard reasoning, local code understanding, plan and build modes, subagents, routing, and verification."
+  activeDoc="/docs/how-it-works/"
+  eyebrow="concepts"
+  heading={page.title}
+  lead={page.intro}
+>
+  <DocSections page={page} />
+</DocsLayout>

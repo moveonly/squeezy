@@ -1,0 +1,41 @@
+---
+import type { BenchmarkRow } from "../facts";
+
+const { rows } = Astro.props as { rows: BenchmarkRow[] };
+const maxRatio = Math.max(...rows.map((row) => row.ratio), 1.25);
+const parityLeft = `${Math.min(100, (1 / maxRatio) * 100).toFixed(1)}%`;
+---
+
+<div class="cost-chart" role="img" aria-label="Squeezy cost ratio by language. Values below 1.0 are cheaper than the baseline.">
+  <div class="chart-axis" aria-hidden="true">
+    <span>0.0</span>
+    <span>0.5</span>
+    <span>1.0 parity</span>
+    <span>{maxRatio.toFixed(2)}</span>
+  </div>
+  {
+    rows
+      .slice()
+      .sort((a, b) => a.ratio - b.ratio)
+      .map((row) => {
+        const width = `${Math.min(100, (row.ratio / maxRatio) * 100).toFixed(1)}%`;
+        const saving = Math.round((1 - row.ratio) * 100);
+        return (
+          <div class:list={["chart-row", row.verdict === "WIN" ? "win" : "loss"]}>
+            <div class="chart-label">
+              <strong>{row.lang}</strong>
+              <span>{row.verdict === "WIN" ? `${saving}% lower` : `${row.ratio.toFixed(2)}x baseline`}</span>
+            </div>
+            <div class="chart-track">
+              <span class="parity-line" style={`left: ${parityLeft}`} aria-hidden="true"></span>
+              <span class="chart-bar" style={`width: ${width}`}></span>
+            </div>
+            <div class="chart-value">
+              <strong>{row.ratio.toFixed(2)}</strong>
+              <span>${row.squeezyCost.toFixed(4)}</span>
+            </div>
+          </div>
+        );
+      })
+  }
+</div>

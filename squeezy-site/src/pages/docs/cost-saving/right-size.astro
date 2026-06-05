@@ -1,0 +1,18 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import DocSections from "../../../components/DocSections.astro";
+import { docPages } from "../../../docContent";
+
+const page = docPages.rightSize;
+---
+
+<DocsLayout
+  title={`${page.title} · Squeezy docs`}
+  description="How Squeezy matches effort to each turn: cheap-model routing, conversation compaction, shaped tool output, verbosity controls, and subagents."
+  activeDoc="/docs/cost-saving/right-size/"
+  eyebrow="cost-saving · layer 3"
+  heading={page.title}
+  lead={page.intro}
+>
+  <DocSections page={page} />
+</DocsLayout>

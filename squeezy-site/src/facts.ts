@@ -10,195 +10,315 @@ export type MatrixRow = {
   status?: string;
 };
 
-export const productPosition = {
-  eyebrow: "Local-first coding agent",
-  title: "Understand the repo before you ask the model.",
-  lead:
-    "Squeezy is a terminal coding agent that builds a local semantic graph of your codebase, then answers navigation, reference, and impact questions from that graph instead of from paid model context."
+export type BenchmarkRow = {
+  lang: string;
+  squeezyCost: number;
+  baselineCost: number;
+  ratio: number;
+  recall: number;
+  verdict: "WIN" | "LOSS";
 };
 
-export const homepageCards: FactCard[] = [
+export const productPosition = {
+  eyebrow: "coding agent",
+  title: "Your CPU does the deterministic, repetitive work.",
+  titleCont: "Your tokens go to the thinking.",
+  lead:
+    "Squeezy does the deterministic, repetitive work on your machine and saves model tokens for the reasoning that actually needs them. Same coding work, smaller bill.",
+  note: "Written in Rust. Bring your own model."
+};
+
+export const heroMetrics = [
+  { label: "Languages", value: "15", detail: "with local code understanding" },
+  { label: "Saving layers", value: "4", detail: "working together on every turn" },
+  { label: "Providers", value: "18", detail: "presets, plus any compatible endpoint" },
+  { label: "Platforms", value: "3", detail: "macOS, Linux, Windows" }
+];
+
+export const genericProof = {
+  stat: "Lower cost",
+  detail: "across all 15 languages in our same-task benchmark, at about 0.65× the baseline.",
+  note: "Measured against other agents on matched tasks. See the benchmark page for the full method and the model-by-model breakdown."
+};
+
+export type LeverGroup = {
+  id: string;
+  label: string;
+  title: string;
+  why: string;
+  levers: FactCard[];
+};
+
+// The four saving layers, in narrative order: understand -> reuse -> right-size -> observe.
+// Local code understanding is shown first but is co-equal with caching and routing.
+export const leverGroups: LeverGroup[] = [
   {
-    label: "Local first",
-    title: "Static analysis does the repetitive work",
-    body:
-      "Squeezy maps the repository locally, then answers common navigation questions from the graph before the model touches source text."
+    id: "understand",
+    label: "understand first",
+    title: "Understand the code first",
+    why:
+      "Before it asks the model anything, Squeezy reads your repository locally and works out which files and which lines matter.",
+    levers: [
+      {
+        label: "local code understanding",
+        title: "Read the relevant code, not the whole file",
+        body:
+          "Squeezy navigates your code on your machine to find the right declarations, callers, and slices, then sends the model those instead of dumping entire files into the prompt."
+      }
+    ]
   },
   {
-    label: "Token budget",
-    title: "Less context sent without losing the trail",
-    body:
-      "Graph tools return paths, spans, hashes, confidence labels, provenance, and next actions. Raw reads stay available, narrowed to the exact slice when structure is enough."
+    id: "reuse",
+    label: "don't pay twice",
+    title: "Don't pay for the same bytes twice",
+    why:
+      "Most of a coding session repeats: the same instructions, the same files, the same command output. Squeezy keeps that out of the bill.",
+    levers: [
+      {
+        label: "prompt caching",
+        title: "Reuse stable context",
+        body:
+          "Where a provider supports prompt caching, Squeezy keeps stable instructions and tool context cache-friendly so repeated turns are charged less."
+      },
+      {
+        label: "receipts",
+        title: "Replace repeated output with a receipt",
+        body:
+          "When the same file or command result would be sent again, Squeezy sends a small receipt that points back to the earlier result instead of resending the bytes."
+      },
+      {
+        label: "deferred tool schemas",
+        title: "Load tool definitions on demand",
+        body:
+          "The model sees a compact, stable index of tools first and pulls a full tool definition only when it needs one, which also keeps the cached prompt prefix intact."
+      }
+    ]
   },
   {
-    label: "Terminal app",
-    title: "Fast local agent loop",
-    body:
-      "Squeezy runs as a single Rust binary with deterministic local work, explicit verification, and bounded tool output."
+    id: "right-size",
+    label: "right-size turns",
+    title: "Right-size every turn",
+    why:
+      "Not every turn deserves the biggest model or the longest history. Squeezy matches the effort and the context to the task in front of it.",
+    levers: [
+      {
+        label: "routing",
+        title: "Send simple turns to a cheaper model",
+        body:
+          "Obvious mechanical requests start on the provider's small, fast model and escalate to the main model only when the task turns out to be hard."
+      },
+      {
+        label: "compaction",
+        title: "Keep long sessions bounded",
+        body:
+          "As a conversation grows, older state is folded into a short summary of goal, progress, decisions, and next steps while recent work stays intact, so turn 30 doesn't pay for turns 1 through 29."
+      },
+      {
+        label: "shaped output",
+        title: "Send the useful part of command output",
+        body:
+          "Build, test, search, and diff output is trimmed to the part the model can act on, with the full output kept available if it is needed."
+      },
+      {
+        label: "verbosity",
+        title: "Control how much is said",
+        body:
+          "Response and tool-output verbosity settings keep normal turns concise, with full detail available on request."
+      },
+      {
+        label: "subagents",
+        title: "Keep exploration off the main thread",
+        body:
+          "Short-lived subagents research or review in their own context and hand back a summary, instead of expanding the main conversation."
+      }
+    ]
+  },
+  {
+    id: "see-the-bill",
+    label: "see the bill",
+    title: "See the bill",
+    why:
+      "None of this is a black box. Squeezy shows where the tokens went so you can trust, and tune, the savings.",
+    levers: [
+      {
+        label: "accounting",
+        title: "Show where tokens go",
+        body:
+          "Cost and context views separate input, output, cached input, tool output, and reasoning, with dollar estimates where the provider exposes them."
+      }
+    ]
   }
 ];
 
-export const optimizationCards: FactCard[] = [
+export const productSubjects: FactCard[] = [
   {
-    label: "static graph",
-    title: "Semantic navigation before file reads",
+    label: "coding first",
+    title: "A coding agent for real code work",
     body:
-      "repo_map, declaration search, references, hierarchy, symbol context, upstream/downstream flow, and read_slice work from local graph state and return narrowed results with paths, spans, and confidence."
+      "Squeezy can inspect code, edit files, run commands, manage plans, resume sessions, and keep model work tied to local evidence."
   },
   {
-    label: "read shaping",
-    title: "Exact slices, diff reads, and receipts",
+    label: "languages",
+    title: "Language-aware code understanding",
     body:
-      "Read tools return bounded slices, changed ranges, receipt stubs for unchanged content, and spill handles for large output. The model gets enough to act without paying for repeated bytes."
+      "Fifteen supported languages get local code understanding and navigation before the model reaches for broad file context."
   },
   {
-    label: "tool budget",
-    title: "Budget counters visible in the session",
+    label: "permissions",
+    title: "Reviewable local actions",
     body:
-      "Per-turn counters track tool calls, read bytes, search hits, receipt hits, spills, denials, provider tokens, cache usage, and estimated cost when a provider exposes enough data."
+      "File edits, shell commands, web access, MCP calls, destructive actions, and outside-workspace paths stay behind configurable policies."
+  },
+  {
+    label: "sessions",
+    title: "Work can be resumed and audited",
+    body:
+      "Local logs, resume state, reports, labels, forks, and feedback keep long coding sessions inspectable."
+  },
+  {
+    label: "providers",
+    title: "Bring your preferred model",
+    body:
+      "Use native providers, compatible endpoints, OAuth-style routes, or local runtimes while Squeezy keeps the optimization local."
+  },
+  {
+    label: "docs",
+    title: "Technical detail stays in docs",
+    body:
+      "Marketing pages explain outcomes. Documentation covers configuration, permissions, cost receipts, providers, and code navigation internals."
   }
 ];
+
+export const benchmarkRows: BenchmarkRow[] = [
+  { lang: "C", squeezyCost: 0.0454, baselineCost: 0.0504, ratio: 0.9, recall: 100, verdict: "WIN" },
+  { lang: "C++", squeezyCost: 0.0557, baselineCost: 0.0689, ratio: 0.81, recall: 100, verdict: "WIN" },
+  { lang: "C#", squeezyCost: 0.016, baselineCost: 0.0341, ratio: 0.47, recall: 100, verdict: "WIN" },
+  { lang: "Dart", squeezyCost: 0.1049, baselineCost: 0.1802, ratio: 0.58, recall: 100, verdict: "WIN" },
+  { lang: "Go", squeezyCost: 0.0222, baselineCost: 0.0477, ratio: 0.47, recall: 100, verdict: "WIN" },
+  { lang: "Java", squeezyCost: 0.0488, baselineCost: 0.1094, ratio: 0.45, recall: 100, verdict: "WIN" },
+  { lang: "JS", squeezyCost: 0.0122, baselineCost: 0.0182, ratio: 0.67, recall: 100, verdict: "WIN" },
+  { lang: "Kotlin", squeezyCost: 0.0271, baselineCost: 0.0416, ratio: 0.65, recall: 100, verdict: "WIN" },
+  { lang: "PHP", squeezyCost: 0.0261, baselineCost: 0.0418, ratio: 0.62, recall: 100, verdict: "WIN" },
+  { lang: "Python", squeezyCost: 0.0155, baselineCost: 0.0193, ratio: 0.81, recall: 100, verdict: "WIN" },
+  { lang: "Ruby", squeezyCost: 0.0134, baselineCost: 0.0496, ratio: 0.27, recall: 100, verdict: "WIN" },
+  { lang: "Rust", squeezyCost: 0.0278, baselineCost: 0.0355, ratio: 0.78, recall: 100, verdict: "WIN" },
+  { lang: "Scala", squeezyCost: 0.0202, baselineCost: 0.0611, ratio: 0.33, recall: 100, verdict: "WIN" },
+  { lang: "Swift", squeezyCost: 0.0134, baselineCost: 0.0181, ratio: 0.74, recall: 100, verdict: "WIN" },
+  { lang: "TS", squeezyCost: 0.0378, baselineCost: 0.0424, ratio: 0.89, recall: 100, verdict: "WIN" }
+];
+
+export const haikuBenchmarkRows: BenchmarkRow[] = [
+  { lang: "C", squeezyCost: 0.2494, baselineCost: 0.2474, ratio: 1.01, recall: 100, verdict: "LOSS" },
+  { lang: "C++", squeezyCost: 0.1707, baselineCost: 0.2074, ratio: 0.82, recall: 100, verdict: "WIN" },
+  { lang: "C#", squeezyCost: 0.2242, baselineCost: 0.2364, ratio: 0.95, recall: 100, verdict: "WIN" },
+  { lang: "Dart", squeezyCost: 0.1326, baselineCost: 0.2275, ratio: 0.58, recall: 100, verdict: "WIN" },
+  { lang: "Go", squeezyCost: 0.2336, baselineCost: 0.1479, ratio: 1.58, recall: 100, verdict: "LOSS" },
+  { lang: "Java", squeezyCost: 0.267, baselineCost: 0.3696, ratio: 0.72, recall: 100, verdict: "WIN" },
+  { lang: "JS", squeezyCost: 0.0404, baselineCost: 0.0549, ratio: 0.74, recall: 100, verdict: "WIN" },
+  { lang: "Kotlin", squeezyCost: 0.1159, baselineCost: 0.2038, ratio: 0.57, recall: 100, verdict: "WIN" },
+  { lang: "PHP", squeezyCost: 0.0499, baselineCost: 0.1083, ratio: 0.46, recall: 100, verdict: "WIN" },
+  { lang: "Python", squeezyCost: 0.058, baselineCost: 0.1074, ratio: 0.54, recall: 100, verdict: "WIN" },
+  { lang: "Ruby", squeezyCost: 0.2178, baselineCost: 0.2963, ratio: 0.73, recall: 100, verdict: "WIN" },
+  { lang: "Rust", squeezyCost: 0.0858, baselineCost: 0.1509, ratio: 0.57, recall: 80, verdict: "WIN" },
+  { lang: "Scala", squeezyCost: 0.1959, baselineCost: 0.2884, ratio: 0.68, recall: 100, verdict: "WIN" },
+  { lang: "Swift", squeezyCost: 0.0215, baselineCost: 0.0342, ratio: 0.63, recall: 100, verdict: "WIN" },
+  { lang: "TS", squeezyCost: 0.0791, baselineCost: 0.0996, ratio: 0.79, recall: 100, verdict: "WIN" }
+];
+
+export const benchmarkSummary = {
+  codexWins: "15 / 15",
+  claudeWins: "13 / 15",
+  codexModel: "Squeezy gpt-5.4-mini vs Codex gpt-5.4-mini",
+  claudeModel: "Squeezy claude-haiku-4-5 vs Claude Code haiku",
+  runs: "n=10 medians",
+  totalDelta: "lower model spend",
+  medianRatio: "0.65",
+  suite:
+    "same-task real-world code-navigation benchmark, equal pricing and grader, Squeezy versus Codex on the Mini tier and Claude Code on the Haiku tier.",
+  source:
+    "docs/internal/eval-findings/board-and-graph-fixes-summary.md"
+};
 
 export const operatingLoop: FactCard[] = [
   {
     label: "1",
-    title: "Index local code",
+    title: "Understand the repo locally",
     body:
-      "Squeezy parses supported files, discovers workspace facts, stores graph/cache partitions, and refreshes graph state as the workspace changes."
+      "Squeezy builds a local understanding of your code and workspace so the first model call does not start from a blank repository."
   },
   {
     label: "2",
-    title: "Compile a focused evidence plan",
+    title: "Read only the relevant code",
     body:
-      "Common navigation prompts are routed through graph-first plans so the model starts with declarations, references, callers, hierarchy, and exact next actions."
+      "The agent narrows broad questions into specific files, symbols, diffs, command outputs, or verifier steps."
   },
   {
     label: "3",
-    title: "Escalate only when needed",
+    title: "Keep context tight",
     body:
-      "If graph evidence is incomplete, Squeezy falls back to bounded grep, glob, read_file, web, shell, or compiler tools behind the configured permission policy."
+      "Repeated output is replaced with receipts, noisy output is shaped, and long conversations are compacted before they become expensive."
   },
   {
     label: "4",
-    title: "Verify with local tools",
+    title: "Send focused work to the model",
     body:
-      "Builds, tests, formatters, linters, and benchmark commands provide compiler-backed evidence when the task needs it."
-  }
-];
-
-export const toolSurface: FactCard[] = [
-  {
-    label: "navigation",
-    title: "Graph-backed code tools",
-    body:
-      "Architecture maps, declarations, definitions, references, call candidates, hierarchy, symbol context, dependency flow, diff context, and exact read slices."
-  },
-  {
-    label: "mutation",
-    title: "Plan, patch, verify",
-    body:
-      "Plan mode hides mutation. Build mode exposes edit, shell, compiler, and git-style actions through capability checks, output shaping, and optional checkpoints."
-  },
-  {
-    label: "support",
-    title: "Local help, sessions, reports",
-    body:
-      "Squeezy can answer questions about itself from bundled docs before provider work, resume sessions, export/replay session logs, and prepare redacted feedback or report bundles."
+      "The selected provider gets the useful context, and Squeezy tracks tokens, cache usage, tool output, and estimated spend."
   }
 ];
 
 export const languageRows: MatrixRow[] = [
+  { name: "Rust", detail: "Cargo workspaces, crates, traits, impls, modules, and tests." },
+  { name: "Python", detail: "Packages, imports, classes, functions, decorators, and inheritance." },
+  { name: "Java", detail: "Packages, Maven/Gradle projects, classes, members, and inheritance." },
+  { name: "Kotlin", detail: "Packages, Gradle projects, classes, objects, companions, and extensions." },
+  { name: "Scala", detail: "Packages, traits, objects, case classes, enums, and extension methods." },
+  { name: "C#/.NET", detail: "Solutions, namespaces, usings, partial types, attributes, and members." },
+  { name: "Go", detail: "Modules, packages, structs, interfaces, receivers, imports, and tests." },
+  { name: "C", detail: "Headers, includes, structs, functions, typedefs, macros, and references." },
+  { name: "C++", detail: "Headers, namespaces, classes, templates, methods, and overload-heavy code." },
+  { name: "JavaScript", detail: "ES modules, CommonJS, functions, classes, exports, and JSX." },
+  { name: "TypeScript", detail: "Types, interfaces, imports, generics, classes, and TSX." },
+  { name: "PHP", detail: "Namespaces, Composer-style code, traits, enums, attributes, and methods." },
+  { name: "Ruby", detail: "Classes, modules, mixins, singleton methods, accessors, and require paths." },
+  { name: "Swift", detail: "Modules, protocols, actors, structs, extensions, and property wrappers." },
+  { name: "Dart", detail: "Libraries, parts, classes, mixins, extensions, and Flutter-style projects." }
+];
+
+export const providerGroups: MatrixRow[] = [
   {
-    name: "Rust",
-    detail: "Modules, traits, impls, references, calls, tests, and crate facts from cargo metadata.",
-    status: "first-class graph"
+    name: "Native providers",
+    detail:
+      "OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, and Ollama have dedicated or local runtime paths.",
+    status: "API keys or local config"
   },
   {
-    name: "Python",
-    detail: "Classes, functions, imports, decorators, bases, annotations, exports, and references.",
-    status: "first-class graph"
+    name: "Compatible APIs",
+    detail:
+      "OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, and any other OpenAI-compatible endpoint.",
+    status: "bring an endpoint"
   },
   {
-    name: "Java",
-    detail: "Packages, types, members, inheritance, implements edges, calls, references, and Maven/Gradle facts.",
-    status: "first-class graph"
-  },
-  {
-    name: "Kotlin",
-    detail: "Packages, imports (aliased/wildcard), classes, objects, companion objects, data/sealed types, extension functions, suspend, typealiases, and Gradle facts.",
-    status: "first-class graph"
-  },
-  {
-    name: "Scala",
-    detail: "Packages, classes, traits, case classes, enums, companion objects, extension methods, given declarations, top-level defs, and Scala 3 imports.",
-    status: "first-class graph"
-  },
-  {
-    name: "C#",
-    detail: "Namespaces, types, members, partial links, inheritance, references, and .csproj/.sln project facts.",
-    status: "first-class graph"
-  },
-  {
-    name: "Go",
-    detail: "Packages, structs, interfaces, methods, receivers, tests, calls, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "C",
-    detail: "Includes, structs, unions, enums, typedefs, functions, macros, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "C++",
-    detail: "Includes, namespaces, classes, methods, constructors, destructors, templates, operators, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "JavaScript",
-    detail: "Imports, exports, CommonJS aliases, functions, classes, member references, calls, and JSX declarations.",
-    status: "first-class graph"
-  },
-  {
-    name: "TypeScript",
-    detail: "Imports, exports, classes, interfaces, type aliases, enums, decorators, type references, calls, and TSX declarations.",
-    status: "first-class graph"
-  },
-  {
-    name: "PHP",
-    detail: "Namespaces, use imports (named/aliased/group/function/const), classes, interfaces, traits, enums, backed enums, methods, properties, attributes, calls, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "Ruby",
-    detail: "Classes, modules, methods, singleton methods, attr_* synthesis, require_relative imports, include/extend/prepend mixins, calls, and references.",
-    status: "first-class graph"
-  },
-  {
-    name: "Swift",
-    detail: "Imports, classes, structs, actors, protocols, enums with associated cases, extensions, generics with constraints, property wrappers, and module hints.",
-    status: "first-class graph"
-  },
-  {
-    name: "Dart",
-    detail: "Libraries, parts, classes, mixins, extensions, extension types, sealed classes, enums, named and factory constructors, getters/setters, async modifiers, and prefix imports with show/hide combinators.",
-    status: "first-class graph"
+    name: "Local runtimes",
+    detail:
+      "Use local or self-hosted routes such as Ollama, LM Studio, vLLM, llama.cpp-style servers, or custom compatible base URLs.",
+    status: "local when configured"
   }
 ];
 
 export const aggregatorRows: MatrixRow[] = [
   {
     name: "OpenRouter",
-    detail: "One credit, every frontier model. OpenAI-compatible Chat Completions streaming, function tools, usage metadata, reasoning passthrough, Anthropic cache_control forwarding. Default model: anthropic/claude-opus-4-7.",
+    detail: "OpenAI-compatible aggregator route with many hosted models. Pricing and cache support depend on the selected model and registry metadata.",
     status: "OPENROUTER_API_KEY"
   },
   {
     name: "Vercel AI Gateway",
-    detail: "Vercel's routing proxy for OpenAI, Anthropic, Google, xAI, and more. Default model: anthropic/claude-opus-4-7.",
+    detail: "OpenAI-compatible gateway route for hosted model access through Vercel.",
     status: "AI_GATEWAY_API_KEY"
   },
   {
     name: "PortKey",
-    detail: "Gateway with virtual keys, caching, and observability. Configure a virtual key via x-portkey-virtual-key header.",
+    detail: "OpenAI-compatible gateway route for virtual keys, routing, and observability.",
     status: "PORTKEY_API_KEY"
   }
 ];
@@ -206,17 +326,17 @@ export const aggregatorRows: MatrixRow[] = [
 export const providerRows: MatrixRow[] = [
   {
     name: "OpenAI",
-    detail: "Responses streaming, function tools, cached-token usage. Default model: gpt-5.5, 400K context.",
+    detail: "Native OpenAI route with usage parsing and cache-related request metadata where supported.",
     status: "OPENAI_API_KEY"
   },
   {
     name: "Anthropic",
-    detail: "Messages streaming, function tools, cache read/write usage. Default model: claude-opus-4-7, 200K context.",
+    detail: "Native Anthropic route with API-key and OAuth credential paths plus cache read/write accounting where exposed.",
     status: "ANTHROPIC_API_KEY"
   },
   {
     name: "Google Gemini",
-    detail: "streamGenerateContent SSE, function declarations, usage metadata. Default model: gemini-2.5-pro, 1M context.",
+    detail: "Native Gemini route with API-key configuration and streaming usage metadata where available.",
     status: "GEMINI_API_KEY"
   }
 ];
@@ -224,112 +344,62 @@ export const providerRows: MatrixRow[] = [
 export const cloudPlatformRows: MatrixRow[] = [
   {
     name: "Amazon Bedrock",
-    detail: "AWS multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability). Bedrock Runtime ConverseStream over the AWS default credential chain. Default model: Claude Haiku 4.5, 200K context.",
+    detail: "AWS-hosted provider route using the AWS credential chain and Bedrock runtime APIs.",
     status: "AWS credentials"
   },
   {
     name: "Azure OpenAI",
-    detail: "OpenAI models hosted on Microsoft Azure (single-vendor slice of the broader Azure model catalog). Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context. For Azure AI Foundry's multi-vendor catalog use the openai_compatible preset with the Foundry serverless endpoint.",
+    detail: "Azure-hosted OpenAI route with deployment-specific endpoint and API-key or bearer-token configuration.",
     status: "AZURE_OPENAI_API_KEY"
   },
   {
     name: "Google Vertex AI",
-    detail: "Gemini and other models on Google Cloud Vertex AI's OpenAI-compatible endpoint. OAuth2 access token (refresh every ~50 min) or service-account JSON, project + location templated into base_url. Default model: gemini-2.5-pro.",
-    status: "VERTEX_ACCESS_TOKEN"
+    detail: "Google Cloud route through an OpenAI-compatible endpoint with access-token or service-account OAuth support.",
+    status: "Google Cloud auth"
   }
 ];
 
 export const localRuntimeRows: MatrixRow[] = [
   {
     name: "Ollama",
-    detail: "Local /api/chat NDJSON streaming with function tool schemas. Default model: qwen3-coder, runtime-defined context.",
+    detail: "Local runtime route for models served by Ollama. Context and model availability are runtime-defined.",
     status: "local runtime"
   }
 ];
 
 export const openAiCompatibleRows: MatrixRow[] = [
   {
-    name: "Groq",
-    detail: "Fast OpenAI-compatible inference of open models. Curated registry: llama-3.3-70b-versatile, llama-3.1-8b-instant, moonshotai/kimi-k2-instruct.",
-    status: "GROQ_API_KEY"
+    name: "Groq, xAI, DeepSeek",
+    detail: "Hosted OpenAI-compatible presets with API-key configuration and curated registry entries where available.",
+    status: "API key"
   },
   {
-    name: "xAI",
-    detail: "Grok family via OpenAI-compatible API. Curated registry: grok-4, grok-4-fast-reasoning, grok-code-fast-1.",
-    status: "XAI_API_KEY"
+    name: "Mistral, Together, Fireworks, Cerebras",
+    detail: "OpenAI-compatible hosted inference presets. Dollar estimates require matching pricing metadata.",
+    status: "API key"
   },
   {
-    name: "DeepSeek",
-    detail: "DeepSeek Chat and Reasoner via OpenAI-compatible API. Curated registry: deepseek-chat, deepseek-reasoner.",
-    status: "DEEPSEEK_API_KEY"
-  },
-  {
-    name: "Mistral La Plateforme",
-    detail: "Mistral's OpenAI-compatible Chat Completions endpoint. Default model: mistral-large-latest (light preset — no curated registry entries).",
-    status: "MISTRAL_API_KEY"
-  },
-  {
-    name: "Together AI",
-    detail: "Hosted open models via OpenAI-compatible API. Default model: meta-llama/Llama-3.3-70B-Instruct-Turbo (light preset).",
-    status: "TOGETHER_API_KEY"
-  },
-  {
-    name: "Fireworks AI",
-    detail: "Production OpenAI-compatible inference. Default model: accounts/fireworks/models/llama-v3p3-70b-instruct (light preset).",
-    status: "FIREWORKS_API_KEY"
-  },
-  {
-    name: "Cerebras",
-    detail: "Cerebras Cloud OpenAI-compatible endpoint. Default model: llama-3.3-70b (light preset).",
-    status: "CEREBRAS_API_KEY"
-  },
-  {
-    name: "Custom OpenAI-compatible",
-    detail: "Any endpoint that speaks POST /chat/completions with a Bearer token. Microsoft Foundry (Azure AI Studio) serverless deployments, Cloudflare Workers AI, self-hosted LiteLLM, and similar services use this preset.",
-    status: "openai_compatible preset"
+    name: "Custom and local compatible endpoints",
+    detail: "Custom OpenAI-compatible base URLs, plus local LM Studio, vLLM, and llama.cpp style routes.",
+    status: "preset"
   }
 ];
 
 export const installRows: MatrixRow[] = [
   {
     name: "macOS",
-    detail: "Release targets: aarch64-apple-darwin for Apple Silicon and x86_64-apple-darwin for Intel. Primary install path: one-line curl installer.",
-    status: "curl installer"
+    detail: "Release targets for Apple Silicon and Intel. Primary path is the one-line installer; Homebrew tap support is scripted.",
+    status: "aarch64 + x86_64"
   },
   {
     name: "Linux",
-    detail: "x86_64-unknown-linux-musl static binary. Primary install path: one-line curl installer.",
-    status: "curl installer"
+    detail: "x86_64 musl static binary target plus source install when the Rust toolchain is already present.",
+    status: "x86_64"
   },
   {
     name: "Windows",
-    detail: "x86_64-pc-windows-msvc archive. Primary install path: Winget.",
-    status: "winget"
-  },
-  {
-    name: "Source build",
-    detail: "Cargo install is available when you already have the required Rust toolchain.",
-    status: "cargo"
+    detail: "x86_64 MSVC archive and Winget manifest update path. Some sandbox behavior is platform-limited on Windows.",
+    status: "x86_64"
   }
 ];
 
-export const benchmarkFacts: FactCard[] = [
-  {
-    label: "scope",
-    title: "Cost-saving benchmark page is under construction",
-    body:
-      "The public page will report how much context Squeezy avoids by using graph navigation, exact reads, receipts, and output shaping before model turns."
-  },
-  {
-    label: "method",
-    title: "Benchmarks need quality and cost together",
-    body:
-      "The benchmark method will pair navigation quality with measured read bytes, tool calls, receipt hits, spills, provider tokens, and baseline discovery effort."
-  },
-  {
-    label: "status",
-    title: "No public savings number yet",
-    body:
-      "Until the report is ready, the page should explain the measurement plan without publishing unsupported percentages or cost claims."
-  }
-];

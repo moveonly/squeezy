@@ -1,11 +1,11 @@
 {
   "name": "Squeezy",
   "short_name": "Squeezy",
-  "description": "Local code structure before model context.",
+  "description": "A coding agent that does the repetitive work on your machine and spends model tokens only where they're needed.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#080807",
-  "theme_color": "#080807",
+  "background_color": "#0f1320",
+  "theme_color": "#0f1320",
   "icons": [
     {
       "src": "/favicon.svg",

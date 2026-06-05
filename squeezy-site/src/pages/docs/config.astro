@@ -1,77 +1,18 @@
 ---
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import DocSections from "../../components/DocSections.astro";
+import { docPages } from "../../docContent";
+
+const page = docPages.configuration;
 ---
 
 <DocsLayout
-  title="Configuration · Squeezy"
-  description="Squeezy configuration precedence, provider defaults, credentials, and local inspection commands."
+  title="Configuration · Squeezy docs"
+  description="How Squeezy configuration works: user, project, per-repo, environment, and CLI settings; how they layer; and the main things you can customize."
   activeDoc="/docs/config/"
-  eyebrow="configuration"
-  heading="Configuration is layered and inspectable."
-  lead="Squeezy keeps provider choice, model profile, permissions, sandboxing, telemetry, graph settings, and session behavior in one typed configuration model."
+  eyebrow="settings"
+  heading={page.title}
+  lead={page.intro}
 >
-  <section class="doc-block">
-    <h2>Precedence</h2>
-    <p>From highest to lowest precedence, Squeezy resolves settings from CLI flags, environment variables, the nearest project `squeezy.toml`, user `~/.squeezy/settings.toml`, and built-in defaults.</p>
-    <div class="doc-card-grid">
-      <article class="card">
-        <span class="label">inspect</span>
-        <h3>See the merged config</h3>
-        <pre><code>squeezy config inspect</code></pre>
-        <p>Sensitive values are redacted before display.</p>
-      </article>
-      <article class="card">
-        <span class="label">doctor</span>
-        <h3>Check runtime readiness</h3>
-        <pre><code>squeezy doctor</code></pre>
-        <p>Doctor reports config sources, provider credential state, repo profile, session store, and sandbox availability.</p>
-      </article>
-    </div>
-  </section>
-
-  <section class="doc-block">
-    <h2>Provider example</h2>
-    <p>Provider defaults are stored as names and settings. Secret token values stay in environment variables, macOS Keychain, AWS credentials, or the provider's own local runtime.</p>
-    <pre><code>[model]
-provider = "openai"
-profile = "balanced"
-model = ""
-
-[providers.openai]
-api_key_env = "OPENAI_API_KEY"
-
-[permissions]
-mode = "default"</code></pre>
-  </section>
-
-  <section class="doc-block">
-    <h2>Permission modes</h2>
-    <div class="doc-card-grid">
-      <article class="card">
-        <span class="label">default</span>
-        <h3>Workspace write</h3>
-        <p>Allows workspace reads, searches, edits, local shell, git, and compiler commands. Web, MCP, destructive actions, and outside-workspace paths still ask.</p>
-      </article>
-      <article class="card">
-        <span class="label">auto_review</span>
-        <h3>Reviewer-assisted</h3>
-        <p>Uses the same workspace defaults, but eligible read, search, network, and MCP prompts can be handled by the AI reviewer.</p>
-      </article>
-      <article class="card">
-        <span class="label">full_access</span>
-        <h3>Trusted work</h3>
-        <p>Allows all capability defaults, permits outside-workspace file paths, and turns off the local shell OS sandbox.</p>
-      </article>
-      <article class="card">
-        <span class="label">custom</span>
-        <h3>Granular defaults</h3>
-        <p>Reads per-capability defaults from `[permissions.custom]`; top-level capability keys are legacy aliases.</p>
-      </article>
-    </div>
-  </section>
-
-  <section class="doc-block">
-    <h2>Why it matters for cost</h2>
-    <p>Configuration controls the model profile, context limit hints, tool budgets, schema loading, web permission policy, telemetry opt-out, and shell sandbox behavior. Those settings decide when Squeezy can use local evidence and when it is allowed to spend provider context.</p>
-  </section>
+  <DocSections page={page} />
 </DocsLayout>

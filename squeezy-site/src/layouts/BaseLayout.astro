@@ -21,7 +21,7 @@ const softwareJsonLd = {
   description: SITE.description,
   applicationCategory: "DeveloperApplication",
   operatingSystem: "macOS, Linux, Windows",
-  url: SITE.url,
+  url: new URL("/", SITE.url).toString(),
   downloadUrl: SITE.repoUrl,
   license: "https://www.apache.org/licenses/LICENSE-2.0",
   offers: {
@@ -33,9 +33,8 @@ const softwareJsonLd = {
 
 const navItems = [
   { href: "/how-it-works/", label: "How it works", key: "how" },
-  { href: "/languages/", label: "Languages", key: "languages" },
-  { href: "/providers/", label: "Providers", key: "providers" },
-  { href: "/benchmarks/", label: "Benchmark", key: "benchmarks" },
+  { href: "/benchmarks/", label: "Benchmarks", key: "benchmarks" },
+  { href: "/support/", label: "Support", key: "support" },
   { href: "/install/", label: "Install", key: "install" },
   { href: "/docs/", label: "Docs", key: "docs" }
 ];
@@ -47,7 +46,7 @@ const navItems = [
     <meta charset="UTF-8" />
     <meta name="description" content={description} />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#080807" />
+    <meta name="theme-color" content="#0f1320" />
     <link rel="canonical" href={canonicalUrl} />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="manifest" href="/site.webmanifest" />
@@ -73,12 +72,6 @@ const navItems = [
           <span class="brand-mark">sq</span>
           <span>Squeezy</span>
         </a>
-        <a
-          class="brand-status"
-          href="/roadmap/"
-          aria-label="Squeezy is pre-1.0. See the roadmap."
-          data-track-click="brand_status"
-        >Pre-1.0</a>
       </div>
       <nav class="site-nav" aria-label="Primary navigation">
         {
@@ -113,19 +106,18 @@ const navItems = [
           <span>Squeezy</span>
         </a>
         <p>
-          A terminal coding agent with a local semantic graph at its core.
+          The CPU does the repetitive work.<br />Your tokens do the thinking.
         </p>
         <p class="footer-meta">
-          Squeezy is pre-1.0; some surfaces are marked WIP.
+          Website analytics help improve the site and documentation.
         </p>
       </div>
       <div class="footer-links">
         <a href="/install/" data-track-click="footer_install">Install</a>
+        <a href="/how-it-works/" data-track-click="footer_how">How it works</a>
+        <a href="/support/" data-track-click="footer_support">Support</a>
         <a href="/docs/" data-track-click="footer_docs">Docs</a>
         <a href="/benchmarks/" data-track-click="footer_benchmarks">Benchmark</a>
-        <a href="/roadmap/" data-track-click="footer_roadmap">Roadmap</a>
-        <a href="/support/" data-track-click="footer_support">Support</a>
-        <a href="/privacy/" data-track-click="footer_privacy">Privacy</a>
         <a href={SITE.repoUrl} data-track-click="footer_github" data-track-target="github">GitHub</a>
       </div>
     </footer>
@@ -215,10 +207,19 @@ const navItems = [
         document.addEventListener("click", (event) => {
           const target = event.target instanceof Element ? event.target.closest("[data-track-click]") : null;
           if (!target) return;
+          const href = target instanceof HTMLAnchorElement ? target.href : undefined;
+          const external = href ? new URL(href, location.href).hostname !== location.hostname : false;
+          const targetKind = target.getAttribute("data-track-target") || (external ? "other" : "internal");
           send("squeezy_site_cta_clicked", {
             cta_id: target.getAttribute("data-track-click"),
-            target_kind: target.getAttribute("data-track-target") || "internal"
+            target_kind: targetKind
           });
+          if (external) {
+            send("squeezy_site_outbound_clicked", {
+              cta_id: target.getAttribute("data-track-click"),
+              target_kind: targetKind
+            });
+          }
         });
       })();
     </script>

@@ -4,35 +4,45 @@ import { languageRows } from "../../facts";
 ---
 
 <DocsLayout
-  title="Languages · Squeezy"
-  description="Squeezy first-class language support for graph-backed code navigation and bounded fallback behavior."
+  title="Languages & graph · Squeezy docs"
+  description="The 15 languages Squeezy understands locally, what the code graph gives you, and how unsupported files are handled."
   activeDoc="/docs/languages/"
-  eyebrow="languages"
-  heading="First-class language support feeds graph-backed navigation."
-  lead="Squeezy gives these languages the strongest local navigation path. Other languages remain usable through bounded search, file reads, shell commands, and verifier tools, but they do not get the same structured cost-saving behavior."
+  eyebrow="coverage"
+  heading="Languages & the code graph."
+  lead="For supported languages, Squeezy understands your code on your machine, declarations, references, and structure, instead of guessing from raw text."
 >
   <section class="doc-block">
-    <h2>First-class graph support</h2>
+    <div class="doc-prose">
+      <h2>When Squeezy understands your code vs when it guesses</h2>
+      <p>
+        For the 15 languages below, Squeezy builds a local map of your code and
+        navigates it directly: it can find where something is declared, who
+        calls it, and how files relate, then read just the relevant lines. Each
+        result is grounded in your actual source rather than a guess.
+      </p>
+      <p>
+        Files outside this list still work. They fall back to bounded search,
+        targeted reads, shell commands, and verifier tools, just without the
+        graph-backed navigation.
+      </p>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Supported languages</h2>
     <div class="matrix compact-matrix">
       {
         languageRows.map((row) => (
           <article class="matrix-row">
             <h3>{row.name}</h3>
             <p>{row.detail}</p>
-            {row.status && <span class="status-pill ok">{row.status}</span>}
           </article>
         ))
       }
     </div>
-  </section>
-
-  <section class="doc-block">
-    <h2>Graph tools</h2>
-    <p>Language support feeds the same navigation surface: repo maps, declaration search, definition search, reference search, hierarchy, upstream and downstream flow, symbol context, diff context, and read_slice.</p>
-  </section>
-
-  <section class="doc-block">
-    <h2>Fallback behavior</h2>
-    <p>For files outside first-class language support, Squeezy can still inspect the repository with bounded grep, glob, file reads, shell tools, and verifier commands. The agent should treat those paths as ordinary evidence gathering instead of graph-backed cost optimization.</p>
+    <p class="footnote">
+      Under the hood these map to 13 parser families (C and C++ share a family,
+      as do JavaScript and TypeScript). Coverage maturity varies by language.
+    </p>
   </section>
 </DocsLayout>

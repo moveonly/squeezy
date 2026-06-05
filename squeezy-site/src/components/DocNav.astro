@@ -10,10 +10,22 @@ const { active = "" } = Astro.props;
   </a>
   {
     DOCS_NAV.map((item) => (
-      <a href={item.href} aria-current={active === item.href ? "page" : undefined}>
-        <span>{item.label}</span>
-        <em>{item.status}</em>
-      </a>
+      <>
+        <a href={item.href} aria-current={active === item.href ? "page" : undefined}>
+          <span>{item.label}</span>
+          <em>{item.status}</em>
+        </a>
+        {item.children &&
+          item.children.map((child) => (
+            <a
+              class="toc-sub"
+              href={child.href}
+              aria-current={active === child.href ? "page" : undefined}
+            >
+              {child.label}
+            </a>
+          ))}
+      </>
     ))
   }
 </nav>

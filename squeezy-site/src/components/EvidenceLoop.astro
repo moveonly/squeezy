@@ -3,26 +3,26 @@ const stages = [
   {
     zone: "local",
     num: "01",
-    title: "Intent",
-    caption: "/q find callers of X"
+    title: "Your question",
+    caption: "“who calls this function?”"
   },
   {
     zone: "local",
     num: "02",
-    title: "Local semantic graph",
-    caption: "tree-sitter · 9 languages · workspace facts"
+    title: "Local code understanding",
+    caption: "15 languages · understood on your machine"
   },
   {
     zone: "local",
     num: "03",
-    title: "Narrowed evidence",
-    caption: "paths · spans · confidence · exact slice"
+    title: "The exact evidence",
+    caption: "the right files and lines, nothing extra"
   },
   {
     zone: "remote",
     num: "04",
-    title: "Model",
-    caption: "bounded prompt · billable context"
+    title: "The model",
+    caption: "a small, focused prompt"
   }
 ];
 ---
@@ -30,7 +30,7 @@ const stages = [
 <figure
   class="evidence-loop"
   role="img"
-  aria-label="A four-stage pipeline. Stages one through three (intent, local semantic graph, narrowed evidence) run on your machine. Only stage four, the model call, leaves your machine as billable context."
+  aria-label="A four-stage pipeline. Stages one through three (your question, local code understanding, the exact evidence) run on your machine. Only stage four, the model call, leaves your machine and is charged by the model."
 >
   <div class="loop-zone loop-zone-local">
     <span class="loop-zone-label">Your machine</span>

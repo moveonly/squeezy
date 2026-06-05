@@ -1,86 +1,95 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
-import TerminalWindow from "../components/TerminalWindow.astro";
-import Wip from "../components/Wip.astro";
-import { benchmarkFacts } from "../facts";
+import CostChart from "../components/CostChart.astro";
+import { benchmarkRows, benchmarkSummary, haikuBenchmarkRows } from "../facts";
 ---
 
 <BaseLayout
-  title="Benchmark methodology · Squeezy"
-  description="How Squeezy will measure cost savings from graph navigation, exact reads, receipts, and output shaping."
+  title="Benchmarks · Squeezy"
+  description="Same-task benchmark boards comparing Squeezy cost against Codex Mini and Claude Code Haiku."
   active="benchmarks"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
-      <span class="eyebrow">benchmark methodology</span>
-      <h1>How we'll measure cost savings.</h1>
+      <span class="eyebrow">benchmarks</span>
+      <h1>Measured cost on the same coding tasks.</h1>
       <p class="lead">
-        This page documents the method for measuring how much provider context
-        Squeezy avoids by doing code discovery locally first. Numbers ship once
-        the report is reproducible end-to-end.
+        These boards compare Squeezy against external coding-agent baselines on
+        the same repository prompts, same grader, and same model tier. Lower
+        ratio means Squeezy used less model spend for that language task.
       </p>
     </div>
   </section>
 
   <section class="section">
-    <div class="grid-2 align-center">
-      <TerminalWindow title="planned report shape">
-        <div class="terminal-body">
-          <div class="terminal-line">
-            <span class="green">quality</span>
-            <span>navigation accuracy, missed symbols, false positives</span>
-          </div>
-          <div class="terminal-line">
-            <span class="cyan">local work</span>
-            <span>graph queries, exact reads, receipt hits, output spills</span>
-          </div>
-          <div class="terminal-line">
-            <span class="amber">cost</span>
-            <span>model-visible bytes, provider tokens, repeated context avoided</span>
-          </div>
-          <div class="terminal-line">
-            <span class="muted">baseline</span>
-            <span>graph-first discovery compared with ordinary search and reads</span>
-          </div>
-          <div class="terminal-line">
-            <Wip label="WIP" />
-            <span>numbers pending the first reproducible report</span>
-          </div>
-        </div>
-      </TerminalWindow>
-      <div class="list">
-        {
-          benchmarkFacts.map((fact) => (
-            <div class="list-item">
-              <span class="num">{fact.label.slice(0, 2)}</span>
-              <div>
-                <h3>{fact.title}</h3>
-                <p>{fact.body}</p>
-              </div>
-            </div>
-          ))
-        }
-      </div>
+    <div class="benchmark-summary">
+      <article class="card proof-card">
+        <span class="label">Mini board</span>
+        <strong>{benchmarkSummary.codexWins}</strong>
+        <h3>{benchmarkSummary.codexModel}</h3>
+        <p>{benchmarkSummary.runs}. All 15 language rows are lower cost.</p>
+      </article>
+      <article class="card proof-card">
+        <span class="label">Haiku board</span>
+        <strong>{benchmarkSummary.claudeWins}</strong>
+        <h3>{benchmarkSummary.claudeModel}</h3>
+        <p>{benchmarkSummary.runs}, same-task comparison at the Haiku tier.</p>
+      </article>
     </div>
   </section>
 
   <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">publish criteria</span>
-      <h2>The page stays under construction until the benchmark is reproducible.</h2>
+    <div class="section-header wide">
+      <span class="eyebrow">language ratios</span>
+      <h2>Cost ratio by language.</h2>
       <p>
-        Public results should include the corpus, the baseline, the commands,
-        the measured token or byte counters, and the quality checks. A savings
-        number without that evidence should not ship.
+        Ratio is Squeezy cost divided by the baseline cost. A value below 1.0
+        means Squeezy was lower cost on that same task. The benchmark counts
+        cost only when recall passes the board rule. The 15 rows cover all
+        supported languages; C and C++, and JavaScript and TypeScript, are
+        scored as separate rows.
       </p>
-      <div class="actions">
-        <a class="button" href="/docs/cost-receipts/" data-track-click="benchmark_cost_docs">
-          Cost &amp; receipts
-        </a>
-        <a class="button secondary" href="/docs/semantic-navigation/" data-track-click="benchmark_graph_docs">
-          Graph docs
-        </a>
-      </div>
+    </div>
+    <div class="benchmark-boards">
+      <article>
+        <div class="board-heading">
+          <span class="label">Mini / Codex</span>
+          <h3>15 language tasks</h3>
+        </div>
+        <CostChart rows={benchmarkRows} />
+      </article>
+      <article>
+        <div class="board-heading">
+          <span class="label">Haiku / Claude Code</span>
+          <h3>15 language tasks</h3>
+        </div>
+        <CostChart rows={haikuBenchmarkRows} />
+      </article>
+    </div>
+    <p class="footnote">
+      Sources: <code>docs/internal/eval-findings/board-and-graph-fixes-summary.md</code>,
+      <code>mini-vs-codex-realworld.csv</code>, and
+      <code>haiku-vs-cc-realworld.csv</code>.
+    </p>
+  </section>
+
+  <section class="section">
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">same task</span>
+        <h3>Prompt and repo are matched</h3>
+        <p>Each row compares answers to the same real-world repository question, scored by the same grader.</p>
+      </article>
+      <article class="card">
+        <span class="label">median</span>
+        <h3>Multiple runs reduce noise</h3>
+        <p>The board reports n=10 medians because single agent runs can vary in both cost and recall.</p>
+      </article>
+      <article class="card">
+        <span class="label">scope</span>
+        <h3>A benchmark, not a promise</h3>
+        <p>These numbers are for this task suite and these model tiers. What you actually pay depends on the models you pick, your provider's pricing, and the shape of your own work.</p>
+      </article>
     </div>
   </section>
 </BaseLayout>
