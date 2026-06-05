@@ -1217,6 +1217,46 @@ fn api_key_row_reports_env_var_presence() {
     );
 }
 
+#[test]
+fn api_key_row_reports_fallback_env_var() {
+    // Audit 7.1: the row must reflect the *fallback* env var the runtime
+    // honors (e.g. ANTHROPIC_API_KEY for the SQUEEZY_ANTHROPIC_KEY pair),
+    // not only the canonical name. Previously a working fallback rendered
+    // as "unset", so operators could not trust /config. Use a synthetic
+    // provider pair so the test never collides with a real key on the
+    // developer's machine.
+    let canonical = "SQUEEZY_OPTIONS_EVAL_FALLBACK_KEY";
+    let fallback = "OPTIONS_EVAL_FALLBACK_API_KEY";
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var(canonical);
+        std::env::set_var(fallback, "sk-test-from-fallback-XYZ");
+    }
+    let cfg = AppConfig {
+        provider: squeezy_core::ProviderConfig::OpenAi(squeezy_core::OpenAiConfig {
+            api_key_env: canonical.to_string(),
+            api_key: None,
+            base_url: squeezy_core::DEFAULT_OPENAI_BASE_URL.to_string(),
+            organization: None,
+            project: None,
+            service_tier: None,
+            transport: Default::default(),
+        }),
+        ..AppConfig::default()
+    };
+    let mut state = ConfigScreenState::new(cfg, Some(SectionId::Models));
+    state.field_index = 2; // synthetic API-key row
+    let rendered = render_screen_to_text(&state, 120, 30);
+    // SAFETY: tests in this module run single-threaded.
+    unsafe { std::env::remove_var(fallback) };
+    assert!(
+        rendered.contains("[env · openai]")
+            && rendered.contains(fallback)
+            && rendered.contains("from environment"),
+        "API-key row should advertise the working fallback env var, got:\n{rendered}"
+    );
+}
+
 #[tokio::test]
 async fn model_picker_provider_swap_writes_once_not_twice() {
     // SAFETY: tests in this module run single-threaded.

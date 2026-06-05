@@ -12346,8 +12346,10 @@ fn human_label_falls_back_to_tool_name_when_no_template() {
 fn prepare_arguments_lookup_advertises_only_hooked_tools() {
     let root = temp_workspace("prepare_arguments_lookup");
     let registry = ToolRegistry::new(&root).expect("registry");
-    // read_file and shell both ship hooks; tools without spelling drift
-    // (e.g. grep) intentionally leave the slot empty.
+    // shell and verify ship bespoke hooks; every path-bearing tool
+    // (read_file, grep, …) gets the shared path-alias hook attached
+    // uniformly in build_specs. A tool with neither a bespoke hook nor a
+    // top-level `path` argument (e.g. repo_map) leaves the slot empty.
     assert!(
         registry.prepare_arguments_for("read_file").is_some(),
         "read_file should advertise a prepare_arguments hook"
@@ -12361,8 +12363,12 @@ fn prepare_arguments_lookup_advertises_only_hooked_tools() {
         "verify should advertise a prepare_arguments hook"
     );
     assert!(
-        registry.prepare_arguments_for("grep").is_none(),
-        "grep does not declare a hook"
+        registry.prepare_arguments_for("grep").is_some(),
+        "grep takes a `path`, so it shares the uniform path-alias hook"
+    );
+    assert!(
+        registry.prepare_arguments_for("repo_map").is_none(),
+        "repo_map has no `path` argument and no bespoke hook"
     );
     assert!(
         registry
@@ -12412,6 +12418,59 @@ fn prepare_arguments_read_file_hook_normalizes_filepath_aliases() {
     let mut args = json!(42);
     hook(&mut args).expect("hook ok");
     assert_eq!(args, json!(42));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn path_bearing_tools_uniformly_accept_path_aliases() {
+    // Audit 6.1: every first-party tool that advertises a top-level `path`
+    // argument must fold the `filepath`/`file_path`/`file` spelling drift
+    // onto `path` before typed deserialization, so a model that misspells
+    // the field gets the same forgiving behavior on write_file/grep/glob/
+    // the graph tools that it already gets on read_file — instead of a
+    // `deny_unknown_fields` hard-reject on some tools and silent acceptance
+    // on others. Locks in the uniform policy attached in `build_specs`.
+    let root = temp_workspace("path_alias_uniformity");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let mut checked = 0usize;
+    for spec in registry.specs().iter() {
+        let has_top_level_path = spec
+            .parameters
+            .properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key("path"));
+        if !has_top_level_path {
+            continue;
+        }
+        let hook = registry
+            .prepare_arguments_for(&spec.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "tool `{}` advertises a top-level `path` argument but has \
+                     no prepare hook to normalize path aliases",
+                    spec.name
+                )
+            });
+        for alias in ["filepath", "file_path", "file"] {
+            let mut args = json!({ alias: "sample.txt" });
+            hook(&mut args).expect("hook ok");
+            assert_eq!(
+                args.get("path").and_then(Value::as_str),
+                Some("sample.txt"),
+                "tool `{}` did not normalize `{alias}` onto `path`",
+                spec.name
+            );
+        }
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 12,
+        "expected the path-alias policy to cover the path-bearing tool set; \
+         only {checked} tools were checked"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

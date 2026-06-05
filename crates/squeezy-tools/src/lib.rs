@@ -118,9 +118,10 @@ use specs::{
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
     mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
-    plan_patch_spec, read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
-    refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
-    upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
+    plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
+    read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec, repo_map_spec,
+    shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
+    websearch_spec, write_file_spec,
 };
 pub use squeezy_graph::LanguageReport;
 
@@ -451,6 +452,17 @@ pub struct ToolExecutionOptions {
 /// error, so they should only fail when a normalization *cannot* leave
 /// the JSON in a typed-deserialize-friendly shape.
 pub type PrepareArgumentsHook = fn(&mut Value) -> std::result::Result<(), String>;
+
+/// True when a tool advertises a top-level `path` argument. Drives the
+/// uniform attachment of [`specs::prepare_path_arguments`] in
+/// [`ToolRegistry::build_specs`] so every path-bearing tool accepts the
+/// same path aliases.
+fn spec_has_top_level_path(spec: &ToolSpec) -> bool {
+    spec.parameters
+        .properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key("path"))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -1897,6 +1909,20 @@ impl ToolRegistry {
         // uniformly regardless of how a spec was built.
         for spec in specs.iter_mut() {
             compact_typed_tool_parameters(&mut spec.parameters);
+            // Uniform path-alias policy: any first-party tool that advertises
+            // a top-level `path` argument folds the common `filepath` /
+            // `file_path` / `file` spelling drift onto `path` before typed
+            // deserialization, so a misspelled path field is accepted on every
+            // path-bearing tool instead of being a `deny_unknown_fields`
+            // hard-reject on some (write_file/grep/glob/graph) and silently
+            // accepted on others (read_file). Specs that already declare a hook
+            // keep it (shell's command rehome, verify's arg rehome); a future
+            // path-bearing tool needing a custom hook must fold path
+            // normalization into it — `path_bearing_tools_uniformly_accept_path_aliases`
+            // enforces that contract.
+            if spec.prepare_arguments.is_none() && spec_has_top_level_path(spec) {
+                spec.prepare_arguments = Some(prepare_path_arguments);
+            }
         }
         // `mcp_tool_spec` already compacts at construction; append after the
         // first-party loop to avoid double work.

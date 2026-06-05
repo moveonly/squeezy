@@ -1754,15 +1754,26 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                         Some(t) => (t.0.to_string(), t.1),
                         None => ("—".to_string(), String::new()),
                     };
-                let inline_present =
-                    super::provider_inline_api_key(&state.effective.provider).is_some();
-                // The label said "unset" even when the user had exported
-                // the env var in their shell. A key present in $OPENAI_API_KEY
-                // is exactly what the provider client picks up at startup,
-                // so report it as such — the inline TOML write is only one
-                // way to populate the credential.
-                let env_present =
-                    !env_var.is_empty() && std::env::var(&env_var).is_ok_and(|v| !v.is_empty());
+                // Reflect the *full* runtime resolution chain the provider
+                // client uses (`resolve_api_key_with_inline`: inline TOML,
+                // credentials.json, the canonical env var, the conventional
+                // fallback env var, then SQUEEZY_CREDENTIALS_JSON) so the row
+                // agrees with what a real session resolves. Checking only the
+                // canonical env var reported "unset" while a working
+                // `ANTHROPIC_API_KEY`, credentials.json, or inline key was in
+                // effect. Mirrors `doctor`'s credential check; only the
+                // synthetic row resolves (not every field), and the screen
+                // redraws on input rather than per-frame, so the cost is
+                // negligible. Only `source` is read — the secret value never
+                // reaches the display.
+                let inline = super::provider_inline_api_key(&state.effective.provider);
+                let source = if env_var.is_empty() {
+                    None
+                } else {
+                    squeezy_llm::resolve_api_key_with_inline(inline.as_deref(), &env_var)
+                        .ok()
+                        .map(|resolved| resolved.source)
+                };
                 let label_style = if active {
                     Style::default()
                         .fg(crate::render::theme::magenta())
@@ -1772,19 +1783,19 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 };
                 let env_text = if env_var.is_empty() {
                     "n/a for this provider".to_string()
-                } else if inline_present {
-                    format!("•••• ({env_var})")
-                } else if env_present {
-                    format!("•••• ({env_var} — from environment)")
+                } else if let Some(source) = source {
+                    format!("•••• ({})", credential_source_detail(source, &env_var))
                 } else {
                     format!("unset ({env_var})")
                 };
                 let badge = if env_var.is_empty() {
                     String::new()
-                } else if inline_present {
-                    format!("[toml · {}]", provider_label.to_lowercase())
-                } else if env_present {
-                    format!("[env · {}]", provider_label.to_lowercase())
+                } else if let Some(source) = source {
+                    format!(
+                        "[{} · {}]",
+                        credential_source_tag(source),
+                        provider_label.to_lowercase()
+                    )
                 } else {
                     format!("[unset · {}]", provider_label.to_lowercase())
                 };
@@ -2164,6 +2175,35 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
             .block(block),
         area,
     );
+}
+
+/// Detail shown after the masked key on the synthetic API-key row, naming
+/// the source the runtime resolved the credential from. Mirrors `doctor`'s
+/// `key_source_label` so `/config` and `doctor` agree. For a fallback env
+/// var it surfaces the conventional vendor name (e.g. `ANTHROPIC_API_KEY`)
+/// the user actually exported, not the canonical `SQUEEZY_*` name.
+fn credential_source_detail(source: squeezy_llm::KeySource, env_var: &str) -> String {
+    use squeezy_llm::KeySource;
+    match source {
+        KeySource::Inline => env_var.to_string(),
+        KeySource::Env => format!("{env_var} — from environment"),
+        KeySource::FallbackEnv => squeezy_llm::fallback_env_var(env_var)
+            .map(|name| format!("{name} — from environment"))
+            .unwrap_or_else(|| format!("{env_var} — from environment")),
+        KeySource::File => "credentials.json".to_string(),
+        KeySource::JsonEnv => "SQUEEZY_CREDENTIALS_JSON".to_string(),
+    }
+}
+
+/// One-word badge tag for a resolved credential source.
+fn credential_source_tag(source: squeezy_llm::KeySource) -> &'static str {
+    use squeezy_llm::KeySource;
+    match source {
+        KeySource::Inline => "toml",
+        KeySource::Env | KeySource::FallbackEnv => "env",
+        KeySource::File => "file",
+        KeySource::JsonEnv => "json",
+    }
 }
 
 fn source_style(source: FieldSource) -> Style {

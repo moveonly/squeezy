@@ -286,19 +286,19 @@ pub(crate) fn read_file_spec() -> ToolSpec {
         })),
         prepare_arguments: None,
     }
-    .with_prepare_arguments(prepare_read_file_arguments)
 }
 
-/// Map common spelling drift for `read_file` arguments back onto the
-/// canonical `path` field before typed deserialization runs. Idempotent —
-/// `path` is preferred when present, so calls that already use the
-/// canonical name pass through unchanged (with stray aliases stripped
-/// so the live `deny_unknown_fields` schema does not later reject them).
-///
-/// Strengthens the silent-acceptance gap where the typed `ReadFileArgs`
-/// struct used to reject `"filepath"`/`"file_path"`/`"file"` with a
-/// `deny_unknown_fields` error even though the intent was unambiguous.
-fn prepare_read_file_arguments(raw: &mut Value) -> std::result::Result<(), String> {
+/// Shared prepare hook for every tool that takes a workspace `path`: fold
+/// the common `filepath`/`file_path`/`file` spelling drift onto the
+/// canonical `path` field before typed deserialization. Attached uniformly
+/// by [`crate::ToolRegistry::build_specs`] to every first-party spec that
+/// advertises a top-level `path` argument, so a misspelled path field is
+/// accepted on `write_file`/`grep`/`glob`/the graph tools exactly as it is
+/// on `read_file` — instead of `deny_unknown_fields` hard-rejecting it on
+/// some tools while another silently accepts it. Idempotent: `path` wins
+/// when present and stray aliases are stripped so the live
+/// `deny_unknown_fields` schema does not later reject them.
+pub(crate) fn prepare_path_arguments(raw: &mut Value) -> std::result::Result<(), String> {
     normalize_string_aliases(raw, "path", &["filepath", "file_path", "file"]);
     Ok(())
 }
