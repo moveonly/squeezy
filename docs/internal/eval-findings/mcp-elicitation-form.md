@@ -1,5 +1,11 @@
 # mcp-elicitation-form: harness cannot drive an MCP `Form` elicitation offline — needs a `mock_mcp` driver
 
+Status: historical finding. The eval schema now has scenario MCP server
+configuration and an `InjectMcpElicitation` action path; keep this report as
+evidence of the original gap, not as the current harness capability statement.
+Use `docs/internal/EVAL_HARNESS.md` and `crates/squeezy-eval/src/scenario.rs`
+for the current MCP scenario API.
+
 ## Severity
 
 medium — the user-facing modal (styling, multiline input, Esc cancel) is unreachable from the eval harness today, so any visual or input regression in `format_mcp_elicitation_menu_lines` / `pending_mcp_elicitation` handling slips past every scenario-driven probe. It is not data-loss, but it is a hole in the post-#154 styling regression net for one of the more sensitive (user-trust, agent-side privilege) surfaces.

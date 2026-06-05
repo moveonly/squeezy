@@ -451,7 +451,7 @@ partition, no per-thread scope, no session-id key. The
 v1 graph milestone; a model-callable `memory_append` tool, an
 extraction phase, a consolidation pass are deferred.
 `user_memory_max_bytes` truncates at a char boundary and appends
-`\n[truncated]`. Default 8 KiB; zero disables ingestion.
+`\n[truncated]`. Default 16 KiB; zero disables ingestion.
 
 If `resume_state.json` is missing — a partial write lost on crash —
 both `fork_session` and the agent's resume path fall back to
@@ -485,7 +485,7 @@ parent's compacted state.
 
 Cross-session memory shifts a recurring cost off the agent. A user
 who would otherwise re-explain the same five preferences pays N
-times. With `~/.squeezy/memory.md`, the cap is 8 KiB of input
+times. With `~/.squeezy/MEMORY.md` or lowercase `memory.md`, the cap is 16 KiB of input
 tokens per session start, amortised across however many turns the
 session runs.
 

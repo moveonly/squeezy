@@ -11,7 +11,7 @@ The oracle is a benchmark/testing aid only; production navigation must not call
 
 Language coverage, oracle ownership, mixed-workload support, limitations, and
 language follow-ups are documented in
-[`../external/LANGUAGES.md`](../external/LANGUAGES.md).
+[`../../crates/squeezy-skills/external-docs/LANGUAGES.md`](../../crates/squeezy-skills/external-docs/LANGUAGES.md).
 
 ## Layout
 
@@ -21,9 +21,15 @@ benchmarks/
   fixtures/python/semantic-cases/   # small Python package used by smoke CI
   fixtures/js-ts/semantic-cases/    # small JS/TS package used by smoke CI
   fixtures/java/semantic-cases/     # small Java package used by smoke CI
+  fixtures/kotlin/semantic-cases/   # small Kotlin package used by smoke CI
+  fixtures/scala/semantic-cases/    # small Scala package used by smoke CI
   fixtures/go/semantic-cases/       # small Go module used by smoke CI
   fixtures/c/semantic-cases/        # small C project used by smoke CI
   fixtures/cpp/semantic-cases/      # small C++ project used by smoke CI
+  fixtures/php/semantic-cases/      # small PHP project used by smoke CI
+  fixtures/ruby/semantic-cases/     # small Ruby project used by smoke CI
+  fixtures/swift/semantic-cases/    # small Swift package used by smoke CI
+  fixtures/dart/semantic-cases/     # small Dart package used by smoke CI
   corpus.json                       # pinned smoke/full corpus manifest
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
@@ -32,6 +38,12 @@ benchmarks/
   specs/go-smoke-queries.json       # Go expected query results
   specs/c-smoke-queries.json        # C expected query results
   specs/cpp-smoke-queries.json      # C++ expected query results
+  specs/kotlin-smoke-queries.json
+  specs/scala-smoke-queries.json
+  specs/php-smoke-queries.json
+  specs/ruby-smoke-queries.json
+  specs/swift-smoke-queries.json
+  specs/dart-smoke-queries.json
   squeezy-graph-bench/              # benchmark CLI
 ```
 
@@ -60,8 +72,9 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --ra-lsp-probes 25
 ```
 
-Use `--language python|java|go|c|cpp|csharp|javascript|typescript|js-ts` with
-the matching fixture/spec from `../external/LANGUAGES.md`. Families with mixed
+Use `--language rust|python|java|kotlin|scala|go|c|cpp|csharp|javascript|typescript|js-ts|php|ruby|swift|dart`
+with the matching fixture/spec from
+`../../crates/squeezy-skills/external-docs/LANGUAGES.md`. Families with mixed
 workload support also accept `--mixed-repo <path>` and `--mixed-iterations <n>`.
 
 `benchmarks/corpus.json` is the reproducible v0 corpus entry point. It records
@@ -347,27 +360,13 @@ cross-language matrix used for v0 demo and website claims: wall time, graph
 queries, grep-baseline queries, mixed scenarios, missing checks, fallback rate,
 low-confidence edges, and oracle precision/recall by case.
 
-`.github/workflows/python-semantic-graph-benchmark.yml` runs the Python smoke
-benchmark on PRs and pushes that touch graph, parser, workspace, benchmark, or
-workflow files. It writes the Squeezy timing, CPython AST oracle accuracy, query
-diffs, and raw JSON report as a workflow artifact. Manual `workflow_dispatch`
-with `tier=full` additionally clones requests, flask, click, black, and fastapi,
-then runs oracle-only FP/FN comparison against their importable package source
-roots with the fixture speed gate disabled so external-corpus variance is
-reported rather than blocking the run. The full tier intentionally avoids whole
-repository roots because formatter snapshots, parser fixtures, and future-syntax
-test corpora can contain Python files that tree-sitter can recover from but
-CPython `ast` rejects as non-modules. If such files appear anyway, the report
-counts them as `oracle_unparseable` instead of Squeezy false positives.
-
-`.github/workflows/java-semantic-graph-benchmark.yml` runs the Java smoke
-benchmark on PRs and pushes that touch graph, parser, workspace, benchmark, or
-workflow files. It writes Squeezy timing, JDK compiler tree oracle accuracy,
-query diffs, and raw JSON reports as a workflow artifact. Manual
-`workflow_dispatch` with `tier=full` additionally clones junit5, mockito, guava,
-retrofit, and picocli, then runs oracle-only FP/FN comparison against each repo
-root with the fixture speed gate disabled so external-corpus variance is
-reported rather than blocking the run.
+The old per-language workflow files were collapsed into the two-file benchmark
+workflow listed above. `benchmark.yml` selects the family and tier, then calls
+`benchmark-lang.yml` with the matching toolchain and corpus settings. Manual
+`workflow_dispatch` accepts `family=all` or a single family plus `tier=smoke` or
+`tier=full`; full-tier runs clone the pinned external corpus entries from
+`benchmarks/corpus.json` and report external-corpus variance without turning
+every compiler/oracle mismatch into a hard PR gate.
 
 For Go, the benchmark runs a benchmark-only Go parser/AST oracle over `.go`
 files and compares top-level declarations against Squeezy's tree-sitter graph.
@@ -378,13 +377,10 @@ fails when a two-file Go edit causes more files to be reparsed than edited. The
 Go FP/FN accuracy gate is enforced for the smoke fixture by default and is
 relaxed by `--no-speed-gate` so external corpora can run in reporting-only mode
 without blocking the workflow on upstream parser drift, generated files, or
-build-tag differences. `.github/workflows/go-semantic-graph-benchmark.yml` runs
-Go smoke on PRs and pushes. Manual `workflow_dispatch` with `tier=full`, or a
-push to `benchmark-full/**` after the workflow is present on the default
-branch, clones gin, cobra, prometheus, etcd, and zap. The workflow shape
-intentionally mirrors the shared benchmark workflow while staying separate from
-`.github/workflows/semantic-graph-benchmark.yml` so it does not conflict with
-parallel Rust/C/C++ workflow changes.
+build-tag differences. Go now runs through the shared benchmark workflow:
+manual `workflow_dispatch` with `family=go` and `tier=full`, or a push to
+`benchmark-full/**` after the workflow is present on the default branch, clones
+gin, cobra, prometheus, etcd, and zap.
 
 Initial local Go full run on May 23, 2026 used Go 1.26.3 and compared five
 popular open-source Go repositories:

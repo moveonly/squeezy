@@ -18,8 +18,10 @@ Each scenario drives the same four-stage script through the
 `TuiHarness` (drive_tui = true, 160×48, palette_tone = "dark"):
 
 1. `/help` (curated topic index, system transcript message).
-2. `/help providers` (curated topic answer with `docs/external/PROVIDERS.md`
-   citation and an extracted `[model]` config-inspect section).
+2. `/help providers` (curated topic answer with a logical
+   `docs/external/PROVIDERS.md` citation backed by
+   `crates/squeezy-skills/external-docs/PROVIDERS.md`, plus an extracted
+   `[model]` config-inspect section).
 3. Slash-menu fuzzy ranking: type `/com` (expect `/compact` row + GOLD
    `›` selected marker), `Ctrl+U` to clear, then `/atc` (expect the
    non-prefix-but-subsequence hit `/attach` per
@@ -53,7 +55,7 @@ rubric dimension (rubric #6) is unverifiable for this domain.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-portkey.toml \
   --no-triage
 ```
@@ -131,17 +133,17 @@ same tax.
 source ~/.env.sh
 
 # OpenAI leg
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-openai.toml \
   --no-triage
 
 # Anthropic leg
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-anthropic.toml \
   --no-triage
 
 # Portkey leg (currently fails preflight per finding above)
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-03-slash-help-discovery-portkey.toml \
   --no-triage
 ```

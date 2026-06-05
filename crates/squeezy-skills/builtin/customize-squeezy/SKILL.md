@@ -34,8 +34,8 @@ Later sources override earlier ones:
 put shared project config there. `SQUEEZY_SETTINGS_PATH` redirects the user
 settings file.
 
-Authoritative reference: `docs/external/CONFIGURATION.md`. The bundled
-help index exposes the same content via `/help configuration`.
+Authoritative reference: `crates/squeezy-skills/external-docs/CONFIGURATION.md`.
+The bundled help index exposes the same content via `/help configuration`.
 
 ## Common edits
 
@@ -158,10 +158,15 @@ Use narrower targets.
 [skills]
 user_dir = "/path/to/squeezy-skills"
 compat_user_dir = "/path/to/agent-skills"
+extra_roots = ["/mnt/team-skills"]
 active_budget_chars = 4000
 active_body_cap_chars = 16000
 preamble_enabled = true
 preamble_budget_chars = 800
+active_budget_mode = { context_percent = 2.0 }
+preamble_budget_mode = { context_percent = 2.0 }
+inline = false
+hooks_enabled = false
 
 [[skills.config]]
 name = "noisy-project-skill"
@@ -173,8 +178,10 @@ enabled = true
 ```
 
 Skills live at one of `~/.squeezy/skills/`, `~/.agents/skills/`,
-`<workspace>/.squeezy/skills/`, `<workspace>/.agents/skills/`. Project
-tiers override user tiers; native tiers override compat tiers.
+configured `extra_roots`, `<workspace>/.squeezy/skills/`, or
+`<workspace>/.agents/skills/`. Project tiers override user tiers; native tiers
+override compat tiers. Ancestor workspace skill roots are discovered for nested
+monorepo packages.
 `[[skills.config]]` selects by exact `name` OR by `path` (never both).
 
 ### Budgets and limits
@@ -210,8 +217,8 @@ edit/shell/git/network/MCP/compiler before normal permission checks.
 `[redaction]`, `[web]`, `[graph]`, `[cache]`, `[tools]`, `[tui]`,
 `[skills]`, `[[skills.config]]`.
 
-See `docs/external/CONFIGURATION.md` for the per-field reference, defaults,
-and apply-tier (immediate / next prompt / restart required).
+See `crates/squeezy-skills/external-docs/CONFIGURATION.md` for the per-field
+reference, defaults, and apply-tier (immediate / next prompt / restart required).
 
 ## Workflow
 

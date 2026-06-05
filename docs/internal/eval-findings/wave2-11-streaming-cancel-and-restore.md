@@ -180,7 +180,7 @@ no pricing entry") implies the displayed form should be `"$0.0000"`.
 Invocation:
 
 ```
-$ source ~/.env.sh && cargo run -p squeezy-eval --quiet -- run \
+$ source ~/.env.sh && cargo run -p squeezy-eval -- run \
     crates/squeezy-eval/fixtures/scenarios/wave2-11-streaming-cancel-portkey.toml --no-triage
 squeezy-eval: provider: provider is not configured: missing PORTKEY_API_KEY or
   SQUEEZY_PORTKEY_KEY; set the env var or add `[providers.<name>] api_key = "…"`

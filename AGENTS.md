@@ -49,7 +49,7 @@ The crate layout separates:
 - Keep the graph schema and navigation behavior consistent across languages.
 - Attach provenance and confidence to every graph edge.
 
-Committed implementation documentation belongs in `docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
+Contributor and implementation documentation belongs in `docs/`. User-facing bundled help documentation belongs in `crates/squeezy-skills/external-docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
 
 Skill architecture scope is documented in `docs/internal/SKILLS_SCOPE.md`.
 Keep skills as local filesystem instruction bundles; do not add marketplace,

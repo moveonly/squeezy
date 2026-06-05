@@ -33,9 +33,9 @@ preview palette, recovery affordance, retention prune safety).
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-13-tool-output-spillover-openai.toml --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-13-tool-output-spillover-anthropic.toml --no-triage
 # portkey requires PORTKEY_API_KEY in env or [providers.portkey].api_key in ~/.squeezy/settings.toml
 ```

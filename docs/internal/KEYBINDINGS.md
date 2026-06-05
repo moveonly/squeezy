@@ -60,11 +60,15 @@ new variants are added.
 | `page_down`                         | `PageDown`      | Scroll the transcript one page down.                                    |
 | `transcript_home`                   | `Home`          | Jump to the top of the transcript when the composer is empty.           |
 | `transcript_end`                    | `End`           | Jump to the bottom of the transcript when the composer is empty.        |
-| `expand_selected_transcript_entry`  | `Ctrl+E`        | Toggle expand/collapse on the selected transcript entry.                |
-| `expand_all_transcript_entries`     | `Alt+E`         | Toggle expand-all across every toggleable transcript entry.             |
 
 Use `/keymap` inside the TUI to inspect the live resolution and see
 which entries are overrides.
+
+Transcript-overlay expansion is not currently part of the editable keymap
+namespace. `transcript_overlay` (`Ctrl+T` by default) opens the expanded
+overlay, expands a folded subagent overlay in place, and closes an already
+expanded overlay. Keep any future expansion-specific binding in
+`Action::ALL` before documenting it here.
 
 ## Key spec grammar
 

@@ -89,7 +89,7 @@ Functionality (harness instrumentation) + Cross-model consistency
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-14-tool-card-coalescing-openai.toml \
   --no-triage
 ```
@@ -165,7 +165,7 @@ Functionality (provider plumbing) + Cross-model consistency.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-14-tool-card-coalescing-portkey.toml \
   --no-triage
 ```

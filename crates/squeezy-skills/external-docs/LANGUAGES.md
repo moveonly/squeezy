@@ -19,9 +19,9 @@ uses the same family names so coverage claims stay checkable.
 | `js-ts` | JavaScript, JSX, TypeScript, TSX | `cjs`, `cts`, `js`, `jsx`, `mjs`, `mts`, `ts`, `tsx` | `tree-sitter-javascript`, `tree-sitter-typescript` | `tsc` | yes | `benchmarks/fixtures/js-ts/semantic-cases` | `benchmarks/specs/js-ts-smoke-queries.json` | vite, redux, axios, express, prettier |
 | `php` | PHP | `php` | `tree-sitter-php` | `nikic_php_parser` | yes | `benchmarks/fixtures/php/semantic-cases` | `benchmarks/specs/php-smoke-queries.json` | symfony-console |
 | `ruby` | Ruby | `rb` | `tree-sitter-ruby` | `ruby_prism` | no | `benchmarks/fixtures/ruby/semantic-cases` | `benchmarks/specs/ruby-smoke-queries.json` | sinatra |
-| `scala` | Scala | `scala`, `sc` | `tree-sitter-scala` | `scala_semanticdb` | no | `benchmarks/fixtures/scala/semantic-cases` | `benchmarks/specs/scala-smoke-queries.json` | _(deferred to follow-up PR)_ |
+| `scala` | Scala | `scala`, `sc` | `tree-sitter-scala` | `scala_semanticdb` | no | `benchmarks/fixtures/scala/semantic-cases` | `benchmarks/specs/scala-smoke-queries.json` | utest |
 | `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
-| `dart` | Dart | `dart` | `tree-sitter-dart` | `dart_analyzer` | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(deferred to follow-up PR)_ |
+| `dart` | Dart | `dart` | `tree-sitter-dart` | `dart_analyzer` with scan-only fallback | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(smoke only)_ |
 
 ## Rust
 
@@ -229,11 +229,11 @@ mappings), `#externalMacro`/`#freestanding` macro expansion, and SwiftPM
 contribute body hits to their enclosing symbol but do not produce symbols of
 their own.
 
-Oracle: SourceKit-LSP. The first PR ships the scan-only path that exercises the
-Swift extractor against a corpus-shaped fixture; CI installs the Swift 5.10
-toolchain on Linux and uses the bundled `sourcekit-lsp`. macOS-only frameworks
-(`Combine`, `SwiftUI`, `Network`) are intentionally absent from the fixture so
-the smoke run works on `ubuntu-latest`.
+Oracle: SourceKit-LSP when `sourcekit-lsp` is available, with syntactic
+scan-only fallback recorded in the report when the Swift toolchain is absent.
+CI installs the Swift toolchain for the language benchmark path. macOS-only
+frameworks (`Combine`, `SwiftUI`, `Network`) are intentionally absent from the
+fixture so the smoke run works on `ubuntu-latest`.
 
 ## Dart
 
@@ -250,8 +250,9 @@ alternate URIs as separate imports; the resolver prefers the primary when both
 exist. Generated `*.g.dart` / `*.freezed.dart` / `*.mocks.dart` files parse but
 are excluded from oracle precision/recall accounting via glob.
 
-Oracle: deferred to a follow-up PR. The first PR runs in scan-only mode while
-the `package:analyzer`-backed Dart oracle is wired up in CI.
+Oracle: `package:analyzer` helper when the Dart oracle helper is present and
+the analyzer run succeeds; otherwise the benchmark degrades to scan-only mode and
+records that status in the report.
 
 ## Benchmark Corpus Reporting
 
@@ -263,4 +264,4 @@ source paths; their specs assert those paths are surfaced as generated/vendor
 fallback evidence rather than graph-confident answers.
 
 Contributor steps for adding or changing a language family live in
-[`../internal/ARCHITECTURE.md`](../internal/ARCHITECTURE.md).
+[`../../../docs/internal/ARCHITECTURE.md`](../../../docs/internal/ARCHITECTURE.md).

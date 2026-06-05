@@ -150,11 +150,11 @@ out-of-scope for headless eval probes.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-07-tool-approval-openai.toml --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-07-tool-approval-anthropic.toml --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-07-tool-approval-portkey.toml --no-triage
 ```
 

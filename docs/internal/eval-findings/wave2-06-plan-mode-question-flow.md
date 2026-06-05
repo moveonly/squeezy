@@ -207,15 +207,15 @@ source ~/.env.sh
 
 cargo build -p squeezy-eval
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-06-plan-mode-question-openai.toml \
   --no-triage
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-06-plan-mode-question-anthropic.toml \
   --no-triage
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-06-plan-mode-question-portkey.toml \
   --no-triage
 ```

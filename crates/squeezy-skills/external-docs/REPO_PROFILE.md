@@ -24,7 +24,9 @@ The generated profile does not store source contents, secrets, raw command
 output, or a long repo map. Squeezy refreshes it on first run, explicit
 `squeezy repo refresh`, or when the cheap repo fingerprint changes. Unchanged
 later sessions reuse it silently. When a profile is created or refreshed, CLI
-and TUI startup show a compact onboarding summary.
+and TUI startup show a compact onboarding summary, and startup also appends the
+current profile summary into model instructions so the agent can use that
+machine-local project context without re-exploring it every session.
 
 Set `SQUEEZY_REPOS_PATH` to use a different registry path, which is useful for
 tests and isolated runs. Set `SQUEEZY_PROJECTS_DIR` to use a different

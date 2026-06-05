@@ -72,16 +72,21 @@ Candidate triggers are a graph rebuild that becomes user-visible after a schema
 bump, compaction work that intentionally outlives a turn, or a future telemetry
 spool that earns persistence.
 
-## Deferred Workspace File Watcher
+## Workspace File Watcher Boundary
 
-Do not add `notify`, inotify, or FSEvents just to keep the graph warm. The
-current `GraphManager` refresh policy already refreshes before graph queries,
-debounces explicit changed paths, and has a bounded polling fallback.
+`squeezy-graph` has a cross-platform `FileWatcher` backed by
+`notify-debouncer-full` and `GraphManager::open_watching`. It batches
+FSEvents/inotify/ReadDirectoryChangesW notifications into
+`pending_changed_paths`, which `refresh_before_query` drains on the next graph
+query. The watcher is an available graph API for long-lived callers, not a
+daemon or IPC surface.
 
-Revisit a watcher only when there is a measured stale-result problem from
-outside-Squeezy edits or a live diagnostic UI that requires sub-second
-freshness. If that happens, keep the poll-on-query path as the fallback and
-coalesce mutating events before they reach the graph refresh queue.
+The default tool registry still opens the graph with `GraphManager::open_with_store`
+on the blocking pool and relies on poll-on-query plus explicit invalidation
+from Squeezy-owned mutations. Do not wire an always-on watcher into normal
+startup unless a measured stale-result problem justifies the startup cost.
+Keep poll-on-query as the fallback and coalesce mutating events before they
+reach the graph refresh queue.
 
 ## Deferred Telemetry Spool
 

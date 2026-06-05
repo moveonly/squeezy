@@ -336,9 +336,9 @@ per-source block runs `div_ceil(4)` over each byte counter:
 - system prompt + framing: `~24_020 tokens` (the remainder)
 
 Tool outputs are 51% of the consumed budget. The user runs
-`/tool-verbosity compact`. On the next turn, `read_file` shrinks its result
-formatter, `tool_output_bytes` drops to roughly 64_000, and the next
-`/context` shows `~62_000 tokens (~31% of window)`. The
+`/compact`. On the next turn, stale raw tool outputs are replaced by compact
+summaries or receipt stubs, `tool_output_bytes` drops to roughly 64_000, and the
+next `/context` shows `~62_000 tokens (~31% of window)`. The
 `SessionAccountingSnapshot` made the decision obvious — no guessing whether
 the system prompt, the conversation, or the tools was the driver. The
 compaction trigger reads the same `transmitted_request.used_input_percent_x100`

@@ -1,6 +1,8 @@
 # Eval coverage plan — wave 2 (20 domains × 3 providers)
 
-Status: dispatch board for the wave-2 bug-hunt, as of 2026-05-30.
+Status: historical dispatch board for the 2026-05-30 wave-2 bug hunt. The
+provider failures and findings below are snapshot evidence, not the current
+source of truth for whether a bug is still reproducible.
 
 Each domain gets a single agent that drives the `squeezy-eval` harness
 against the squeezy repo itself using **three live provider scenarios**

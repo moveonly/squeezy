@@ -69,13 +69,14 @@ a labeled fallback.
 - Unsupported languages return structured `unsupported` / `partial`
   results rather than fabricated graph confidence. The current
   language coverage matrix lives in
-  [`docs/external/LANGUAGES.md`](external/LANGUAGES.md).
+  [`crates/squeezy-skills/external-docs/LANGUAGES.md`](../crates/squeezy-skills/external-docs/LANGUAGES.md).
 
 ## Scope
 
 Squeezy targets local semantic navigation across Rust, Python, Java,
-C#/.NET, Go, C/C++, and JavaScript/TypeScript. Initial platforms are
-macOS and Linux. The Linux release artifact is built for
+Kotlin, Scala, C#/.NET, Go, C/C++, JavaScript/TypeScript, PHP, Ruby,
+Swift, and Dart. Supported platforms are macOS, Linux, and Windows
+`x86_64`. The Linux release artifact is built for
 `x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is
 a TUI. Squeezy is an MCP client: external MCP servers can be installed
 and consumed as tools.
@@ -95,9 +96,11 @@ Squeezy explicitly does not provide:
   internal.
 
 For deeper reading, the agent approach is documented in
-[`docs/external/AGENT_APPROACH.md`](external/AGENT_APPROACH.md), the
-tool surface in [`docs/external/TOOLS.md`](external/TOOLS.md), and the
+[`crates/squeezy-skills/external-docs/AGENT_APPROACH.md`](../crates/squeezy-skills/external-docs/AGENT_APPROACH.md),
+the tool surface in
+[`crates/squeezy-skills/external-docs/TOOLS.md`](../crates/squeezy-skills/external-docs/TOOLS.md),
+and the
 tool-call saving roadmap in
-[`docs/external/tool-call-saving-strategy.md`](external/tool-call-saving-strategy.md).
+[`crates/squeezy-skills/external-docs/tool-call-saving-strategy.md`](../crates/squeezy-skills/external-docs/tool-call-saving-strategy.md).
 Contributor-facing internals live under
 [`docs/internal/`](internal).

@@ -60,13 +60,13 @@
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-08-apply-patch-diff-openai.toml \
   --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-08-apply-patch-diff-anthropic.toml \
   --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-08-apply-patch-diff-portkey.toml \
   --no-triage   # requires PORTKEY_API_KEY
 ```

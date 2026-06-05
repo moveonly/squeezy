@@ -397,9 +397,9 @@ spillover never outlives the registry that produced it.
 output a single grep can pin to the prompt:
 
 ```rust
-// crates/squeezy-tools/src/file_ops.rs:407–451 (Content mode)
+// crates/squeezy-tools/src/file_ops.rs (Content mode)
 GrepOutputMode::Content => {
-    let line_text = truncate_text(line, 500);
+    let line_text = truncate_text(line, 2_000);
     let mut next = serde_json::Map::new();
     next.insert("path".to_string(), json!(&rel_str));
     next.insert("line".to_string(), json!(line_index + 1));
@@ -412,7 +412,7 @@ GrepOutputMode::Content => {
             .map(|(offset_idx, ctx_line)| {
                 json!({
                     "line": before_start + offset_idx + 1,
-                    "text": truncate_text(ctx_line, 500),
+                    "text": truncate_text(ctx_line, 2_000),
                 })
             })
             .collect();
@@ -435,8 +435,8 @@ GrepOutputMode::Content => {
 
 The cap stack:
 
-- **Per-line cap.** `truncate_text(line, 500)` (`file_ops.rs:408`)
-  shortens any single matched line to 500 characters. Generated code,
+- **Per-line cap.** `truncate_text(line, 2_000)` shortens any single matched
+  line or context line to 2,000 characters. Generated code,
   minified JS, and accidental binary matches can't blow the budget on
   one match.
 - **Total byte cap.** `DEFAULT_OUTPUT_BYTE_CAP = 48_000`
@@ -650,12 +650,9 @@ round-trip and gained nothing from it.
   the raw bytes for the remainder of the session. With a 100 MiB
   budget this is unreachable in normal use but it is the failure mode
   to watch for in extremely long agent loops.
-- **Image size cap is implicit.** The image path reads the full file
-  with no explicit size gate — anything that survives the workspace
-  policy exclusion gets fully base64-encoded into the response. A
-  multi-megabyte image will produce a multi-megabyte
-  `data_base64` payload. Callers that want a cap have to enforce it
-  upstream of the read.
+- **Image size cap.** Image reads are explicitly capped at 5 MiB before
+  base64 encoding. Larger images return an error instead of pinning a
+  multi-megabyte `data_base64` payload into the response.
 - **Grep dedup false negatives.** The
   `FilesWithMatches` mode dedupes by `rel_str.clone()`
   (`file_ops.rs:454`); two paths that point to the same file via

@@ -1,7 +1,9 @@
-# Telemetry Next-Agent Handoff
+# Telemetry Summary Architecture
 
-This branch migrates high-frequency product telemetry into one bounded
+Squeezy reduces high-frequency product telemetry into one bounded
 `squeezy_session_summary` event built from a local durable telemetry ledger.
+This file records the durable architecture and safety boundary for future
+telemetry changes.
 
 ## Current Implementation
 
@@ -84,22 +86,17 @@ The `squeezy_session_summary` event now carries:
 - Cache fields: cache_supported, cache_write_tokens, reasoning_output_tokens.
 - Cost/context: aggregate token/cost/cache/budget counters.
 
-## Files Touched In This Branch
+## Maintenance Pointers
 
-- `crates/squeezy-telemetry/src/lib.rs`
-- `crates/squeezy-telemetry/src/lib_tests.rs`
-- `crates/squeezy-agent/src/lib.rs`
-- `crates/squeezy-tools/src/lib.rs`
-- `crates/squeezy-tools/Cargo.toml`
-- `crates/squeezy-tui/src/lib.rs`
-- `crates/squeezy-tui/src/config_screen.rs`
-- `crates/squeezy-tui/src/config_screen/keys.rs`
-- `crates/squeezy-tui/src/config_screen/save.rs`
-- `infra/telemetry-worker/src/worker.ts`
-- `infra/telemetry-worker/tests/worker.test.ts`
-- `crates/squeezy-skills/external-docs/TELEMETRY.md`
+- Product telemetry client and ledger: `crates/squeezy-telemetry/src/lib.rs`.
+- Runtime event call sites: `crates/squeezy-agent/`, `crates/squeezy-tools/`,
+  `crates/squeezy-tui/`, and adjacent integration crates.
+- Worker validation and forwarding: `infra/telemetry-worker/src/worker.ts`.
+- User-facing privacy contract:
+  `crates/squeezy-skills/external-docs/TELEMETRY.md` and
+  `crates/squeezy-skills/external-docs/FEEDBACK.md`.
 
-## Validation Run
-
-- `cargo test -p squeezy-telemetry`
-- `cargo check -p squeezy-agent -p squeezy-tui -p squeezy`
+When adding a new summary field, update the typed reducer tests, the Worker
+allowlist/shape tests, the dashboard setup script if the field is meant to be
+queried, and the external telemetry doc when the user-visible privacy contract
+changes.

@@ -28,6 +28,11 @@ https://squeezy-telemetry.esqueezy.workers.dev/v1/batch
 Override it with `SQUEEZY_TELEMETRY_ENDPOINT` when testing a local or staging
 collector.
 
+The durable local telemetry ledger defaults to `~/.squeezy/telemetry.redb`.
+Tests and staging runs can override the install id path with
+`SQUEEZY_TELEMETRY_INSTALL_ID_PATH` and the ledger path with
+`SQUEEZY_TELEMETRY_STORE_PATH`.
+
 The same Worker also exposes consented intake endpoints for `/feedback` and
 `/report`, plus a separate website visitor endpoint:
 
@@ -51,6 +56,9 @@ is used only to count anonymous unique users. Each process also gets a random
 `session_id`. Local telemetry facts are written with a millisecond timestamp
 and an increasing local sequence, then reduced into one bounded session summary
 before upload.
+Local facts include correlation ids such as `trace_id`, `span_id`, and
+`store_session_id` when they help connect safe runtime events in the ledger. The
+remote summary remains aggregate-first and does not upload raw timelines.
 
 ## Events
 

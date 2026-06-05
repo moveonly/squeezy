@@ -41,11 +41,11 @@
 
 ```sh
 source ~/.env.sh
-SQUEEZY_CHECKPOINTS_ENABLED=1 cargo run -p squeezy-eval --quiet -- run \
+SQUEEZY_CHECKPOINTS_ENABLED=1 cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-19-git-vcs-openai.toml --no-triage
-SQUEEZY_CHECKPOINTS_ENABLED=1 cargo run -p squeezy-eval --quiet -- run \
+SQUEEZY_CHECKPOINTS_ENABLED=1 cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-19-git-vcs-anthropic.toml --no-triage
-SQUEEZY_CHECKPOINTS_ENABLED=1 cargo run -p squeezy-eval --quiet -- run \
+SQUEEZY_CHECKPOINTS_ENABLED=1 cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-19-git-vcs-portkey.toml --no-triage
 ```
 

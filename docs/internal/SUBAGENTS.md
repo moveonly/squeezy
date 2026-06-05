@@ -15,7 +15,7 @@ Subagent behavior is parameterized by a role drawn from a static catalog in
 - A model policy: reuse the parent model, or downshift to a cheap model.
 - A reasoning-effort hint for providers that accept one.
 
-The catalog currently defines three roles:
+The catalog currently defines three role overlays:
 
 | Role     | Mutates files | Default model | Purpose                                                              |
 | -------- | ------------- | ------------- | -------------------------------------------------------------------- |
@@ -23,9 +23,14 @@ The catalog currently defines three roles:
 | Planner  | No            | Parent        | Read-only implementation planning; the `delegate_plan` control tool. |
 | Reviewer | No            | Cheap         | Read-only diff review; the `delegate_review` control tool.           |
 
-`delegate` keeps its existing broad-research behavior and is intentionally
-not overlaid by any role, so it retains access to `plan_patch` and skill
-discovery for broad research tasks.
+`delegate`, `doc_help`, and fork-mode `skill` subagents are real
+`SubagentKind` variants but are intentionally not overlaid by a role.
+`delegate` keeps its existing broad-research behavior so it retains access to
+`plan_patch` and skill discovery for broad research tasks. `doc_help` answers
+from the bundled help corpus with no file tools. `skill` is wired for bounded
+fork-mode skill execution with the skill body as the subagent instruction
+overlay, but current fork-mode skills are advertised to the parent and rely on
+normal delegation rather than automatic `SubagentKind::Skill` dispatch.
 
 ## Control Tools
 
@@ -57,7 +62,8 @@ in `subagent_allowed_tools` (in `crates/squeezy-agent/src/lib.rs`) starts
 from the parent's advertised tools, intersects them with the per-kind
 allow-list (the role catalog for `explore`, `delegate_plan`,
 `delegate_review`; a curated research list for `delegate`; empty for
-`doc_help`), then drops anything whose `PermissionCapability` is not
+`doc_help`; the delegate read-only research set for `skill`), then drops
+anything whose `PermissionCapability` is not
 `Read` or `Search`. The capability filter is the load-bearing safety
 guarantee: even if a future role allow-list accidentally names a mutating
 tool, the filter still strips `Edit`, `Shell`, `Network`, `Mcp`, `Git`,

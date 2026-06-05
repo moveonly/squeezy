@@ -39,7 +39,7 @@ Visual clarity.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-01-startup-banner-and-card-openai.toml \
   --no-triage
 ```
@@ -88,7 +88,7 @@ Functionality + Cross-model consistency (anthropic regresses vs. openai).
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-01-startup-banner-and-card-anthropic.toml \
   --no-triage
 ```
@@ -138,7 +138,7 @@ Cross-model consistency (provider name is meant to be the most basic cross-provi
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-01-startup-banner-and-card-openai.toml \
   --no-triage
 ```
@@ -185,7 +185,7 @@ Functionality (provider plumbing) + Cross-model consistency.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-01-startup-banner-and-card-portkey.toml \
   --no-triage
 ```

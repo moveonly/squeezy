@@ -51,13 +51,14 @@ rather than parsing the human output.
 
 ## Linux
 
-Linux is built and tested in CI on GitHub-hosted Ubuntu runners. The distributable Linux artifact is built for:
+Linux is built and tested in CI on GitHub-hosted Ubuntu runners. The distributable Linux artifacts are built for:
 
 ```text
 x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
 ```
 
-That target is used so the Linux binary is statically linked and does not depend on glibc. This makes the artifact usable on Alpine and ordinary glibc-based distributions without shipping separate libc builds.
+Those targets are used so the Linux binaries are statically linked and do not depend on glibc. This makes the artifacts usable on Alpine and ordinary glibc-based distributions without shipping separate libc builds.
 
 CI uses the musl target for Linux validation and artifact upload. The jobs set `CC_x86_64_unknown_linux_musl=musl-gcc` for native C dependencies and `CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld` for the final target link.
 
@@ -65,7 +66,7 @@ CI uses the musl target for Linux validation and artifact upload. The jobs set `
 - `cargo test --workspace --all-targets --target x86_64-unknown-linux-musl`
 - `cargo build -p squeezy --target x86_64-unknown-linux-musl`
 - `cargo llvm-cov --workspace --all-targets --target x86_64-unknown-linux-musl --summary-only` for coverage on pushes to `main` and manual CI runs
-- `cargo build --profile dist -p squeezy --target x86_64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../../.github/workflows/release.yml))
+- `cargo build --profile dist -p squeezy --target x86_64-unknown-linux-musl` and `--target aarch64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../../../.github/workflows/release.yml))
 - `readelf -l` must not report a program interpreter.
 - `readelf -d` must not report dynamic `NEEDED` dependencies.
 - the binary must pass `doctor`, `--version`, and `--help`.

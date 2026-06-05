@@ -66,8 +66,8 @@ source ~/.env.sh   # provides OPENAI_API_KEY
 cargo run -p squeezy-eval -- run crates/squeezy-eval/fixtures/scenarios/live-openai-smoke.toml
 ```
 
-A 1-turn smoke against `gpt-5.4-mini` (the cheapest model in the squeezy
-registry). Cost is reported on the final summary line.
+A 1-turn smoke against `gpt-5.4-mini`, the low-cost OpenAI model pinned by the
+fixture. Cost is reported on the final summary line.
 
 ### Bug-hunting against the squeezy repo
 
@@ -107,8 +107,9 @@ this fix", or "regress this behavior", this is the playbook:
    ```sh
    cargo run -p squeezy-eval -- run path/to/scenario.toml
    ```
-   The end-of-run line prints the run directory + cost. You should
-   never spend more than a few cents per probe against `gpt-5.4-mini`.
+   The end-of-run line prints the run directory + cost. Keep live probes
+   tightly scoped and use the current small-fast or fixture-pinned model when
+   the task does not need the parent model.
 
 4. **Read the artifacts in this order:**
    1. **`run.json`** — totals, manifest, finding count. One-line health check.
@@ -235,6 +236,13 @@ becomes a no-op.
 ### Steps: prompts and actions
 
 `steps` is an ordered array. Two kinds: `prompt` and `action`.
+
+The current scenario schema also supports environment variables, platform pins,
+fixture skills, MCP server injection, MCP elicitation injection, user-input
+responses, attachments, mode switching, apply-diff actions, TUI key driving,
+session-id capture, TUI frame assertions, per-turn token caps, and
+dropped-tool-call expectations. Use this section as the operator overview and
+`crates/squeezy-eval/src/scenario.rs` as the exhaustive field reference.
 
 #### `prompt` step
 
@@ -551,6 +559,15 @@ diffable across runs.
 | `expect_no_tool_errors` | minor | any `Error`/`Cancelled` `tool_call_completed` and `expect.no_tool_errors = true` |
 | `expect_finish_reason` | major | any completed turn matches `expect.finish_reason_not` — literal match against the provider's `finish_reason`, or the sentinel `"stop_no_action"` (stop + zero tool calls) |
 
+Additional bundled rules cover graph-overfetch patterns, missing confidence
+labels, unsupported or failed TUI actions, platform mismatch, unfired scripted
+actions, user-input auto-cancel, denied-tool-call UX, cross-turn duplicate tool
+calls, post-compaction failures, empty assistant text, subagent and MCP failures,
+cost warnings, AI-reviewer trips, length truncation, sandbox degradation, slow
+first token, compaction loops, deferred findings, and dropped-tool-call
+expectations. `crates/squeezy-eval/src/findings.rs` is the source of truth for
+the full rule inventory.
+
 Adding a new rule is a single file change in
 `crates/squeezy-eval/src/findings.rs`: implement the `Rule` trait,
 register it in `default_rules()`. The trace context carries
@@ -616,10 +633,14 @@ squeezy-eval run <scenario.toml> [--workspace-override <path>]
 squeezy-eval list [<dir>]                       # ls bundled or directory scenarios
 squeezy-eval replay <trace.jsonl>               # one-line summary of a recorded trace
 squeezy-eval view <run-dir>                     # chronological markdown transcript of a run
-squeezy-eval diff <run-a> <run-b> [--format markdown|json]
+squeezy-eval diff <run-a> <run-b> [--format markdown|json] [--schema-check]
 squeezy-eval check <dir> [--fail-on findings,expectations,errors]
                           [--junit <path>]
                           [--out <dir>]
+                          [--parallelism <n>]
+                          [--input-baseline <json>]
+                          [--input-tolerance <fraction>]
+                          [--update-baseline]
 ```
 
 Flags:
@@ -633,10 +654,18 @@ Flags:
 - `--out <dir>`: change the per-run scratch root (default `target/eval`).
 - `--fail-on`: comma list. `expectations` = any `expect_*` rule fired,
   `findings` = any non-expect rule fired, `errors` = scenario errored
-  out (provider not configured, IO error, etc.). Default is
+  out (provider not configured, IO error, etc.), `input-regression` =
+  total input tokens exceeded a saved baseline beyond tolerance. Default is
   `expectations,errors`.
 - `--junit <path>`: write a JUnit XML summary; one `<testcase>` per scenario.
 - `--quiet` (on `run`): suppress the default live narration. Without it, `squeezy-eval run` streams squeezy's activity to stdout as it happens — step boundaries, tool calls (`🔧 name(args)` + `↳ ✅/❌ status (bytes)`), the assistant's streaming text rendered inline, approvals, slash commands, and findings the moment each rule fires. Use `--quiet` for CI or when piping output into a pager. `check` always runs quietly because per-scenario PASS/FAIL is the right granularity for batch mode.
+- `--schema-check` (on `diff`): refuse to compare runs with different trace
+  schema versions.
+- `--parallelism <n>` (on `check`): run multiple scenarios concurrently.
+- `--input-baseline <json>`, `--input-tolerance <fraction>`, and
+  `--update-baseline` (on `check`): compare total input tokens against a saved
+  per-scenario baseline, tolerate a bounded increase, and record only newly-seen
+  baselines when explicitly requested.
 
 ### `view` output
 
@@ -706,10 +735,10 @@ focus = "transcript-state regressions only — ignore stylistic findings"
 
 ## Cost and token budgeting
 
-- Every turn against `gpt-5.4-mini` costs roughly `input_tokens *
-  0.4¢/1M` + `output_tokens * 1.6¢/1M`. A trivial nav prompt against
-  the squeezy repo lands around 14k–50k input tokens because the
-  system prompt + repo profile is substantial.
+- `gpt-5.4-mini` is priced in `crates/squeezy-llm/src/models.json` at
+  `$0.75/1M` input tokens, `$0.075/1M` cached-input tokens, and `$4.50/1M`
+  output tokens. A trivial nav prompt against the squeezy repo lands around
+  14k-50k input tokens because the system prompt + repo profile is substantial.
 - Set `max_input_tokens` on `[expect]` to catch runaway burns; the
   `expect_input_tokens` rule fires when crossed.
 - The mock provider has zero cost and runs the *real* agent loop

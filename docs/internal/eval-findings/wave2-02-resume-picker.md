@@ -35,7 +35,7 @@ The scenarios target the post-#151/#153 `Resuming session…` placeholder (`crat
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-02-resume-picker-anthropic.toml --no-triage
 ```
 
@@ -81,7 +81,7 @@ Functionality + Messaging.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-02-resume-picker-openai.toml --no-triage
 ```
 
@@ -133,7 +133,7 @@ Visual clarity (primary). Cross-model consistency (both OpenAI and Anthropic leg
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-02-resume-picker-openai.toml --no-triage
 ```
 
@@ -222,7 +222,7 @@ Visual clarity (the rubric exists but cannot be enforced).
 ### Reproducer
 
 ```sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-02-resume-picker-portkey.toml --no-triage
 ```
 

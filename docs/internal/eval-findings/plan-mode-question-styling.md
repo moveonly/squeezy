@@ -4,8 +4,9 @@
 - **Scenario:** `crates/squeezy-eval/fixtures/scenarios/plan-mode-question-styling.toml`
 - **Run dir:** `target/eval/plan-mode-question-styling-1780101029858/`
 - **Severity:** minor (harness gap; no defect found in PR #154 itself — regression guard)
-- **Status:** scenario passes; rendered-frame regression coverage is
-  unrealizable today due to a separate harness deadlock (see below).
+- **Status:** historical snapshot. The scenario passed in this run, and the
+  modal pump deadlock below has since been addressed in the TUI test harness;
+  keep this file as evidence of the original regression target.
 
 ## Summary
 

@@ -28,10 +28,12 @@ scripts/local_release_smoke.sh --verbose        # stream per-channel logs to std
 
 The script:
 
-- **Never publishes, pushes, or mutates anything outside `$TMPDIR`.**
-  Cargo uses `--dry-run`. Homebrew/winget generators run against stub
-  assets staged into the tmp tree. install.sh runs against a `file://`
-  mirror under the same tmp tree.
+- **Never publishes or pushes, and keeps release-channel outputs inside
+  `$TMPDIR`.** Cargo uses `--dry-run` and writes build artifacts through
+  `CARGO_TARGET_DIR` under the tmp tree, though it may still consult or update
+  the normal Cargo registry cache. Homebrew/winget generators run against stub
+  assets staged into the tmp tree. install.sh runs against a `file://` mirror
+  under the same tmp tree.
 - Creates a fresh `${TMPDIR:-/tmp}/squeezy-release-smoke.XXXXXX/` per
   invocation. Each channel gets its own subdirectory and a per-channel
   log under `logs/<channel>.log`.

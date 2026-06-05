@@ -199,7 +199,7 @@ Either export `PORTKEY_API_KEY` (or `SQUEEZY_PORTKEY_KEY`) in
 verify the `[providers.portkey] api_key = "…"` entry actually sits in
 `~/.squeezy/settings.toml` and is readable by the eval process. Once
 wired, re-run
-`cargo run -p squeezy-eval --quiet -- run
+`cargo run -p squeezy-eval -- run
 crates/squeezy-eval/fixtures/scenarios/wave2-15-working-card-portkey.toml
 --no-triage`. The fixture is otherwise unchanged.
 
@@ -224,13 +224,13 @@ interrupt"` against the live spinner instead.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-15-working-card-openai.toml \
   --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-15-working-card-anthropic.toml \
   --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-15-working-card-portkey.toml \
   --no-triage    # currently errors with provider config (Finding 3)
 ```

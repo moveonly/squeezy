@@ -235,9 +235,9 @@ The parent model is debugging a regression. It emits three `explore`
 calls in one turn — one per suspect subsystem (`auth`, `cache`,
 `router`).
 
-`flush_delegate_batch` (`lib.rs:9451`) receives all three. The lease
-registry hands out three slots (under the 4-cap). All three children
-run concurrently inside `buffer_unordered(4)`. Each runs
+`flush_delegate_batch` receives all three. The lease registry hands out three
+slots under the configured concurrent-subagent cap (20 by default). All three
+children run concurrently. Each runs
 `run_subagent` (`lib.rs:7540`), which: clones `AppConfig`
 (`lib.rs:7545`) and forces `SessionMode::Plan`,
 `store_responses = false`, inherited `max_output_tokens`, and per-call
@@ -352,7 +352,9 @@ thing".
                 cheap_model_for(provider, config).unwrap_or(parent_model.clone())
             })
         }
-        (SubagentKind::DocHelp, _) => parent_model,
+        (SubagentKind::DocHelp, _) => {
+            cheap_model_for(provider, config).unwrap_or(parent_model.clone())
+        }
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
@@ -362,10 +364,11 @@ Reviewer (`Cheap`, `roles.rs:125`) and Explorer (`Cheap`,
 `roles.rs:103`) drop to the provider's small/fast tier when one is
 curated. Planner stays on the parent model (`Parent`, `roles.rs:114`)
 because planning quality suffers under cheap-tier. `Delegate` has no
-role overlay and keeps the parent model; `DocHelp` keeps the parent
-model because its summary *is* the user-visible answer. There is no
+role overlay and keeps the parent model; `DocHelp` uses the provider's cheap
+tier when available and falls back to the parent model, with a separate output
+budget floor so the user-visible answer can still be complete. There is no
 "global cheap-model fast path" — cheap-tier fires only for the kinds
-whose role catalog asks for it, and only when the provider has a
+whose role catalog or subagent kind asks for it, and only when the provider has a
 curated cheap tier (`cheap_model_for`, `lib.rs:8578-8589`). A child's
 dollar savings come from two independent levers: smaller per-round
 payload (tool subsetting + lazy schemas) and, for two of the four

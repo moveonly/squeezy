@@ -6,7 +6,8 @@ development conventions.
 
 - [Architecture](ARCHITECTURE.md): crate boundaries and major runtime choices.
 - [Async and background work](ASYNC_BACKGROUND_WORK.md): job cancellation,
-  session-log writer boundaries, and deferred queue/watcher/spool guardrails.
+  session-log writer boundaries, graph watcher scope, and deferred queue/spool
+  guardrails.
 - [Checkpoints and rollback](CHECKPOINTS.md): why `RollbackTarget::Group`
   exists alongside `Latest` and `Checkpoint(id)`.
 - [Semantic graph](SEMANTIC_GRAPH.md): graph schema, refresh policy,
@@ -32,7 +33,8 @@ development conventions.
   Homebrew formula, winget manifest) via
   `scripts/local_release_smoke.sh`.
 
-External user-help docs live in [`../external/`](../external/). Do not put
-private deployment notes, implementation-only tradeoffs, benchmark details, or
-contributor workflow in external docs unless a user needs that information to
-operate Squeezy.
+External user-help docs live in
+[`../../crates/squeezy-skills/external-docs/`](../../crates/squeezy-skills/external-docs/).
+Do not put private deployment notes, implementation-only tradeoffs, benchmark
+details, or contributor workflow in external docs unless a user needs that
+information to operate Squeezy.

@@ -29,6 +29,11 @@ hidden via `[tools] excluded` overlay.
 
 ## Sweep mechanics
 
+The reproducible scripts for this board are vendored under
+[`realworld-harness/`](realworld-harness/). The `/tmp/...` paths below are the
+historical scratch locations used by the captured sweep; regenerate from the
+vendored harness when repeating the measurement.
+
 Per cell (lang × variant × model), n = 3 reps. Each rep is a fresh
 ephemeral workspace clone + a single agent turn capped at 600s (1500s for
 dart-on-Flutter SDK because the workspace is huge).
@@ -61,21 +66,20 @@ grader.
 
 ## Grading
 
-- Per-language graders in `/tmp/codex-runs/realworld/grade.py` (one
-  `grade_{lang}` per language) score each model answer against ground
-  truth captured in each scenario's `description` block. Recall =
-  found / total expected rows.
-- Ground truth lives in `/tmp/codex-runs/realworld/ground_truth.json`.
+- Per-language graders in `realworld-harness/grade.py` (historically copied to
+  `/tmp/codex-runs/realworld/grade.py`) score each model answer against ground
+  truth captured in each scenario's `description` block. Recall = found / total
+  expected rows.
+- Ground truth lives in `realworld-harness/ground_truth.json`.
 
 ## CSV generation
 
-`/tmp/full-sweep/build_csv.py` walks the fresh sweep run directories,
-medians cost (dropping `$0` failures) and recall (dropping
-zero-total grader misses) per cell, joins baselines, classifies, and
-writes the two CSVs.
+`realworld-harness/board_combined.py` walks the fresh sweep run directories, medians
+cost (dropping `$0` failures) and recall (dropping zero-total grader misses) per
+cell, joins baselines, classifies, and writes the two CSVs.
 
 ```
-python3 /tmp/full-sweep/build_csv.py
+python3 docs/internal/eval-findings/realworld-harness/board_combined.py
 ```
 
 ## Snapshot tally (this PR's HEAD)

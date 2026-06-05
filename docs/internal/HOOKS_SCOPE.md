@@ -1,37 +1,54 @@
 # Hooks Scope
 
-Squeezy does not expose a hook framework. Tool lifecycle, compaction, and
-prompt assembly are closed paths owned by the agent crate. This document
-records the scope decision per use-case so we can decline incremental hook
-extensions consistently and revisit only on concrete user demand.
+Squeezy now has a hook engine, but the public user surface is deliberately
+narrow. `squeezy-hooks` defines the typed lifecycle events and the agent crate
+dispatches them from prompt, tool, permission, compaction, setup, and subagent
+paths. Skills may declare shell hooks in `SKILL.md`, but those hooks are inert
+unless `[skills].hooks_enabled = true`.
 
-## Session-start and per-prompt enrichment
+This document records the boundary between the implemented local hook surface
+and extension-runtime ideas that remain out of scope.
 
-The enrichment surface today is static. `squeezy-agent` stitches two sources
-into `config.instructions` exactly once at session start
-(`crates/squeezy-agent/src/lib.rs:1369-1402`):
+## Implemented surface
+
+The internal hook system has two layers:
+
+- `AgentHook` / `AgentHookBus`: typed integration hooks for Squeezy-owned
+  extensions that can mutate request, tool-call, and tool-result views.
+- `HookRegistry` / `HookHandler`: event-keyed dispatch used by skill hook
+  scripts and current agent dispatch sites.
+
+The current skill hook surface is intentionally smaller than the internal enum:
+frontmatter accepts `PreTurn`, `PreToolUse`, `PostToolUse`, `PostTool`,
+`PreCompact`, `PostCompact`, `SubagentStart`, and `PermissionRequest` (plus
+snake_case aliases). Commands run through `sh -c` from the skill directory with
+`SQUEEZY_HOOK_PAYLOAD`, `SQUEEZY_SKILL_DIR`, and `SQUEEZY_SKILL_NAME` set.
+Stdout is not parsed for mutations. A successful exit allows the event; a
+non-zero exit returns a deny result where the dispatch site enforces one.
+
+## Prompt enrichment
+
+The static enrichment surface still exists. `squeezy-agent` stitches repo docs,
+user memory, generated repo profile context, and selected runtime context into
+instructions before issuing requests. The durable local sources include:
 
 - Repo doc: concatenated `AGENTS.md` content, capped by
   `ContextCompactionConfig::repo_doc_max_bytes`.
-- User memory: contents of `~/.squeezy/memory.md`, capped by
+- User memory: contents of `~/.squeezy/MEMORY.md` when present, with lowercase
+  `memory.md` retained by the session-store remember/recall path, capped by
   `ContextCompactionConfig::user_memory_max_bytes`
-  (`crates/squeezy-core/src/lib.rs:2725`).
+- Repo profile: generated machine-local repo facts from `~/.squeezy/repos.toml`.
 
-Both caps are config-driven; setting either to `0` disables the corresponding
-ingestion. There is no per-prompt hook, no callback that can append text to a
-running turn, and no way to fold dynamic facts (today's date, current git
-branch, last build status, recent test failures, on-call rotation) into the
-base prompt without the user editing `memory.md` or invoking `/context` by
-hand.
+`PreTurn` typed handlers may append `extra_instructions`, and
+`UserPromptSubmit` typed handlers may rewrite the prompt. Skill shell hooks do
+not currently expose those mutations because their stdout is ignored.
 
-A typical alternative shape is a pair of `SessionStart` and
-`UserPromptSubmit` hook events that return `additional_context` strings
-the agent folds into developer instructions.
+## Still out of scope
 
-### Deferred design
-
-We are not adding a hook framework. If a future user request justifies the
-work, the minimal alternative is a startup-time enrichment registry that:
+The hook engine is not a marketplace, plugin runtime, remote extension host, or
+general shell-automation framework. New public hook capabilities should stay
+local, opt-in, and testable. If a future user request justifies more prompt
+enrichment, the minimal alternative is a startup-time enrichment registry that:
 
 - Reads a fixed list of declared local commands from config (e.g.
   `[[enrichment]] name = "git_branch", command = ["git", "branch", "--show-current"]`).
@@ -43,13 +60,7 @@ work, the minimal alternative is a startup-time enrichment registry that:
 - Surfaces per-command success/failure as a session-log event in the same
   shape as `user_memory_ingested`.
 
-This stays inside `squeezy-agent`, reuses the sandbox and session-log
-plumbing, and avoids introducing a hook trait, per-event scopes, or a plugin
-runtime. A per-prompt variant is explicitly out of scope for the first cut:
-session-start enrichment covers the highest-leverage facts (branch, current
-date, last test status) without the latency cost of running shells on every
-user turn.
-
-The decision to defer is intentional: session-start enrichment is the
-load-bearing knob, and a per-prompt variant can land later once we have
-profiling on how much the deferred hook costs.
+This stays inside `squeezy-agent`, reuses the sandbox and session-log plumbing,
+and avoids introducing remote code-loading or a plugin runtime. A broader
+per-prompt shell-enrichment variant remains out of scope until there is
+profiling that justifies the latency and trust cost.

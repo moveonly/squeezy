@@ -43,12 +43,13 @@ Production branch: main
 ## Content Boundary
 
 Public copy should be grounded in repo facts from `README.md`,
-`docs/external/`, `docs/internal/BENCHMARKS.md`, and the implementation.
+`crates/squeezy-skills/external-docs/`, `docs/internal/BENCHMARKS.md`, and the
+implementation.
 Avoid quantitative savings claims until release artifacts and auditable
 benchmark traces exist.
 
 ## Website Telemetry
 
 The site sends anonymous visitor and CTA events to the Squeezy telemetry Worker
-at `/v1/site`. The browser client respects Do Not Track and the local opt-out
-key `squeezy_site_telemetry_opt_out=1`.
+at `/v1/site`. The browser client respects Do Not Track, Global Privacy
+Control, and the local opt-out key `squeezy_site_telemetry_opt_out=1`.

@@ -10,9 +10,10 @@ The CLI equivalent is:
 squeezy feedback "what happened" --yes
 ```
 
-Feedback text is redacted locally, capped by `[feedback].max_feedback_bytes`,
-and sent to the configured Cloudflare Worker feedback endpoint. The Worker
-stores the redacted text as a PostHog feedback event.
+Feedback text is redacted locally, capped by `[feedback].max_feedback_bytes`
+(16 KiB by default), and sent to the configured Cloudflare Worker feedback
+endpoint. The Worker stores the redacted message body as the PostHog feedback
+event's `message` property.
 
 `/report` is for diagnostic bundles. The TUI builds a local redacted archive
 for the current session (or an explicit session id), previews the sections,
@@ -31,6 +32,11 @@ local-only traces are never included in report archives. Archives are uploaded
 to private Cloudflare R2 storage; PostHog receives only report
 metadata such as `report_id`, byte size, section names, platform, and redaction
 count. If upload fails, Squeezy writes the archive locally instead.
+
+Feedback and report upload can be disabled with `SQUEEZY_FEEDBACK=off`. Test or
+staging collectors can override endpoints with `SQUEEZY_FEEDBACK_ENDPOINT` and
+`SQUEEZY_REPORT_ENDPOINT`. Report archives are capped by
+`[feedback].max_report_bytes` (2 MiB by default).
 
 Public GitHub issues should include only a sanitized summary and the returned
 `feedback_id` or `report_id`, never the archive contents by default.

@@ -49,10 +49,11 @@ Squeezy discovers skills from four locations, from lowest to highest precedence:
 
 1. `~/.agents/skills/` (compat user)
 2. `~/.squeezy/skills/` (native user)
-3. `<workspace>/.agents/skills/` (compat project)
-4. `<workspace>/.squeezy/skills/` (native project)
+3. Additional roots from `[skills].extra_roots`
+4. `<workspace>/.agents/skills/` (compat project)
+5. `<workspace>/.squeezy/skills/` (native project)
 
-Higher tiers override lower tiers with the same skill name. Project tiers override user tiers; native tiers override compat tiers.
+Higher tiers override lower tiers with the same skill name. Project tiers override user tiers; native tiers override compat tiers. In monorepos, Squeezy walks ancestor workspaces for project skill roots so a nested package can still inherit the nearest shared `.squeezy/skills/` catalog.
 
 The user skill directories can be changed with `SQUEEZY_SKILLS_USER_DIR` and `SQUEEZY_SKILLS_COMPAT_USER_DIR`. The same fields are available in `~/.squeezy/settings.toml`:
 
@@ -60,10 +61,15 @@ The user skill directories can be changed with `SQUEEZY_SKILLS_USER_DIR` and `SQ
 [skills]
 user_dir = "/path/to/squeezy-skills"
 compat_user_dir = "/path/to/agent-skills"
+extra_roots = ["/mnt/team-skills"]
 active_budget_chars = 4000
 active_body_cap_chars = 16000
 preamble_enabled = true
 preamble_budget_chars = 800
+active_budget_mode = { context_percent = 2.0 }
+preamble_budget_mode = { context_percent = 2.0 }
+inline = false
+hooks_enabled = false
 
 [[skills.config]]
 name = "noisy-project-skill"
@@ -74,7 +80,7 @@ path = "/path/to/project/.squeezy/skills/specific-skill"
 enabled = true
 ```
 
-`active_budget_chars` caps the rendered `<active_skills>` bundle for a turn. `active_body_cap_chars` replaces very large individual skill bodies with a compact stub and a `load_skill` hint. `preamble_enabled` controls the session-start metadata catalog; `preamble_budget_chars` caps that catalog.
+`extra_roots` adds shared catalogs above personal skills and below project skills. `active_body_cap_chars` replaces very large individual skill bodies with a compact stub and a `load_skill` hint. `active_budget_mode` and `preamble_budget_mode` default to `{ context_percent = 2.0 }`, scaling skill metadata budgets with the active model context window. The older `active_budget_chars` and `preamble_budget_chars` remain supported as absolute fallback caps. `inline = false` is the default: active skill bodies are advertised as metadata and fetched with `load_skill` only when needed. Set `inline = true` to restore legacy full-body injection. `hooks_enabled = false` keeps `hooks:` declarations inert unless explicitly enabled.
 
 `[[skills.config]]` entries enable or disable a skill by exact `name` or by skill directory / `SKILL.md` `path`. Use exactly one selector per entry. Entries are applied in order after discovery, so later matches win.
 
@@ -99,7 +105,7 @@ If two discovered skills with the same name have the same precedence, Squeezy lo
 
 ## Fork-mode skills
 
-A skill that declares `context: fork` in its frontmatter is surfaced in a separate `<fork_skills>` system block rather than merged into `<active_skills>`. The block includes the full skill body with an instruction telling the model to dispatch it as a focused `delegate` subagent task rather than executing the body as direct guidance for the parent turn. The body is still present in the parent system prompt inside `<fork_skills>`; it is structurally separated and accompanied by an explicit instruction not to act on it inline. Inline-mode (the default) is unchanged.
+A skill that declares `context: fork` in its frontmatter is surfaced in a separate `<fork_skills>` system block rather than merged into `<active_skills>`. The block includes the full skill body with an instruction telling the model to dispatch it as a focused `delegate` subagent task rather than executing the body as direct guidance for the parent turn. The body is still present in the parent system prompt inside `<fork_skills>`; it is structurally separated and accompanied by an explicit instruction not to act on it inline. The default metadata mode for ordinary active skills is unchanged.
 
 ## `tool_deps` enforcement
 
@@ -135,8 +141,8 @@ This is separate from user and project `SKILL.md` directories.
 
 - Use `/help` in the TUI to list covered Squeezy help topics.
 - Use `/help <topic>` for a local answer grounded in bundled
-  `docs/external/` files and the current run's redacted `config inspect`
-  output.
+  `crates/squeezy-skills/external-docs/` files and the current run's redacted
+  `config inspect` output.
 - Natural-language questions that clearly ask about Squeezy itself can be
   answered by the same local help path before model or MCP calls.
 - If the local corpus does not cover the topic, Squeezy refuses to guess and

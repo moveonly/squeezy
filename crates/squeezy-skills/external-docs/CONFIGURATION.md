@@ -183,7 +183,7 @@ commented examples so that built-in defaults can evolve over time:
 # enabled = true
 # model = "gpt-5-nano"
 # allow_capabilities = ["read", "search", "network", "mcp"]
-# policy_file = "docs/external/APPROVAL_POLICY.md"
+# policy_file = "crates/squeezy-skills/external-docs/APPROVAL_POLICY.md"
 # timeout_secs = 15
 
 # [permissions.shell_sandbox]
@@ -202,6 +202,19 @@ commented examples so that built-in defaults can evolve over time:
 
 [telemetry]
 # enabled = true
+
+[skills]
+# user_dir = "~/.squeezy/skills"
+# compat_user_dir = "~/.agents/skills"
+# extra_roots = []
+# active_budget_chars = 4000          # legacy absolute cap; used when active_budget_mode is unset
+# active_body_cap_chars = 16000
+# preamble_enabled = true
+# preamble_budget_chars = 800         # legacy absolute cap; used when preamble_budget_mode is unset
+# active_budget_mode = { context_percent = 2.0 }
+# preamble_budget_mode = { context_percent = 2.0 }
+# inline = false                      # false advertises metadata and loads bodies on demand
+# hooks_enabled = false               # opt in before executing skill hook commands
 
 [hardening]
 # disable_core_dumps = true
@@ -483,6 +496,16 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   telemetry: `/feedback` sends short redacted text, while `/report` uploads a
   redacted archive to private report storage and stores only metadata in
   PostHog.
+- `[skills]`: local skill discovery and rendering controls. `user_dir` and
+  `compat_user_dir` point at personal skill catalogs. `extra_roots` adds shared
+  catalogs above personal skills and below project-local skills. `active_*`
+  fields control the active-skill bundle for the current turn, and
+  `preamble_*` fields control the available-skill metadata catalog. Budget
+  modes default to `{ context_percent = 2.0 }`, scaling with
+  `[context].model_context_window`; the legacy `*_budget_chars` fields remain
+  absolute fallbacks. `inline = false` keeps skill bodies out of the system
+  prompt until `load_skill` is called. `hooks_enabled = false` keeps `hooks:`
+  declarations inert until a trusted catalog is explicitly allowed.
 - `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
   that extend Squeezy's built-in secret redaction.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.

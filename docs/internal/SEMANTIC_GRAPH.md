@@ -8,7 +8,8 @@ navigation questions before the model reads raw files.
 
 Squeezy deliberately keeps a graph-first navigation surface and will not retreat
 to a bash/grep/`apply_patch` shell-loop navigation model. Tree-sitter grammars
-for Rust, Python, Java, C#, Go, C/C++, and JavaScript/TypeScript drive a
+for Rust, Python, Java, Kotlin, Scala, C#, Go, C/C++, JavaScript/TypeScript,
+PHP, Ruby, Swift, and Dart drive a
 persisted semantic graph with a typed-confidence call resolver and a documented
 agent-facing tool surface (`decl_search`, `definition_search`,
 `reference_search`, `hierarchy`, `upstream_flow`, `downstream_flow`,
@@ -47,8 +48,9 @@ that forwards raw LSP responses to the model.
   build output, lockfile, binary, large, VCS metadata, hidden, and
   user-excluded paths.
 - Language-specific declaration coverage is tracked in
-  [`../external/LANGUAGES.md`](../external/LANGUAGES.md). The supported `LanguageFamily` set is
-  Rust, Python, Java, C#, Go, C/C++, and JavaScript/TypeScript.
+  [`../../crates/squeezy-skills/external-docs/LANGUAGES.md`](../../crates/squeezy-skills/external-docs/LANGUAGES.md).
+  The supported `LanguageFamily` set is Rust, Python, Java, Kotlin, Scala, C#,
+  Go, C/C++, JavaScript/TypeScript, PHP, Ruby, Swift, and Dart.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -112,8 +114,8 @@ decision instead of walking a likely non-code or dangerous directory.
   treat affected results as lower-confidence until compiler facts land in the
   later compiler-as-fact epic.
 - Language-specific heuristics, limitations, and follow-ups live in
-  [`../external/LANGUAGES.md`](../external/LANGUAGES.md). This file only describes the shared graph
-  policy and query surface.
+  [`../../crates/squeezy-skills/external-docs/LANGUAGES.md`](../../crates/squeezy-skills/external-docs/LANGUAGES.md).
+  This file only describes the shared graph policy and query surface.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 `Heuristic`, `CandidateSet`, `External`, `MacroOpaque`, `ConditionalUnknown`,

@@ -237,10 +237,10 @@ The error message itself is the gold standard for this domain — concrete
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-17-error-messages-openai.toml \
   --no-triage
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-17-error-messages-anthropic.toml \
   --no-triage
 # Portkey: provision PORTKEY_API_KEY first, then run the third scenario.

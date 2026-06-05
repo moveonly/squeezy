@@ -652,7 +652,7 @@ const TOPICS: &[TopicDefinition] = &[
             "scripts",
             "skill script",
         ],
-        summary: "Hooks are observation and mutation points fired at key lifecycle events in the agent loop. They are used internally by skills, telemetry, and MCP integration. Hook scripts are executables placed under a skill's `scripts/` directory; they receive a JSON payload on stdin. Events include PreTurn (may append extra_instructions), UserPromptSubmit (may rewrite the prompt), PreToolUse, PostToolUse, PostToolUseFailure, PreCompact, PostCompact, SubagentStart, SubagentStop, PermissionRequest, PermissionDenied, SessionStart, Stop, and Setup.",
+        summary: "Hooks are lifecycle points fired by the agent loop. Internal typed hooks can mutate PreTurn and UserPromptSubmit, but user-authored skill hook scripts are a smaller opt-in surface: set `[skills].hooks_enabled = true`, declare `hooks:` in SKILL.md, and read the JSON payload from `SQUEEZY_HOOK_PAYLOAD`. Script stdout is ignored; zero exit allows the event and non-zero exit returns a deny result at the dispatch site. The skill parser currently accepts PreTurn, PreToolUse, PostToolUse, PostTool, PreCompact, PostCompact, SubagentStart, and PermissionRequest.",
         docs: &["docs/external/HOOKS.md", "docs/external/SKILLS.md"],
         config: &["skills"],
     },

@@ -1,6 +1,9 @@
 # Eval coverage plan: scenario-driven bug hunt
 
-Status: in-progress hunt against `main` as of 2026-05-30.
+Status: historical dispatch board for the 2026-05-30 bug hunt. The corresponding
+scenarios, eval harness features, and finding reports have since landed; use
+`EVAL_HARNESS.md` and `docs/internal/eval-findings/README.md` for current
+operator guidance.
 
 This document inventories the areas of squeezy that should each have at
 least one driving scenario under `crates/squeezy-eval/fixtures/scenarios/`

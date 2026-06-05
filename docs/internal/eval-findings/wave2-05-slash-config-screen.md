@@ -77,7 +77,7 @@ inactive tabs once the budget is exhausted.
 `Color::White` evaluates to RGB `(255, 255, 255)`, luminance
 `0.299*255 + 0.587*255 + 0.114*255 = 255` — far above the ~160
 ceiling documented in
-[`EVAL_COVERAGE_PLAN_WAVE2.md`](../EVAL_COVERAGE_PLAN_WAVE2.md#palette-guardrails).
+[`EVAL_COVERAGE_PLAN_WAVE2.md`](../EVAL_COVERAGE_PLAN_WAVE2.md#palette-guardrails-read-these-before-evaluating-visual-clarity).
 The expected substitute is `muted_fg()` /
 `footer_fg()` (TrueColor-aware mid-tone derived from the active
 palette tone), or `Color::White` should be guarded behind the
@@ -220,15 +220,15 @@ the available evidence.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-05-slash-config-screen-openai.toml \
   --no-triage
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-05-slash-config-screen-anthropic.toml \
   --no-triage
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-05-slash-config-screen-portkey.toml \
   --no-triage    # currently errors: missing PORTKEY_API_KEY
 ```

@@ -114,7 +114,7 @@
       "no_speed_gate": true,
       "repo": {
         "url": "https://github.com/symfony/console",
-        "rev": "TBD-pin-v7.2.0-commit-sha-when-landing",
+        "rev": "49d4de3417b34791e9e4d03368c888b4298e36e3",
         "checkout": "target/benchmark-repos/symfony-console"
       }
     },

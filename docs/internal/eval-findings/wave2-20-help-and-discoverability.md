@@ -50,9 +50,10 @@ The canonical answer set:
   plus a redacted `config inspect` dump for `[agent]` / `[session]`
   / `[tools]` / `[budgets]` / `[tui]`. The actual cancel answer
   (Esc / Ctrl+C) is nowhere in the response, the model is never
-  called for that turn, and the only citations are doc paths
-  (`docs/external/AGENT_APPROACH.md`, etc.) that themselves do not
-  name the cancel keys.
+  called for that turn, and the only citations are logical external-doc paths
+  (`docs/external/AGENT_APPROACH.md`, etc., backed by
+  `crates/squeezy-skills/external-docs/`) that themselves do not name the cancel
+  keys.
 
 ### What you should see vs. what you see
 
@@ -86,7 +87,7 @@ for a real LLM round trip.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-20-help-discoverability-openai.toml \
   --no-triage
 ```
@@ -98,8 +99,8 @@ Either of the following — both keep the local-help feature alive:
 - **Add a `cancel` / `keys` topic** to `TOPICS` in
   `crates/squeezy-skills/src/help.rs:194`. The summary should name
   Esc / Ctrl+C verbatim, cite the footer hint, and link to
-  `docs/external/KEYBINDINGS.md` (if present) or
-  `docs/internal/KEYBINDINGS.md`.
+  `docs/internal/KEYBINDINGS.md` or a new packaged external-doc keybinding
+  topic if one is added.
 - **Tighten `looks_like_squeezy_help_question`**
   (`crates/squeezy-skills/src/help.rs:530`) so action questions
   ("how do I X") only intercept when the input also matches a topic
@@ -156,7 +157,7 @@ of each run.
 ### Suggested fix
 
 - Add a brief discoverability section to the onboarding summary or
-  `docs/external/AGENT_APPROACH.md` (already a help citation) that
+  `crates/squeezy-skills/external-docs/AGENT_APPROACH.md` that
   names `request_turn_interrupt` at
   `crates/squeezy-tui/src/lib.rs:1799` and the Esc / Ctrl+C keys.
   This grounds every provider on the right answer.
@@ -198,7 +199,7 @@ dispatching account, rerun:
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-20-help-discoverability-portkey.toml \
   --no-triage
 ```

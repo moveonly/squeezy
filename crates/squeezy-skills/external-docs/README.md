@@ -4,7 +4,7 @@ These docs describe implemented Squeezy behavior for users. They are also the
 closed local corpus embedded into built-in Squeezy help.
 
 For the project's premise, design choices, and non-goals, see
-[`../THESIS.md`](../THESIS.md).
+[`../../../docs/THESIS.md`](../../../docs/THESIS.md).
 
 ## Use Squeezy
 

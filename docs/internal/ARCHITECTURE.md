@@ -1,7 +1,7 @@
 # Architecture
 
 Squeezy is implemented in Rust and targets local, deterministic code assistance
-on macOS and Linux. The TUI is the first interface. Navigation is built on
+on macOS, Linux, and Windows. The TUI is the first interface. Navigation is built on
 tree-sitter and Squeezy's own semantic graph rather than LSP or
 `rust-analyzer`.
 
@@ -25,6 +25,11 @@ tree-sitter and Squeezy's own semantic graph rather than LSP or
   wrapping.
 - `squeezy-skills`: local `SKILL.md` discovery/loading and built-in Squeezy
   help.
+- `squeezy-hooks`: opt-in hook event types, payloads, registry, and dispatch
+  helpers used by agent and skill integrations.
+- `squeezy-mcp`: MCP server/client plumbing and protocol adapters.
+- `squeezy-eval`: scenario-driven live-agent evaluation, replay, trace, and
+  finding-report tooling.
 - `squeezy-workspace`, `squeezy-parse`, `squeezy-graph`, `squeezy-rank`,
   `squeezy-store`, `squeezy-vcs`, `squeezy-telemetry`, and `squeezy-harness`:
   workspace discovery, parsers, graph state, ranking helpers, persistent local
@@ -51,8 +56,9 @@ fed back to the provider loop.
 
 ## Documentation Boundary
 
-User-facing behavior belongs in `docs/external/` because those files are bundled
-into in-product help. Contributor workflow, implementation decisions, benchmark
+User-facing behavior belongs in `crates/squeezy-skills/external-docs/` because
+those files are packaged with the `squeezy-skills` crate and embedded into
+in-product help. Contributor workflow, implementation decisions, benchmark
 oracles, release/deployment notes, and maintenance conventions belong in
 `docs/internal/`.
 
@@ -159,4 +165,5 @@ MCP, not to a Squeezy-specific protocol.
 6. Add fixture and spec files under `benchmarks/fixtures/` and
    `benchmarks/specs/`.
 7. Add the language family to the benchmark workflow and update
-   `docs/external/LANGUAGES.md` with user-facing coverage and limitations.
+   `crates/squeezy-skills/external-docs/LANGUAGES.md` with user-facing coverage
+   and limitations.

@@ -67,10 +67,10 @@ Layer 2 is the **provider-cheap-tier LLM judge**. It runs only when:
 - the escalation-sticky window is not engaged.
 
 The judge dispatches a single short request via `LlmProvider::stream_response`
-to **the same cheap-tier model that would handle the routed turn** —
-resolved through `cheap_model_for(provider, config)`
-(`crates/squeezy-agent/src/lib.rs:8630-8641`), shared with the
-subagent path. That means the judge model varies by provider:
+to a cheap judge model. Resolution prefers `[providers.<id>].judge_model`, then
+`[routing].judge_model`, then the provider's curated mini/cheap tier via
+`judge_model_for_provider` / `cheap_model_for`. That means the judge model
+varies by provider and can differ from the routed-turn model:
 
 | Parent provider                | Judge / routed-turn model           |
 |--------------------------------|--------------------------------------|
@@ -82,8 +82,10 @@ subagent path. That means the judge model varies by provider:
 | Ollama / local                 | User's `[model].small_fast_model`    |
 
 The judge's system prompt is fixed (`turn_router.rs::JUDGE_INSTRUCTIONS`)
-and asks for a strict JSON reply `{"route":"cheap"|"parent","reason":"…"}`
-with `max_output_tokens = 80` and `reasoning_effort = Low`. The
+and asks for a strict JSON reply `{"route":"cheap"|"parent","reason":"…"}`.
+The judge uses `max_output_tokens = 512`, leaves `reasoning_effort` unset, and
+prefers a provider-specific `judge_model` or configured routing judge before
+falling back to the provider's curated cheap tier. The
 classifier parses the JSON, optionally stripping a `\`\`\`json` fence,
 and treats any timeout (10 s), parse error, or non-`cheap`/`parent`
 verdict as `Parent`. The judge **never** blocks a turn.

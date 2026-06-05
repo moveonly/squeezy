@@ -51,12 +51,14 @@ fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser>
 }
 ```
 
-The supported set is: C, C++, C#, Go, Java, JavaScript, JSX, Python,
-Rust, TypeScript, TSX. The per-language extractors live in
+The supported set is: Rust, Python, Java, Kotlin, Scala, C#, Go, C, C++,
+JavaScript, JSX, TypeScript, TSX, PHP, Ruby, Swift, and Dart. The per-language
+extractors live in
 `crates/squeezy-parse/src/languages/` — one module per family
-(`c_family.rs`, `csharp.rs`, `go.rs`, `java.rs`, `js_ts.rs`,
-`python.rs`, `rust.rs`) — each exporting an `extract_*` entry point
-that walks the tree-sitter tree and returns a `ParsedFile`.
+(`c_family.rs`, `csharp.rs`, `dart.rs`, `go.rs`, `java.rs`, `js_ts.rs`,
+`kotlin.rs`, `php.rs`, `python.rs`, `ruby.rs`, `rust.rs`, `scala.rs`,
+`swift.rs`) — each exporting an `extract_*` entry point that walks the
+tree-sitter tree and returns a `ParsedFile`.
 
 Each extractor produces the same five products: `symbols`, `imports`,
 `calls`, `references`, and `body_hits` (literals, identifiers, type
@@ -84,9 +86,10 @@ suggests `"bounded read/grep/list navigation"` as the fallback.
 
 ### Signature / body split
 
-The single most important field is `body_span`. Every symbol carries one
-`span` (covering the entire declaration including the body) and an
-optional `body_span` (covering just the body). The structure is at
+The two most important slice fields are `signature_span` and `body_span`. Every
+symbol carries one `span` (covering the entire declaration), a signature string,
+an optional `signature_span` for the declaration header, and an optional
+`body_span` (covering just the body). The structure is at
 `crates/squeezy-parse/src/lib.rs:64-88`:
 
 ```rust
@@ -459,8 +462,8 @@ would be **15,000–40,000 tokens**.
 
 **Step 2 — read the shape.** Knowing the symbol ID, the model asks
 `read_slice {symbol_id, span_kind: "signature"}`. `read_slice_target`
-returns the symbol's full `span` (signature lives in the bytes from
-the declaration start to the body start) —
+uses `signature_span` when available and falls back to the declaration span only
+for symbols that do not carry a separate header span:
 `pub async fn verify_token(token: &str, now: SystemTime) -> Result<Claims, AuthError>`.
 Cost: roughly **50 tokens**. A naïve `Read auth/middleware.rs` is
 **~7000 tokens**.
@@ -483,11 +486,11 @@ sees code it doesn't need.
 
 ## Edge cases and limits
 
-**Unsupported languages.** Anything outside the list at
-`lib.rs:458-469` — Ruby, Kotlin, Swift, Scala, Zig, Haskell, Elixir,
-Lua, Bash, SQL, HTML, CSS, YAML, TOML, Markdown — produces a
+**Unsupported languages.** Anything outside the supported `LanguageFamily` set
+— for example Zig, Haskell, Elixir, Lua, Bash, SQL, HTML, CSS, YAML, TOML, and
+Markdown — produces a
 `ParsedFile::unsupported` and gets `"bounded read/grep/list navigation"`
-as the documented fallback (`lib.rs:48`). The graph contains a `File`
+as the documented fallback. The graph contains a `File`
 symbol for the file but no declarations; the agent can still read it,
 just with no slice shortcut.
 

@@ -162,15 +162,15 @@ wave-2 / 18 theme domain scenarios.
 ```sh
 cargo build -p squeezy-eval
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-04-slash-compact-openai.toml \
   --no-triage
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-04-slash-compact-anthropic.toml \
   --no-triage
 
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-04-slash-compact-portkey.toml \
   --no-triage
 ```

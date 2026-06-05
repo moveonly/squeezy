@@ -1,12 +1,14 @@
 # Hooks
 
-Hooks are observation and mutation points fired at key lifecycle events in the
-Squeezy agent loop. Skills, telemetry, and MCP integration use hooks internally;
-you can also write your own hook scripts in a skill's `scripts/` directory.
+Hooks are lifecycle points fired by the Squeezy agent loop. The internal hook
+engine supports typed mutation hooks, but user-authored skill hooks are a
+smaller opt-in shell-script surface: they receive the event payload in an
+environment variable and can allow or deny selected actions by exit status.
+Skill hook scripts do not read stdout for mutations.
 
 ## Hook Events
 
-Each event fires at a specific point in the agent loop:
+The internal hook enum includes these lifecycle events:
 
 | Event | When it fires | Mutation capability |
 |-------|--------------|---------------------|
@@ -28,7 +30,7 @@ Each event fires at a specific point in the agent loop:
 
 ## Mutation Capabilities
 
-Two events support mutations that affect agent behavior:
+Typed internal handlers can mutate two events:
 
 **`PreTurn`** — the hook script can return a JSON object with an
 `extra_instructions` key. Squeezy appends that string to the system prompt for
@@ -40,8 +42,9 @@ dynamic instructions.
 value. Use this for prompt enrichment, templating, or redaction before the
 model sees the input.
 
-For all other events, the hook runs as an observer. Returning a non-zero exit
-code on `PreToolUse` or `PermissionRequest` denies the action.
+Skill hook scripts cannot currently return those mutations. Their stdout is
+ignored; a zero exit status allows execution to continue, and a non-zero exit
+status returns a deny result at the dispatch site.
 
 ## Hook Scripts
 
@@ -55,8 +58,9 @@ A minimal shell hook:
 ```sh
 #!/usr/bin/env sh
 # scripts/pre-turn.sh
-# Append an instruction on every PreTurn event.
-echo '{"extra_instructions": "Always cite sources."}'
+# Inspect the payload and allow the event.
+printf '%s\n' "$SQUEEZY_HOOK_PAYLOAD" >> "$SQUEEZY_SKILL_DIR/hooks.log"
+exit 0
 ```
 
 Declare hooks in the skill's `SKILL.md` frontmatter:
@@ -75,16 +79,22 @@ hooks:
           command: scripts/audit-shell.sh
 ```
 
-- `matcher` is a tool-name filter. Use `"*"` or omit it to match all payloads
-  for the event.
+The skill frontmatter parser currently accepts only these event keys:
+`PreTurn`, `PreToolUse`, `PostToolUse`, `PostTool`, `PreCompact`,
+`PostCompact`, `SubagentStart`, and `PermissionRequest` (or their snake_case
+aliases).
+
+- `matcher` is a tool-name filter for payloads that include `tool_name`. Use
+  `"*"` or omit it to match all payloads for the event.
 - `once: true` causes the hook to fire only on its first successful invocation
   per session.
 
 ## Configuration
 
-Hooks are enabled automatically through the skill system. When a skill with
-hooks is activated, its hook handlers are registered against the session's
-`HookRegistry`. No separate configuration key is needed.
+Hooks are disabled by default. When `[skills].hooks_enabled = true` and a skill
+with `hooks:` is activated, its hook handlers are registered against the
+session's `HookRegistry`. Hook commands run through `sh -c` with the privileges
+of the Squeezy process, so only enable this for trusted skill catalogs.
 
 The `[skills]` section controls skill discovery:
 
@@ -92,6 +102,7 @@ The `[skills]` section controls skill discovery:
 [skills]
 user_dir = "~/.squeezy/skills"
 # project skills live under <workspace>/.squeezy/skills/
+hooks_enabled = true
 ```
 
 ## Environment Variables In Hook Scripts
@@ -105,11 +116,8 @@ Scripts receive the following environment:
 ## Use Cases
 
 - **Audit logging**: write tool calls or session events to a local log file.
-- **Prompt enrichment**: inject dynamic instructions (date, project context,
-  policy reminders) on every `PreTurn`.
 - **Policy enforcement**: deny shell commands that match a blocklist on
   `PreToolUse`.
 - **Observability**: emit structured telemetry events to an internal system.
-- **Prompt rewriting**: normalize or template user input on `UserPromptSubmit`.
 
 See [SKILLS.md](SKILLS.md) for the full skill authoring guide.

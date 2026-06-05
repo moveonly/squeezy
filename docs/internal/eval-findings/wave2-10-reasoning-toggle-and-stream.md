@@ -68,7 +68,7 @@ the assistant body and **collapses** it (the binding is named
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-openai.toml \
   --no-triage
 ```
@@ -144,7 +144,7 @@ the moment the turn finishes even though they didn't touch anything.
 
 ```sh
 source ~/.env.sh
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-anthropic.toml \
   --no-triage
 ```
@@ -210,7 +210,7 @@ fixture itself notes this in its description block.
 
 ```sh
 unset PORTKEY_API_KEY SQUEEZY_PORTKEY_KEY
-cargo run -p squeezy-eval --quiet -- run \
+cargo run -p squeezy-eval -- run \
   crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-portkey.toml \
   --no-triage
 ```
@@ -282,7 +282,7 @@ source ~/.env.sh   # OPENAI_API_KEY, ANTHROPIC_API_KEY
 # Without it, finding 3 reproduces.
 
 for prov in openai anthropic portkey; do
-  cargo run -p squeezy-eval --quiet -- run \
+  cargo run -p squeezy-eval -- run \
     crates/squeezy-eval/fixtures/scenarios/wave2-10-reasoning-toggle-${prov}.toml \
     --no-triage
 done

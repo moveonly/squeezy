@@ -77,6 +77,7 @@ Tagged releases publish prebuilt archives and SHA-256 checksum files:
 - `squeezy-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS
 - `squeezy-x86_64-apple-darwin.tar.gz` for Intel macOS
 - `squeezy-x86_64-unknown-linux-musl.tar.gz` for Linux x86_64
+- `squeezy-aarch64-unknown-linux-musl.tar.gz` for Linux ARM64
 - `squeezy-x86_64-pc-windows-msvc.zip` for Windows x86_64
 
 Download the archive for your platform from
@@ -90,7 +91,8 @@ install -m 0755 squeezy /usr/local/bin/squeezy
 squeezy doctor
 ```
 
-Replace the archive name with the Intel macOS or Linux archive when needed.
+Replace the archive name with the Intel macOS, Linux x86_64, or Linux ARM64
+archive when needed.
 
 On Windows, expand the zip and add the install location to `PATH`:
 
