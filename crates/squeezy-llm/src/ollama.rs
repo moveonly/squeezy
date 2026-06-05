@@ -113,16 +113,11 @@ impl OllamaProvider {
     }
 
     pub(crate) fn request_body_with(request: &LlmRequest, keep_alive: Option<&str>) -> Value {
-        // Canonicalize tool-call ids and synthesize placeholders for
-        // orphan tool results before building Ollama's `messages`
-        // array. Ollama's native route drops the `call_id` on the
-        // wire entirely (it pairs by surrounding role/tool blocks),
-        // but normalization still synthesizes the assistant
-        // tool-call message that an orphan tool-result needs to sit
-        // after — without that the `role:"tool"` message appears in
-        // the chat with no preceding assistant call and the model
-        // gets confused about the conversation order.
-        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        // Native Ollama accepts role-adjacent tool call/result messages
+        // and, on newer servers, preserves explicit ids. Keep original
+        // ids for already-paired calls while still synthesizing a
+        // placeholder call for orphan tool results after model switches.
+        let normalized_input = normalize_ollama_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
             "messages": ollama_messages(&request.instructions, &normalized_input),
@@ -142,6 +137,18 @@ impl OllamaProvider {
         let mut options = json!({ "num_ctx": DEFAULT_NUM_CTX });
         if let Some(max_output_tokens) = request.max_output_tokens {
             options["num_predict"] = json!(max_output_tokens);
+        }
+        if let Some(temperature) = request.temperature {
+            options["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            options["top_p"] = json!(top_p);
+        }
+        if let Some(seed) = request.seed {
+            options["seed"] = json!(seed);
+        }
+        if !request.stop.is_empty() {
+            options["stop"] = json!(request.stop);
         }
         body["options"] = options;
         if !request.tools.is_empty() {
@@ -545,7 +552,7 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
                 messages.push(json!({ "role": "assistant", "content": text }));
             }
             LlmInputItem::FunctionCall {
-                call_id: _,
+                call_id,
                 name,
                 arguments,
             } => {
@@ -553,6 +560,7 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
                     "role": "assistant",
                     "content": "",
                     "tool_calls": [{
+                        "id": call_id,
                         "function": {
                             "name": name,
                             "arguments": arguments,
@@ -561,9 +569,13 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
                 }));
             }
             LlmInputItem::FunctionCallOutput {
-                call_id: _, output, ..
+                call_id, output, ..
             } => {
-                messages.push(json!({ "role": "tool", "content": output }));
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output,
+                }));
             }
             // Ollama's native chat API puts images on the message itself
             // (`{"role": "user", "content": "...", "images": ["<b64>"]}`)
@@ -624,6 +636,50 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
         }
     }
     Value::Array(messages)
+}
+
+fn normalize_ollama_tool_ids_for_replay(items: &[LlmInputItem]) -> Vec<LlmInputItem> {
+    let mut seen_calls = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                seen_calls.insert(call_id.clone());
+                out.push(LlmInputItem::FunctionCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+            LlmInputItem::FunctionCallOutput {
+                call_id,
+                output,
+                content_parts,
+                is_error,
+            } => {
+                if !seen_calls.contains(call_id) {
+                    seen_calls.insert(call_id.clone());
+                    out.push(LlmInputItem::FunctionCall {
+                        call_id: call_id.clone(),
+                        name: crate::MODEL_SWITCHED_PLACEHOLDER_NAME.to_string(),
+                        arguments: json!({ "reason": "model_switched" }),
+                    });
+                }
+                out.push(LlmInputItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: output.clone(),
+                    content_parts: content_parts.clone(),
+                    is_error: *is_error,
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
 }
 
 /// Upper bound for a single NDJSON line accumulated by [`JsonLineDecoder`].
@@ -782,8 +838,14 @@ fn parse_ollama_line(line: &str, state: &mut OllamaStreamParseState) -> Result<V
             };
             let index = state.next_tool_call_index;
             state.next_tool_call_index += 1;
+            let call_id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("ollama_call_{index}"));
             events.push(LlmEvent::ToolCall(LlmToolCall {
-                call_id: format!("ollama_call_{index}"),
+                call_id,
                 name,
                 arguments,
             }));

@@ -62,6 +62,27 @@ fn request_body_uses_generate_content_shape() {
 }
 
 #[test]
+fn request_body_lowers_sampling_fields() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        temperature: Some(0.3),
+        top_p: Some(0.9),
+        stop: vec!["END".to_string(), "STOP".to_string()],
+        ..LlmRequest::default()
+    };
+
+    let body = GoogleProvider::request_body(&request);
+
+    assert_eq!(body["generationConfig"]["temperature"], json!(0.3f32));
+    assert_eq!(body["generationConfig"]["topP"], json!(0.9f32));
+    assert_eq!(
+        body["generationConfig"]["stopSequences"],
+        json!(["END", "STOP"])
+    );
+}
+
+#[test]
 fn request_body_preserves_function_tool_order() {
     let request = LlmRequest {
         model: "gemini-test".to_string().into(),

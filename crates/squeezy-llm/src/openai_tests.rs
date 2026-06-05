@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CacheSpec, LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmHostedTool, LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -52,6 +52,54 @@ fn request_body_uses_responses_streaming_shape() {
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["tools"][0]["name"], "grep");
     assert_eq!(body["tools"][0]["strict"], true);
+}
+
+#[test]
+fn request_body_lowers_sampling_and_hosted_tools() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        temperature: Some(0.2),
+        top_p: Some(0.7),
+        hosted_tools: vec![
+            Arc::new(LlmHostedTool::WebSearch {
+                filters: Some(json!({"allowed_domains": ["example.com"]})),
+            }),
+            Arc::new(LlmHostedTool::FileSearch {
+                vector_store_ids: vec!["vs_123".to_string()],
+            }),
+            Arc::new(LlmHostedTool::ComputerUse),
+        ],
+        ..LlmRequest::default()
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+
+    assert_eq!(body["temperature"], json!(0.2f32));
+    assert_eq!(body["top_p"], json!(0.7f32));
+    assert_eq!(body["tools"][0]["type"], "web_search_preview");
+    assert_eq!(
+        body["tools"][0]["filters"]["allowed_domains"][0],
+        "example.com"
+    );
+    assert_eq!(body["tools"][1]["type"], "file_search");
+    assert_eq!(body["tools"][1]["vector_store_ids"][0], "vs_123");
+    assert_eq!(body["tools"][2]["type"], "computer_use_preview");
+}
+
+#[test]
+fn request_body_uses_xai_web_search_tool_name() {
+    let request = LlmRequest {
+        model: "grok-4.3".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        hosted_tools: vec![Arc::new(LlmHostedTool::WebSearch { filters: None })],
+        ..LlmRequest::default()
+    };
+
+    let body = OpenAiProvider::request_body(&request, "xai");
+
+    assert_eq!(body["tools"][0]["type"], "web_search");
 }
 
 #[test]

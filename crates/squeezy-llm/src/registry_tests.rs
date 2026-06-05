@@ -7,8 +7,9 @@ use squeezy_core::{
 };
 
 use super::{
-    MODEL_REGISTRY, PROVIDERS, estimate_json_tokens, estimate_text_tokens, model_info_for,
-    provider_from_config, provider_honors_output_schema,
+    MODEL_REGISTRY, PROVIDERS, estimate_json_tokens, estimate_text_tokens,
+    is_text_model_picker_eligible, model_info_for, provider_from_config,
+    provider_honors_output_schema,
 };
 
 static GITHUB_COPILOT_AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -85,6 +86,18 @@ fn resolve_alias_for_bedrock_and_google() {
         resolve_model_alias("google", "haiku"),
         Some("gemini-2.5-flash-lite")
     );
+}
+
+#[test]
+fn xai_image_models_are_not_text_picker_eligible() {
+    assert!(!is_text_model_picker_eligible("xai", "grok-imagine"));
+    assert!(!is_text_model_picker_eligible("xai", "grok-imagine-1"));
+    assert!(!is_text_model_picker_eligible(
+        "xai",
+        "xai/grok-imagine-image"
+    ));
+    assert!(is_text_model_picker_eligible("xai", "grok-4.3"));
+    assert!(is_text_model_picker_eligible("openai", "grok-imagine"));
 }
 
 #[test]

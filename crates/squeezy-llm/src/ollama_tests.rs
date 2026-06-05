@@ -201,6 +201,59 @@ fn parser_extracts_text_tool_calls_and_usage() {
 }
 
 #[test]
+fn request_body_lowers_sampling_options_and_tool_call_ids() {
+    let request = LlmRequest {
+        model: "qwen3:8b".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::FunctionCall {
+                call_id: "native_call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "native_call_1".to_string(),
+                output: r#"{"result":"ok"}"#.to_string(),
+                content_parts: None,
+                is_error: false,
+            },
+        ]),
+        temperature: Some(0.2),
+        top_p: Some(0.75),
+        seed: Some(7),
+        stop: vec!["END".to_string()],
+        ..LlmRequest::default()
+    };
+
+    let body = OllamaProvider::request_body(&request);
+
+    assert_eq!(body["options"]["temperature"], json!(0.2f32));
+    assert_eq!(body["options"]["top_p"], json!(0.75f32));
+    assert_eq!(body["options"]["seed"], 7);
+    assert_eq!(body["options"]["stop"], json!(["END"]));
+    assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "native_call_1");
+    assert_eq!(body["messages"][1]["tool_call_id"], "native_call_1");
+}
+
+#[test]
+fn parser_preserves_native_tool_call_id_when_present() {
+    let mut state = OllamaStreamParseState::default();
+    let events = parse_ollama_line(
+        r#"{"model":"qwen3","message":{"tool_calls":[{"id":"native_call_7","function":{"name":"grep","arguments":{"pattern":"needle"}}}]}}"#,
+        &mut state,
+    )
+    .expect("native id tool call parses");
+
+    assert_eq!(
+        events[0],
+        LlmEvent::ToolCall(LlmToolCall {
+            call_id: "native_call_7".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "needle"}),
+        })
+    );
+}
+
+#[test]
 fn request_body_sets_think_true_for_reasoning_effort() {
     let request = LlmRequest {
         model: "qwen3:8b".to_string().into(),

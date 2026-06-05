@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CacheSpec, LlmEvent, LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmEvent, LlmHostedTool, LlmInputItem, LlmToolSpec};
 use serde_json::{Value, json};
 use squeezy_core::{
     DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL, DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL,
@@ -179,6 +179,65 @@ fn request_body_uses_chat_completions_shape() {
         tools[0]["function"]["parameters"]["properties"]["pattern"]["type"],
         "string"
     );
+}
+
+#[test]
+fn request_body_lowers_chat_completions_sampling_fields() {
+    let mut request = sample_request();
+    request.temperature = Some(0.1);
+    request.top_p = Some(0.6);
+    request.seed = Some(42);
+    request.stop = vec!["END".to_string(), "STOP".to_string()];
+    request.frequency_penalty = Some(0.25);
+    request.presence_penalty = Some(0.5);
+
+    let body = OpenAiCompatibleProvider::request_body(&request);
+
+    assert_eq!(body["temperature"], json!(0.1f32));
+    assert_eq!(body["top_p"], json!(0.6f32));
+    assert_eq!(body["seed"], 42);
+    assert_eq!(body["stop"], json!(["END", "STOP"]));
+    assert_eq!(body["frequency_penalty"], json!(0.25f32));
+    assert_eq!(body["presence_penalty"], json!(0.5f32));
+}
+
+#[test]
+fn request_body_lowers_xai_chat_hosted_search_for_native_preset() {
+    let mut request = sample_request();
+    request.model = "grok-2".to_string().into();
+    request.hosted_tools = vec![Arc::new(LlmHostedTool::WebSearch {
+        filters: Some(json!({
+            "mode": "on",
+            "from_date": "2026-01-01",
+        })),
+    })];
+
+    let body =
+        OpenAiCompatibleProvider::request_body_for_preset(&request, OpenAiCompatiblePreset::XAi);
+
+    assert_eq!(body["search_parameters"]["mode"], "on");
+    assert_eq!(body["search_parameters"]["from_date"], "2026-01-01");
+}
+
+#[test]
+fn request_body_lowers_xai_chat_hosted_search_for_namespaced_model() {
+    let mut request = sample_request();
+    request.model = "xai/grok-2".to_string().into();
+    request.hosted_tools = vec![Arc::new(LlmHostedTool::WebSearch { filters: None })];
+
+    let body = OpenAiCompatibleProvider::request_body(&request);
+
+    assert_eq!(body["search_parameters"]["mode"], "auto");
+}
+
+#[test]
+fn request_body_omits_non_xai_hosted_search_on_chat_compatible_routes() {
+    let mut request = sample_request();
+    request.hosted_tools = vec![Arc::new(LlmHostedTool::WebSearch { filters: None })];
+
+    let body = OpenAiCompatibleProvider::request_body(&request);
+
+    assert!(body.get("search_parameters").is_none());
 }
 
 #[test]

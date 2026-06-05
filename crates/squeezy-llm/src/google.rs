@@ -81,6 +81,15 @@ impl GoogleProvider {
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
         }
+        if let Some(temperature) = request.temperature {
+            body["generationConfig"]["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
+        }
+        if !request.stop.is_empty() {
+            body["generationConfig"]["stopSequences"] = json!(request.stop);
+        }
         // Gemini 2.5 thinks by default; the API just won't return thought
         // summaries unless `includeThoughts` is on. Mirror OpenAI: request
         // summaries whenever the model is reasoning-capable, and only set

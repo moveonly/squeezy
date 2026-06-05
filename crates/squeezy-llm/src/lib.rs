@@ -181,38 +181,36 @@ pub struct LlmRequest {
     #[serde(default = "empty_beta_headers")]
     pub beta_headers: Arc<[Arc<str>]>,
     /// Sampling temperature. `None` leaves the provider's default in
-    /// place (matches squeezy's historical behavior). Per-provider
-    /// lowering to the wire body lands in Phase 4.
+    /// place (matches squeezy's historical behavior). Lowered by
+    /// providers that expose a matching wire field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// Nucleus-sampling cutoff. `None` leaves the provider's default
-    /// in place. Per-provider lowering lands in Phase 4.
+    /// in place. Lowered by providers that expose a matching wire field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// Deterministic seed forwarded where the provider supports it
-    /// (OpenAI Chat-Completions / Responses, Bedrock Converse `seed`,
-    /// Ollama `options.seed`). `None` keeps generation
-    /// non-deterministic. Per-provider lowering lands in Phase 4.
+    /// Deterministic seed forwarded where the provider supports it.
+    /// `None` keeps generation non-deterministic. Providers without a
+    /// seed wire field ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
-    /// Stop-sequence list (Anthropic `stop_sequences`, OpenAI `stop`,
-    /// Google `stopSequences`, Bedrock `stopSequences`). Empty leaves
-    /// the provider default. Per-provider lowering lands in Phase 4.
+    /// Stop-sequence list. Empty leaves the provider default. Lowered
+    /// by providers that expose a matching wire field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
     /// OpenAI-style `frequency_penalty`. `None` keeps the default.
-    /// Per-provider lowering lands in Phase 4.
+    /// Providers without a penalty wire field ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
     /// OpenAI-style `presence_penalty`. `None` keeps the default.
-    /// Per-provider lowering lands in Phase 4.
+    /// Providers without a penalty wire field ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
-    /// Provider-hosted tool registry. xAI Live Search (H-23),
-    /// OpenAI's hosted web/file search, and Anthropic's computer-use
-    /// tool live here so we can advertise them alongside the
-    /// agent-defined [`LlmToolSpec`] list. Per-provider lowering
-    /// lands in Phase 4.
+    /// Provider-hosted tool registry. xAI Live Search, OpenAI's hosted
+    /// web/file search, and Anthropic's computer-use tool live here so
+    /// we can advertise them alongside the agent-defined
+    /// [`LlmToolSpec`] list. Lowered by providers that expose matching
+    /// hosted-tool wire entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosted_tools: Vec<Arc<LlmHostedTool>>,
 }

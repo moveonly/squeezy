@@ -9305,6 +9305,50 @@ async fn refusal_stop_reason_emits_failed_with_safety_hint() {
 }
 
 #[tokio::test]
+async fn pause_turn_without_tool_calls_reissues_before_failing() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_pause".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::PauseTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_done".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut saw_success = false;
+    let mut saw_failure = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { .. } => saw_success = true,
+            AgentEvent::Failed { .. } => saw_failure = true,
+            _ => {}
+        }
+    }
+
+    assert!(saw_success, "pause_turn reissue should allow completion");
+    assert!(!saw_failure, "successful pause_turn reissue must not fail");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "agent must issue a second provider request after pause_turn"
+    );
+}
+
+#[tokio::test]
 async fn end_turn_stop_reason_completes_successfully() {
     // Regression guard for the audit's `end_turn_with_empty_content_is_success`
     // case: a clean `EndTurn` with text content must still take the

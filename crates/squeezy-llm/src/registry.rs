@@ -309,6 +309,19 @@ pub fn models_for_provider(provider: &str) -> impl Iterator<Item = &'static Mode
     MODEL_REGISTRY
         .iter()
         .filter(move |model| model.provider == provider)
+        .filter(|model| is_text_model_picker_eligible(model.provider, model.id))
+}
+
+fn is_text_model_picker_eligible(provider: &str, model: &str) -> bool {
+    if provider != "xai" {
+        return true;
+    }
+    !model
+        .rsplit_once('/')
+        .map(|(_, id)| id)
+        .unwrap_or(model)
+        .to_ascii_lowercase()
+        .starts_with("grok-imagine")
 }
 
 pub fn model_info_for(provider: &str, model: &str) -> Option<&'static ModelInfo> {

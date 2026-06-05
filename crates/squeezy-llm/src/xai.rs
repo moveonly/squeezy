@@ -111,32 +111,11 @@ impl LlmProvider for XaiProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
-        // H-23: xAI Live Search.
-        //
-        // Once [`LlmRequest::hosted_tools`] (Phase 1) lands in this
-        // branch, the dispatcher forwards the `LlmHostedTool::WebSearch`
-        // entries through to whichever sub-provider handles the
-        // selected route:
-        //   * Responses path appends `{ "type": "web_search", "filters": … }`
-        //     as a hosted tool entry alongside any caller-supplied
-        //     function tools.
-        //   * Chat path merges the same intent into a top-level
-        //     `search_parameters: { mode: "auto", … }` field on the
-        //     request body.
-        //
-        // The actual body lowering must land in `openai.rs`
-        // (Responses) and `compatible.rs` (Chat); xAI's own dispatcher
-        // is responsible only for forwarding the field unchanged when
-        // it is present on `request`. Coordination: this TODO is
-        // intentional so Phase 4B (openai.rs) and the cross-cutting
-        // compatible.rs change land in lock-step with the field
-        // appearing on `LlmRequest`. Citation parsing on the chat
-        // path is tracked separately in M-31.
-        //
-        // Until Phase 1's `hosted_tools` slot ships, requests cannot
-        // carry the Live Search intent at all. The forwarding still
-        // happens because we hand the *full* `LlmRequest` to the
-        // sub-provider; no per-field copy is needed here.
+        // H-23: xAI Live Search. The dispatcher keeps the hosted-tool
+        // intent on the full request and lets the selected wire adapter
+        // lower it: Responses appends a `web_search` hosted tool, while
+        // Chat Completions maps it to top-level `search_parameters`.
+        // Citation parsing on the chat path is tracked separately in M-31.
         match classify_route(&request.model) {
             XaiRoute::Responses => self.responses.stream_response(request, cancel),
             XaiRoute::Chat => self.chat.stream_response(request, cancel),

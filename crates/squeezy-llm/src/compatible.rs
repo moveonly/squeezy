@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
-    ReasoningPayload,
+    LlmEvent, LlmHostedTool, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    ReasoningKind, ReasoningPayload,
     anthropic_error::NON_RETRYABLE_MARKER,
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::{
@@ -393,6 +393,24 @@ impl OpenAiCompatibleProvider {
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if let Some(seed) = request.seed {
+            body["seed"] = json!(seed);
+        }
+        if !request.stop.is_empty() {
+            body["stop"] = json!(request.stop);
+        }
+        if let Some(frequency_penalty) = request.frequency_penalty {
+            body["frequency_penalty"] = json!(frequency_penalty);
+        }
+        if let Some(presence_penalty) = request.presence_penalty {
+            body["presence_penalty"] = json!(presence_penalty);
+        }
         // X-05: forward `output_schema` as the chat-completions
         // `response_format: { type: "json_schema", json_schema: { ... } }`
         // shape so providers that honour structured outputs
@@ -412,6 +430,12 @@ impl OpenAiCompatibleProvider {
         }
         if let Some(effort) = request.reasoning_effort {
             emit_reasoning_hints(&mut body, preset, &request.model, effort);
+        }
+        if (preset == OpenAiCompatiblePreset::XAi
+            || classify(&request.model) == CompatFlavor::XaiCompat)
+            && let Some(search_parameters) = xai_search_parameters(&request.hosted_tools)
+        {
+            body["search_parameters"] = search_parameters;
         }
         if let Some(key) = cache_spec.key.as_deref() {
             // OpenAI's Chat Completions / Responses APIs honor a top-level
@@ -511,6 +535,24 @@ impl OpenAiCompatibleProvider {
         }
         body
     }
+}
+
+fn xai_search_parameters(hosted_tools: &[Arc<LlmHostedTool>]) -> Option<Value> {
+    hosted_tools.iter().find_map(|tool| match tool.as_ref() {
+        LlmHostedTool::WebSearch { filters } => {
+            let mut params = serde_json::Map::new();
+            if let Some(Value::Object(filters)) = filters {
+                for (key, value) in filters {
+                    params.insert(key.clone(), value.clone());
+                }
+            }
+            params
+                .entry("mode".to_string())
+                .or_insert_with(|| json!("auto"));
+            Some(Value::Object(params))
+        }
+        _ => None,
+    })
 }
 
 /// Coarse classification of an OpenAI-compatible model namespace.

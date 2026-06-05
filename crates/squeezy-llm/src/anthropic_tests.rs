@@ -68,6 +68,24 @@ fn request_body_uses_messages_streaming_shape() {
     assert!(body.get("store").is_none());
 }
 
+#[test]
+fn request_body_lowers_sampling_fields() {
+    let request = LlmRequest {
+        model: "claude-test".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        temperature: Some(0.0),
+        top_p: Some(0.8),
+        stop: vec!["END".to_string(), "STOP".to_string()],
+        ..LlmRequest::default()
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    assert_eq!(body["temperature"], serde_json::json!(0.0f32));
+    assert_eq!(body["top_p"], serde_json::json!(0.8f32));
+    assert_eq!(body["stop_sequences"], serde_json::json!(["END", "STOP"]));
+}
+
 #[tokio::test]
 async fn from_config_loads_oauth_when_static_key_missing() {
     let home = temp_home("oauth-load");

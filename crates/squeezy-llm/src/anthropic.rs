@@ -279,6 +279,15 @@ impl AnthropicProvider {
                 }
             }
         }
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if !request.stop.is_empty() {
+            body["stop_sequences"] = json!(request.stop);
+        }
         if !request.tools.is_empty() {
             let mut tool_values = Vec::with_capacity(request.tools.len());
             for tool in request.tools.iter() {
