@@ -12534,8 +12534,48 @@ impl SourceSpan {
         }
     }
 
+    /// Inclusive point-membership test for a single byte *position*.
+    ///
+    /// This intentionally treats `end_byte` as a valid position: callers that
+    /// probe an *exclusive* half-open boundary (e.g. another span's
+    /// `end_byte`) rely on it so that a child span exactly filling its parent
+    /// — `child.end_byte == parent.end_byte` — still reads as inside. For
+    /// span-vs-span containment use [`Self::contains_span`], which applies the
+    /// correct half-open semantics in one place rather than two byte probes.
     pub const fn contains_byte(self, byte: u32) -> bool {
         self.start_byte <= byte && byte <= self.end_byte
+    }
+
+    /// Half-open `[start, end)` span containment: true when `other` lies fully
+    /// inside `self`. A zero-width touch at the boundary is NOT containment —
+    /// a span starting exactly at `self.end_byte` (or an empty span there) is
+    /// excluded, because the parent's last addressed byte is `end_byte - 1`.
+    /// The single exception is a zero-width `other` sitting at `self.start`,
+    /// which is still inside.
+    pub const fn contains_span(self, other: Self) -> bool {
+        // Empty parents address no bytes, so they contain nothing.
+        self.start_byte < self.end_byte
+            && self.start_byte <= other.start_byte
+            && other.end_byte <= self.end_byte
+            // Reject a child that begins on the exclusive boundary: a span
+            // starting at `self.end_byte` only "fits" because `end <= end`,
+            // but it touches the boundary rather than living inside it.
+            && other.start_byte < self.end_byte
+    }
+
+    /// Half-open `[start, end)` overlap test: true when the two spans share at
+    /// least one addressed byte. A boundary touch — one span ending exactly
+    /// where the other starts (`a.end_byte == b.start_byte`) — is NOT an
+    /// overlap, and an empty span (which addresses no bytes) never overlaps
+    /// anything.
+    pub const fn overlaps(self, other: Self) -> bool {
+        // Empty spans address no bytes; the half-open intersection test below
+        // would otherwise report a zero-width span sitting inside the other as
+        // an overlap.
+        self.start_byte < self.end_byte
+            && other.start_byte < other.end_byte
+            && self.start_byte < other.end_byte
+            && other.start_byte < self.end_byte
     }
 }
 
