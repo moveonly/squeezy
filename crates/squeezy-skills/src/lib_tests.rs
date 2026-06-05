@@ -223,6 +223,18 @@ fn folded_block_scalar_folds_blank_line_to_newline() {
 }
 
 #[test]
+fn parses_skill_frontmatter_after_bom_and_leading_blanks() {
+    let (metadata, body) = parse_skill_file(
+        "\u{feff}\n\n---\nname: rust-nav\ndescription: Use Rust navigation\n---\n# Rust Nav\n",
+    )
+    .expect("parse");
+
+    assert_eq!(metadata.name, "rust-nav");
+    assert_eq!(metadata.description, "Use Rust navigation");
+    assert_eq!(body.trim(), "# Rust Nav");
+}
+
+#[test]
 fn compat_project_overrides_user_and_compat_user() {
     let root = temp_workspace("skills_precedence_compat_project");
     let user = root.join("user");

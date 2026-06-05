@@ -1165,7 +1165,8 @@ fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_skill_file(content: &str) -> std::result::Result<(SkillMetadata, String), String> {
-    let mut lines = content.lines();
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines().skip_while(|line| line.trim().is_empty());
     if lines.next() != Some("---") {
         return Err("missing YAML frontmatter".to_string());
     }
