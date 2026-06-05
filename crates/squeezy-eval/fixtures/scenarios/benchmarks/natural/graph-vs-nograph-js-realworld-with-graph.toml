@@ -1,31 +1,31 @@
 id = "graph-vs-nograph-js-realworld-with-graph"
-title = "lodash fp wrapper resolution — with graph (openai mini)"
+title = "sequelize BaseError transitive subclass tree — with-graph"
 description = """
-Realistic JS A/B half. Pinned `lodash/lodash` SHA on the `npm`
-(CommonJS) branch where dynamic `require(...)` and aliased default
-exports via `module.exports = require('./X');` are the primary module
-plumbing. Models the user request "I want to know which `fp/*` wrapper
-modules ultimately resolve to one of five specific root modules
-(`./get.js`, `./set.js`, `./spread.js`, `./assignIn.js`,
-`./assignInWith.js`), and for each whether the wrapper is a pure alias
-or a `convert(...)` curry wrapper."
+Real-world JS audit A/B (with-graph half). A sequelize
+maintainer auditing the full `BaseError` subclass tree before
+refactoring error construction/serialization: enumerate every error
+class under `src/errors/` that is a (direct OR transitive) subclass of
+`BaseError`, paired with each class's IMMEDIATE superclass.
 
-Multi-step semantic resolution beats grep here: every `fp/*.js` is
-either (a) `module.exports = require('./X');` — a default-export
-re-export that can chain through other `fp/*.js` files — or (b)
-`func = convert('NAME', require('../X'))` — a dynamic require of the
-root sibling. The model must (1) classify each `fp/*` by its top-level
-form, (2) chase the alias chain through `fp/*` until it lands on a
-`convert(...)` site that pins the root target, and (3) deduplicate and
-sort. Graph + reference_search on `convert` and symbol_context on the
-intermediate `fp/*.js` exports close the chain cleanly; the no-graph
-half has to grep `require\\('` patterns across `fp/` and manually walk
-each alias chain.
+The graph half wins because the hierarchy is deep and SCATTERED ONE
+CLASS PER FILE across `src/errors/` plus the `connection/`,
+`database/`, and `validation/` subdirectories. `grep "extends
+BaseError"` finds only the 12 DIRECT children and misses all 12
+transitive ones (the seven `connection/*` errors that extend
+`ConnectionError`, the four `database/*` errors that extend
+`DatabaseError`, and `UniqueConstraintError` extending
+`ValidationError`); recovering them by grep means chasing each
+intermediate base across the error subdirectories and reading ~24
+separate files to pin each class's immediate parent. `decl_search`
+with `transitive=true` on `BaseError` returns the entire subclass
+closure (with file locations and immediate parents) in a single call.
+
+Pair with `graph-vs-nograph-js-realworld-no-graph.toml`.
 """
 
 [workspace.github]
-repo = "lodash/lodash"
-sha = "4f0b76e2eca13de1c1fe8b4305abc1f7d63f4b86"
+repo = "sequelize/sequelize"
+sha = "fce5ad34fb70dc7fb12876d10213cf4ed51c7b96"
 
 [squeezy]
 provider = "openai"
@@ -40,67 +40,59 @@ and 1-based line numbers when relevant. Do not invent symbols. Stop
 once you have enough evidence to answer the question, and answer in
 the exact requested format.
 """
-max_tool_calls_per_turn = 32
+max_tool_calls_per_turn = 48
+
 
 [[steps]]
 kind = "prompt"
 text = """
-In the lodash repository (the CommonJS `npm` build at the root), the
-`fp/` directory contains wrapper modules around root modules. Each
-`fp/<name>.js` module is one of two forms:
+In the sequelize repository, all public error classes live under
+`src/errors/` and form an inheritance tree rooted at the abstract base
+class `BaseError` (declared in `src/errors/base-error.ts`). Many error
+classes extend `BaseError` directly, but several extend it only
+indirectly through an intermediate error class — for example
+`ConnectionError` extends `BaseError`, and `ConnectionTimedOutError`
+extends `ConnectionError` (so it is a transitive subclass of
+`BaseError`). These subclasses are scattered ONE PER FILE across
+`src/errors/` and its subdirectories `src/errors/connection/`,
+`src/errors/database/`, and `src/errors/validation/`.
 
-- pure-alias: a single top-level statement
-    `module.exports = require('./<target>');`
-  where `<target>` resolves to another `fp/<target>.js`. The alias
-  chain may be more than one hop — chase it through `fp/` until you
-  land on a non-alias module.
-- convert: a `convert(...)` curry wrapper that imports its source via
-  a dynamic `require('../<root>')` — for example
-    `var convert = require('./convert'),
-         func = convert('<name>', require('../<root>'));`
-  Here `<root>` is the terminal root module at the repository root
-  (a sibling of `fp/`, not inside `fp/`).
+I am refactoring how Sequelize errors are constructed and serialized,
+so I need a complete inventory of the full `BaseError` subclass tree.
+Enumerate EVERY error class declared under `src/errors/` that is a
+subclass of `BaseError` — both the ones that extend `BaseError`
+directly AND the ones that reach `BaseError` only transitively through
+one or more intermediate error classes (so the `connection/`,
+`database/`, and `validation/` subclasses must all be included). Do
+NOT include `BaseError` itself, and do NOT include the built-in
+JavaScript `Error`.
 
-For EACH `fp/<name>.js` module whose terminal root resolution is one
-of these five root modules:
+For EACH such class, output exactly one line:
 
-- `./get.js`
-- `./set.js`
-- `./spread.js`
-- `./assignIn.js`
-- `./assignInWith.js`
+  <ClassName> extends <ImmediateSuperclass>
 
-output exactly one line, three space-separated fields in this order:
+where `<ImmediateSuperclass>` is the class named on that class's own
+`extends` clause — its DIRECT parent, not necessarily `BaseError`. For
+example `ConnectionTimedOutError extends ConnectionError` (NOT
+`extends BaseError`), `TimeoutError extends DatabaseError`,
+`UniqueConstraintError extends ValidationError`, and
+`ConnectionError extends BaseError`. Use the class identifiers exactly
+as written in the `class X extends Y` declarations.
 
-  <fp-name> <kind> <root-target>.js
+Scope:
+- ONLY error classes declared under `src/errors/` (including its
+  `connection/`, `database/`, and `validation/` subdirectories).
+- Every line must name a class whose chain of `extends` clauses
+  eventually reaches `BaseError`.
 
-where:
-- `<fp-name>` is the `fp/<name>.js` file's base name without the
-  `.js` extension (e.g. `path` for `fp/path.js`).
-- `<kind>` is the literal string `pure-alias` if `fp/<fp-name>.js`'s
-  top-level form is `module.exports = require('./X');`, or `convert`
-  if it is a `convert(...)` wrapper. The classification reflects
-  THIS module's own form — NOT any module it chains through.
-- `<root-target>.js` is the terminal root module name (one of the
-  five listed above).
-
-Exclude:
-- Files inside `fp/_*.js` (helpers starting with `_`).
-- Any `fp/*.js` whose terminal root resolution is NOT one of the
-  five listed root modules.
-- Anything under `.git/`.
-
-Example output line:
-
-  path pure-alias get.js
-
-Sort the lines lexicographically by `<fp-name>`. Output a compact
-plain-text list. No prose, no extra commentary, no headers.
+Sort the lines lexicographically by `<ClassName>`. Output a compact
+plain-text list, one class per line, in the exact format above. No
+prose, no extra commentary, no headers.
 """
 
 [expect]
-max_wall_clock_seconds = 360
-max_input_tokens = 200000
+max_wall_clock_seconds = 420
+max_input_tokens = 220000
 
 [triage]
 enabled = false

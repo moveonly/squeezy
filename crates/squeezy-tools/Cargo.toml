@@ -41,6 +41,9 @@ tree-sitter-bash.workspace = true
 unicode-normalization.workspace = true
 which.workspace = true
 
+[dev-dependencies]
+squeezy-parse.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5"
 

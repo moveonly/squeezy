@@ -1,11 +1,19 @@
 id = "graph-vs-nograph-csharp-realworld-no-graph"
-title = "Newtonsoft.Json sync Read* override strategy audit — no graph (openai mini)"
+title = "Newtonsoft.Json JsonConverter subclass hierarchy audit — no graph (openai mini)"
 description = """
-No-graph half of the C# real-world A/B. Same prompt as the with-graph
-variant, but the semantic-graph tool family is removed so the model
-has to fall back to grep + read_file across the repo and disambiguate
-JsonReader-side overrides from JsonWriter-side overrides by reading
-each match's containing class.
+Cross-language A/B (C#), real-world variant. Inventory every subclass of
+the abstract `Newtonsoft.Json.JsonConverter` and report each
+converter's IMMEDIATE base class. Most built-in converters extend
+`JsonConverter` directly, but three date converters
+(`IsoDateTimeConverter`, `JavaScriptDateTimeConverter`,
+`UnixDateTimeConverter`) derive TRANSITIVELY through the intermediate
+abstract base `DateTimeConverterBase`, which a grep `: JsonConverter`
+misses or mislabels. The name `JsonConverter` also over-matches across
+~40 production files as an attribute argument, collection element type,
+field/parameter/return type. The graph resolves the full subclass
+closure plus each immediate base in one decl_search/hierarchy call; the
+no-graph half must grep, filter ~25 non-subclass references, and read
+the date-converter declarations to recover the intermediate base.
 """
 
 [workspace.github]
@@ -47,58 +55,48 @@ SQUEEZY_EXPLORATION_COMPILER = "0"
 [[steps]]
 kind = "prompt"
 text = """
-The abstract class `Newtonsoft.Json.JsonReader` (declared in
-`Src/Newtonsoft.Json/JsonReader.cs`) defines nine virtual sync
-`Read*` slots:
+We're cataloguing the JSON converters that ship inside Newtonsoft.Json.
+The abstract base class `Newtonsoft.Json.JsonConverter` (declared in
+`Src/Newtonsoft.Json/JsonConverter.cs`) is the root of the converter
+hierarchy; the library bundles a set of built-in converters under
+`Src/Newtonsoft.Json/Converters/`.
 
-- `public virtual bool Read()`
-- `public virtual string? ReadAsString()`
-- `public virtual byte[]? ReadAsBytes()`
-- `public virtual bool? ReadAsBoolean()`
-- `public virtual int? ReadAsInt32()`
-- `public virtual decimal? ReadAsDecimal()`
-- `public virtual double? ReadAsDouble()`
-- `public virtual DateTime? ReadAsDateTime()`
-- `public virtual DateTimeOffset? ReadAsDateTimeOffset()`
+I need a complete inventory of every class that derives from
+`JsonConverter`, INCLUDING the converters that derive from it only
+INDIRECTLY through an intermediate abstract converter base (the
+hierarchy is more than one level deep — a few built-in converters do
+NOT extend `JsonConverter` directly). For each converter I need to
+know its IMMEDIATE base class.
 
-For every concrete (non-abstract) subclass of `JsonReader` declared
-under `Src/Newtonsoft.Json/`, enumerate every `public override` of
-those nine sync slots and classify each override's body by its
-delegation strategy.
+Scope and rules:
+- A class qualifies if it transitively derives from
+  `Newtonsoft.Json.JsonConverter` (directly, or through an
+  intermediate base class that itself derives from `JsonConverter`).
+- Search the production tree under `Src/Newtonsoft.Json/` only.
+- Do NOT include `JsonConverter` itself (it is the abstract root), and
+  do NOT include the generic `JsonConverter<T>` base.
+- Do NOT include classes that merely REFERENCE `JsonConverter` as a
+  field type, parameter type, attribute argument (`[JsonConverter(
+  typeof(...))]`), collection element type (`JsonConverterCollection`),
+  return type, or local variable. Many serializer-internal and
+  attribute classes mention `JsonConverter` without subclassing it —
+  exclude those. Only real subclasses count.
+- Exclude anything under `Src/Newtonsoft.Json.Tests/`.
 
-Do NOT confuse these with `JsonWriter`-side overrides (`JsonWriter`,
-`JsonTextWriter`, `BsonWriter`, `TraceJsonWriter`, `JTokenWriter`)
-or with async `Read*Async` overrides declared in files named
-`*.Async.cs`. Only count sync `Read*` overrides whose enclosing
-class transitively derives from `JsonReader`.
+For EACH qualifying converter, output exactly ONE line:
 
-Exclude:
-- Anything under `Src/Newtonsoft.Json.Tests/`.
-- Files named `*.Async.cs` (async overrides are out of scope).
-- The base class `JsonReader` itself.
+  <Converter> : <ImmediateBaseClass>
 
-Include both `public` and `internal` classes, and treat `partial`
-classes as a single type — search every partial file when looking
-for an override.
+where `<ImmediateBaseClass>` is the class named directly after the
+colon in that converter's declaration — its DIRECT parent. For most
+converters this is `JsonConverter`, but for the date converters that
+extend an intermediate abstract base the immediate base is that base
+class (for example `DateTimeConverterBase`), NOT `JsonConverter`. Use
+the plain type name — no namespace, no generic arguments, no
+interfaces.
 
-For each override, give exactly four fields, one per line, in the
-order listed:
-- `type`: subclass name (just the type, not the full path)
-- `method`: the method name (e.g. `Read`, `ReadAsString`)
-- `file_line`: the path relative to repo root plus the 1-based line
-  number of the override's `public override` line, joined with `:`
-  (e.g. `Src/Newtonsoft.Json/JsonTextReader.cs:488`)
-- `strategy`: `delegate` if the override body invokes the same-named
-  method on a private/internal `JsonReader`-typed field of the
-  enclosing class (forms `<field>.<sameMethodName>()`, e.g.
-  `_reader.ReadAsString()` or `_innerReader.Read()`); `compute`
-  otherwise (the body parses internal state, calls a private helper
-  like `ReadStringValue` / `ReadNumberValue` / `ReadNormal`, or
-  computes the value any other way).
-
-Output as a compact plain-text list. No prose, no extra commentary.
-Group rows by `type` (all `JsonTextReader` rows, then all
-`JsonValidatingReader` rows, etc.).
+Output only the lines, one per converter, no prose, no headers, no
+extra commentary.
 """
 
 [expect]

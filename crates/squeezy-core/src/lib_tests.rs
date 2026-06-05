@@ -123,8 +123,55 @@ fn source_span_contains_byte_inclusively() {
 
     assert!(!span.contains_byte(9));
     assert!(span.contains_byte(10));
+    // `contains_byte` is a point-membership test and stays inclusive on
+    // `end_byte`: callers probe an exclusive half-open boundary (another
+    // span's `end_byte`) and need a child exactly filling its parent to read
+    // as inside. Span-vs-span containment is half-open via `contains_span`.
     assert!(span.contains_byte(20));
     assert!(!span.contains_byte(21));
+}
+
+fn span(start: u32, end: u32) -> SourceSpan {
+    SourceSpan::new(start, end, SourcePoint::new(0, 0), SourcePoint::new(0, 0))
+}
+
+#[test]
+fn source_span_contains_span_is_half_open_at_boundary() {
+    let parent = span(10, 20);
+
+    // A reference exactly filling the parent is contained: `end == end` is
+    // fine because the child's last addressed byte is `end_byte - 1`.
+    assert!(parent.contains_span(span(10, 20)));
+    assert!(parent.contains_span(span(12, 18)));
+    assert!(parent.contains_span(span(10, 11)));
+
+    // Boundary touch is NOT containment: a span `[a, b)` does not contain a
+    // span starting exactly at `b` (here the parent's exclusive end, 20).
+    assert!(!parent.contains_span(span(20, 25)));
+    // Nor a zero-width span sitting on the exclusive boundary.
+    assert!(!parent.contains_span(span(20, 20)));
+    // Spilling past either edge is excluded.
+    assert!(!parent.contains_span(span(5, 12)));
+    assert!(!parent.contains_span(span(18, 22)));
+
+    // An empty parent addresses no bytes and contains nothing.
+    assert!(!span(10, 10).contains_span(span(10, 10)));
+}
+
+#[test]
+fn source_span_overlaps_is_half_open_at_boundary() {
+    let base = span(10, 20);
+
+    assert!(base.overlaps(span(15, 25)));
+    assert!(base.overlaps(span(5, 12)));
+    assert!(base.overlaps(span(12, 18)));
+
+    // Boundary touch is NOT an overlap: a span ending exactly where another
+    // starts (`end == start`) shares no addressed byte.
+    assert!(!base.overlaps(span(20, 30)));
+    assert!(!base.overlaps(span(0, 10)));
+    // Empty spans never overlap.
+    assert!(!base.overlaps(span(15, 15)));
 }
 
 #[test]

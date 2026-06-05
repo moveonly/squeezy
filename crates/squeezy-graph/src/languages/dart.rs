@@ -103,6 +103,7 @@ impl SemanticGraph {
             return None;
         }
         let class = self.symbols.get(class_id)?;
+        let class_file_id = class.file_id.clone();
         let (mixins, bases, ifaces, ons) = dart_ancestor_attributes(class);
         // Dart resolution order: mixin chain right-to-left, then superclass,
         // then implements, then `on` constraints.
@@ -113,7 +114,11 @@ impl SemanticGraph {
             .chain(ifaces.iter())
             .chain(ons.iter())
         {
-            for candidate_class_id in self.dart_class_symbols_by_name(name) {
+            // Scope ancestor resolution to declarations visible from the
+            // subclass's file so a same-named class in an unrelated library
+            // cannot be picked up.
+            for candidate_class_id in self.dart_class_symbols_by_name_in_file(&class_file_id, name)
+            {
                 // Skip ancestors already expanded on another path: their
                 // subtree is identical no matter how we reach them, so a
                 // re-walk only burns time (exponentially, on a diamond).
@@ -156,31 +161,101 @@ impl SemanticGraph {
         }
     }
 
-    /// Lookup class-like Dart symbols by name (used for ancestor walks).
-    pub(crate) fn dart_class_symbols_by_name(&self, name: &str) -> Vec<SymbolId> {
-        self.symbols_by_name
+    /// True for a Dart class-like symbol (the kinds an `extends`/`with`/
+    /// `implements`/typed-local reference can name).
+    fn dart_symbol_is_class_like(&self, symbol: &GraphSymbol) -> bool {
+        self.files
+            .get(&symbol.file_id)
+            .map(|file| {
+                file.language == LanguageKind::Dart
+                    && matches!(
+                        symbol.kind,
+                        SymbolKind::Class
+                            | SymbolKind::Trait
+                            | SymbolKind::Enum
+                            | SymbolKind::Struct
+                            | SymbolKind::Interface
+                    )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Scope-aware class lookup: resolve `name` to the class-like declaration(s)
+    /// visible from `file_id` — declarations in the same library (same file or a
+    /// `part` sibling) and any class brought in by an import whose URI suffix
+    /// matches the declaring file. Only when no in-scope declaration exists do we
+    /// fall back to a global name match, and even then only when it is
+    /// unambiguous, so a same-named class in an unrelated library cannot produce
+    /// a wrong call edge.
+    pub(crate) fn dart_class_symbols_by_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let global = self
+            .symbols_by_name
             .get(name)
             .into_iter()
             .flatten()
-            .filter(|id| {
-                self.symbols
-                    .get(*id)
-                    .and_then(|symbol| self.files.get(&symbol.file_id).map(|file| (symbol, file)))
-                    .map(|(symbol, file)| {
-                        file.language == LanguageKind::Dart
-                            && matches!(
-                                symbol.kind,
-                                SymbolKind::Class
-                                    | SymbolKind::Trait
-                                    | SymbolKind::Enum
-                                    | SymbolKind::Struct
-                                    | SymbolKind::Interface
-                            )
-                    })
-                    .unwrap_or(false)
+            .filter_map(|id| self.symbols.get(id))
+            .filter(|symbol| self.dart_symbol_is_class_like(symbol))
+            .collect::<Vec<_>>();
+
+        let mut scoped = global
+            .iter()
+            .filter(|symbol| self.dart_class_is_in_scope(file_id, symbol))
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+
+        if scoped.is_empty() && global.len() == 1 {
+            scoped.push(global[0].id.clone());
+        }
+
+        scoped.sort_by(|left, right| left.0.cmp(&right.0));
+        scoped.dedup();
+        scoped
+    }
+
+    /// True when `symbol` is visible from `file_id`: the same library (same file
+    /// or its `part`/host siblings) or reachable through an import directive
+    /// whose URI suffix matches the symbol's declaring file.
+    fn dart_class_is_in_scope(&self, file_id: &FileId, symbol: &GraphSymbol) -> bool {
+        if symbol.file_id == *file_id {
+            return true;
+        }
+        // Same Dart library spanning multiple `part` files counts as in scope.
+        if self.dart_same_library(file_id, &symbol.file_id) {
+            return true;
+        }
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        self.imports_for_file(file_id)
+            .filter(|import| {
+                !matches!(
+                    import.alias.as_deref(),
+                    Some(DART_LIBRARY_ALIAS) | Some(DART_PART_ALIAS) | Some(DART_PART_OF_ALIAS)
+                )
             })
-            .cloned()
-            .collect()
+            .any(|import| {
+                let suffix = dart_path_suffix(&import.path);
+                !suffix.is_empty() && symbol_file.relative_path.ends_with(&suffix)
+            })
+    }
+
+    /// True when two files belong to the same Dart library (identical
+    /// `dart_library_for_file`), covering `part`/`part of` siblings.
+    fn dart_same_library(&self, left: &FileId, right: &FileId) -> bool {
+        if left == right {
+            return true;
+        }
+        match (
+            self.dart_library_for_file(left),
+            self.dart_library_for_file(right),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
     }
 
     /// Dart extension dispatch: when a call is `receiver.method(...)`, search
@@ -342,10 +417,12 @@ impl SemanticGraph {
             return None;
         }
         let receiver_type = self.dart_receiver_static_type(caller_id, receiver_text)?;
-        let class_id = self
-            .dart_class_symbols_by_name(&receiver_type)
-            .into_iter()
-            .next()?;
+        let caller = self.symbols.get(caller_id)?;
+        // Prefer the declaration of `receiver_type` that is actually in scope at
+        // the call site rather than blindly taking the first global match — a
+        // same-named class in another library would otherwise hijack the edge.
+        let candidates = self.dart_class_symbols_by_name_in_file(&caller.file_id, &receiver_type);
+        let class_id = single_symbol(candidates.into_iter())?;
         if let Some(method) = self.dart_method_on_class(&class_id, &call.name) {
             return Some(method);
         }

@@ -61,6 +61,180 @@ impl SemanticGraph {
             .iter()
             .any(|candidate| symbol_modules.contains(candidate))
     }
+
+    /// Bug #14: resolve a JS/TS `this.foo()` / `super.foo()` call to a method
+    /// inherited from the caller class's `extends`/`implements` ancestors.
+    ///
+    /// The JS/TS parser records inheritance as queryable `base:`/`iface:`
+    /// attributes on the class symbol (mirroring C#, Java, Dart, Python), but
+    /// unlike C#/PHP it never lowers them to `Extends`/`Implements` edges, so
+    /// the edge-driven `walk_inheritance_ancestors` would find nothing. We walk
+    /// the attribute chain directly — exactly like the Dart resolver — resolving
+    /// each ancestor name to a JS/TS class/interface symbol and looking for the
+    /// method there.
+    ///
+    /// Receivers handled: `this`/`self` (own class first, then ancestors) and
+    /// `super` (skip the own class, go straight to ancestors). Any other
+    /// receiver belongs to a value of some other type and is left to the
+    /// type-directed rules.
+    pub(crate) fn inherited_js_ts_method(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if !self.caller_is_js_ts(caller_id) {
+            return None;
+        }
+        let receiver = call.receiver.as_deref()?;
+        let skip_self = match receiver {
+            "this" | "self" => false,
+            "super" => true,
+            _ => return None,
+        };
+        let class_id = self.js_ts_class_for_caller(caller_id)?;
+        if !skip_self && let Some(method) = self.js_ts_method_on_class(&class_id, &call.name) {
+            return Some(method);
+        }
+        self.js_ts_method_in_ancestors(&class_id, &call.name, 0)
+    }
+
+    fn caller_is_js_ts(&self, caller_id: &SymbolId) -> bool {
+        self.symbols
+            .get(caller_id)
+            .and_then(|caller| self.files.get(&caller.file_id))
+            .map(|file| is_js_ts_language(file.language))
+            .unwrap_or(false)
+    }
+
+    /// Climb the caller's `parent_id` chain to the enclosing class/interface.
+    fn js_ts_class_for_caller(&self, caller_id: &SymbolId) -> Option<SymbolId> {
+        let mut current = self.symbols.get(caller_id)?;
+        loop {
+            if matches!(current.kind, SymbolKind::Class | SymbolKind::Interface) {
+                return Some(current.id.clone());
+            }
+            let parent_id = current.parent_id.as_ref()?;
+            current = self.symbols.get(parent_id)?;
+        }
+    }
+
+    /// A method named `method_name` declared directly on `class_id`.
+    fn js_ts_method_on_class(&self, class_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
+        single_symbol(
+            self.children_by_parent
+                .get(class_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|child_id| self.symbols.get(child_id))
+                .filter(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::Method | SymbolKind::Function | SymbolKind::Test
+                    ) && symbol.name == method_name
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    /// Walk the class's `base:`/`iface:` ancestor chain (depth-capped, with a
+    /// visited-set to keep a diamond hierarchy from re-expanding shared
+    /// ancestors) looking for `method_name`. `base:` ancestors take priority
+    /// over `iface:` ones, matching JS/TS single-inheritance + interface
+    /// semantics.
+    fn js_ts_method_in_ancestors(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        depth: usize,
+    ) -> Option<SymbolId> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(class_id.clone());
+        self.js_ts_method_in_ancestors_visited(class_id, method_name, depth, &mut visited)
+    }
+
+    fn js_ts_method_in_ancestors_visited(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        depth: usize,
+        visited: &mut std::collections::HashSet<SymbolId>,
+    ) -> Option<SymbolId> {
+        const JS_TS_ANCESTOR_DEPTH_CAP: usize = 8;
+        if depth >= JS_TS_ANCESTOR_DEPTH_CAP {
+            return None;
+        }
+        let class = self.symbols.get(class_id)?;
+        let file_id = class.file_id.clone();
+        let bases = class
+            .attributes
+            .iter()
+            .filter_map(|attr| attr.strip_prefix("base:"));
+        let ifaces = class
+            .attributes
+            .iter()
+            .filter_map(|attr| attr.strip_prefix("iface:"));
+        for name in bases.chain(ifaces) {
+            for ancestor_id in self.js_ts_class_candidates_for_name_in_file(&file_id, name) {
+                if !visited.insert(ancestor_id.clone()) {
+                    continue;
+                }
+                if let Some(method) = self.js_ts_method_on_class(&ancestor_id, method_name) {
+                    return Some(method);
+                }
+                if let Some(method) = self.js_ts_method_in_ancestors_visited(
+                    &ancestor_id,
+                    method_name,
+                    depth + 1,
+                    visited,
+                ) {
+                    return Some(method);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a `base:`/`iface:` ancestor name to JS/TS class/interface
+    /// symbols, scoping to the calling file: same-file declarations and any
+    /// declaration brought into scope by a matching import. This avoids binding
+    /// to an unrelated same-named class in another module.
+    fn js_ts_class_candidates_for_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let leaf = last_path_segment(name);
+        let mut ids = self
+            .symbols_by_name_or_scan(&leaf)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .filter(|symbol| matches!(symbol.kind, SymbolKind::Class | SymbolKind::Interface))
+            .filter(|symbol| {
+                self.files
+                    .get(&symbol.file_id)
+                    .map(|file| is_js_ts_language(file.language))
+                    .unwrap_or(false)
+            })
+            .filter(|symbol| {
+                symbol.file_id == *file_id
+                    || self
+                        .imports_for_file(file_id)
+                        .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
+                        .filter(|import| {
+                            import
+                                .alias
+                                .as_deref()
+                                .unwrap_or_else(|| last_path_segment_str(&import.path))
+                                == leaf
+                        })
+                        .any(|import| self.js_ts_import_matches_symbol(import, symbol))
+            })
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort_by(|left, right| left.0.cmp(&right.0));
+        ids.dedup();
+        ids
+    }
 }
 
 pub(crate) fn is_js_ts_language(language: LanguageKind) -> bool {

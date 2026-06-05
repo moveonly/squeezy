@@ -1,42 +1,22 @@
 id = "graph-vs-nograph-ruby-realworld-with-graph"
-title = "sidekiq/sidekiq Component method-usage audit — with graph (openai mini)"
+title = "rails/rails Arel::Nodes::Unary transitive subclass audit — with graph (openai mini)"
 description = """
-Cross-language A/B (Ruby), real-world variant. Models the user
-request "I want to extract the `fire_event` / `safe_thread` /
-`handle_exception` / `watchdog` helpers off `Sidekiq::Component`
-into a separate `Sidekiq::Runtime` module so that pure-data
-components (Capsule, Manager, BasicFetch, ...) stop pulling in the
-runtime surface. Before I split, I need to know which Component
-consumers actually use any of those four runtime helpers and which
-ones don't, so the migration knows which classes need to `include
-Sidekiq::Runtime` and which can drop to a slimmer Component."
-
-The expected answer has 14 rows, one per class that
-`include`s `Sidekiq::Component` under `lib/`. Each row requires
-multi-step reasoning: (a) enumerate every `include Sidekiq::Component`
-site under `lib/` (14 entries across 13 files — `scheduled.rb` has
-two distinct classes); (b) resolve each include to a fully-qualified
-class path including any intermediate module (`Sidekiq::Scheduled::Enq`,
-`Sidekiq::Metrics::ExecutionTracker`); (c) read each class body and
-count bare-name dispatches to the four target methods, treating
-dispatches as mixin-resolved calls into Component. The naive grep
-approach has to disambiguate `fire_event` / `safe_thread` /
-`handle_exception` / `watchdog` matches across the module definition
-itself, comments, and helper docstrings, and then map each call to
-the enclosing class.
-
-The graph half can resolve `Sidekiq::Component` via `decl_search`,
-ask `hierarchy` / `reference_search` for `include` sites, and
-`reference_search` each of the four method names scoped to consumer
-files; the no-graph half has to grep every `include Sidekiq::Component`
-site, read each enclosing file for class nesting, and grep each
-of the four method names with manual filtering of the definition
-site and comments.
+Cross-language A/B (Ruby), real-world variant on rails/rails Arel.
+Models a developer refactoring Arel unary-node visiting: "enumerate
+every Arel node class that is a subclass of Arel::Nodes::Unary." 19
+classes live scattered across activerecord/lib/arel/nodes/. The grep
+trap: a literal search for `< Unary` finds only the 13 DIRECT subclasses
+and MISSES the 6 that reach Unary transitively through an intermediate
+node they name instead (Ordering, UnaryOperation, With), 3-4 hops above
+Node. The graph half resolves the full Unary subclass tree with one
+hierarchy query and reports each class with its CORRECT immediate super;
+the no-graph half must grep, then read each scattered nodes/ file and
+walk the intermediate bases to recover the transitive members.
 """
 
 [workspace.github]
-repo = "sidekiq/sidekiq"
-sha = "63f24c050bed5ab4e6b4efadb9f7f4f3932d5f0f"
+repo = "rails/rails"
+sha = "727dbb36405112e0e2dbf8ecb145e67f91e3c90c"
 
 [squeezy]
 provider = "openai"
@@ -56,55 +36,56 @@ max_tool_calls_per_turn = 48
 [[steps]]
 kind = "prompt"
 text = """
-The `Sidekiq::Component` module (declared in
-`lib/sidekiq/component.rb`) provides four runtime helper methods:
-`fire_event`, `safe_thread`, `handle_exception`, and `watchdog`.
+In the rails/rails repository, Arel (its SQL AST library) defines its
+node classes under `activerecord/lib/arel/nodes/`. They form a deep
+inheritance tree rooted at `Arel::Nodes::Node`. One important mid-level
+base is `Arel::Nodes::Unary` (declared in
+`activerecord/lib/arel/nodes/unary.rb`), which represents a node wrapping
+a single child expression.
 
-For every Ruby class under `lib/` that mixes in this module via an
-`include Sidekiq::Component` directive in its class body, audit how
-many times the class body invokes each of those four helpers as a
-bare-name mixin dispatch (e.g. `fire_event(:startup)` or
-`handle_exception(ex)` inside an instance method of the consumer
-class).
+Many node classes subclass `Unary` directly (`class X < Unary`). But
+several reach `Unary` only INDIRECTLY, through an intermediate node class
+they name on their own `<` line — for example `Ascending` and
+`Descending` and `NullsFirst` and `NullsLast` all subclass `Ordering`
+(and `Ordering < Unary`), `BitwiseNot` subclasses `UnaryOperation`
+(and `UnaryOperation < Unary`), and `WithRecursive` subclasses `With`
+(and `With < Unary`). These intermediate classes are themselves
+subclasses of `Unary`, so their children are TRANSITIVE subclasses of
+`Unary`, two or more hops deep.
 
-Exclude:
-- Anything under `test/`, `web/`, `bin/`, `examples/`, `myapp/`,
-  `bare/`, or `docs/`.
-- The `Sidekiq::Component` module declaration itself
-  (`lib/sidekiq/component.rb`).
-- Method-definition lines (`def fire_event`, etc.) — only count
-  call sites.
-- Comment-only matches (lines whose only occurrence of the helper
-  name is inside a `#` comment).
-- `require` lines and string-literal matches.
+I am refactoring how Arel unary nodes are visited and need a complete
+inventory of the full `Arel::Nodes::Unary` subclass tree. Enumerate
+EVERY node class declared under `activerecord/lib/arel/nodes/` that is a
+subclass of `Arel::Nodes::Unary` — both the ones that subclass `Unary`
+directly AND the ones that reach it only transitively through one or more
+intermediate node classes. Do NOT include `Unary` itself, and do NOT
+include classes that never reach `Unary` in their superclass chain (e.g.
+the `Binary` family).
 
-Treat each `class Foo` ... `include Sidekiq::Component` ... `end`
-body that names the module on its own line as one entry. If two
-distinct classes inside the same file both `include Sidekiq::Component`
-(e.g. `Sidekiq::Scheduled::Enq` and `Sidekiq::Scheduled::Poller` in
-`lib/sidekiq/scheduled.rb`), report them as two separate rows.
+For EACH such class, output exactly one line:
 
-For each consumer class give exactly six fields, one per line, in
-the order listed:
-- `class`: fully-qualified Ruby class path, including every
-  enclosing module (e.g. `Sidekiq::CLI`, `Sidekiq::Scheduled::Enq`,
-  `Sidekiq::Metrics::ExecutionTracker`)
-- `file`: path relative to repo root containing the
-  `include Sidekiq::Component` line
-- `fire_event`: integer count of call sites of `fire_event` in
-  the class body (0 if none)
-- `safe_thread`: integer count of call sites of `safe_thread`
-  in the class body (0 if none)
-- `handle_exception`: integer count of call sites of
-  `handle_exception` in the class body (0 if none)
-- `watchdog`: integer count of call sites of `watchdog` in the
-  class body (0 if none)
+  <ClassName> < <ImmediateSuperclass>
 
-Output as a compact plain-text list. No prose, no extra commentary.
-Separate consumers with a blank line. Group rows by file path in
-the order the include sites appear in `lib/`. If you find fewer
-than 10 consumer classes, double-check — there are more than that
-in this repo.
+where `<ImmediateSuperclass>` is the class named on THAT class's own `<`
+clause — its DIRECT parent, which is NOT always `Unary`. For example
+`Ascending < Ordering` (NOT `< Unary`), `NullsLast < Ordering`,
+`BitwiseNot < UnaryOperation`, `WithRecursive < With`, and for a direct
+one `Grouping < Unary`. Use the short class names exactly as written on
+each class's `<` line.
+
+If you find fewer than about fifteen such classes, re-check: do not rely
+on a text search for `< Unary`, because several qualifying classes reach
+`Unary` transitively through an intermediate node and never name `Unary`
+on their own line.
+
+Scope:
+- ONLY node classes declared under `activerecord/lib/arel/nodes/`.
+- Every line must name a class whose chain of `<` clauses eventually
+  reaches `Arel::Nodes::Unary`.
+
+Sort the lines lexicographically by `<ClassName>`. Output a compact
+plain-text list, one class per line, in the exact format above. No prose,
+no extra commentary, no headers.
 """
 
 [expect]

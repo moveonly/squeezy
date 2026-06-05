@@ -800,6 +800,109 @@ func (r Runner) TestSuiteStyle() {}
 }
 
 #[test]
+fn go_parser_records_struct_embedding_as_base_attribute() {
+    let source = r#"
+package zoo
+
+type Animal struct{}
+
+type Dog struct {
+    Animal
+}
+
+type Cat struct {
+    *Animal
+}
+
+type X struct {
+    io.Reader
+}
+
+type Puppy struct {
+    Dog
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("zoo/embed.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let base_attrs = |name: &str| -> Vec<String> {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::Struct)
+            .unwrap_or_else(|| panic!("{name} struct declaration"))
+            .attributes
+            .iter()
+            .filter(|attr| attr.starts_with("base:"))
+            .cloned()
+            .collect()
+    };
+
+    assert_eq!(base_attrs("Dog"), vec!["base:Animal".to_string()]);
+    // Pointer embedding strips the leading `*`.
+    assert_eq!(base_attrs("Cat"), vec!["base:Animal".to_string()]);
+    // Qualified embedding drops the `io.` package qualifier.
+    assert_eq!(base_attrs("X"), vec!["base:Reader".to_string()]);
+    // Transitive sanity: Puppy -> Dog -> Animal; the closure of base:Animal
+    // reaches Puppy via Dog's own base: edge.
+    assert_eq!(base_attrs("Puppy"), vec!["base:Dog".to_string()]);
+    assert!(
+        base_attrs("Animal").is_empty(),
+        "a struct with no embedding carries no base: attribute"
+    );
+}
+
+#[test]
+fn go_parser_records_generic_struct_embedding_as_base_attribute() {
+    let source = r#"
+package zoo
+
+type Sub struct {
+    Base[T]
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("zoo/generic.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let sub = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Sub" && symbol.kind == SymbolKind::Struct)
+        .expect("Sub struct declaration");
+    // Generic instantiation `Base[T]` is recorded by its underlying base name.
+    assert!(sub.attributes.contains(&"base:Base".to_string()));
+}
+
+#[test]
+fn go_parser_records_interface_embedding_as_base_attribute() {
+    let source = r#"
+package io
+
+type ReadWriter interface {
+    Reader
+    Writer
+    Greet(name string) string
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("io/rw.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let read_writer = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "ReadWriter" && symbol.kind == SymbolKind::Interface)
+        .expect("ReadWriter interface declaration");
+    assert!(read_writer.attributes.contains(&"base:Reader".to_string()));
+    assert!(read_writer.attributes.contains(&"base:Writer".to_string()));
+    // Method members (`method_elem`) are not embeddings and produce no base:.
+    assert!(
+        !read_writer.attributes.contains(&"base:Greet".to_string()),
+        "interface method members must not be recorded as base:"
+    );
+}
+
+#[test]
 fn go_parser_tags_embedded_struct_fields_with_embed_attribute() {
     let source = r#"
 package greeter
@@ -848,6 +951,55 @@ type Runner struct {
         .expect("embedded Greeter field");
     assert!(embedded.attributes.contains(&"go:embed".to_string()));
     assert!(embedded.attributes.contains(&"go:field".to_string()));
+}
+
+#[test]
+fn go_parser_tags_pointer_and_qualified_embedded_fields() {
+    // Embedded fields can be a pointer (`*Animal`) or qualified (`io.Reader`)
+    // embed with no field-name token. Both must produce a go:embed Field symbol
+    // named by the leaf type (Animal / Reader), not only a base: attribute.
+    let source = r#"
+package zoo
+
+import "io"
+
+type Animal struct {
+    Name string
+}
+
+type Cat struct {
+    *Animal
+    io.Reader
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("zoo/cat.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let cat_id = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Cat" && symbol.kind == SymbolKind::Struct)
+        .map(|symbol| symbol.id.clone())
+        .expect("Cat struct declaration");
+
+    for leaf in ["Animal", "Reader"] {
+        let embedded = parsed
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.name == leaf
+                    && symbol.kind == SymbolKind::Field
+                    && symbol.parent_id.as_ref() == Some(&cat_id)
+            })
+            .unwrap_or_else(|| panic!("embedded {leaf} field symbol (pointer/qualified embed)"));
+        assert!(
+            embedded.attributes.contains(&"go:embed".to_string()),
+            "{leaf} pointer/qualified embed should be tagged go:embed, got {:?}",
+            embedded.attributes
+        );
+        assert!(embedded.attributes.contains(&"go:field".to_string()));
+    }
 }
 
 #[test]
@@ -1196,6 +1348,46 @@ object StringOps {
     assert!(parsed.calls.iter().any(|call| call.name == "greet"
         && call.kind == ParsedCallKind::Method
         && call.receiver.as_deref() == Some("greeter")));
+}
+
+#[test]
+fn kotlin_qualified_user_type_records_leaf_not_package_segment() {
+    // A qualified type reference `com.example.Greeter` must record the LEAF
+    // type name `Greeter`, never the leading package segment `com`.
+    let source = r#"package com.example.app
+
+class Host {
+    fun make(): com.example.Greeter = TODO()
+    val cache: Container<Greeter> = TODO()
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/app/Host.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+
+    let type_refs: Vec<&str> = parsed
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::Type)
+        .map(|reference| reference.text.as_str())
+        .collect();
+
+    // The leaf type name is recorded.
+    assert!(
+        type_refs.contains(&"Greeter"),
+        "expected leaf `Greeter`, got {type_refs:?}"
+    );
+    // The package segment is never recorded as a type reference.
+    assert!(
+        !type_refs.contains(&"com"),
+        "package segment leaked as type reference: {type_refs:?}"
+    );
+    // A generic head still records the head, not the type argument.
+    assert!(
+        type_refs.contains(&"Container"),
+        "expected generic head `Container`, got {type_refs:?}"
+    );
 }
 
 #[test]
@@ -2210,6 +2402,131 @@ export const RunnerView = (props: RunnerProps) => <Runner />;
 }
 
 #[test]
+fn js_ts_import_type_does_not_emit_bogus_type_import() {
+    // `import type ...` is a TYPE-ONLY import: the `type` keyword is a modifier,
+    // not a default binding. It must never surface as an import named/aliased
+    // `type`, while a real default import (`import Foo from ...`) still does.
+    let source = r#"
+import type { Foo } from "./m";
+import type Bar from "./n";
+import Baz from "./o";
+import { type Qux, Plain } from "./p";
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = ts_record("src/types.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // No import may be named or aliased `type`.
+    assert!(
+        !parsed
+            .imports
+            .iter()
+            .any(|import| import.alias.as_deref() == Some("type")
+                || import.path.ends_with(".type")
+                || import.imported_name.as_deref() == Some("type")),
+        "bogus `type` import emitted: {:?}",
+        parsed.imports
+    );
+
+    // The type-only named import still records its member correctly.
+    assert!(
+        parsed.imports.iter().any(|import| import.path == "./m.Foo"),
+        "expected ./m.Foo, got {:?}",
+        parsed.imports
+    );
+
+    // `import type Bar from "./n"` is a default type-only import; if recorded it
+    // must be the default binding `Bar`, never `type`.
+    assert!(
+        !parsed
+            .imports
+            .iter()
+            .any(|import| import.alias.as_deref() == Some("type") && import.path.contains("./n")),
+        "type-only default import leaked `type`: {:?}",
+        parsed.imports
+    );
+
+    // A genuine default import still records `Baz` as the default.
+    assert!(
+        parsed.imports.iter().any(|import| {
+            import.path == "./o.default" && import.alias.as_deref() == Some("Baz")
+        }),
+        "expected default Baz, got {:?}",
+        parsed.imports
+    );
+
+    // Inline `type Qux` modifier is stripped; `Plain` records normally.
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "./p.Plain"),
+        "expected ./p.Plain, got {:?}",
+        parsed.imports
+    );
+}
+
+#[test]
+fn js_ts_class_heritage_emits_base_and_iface_attributes() {
+    // `extends` -> base:, `implements` -> iface:, so `decl_search attribute=base:X`
+    // and the grep→graph augment can enumerate TS/JS subtypes without a read storm.
+    let source = r#"
+export class Admin extends User implements Auditable, Serializable {}
+
+// Generic params and generic bases must not confuse the keyword scan:
+// `<T extends Constraint>` and `Base<T>` resolve to the head identifier `Base`.
+export class Repo<T extends Entity> extends Base<T> implements Lifecycle<T> {}
+
+// `implements` targets must not leak into the base list.
+class Service extends ns.Core implements Closeable {}
+
+interface Named extends ServiceInfo, Other {}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = ts_record("src/heritage.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let attrs = |name: &str| -> Vec<String> {
+        parsed
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("missing symbol {name}"))
+            .attributes
+            .clone()
+    };
+    let has = |name: &str, attr: &str| attrs(name).iter().any(|a| a == attr);
+
+    assert!(
+        has("Admin", "base:User"),
+        "Admin attrs: {:?}",
+        attrs("Admin")
+    );
+    assert!(has("Admin", "iface:Auditable"));
+    assert!(has("Admin", "iface:Serializable"));
+    assert!(
+        !has("Admin", "base:Auditable"),
+        "implements must not be base:"
+    );
+
+    // generic base head only; constraint `Entity` must NOT become a base.
+    assert!(has("Repo", "base:Base"), "Repo attrs: {:?}", attrs("Repo"));
+    assert!(has("Repo", "iface:Lifecycle"));
+    assert!(
+        !has("Repo", "base:Entity"),
+        "generic constraint leaked as base"
+    );
+
+    // member-expression base resolves to its last segment.
+    assert!(has("Service", "base:Core"));
+    assert!(has("Service", "iface:Closeable"));
+
+    // interface extends -> base: (possibly several).
+    assert!(has("Named", "base:ServiceInfo"));
+    assert!(has("Named", "base:Other"));
+}
+
+#[test]
 fn parser_keeps_js_ts_const_and_function_symbol_scope_precise() {
     let source = r#"
 const options = values.map((value) => value.name);
@@ -2515,6 +2832,9 @@ end
             .iter()
             .any(|a| a == "mixin:include:Auditable")
     );
+    // The bare `mixin:<Type>` form is what `decl_search attribute=mixin:T` and
+    // the grep→graph augment query (`base:T|mixin:T|iface:T`) substring-match.
+    assert!(admin.attributes.iter().any(|a| a == "mixin:Auditable"));
     assert!(parsed.symbols.iter().any(|s| s.name == "promote"
         && s.kind == SymbolKind::Method
         && s.parent_id == Some(admin.id.clone())));
@@ -2613,6 +2933,69 @@ end
             .calls
             .iter()
             .any(|c| c.name == "new" && c.receiver.as_deref() == Some("Foo::Bar"))
+    );
+}
+
+#[test]
+fn ruby_namespaced_mixins_are_distinguishable_by_qualified_attribute() {
+    // Two classes include modules whose leaf name collides (`Component`) but
+    // whose namespace differs. Both carry the shared `mixin:Component` leaf
+    // (kept for the grep->graph augment), but must ALSO carry a fully-qualified
+    // `mixin:<ns>::Component` so `Sidekiq::Component` and `Other::Component`
+    // stay distinguishable instead of collapsing onto the shared leaf.
+    let source = "class Worker\n\
+                  include Sidekiq::Component\n\
+                  end\n\
+                  class Widget\n\
+                  include Other::Component\n\
+                  end\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ruby_record("app/worker.rb", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let worker = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Worker" && s.kind == SymbolKind::Class)
+        .expect("Worker class");
+    let widget = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "Widget" && s.kind == SymbolKind::Class)
+        .expect("Widget class");
+
+    // Shared leaf on both (the augment relies on it).
+    assert!(worker.attributes.iter().any(|a| a == "mixin:Component"));
+    assert!(widget.attributes.iter().any(|a| a == "mixin:Component"));
+    // Fully-qualified, distinguishing forms.
+    assert!(
+        worker
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Sidekiq::Component"),
+        "Worker should carry mixin:Sidekiq::Component, got {:?}",
+        worker.attributes
+    );
+    assert!(
+        widget
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Other::Component"),
+        "Widget should carry mixin:Other::Component, got {:?}",
+        widget.attributes
+    );
+    // The qualified forms do not bleed between the two hosts.
+    assert!(
+        !worker
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Other::Component")
+    );
+    assert!(
+        !widget
+            .attributes
+            .iter()
+            .any(|a| a == "mixin:Sidekiq::Component")
     );
 }
 

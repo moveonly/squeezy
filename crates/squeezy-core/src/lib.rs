@@ -12616,8 +12616,48 @@ impl SourceSpan {
         }
     }
 
+    /// Inclusive point-membership test for a single byte *position*.
+    ///
+    /// This intentionally treats `end_byte` as a valid position: callers that
+    /// probe an *exclusive* half-open boundary (e.g. another span's
+    /// `end_byte`) rely on it so that a child span exactly filling its parent
+    /// — `child.end_byte == parent.end_byte` — still reads as inside. For
+    /// span-vs-span containment use [`Self::contains_span`], which applies the
+    /// correct half-open semantics in one place rather than two byte probes.
     pub const fn contains_byte(self, byte: u32) -> bool {
         self.start_byte <= byte && byte <= self.end_byte
+    }
+
+    /// Half-open `[start, end)` span containment: true when `other` lies fully
+    /// inside `self`. A zero-width touch at the boundary is NOT containment —
+    /// a span starting exactly at `self.end_byte` (or an empty span there) is
+    /// excluded, because the parent's last addressed byte is `end_byte - 1`.
+    /// The single exception is a zero-width `other` sitting at `self.start`,
+    /// which is still inside.
+    pub const fn contains_span(self, other: Self) -> bool {
+        // Empty parents address no bytes, so they contain nothing.
+        self.start_byte < self.end_byte
+            && self.start_byte <= other.start_byte
+            && other.end_byte <= self.end_byte
+            // Reject a child that begins on the exclusive boundary: a span
+            // starting at `self.end_byte` only "fits" because `end <= end`,
+            // but it touches the boundary rather than living inside it.
+            && other.start_byte < self.end_byte
+    }
+
+    /// Half-open `[start, end)` overlap test: true when the two spans share at
+    /// least one addressed byte. A boundary touch — one span ending exactly
+    /// where the other starts (`a.end_byte == b.start_byte`) — is NOT an
+    /// overlap, and an empty span (which addresses no bytes) never overlaps
+    /// anything.
+    pub const fn overlaps(self, other: Self) -> bool {
+        // Empty spans address no bytes; the half-open intersection test below
+        // would otherwise report a zero-width span sitting inside the other as
+        // an overlap.
+        self.start_byte < self.end_byte
+            && other.start_byte < other.end_byte
+            && self.start_byte < other.end_byte
+            && other.start_byte < self.end_byte
     }
 }
 
@@ -13220,7 +13260,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. When you would otherwise issue the same grep or read_file repeatedly against one symbol or one type, a single graph call replaces them — reach for it even when grep would also work, because the graph result already follows imports, re-exports, and renamed aliases that regex misses. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call. Do not issue duplicate tool calls — if you need the same result you already have, refer to the earlier output instead of re-running the call. For simple existence checks (e.g. \"does function X exist?\") or simple definition questions (e.g. \"which file defines X?\"), a single grep or definition_search is usually enough; stop once graph evidence directly answers the user instead of adding repo_map, grep, or relationship tools. Before a batch of two or more related tool calls, emit a brief preamble (1–2 sentences, roughly 8–12 words) saying what you are about to do — for example: \"Looking up Error in src/lib.rs, then tracing its constructors.\" Logically group related tools under one preamble; if a turn covers two unrelated topics, emit one preamble per group. Skip the preamble for a single tool call or a trivial answer.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. When you would otherwise issue the same grep or read_file repeatedly against one symbol or one type, a single graph call replaces them — reach for it even when grep would also work, because the graph result already follows imports, re-exports, and renamed aliases that regex misses. When a graph result gives you a symbol_id, prefer reading its body with read_slice(symbol_id, span_kind=body) over a whole-file read_file. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call. Do not issue duplicate tool calls — if you need the same result you already have, refer to the earlier output instead of re-running the call. For simple existence checks (e.g. \"does function X exist?\") or simple definition questions (e.g. \"which file defines X?\"), a single grep or definition_search is usually enough; stop once graph evidence directly answers the user instead of adding repo_map, grep, or relationship tools. Before a batch of two or more related tool calls, emit a brief preamble (1–2 sentences, roughly 8–12 words) saying what you are about to do — for example: \"Looking up Error in src/lib.rs, then tracing its constructors.\" Logically group related tools under one preamble; if a turn covers two unrelated topics, emit one preamble per group. Skip the preamble for a single tool call or a trivial answer.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

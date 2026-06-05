@@ -174,6 +174,11 @@ pub(crate) fn js_ts_imports_from_statement(raw: &str) -> Vec<(String, Option<Str
             .trim()
             .trim_end_matches(';')
             .trim();
+        // `import type ...` / `import { type Foo }` are TYPE-ONLY imports.
+        // Strip a statement-level `type` modifier so it is never mistaken for a
+        // default import named `type`. (Inline member-level `type Foo` is handled
+        // in `js_ts_named_imports`.)
+        let before_from = strip_js_ts_type_modifier(before_from);
         if before_from.is_empty() || before_from.starts_with(['"', '\'']) {
             imports.push((module, None, false));
             return imports;
@@ -214,6 +219,34 @@ pub(crate) fn js_ts_imports_from_statement(raw: &str) -> Vec<(String, Option<Str
         }
     }
     imports
+}
+
+/// Strip a leading TypeScript `type` import/export modifier.
+///
+/// In `import type { Foo } from "./m"` and `import type Foo from "./m"`, the
+/// `type` keyword marks a TYPE-ONLY import and is NOT a value binding. Without
+/// stripping it the clause parser would treat `type` as a default import named
+/// `type`, emitting a bogus value-import fact.
+///
+/// The bare word `type` on its own (e.g. `import type from "./m"`) is a real
+/// default binding named `type`, so it is left untouched.
+pub(crate) fn strip_js_ts_type_modifier(before_from: &str) -> &str {
+    if let Some(rest) = before_from.strip_prefix("type") {
+        // `type` must be a standalone keyword, not a prefix of a longer
+        // identifier such as `typeName`.
+        let is_word_boundary = rest
+            .chars()
+            .next()
+            .is_none_or(|ch| ch.is_whitespace() || ch == '{' || ch == '*');
+        let rest = rest.trim_start();
+        // A bare `type` (no trailing clause) is itself the imported default
+        // binding and must be preserved; anything else means `type` was the
+        // TYPE-ONLY modifier.
+        if is_word_boundary && !rest.is_empty() {
+            return rest;
+        }
+    }
+    before_from
 }
 
 pub(crate) fn split_js_ts_default_and_named_import(text: &str) -> (Option<&str>, Option<&str>) {

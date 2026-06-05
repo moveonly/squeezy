@@ -757,11 +757,19 @@ fn provider_hint(err: squeezy_core::SqueezyError) -> String {
 }
 
 fn timestamp_dir_slug() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Append the pid and a process-local sequence to the millisecond stamp so
+    // that concurrent eval runs (separate processes for an A/B sweep, or several
+    // runs inside one process) landing in the same millisecond cannot collide on
+    // the same run directory and clobber each other's run.json / trace.jsonl —
+    // a collision silently corrupts the cost accounting both sides depend on.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("{ms}")
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{ms}-{}-{seq}", std::process::id())
 }
 
 struct Driver {

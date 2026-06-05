@@ -249,7 +249,21 @@ pub(crate) fn go_type_symbol(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let attributes = go_doc_and_semantic_attributes(node, ctx.source);
+    let mut attributes = go_doc_and_semantic_attributes(node, ctx.source);
+    // Record struct/interface embedding as queryable `base:<Type>` attributes,
+    // mirroring how C#/Java/Dart/JS-TS record inheritance. Embedding is already
+    // surfaced as a child field symbol tagged `go:embed`, but that is not
+    // reachable by `decl_search attribute=base:X` or its transitive closure.
+    if let Some(type_node) =
+        type_node.filter(|child| matches!(child.kind(), "struct_type" | "interface_type"))
+    {
+        for base in go_embedded_base_names(type_node, ctx.source) {
+            let attr = format!("base:{base}");
+            if !attributes.contains(&attr) {
+                attributes.push(attr);
+            }
+        }
+    }
     Some(ParsedSymbol {
         id: symbol_id(&ctx.file, parent_symbol.as_ref(), kind, &name, span),
         file_id: ctx.file.id.clone(),
@@ -269,6 +283,95 @@ pub(crate) fn go_type_symbol(
         freshness: Freshness::Fresh,
         arity: None,
     })
+}
+
+/// Collect the leaf type name of each embedded base in a `struct_type` or
+/// `interface_type` body. Strips a leading `*` (pointer embedding), drops a
+/// `pkg.` qualifier to its last segment, and unwraps generic instantiations
+/// (`Base[T]`) to the underlying `type_identifier`.
+///
+/// Struct embedding lives in a `field_declaration_list` of `field_declaration`s;
+/// the embedding case is a declaration with no `field_identifier` (the same
+/// signal `go_field_symbols` uses). Interface embedding lives in `type_elem`
+/// children of the `interface_type` (method members are `method_elem`).
+pub(crate) fn go_embedded_base_names(type_node: Node<'_>, source: &str) -> Vec<String> {
+    let mut bases = Vec::new();
+    match type_node.kind() {
+        "struct_type" => {
+            let mut cursor = type_node.walk();
+            for list in type_node.named_children(&mut cursor) {
+                if list.kind() != "field_declaration_list" {
+                    continue;
+                }
+                let mut field_cursor = list.walk();
+                for field in list.named_children(&mut field_cursor) {
+                    if field.kind() != "field_declaration" {
+                        continue;
+                    }
+                    // A named field carries a leading `field_identifier`; only
+                    // declarations without one are embeddings.
+                    let mut name_cursor = field.walk();
+                    let has_field_name = field
+                        .named_children(&mut name_cursor)
+                        .any(|child| child.kind() == "field_identifier");
+                    if has_field_name {
+                        continue;
+                    }
+                    if let Some(base) = go_leaf_type_name(field, source) {
+                        bases.push(base);
+                    }
+                }
+            }
+        }
+        "interface_type" => {
+            let mut cursor = type_node.walk();
+            for elem in type_node.named_children(&mut cursor) {
+                if elem.kind() != "type_elem" {
+                    continue;
+                }
+                if let Some(base) = go_leaf_type_name(elem, source) {
+                    bases.push(base);
+                }
+            }
+        }
+        _ => {}
+    }
+    bases
+}
+
+/// Find the leaf `type_identifier` of an embedded type reference, descending
+/// through `field_declaration`/`type_elem` wrappers, pointer `*`, qualified
+/// (`pkg.Base`) and generic (`Base[T]`) forms.
+fn go_leaf_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => {
+            let text = node_text(node, source).ok()?.trim().to_string();
+            is_go_identifier(&text).then_some(text)
+        }
+        // `pkg.Base` -> last segment; `Base[T]` -> the generic base type. Both
+        // expose the base name as their last `type_identifier` child.
+        "qualified_type" | "generic_type" => {
+            let mut cursor = node.walk();
+            let leaf = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "type_identifier")
+                .last()?;
+            go_leaf_type_name(leaf, source)
+        }
+        // `field_declaration` (possibly with a leading `*`), `type_elem`, or a
+        // bare `pointer_type`: descend into the first type-bearing child.
+        _ => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        "type_identifier" | "qualified_type" | "generic_type" | "pointer_type"
+                    )
+                })
+                .and_then(|child| go_leaf_type_name(child, source))
+        }
+    }
 }
 
 pub(crate) fn go_field_symbols(
@@ -305,6 +408,17 @@ pub(crate) fn go_field_symbols(
                         is_embed = true;
                         names.push((text.to_string(), span_from_node(child)));
                     }
+                }
+            }
+            // Embedded fields can also be a pointer (`*Animal`), qualified
+            // (`io.Reader`), or generic (`Base[T]`) embed with no field-name
+            // token. `base:` attributes already record these via
+            // `go_leaf_type_name`; emit the embedded Field symbol too (named by
+            // the leaf type) so it is not silently dropped.
+            "pointer_type" | "qualified_type" | "generic_type" if names.is_empty() => {
+                if let Some(leaf) = go_leaf_type_name(child, ctx.source) {
+                    is_embed = true;
+                    names.push((leaf, span_from_node(child)));
                 }
             }
             _ => {}

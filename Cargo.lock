@@ -3221,6 +3221,7 @@ dependencies = [
  "squeezy-graph",
  "squeezy-hooks",
  "squeezy-mcp",
+ "squeezy-parse",
  "squeezy-rank",
  "squeezy-skills",
  "squeezy-store",

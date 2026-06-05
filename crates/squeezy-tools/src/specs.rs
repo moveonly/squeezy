@@ -347,7 +347,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -360,6 +360,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
                 "attribute": {"type": "string"},
+                "transitive": {"type": "boolean", "description": "With an inheritance attribute (base:/iface:/mixin:), return the full transitive subtype closure instead of only the direct subtypes."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
                 "offset": {"type": "integer", "minimum": 0}
             }
@@ -498,7 +499,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
                 "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
-                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. Windows narrower than ~60 lines auto-widen symmetrically toward ~80 lines so the enclosing block fits in one fetch."},
+                "start_line": {"type": "integer", "minimum": 1, "description": "1-based start line. Windows narrower than ~40 lines auto-widen symmetrically toward ~48 lines so the enclosing block fits in one fetch."},
                 "end_line": {"type": "integer", "minimum": 1, "description": "1-based end line, inclusive. Pair with start_line; the window auto-widens when too tight."},
                 "context_lines": {"type": "integer", "minimum": 0, "description": "Extra context on each side of the line range, on top of the auto-widening default."},
                 "offset": {"type": "integer", "minimum": 0},

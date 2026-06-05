@@ -1,35 +1,32 @@
 id = "graph-vs-nograph-java-realworld-with-graph"
-title = "google/gson TypeAdapter<T> subclass + first construction site — with graph (openai mini)"
+title = "google/gson TypeAdapter<T> subtype closure + immediate superclass — with graph (openai mini)"
 description = """
 Real-world Java audit A/B (with-graph half). The task is the kind of
-audit a gson maintainer would run before refactoring how
-`TypeAdapter` subclasses are instantiated: enumerate every named
-class under `gson/src/main/java/` that directly extends
-`com.google.gson.TypeAdapter<T>` and, for each one, pin the first
-production call site that constructs an instance via `new
-<ClassName>(`.
+audit a gson maintainer would run before refactoring the
+`TypeAdapter` type hierarchy: enumerate the COMPLETE subtype closure
+of `com.google.gson.TypeAdapter<T>` under `gson/src/main/java/` and,
+for each named subtype, report its IMMEDIATE (direct) superclass so
+the maintainer can separate the direct `TypeAdapter` subclasses from
+the ones that sit one level deeper in the chain.
 
-The graph half wins because the answer is fundamentally multi-step
-and cross-file:
-1. Hierarchy walk → enumerate the 18 direct subclasses, dropping
-   anonymous `new TypeAdapter<X>() { ... }` instances, indirect
-   subclasses that go through `SerializationDelegatingTypeAdapter`,
-   and Javadoc-example declarations inside `TypeAdapter.java`.
-2. For each subclass, `reference_search` for `new <Class>(`
-   constructor sites in production code — many of these are
-   constructed in a DIFFERENT file than the one that declares them
-   (e.g. `TypeAdapterRuntimeTypeWrapper` is declared in its own
-   file but FIRST constructed inside `MapTypeAdapterFactory.java`).
-   The no-graph half has to grep per class name, filter Javadoc
-   examples, and skip over `// ... new <Class> ...` line comments.
-
-Three classes have no direct constructor call site: the abstract
-`SerializationDelegatingTypeAdapter` and the abstract
-`ReflectiveTypeAdapterFactory.Adapter` are never instantiated by
-name (only their concrete subclasses are), so the model must
-report `new_site: none` for them after exhausting the reference
-walk — a discipline that graph evidence makes easy to assert and
-plain grep makes easy to confuse.
+The graph half wins on grep-noise from deep transitive inheritance:
+1. Of the 18 uniquely-named closure members, 14 say `extends
+   TypeAdapter` directly, but 4 reach `TypeAdapter` only through an
+   intermediate abstract base and are INVISIBLE to a `grep "extends
+   TypeAdapter"`:
+     - `FutureTypeAdapter` and `TreeTypeAdapter` extend
+       `SerializationDelegatingTypeAdapter<T>`;
+     - `FieldReflectionAdapter` and `RecordAdapter` extend the
+       nested `ReflectiveTypeAdapterFactory.Adapter<T,A>` base.
+   `decl_search transitive=true` returns the full subtype closure in
+   one call, with each member's immediate superclass attached.
+2. The per-member detail (immediate superclass) cannot be supplied
+   by a single grep: for the 4 transitive members the grep agent must
+   discover the intermediate base, then read each declaration to learn
+   the exact `extends` target. The `TypeAdapter` name also collides
+   across 35 files / 659 mentions (imports, type hints, anonymous
+   `new TypeAdapter<X>(){}`), so a no-graph agent burns tokens
+   filtering noise that the graph never surfaces.
 
 Pair with `graph-vs-nograph-java-realworld-no-graph.toml` and
 `squeezy-eval diff` to compare cost and accuracy.
@@ -57,46 +54,49 @@ max_tool_calls_per_turn = 48
 [[steps]]
 kind = "prompt"
 text = """
-Audit every named (non-anonymous) Java class declared under
-`gson/src/main/java/` that **directly extends
-`com.google.gson.TypeAdapter<T>`** (for any concrete or bounded `T`),
-and pair each with the first production call site that constructs
-an instance.
+I'm refactoring gson's `com.google.gson.TypeAdapter<T>` hierarchy and
+need a COMPLETE inventory of every named class in the codebase that is a
+subtype of `TypeAdapter` — not just the ones that say `extends TypeAdapter`
+directly, but the WHOLE subtype closure, including classes that reach
+`TypeAdapter` through an intermediate abstract base (for example a class
+that extends `SerializationDelegatingTypeAdapter<T>`, or a nested
+`Adapter` base, which in turn extends `TypeAdapter`).
+
+For my refactor I specifically need, for each subtype, its IMMEDIATE
+(direct) superclass — i.e. the exact type written after `extends` on that
+class's declaration — so I can tell the direct `TypeAdapter` subclasses
+apart from the ones that sit one level deeper in the chain.
 
 Scope:
-- ONLY look at paths under `gson/src/main/java/`. Skip `proto/`,
+- ONLY look at paths under `gson/src/main/java/`. Ignore `proto/`,
   `extras/`, `metrics/`, `test-graal-native-image/`, `test-jpms/`,
-  `test-shrinker/`, and every `src/test/` path.
+  `test-shrinker/`, and any `src/test/` path.
 
 Include:
-- Both top-level (file-level) classes AND nested / inner / static
-  nested classes whose direct base is `TypeAdapter<...>`.
+- Top-level classes AND nested / inner / static-nested classes.
+- Both classes whose direct base is `TypeAdapter<...>` and classes whose
+  direct base is some OTHER class that is itself (transitively) a
+  `TypeAdapter` subtype. Walk the chain to its end.
 
 Exclude:
 - Anonymous classes (`new TypeAdapter<X>() { ... }`).
 - The abstract `TypeAdapter` base class itself.
-- Indirect subclasses that extend `TypeAdapter` only via an
-  intermediate base (e.g. classes that extend
-  `SerializationDelegatingTypeAdapter<T>` rather than `TypeAdapter<T>`
-  directly).
-- Occurrences inside Javadoc `/** ... */` block comments or `//`
-  line comments (these are documentation, not real declarations).
+- Any class named exactly `Adapter` (there are several unrelated nested
+  `Adapter` classes — skip those as keys; but DO still report the
+  uniquely-named classes that extend such an `Adapter` base).
+- Declarations that appear inside Javadoc `/** ... */` blocks or `//`
+  line comments (documentation examples, not real classes).
 
-For each direct subclass give exactly five fields, one per line:
-- `file`: path of the class declaration, relative to repo root
-- `line`: 1-based line number where the class declaration starts
-- `class`: simple class name (no generics, no package)
-- `new_site_file`: path of the FIRST production source line that
-  constructs an instance via `new <ClassName>(` — search across
-  every `.java` file under `gson/src/main/java/` (NOT only the
-  declaring file), pick the lexicographically earliest path and
-  then the lowest line number in that path; ignore lines inside
-  `/** ... */` Javadoc or `//` line comments; report `none` if the
-  class is abstract or otherwise never constructed by name.
-- `new_site_line`: 1-based line number of that construction call
-  site, or `none` if `new_site_file` is `none`.
+Output one line per subtype, in this exact shape:
 
-Output as a compact plain-text list. No prose, no extra commentary.
+  <ClassName> | extends <ImmediateSuperclassSimpleName>
+
+where `<ClassName>` is the simple class name (no generics, no package)
+and `<ImmediateSuperclassSimpleName>` is the simple name of the type that
+appears directly after `extends` on that class's own declaration (this is
+`TypeAdapter` for the direct subclasses, but the intermediate base name
+for the deeper ones). Put the class name and its immediate superclass on
+the SAME line. No prose, no extra commentary, just the list.
 """
 
 [expect]

@@ -724,6 +724,27 @@ pub(crate) fn js_ts_attributes_for_symbol(
     if js_ts_node_has_jsx_descendant(node) {
         attributes.push("jsx:returns-jsx".to_string());
     }
+    // Record inheritance as queryable `base:`/`iface:` attributes (mirroring C#,
+    // Java, Dart, Python). Without this the JS/TS heritage was only emitted as
+    // type-reference edges, so `decl_search attribute=base:X` and the grep→graph
+    // augment returned nothing for TS/JS — forcing the model into grep+read_file
+    // storms to enumerate subclasses. Read only the header (start..body) so we
+    // never scan the class body.
+    if matches!(kind, SymbolKind::Class | SymbolKind::Interface) {
+        let header_end = node
+            .child_by_field_name("body")
+            .map(|body| body.start_byte())
+            .unwrap_or_else(|| node.end_byte());
+        if let Some(header) = ctx.source.get(node.start_byte()..header_end) {
+            let (extends, implements) = js_ts_heritage_split(header);
+            for base in extends {
+                attributes.push(format!("base:{base}"));
+            }
+            for iface in implements {
+                attributes.push(format!("iface:{iface}"));
+            }
+        }
+    }
     attributes.extend(js_ts_decorator_attributes(node, ctx.source));
     attributes
 }
@@ -880,6 +901,62 @@ pub(crate) fn js_ts_extends_implements_names(signature: &str) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// Strip balanced `<...>` generic groups from a class/interface header so a
+/// `class X<T extends Base>` parameter constraint or a `Base<Y>` argument never
+/// confuses the `extends`/`implements` keyword scan in [`js_ts_heritage_split`].
+fn strip_angle_groups(header: &str) -> String {
+    let mut out = String::with_capacity(header.len());
+    let mut depth: u32 = 0;
+    for ch in header.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Split a JS/TS class/interface declaration header into its `extends` targets
+/// (superclass / extended interfaces -> `base:`) and `implements` targets
+/// (-> `iface:`). The `extends` clause is cut at `implements` so a multi-target
+/// `implements A, B` never leaks into the base list, and generic argument lists
+/// are stripped first so `extends Base<T>` and `<T extends X>` resolve cleanly.
+/// Keyword matching is space-delimited so an identifier such as `extendsFoo`
+/// does not register as an `extends` clause.
+pub(crate) fn js_ts_heritage_split(declaration: &str) -> (Vec<String>, Vec<String>) {
+    let header = declaration
+        .split_once('{')
+        .map(|(before, _)| before)
+        .unwrap_or(declaration);
+    let cleaned = strip_angle_groups(header);
+    // Pad so a clause at the very start still matches the space-delimited scan.
+    let padded = format!(" {cleaned} ");
+    let clause = |keyword: &str, stop: Option<&str>| -> Vec<String> {
+        let Some((_, rest)) = padded.split_once(keyword) else {
+            return Vec::new();
+        };
+        let scope = match stop {
+            Some(stop_kw) => rest
+                .split_once(stop_kw)
+                .map(|(before, _)| before)
+                .unwrap_or(rest),
+            None => rest,
+        };
+        let mut names: Vec<String> = split_top_level_commas(scope)
+            .into_iter()
+            .filter_map(|name| js_ts_type_name_from_annotation(&name))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let extends = clause(" extends ", Some(" implements "));
+    let implements = clause(" implements ", None);
+    (extends, implements)
 }
 
 pub(crate) fn js_ts_type_reference_names(signature: &str) -> Vec<String> {

@@ -125,10 +125,14 @@ impl SemanticGraph {
                 .owner_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let target_name = import
-                .alias
-                .as_deref()
-                .unwrap_or_else(|| last_path_segment_str(&import.path));
+            // Bug #13: index/resolve against the ORIGINAL imported symbol name
+            // (the import path's leaf), never the local alias. For
+            // `import { Thing as T }` (or Rust `use foo::Thing as T;`) the
+            // workspace symbol is named `Thing`, so looking up `T` finds
+            // nothing and the dependency/import edge to `Thing` is lost. The
+            // alias is only the in-file binding (used by reference resolution),
+            // not the target symbol's name.
+            let target_name = last_path_segment_str(&import.path);
             let mut candidates = graph.symbols_by_name_or_scan(target_name);
             if graph
                 .files
@@ -342,8 +346,19 @@ impl SemanticGraph {
         let is_base_call =
             call.kind == ParsedCallKind::Method && call.receiver.as_deref() == Some("base");
 
+        // Bug #4: only let a method call short-circuit to the caller's OWN
+        // class/impl when it has no explicit receiver (`foo()` parsed as
+        // Method) or a self-receiver (`self.foo()`, `this.foo()`). A call with
+        // a non-self receiver (`b.foo()`) targets `b`'s type, not the caller's;
+        // letting it bind here would make a same-named method on the caller's
+        // class swallow it. Such calls fall through to receiver/type-directed
+        // resolution below (and, failing that, stay unresolved).
+        let receiver_is_self_or_absent =
+            call.receiver.is_none() || is_self_receiver(call.receiver.as_deref());
+
         if call.kind == ParsedCallKind::Method
             && !is_base_call
+            && receiver_is_self_or_absent
             && let Some(callee) = self.same_impl_method(caller_id, &call.name)
         {
             return (
@@ -392,6 +407,22 @@ impl SemanticGraph {
                 Some(callee),
                 Confidence::Heuristic,
                 "dart inherited",
+                Vec::new(),
+            );
+        }
+
+        // Bug #14: JS/TS records `extends`/`implements` as `base:`/`iface:`
+        // attributes but emits no inheritance edges, so the generic Python
+        // base-walk only covers `this.foo()` and `super.foo()` stays
+        // unresolved. Wire JS/TS into the same inherited-method path the other
+        // languages use, walking the class's ancestor attributes directly.
+        if call.kind == ParsedCallKind::Method
+            && let Some(callee) = self.inherited_js_ts_method(caller_id, call)
+        {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "js/ts inherited",
                 Vec::new(),
             );
         }
@@ -546,7 +577,17 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
-            if let Some(id) = self.arity_unique_candidate(&candidates, call) {
+            // Bug #5: the global arity shortcut binds a call to the single
+            // candidate of matching arg-count, ignoring receiver/import/scope.
+            // For a method call with a NON-self explicit receiver (`b.foo(1)`)
+            // that has reached here, every receiver/type-directed rule above
+            // already declined, so arity-uniqueness would forge an edge to an
+            // unrelated `foo`. Restrict the shortcut to receiver-less and
+            // self-receiver calls; prefer leaving the rest unresolved over a
+            // wrong hard edge.
+            if receiver_is_self_or_absent
+                && let Some(id) = self.arity_unique_candidate(&candidates, call)
+            {
                 return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
             }
             return match candidates.as_slice() {
@@ -564,7 +605,13 @@ impl SemanticGraph {
         }
 
         if call.receiver.is_some() {
-            if let Some(id) = self.arity_unique_candidate(&candidates, call) {
+            // Bug #5: same guard for non-Method calls that carry an explicit
+            // receiver (e.g. a qualified call whose receiver/scope rules above
+            // declined). With a non-self receiver, arity-uniqueness alone is
+            // not enough signal to forge an edge — leave it unresolved.
+            if is_self_receiver(call.receiver.as_deref())
+                && let Some(id) = self.arity_unique_candidate(&candidates, call)
+            {
                 return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
             }
             return match candidates.as_slice() {

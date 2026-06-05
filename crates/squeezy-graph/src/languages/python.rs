@@ -239,40 +239,63 @@ impl SemanticGraph {
         None
     }
 
+    /// Resolve a `base:` ancestor name to Python class-like symbols, scoping to
+    /// the file the subclass lives in: same-file declarations and any class
+    /// brought into scope by a matching import (`from pkg import Base`, or an
+    /// aliased `import pkg.Base as B`). This prevents `Child(Base)` from binding
+    /// to an unrelated same-named `Base` defined in another module. Only when
+    /// the leaf name resolves to no in-scope candidate at all do we fall back to
+    /// a global name match, and even then only when that match is unambiguous
+    /// (a single class-like symbol workspace-wide) — mirroring the scope-aware
+    /// JS/TS resolver.
     pub(crate) fn python_class_candidates_for_name_in_file(
         &self,
         file_id: &FileId,
         name: &str,
     ) -> Vec<SymbolId> {
         let direct_name = last_path_segment(name);
-        let mut class_ids = self
+        let global = self
             .symbols_by_name_or_scan(&direct_name)
             .into_iter()
             .filter_map(|id| self.symbols.get(&id))
             .filter(|symbol| is_class_like_kind(symbol.kind))
+            .collect::<Vec<_>>();
+
+        let mut class_ids = global
+            .iter()
+            .filter(|symbol| {
+                symbol.file_id == *file_id || self.python_class_is_in_scope(file_id, name, symbol)
+            })
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
 
-        class_ids.extend(
-            self.imports_for_file(file_id)
-                .filter(|import| import.alias.as_deref() == Some(name))
-                .flat_map(|import| {
-                    let target_name = last_path_segment(&import.path);
-                    self.symbols_by_name_or_scan(&target_name)
-                        .into_iter()
-                        .filter_map(|id| self.symbols.get(&id))
-                        .filter(|symbol| {
-                            is_class_like_kind(symbol.kind)
-                                && self.import_matches_symbol(import, symbol)
-                        })
-                        .map(|symbol| symbol.id.clone())
-                        .collect::<Vec<_>>()
-                }),
-        );
+        // No in-scope declaration: fall back to a global name match, but only
+        // when it is unambiguous so we never silently bind to one of several
+        // unrelated same-named classes.
+        if class_ids.is_empty() && global.len() == 1 {
+            class_ids.push(global[0].id.clone());
+        }
 
         class_ids.sort_by(|left, right| left.0.cmp(&right.0));
         class_ids.dedup();
         class_ids
+    }
+
+    /// True when an import visible in `file_id` brings `symbol` into scope under
+    /// `name` — either as an explicit alias (`import pkg.Base as name`) or by the
+    /// import path's leaf (`from pkg import Base`), with the import's module
+    /// suffix matching the symbol's file (via [`Self::import_matches_symbol`]).
+    fn python_class_is_in_scope(&self, file_id: &FileId, name: &str, symbol: &GraphSymbol) -> bool {
+        self.imports_for_file(file_id)
+            .filter(|import| !is_package_marker(import))
+            .filter(|import| {
+                import
+                    .alias
+                    .as_deref()
+                    .map(|alias| alias == name)
+                    .unwrap_or_else(|| last_path_segment_str(&import.path) == name)
+            })
+            .any(|import| self.import_matches_symbol(import, symbol))
     }
 
     pub(crate) fn python_method_on_class(

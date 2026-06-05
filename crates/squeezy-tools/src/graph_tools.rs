@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     path::Path,
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -55,6 +56,7 @@ struct DeclSearchArgs {
     language: Option<String>,
     visibility: Option<String>,
     attribute: Option<String>,
+    transitive: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -180,6 +182,11 @@ struct ReadSliceDiffCtx<'a> {
     confidence: Confidence,
     provenance: Vec<Provenance>,
     span: Option<SourceSpan>,
+    /// Policy-exclusion reason for this file, mirrored from slice mode so the
+    /// diff payload can advertise `ignored`/`ignored_reason` too. Slice mode
+    /// surfaces this; without it a model can't tell a policy-excluded file
+    /// apart from a clean one when reading in diff mode.
+    ignored_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,8 +739,8 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) ->
 
 pub(crate) fn graph_payload(
     tool: &str,
-    _manager: &GraphManager,
-    _refresh: &squeezy_graph::RefreshReport,
+    manager: &GraphManager,
+    refresh: &squeezy_graph::RefreshReport,
 ) -> serde_json::Map<String, Value> {
     // Trim policy: `refresh` and `coverage` are dropped from the wire payload.
     // The model never branched on either; the byte cost ran ~150-400B per
@@ -742,6 +749,20 @@ pub(crate) fn graph_payload(
     let mut payload = serde_json::Map::new();
     payload.insert("tool".to_string(), json!(tool));
     payload.insert("graph_available".to_string(), json!(true));
+    // Bug #2: when the incremental refresh budget was exhausted, some changed
+    // files were never reparsed and stay queued for the next refresh — the
+    // graph evidence below is partially stale. A bare `graph_available=true`
+    // hides that, so surface a compact `refresh_incomplete` signal plus the
+    // count of still-pending changed paths (read from the manager, since the
+    // unprocessed paths are left queued in that case). Emitted only when the
+    // refresh did not fully complete, so a healthy graph pays no byte cost.
+    if refresh.budget_exhausted {
+        payload.insert("refresh_incomplete".to_string(), json!(true));
+        payload.insert(
+            "stale_pending".to_string(),
+            json!(manager.pending_changed_count()),
+        );
+    }
     payload
 }
 
@@ -885,8 +906,13 @@ fn symbol_matches_attribute_filter(symbol: &GraphSymbol, attribute: Option<&str>
 /// `base:A|base:B|base:C`) matches if the symbol satisfies ANY alternative.
 /// This lets an "enumerate symbols whose base is one of N" query be a SINGLE
 /// `decl_search` call instead of N — the difference between staying under the
-/// per-turn tool-call budget and starving it on a wide hierarchy. A
-/// single-value filter (no `|`) behaves exactly as the original substring match.
+/// per-turn tool-call budget and starving it on a wide hierarchy.
+///
+/// Each alternative is matched against an attribute with case-insensitive
+/// EQUALITY only. A substring fallback was a false-positive source: filter
+/// `base:User` would wrongly match a symbol carrying `base:UserProfile`.
+/// Exact, segmented attributes (`mixin:ns:leaf`) still match because the
+/// stored attribute string is compared in full.
 fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
     filter
         .split('|')
@@ -895,7 +921,7 @@ fn attribute_filter_matches(attributes: &[String], filter: &str) -> bool {
         .any(|alternative| {
             attributes
                 .iter()
-                .any(|value| value.eq_ignore_ascii_case(alternative) || value.contains(alternative))
+                .any(|value| value.eq_ignore_ascii_case(alternative))
         })
 }
 
@@ -979,6 +1005,145 @@ pub(crate) fn graph_symbol_search(
             .then(left.span.start_byte.cmp(&right.span.start_byte))
     });
     symbols
+}
+
+/// Cap on the number of symbols a transitive subtype closure may return.
+/// Keeps a deep or wide hierarchy from producing an unbounded payload; the
+/// seen-names set guarantees termination, this guarantees a bounded size.
+pub(crate) const TRANSITIVE_CLOSURE_CAP: usize = 200;
+
+/// Inheritance-attribute prefixes the transitive closure understands. A seed
+/// `attribute` value carrying any of these enumerates subtypes by name.
+const INHERITANCE_PREFIXES: [&str; 3] = ["base:", "mixin:", "iface:"];
+
+/// True when `attribute` carries at least one inheritance prefix
+/// (`base:`/`mixin:`/`iface:`), i.e. the filter names a supertype to enumerate
+/// subtypes of. Only then does a transitive closure make sense.
+fn attribute_has_inheritance_prefix(attribute: &str) -> bool {
+    attribute
+        .split('|')
+        .map(str::trim)
+        .any(|alt| INHERITANCE_PREFIXES.iter().any(|p| alt.starts_with(p)))
+}
+
+/// Parse the seed supertype name(s) out of an inheritance `attribute` filter.
+/// Each `prefix:Name` alternative contributes `Name`; prefix-free or empty
+/// alternatives are skipped. De-duplicates while preserving first-seen order.
+fn seed_type_names(attribute: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for alt in attribute.split('|').map(str::trim) {
+        for prefix in INHERITANCE_PREFIXES {
+            if let Some(name) = alt.strip_prefix(prefix) {
+                let name = name.trim();
+                if !name.is_empty() && seen.insert(name.to_string()) {
+                    names.push(name.to_string());
+                }
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// Transitive subtype closure for an inheritance `attribute` filter.
+///
+/// `decl_search`/grep's direct-attribute filter only ever surfaces the
+/// *immediate* subtypes of a base (`class B extends A` records `base:A` on
+/// `B`, but `class C extends B` records `base:B`, not `base:A`). This walks the
+/// hierarchy by name: starting from each seed supertype, it repeatedly runs the
+/// existing direct-attribute search (`base:N|mixin:N|iface:N`) and enqueues
+/// every newly discovered subtype's name, so an `attribute="base:A"` query
+/// returns A's whole subtype tree (B, C, ...), not just B.
+///
+/// Termination/cycle safety comes from a seen-names set (each type name is
+/// expanded at most once); size is bounded by [`TRANSITIVE_CLOSURE_CAP`]. The
+/// `path`/`language`/`visibility` scope the walk; `kind` and `query` are
+/// applied to the *emitted* results (not the walk) so a mixed-kind intermediate
+/// is still traversed and a `query` still narrows the closure — matching the
+/// non-transitive search's filter semantics.
+// Mirrors `graph_symbol_search`'s filter surface (query/kind/path/language/
+// visibility) plus the seed/cap, so the argument count is inherent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn graph_transitive_subtype_closure(
+    graph: &squeezy_graph::SemanticGraph,
+    query: Option<&str>,
+    kind: Option<&str>,
+    path: Option<&str>,
+    language: Option<&str>,
+    visibility: Option<&str>,
+    seed_names: &[String],
+    cap: usize,
+) -> Vec<GraphSymbol> {
+    let kind_filter = kind.and_then(parse_symbol_kind_filter);
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for name in seed_names {
+        if seen_names.insert(name.clone()) {
+            queue.push_back(name.clone());
+        }
+    }
+
+    let mut seen_ids: HashSet<SymbolId> = HashSet::new();
+    let mut results: Vec<GraphSymbol> = Vec::new();
+
+    while let Some(name) = queue.pop_front() {
+        let attribute = format!("base:{name}|mixin:{name}|iface:{name}");
+        // Expand KIND-AGNOSTICALLY. The hierarchy must be walked through every
+        // inheritance edge regardless of kind, or a mixed-kind *intermediate*
+        // (e.g. `interface J extends I`, an abstract class between two concrete
+        // ones) is never enqueued and its whole subtree is silently dropped
+        // (`class C implements J` would be missed for a `kind=class base:I`
+        // query). The requested `kind` is applied to *emitted* results below,
+        // not to the walk. `path`/`language`/`visibility` still scope the walk.
+        let matches = graph_symbol_search(
+            graph,
+            None,
+            None,
+            path,
+            language,
+            visibility,
+            Some(&attribute),
+        );
+        for symbol in matches {
+            let newly_seen = seen_ids.insert(symbol.id.clone());
+            // Enqueue every newly-seen *name* so its subtypes are discovered too
+            // — even when the symbol itself is filtered out of the results. This
+            // is what keeps the closure transitive across kind boundaries.
+            if seen_names.insert(symbol.name.clone()) {
+                queue.push_back(symbol.name.clone());
+            }
+            if !newly_seen {
+                continue;
+            }
+            // Result filters. `kind` narrows emitted results (the walk above was
+            // kind-agnostic); `query`, when present, narrows the closure to name
+            // matches so `decl_search{query,attribute:base:X,transitive:true}`
+            // honors the query just like the non-transitive path does.
+            if !symbol_matches_kind_filter(symbol.kind, kind_filter) {
+                continue;
+            }
+            if let Some(query) = query {
+                let view = squeezy_rank::GraphSymbolView {
+                    name: symbol.name.as_str(),
+                    signature: symbol.signature.as_str(),
+                };
+                if squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                    == squeezy_rank::symbol_rank::RankTier::NoMatch
+                {
+                    continue;
+                }
+            }
+            if results.len() >= cap {
+                return results;
+            }
+            results.push(symbol);
+        }
+    }
+
+    results
 }
 
 /// Resolve a dotted-or-double-coloned query like `PQueue.add` or
@@ -1420,8 +1585,12 @@ fn reference_packet(hit: &ReferenceHit) -> Value {
 }
 
 fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
-    let path = hit.reference.file_id.0.as_str();
-    path_matches_exact_or_suffix(path, filter)
+    // Use the same directory-aware filter `decl_search` uses so a `path=`
+    // scope like `src/foo` matches references in `src/foo/bar.rs` (directory
+    // boundary) while rejecting `src/foobar/baz.rs`. The previous
+    // `path_matches_exact_or_suffix` only handled exact/trailing-segment
+    // matches and silently ignored directory scopes.
+    path_matches_filter(hit.reference.file_id.0.as_str(), filter)
 }
 
 fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
@@ -1901,6 +2070,18 @@ fn hierarchy_node_json(graph: &squeezy_graph::SemanticGraph, node: &HierarchyNod
     })
 }
 
+/// Total number of nodes a `HierarchyNode` serializes to — itself plus every
+/// descendant, since [`hierarchy_node_json`] recurses into `children`. Used to
+/// size the `truncated` flag against what actually lands in the payload rather
+/// than just the count of root nodes.
+fn hierarchy_node_count(node: &HierarchyNode) -> usize {
+    1 + node
+        .children
+        .iter()
+        .map(hierarchy_node_count)
+        .sum::<usize>()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hierarchy_result(
     call: &ToolCall,
@@ -1913,8 +2094,16 @@ fn hierarchy_result(
     root: Option<GraphSymbol>,
 ) -> ToolResult {
     let max_results = graph_limit(max_results);
-    let truncated = nodes.len() > max_results;
     let selected = nodes.iter().take(max_results).collect::<Vec<_>>();
+    // Count the total serialized nodes (roots + all recursively-emitted
+    // children), not just the number of roots. A single wide root can blow past
+    // `max_results` in the serialized `hierarchy`/`packets` while
+    // `nodes.len() <= max_results`, which previously reported `truncated=false`.
+    let serialized_nodes = selected
+        .iter()
+        .map(|node| hierarchy_node_count(node))
+        .sum::<usize>();
+    let truncated = nodes.len() > max_results || serialized_nodes > max_results;
     let hierarchy = selected
         .iter()
         .map(|node| hierarchy_node_json(graph, node))
@@ -2100,6 +2289,25 @@ type ReadSliceTarget = (
     Vec<Provenance>,
 );
 
+/// Returns the parsed [`ReadSliceArgs`] when `call` is a `read_slice` that
+/// targets a plain `path` (no `symbol_id`) and therefore needs no graph.
+/// Such reads pull bytes straight off disk, so they can — and should — run
+/// even when the semantic graph is still indexing or structurally
+/// unavailable (bug #1). Returns `None` for any other tool, for a
+/// `symbol_id`-based read_slice (which still requires the graph), or when the
+/// arguments fail to deserialize (so the normal dispatch path surfaces the
+/// arg error).
+fn read_slice_path_only_args(call: &ToolCall) -> Option<ReadSliceArgs> {
+    if call.name != "read_slice" {
+        return None;
+    }
+    let args = serde_json::from_value::<ReadSliceArgs>(call.arguments.clone()).ok()?;
+    if args.symbol_id.is_some() {
+        return None;
+    }
+    Some(args)
+}
+
 fn read_slice_target(
     graph: Option<&squeezy_graph::SemanticGraph>,
     args: &ReadSliceArgs,
@@ -2176,6 +2384,31 @@ pub(crate) fn prefix_lines_with_numbers(content: &str, start_line: u32) -> Strin
         use std::fmt::Write as _;
         let _ = write!(out, "{line_no}\t{piece}");
         line_no = line_no.saturating_add(1);
+    }
+    out
+}
+
+/// Inverse of [`prefix_lines_with_numbers`]: strip the leading `"{digits}\t"`
+/// gutter from each line so stored, line-numbered `read_slice` output can be
+/// diffed against raw file bytes. A line without the expected gutter (e.g.
+/// content that was never line-numbered) is passed through unchanged so this
+/// never corrupts non-prefixed input.
+fn strip_line_number_prefixes(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for piece in content.split_inclusive('\n') {
+        // `split_inclusive` keeps the trailing `\n`, so the gutter we strip is
+        // the `{digits}\t` at the very start of `piece`. Only strip when the
+        // prefix before the first tab is all ASCII digits — otherwise the line
+        // is not a numbered render and must survive verbatim.
+        let stripped = match piece.split_once('\t') {
+            Some((number, rest))
+                if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                rest
+            }
+            _ => piece,
+        };
+        out.push_str(stripped);
     }
     out
 }
@@ -2371,7 +2604,17 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
+        // Bug #1: a path-only `read_slice` never consults the graph, so don't
+        // make it wait on background indexing — only block on graph readiness
+        // for calls that actually need the graph. If the graph happens to be
+        // ready already we still fall through and pass it down for richer
+        // `graph_status` classification; this only skips the *wait*.
+        let path_only_read_slice = read_slice_path_only_args(call).is_some();
+        let graph_ready = if path_only_read_slice {
+            self.wait_for_graph_ready(Duration::ZERO)
+        } else {
+            self.wait_for_graph_ready(graph_ready_wait())
+        };
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -2385,6 +2628,19 @@ impl ToolRegistry {
             }
         };
         let Some(manager) = graph.as_mut() else {
+            // Bug #1: a path-only `read_slice` (no `symbol_id`) reads bytes
+            // straight off disk and never touches the graph. Don't strand it on
+            // a `graph_unavailable` result just because the graph is still
+            // indexing or structurally absent — route it through the path-read
+            // path with `graph=None`. `symbol_id`-based read_slice still needs
+            // the graph and falls through to the unavailable result below.
+            // (A wait was already skipped above when the graph isn't ready, so
+            // this also avoids stalling the read behind background indexing.)
+            if let Some(args) = read_slice_path_only_args(call) {
+                // Release the graph lock before the (potentially slow) file read.
+                drop(graph);
+                return self.execute_read_slice_blocking(call, args, None);
+            }
             return graph_unavailable_result(call, !graph_ready);
         };
         let refresh = match manager.refresh_before_query() {
@@ -2466,8 +2722,15 @@ impl ToolRegistry {
         let max_depth = args.max_depth.unwrap_or(2).clamp(1, MAX_GRAPH_MAX_DEPTH);
         let max_files = args.max_files.unwrap_or(50).clamp(1, 200);
         let nodes = graph.hierarchy(None, max_depth);
-        let truncated = nodes.len() > max_files;
         let selected = nodes.iter().take(max_files).collect::<Vec<_>>();
+        // Count total serialized nodes (roots + recursively-emitted children),
+        // not just the number of roots, so a single wide root that exceeds
+        // `max_files` in the serialized output is reported as truncated.
+        let serialized_nodes = selected
+            .iter()
+            .map(|node| hierarchy_node_count(node))
+            .sum::<usize>();
+        let truncated = nodes.len() > max_files || serialized_nodes > max_files;
         let hierarchy = selected
             .iter()
             .map(|node| hierarchy_node_json(graph, node))
@@ -2520,15 +2783,38 @@ impl ToolRegistry {
         }
         let max_results = graph_limit(args.max_results);
         let offset = args.offset.unwrap_or(0);
-        let symbols = graph_symbol_search(
-            graph,
-            args.query.as_deref(),
-            args.kind.as_deref(),
-            args.path.as_deref(),
-            args.language.as_deref(),
-            args.visibility.as_deref(),
-            args.attribute.as_deref(),
-        );
+        // Transitive subtype closure: when the caller asks for `transitive=true`
+        // AND the attribute names a supertype (`base:`/`mixin:`/`iface:`), walk
+        // the whole subtype tree by name instead of returning only the direct
+        // subtypes the single-pass attribute filter surfaces. Any other shape
+        // (no transitive flag, or a non-inheritance attribute) is unchanged.
+        let transitive_seed = args.transitive.unwrap_or(false).then(|| {
+            args.attribute
+                .as_deref()
+                .filter(|attr| attribute_has_inheritance_prefix(attr))
+                .map(seed_type_names)
+        });
+        let symbols = match transitive_seed {
+            Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
+                graph,
+                args.query.as_deref(),
+                args.kind.as_deref(),
+                args.path.as_deref(),
+                args.language.as_deref(),
+                args.visibility.as_deref(),
+                &seed_names,
+                TRANSITIVE_CLOSURE_CAP,
+            ),
+            _ => graph_symbol_search(
+                graph,
+                args.query.as_deref(),
+                args.kind.as_deref(),
+                args.path.as_deref(),
+                args.language.as_deref(),
+                args.visibility.as_deref(),
+                args.attribute.as_deref(),
+            ),
+        };
         let truncated = symbols.len().saturating_sub(offset) > max_results;
         let selected = symbols
             .iter()
@@ -2865,7 +3151,10 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
-        let mut symbols = graph_symbol_search(
+        // Count candidates BEFORE `take(max_results)` so the response can
+        // report `truncated` honestly: emitting `truncated:false` while
+        // dropping matches misleads the model into thinking it saw everything.
+        let candidates = graph_symbol_search(
             graph,
             Some(&args.query),
             None,
@@ -2878,19 +3167,22 @@ impl ToolRegistry {
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
         })
-        .take(max_results)
         .collect::<Vec<_>>();
+        let mut pre_take_len = candidates.len();
+        let mut symbols = candidates.into_iter().take(max_results).collect::<Vec<_>>();
         if symbols.is_empty() && diff_only {
-            symbols = graph
+            let fallback = graph
                 .dirty_symbols()
                 .into_iter()
                 .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
                 .filter(|symbol| {
                     symbol.name.contains(&args.query) || symbol.signature.contains(&args.query)
                 })
-                .take(max_results)
-                .collect();
+                .collect::<Vec<_>>();
+            pre_take_len = fallback.len();
+            symbols = fallback.into_iter().take(max_results).collect();
         }
+        let truncated = pre_take_len > max_results;
         let packets = symbols
             .iter()
             .map(|symbol| symbol_context_packet(graph, symbol, max_references))
@@ -2910,7 +3202,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(graph, path_filter, Some(&args.query), packet_count),
         );
-        payload.insert("truncated".to_string(), json!(false));
+        payload.insert("truncated".to_string(), json!(truncated));
         make_result(
             call,
             ToolStatus::Success,
@@ -3014,6 +3306,17 @@ impl ToolRegistry {
             );
         }
         if diff_mode {
+            // Mirror slice mode's policy-exclusion check so diff payloads carry
+            // the same `ignored`/`ignored_reason` metadata. The file may not
+            // exist on disk (deleted in the diff), in which case `read_prefix`
+            // / `policy_exclusion_for_file` simply yield no reason.
+            let ignored_reason = self
+                .policy_exclusion_for_file(
+                    &path,
+                    &rel,
+                    read_prefix(&path, POLICY_PREFIX_BYTES).ok().as_deref(),
+                )
+                .map(ExclusionReason::as_str);
             let ctx = ReadSliceDiffCtx {
                 call,
                 args: &args,
@@ -3024,6 +3327,7 @@ impl ToolRegistry {
                 confidence,
                 provenance,
                 span,
+                ignored_reason,
             };
             return self.execute_read_slice_diff_blocking(&ctx);
         }
@@ -3237,6 +3541,10 @@ impl ToolRegistry {
                 payload.insert("max_file_bytes".to_string(), json!(limit));
                 payload.insert("ranges".to_string(), json!([]));
                 payload.insert("packets".to_string(), json!([]));
+                if let Some(reason) = ctx.ignored_reason {
+                    payload.insert("ignored".to_string(), json!(true));
+                    payload.insert("ignored_reason".to_string(), json!(reason));
+                }
                 payload.insert("truncated".to_string(), json!(true));
                 return make_result(
                     call,
@@ -3318,6 +3626,12 @@ impl ToolRegistry {
                             diff_hunks_to_byte_ranges(&file.hunks, text)
                         }
                     });
+                // A single hunk can yield many changed ranges, so the per-file
+                // cap must be measured against the *range* count rather than the
+                // hunk count. Capture the total before `take(max_ranges)` so the
+                // `truncated` flag below reflects dropped ranges even when they
+                // all live in one hunk.
+                let total_changed_ranges = changed_ranges.len();
                 for range in changed_ranges.into_iter().take(max_ranges) {
                     let bytes = text.as_bytes();
                     let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
@@ -3364,8 +3678,7 @@ impl ToolRegistry {
                         "content": content,
                     }));
                 }
-                truncated |= file.patch_truncated
-                    || (ranges.len() >= max_ranges && file.hunks.len() > max_ranges);
+                truncated |= file.patch_truncated || total_changed_ranges > max_ranges;
             }
         }
 
@@ -3420,6 +3733,12 @@ impl ToolRegistry {
         payload.insert("ranges".to_string(), json!(ranges));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(cost.truncated));
+        // Mirror slice mode's ignored-file metadata so a policy-excluded file
+        // read in diff mode is distinguishable from a clean one.
+        if let Some(reason) = ctx.ignored_reason {
+            payload.insert("ignored".to_string(), json!(true));
+            payload.insert("ignored_reason".to_string(), json!(reason));
+        }
         payload.insert("vcs".to_string(), json!(snapshot.vcs));
         payload.insert("errors".to_string(), json!(snapshot.errors));
         make_result(
@@ -3442,6 +3761,7 @@ impl ToolRegistry {
             confidence,
             provenance,
             span,
+            ..
         } = ctx;
         let rel = *rel;
         let Some(store) = self.state_store.as_deref() else {
@@ -3548,7 +3868,13 @@ impl ToolRegistry {
                 return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
             }
         };
-        let local_ranges = byte_diff_ranges(snapshot.content.as_bytes(), current.as_bytes());
+        // `snapshot.content` is the model-facing, line-numbered render
+        // (`"{line_no}\t{source}"` from `prefix_lines_with_numbers`). Diffing it
+        // directly against the raw file bytes treats every line-number gutter as
+        // a change, producing spurious ranges for an otherwise-unchanged file.
+        // Strip the gutter back to source bytes before diffing.
+        let baseline_content = strip_line_number_prefixes(&snapshot.content);
+        let local_ranges = byte_diff_ranges(baseline_content.as_bytes(), current.as_bytes());
         let mut cost = ToolCostHint::default();
         let mut ranges = Vec::new();
         let mut packets = Vec::new();
@@ -3799,11 +4125,40 @@ mod attribute_filter_tests {
     use super::attribute_filter_matches;
 
     #[test]
-    fn single_value_filter_matches_exact_or_substring() {
+    fn single_value_filter_matches_case_insensitive_equality_only() {
         let attrs = vec!["base:Session".to_string(), "decorator:property".to_string()];
         assert!(attribute_filter_matches(&attrs, "base:Session"));
-        assert!(attribute_filter_matches(&attrs, "Session")); // substring
+        // Case-insensitive equality still holds.
+        assert!(attribute_filter_matches(&attrs, "BASE:session"));
+        // Substring no longer matches: `Session` is not a stored attribute.
+        assert!(!attribute_filter_matches(&attrs, "Session"));
         assert!(!attribute_filter_matches(&attrs, "base:AuthBase"));
+    }
+
+    #[test]
+    fn prefix_filter_does_not_false_positive_on_longer_attribute() {
+        // Bug #6: `base:User` must NOT match a symbol carrying
+        // `base:UserProfile` — the old `contains` substring fallback did.
+        let profile = vec!["base:UserProfile".to_string()];
+        assert!(!attribute_filter_matches(&profile, "base:User"));
+        // It must still match the exact attribute.
+        let user = vec!["base:User".to_string()];
+        assert!(attribute_filter_matches(&user, "base:User"));
+    }
+
+    #[test]
+    fn segmented_attribute_still_matches_exactly() {
+        // Multi-segment attrs (`mixin:ns:leaf`) compare in full.
+        let attrs = vec!["mixin:ns:leaf".to_string()];
+        assert!(attribute_filter_matches(&attrs, "mixin:ns:leaf"));
+        assert!(!attribute_filter_matches(&attrs, "mixin:ns"));
+    }
+
+    #[test]
+    fn alternation_still_matches_a_listed_alternative() {
+        // `base:A|base:B` matches a symbol carrying `base:B`.
+        let symbol = vec!["base:B".to_string()];
+        assert!(attribute_filter_matches(&symbol, "base:A|base:B"));
     }
 
     #[test]
@@ -3826,6 +4181,42 @@ mod attribute_filter_tests {
             "base:Session | base:AuthBase"
         ));
         assert!(attribute_filter_matches(&attrs, "|base:Session|"));
+    }
+}
+
+#[cfg(test)]
+mod transitive_seed_tests {
+    use super::{attribute_has_inheritance_prefix, seed_type_names};
+
+    #[test]
+    fn detects_each_inheritance_prefix() {
+        assert!(attribute_has_inheritance_prefix("base:A"));
+        assert!(attribute_has_inheritance_prefix("iface:Comparable"));
+        assert!(attribute_has_inheritance_prefix("mixin:Observer"));
+        // Any alternative with a prefix qualifies.
+        assert!(attribute_has_inheritance_prefix("decorator:x|base:A"));
+        // Prefix-free / non-inheritance filters do not.
+        assert!(!attribute_has_inheritance_prefix("A"));
+        assert!(!attribute_has_inheritance_prefix("decorator:property"));
+    }
+
+    #[test]
+    fn parses_seed_names_from_each_prefix() {
+        assert_eq!(
+            seed_type_names("base:A|mixin:M|iface:I"),
+            vec!["A".to_string(), "M".to_string(), "I".to_string()],
+        );
+    }
+
+    #[test]
+    fn seed_names_dedup_trim_and_skip_prefix_free() {
+        // Whitespace is trimmed, duplicates collapse (first-seen order), and a
+        // prefix-free alternative contributes no seed.
+        assert_eq!(
+            seed_type_names(" base:A | base:A | Plain | iface:B "),
+            vec!["A".to_string(), "B".to_string()],
+        );
+        assert!(seed_type_names("Plain").is_empty());
     }
 }
 
@@ -3895,5 +4286,209 @@ mod path_filter_tests {
             "crates/squeezy-graph/src/lib.rs",
             "zzzznope",
         ));
+    }
+}
+
+#[cfg(test)]
+mod reference_path_filter_tests {
+    use super::reference_matches_path;
+    use squeezy_core::{Confidence, FileId, Provenance, SourcePoint, SourceSpan};
+    use squeezy_graph::ReferenceHit;
+    use squeezy_parse::{ParsedReference, ReferenceKind};
+
+    fn hit_in(path: &str) -> ReferenceHit {
+        ReferenceHit {
+            owner: None,
+            reference: ParsedReference {
+                file_id: FileId::new(path.to_string()),
+                owner_id: None,
+                text: "Symbol".to_string(),
+                kind: ReferenceKind::Identifier,
+                span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                provenance: Provenance::new("test", "test"),
+            },
+            confidence: Confidence::Heuristic,
+        }
+    }
+
+    #[test]
+    fn directory_scope_matches_files_under_tree() {
+        // Bug #9: `path="src/foo"` must match a reference in `src/foo/bar.rs`.
+        // The previous exact-or-suffix matcher ignored directory scopes.
+        assert!(reference_matches_path(&hit_in("src/foo/bar.rs"), "src/foo"));
+    }
+
+    #[test]
+    fn directory_scope_respects_boundary() {
+        // Must not bleed across the directory boundary into a sibling whose
+        // name merely starts with the filter.
+        assert!(!reference_matches_path(
+            &hit_in("src/foobar/baz.rs"),
+            "src/foo"
+        ));
+        // And not into an unrelated tree that contains the segment.
+        assert!(!reference_matches_path(
+            &hit_in("experimental_src/foo/x.rs"),
+            "src/foo"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_node_count_tests {
+    use super::hierarchy_node_count;
+    use squeezy_core::{Freshness, SourcePoint, SourceSpan, SymbolId, SymbolKind};
+    use squeezy_graph::HierarchyNode;
+
+    fn leaf(name: &str) -> HierarchyNode {
+        HierarchyNode {
+            id: SymbolId::new(name),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+            freshness: Freshness::Fresh,
+            children: Vec::new(),
+        }
+    }
+
+    fn root_with(children: usize) -> HierarchyNode {
+        let mut node = leaf("root");
+        node.kind = SymbolKind::File;
+        node.children = (0..children).map(|i| leaf(&format!("child{i}"))).collect();
+        node
+    }
+
+    #[test]
+    fn counts_root_plus_every_descendant() {
+        // A single root with 5 children serializes 6 nodes, not 1. This is the
+        // miscount behind the "wide root reports truncated=false" bug.
+        assert_eq!(hierarchy_node_count(&root_with(5)), 6);
+    }
+
+    #[test]
+    fn counts_nested_descendants_recursively() {
+        let mut root = root_with(2);
+        // Give the first child two grandchildren.
+        root.children[0].children = vec![leaf("g0"), leaf("g1")];
+        // root(1) + child0(1) + child1(1) + g0(1) + g1(1) = 5
+        assert_eq!(hierarchy_node_count(&root), 5);
+    }
+
+    #[test]
+    fn leaf_counts_as_one() {
+        assert_eq!(hierarchy_node_count(&leaf("solo")), 1);
+    }
+}
+
+#[cfg(test)]
+mod graph_payload_refresh_status_tests {
+    use super::graph_payload;
+    use squeezy_graph::{GraphManager, RefreshConfig};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "squeezy_graph_payload_{name}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create temp workspace");
+        root
+    }
+
+    /// Build a GraphManager over a tiny crate, then force a budget-exhausted
+    /// refresh by recording changed paths under a zero per-tool budget. The
+    /// returned manager + report mirror the production state where some changed
+    /// files were never reparsed and stay queued.
+    fn budget_exhausted_manager(name: &str) -> (GraphManager, squeezy_graph::RefreshReport) {
+        let root = temp_root(name);
+        for file in ["a.rs", "b.rs"] {
+            std::fs::write(
+                root.join("src").join(file),
+                format!("fn {}_v1() {{}}\n", file.trim_end_matches(".rs")),
+            )
+            .expect("write source");
+        }
+        let mut manager = GraphManager::open_with_config(
+            &root,
+            RefreshConfig {
+                debounce: Duration::from_millis(0),
+                idle_refresh_interval: Duration::from_secs(600),
+                // Zero budget: the reparse loop breaks before parsing any file.
+                per_tool_refresh_budget: Duration::from_millis(0),
+            },
+        )
+        .expect("open graph");
+        std::thread::sleep(Duration::from_millis(2));
+        let mut changed = Vec::new();
+        for file in ["a.rs", "b.rs"] {
+            let path = root.join("src").join(file);
+            std::fs::write(
+                &path,
+                format!("fn {}_v2() {{}}\n", file.trim_end_matches(".rs")),
+            )
+            .expect("rewrite source");
+            changed.push(path);
+        }
+        manager.record_changed_paths(changed);
+        let report = manager.refresh_before_query().expect("refresh");
+        let _ = std::fs::remove_dir_all(&root);
+        (manager, report)
+    }
+
+    #[test]
+    fn payload_surfaces_refresh_incomplete_when_budget_exhausted() {
+        // Bug #2: a budget-exhausted refresh leaves changed paths unprocessed.
+        // The payload must tell the model the graph evidence is partially stale
+        // instead of advertising a bare `graph_available=true`.
+        let (manager, report) = budget_exhausted_manager("incomplete");
+        assert!(
+            report.budget_exhausted,
+            "zero budget must exhaust the refresh"
+        );
+        let payload = graph_payload("repo_map", &manager, &report);
+        assert_eq!(
+            payload.get("refresh_incomplete"),
+            Some(&serde_json::json!(true))
+        );
+        let pending = payload
+            .get("stale_pending")
+            .and_then(|v| v.as_u64())
+            .expect("stale_pending count");
+        assert!(pending > 0, "expected unprocessed paths, got {pending}");
+    }
+
+    #[test]
+    fn payload_omits_refresh_status_when_refresh_completes() {
+        // A healthy, fully-completed refresh must not pay the stale-signal byte
+        // cost: no `refresh_incomplete` / `stale_pending` keys.
+        let root = temp_root("complete");
+        std::fs::write(root.join("src").join("a.rs"), "fn a_v1() {}\n").expect("write source");
+        let mut manager = GraphManager::open_with_config(
+            &root,
+            RefreshConfig {
+                debounce: Duration::from_millis(0),
+                idle_refresh_interval: Duration::from_millis(0),
+                // Generous budget so the reparse loop completes.
+                per_tool_refresh_budget: Duration::from_secs(30),
+            },
+        )
+        .expect("open graph");
+        let report = manager.refresh_before_query().expect("refresh");
+        assert!(
+            !report.budget_exhausted,
+            "generous budget must complete the refresh"
+        );
+        let payload = graph_payload("repo_map", &manager, &report);
+        assert_eq!(
+            payload.get("graph_available"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(payload.get("refresh_incomplete").is_none());
+        assert!(payload.get("stale_pending").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

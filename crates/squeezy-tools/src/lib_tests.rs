@@ -1916,6 +1916,249 @@ async fn read_slice_diff_mode_returns_only_changed_worktree_ranges() {
 }
 
 #[tokio::test]
+async fn symbol_context_reports_truncated_when_matches_exceed_max_results() {
+    // Bug #10: `symbol_context` applied `take(max_results)` but always emitted
+    // `truncated:false`. With three matching symbols and `max_results:1`, the
+    // response must own up to truncation; raising the cap above the match count
+    // must report `false`.
+    let root = temp_workspace("symbol_context_truncated");
+    write_rust_crate(
+        &root,
+        "pub fn handler_one() {}\npub fn handler_two() {}\npub fn handler_three() {}\n",
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let truncated = registry
+        .execute(
+            ToolCall {
+                call_id: "ctx_trunc".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "handler", "max_results": 1}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(truncated.status, ToolStatus::Success);
+    assert_eq!(
+        truncated.content["packets"]
+            .as_array()
+            .expect("packets")
+            .len(),
+        1,
+        "max_results=1 must return a single packet"
+    );
+    assert_eq!(
+        truncated.content["truncated"], true,
+        "more matches than max_results must report truncated:true"
+    );
+
+    let complete = registry
+        .execute(
+            ToolCall {
+                call_id: "ctx_full".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "handler", "max_results": 10}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(complete.status, ToolStatus::Success);
+    assert_eq!(
+        complete.content["truncated"], false,
+        "fewer matches than max_results must report truncated:false"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_reports_truncated_when_single_hunk_exceeds_max_ranges() {
+    // Bug #12: a single hunk can hold many changed ranges. `take(max_ranges)`
+    // dropped the surplus but `truncated` only checked hunk count, so a
+    // many-range single-hunk diff reported `truncated:false`. Stage a file with
+    // several interleaved changed/unchanged lines (one contiguous hunk, many
+    // changed ranges) and cap `max_ranges` below the range count.
+    let root = temp_workspace("read_slice_diff_ranges_truncated");
+    let original = "a0\nKEEP\na1\nKEEP\na2\nKEEP\na3\nKEEP\na4\nKEEP\n";
+    write_rust_crate(&root, "pub fn placeholder() {}\n");
+    fs::write(root.join("data.txt"), original).expect("write original");
+    git_init_commit(&root);
+    // Flip every "aN" line; the unchanged "KEEP" lines between them split the
+    // edit into many distinct changed byte ranges inside one diff hunk.
+    let modified = "b0\nKEEP\nb1\nKEEP\nb2\nKEEP\nb3\nKEEP\nb4\nKEEP\n";
+    fs::write(root.join("data.txt"), modified).expect("write modified");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Baseline: with a generous cap, the single hunk yields more than two
+    // distinct changed ranges (the "KEEP" lines split the edit). This anchors
+    // the "more ranges than max_ranges" precondition the bug hinges on.
+    let uncapped = registry
+        .execute(
+            ToolCall {
+                call_id: "diff_uncapped".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "data.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree",
+                    "max_ranges": 100,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(uncapped.status, ToolStatus::Success);
+    let uncapped_ranges = uncapped.content["ranges"].as_array().expect("ranges");
+    assert!(
+        uncapped_ranges.len() > 2,
+        "precondition: a single hunk must yield more than max_ranges ranges; got {}",
+        uncapped_ranges.len()
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "data.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree",
+                    "max_ranges": 2,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert_eq!(
+        ranges.len(),
+        2,
+        "ranges must be capped at max_ranges=2, got {}",
+        ranges.len()
+    );
+    assert_eq!(
+        result.content["truncated"], true,
+        "dropping ranges within a single hunk must report truncated:true"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_mode_reports_policy_ignored_metadata() {
+    // Bug #15: slice mode surfaced policy-exclusion metadata
+    // (`ignored`/`ignored_reason`) but diff mode dropped it, so a model could
+    // not tell a policy-excluded file apart from a clean one in diff mode.
+    let root = temp_workspace("read_slice_diff_ignored");
+    fs::create_dir_all(root.join("vendor/lib")).expect("mkdir vendor");
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() -> usize { 1 }\n",
+    )
+    .expect("write vendored");
+    git_init_commit(&root);
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() -> usize { 2 }\n",
+    )
+    .expect("modify vendored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "vendor/lib/generated.rs",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["read_mode"], "diff");
+    assert_eq!(
+        result.content["ignored"], true,
+        "diff mode must surface policy-ignored metadata: {}",
+        result.content
+    );
+    assert_eq!(result.content["ignored_reason"], "vendor");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_ignores_line_number_gutter_for_unchanged_source() {
+    // Bug #3: compaction stores the line-numbered `read_slice` render
+    // (`"{line_no}\t{source}"`) as the snapshot content. The last-receipt diff
+    // compared that gutter-prefixed text against the raw file bytes, so an
+    // otherwise-unchanged file produced a spurious changed range on every line.
+    // Store the line-numbered render of the *current* source and assert no
+    // changed ranges survive.
+    let root = temp_workspace("read_slice_last_receipt_line_gutter");
+    let source = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), source).expect("write sample");
+    // Mirror exactly what compaction persists: the model-facing, line-numbered
+    // render produced by `prefix_lines_with_numbers`.
+    let line_numbered = crate::graph_tools::prefix_lines_with_numbers(source, 1);
+    assert_ne!(
+        line_numbered, source,
+        "guard: stored content must actually carry the line-number gutter"
+    );
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_slice".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            // Deliberately stale hash so the unchanged-stub shortcut does not
+            // fire and we exercise the byte-diff path that carried the bug.
+            content_sha256: Some("stale-hash-forces-byte-diff".to_string()),
+            start_byte: 0,
+            end_byte: source.len() as u64,
+            content: line_numbered,
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "limit": source.len(),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["baseline_used"], "last_receipt");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert!(
+        ranges.is_empty(),
+        "line-numbered gutter must be stripped before diffing; spurious ranges: {ranges:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn read_slice_diff_last_receipt_returns_stub_when_file_is_unchanged() {
     let root = temp_workspace("read_slice_last_receipt_unchanged");
     fs::write(root.join("sample.txt"), "alpha\nbeta\n").expect("write sample");
@@ -8987,6 +9230,214 @@ pub mod service {
 }
 
 #[tokio::test]
+async fn read_slice_path_only_succeeds_when_graph_unavailable() {
+    // Bug #1: a path-only `read_slice` reads bytes straight off disk and never
+    // needs the graph. It must still succeed when the semantic graph is
+    // structurally unavailable (slot `None`) or still indexing, instead of
+    // returning a `graph_unavailable` result that strands the model.
+    let root = temp_workspace("read_slice_path_only_no_graph");
+    write_rust_crate(
+        &root,
+        "pub fn alpha() -> usize { 1 }\npub fn beta() -> usize { 2 }\n",
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // The registry may open the graph on a background blocking task (a runtime
+    // is present under `#[tokio::test]`). Wait for that open to settle before
+    // we null the slot, otherwise it could race and repopulate `graph`.
+    registry.wait_for_graph_ready(std::time::Duration::from_secs(5));
+    // Simulate an unavailable graph: drop the manager and mark the slot ready
+    // so dispatch sees a *failed/absent* graph rather than one still indexing.
+    *registry.graph.lock().unwrap() = None;
+    {
+        let (lock, _cv) = &*registry.graph_ready;
+        *lock.lock().unwrap() = true;
+    }
+
+    let read = registry
+        .execute(
+            ToolCall {
+                call_id: "slice_path".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"path": "src/lib.rs", "start_line": 1, "end_line": 1}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(read.status, ToolStatus::Success, "{:?}", read.content);
+    // A real slice came back (not a graph_unavailable stub).
+    assert_eq!(read.content["tool"], json!("read_slice"));
+    assert!(read.content.get("graph_available").is_none());
+    assert!(
+        read.content["content"]
+            .as_str()
+            .expect("slice content")
+            .contains("alpha"),
+        "expected first line of source, got {:?}",
+        read.content["content"]
+    );
+
+    // It must also work while the graph is still *indexing* (slot None, not
+    // yet ready) — the path read should not block on or wait for indexing.
+    {
+        let (lock, _cv) = &*registry.graph_ready;
+        *lock.lock().unwrap() = false;
+    }
+    let read_indexing = registry
+        .execute(
+            ToolCall {
+                call_id: "slice_path_indexing".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"path": "src/lib.rs", "start_line": 2, "end_line": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        read_indexing.status,
+        ToolStatus::Success,
+        "{:?}",
+        read_indexing.content
+    );
+    assert_eq!(read_indexing.content["tool"], json!("read_slice"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_symbol_id_still_requires_graph() {
+    // Bug #1 guard: the path-only carve-out must NOT leak to `symbol_id`-based
+    // read_slice, which genuinely needs the graph. With the graph unavailable,
+    // a `symbol_id` read must still report the graph as unavailable.
+    let root = temp_workspace("read_slice_symbol_requires_graph");
+    write_rust_crate(&root, "pub fn alpha() -> usize { 1 }\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Let the background graph open settle before nulling the slot.
+    registry.wait_for_graph_ready(std::time::Duration::from_secs(5));
+    *registry.graph.lock().unwrap() = None;
+    {
+        let (lock, _cv) = &*registry.graph_ready;
+        *lock.lock().unwrap() = true;
+    }
+
+    let read = registry
+        .execute(
+            ToolCall {
+                call_id: "slice_symbol".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"symbol_id": "does::not::matter"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    // The graph-gated path is taken: a `graph_unavailable` result, not a slice.
+    assert_eq!(read.content["graph_available"], json!(false));
+    assert!(read.content.get("content").is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn record_graph_open_preserves_error_instead_of_swallowing() {
+    // Bug #7: `record_graph_open` is the folding step the two graph-open
+    // construction sites use. On `Err` it must leave the slot `None` AND record
+    // the reason — the previous `.ok()` discarded the error, collapsing a
+    // *failed* open into the same indistinguishable `None` as an absent graph.
+    let error_slot = StdMutex::new(None);
+    let failed: squeezy_core::Result<GraphManager> = Err(squeezy_core::SqueezyError::Graph(
+        "simulated parser/crawl failure".to_string(),
+    ));
+    let opened = record_graph_open(failed, &error_slot);
+    assert!(opened.is_none(), "a failed open must not yield a manager");
+    let recorded = error_slot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the open error must be recorded, not silently None-ified");
+    assert!(
+        recorded.contains("simulated parser/crawl failure"),
+        "recorded reason should carry the underlying error, got {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn graph_open_error_accessor_distinguishes_errored_from_absent() {
+    // Bug #7 end-to-end: a healthy workspace records no error, so a non-`None`
+    // `graph_open_error()` is unambiguous evidence the open *failed* — even
+    // though both an errored and an absent graph leave the slot `None`.
+    let root = temp_workspace("graph_open_error_recorded");
+    write_rust_crate(&root, "pub fn alpha() -> usize { 1 }\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Wait for the background open to complete; a clean open records no error.
+    registry.wait_for_graph_ready(std::time::Duration::from_secs(5));
+    assert!(
+        registry.graph_open_error().is_none(),
+        "successful open must not record an error"
+    );
+
+    // An errored open (slot `None` + recorded reason) is distinguishable from
+    // a legitimately-absent graph (slot `None`, no reason) via the accessor.
+    *registry.graph.lock().unwrap() = None;
+    *registry.graph_open_error.lock().unwrap() = Some("simulated parser failure".to_string());
+    assert_eq!(
+        registry.graph_open_error().as_deref(),
+        Some("simulated parser failure"),
+        "open error must be preserved and surfaced by the accessor"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn repo_map_truncates_when_single_root_exceeds_cap() {
+    // Bug (medium): the cap counted root nodes, not total serialized children.
+    // One wide root (a file with many top-level symbols) can blow past
+    // `max_files` in the serialized output while `nodes.len() == 1`, which used
+    // to report `truncated=false`.
+    let root = temp_workspace("repo_map_wide_root_truncates");
+    let mut source = String::new();
+    for i in 0..12 {
+        source.push_str(&format!("pub fn func_{i}() -> usize {{ {i} }}\n"));
+    }
+    write_rust_crate(&root, &source);
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let repo_map = registry
+        .execute(
+            ToolCall {
+                call_id: "repo_map_cap".to_string(),
+                name: "repo_map".to_string(),
+                // One file root with 12 functions; cap at 3 serialized nodes.
+                arguments: json!({"max_depth": 2, "max_files": 3}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        repo_map.status,
+        ToolStatus::Success,
+        "{:?}",
+        repo_map.content
+    );
+    if repo_map.content["graph_available"].as_bool() != Some(true) {
+        // No graph available in this environment — the truncation path is a
+        // no-op; nothing to assert.
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    assert_eq!(
+        repo_map.content["truncated"],
+        json!(true),
+        "a single root with more serialized children than the cap must truncate: {:?}",
+        repo_map.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn refresh_compiler_facts_caches_diagnostics_for_symbol_context() {
     let root = temp_workspace("compiler_facts_symbol_context");
     write_rust_crate(
@@ -9089,6 +9540,229 @@ class Foo {
     );
     assert_eq!(result.content["counts_by_kind"]["method"].as_u64(), Some(3));
     assert_eq!(result.content["packets"].as_array().unwrap().len(), 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Collect the declaration names from a `decl_search` result's packets.
+fn decl_search_packet_names(content: &Value) -> Vec<String> {
+    content["packets"]
+        .as_array()
+        .map(|packets| {
+            packets
+                .iter()
+                .filter_map(|p| p["symbol"]["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn decl_search_transitive_returns_full_subtype_closure() {
+    // A 3-level C# hierarchy: A <- B <- C. The graph only records each class's
+    // DIRECT base (`B` carries `base:A`, `C` carries `base:B`, not `base:A`),
+    // so a one-shot `attribute="base:A"` query surfaces only B. With
+    // `transitive=true` the closure must walk B -> C and return BOTH.
+    let root = temp_workspace("decl_search_transitive_closure");
+    fs::write(
+        root.join("Hierarchy.cs"),
+        r#"
+namespace App;
+
+public class A { }
+public class B : A { }
+public class C : B { }
+"#,
+    )
+    .expect("write csharp source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Sanity: the non-transitive search returns ONLY the direct subtype B.
+    let direct = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_direct".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A" }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(direct.status, ToolStatus::Success, "{:?}", direct.content);
+    let direct_names = decl_search_packet_names(&direct.content);
+    assert_eq!(
+        direct_names,
+        vec!["B".to_string()],
+        "direct (transitive absent) decl_search must return only the immediate subtype: {:?}",
+        direct.content
+    );
+
+    // transitive=false behaves identically to omitting it.
+    let explicit_false = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_false".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "transitive": false }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        explicit_false.status,
+        ToolStatus::Success,
+        "{:?}",
+        explicit_false.content
+    );
+    assert_eq!(
+        decl_search_packet_names(&explicit_false.content),
+        vec!["B".to_string()],
+        "transitive=false must match the omitted-flag behaviour: {:?}",
+        explicit_false.content
+    );
+
+    // transitive=true walks the whole subtype tree: BOTH B and C.
+    let transitive = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_transitive".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        transitive.status,
+        ToolStatus::Success,
+        "{:?}",
+        transitive.content
+    );
+    let transitive_names = decl_search_packet_names(&transitive.content);
+    assert!(
+        transitive_names.contains(&"B".to_string()) && transitive_names.contains(&"C".to_string()),
+        "transitive=true must return the full subtype closure (B and C), got {transitive_names:?}: {:?}",
+        transitive.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_transitive_walks_mixed_kind_chain() {
+    // Mixed-kind chain: `class C` reaches base interface `I` only THROUGH an
+    // intermediate interface `J` (`I` <- iface `J` <- class `C`). A
+    // `kind=class, attribute=base:I, transitive=true` query must still return
+    // `C`: the closure has to walk the interface intermediate (a *different*
+    // kind) and apply `kind=class` to the EMITTED results, not to the walk.
+    // Before the fix the walk threaded `kind=class` into every expansion, so
+    // the interface `J` was never enqueued and `C`'s subtree was dropped.
+    let root = temp_workspace("decl_search_transitive_mixed_kind");
+    fs::write(
+        root.join("Mixed.cs"),
+        r#"
+namespace App;
+
+public interface I { }
+public interface J : I { }
+public class C : J { }
+"#,
+    )
+    .expect("write csharp source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let transitive = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_mixed".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:I", "kind": "class", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        transitive.status,
+        ToolStatus::Success,
+        "{:?}",
+        transitive.content
+    );
+    let names = decl_search_packet_names(&transitive.content);
+    assert!(
+        names.contains(&"C".to_string()),
+        "transitive closure must reach class C THROUGH interface J (kind applied \
+         to emitted results, not the walk), got {names:?}: {:?}",
+        transitive.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_transitive_honors_query_filter() {
+    // `query` must narrow a transitive closure exactly as it narrows a one-shot
+    // search. base:A's closure is {B, Admin, SuperAdmin}; adding query="Admin"
+    // must drop the unrelated sibling B and keep the Admin branch. Before the
+    // fix the transitive branch ignored `query` entirely and returned the whole
+    // closure.
+    let root = temp_workspace("decl_search_transitive_query");
+    fs::write(
+        root.join("Roles.cs"),
+        r#"
+namespace App;
+
+public class A { }
+public class B : A { }
+public class Admin : A { }
+public class SuperAdmin : Admin { }
+"#,
+    )
+    .expect("write csharp source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Without query: the whole closure includes the unrelated sibling B.
+    let all = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_all".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let all_names = decl_search_packet_names(&all.content);
+    assert!(
+        all_names.contains(&"B".to_string()),
+        "unfiltered transitive closure should include B: {all_names:?}"
+    );
+
+    // With query="Admin": B is dropped, the Admin branch kept.
+    let narrowed = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_query".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({ "attribute": "base:A", "query": "Admin", "transitive": true }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        narrowed.status,
+        ToolStatus::Success,
+        "{:?}",
+        narrowed.content
+    );
+    let narrowed_names = decl_search_packet_names(&narrowed.content);
+    assert!(
+        narrowed_names.contains(&"Admin".to_string()),
+        "query=Admin must keep the Admin branch: {narrowed_names:?}"
+    );
+    assert!(
+        !narrowed_names.contains(&"B".to_string()),
+        "query=Admin must drop the unrelated sibling B (returned without query): {narrowed_names:?}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -11979,7 +12653,13 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // buys correct one-call retrieval of every extender/implementer/mixer of
     // a type — net-negative on tokens versus the failed-regex retries it
     // replaces.
-    const PREFIX_BYTES_BASELINE: usize = 24_904;
+    // 24_904 -> 25_230: deliberate bump for `decl_search transitive=true`. The
+    // graph only records each type's DIRECT base, so a one-shot `base:A` query
+    // returns only immediate subtypes; the +326 bytes (description sentence +
+    // the `transitive` boolean schema property) buys one-call retrieval of the
+    // whole transitive subtype closure, replacing the N follow-up `decl_search`
+    // calls a model would otherwise issue to walk a deep hierarchy by hand.
+    const PREFIX_BYTES_BASELINE: usize = 25_230;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -12295,25 +12975,49 @@ fn detect_inheritance_grep_positives() {
     // Dart wrapped-mixin pattern.
     let dart = detect_inheritance_grep(r"class \w+.*\bwith\b.*WidgetsBindingObserver")
         .expect("dart mixin pattern qualifies");
-    assert_eq!(dart.base_name, "WidgetsBindingObserver");
+    assert_eq!(dart.base_names, vec!["WidgetsBindingObserver"]);
     assert_eq!(dart.decl_kw, "class");
 
     // Java nested extends pattern: an explicit `extends <Capitalized>`
     // operator anchors a concrete supertype, so it qualifies even with no
     // decl keyword (the graph `kind` scope defaults to `class`).
     let java = detect_inheritance_grep("extends TypeAdapter").expect("extends Foo qualifies");
-    assert_eq!(java.base_name, "TypeAdapter");
+    assert_eq!(java.base_names, vec!["TypeAdapter"]);
     assert_eq!(java.decl_kw, "class");
 
     let java2 = detect_inheritance_grep("class \\w+ extends TypeAdapter")
         .expect("class + extends qualifies");
-    assert_eq!(java2.base_name, "TypeAdapter");
+    assert_eq!(java2.base_names, vec!["TypeAdapter"]);
     assert_eq!(java2.decl_kw, "class");
 
     let impls = detect_inheritance_grep("interface Foo implements Comparable")
         .expect("implements qualifies");
-    assert_eq!(impls.base_name, "Comparable");
+    assert_eq!(impls.base_names, vec!["Comparable"]);
     assert_eq!(impls.decl_kw, "interface");
+
+    // Alternation grep: `extends (A|B|C)` must enumerate subtypes of ALL three
+    // bases, not just the last. The old single-`base_name` extractor silently
+    // dropped A and B (and thus every subtype found only under them).
+    let alt =
+        detect_inheritance_grep(r"^export class \w+.*extends (ClientProxy|Server|BaseRpcContext)")
+            .expect("alternation extends qualifies");
+    assert_eq!(
+        alt.base_names,
+        vec!["ClientProxy", "Server", "BaseRpcContext"]
+    );
+    assert_eq!(alt.decl_kw, "class");
+
+    // Ruby `include`/`prepend` mixin idiom — the standard way Ruby classes mix
+    // in a module. The graph records `mixin:<leaf>` (plus a qualified
+    // `mixin:<ns>:<leaf>`) on the host, so a grep for `include Sidekiq::Component`
+    // must seed ONLY the leaf `Component` — never the namespace segment
+    // `Sidekiq`, which would inject unrelated `mixin:Sidekiq` declarations and
+    // dilute the augment.
+    let ruby = detect_inheritance_grep(r"^\s*include\s+Sidekiq::Component\b")
+        .expect("ruby include qualifies");
+    assert_eq!(ruby.base_names, vec!["Component"]);
+    let prepend = detect_inheritance_grep(r"prepend Comparable").expect("ruby prepend qualifies");
+    assert!(prepend.base_names.iter().any(|b| b == "Comparable"));
 }
 
 #[test]
@@ -12335,15 +13039,15 @@ fn detect_inheritance_grep_negatives() {
 fn detect_inheritance_grep_extraction() {
     // Generic args stripped.
     let g = detect_inheritance_grep("class X extends TypeAdapter<T>").expect("qualifies");
-    assert_eq!(g.base_name, "TypeAdapter");
+    assert_eq!(g.base_names, vec!["TypeAdapter"]);
 
     // Python `class X(Base):` — supertype is the Capitalized name in the
     // first parenthesized group.
     let py = detect_inheritance_grep("class X(Base):").expect("python qualifies");
-    assert_eq!(py.base_name, "Base");
+    assert_eq!(py.base_names, vec!["Base"]);
 
     // `: Base`-style (Rust/Kotlin/C#) inheritance punctuation.
     let colon = detect_inheritance_grep("struct Foo : Bar").expect("colon qualifies");
-    assert_eq!(colon.base_name, "Bar");
+    assert_eq!(colon.base_names, vec!["Bar"]);
     assert_eq!(colon.decl_kw, "struct");
 }
