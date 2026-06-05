@@ -270,6 +270,27 @@ fn emit_graph_build_telemetry(
     telemetry.spawn(event);
 }
 
+/// Bug #7: fold a `GraphManager::open_with_store` result into the graph slot
+/// while preserving the open error. On `Ok` the manager is returned to be
+/// stored; on `Err` the slot stays `None` but the reason is recorded in
+/// `error_slot` so an *errored* open (parser/crawl/store failure) is
+/// distinguishable from a structurally-absent graph — the previous `.ok()`
+/// collapsed both into an indistinguishable `None`.
+fn record_graph_open(
+    opened: squeezy_core::Result<GraphManager>,
+    error_slot: &StdMutex<Option<String>>,
+) -> Option<GraphManager> {
+    match opened {
+        Ok(manager) => Some(manager),
+        Err(err) => {
+            if let Ok(mut slot) = error_slot.lock() {
+                *slot = Some(err.to_string());
+            }
+            None
+        }
+    }
+}
+
 fn graph_build_perf_report(manager: &GraphManager) -> GraphPerfReport {
     let report = manager.build_report();
     GraphPerfReport {
@@ -939,6 +960,13 @@ pub struct ToolRegistry {
     /// construction) doesn't strand them on `graph_unavailable` while
     /// the workspace crawl + tree-sitter init is still finishing.
     pub(crate) graph_ready: Arc<(StdMutex<bool>, Condvar)>,
+    /// Bug #7: records the error from a failed `GraphManager::open_with_store`
+    /// so an *errored* open (parser/crawl/store failure) is distinguishable
+    /// from a structurally-absent graph. When the slot is `Some(reason)` the
+    /// graph is `None` because the open *failed*, not because the workspace
+    /// legitimately has no graph. `None` means either the open succeeded or it
+    /// has not run yet. Paired with `graph` (the slot stays `None` on error).
+    pub(crate) graph_open_error: Arc<StdMutex<Option<String>>>,
     vcs: Arc<GitVcs>,
     /// Shared persistent state store. When `None`, `read_mode=diff` with
     /// `diff_baseline=last_receipt` cannot reach any stored read snapshots and
@@ -1277,10 +1305,13 @@ impl ToolRegistry {
         let graph: Arc<StdMutex<Option<GraphManager>>> = Arc::new(StdMutex::new(None));
         let graph_ready: Arc<(StdMutex<bool>, Condvar)> =
             Arc::new((StdMutex::new(false), Condvar::new()));
+        // Bug #7: capture the open error rather than discarding it with `.ok()`.
+        let graph_open_error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let graph = Arc::clone(&graph);
                 let graph_ready = Arc::clone(&graph_ready);
+                let graph_open_error = Arc::clone(&graph_open_error);
                 let root_for_graph = root.clone();
                 let crawl_options_for_graph = crawl_options.clone();
                 let graph_cache_root_for_graph = graph_cache_root.clone();
@@ -1303,7 +1334,12 @@ impl ToolRegistry {
                     if let Some(telemetry) = telemetry_for_graph.as_ref() {
                         emit_graph_build_telemetry(telemetry, &opened_result);
                     }
-                    let opened = opened_result.ok();
+                    // Bug #7: preserve the open error so an errored graph is
+                    // distinguishable from a legitimately-absent one. On
+                    // failure the slot stays `None`; record the reason instead
+                    // of silently swallowing it via `.ok()`. (The error is also
+                    // emitted to telemetry above via `emit_graph_build_telemetry`.)
+                    let opened = record_graph_open(opened_result, &graph_open_error);
                     if let Ok(mut slot) = graph.lock() {
                         *slot = opened;
                     }
@@ -1332,7 +1368,10 @@ impl ToolRegistry {
                 if let Some(telemetry) = telemetry.as_ref() {
                     emit_graph_build_telemetry(telemetry, &opened_result);
                 }
-                let opened = opened_result.ok();
+                // Bug #7: same as the async branch — record the open error so
+                // an errored graph is distinguishable from an absent one
+                // instead of collapsing both into `None` via `.ok()`.
+                let opened = record_graph_open(opened_result, &graph_open_error);
                 if let Ok(mut slot) = graph.lock() {
                     *slot = opened;
                 }
@@ -1364,6 +1403,7 @@ impl ToolRegistry {
             http,
             graph,
             graph_ready,
+            graph_open_error,
             vcs: Arc::new(vcs),
             state_store: state_store.clone(),
             checkpoints,
@@ -1416,6 +1456,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             graph_ready: Arc::new((StdMutex::new(true), Condvar::new())),
+            graph_open_error: Arc::new(StdMutex::new(None)),
             vcs: Arc::new(vcs),
             state_store: None,
             checkpoints: None,
@@ -1457,6 +1498,18 @@ impl ToolRegistry {
             Ok((ready, _)) => *ready,
             Err(_) => false,
         }
+    }
+
+    /// Bug #7: the reason a `GraphManager::open_with_store` *failed*, if it
+    /// did. `Some(reason)` means the graph slot is `None` because the open
+    /// errored (parser/crawl/store failure) — distinguishable from a workspace
+    /// that legitimately has no graph (`None` here, graph slot `None`). Returns
+    /// `None` when the open succeeded or has not yet completed.
+    pub fn graph_open_error(&self) -> Option<String> {
+        self.graph_open_error
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Compute (and cache) a worktree/branch diff snapshot. Exposed

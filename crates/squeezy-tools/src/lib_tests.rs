@@ -9230,6 +9230,214 @@ pub mod service {
 }
 
 #[tokio::test]
+async fn read_slice_path_only_succeeds_when_graph_unavailable() {
+    // Bug #1: a path-only `read_slice` reads bytes straight off disk and never
+    // needs the graph. It must still succeed when the semantic graph is
+    // structurally unavailable (slot `None`) or still indexing, instead of
+    // returning a `graph_unavailable` result that strands the model.
+    let root = temp_workspace("read_slice_path_only_no_graph");
+    write_rust_crate(
+        &root,
+        "pub fn alpha() -> usize { 1 }\npub fn beta() -> usize { 2 }\n",
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // The registry may open the graph on a background blocking task (a runtime
+    // is present under `#[tokio::test]`). Wait for that open to settle before
+    // we null the slot, otherwise it could race and repopulate `graph`.
+    registry.wait_for_graph_ready(std::time::Duration::from_secs(5));
+    // Simulate an unavailable graph: drop the manager and mark the slot ready
+    // so dispatch sees a *failed/absent* graph rather than one still indexing.
+    *registry.graph.lock().unwrap() = None;
+    {
+        let (lock, _cv) = &*registry.graph_ready;
+        *lock.lock().unwrap() = true;
+    }
+
+    let read = registry
+        .execute(
+            ToolCall {
+                call_id: "slice_path".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"path": "src/lib.rs", "start_line": 1, "end_line": 1}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(read.status, ToolStatus::Success, "{:?}", read.content);
+    // A real slice came back (not a graph_unavailable stub).
+    assert_eq!(read.content["tool"], json!("read_slice"));
+    assert!(read.content.get("graph_available").is_none());
+    assert!(
+        read.content["content"]
+            .as_str()
+            .expect("slice content")
+            .contains("alpha"),
+        "expected first line of source, got {:?}",
+        read.content["content"]
+    );
+
+    // It must also work while the graph is still *indexing* (slot None, not
+    // yet ready) — the path read should not block on or wait for indexing.
+    {
+        let (lock, _cv) = &*registry.graph_ready;
+        *lock.lock().unwrap() = false;
+    }
+    let read_indexing = registry
+        .execute(
+            ToolCall {
+                call_id: "slice_path_indexing".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"path": "src/lib.rs", "start_line": 2, "end_line": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        read_indexing.status,
+        ToolStatus::Success,
+        "{:?}",
+        read_indexing.content
+    );
+    assert_eq!(read_indexing.content["tool"], json!("read_slice"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_symbol_id_still_requires_graph() {
+    // Bug #1 guard: the path-only carve-out must NOT leak to `symbol_id`-based
+    // read_slice, which genuinely needs the graph. With the graph unavailable,
+    // a `symbol_id` read must still report the graph as unavailable.
+    let root = temp_workspace("read_slice_symbol_requires_graph");
+    write_rust_crate(&root, "pub fn alpha() -> usize { 1 }\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Let the background graph open settle before nulling the slot.
+    registry.wait_for_graph_ready(std::time::Duration::from_secs(5));
+    *registry.graph.lock().unwrap() = None;
+    {
+        let (lock, _cv) = &*registry.graph_ready;
+        *lock.lock().unwrap() = true;
+    }
+
+    let read = registry
+        .execute(
+            ToolCall {
+                call_id: "slice_symbol".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"symbol_id": "does::not::matter"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    // The graph-gated path is taken: a `graph_unavailable` result, not a slice.
+    assert_eq!(read.content["graph_available"], json!(false));
+    assert!(read.content.get("content").is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn record_graph_open_preserves_error_instead_of_swallowing() {
+    // Bug #7: `record_graph_open` is the folding step the two graph-open
+    // construction sites use. On `Err` it must leave the slot `None` AND record
+    // the reason — the previous `.ok()` discarded the error, collapsing a
+    // *failed* open into the same indistinguishable `None` as an absent graph.
+    let error_slot = StdMutex::new(None);
+    let failed: squeezy_core::Result<GraphManager> = Err(squeezy_core::SqueezyError::Graph(
+        "simulated parser/crawl failure".to_string(),
+    ));
+    let opened = record_graph_open(failed, &error_slot);
+    assert!(opened.is_none(), "a failed open must not yield a manager");
+    let recorded = error_slot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the open error must be recorded, not silently None-ified");
+    assert!(
+        recorded.contains("simulated parser/crawl failure"),
+        "recorded reason should carry the underlying error, got {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn graph_open_error_accessor_distinguishes_errored_from_absent() {
+    // Bug #7 end-to-end: a healthy workspace records no error, so a non-`None`
+    // `graph_open_error()` is unambiguous evidence the open *failed* — even
+    // though both an errored and an absent graph leave the slot `None`.
+    let root = temp_workspace("graph_open_error_recorded");
+    write_rust_crate(&root, "pub fn alpha() -> usize { 1 }\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Wait for the background open to complete; a clean open records no error.
+    registry.wait_for_graph_ready(std::time::Duration::from_secs(5));
+    assert!(
+        registry.graph_open_error().is_none(),
+        "successful open must not record an error"
+    );
+
+    // An errored open (slot `None` + recorded reason) is distinguishable from
+    // a legitimately-absent graph (slot `None`, no reason) via the accessor.
+    *registry.graph.lock().unwrap() = None;
+    *registry.graph_open_error.lock().unwrap() = Some("simulated parser failure".to_string());
+    assert_eq!(
+        registry.graph_open_error().as_deref(),
+        Some("simulated parser failure"),
+        "open error must be preserved and surfaced by the accessor"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn repo_map_truncates_when_single_root_exceeds_cap() {
+    // Bug (medium): the cap counted root nodes, not total serialized children.
+    // One wide root (a file with many top-level symbols) can blow past
+    // `max_files` in the serialized output while `nodes.len() == 1`, which used
+    // to report `truncated=false`.
+    let root = temp_workspace("repo_map_wide_root_truncates");
+    let mut source = String::new();
+    for i in 0..12 {
+        source.push_str(&format!("pub fn func_{i}() -> usize {{ {i} }}\n"));
+    }
+    write_rust_crate(&root, &source);
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let repo_map = registry
+        .execute(
+            ToolCall {
+                call_id: "repo_map_cap".to_string(),
+                name: "repo_map".to_string(),
+                // One file root with 12 functions; cap at 3 serialized nodes.
+                arguments: json!({"max_depth": 2, "max_files": 3}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        repo_map.status,
+        ToolStatus::Success,
+        "{:?}",
+        repo_map.content
+    );
+    if repo_map.content["graph_available"].as_bool() != Some(true) {
+        // No graph available in this environment — the truncation path is a
+        // no-op; nothing to assert.
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    assert_eq!(
+        repo_map.content["truncated"],
+        json!(true),
+        "a single root with more serialized children than the cap must truncate: {:?}",
+        repo_map.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn refresh_compiler_facts_caches_diagnostics_for_symbol_context() {
     let root = temp_workspace("compiler_facts_symbol_context");
     write_rust_crate(

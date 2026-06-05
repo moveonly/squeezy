@@ -2239,6 +2239,17 @@ impl GraphManager {
             .unwrap_or(false)
     }
 
+    /// Number of changed paths still queued for the next refresh. After a
+    /// budget-exhausted `refresh_before_query`, the unprocessed paths stay in
+    /// this set; callers (e.g. squeezy-tools' graph payload) surface the count
+    /// so the model learns some changed files were not yet reparsed.
+    pub fn pending_changed_count(&self) -> usize {
+        self.pending_changed_paths
+            .lock()
+            .map(|paths| paths.len())
+            .unwrap_or(0)
+    }
+
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {
         if let Ok(mut paths) = self.pending_changed_paths.lock() {
             paths.insert(path.into());

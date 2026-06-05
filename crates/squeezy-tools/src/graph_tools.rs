@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     path::Path,
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -738,8 +739,8 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) ->
 
 pub(crate) fn graph_payload(
     tool: &str,
-    _manager: &GraphManager,
-    _refresh: &squeezy_graph::RefreshReport,
+    manager: &GraphManager,
+    refresh: &squeezy_graph::RefreshReport,
 ) -> serde_json::Map<String, Value> {
     // Trim policy: `refresh` and `coverage` are dropped from the wire payload.
     // The model never branched on either; the byte cost ran ~150-400B per
@@ -748,6 +749,20 @@ pub(crate) fn graph_payload(
     let mut payload = serde_json::Map::new();
     payload.insert("tool".to_string(), json!(tool));
     payload.insert("graph_available".to_string(), json!(true));
+    // Bug #2: when the incremental refresh budget was exhausted, some changed
+    // files were never reparsed and stay queued for the next refresh — the
+    // graph evidence below is partially stale. A bare `graph_available=true`
+    // hides that, so surface a compact `refresh_incomplete` signal plus the
+    // count of still-pending changed paths (read from the manager, since the
+    // unprocessed paths are left queued in that case). Emitted only when the
+    // refresh did not fully complete, so a healthy graph pays no byte cost.
+    if refresh.budget_exhausted {
+        payload.insert("refresh_incomplete".to_string(), json!(true));
+        payload.insert(
+            "stale_pending".to_string(),
+            json!(manager.pending_changed_count()),
+        );
+    }
     payload
 }
 
@@ -2055,6 +2070,18 @@ fn hierarchy_node_json(graph: &squeezy_graph::SemanticGraph, node: &HierarchyNod
     })
 }
 
+/// Total number of nodes a `HierarchyNode` serializes to — itself plus every
+/// descendant, since [`hierarchy_node_json`] recurses into `children`. Used to
+/// size the `truncated` flag against what actually lands in the payload rather
+/// than just the count of root nodes.
+fn hierarchy_node_count(node: &HierarchyNode) -> usize {
+    1 + node
+        .children
+        .iter()
+        .map(hierarchy_node_count)
+        .sum::<usize>()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hierarchy_result(
     call: &ToolCall,
@@ -2067,8 +2094,16 @@ fn hierarchy_result(
     root: Option<GraphSymbol>,
 ) -> ToolResult {
     let max_results = graph_limit(max_results);
-    let truncated = nodes.len() > max_results;
     let selected = nodes.iter().take(max_results).collect::<Vec<_>>();
+    // Count the total serialized nodes (roots + all recursively-emitted
+    // children), not just the number of roots. A single wide root can blow past
+    // `max_results` in the serialized `hierarchy`/`packets` while
+    // `nodes.len() <= max_results`, which previously reported `truncated=false`.
+    let serialized_nodes = selected
+        .iter()
+        .map(|node| hierarchy_node_count(node))
+        .sum::<usize>();
+    let truncated = nodes.len() > max_results || serialized_nodes > max_results;
     let hierarchy = selected
         .iter()
         .map(|node| hierarchy_node_json(graph, node))
@@ -2253,6 +2288,25 @@ type ReadSliceTarget = (
     Confidence,
     Vec<Provenance>,
 );
+
+/// Returns the parsed [`ReadSliceArgs`] when `call` is a `read_slice` that
+/// targets a plain `path` (no `symbol_id`) and therefore needs no graph.
+/// Such reads pull bytes straight off disk, so they can — and should — run
+/// even when the semantic graph is still indexing or structurally
+/// unavailable (bug #1). Returns `None` for any other tool, for a
+/// `symbol_id`-based read_slice (which still requires the graph), or when the
+/// arguments fail to deserialize (so the normal dispatch path surfaces the
+/// arg error).
+fn read_slice_path_only_args(call: &ToolCall) -> Option<ReadSliceArgs> {
+    if call.name != "read_slice" {
+        return None;
+    }
+    let args = serde_json::from_value::<ReadSliceArgs>(call.arguments.clone()).ok()?;
+    if args.symbol_id.is_some() {
+        return None;
+    }
+    Some(args)
+}
 
 fn read_slice_target(
     graph: Option<&squeezy_graph::SemanticGraph>,
@@ -2550,7 +2604,17 @@ impl ToolRegistry {
     fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
-        let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
+        // Bug #1: a path-only `read_slice` never consults the graph, so don't
+        // make it wait on background indexing — only block on graph readiness
+        // for calls that actually need the graph. If the graph happens to be
+        // ready already we still fall through and pass it down for richer
+        // `graph_status` classification; this only skips the *wait*.
+        let path_only_read_slice = read_slice_path_only_args(call).is_some();
+        let graph_ready = if path_only_read_slice {
+            self.wait_for_graph_ready(Duration::ZERO)
+        } else {
+            self.wait_for_graph_ready(graph_ready_wait())
+        };
         let mut graph = match self.graph.lock() {
             Ok(graph) => graph,
             Err(_) => {
@@ -2564,6 +2628,19 @@ impl ToolRegistry {
             }
         };
         let Some(manager) = graph.as_mut() else {
+            // Bug #1: a path-only `read_slice` (no `symbol_id`) reads bytes
+            // straight off disk and never touches the graph. Don't strand it on
+            // a `graph_unavailable` result just because the graph is still
+            // indexing or structurally absent — route it through the path-read
+            // path with `graph=None`. `symbol_id`-based read_slice still needs
+            // the graph and falls through to the unavailable result below.
+            // (A wait was already skipped above when the graph isn't ready, so
+            // this also avoids stalling the read behind background indexing.)
+            if let Some(args) = read_slice_path_only_args(call) {
+                // Release the graph lock before the (potentially slow) file read.
+                drop(graph);
+                return self.execute_read_slice_blocking(call, args, None);
+            }
             return graph_unavailable_result(call, !graph_ready);
         };
         let refresh = match manager.refresh_before_query() {
@@ -2644,8 +2721,15 @@ impl ToolRegistry {
         let max_depth = args.max_depth.unwrap_or(2).clamp(1, MAX_GRAPH_MAX_DEPTH);
         let max_files = args.max_files.unwrap_or(50).clamp(1, 200);
         let nodes = graph.hierarchy(None, max_depth);
-        let truncated = nodes.len() > max_files;
         let selected = nodes.iter().take(max_files).collect::<Vec<_>>();
+        // Count total serialized nodes (roots + recursively-emitted children),
+        // not just the number of roots, so a single wide root that exceeds
+        // `max_files` in the serialized output is reported as truncated.
+        let serialized_nodes = selected
+            .iter()
+            .map(|node| hierarchy_node_count(node))
+            .sum::<usize>();
+        let truncated = nodes.len() > max_files || serialized_nodes > max_files;
         let hierarchy = selected
             .iter()
             .map(|node| hierarchy_node_json(graph, node))
@@ -4246,5 +4330,164 @@ mod reference_path_filter_tests {
             &hit_in("experimental_src/foo/x.rs"),
             "src/foo"
         ));
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_node_count_tests {
+    use super::hierarchy_node_count;
+    use squeezy_core::{Freshness, SourcePoint, SourceSpan, SymbolId, SymbolKind};
+    use squeezy_graph::HierarchyNode;
+
+    fn leaf(name: &str) -> HierarchyNode {
+        HierarchyNode {
+            id: SymbolId::new(name),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+            freshness: Freshness::Fresh,
+            children: Vec::new(),
+        }
+    }
+
+    fn root_with(children: usize) -> HierarchyNode {
+        let mut node = leaf("root");
+        node.kind = SymbolKind::File;
+        node.children = (0..children).map(|i| leaf(&format!("child{i}"))).collect();
+        node
+    }
+
+    #[test]
+    fn counts_root_plus_every_descendant() {
+        // A single root with 5 children serializes 6 nodes, not 1. This is the
+        // miscount behind the "wide root reports truncated=false" bug.
+        assert_eq!(hierarchy_node_count(&root_with(5)), 6);
+    }
+
+    #[test]
+    fn counts_nested_descendants_recursively() {
+        let mut root = root_with(2);
+        // Give the first child two grandchildren.
+        root.children[0].children = vec![leaf("g0"), leaf("g1")];
+        // root(1) + child0(1) + child1(1) + g0(1) + g1(1) = 5
+        assert_eq!(hierarchy_node_count(&root), 5);
+    }
+
+    #[test]
+    fn leaf_counts_as_one() {
+        assert_eq!(hierarchy_node_count(&leaf("solo")), 1);
+    }
+}
+
+#[cfg(test)]
+mod graph_payload_refresh_status_tests {
+    use super::graph_payload;
+    use squeezy_graph::{GraphManager, RefreshConfig};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "squeezy_graph_payload_{name}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("create temp workspace");
+        root
+    }
+
+    /// Build a GraphManager over a tiny crate, then force a budget-exhausted
+    /// refresh by recording changed paths under a zero per-tool budget. The
+    /// returned manager + report mirror the production state where some changed
+    /// files were never reparsed and stay queued.
+    fn budget_exhausted_manager(name: &str) -> (GraphManager, squeezy_graph::RefreshReport) {
+        let root = temp_root(name);
+        for file in ["a.rs", "b.rs"] {
+            std::fs::write(
+                root.join("src").join(file),
+                format!("fn {}_v1() {{}}\n", file.trim_end_matches(".rs")),
+            )
+            .expect("write source");
+        }
+        let mut manager = GraphManager::open_with_config(
+            &root,
+            RefreshConfig {
+                debounce: Duration::from_millis(0),
+                idle_refresh_interval: Duration::from_secs(600),
+                // Zero budget: the reparse loop breaks before parsing any file.
+                per_tool_refresh_budget: Duration::from_millis(0),
+            },
+        )
+        .expect("open graph");
+        std::thread::sleep(Duration::from_millis(2));
+        let mut changed = Vec::new();
+        for file in ["a.rs", "b.rs"] {
+            let path = root.join("src").join(file);
+            std::fs::write(
+                &path,
+                format!("fn {}_v2() {{}}\n", file.trim_end_matches(".rs")),
+            )
+            .expect("rewrite source");
+            changed.push(path);
+        }
+        manager.record_changed_paths(changed);
+        let report = manager.refresh_before_query().expect("refresh");
+        let _ = std::fs::remove_dir_all(&root);
+        (manager, report)
+    }
+
+    #[test]
+    fn payload_surfaces_refresh_incomplete_when_budget_exhausted() {
+        // Bug #2: a budget-exhausted refresh leaves changed paths unprocessed.
+        // The payload must tell the model the graph evidence is partially stale
+        // instead of advertising a bare `graph_available=true`.
+        let (manager, report) = budget_exhausted_manager("incomplete");
+        assert!(
+            report.budget_exhausted,
+            "zero budget must exhaust the refresh"
+        );
+        let payload = graph_payload("repo_map", &manager, &report);
+        assert_eq!(
+            payload.get("refresh_incomplete"),
+            Some(&serde_json::json!(true))
+        );
+        let pending = payload
+            .get("stale_pending")
+            .and_then(|v| v.as_u64())
+            .expect("stale_pending count");
+        assert!(pending > 0, "expected unprocessed paths, got {pending}");
+    }
+
+    #[test]
+    fn payload_omits_refresh_status_when_refresh_completes() {
+        // A healthy, fully-completed refresh must not pay the stale-signal byte
+        // cost: no `refresh_incomplete` / `stale_pending` keys.
+        let root = temp_root("complete");
+        std::fs::write(root.join("src").join("a.rs"), "fn a_v1() {}\n").expect("write source");
+        let mut manager = GraphManager::open_with_config(
+            &root,
+            RefreshConfig {
+                debounce: Duration::from_millis(0),
+                idle_refresh_interval: Duration::from_millis(0),
+                // Generous budget so the reparse loop completes.
+                per_tool_refresh_budget: Duration::from_secs(30),
+            },
+        )
+        .expect("open graph");
+        let report = manager.refresh_before_query().expect("refresh");
+        assert!(
+            !report.budget_exhausted,
+            "generous budget must complete the refresh"
+        );
+        let payload = graph_payload("repo_map", &manager, &report);
+        assert_eq!(
+            payload.get("graph_available"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(payload.get("refresh_incomplete").is_none());
+        assert!(payload.get("stale_pending").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
