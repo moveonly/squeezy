@@ -1,0 +1,51 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Sessions · Squeezy docs"
+  description="How Squeezy saves work locally, resumes long sessions efficiently, and produces redacted reports."
+  activeDoc="/docs/sessions/"
+  eyebrow="resume"
+  heading="Sessions."
+  lead="Squeezy keeps each session on your machine so you can leave, come back, and pick up where you were, without re-paying for the whole history."
+>
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>Work is saved as you go</h2>
+      <p>
+        Each session is stored locally under your project. You can list past
+        sessions, show what happened, and resume one to continue. Because long
+        conversations are kept compact, resuming a long session starts from a
+        short summary plus recent work rather than replaying everything.
+      </p>
+      <pre><code>squeezy sessions list
+squeezy sessions show &lt;session_id&gt;
+squeezy sessions resume &lt;session_id&gt;</code></pre>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>Cost and context, in view</h2>
+      <p>
+        During a session, <code>/context</code> and <code>/cost</code> show
+        where tokens are going, input, output, cached input, tool output, and
+        reasoning, with dollar estimates where the provider exposes them. This
+        is the same accounting the cost-saving layers are measured against.
+      </p>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>Reporting</h2>
+      <p>
+        When you need help, <code>squeezy sessions report</code> turns a session
+        into a redacted bundle you can preview before sending. See
+        <a href="/docs/help/">help &amp; troubleshooting</a> for the full
+        reporting flow.
+      </p>
+    </div>
+  </section>
+</DocsLayout>

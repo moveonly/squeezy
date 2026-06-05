@@ -2,7 +2,7 @@ export const SITE = {
   name: "Squeezy",
   url: "https://squeezyagent.com",
   description:
-    "A terminal coding agent that spends local work to keep paid model context focused.",
+    "A coding agent that does the repetitive work on your machine and spends model tokens only where they're needed.",
   repoUrl: "https://github.com/esqueezy/squeezy",
   issuesUrl: "https://github.com/esqueezy/squeezy/issues",
   discussionsUrl: "https://github.com/esqueezy/squeezy/discussions",
@@ -13,42 +13,53 @@ export const SITE = {
 export const DOCS_NAV = [
   {
     href: "/docs/install/",
-    label: "Install",
+    label: "Install & upgrade",
     status: "setup"
   },
   {
-    href: "/docs/semantic-navigation/",
-    label: "Graph",
-    status: "static analysis"
+    href: "/docs/how-it-works/",
+    label: "How it works",
+    status: "concepts"
   },
   {
-    href: "/docs/cost-receipts/",
-    label: "Cost & receipts",
-    status: "token budget"
-  },
-  {
-    href: "/docs/config/",
-    label: "Config",
-    status: "settings"
-  },
-  {
-    href: "/docs/permissions/",
-    label: "Permissions",
-    status: "policy"
+    href: "/docs/cost-saving/",
+    label: "Cost-saving strategies",
+    status: "cost",
+    children: [
+      { href: "/docs/cost-saving/understand/", label: "Understand the code first" },
+      { href: "/docs/cost-saving/reuse/", label: "Don't pay for the same bytes twice" },
+      { href: "/docs/cost-saving/right-size/", label: "Right-size every turn" },
+      { href: "/docs/cost-saving/see-the-bill/", label: "See the bill" }
+    ]
   },
   {
     href: "/docs/languages/",
-    label: "Languages",
+    label: "Languages & graph",
     status: "coverage"
   },
   {
     href: "/docs/providers/",
-    label: "Providers",
+    label: "Providers & models",
     status: "models"
   },
   {
-    href: "/docs/troubleshooting/",
-    label: "Support",
-    status: "debug/report"
+    href: "/docs/config/",
+    label: "Configuration",
+    status: "settings"
+  },
+  {
+    href: "/docs/permissions/",
+    label: "Permissions & safety",
+    status: "policy"
+  },
+  {
+    href: "/docs/sessions/",
+    label: "Sessions",
+    status: "resume"
+  },
+  {
+    href: "/docs/help/",
+    label: "Help & troubleshooting",
+    status: "support"
   }
 ];

@@ -1,21 +1,19 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
 import GitHubIcon from "../components/GitHubIcon.astro";
+import TerminalWindow from "../components/TerminalWindow.astro";
 import { SITE } from "../config";
 import {
-  benchmarkSummary,
-  costLeaks,
-  costPillars,
+  genericProof,
   heroMetrics,
-  operatingLoop,
+  leverGroups,
   productPosition,
-  productSubjects,
-  providerGroups
+  productSubjects
 } from "../facts";
 ---
 
 <BaseLayout
-  title="Squeezy · Spend model tokens on solving code"
+  title="Squeezy · The CPU does the repetitive work. Your tokens do the thinking."
   description={SITE.description}
   active="home"
   jsonLd={true}
@@ -23,37 +21,46 @@ import {
   <section class="hero">
     <div class="hero-copy">
       <span class="eyebrow">{productPosition.eyebrow}</span>
-      <h1>{productPosition.title}</h1>
+      <h1>{productPosition.title}<br />{productPosition.titleCont}</h1>
       <p class="lead">{productPosition.lead}</p>
       <p class="hero-note">{productPosition.note}</p>
       <div class="hero-actions">
         <a class="button" href="/install/" data-track-click="hero_install">Install Squeezy</a>
-        <a class="button secondary" href="/benchmarks/" data-track-click="hero_benchmarks">See benchmark data</a>
+        <a class="button secondary" href="/how-it-works/" data-track-click="hero_how">How it works</a>
         <a class="button secondary" href={SITE.repoUrl} data-track-click="hero_github" data-track-target="github">
           <GitHubIcon /> GitHub
         </a>
       </div>
     </div>
     <div class="hero-visual">
-      <div class="card proof-card">
-        <span class="label">same-task benchmark</span>
-        <strong>{benchmarkSummary.codexWins}</strong>
-        <p>Lower cost on every accepted Codex Mini language row.</p>
-      </div>
-      <div class="mini-stack">
-        {
-          costLeaks.map((item) => (
-            <article>
-              <span>{item.label}</span>
-              <strong>{item.title}</strong>
-            </article>
-          ))
-        }
+      <TerminalWindow title="squeezy">
+        <div class="tw-body" role="img" aria-label="A Squeezy session: a user prompt, a plan, a targeted code read, a reasoning step, and a live working step shown on a tree rail.">
+          <div class="tw-row"><span class="tw-coin">☽</span> <span class="tw-user">add a /cost summary to the status line</span></div>
+          <div class="tw-row"><span class="tw-rail">│</span></div>
+          <div class="tw-row"><span class="tw-rail">├─ </span><span class="mk-plan">◇</span> <span class="tw-node">Plan</span></div>
+          <div class="tw-row"><span class="tw-rail">│   </span><span class="tw-dim">read the status-line renderer</span></div>
+          <div class="tw-row"><span class="tw-rail">│   </span><span class="tw-dim">add a compact cost segment</span></div>
+          <div class="tw-row"><span class="tw-rail">├─ </span><span class="mk-ok">✓</span> <span class="tw-node">read_slice</span> <span class="tw-dim">statusline.rs:120-148</span></div>
+          <div class="tw-row"><span class="tw-rail">│   </span><span class="tw-dim">48 lines · signature only</span></div>
+          <div class="tw-row"><span class="tw-rail">├─ </span><span class="mk-reason">◯</span> <span class="tw-node">Reasoning</span></div>
+          <div class="tw-row"><span class="tw-rail">╰─ </span><span class="mk-star">✦</span> <span class="shimmer-word">Working</span> <span class="tw-dim">apply_patch · 4s</span></div>
+        </div>
+      </TerminalWindow>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="lead-stat">
+      <span class="eyebrow">measured</span>
+      <p class="big"><span class="accent">{genericProof.stat}</span> {genericProof.detail}</p>
+      <p>{genericProof.note}</p>
+      <div class="actions">
+        <a class="button secondary" href="/benchmarks/" data-track-click="home_benchmarks">See the benchmark</a>
       </div>
     </div>
   </section>
 
-  <section class="metric-strip" aria-label="Squeezy product facts">
+  <section class="metric-strip" aria-label="Squeezy at a glance">
     {
       heroMetrics.map((metric) => (
         <div>
@@ -68,12 +75,11 @@ import {
   <section class="section">
     <div class="section-header wide">
       <span class="eyebrow">what it is</span>
-      <h2>A coding agent designed around token discipline.</h2>
+      <h2>A coding agent that prepares locally, then asks the model.</h2>
       <p>
-        Squeezy does the local work a coding agent should do before it asks a
-        model to reason: understand the repository, choose the relevant context,
-        trim repeated output, keep long sessions compact, and show where the
-        provider spend went.
+        Squeezy does the work a coding agent should do before it spends a model
+        token: read your repository, pick the code that matters, and send the
+        model a focused task instead of raw files.
       </p>
     </div>
     <div class="grid-3">
@@ -91,120 +97,50 @@ import {
 
   <section class="section band">
     <div class="section-header wide">
-      <span class="eyebrow">cost savings</span>
-      <h2>The saving comes from layers working together.</h2>
+      <span class="eyebrow">how the saving happens</span>
+      <h2>Four independent ways to cut waste.</h2>
       <p>
-        The internal cost-saving docs describe several independent levers. The
-        public version is simple: reuse stable context, avoid repeating bytes,
-        shape noisy outputs, keep old conversation state compact, route simple
-        work cheaply, and use local code understanding before broad model
-        context.
+        Local code understanding is the first layer, but it is not the whole
+        story, it works alongside reusing stable context, right-sizing each
+        turn, and keeping the bill in plain sight.
       </p>
-      <div class="actions">
-        <a class="button" href="/cost/" data-track-click="home_cost">How Squeezy saves cost</a>
-        <a class="button secondary" href="/docs/cost-receipts/" data-track-click="home_cost_docs">Technical docs</a>
-      </div>
     </div>
-    <div class="grid-3">
-      {
-        costPillars.slice(0, 9).map((fact) => (
-          <article class="card">
-            <span class="label">{fact.label}</span>
-            <h3>{fact.title}</h3>
-            <p>{fact.body}</p>
-          </article>
-        ))
-      }
-    </div>
-  </section>
-
-  <section class="section">
-    <div class="grid-2 align-center">
-      <div class="section-header">
-        <span class="eyebrow">measured data</span>
-        <h2>{benchmarkSummary.codexWins} lower-cost rows versus Codex.</h2>
-        <p>
-          {benchmarkSummary.suite} Claude Code results are shown separately so
-          the Codex claim stays clear and the Haiku-tier comparison is not
-          overstated.
-        </p>
-        <div class="actions">
-          <a class="button" href="/benchmarks/" data-track-click="home_benchmarks">Benchmark details</a>
-          <a class="button secondary" href="/languages/" data-track-click="home_languages">Language support</a>
-        </div>
-      </div>
-      <div class="grid-2">
-        <article class="card proof-card">
-          <span class="label">Squeezy vs Codex</span>
-          <strong>{benchmarkSummary.codexWins}</strong>
-          <p>Accepted Mini-tier same-task result.</p>
-        </article>
-        <article class="card proof-card">
-          <span class="label">Squeezy vs Claude Code</span>
-          <strong>{benchmarkSummary.claudeWins}</strong>
-          <p>Haiku-tier comparison, shown separately because two rows remain higher cost.</p>
-        </article>
-      </div>
-    </div>
-  </section>
-
-  <section class="section band">
-    <div class="section-header">
-      <span class="eyebrow">how it works</span>
-      <h2>Local preparation first. Focused model work second.</h2>
-    </div>
-    <div class="flow">
-      {
-        operatingLoop.map((item) => (
-          <article class="flow-step">
-            <span>{item.label}</span>
-            <strong>{item.title}</strong>
-            <p>{item.body}</p>
-          </article>
-        ))
-      }
-    </div>
-  </section>
-
-  <section class="section">
     <div class="grid-2">
-      <div>
+      {
+        leverGroups.map((group, index) => (
+          <a class="card" href={`/how-it-works/#${group.id}`} data-track-click={`home_lever_${group.id}`}>
+            <span class:list={["card-mark", group.id]}>{`0${index + 1}`}</span>
+            <h3>{group.title}</h3>
+            <p>{group.why}</p>
+          </a>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="split">
+      <div class="split-copy">
         <div class="section-header">
-          <span class="eyebrow">providers</span>
-          <h2>Bring your model. Keep the optimization local.</h2>
+          <span class="eyebrow">your model</span>
+          <h2>Bring your own key. Squeezy keeps the saving local.</h2>
           <p>
-            Squeezy works across native providers, compatible endpoints, and
-            local runtimes. Provider choice stays yours; the context discipline
-            happens before the call.
+            Run Squeezy against 18 provider presets, aggregators, first-party
+            APIs, cloud hosts, local runtimes, or any OpenAI-compatible
+            endpoint. The context work happens on your machine, before the call.
           </p>
-        </div>
-        <div class="matrix compact-matrix">
-          {
-            providerGroups.map((row) => (
-              <article class="matrix-row">
-                <h3>{row.name}</h3>
-                <p>{row.detail}</p>
-                {row.status && <span class="status-pill">{row.status}</span>}
-              </article>
-            ))
-          }
-        </div>
-      </div>
-      <div>
-        <div class="section-header">
-          <span class="eyebrow">start</span>
-          <h2>Install, connect a provider, and open the docs when you want detail.</h2>
-          <p>
-            The website stays focused on the product. The documentation carries
-            setup, permissions, providers, cost receipts, and navigation internals.
-          </p>
-        </div>
-        <div class="card code-card">
-          <pre><code>curl -fsSL https://squeezyagent.com/install.sh | sh
-squeezy</code></pre>
         </div>
         <div class="actions">
-          <a class="button" href="/install/" data-track-click="home_install_bottom">Install</a>
+          <a class="button secondary" href="/support/#providers" data-track-click="home_providers">What it supports</a>
+          <a class="button secondary" href="/docs/providers/" data-track-click="home_provider_docs">Provider docs</a>
+        </div>
+      </div>
+      <div class="card code-card">
+        <span class="label">get started</span>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh
+squeezy</code></pre>
+        <div class="actions">
+          <a class="button secondary" href="/install/" data-track-click="home_install_bottom">Install</a>
           <a class="button secondary" href="/docs/" data-track-click="home_docs_bottom">Docs</a>
           <a class="button secondary" href={SITE.repoUrl} data-track-click="home_github_bottom" data-track-target="github">
             <GitHubIcon /> GitHub

@@ -10,104 +10,98 @@ import {
 ---
 
 <DocsLayout
-  title="Providers · Squeezy"
-  description="Squeezy provider adapter support and local provider configuration."
+  title="Providers & models · Squeezy docs"
+  description="Bring your own model: the provider presets Squeezy supports, how to authenticate each, and how simple turns are routed to a cheaper model."
   activeDoc="/docs/providers/"
-  eyebrow="providers"
-  heading="Bring your model through one local agent loop."
-  lead="Squeezy keeps code analysis, permissions, tool shaping, and session accounting local while routing model turns through configured hosted or local providers."
+  eyebrow="models"
+  heading="Providers & models."
+  lead="Squeezy keeps the code analysis, permissions, and accounting on your machine, and routes model turns through whichever provider you configure. You bring the key."
 >
   <section class="doc-block">
-    <h2>Aggregators (one key, many models)</h2>
-    <p>Quickest start: a single API key routes to every frontier model through the OpenAI-compatible Chat Completions API. OpenRouter additionally forwards Anthropic <code>cache_control</code> markers and reasoning effort, so caching and reasoning behave the same as a direct vendor call.</p>
+    <div class="doc-prose">
+      <h2>Choosing a route</h2>
+      <p>
+        The quickest start is an aggregator: one API key reaches many hosted
+        models. If you prefer a vendor's own API, a cloud platform's catalog, or
+        a model running on your own machine, Squeezy supports those too. Set the
+        provider and supply its credential; the tables below list the
+        environment variable for each.
+      </p>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Aggregators, one key, many models</h2>
     <div class="matrix compact-matrix">
-      {
-        aggregatorRows.map((row) => (
-          <article class="matrix-row">
-            <h3>{row.name}</h3>
-            <p>{row.detail}</p>
-            {row.status && <span class="status-pill">{row.status}</span>}
-          </article>
-        ))
-      }
+      {aggregatorRows.map((row) => (
+        <article class="matrix-row">
+          <h3>{row.name}</h3>
+          <p>{row.detail}</p>
+          {row.status && <span class="status-pill">{row.status}</span>}
+        </article>
+      ))}
     </div>
   </section>
 
   <section class="doc-block">
     <h2>First-party vendor APIs</h2>
-    <p>Native endpoints from the model authors. Each has its own protocol — OpenAI Responses, Anthropic Messages, Gemini <code>streamGenerateContent</code> — wired up by a dedicated adapter.</p>
     <div class="matrix compact-matrix">
-      {
-        providerRows.map((row) => (
-          <article class="matrix-row">
-            <h3>{row.name}</h3>
-            <p>{row.detail}</p>
-            {row.status && <span class="status-pill">{row.status}</span>}
-          </article>
-        ))
-      }
+      {providerRows.map((row) => (
+        <article class="matrix-row">
+          <h3>{row.name}</h3>
+          <p>{row.detail}</p>
+          {row.status && <span class="status-pill">{row.status}</span>}
+        </article>
+      ))}
     </div>
   </section>
 
   <section class="doc-block">
     <h2>Cloud-platform hosts</h2>
-    <p>Models hosted by cloud platforms behind that platform's IAM. Amazon Bedrock is AWS's multi-vendor catalog. Azure OpenAI is the OpenAI-only slice of the broader Azure model surface; for Azure AI Foundry's multi-vendor catalog use the <code>openai_compatible</code> preset below with the Foundry serverless endpoint. Google Vertex AI exposes an OpenAI-compatible <code>/chat/completions</code> endpoint that we reach via an OAuth2 access token; the preset templates <code>base_url</code> from a project + location and refreshes the token when a service-account JSON path is provided.</p>
     <div class="matrix compact-matrix">
-      {
-        cloudPlatformRows.map((row) => (
-          <article class="matrix-row">
-            <h3>{row.name}</h3>
-            <p>{row.detail}</p>
-            {row.status && <span class="status-pill">{row.status}</span>}
-          </article>
-        ))
-      }
+      {cloudPlatformRows.map((row) => (
+        <article class="matrix-row">
+          <h3>{row.name}</h3>
+          <p>{row.detail}</p>
+          {row.status && <span class="status-pill">{row.status}</span>}
+        </article>
+      ))}
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>Local runtime</h2>
-    <p>Run models on the same host as Squeezy. No external network call, no billing, full control over which models are available.</p>
+    <h2>Local &amp; other compatible endpoints</h2>
     <div class="matrix compact-matrix">
-      {
-        localRuntimeRows.map((row) => (
-          <article class="matrix-row">
-            <h3>{row.name}</h3>
-            <p>{row.detail}</p>
-            {row.status && <span class="status-pill">{row.status}</span>}
-          </article>
-        ))
-      }
+      {[...localRuntimeRows, ...openAiCompatibleRows].map((row) => (
+        <article class="matrix-row">
+          <h3>{row.name}</h3>
+          <p>{row.detail}</p>
+          {row.status && <span class="status-pill">{row.status}</span>}
+        </article>
+      ))}
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>Other OpenAI-compatible</h2>
-    <p>Single-vendor services that speak <code>POST /chat/completions</code> with a Bearer token. The same adapter that drives the aggregators powers these — set the preset, supply an API key, done. The "Custom" preset accepts any base_url so self-hosted proxies (LiteLLM, Cloudflare Workers AI) work too.</p>
-    <div class="matrix compact-matrix">
-      {
-        openAiCompatibleRows.map((row) => (
-          <article class="matrix-row">
-            <h3>{row.name}</h3>
-            <p>{row.detail}</p>
-            {row.status && <span class="status-pill">{row.status}</span>}
-          </article>
-        ))
-      }
-    </div>
-    <p class="footnote">Default models and context windows are seed metadata for routing and local accounting, not provider billing authority.</p>
-  </section>
-
-  <section class="doc-block">
-    <h2>Configuration</h2>
-    <p>Provider settings resolve from CLI flags, environment variables, project config, user settings, and built-in defaults. Aggregators and OpenAI-compatible services use a Bearer API key; first-party vendors use their own header conventions; Bedrock uses the AWS default credential chain; Ollama uses the local runtime.</p>
-    <pre><code>[model]
+    <div class="doc-prose">
+      <h2>Routing and configuration</h2>
+      <p>
+        Squeezy can send simple, mechanical turns to a provider's small, fast
+        model and escalate to your main model only when a task turns out to be
+        hard, routing never crosses providers. See
+        <a href="/docs/how-it-works/">how it works</a> for the full picture.
+      </p>
+      <p>
+        Provider settings resolve from CLI flags, environment variables, project
+        config, user settings, and built-in defaults. Set the provider and let
+        the credential come from its environment variable:
+      </p>
+      <pre><code>[model]
 provider = "openrouter"
-profile = "balanced"
-model = ""
+model = ""          # set your model id, or leave blank for the default
 
 [providers.openrouter]
-api_key_env = "OPENROUTER_API_KEY"
-default_model = "anthropic/claude-opus-4-7"</code></pre>
+api_key_env = "OPENROUTER_API_KEY"</code></pre>
+    </div>
   </section>
 </DocsLayout>

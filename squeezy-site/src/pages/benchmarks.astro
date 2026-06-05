@@ -33,7 +33,7 @@ import { benchmarkRows, benchmarkSummary, haikuBenchmarkRows } from "../facts";
         <span class="label">Haiku board</span>
         <strong>{benchmarkSummary.claudeWins}</strong>
         <h3>{benchmarkSummary.claudeModel}</h3>
-        <p>{benchmarkSummary.runs}. C and Go are the two higher-cost rows.</p>
+        <p>{benchmarkSummary.runs}, same-task comparison at the Haiku tier.</p>
       </article>
     </div>
   </section>
@@ -45,7 +45,9 @@ import { benchmarkRows, benchmarkSummary, haikuBenchmarkRows } from "../facts";
       <p>
         Ratio is Squeezy cost divided by the baseline cost. A value below 1.0
         means Squeezy was lower cost on that same task. The benchmark counts
-        cost only when recall passes the board rule.
+        cost only when recall passes the board rule. The 15 rows cover all
+        supported languages; C and C++, and JavaScript and TypeScript, are
+        scored as separate rows.
       </p>
     </div>
     <div class="benchmark-boards">
@@ -81,12 +83,12 @@ import { benchmarkRows, benchmarkSummary, haikuBenchmarkRows } from "../facts";
       <article class="card">
         <span class="label">median</span>
         <h3>Multiple runs reduce noise</h3>
-        <p>The board reports n=3 medians because single agent runs can vary in both cost and recall.</p>
+        <p>The board reports n=10 medians because single agent runs can vary in both cost and recall.</p>
       </article>
       <article class="card">
         <span class="label">scope</span>
-        <h3>Scientific benchmark, not a universal claim</h3>
-        <p>These results are for this benchmark suite and model tier. Provider pricing, task shape, and model behavior can change results.</p>
+        <h3>A benchmark, not a promise</h3>
+        <p>These numbers are for this task suite and these model tiers. What you actually pay depends on the models you pick, your provider's pricing, and the shape of your own work.</p>
       </article>
     </div>
   </section>

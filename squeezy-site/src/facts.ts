@@ -21,119 +21,139 @@ export type BenchmarkRow = {
 
 export const productPosition = {
   eyebrow: "coding agent",
-  title: "Spend model tokens on solving code, not rediscovering your repository.",
+  title: "Your CPU does the deterministic, repetitive work.",
+  titleCont: "Your tokens go to the thinking.",
   lead:
-    "Squeezy is a terminal coding agent built to keep LLM context focused, reduce repeated code discovery, and make provider spend visible.",
-  note: "Built with speed in mind using Rust."
+    "Squeezy does the deterministic, repetitive work on your machine and saves model tokens for the reasoning that actually needs them. Same coding work, smaller bill.",
+  note: "Written in Rust. Bring your own model."
 };
 
 export const heroMetrics = [
-  { label: "Codex comparison", value: "15 / 15 lower cost", detail: "same-task Mini benchmark" },
-  { label: "Languages", value: "15", detail: "supported for local code understanding" },
-  { label: "Cost levers", value: "11", detail: "implemented layers from the cost docs" },
-  { label: "Providers", value: "BYO model", detail: "native, compatible, and local routes" }
+  { label: "Languages", value: "15", detail: "with local code understanding" },
+  { label: "Saving layers", value: "4", detail: "working together on every turn" },
+  { label: "Providers", value: "18", detail: "presets, plus any compatible endpoint" },
+  { label: "Platforms", value: "3", detail: "macOS, Linux, Windows" }
 ];
 
-export const costLeaks: FactCard[] = [
-  {
-    label: "repo discovery",
-    title: "The model keeps finding the same code",
-    body:
-      "Broad searches, whole-file reads, and repeated navigation can turn a simple coding task into a large paid context."
-  },
-  {
-    label: "tool output",
-    title: "Commands return more than the model needs",
-    body:
-      "Build logs, test output, grep results, diffs, and images can flood the next request when they are sent raw."
-  },
-  {
-    label: "long sessions",
-    title: "Old context becomes permanent baggage",
-    body:
-      "Without compaction, every turn carries yesterday's exploration, stale tool output, and already-settled decisions."
-  },
-  {
-    label: "model choice",
-    title: "Every prompt uses the expensive path",
-    body:
-      "Small mechanical turns should not always pay for the same model path as hard design or debugging work."
-  }
-];
+export const genericProof = {
+  stat: "Lower cost",
+  detail: "across all 15 languages in our same-task benchmark, at about 0.65× the baseline.",
+  note: "Measured against other agents on matched tasks. See the benchmark page for the full method and the model-by-model breakdown."
+};
 
-export const costPillars: FactCard[] = [
+export type LeverGroup = {
+  id: string;
+  label: string;
+  title: string;
+  why: string;
+  levers: FactCard[];
+};
+
+// The four saving layers, in narrative order: understand -> reuse -> right-size -> observe.
+// Local code understanding is shown first but is co-equal with caching and routing.
+export const leverGroups: LeverGroup[] = [
   {
-    label: "prompt reuse",
-    title: "Reuse stable prompt context",
-    body:
-      "When a provider supports prompt caching, Squeezy keeps stable instructions and tool context cache-friendly so repeated turns can be cheaper."
+    id: "understand",
+    label: "understand first",
+    title: "Understand the code first",
+    why:
+      "Before it asks the model anything, Squeezy reads your repository locally and works out which files and which lines matter.",
+    levers: [
+      {
+        label: "local code understanding",
+        title: "Read the relevant code, not the whole file",
+        body:
+          "Squeezy navigates your code on your machine to find the right declarations, callers, and slices, then sends the model those instead of dumping entire files into the prompt."
+      }
+    ]
   },
   {
-    label: "compaction",
-    title: "Keep long sessions bounded",
-    body:
-      "Older conversation state is summarized into goal, progress, decisions, and next steps while recent work stays available."
+    id: "reuse",
+    label: "don't pay twice",
+    title: "Don't pay for the same bytes twice",
+    why:
+      "Most of a coding session repeats: the same instructions, the same files, the same command output. Squeezy keeps that out of the bill.",
+    levers: [
+      {
+        label: "prompt caching",
+        title: "Reuse stable context",
+        body:
+          "Where a provider supports prompt caching, Squeezy keeps stable instructions and tool context cache-friendly so repeated turns are charged less."
+      },
+      {
+        label: "receipts",
+        title: "Replace repeated output with a receipt",
+        body:
+          "When the same file or command result would be sent again, Squeezy sends a small receipt that points back to the earlier result instead of resending the bytes."
+      },
+      {
+        label: "deferred tool schemas",
+        title: "Load tool definitions on demand",
+        body:
+          "The model sees a compact, stable index of tools first and pulls a full tool definition only when it needs one, which also keeps the cached prompt prefix intact."
+      }
+    ]
   },
   {
-    label: "receipts",
-    title: "Avoid paying twice for the same output",
-    body:
-      "Repeated file reads or command results can be represented by a small receipt with a recovery path instead of resending the bytes."
+    id: "right-size",
+    label: "right-size turns",
+    title: "Right-size every turn",
+    why:
+      "Not every turn deserves the biggest model or the longest history. Squeezy matches the effort and the context to the task in front of it.",
+    levers: [
+      {
+        label: "routing",
+        title: "Send simple turns to a cheaper model",
+        body:
+          "Obvious mechanical requests start on the provider's small, fast model and escalate to the main model only when the task turns out to be hard."
+      },
+      {
+        label: "compaction",
+        title: "Keep long sessions bounded",
+        body:
+          "As a conversation grows, older state is folded into a short summary of goal, progress, decisions, and next steps while recent work stays intact, so turn 30 doesn't pay for turns 1 through 29."
+      },
+      {
+        label: "shaped output",
+        title: "Send the useful part of command output",
+        body:
+          "Build, test, search, and diff output is trimmed to the part the model can act on, with the full output kept available if it is needed."
+      },
+      {
+        label: "verbosity",
+        title: "Control how much is said",
+        body:
+          "Response and tool-output verbosity settings keep normal turns concise, with full detail available on request."
+      },
+      {
+        label: "subagents",
+        title: "Keep exploration off the main thread",
+        body:
+          "Short-lived subagents research or review in their own context and hand back a summary, instead of expanding the main conversation."
+      }
+    ]
   },
   {
-    label: "shaped output",
-    title: "Send the useful part of command output",
-    body:
-      "Squeezy trims noisy build, test, search, diff, and shell output into focused blocks that the model can act on."
-  },
-  {
-    label: "targeted reads",
-    title: "Read relevant code before broad context",
-    body:
-      "Local code understanding helps the agent choose the files and slices that matter before spending model context on source text."
-  },
-  {
-    label: "lazy loading",
-    title: "Load tools and skills only when needed",
-    body:
-      "The model sees a compact index first, then asks for full tool schemas or skill instructions only when a task needs them."
-  },
-  {
-    label: "resume",
-    title: "Resume without replaying everything",
-    body:
-      "Session state, checkpoints, and memory let longer projects continue from compact anchors instead of rebuilding the full past."
-  },
-  {
-    label: "subagents",
-    title: "Keep exploration off the main thread",
-    body:
-      "Short-lived subagents can research, review, or inspect docs and return summaries instead of expanding the parent conversation."
-  },
-  {
-    label: "verbosity",
-    title: "Control how much gets said and returned",
-    body:
-      "Response and tool-output verbosity settings keep normal turns concise, with full detail still available when needed."
-  },
-  {
-    label: "accounting",
-    title: "Show where tokens go",
-    body:
-      "Cost and context views separate input, output, cached input, tool bytes, reasoning, and estimates where providers expose the data."
-  },
-  {
-    label: "routing",
-    title: "Use cheaper routes for simple turns",
-    body:
-      "Obvious mechanical requests can start on a provider-local small model and escalate when the task becomes complex."
+    id: "see-the-bill",
+    label: "see the bill",
+    title: "See the bill",
+    why:
+      "None of this is a black box. Squeezy shows where the tokens went so you can trust, and tune, the savings.",
+    levers: [
+      {
+        label: "accounting",
+        title: "Show where tokens go",
+        body:
+          "Cost and context views separate input, output, cached input, tool output, and reasoning, with dollar estimates where the provider exposes them."
+      }
+    ]
   }
 ];
 
 export const productSubjects: FactCard[] = [
   {
     label: "coding first",
-    title: "A terminal agent for real code work",
+    title: "A coding agent for real code work",
     body:
       "Squeezy can inspect code, edit files, run commands, manage plans, resume sessions, and keep model work tied to local evidence."
   },
@@ -153,7 +173,7 @@ export const productSubjects: FactCard[] = [
     label: "sessions",
     title: "Work can be resumed and audited",
     body:
-      "Local logs, resume state, reports, labels, forks, feedback, and optional checkpoints keep long coding sessions inspectable."
+      "Local logs, resume state, reports, labels, forks, and feedback keep long coding sessions inspectable."
   },
   {
     label: "providers",
@@ -210,42 +230,21 @@ export const benchmarkSummary = {
   claudeWins: "13 / 15",
   codexModel: "Squeezy gpt-5.4-mini vs Codex gpt-5.4-mini",
   claudeModel: "Squeezy claude-haiku-4-5 vs Claude Code haiku",
-  runs: "n=3 medians",
+  runs: "n=10 medians",
   totalDelta: "lower model spend",
-  medianRatio: "0.78",
+  medianRatio: "0.65",
   suite:
     "same-task real-world code-navigation benchmark, equal pricing and grader, Squeezy versus Codex on the Mini tier and Claude Code on the Haiku tier.",
   source:
     "docs/internal/eval-findings/board-and-graph-fixes-summary.md"
 };
 
-export const accuracyRows: MatrixRow[] = [
-  {
-    name: "Rust",
-    detail:
-      "Benchmarks compare local navigation output against language-specific validation oracles for declaration and relationship coverage.",
-    status: "checked"
-  },
-  {
-    name: "Java",
-    detail:
-      "External repositories are used to test whether Squeezy can find declarations and project relationships without relying on model guesses.",
-    status: "checked"
-  },
-  {
-    name: "Go",
-    detail:
-      "Refresh probes verify that changed files can be re-indexed without rebuilding the whole repository understanding from scratch.",
-    status: "checked"
-  }
-];
-
 export const operatingLoop: FactCard[] = [
   {
     label: "1",
     title: "Understand the repo locally",
     body:
-      "Squeezy builds a local code map and workspace view so the first model call does not start from a blank repository."
+      "Squeezy builds a local understanding of your code and workspace so the first model call does not start from a blank repository."
   },
   {
     label: "2",
@@ -295,7 +294,7 @@ export const providerGroups: MatrixRow[] = [
   {
     name: "Compatible APIs",
     detail:
-      "OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, DeepInfra, Baseten, Cloudflare Workers AI, and custom compatible endpoints.",
+      "OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, and any other OpenAI-compatible endpoint.",
     status: "bring an endpoint"
   },
   {
@@ -338,7 +337,7 @@ export const providerRows: MatrixRow[] = [
   {
     name: "Google Gemini",
     detail: "Native Gemini route with API-key configuration and streaming usage metadata where available.",
-    status: "GOOGLE_API_KEY"
+    status: "GEMINI_API_KEY"
   }
 ];
 
@@ -404,46 +403,3 @@ export const installRows: MatrixRow[] = [
   }
 ];
 
-export const supportCoverageRows: MatrixRow[] = [
-  {
-    name: "Operating systems",
-    detail: "macOS on Apple Silicon and Intel, Linux x86_64, and Windows x86_64.",
-    status: "install targets"
-  },
-  {
-    name: "Languages",
-    detail: "Rust, Python, Java, Kotlin, Scala, C#/.NET, Go, C, C++, JavaScript, TypeScript, PHP, Ruby, Swift, and Dart.",
-    status: "15"
-  },
-  {
-    name: "Providers",
-    detail: "Native providers, compatible APIs, cloud hosts, OAuth-style routes, custom endpoints, and local runtimes.",
-    status: "bring your model"
-  },
-  {
-    name: "Diagnostics",
-    detail: "`/feedback`, `/report`, and `squeezy sessions report` create support material you can preview before sending.",
-    status: "redacted"
-  }
-];
-
-export const trustRows: MatrixRow[] = [
-  {
-    name: "Permissions",
-    detail:
-      "Configurable policies cover edits, shell, web, MCP, destructive actions, and outside-workspace paths.",
-    status: "reviewable"
-  },
-  {
-    name: "Website analytics",
-    detail:
-      "Website visits and clicks are sent through the configured telemetry endpoint so the site can be improved.",
-    status: "PostHog"
-  },
-  {
-    name: "Rollback",
-    detail:
-      "Optional checkpoints can record mutating tool calls and support call-level or turn-level rollback when configured.",
-    status: "optional"
-  }
-];

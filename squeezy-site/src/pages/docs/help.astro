@@ -1,0 +1,60 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout
+  title="Help & troubleshooting · Squeezy docs"
+  description="Ask Squeezy about itself, diagnose a bad startup with doctor, and send redacted reports when something fails."
+  activeDoc="/docs/help/"
+  eyebrow="support"
+  heading="Help & troubleshooting."
+  lead="Most questions can be answered without leaving Squeezy, and most failures start with one command."
+>
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>Ask Squeezy first</h2>
+      <p>
+        Type <code>/help</code> or ask a plain question about Squeezy. These are
+        answered from the documentation bundled in the binary and your redacted
+        configuration, before any provider call. It is the fastest way to learn
+        a command or setting.
+      </p>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>When startup looks wrong</h2>
+      <p>
+        Run <code>squeezy doctor</code>. It reports your merged configuration
+        sources, repo profile, the configured provider credential, the
+        session-store path, and shell-sandbox availability, which is usually
+        enough to spot a missing key, a wrong provider, or a config that is not
+        being picked up.
+      </p>
+      <pre><code>squeezy doctor</code></pre>
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <div class="doc-prose">
+      <h2>Reporting an issue</h2>
+      <p>
+        Use the in-product paths so a report is tied to a real session:
+        <code>/feedback</code> for a short note, <code>/report</code> for the
+        current run, and <code>squeezy sessions report</code> for an earlier
+        one. Each produces a redacted bundle you can preview before sending.
+      </p>
+      <pre><code>/feedback
+/report
+squeezy sessions report &lt;session_id&gt; --preview
+squeezy sessions report &lt;session_id&gt; --send</code></pre>
+      <p>
+        For a public GitHub issue, include the sanitized symptom, your platform,
+        the provider route, the command that failed, and the feedback or report
+        id. Never paste secrets, private code, or report-archive contents into a
+        public issue.
+      </p>
+    </div>
+  </section>
+</DocsLayout>

@@ -3,21 +3,23 @@ import { SITE } from "../config";
 const routes = [
   "/",
   "/how-it-works/",
-  "/cost/",
-  "/install/",
-  "/languages/",
-  "/providers/",
   "/benchmarks/",
   "/support/",
+  "/install/",
   "/docs/",
   "/docs/install/",
-  "/docs/config/",
-  "/docs/semantic-navigation/",
-  "/docs/cost-receipts/",
+  "/docs/how-it-works/",
+  "/docs/cost-saving/",
+  "/docs/cost-saving/understand/",
+  "/docs/cost-saving/reuse/",
+  "/docs/cost-saving/right-size/",
+  "/docs/cost-saving/see-the-bill/",
   "/docs/languages/",
   "/docs/providers/",
+  "/docs/config/",
   "/docs/permissions/",
-  "/docs/troubleshooting/"
+  "/docs/sessions/",
+  "/docs/help/"
 ];
 
 export function GET() {

@@ -1,26 +1,57 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
-import { costPillars, operatingLoop } from "../facts";
+import EvidenceLoop from "../components/EvidenceLoop.astro";
+import { genericProof, leverGroups, operatingLoop } from "../facts";
 ---
 
 <BaseLayout
   title="How it works · Squeezy"
-  description="How Squeezy prepares local code context, keeps conversations compact, sends focused work to the model, and tracks token spend."
+  description="How Squeezy lowers model spend: understand the code locally, reuse stable context, right-size every turn, and keep the bill visible."
   active="how"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">how it works</span>
-      <h1>Prepare locally. Ask the model with focus.</h1>
+      <h1>Prepare locally, then ask the model with focus.</h1>
       <p class="lead">
-        Squeezy is built around a simple loop: understand the repo locally,
-        gather the relevant context, keep the conversation tight, and send the
-        model a smaller, better-shaped task.
+        A coding agent gets expensive when it keeps rediscovering your code and
+        carrying raw output forward. Squeezy understands the repository on your
+        machine, reuses what is stable, right-sizes each turn, and shows you
+        where the tokens went.
       </p>
     </div>
   </section>
 
   <section class="section">
+    <div class="section-header wide">
+      <span class="eyebrow">where cost leaks</span>
+      <h2>Most of an agent's bill is not the work you asked for.</h2>
+      <p>
+        On a normal turn, only a slice of the spend is the change you wanted.
+        The rest piles up from repeated discovery, raw command output, and old
+        history carried turn after turn.
+      </p>
+    </div>
+    <div class="cost-leaks">
+      <div class="leak-bar" role="img" aria-label="A single turn's budget. A small slice is the actual change; the rest is repo discovery, tool output, long-session baggage, and an oversized model.">
+        <div class="leak-seg work" style="width: 17%">the change</div>
+        <div class="leak-seg leak" style="width: 27%">repo discovery</div>
+        <div class="leak-seg leak" style="width: 22%">tool output</div>
+        <div class="leak-seg leak" style="width: 19%">old history</div>
+        <div class="leak-seg leak" style="width: 15%">model size</div>
+      </div>
+      <div class="leak-legend">
+        <span><span class="leak-dot work" aria-hidden="true"></span>work the model actually had to do</span>
+        <span><span class="leak-dot leak" aria-hidden="true"></span>cost that piled up around it</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">the loop</span>
+      <h2>Local preparation first. Focused model work second.</h2>
+    </div>
     <div class="flow">
       {
         operatingLoop.map((item) => (
@@ -34,48 +65,59 @@ import { costPillars, operatingLoop } from "../facts";
     </div>
   </section>
 
-  <section class="section band">
+  <section class="section">
     <div class="section-header wide">
-      <span class="eyebrow">cost controls</span>
-      <h2>The loop is supported by several independent savings.</h2>
+      <span class="eyebrow">the four layers</span>
+      <h2>Where the saving comes from.</h2>
       <p>
-        Local code understanding is only one part. Squeezy also shapes tool
-        output, reuses stable prompt context when possible, compacts older
-        conversation state, isolates exploration, and routes simple turns
-        through cheaper paths.
+        Each layer targets a different source of waste. They are independent, so
+        they stack on a single turn instead of relying on one trick.
       </p>
     </div>
-    <div class="grid-3">
+    <div class="lever-groups">
       {
-        costPillars.slice(0, 6).map((fact) => (
-          <article class="card">
-            <span class="label">{fact.label}</span>
-            <h3>{fact.title}</h3>
-            <p>{fact.body}</p>
-          </article>
+        leverGroups.map((group) => (
+          <section class="lever-group" id={group.id} data-group={group.id}>
+            <div class="lever-group-head">
+              <span class="mk">{group.label}</span>
+              <h3>{group.title}</h3>
+            </div>
+            <p class="lever-group-why">{group.why}</p>
+            <div class="lever-list">
+              {group.levers.map((lever) => (
+                <article class="lever-item">
+                  <span class="label">{lever.label}</span>
+                  <strong>{lever.title}</strong>
+                  <p>{lever.body}</p>
+                </article>
+              ))}
+            </div>
+            {group.id === "understand" && (
+              <EvidenceLoop />
+            )}
+          </section>
         ))
       }
     </div>
   </section>
 
-  <section class="section">
-    <div class="grid-2">
+  <section class="section band">
+    <div class="grid-2 align-center">
+      <div class="lead-stat">
+        <span class="eyebrow">measured</span>
+        <p class="big"><span class="accent">{genericProof.stat}</span> {genericProof.detail}</p>
+        <p>{genericProof.note}</p>
+        <div class="actions">
+          <a class="button secondary" href="/benchmarks/" data-track-click="how_benchmarks">See the benchmark</a>
+        </div>
+      </div>
       <article class="card">
-        <span class="label">fallbacks</span>
-        <h3>It still uses ordinary tools when that is the right path.</h3>
+        <span class="label">honest by default</span>
+        <h3>Savings are not guaranteed on every task.</h3>
         <p>
-          Some tasks are best answered by search, a focused file read, a build,
-          a test, or a verifier command. Squeezy should spend local work where
-          it helps, not force one navigation path onto every task.
-        </p>
-      </article>
-      <article class="card">
-        <span class="label">visibility</span>
-        <h3>The bill is something you can inspect.</h3>
-        <p>
-          Token accounting and context views make provider usage, cache hits,
-          tool output, subagent work, and estimates visible instead of treating
-          spend as a black box.
+          Model choice, provider pricing, cache support, task shape, and
+          codebase size all matter. What stays true is that Squeezy has several
+          independent ways to cut waste, and the accounting to show the result.
         </p>
       </article>
     </div>

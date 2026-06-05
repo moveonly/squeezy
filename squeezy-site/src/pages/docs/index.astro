@@ -3,53 +3,46 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 import { DOCS_NAV } from "../../config";
 
 const descriptions: Record<string, string> = {
-  Install: "Set up the binary, run diagnostics, choose a provider, and start a repo session.",
-  Graph: "Understand graph construction, refresh, confidence labels, and source slicing.",
-  "Cost & receipts": "See how Squeezy reduces repeated tool output and provider context.",
-  Config: "Review configuration precedence, provider defaults, and local inspection commands.",
-  Permissions: "Understand policy-gated local tools, sandbox behavior, and verification controls.",
-  Languages: "Review first-class language support and graph coverage.",
-  Providers: "Review model/provider adapters and local configuration.",
-  Support: "Debug startup, ask Squeezy about itself, and prepare redacted reports."
+  "Install & upgrade": "Install on macOS, Linux, or Windows, run the first-start checks, and upgrade.",
+  "How it works": "What Squeezy does locally before it calls a model, in plain terms.",
+  "Cost-saving strategies": "The four layers Squeezy uses to keep the model bill down.",
+  "Languages & graph": "The 15 languages with local code understanding, and what the graph gives you.",
+  "Providers & models": "Bring your own key, presets, auth, and routing.",
+  Configuration: "Where settings live, how they layer, and the main things you can change.",
+  "Permissions & safety": "What Squeezy can do without asking, and how the sandbox works.",
+  Sessions: "How work is saved, resumed, and reported.",
+  "Help & troubleshooting": "Ask Squeezy about itself, diagnose startup, and report issues."
 };
 ---
 
 <DocsLayout
   title="Docs · Squeezy"
-  description="Technical overview of Squeezy's static analysis, token optimization, providers, installation, and support flow."
+  description="User documentation for Squeezy: install, how it works, cost-saving strategies, languages, providers, configuration, permissions, sessions, and help."
   activeDoc="overview"
-  eyebrow="technical docs"
-  heading="How Squeezy works under the hood."
-  lead="These docs explain the local systems behind Squeezy: graph navigation, exact reads, receipts, provider configuration, install flow, and support diagnostics."
+  eyebrow="docs"
+  heading="Squeezy documentation."
+  lead="Practical, functional docs for using Squeezy. Start with install, then read how it works, then dip into the topic you need."
 >
   <section class="doc-block">
-    <h2>The short version</h2>
-    <div class="doc-card-grid">
-      <article class="card">
-        <span class="label">1</span>
-        <h3>Build local context</h3>
-        <p>Squeezy parses supported files, discovers workspace facts, and builds semantic graph partitions before model work.</p>
-      </article>
-      <article class="card">
-        <span class="label">2</span>
-        <h3>Ask targeted questions</h3>
-        <p>Graph tools answer architecture, declaration, reference, hierarchy, call, flow, and changed-code questions with paths, spans, and confidence.</p>
-      </article>
-      <article class="card">
-        <span class="label">3</span>
-        <h3>Read only what matters</h3>
-        <p>read_slice, diff reads, spill handles, and receipt stubs keep repeated bytes out of the model-visible context.</p>
-      </article>
-      <article class="card">
-        <span class="label">4</span>
-        <h3>Verify explicitly</h3>
-        <p>Builds, tests, linters, compiler checks, and benchmarks run as evidence-producing steps, not hidden side effects.</p>
-      </article>
+    <div class="doc-prose">
+      <h2>Start here</h2>
+      <p>
+        If you are new, follow this order: <a href="/docs/install/">install
+        Squeezy</a>, then read <a href="/docs/how-it-works/">how it works</a> to
+        understand what it does locally before calling a model, then connect a
+        provider from <a href="/docs/providers/">providers &amp; models</a>.
+        Everything else is reference you can reach for when you need it.
+      </p>
+      <p>
+        These pages cover the parts of Squeezy that are stable. For the exact,
+        always-current detail, the same documentation ships inside the binary:
+        ask <code>/help</code> or run <code>squeezy doctor</code>.
+      </p>
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>Docs map</h2>
+    <h2>All topics</h2>
     <div class="doc-card-grid">
       {
         DOCS_NAV.map((item) => (

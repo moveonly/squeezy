@@ -1,33 +1,58 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
 import { SITE } from "../config";
-import { supportCoverageRows } from "../facts";
+import { installRows, languageRows, providerGroups } from "../facts";
 ---
 
 <BaseLayout
   title="Support · Squeezy"
-  description="Squeezy support coverage, diagnostics commands, reporting paths, platforms, languages, and providers."
+  description="What Squeezy supports, platforms, 15 languages, and 18 provider routes, plus the in-product diagnostics and reporting paths."
   active="support"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">support</span>
-      <h1>Coverage and diagnostics in one place.</h1>
+      <h1>What Squeezy supports.</h1>
       <p class="lead">
-        Check supported platforms, languages, providers, and the fastest way to
-        send maintainers useful redacted context when something fails.
+        The platforms it runs on, the languages it understands, the models you
+        can bring, and the fastest way to send useful, redacted context when
+        something goes wrong.
       </p>
     </div>
   </section>
 
   <section class="section">
+    <div class="coverage-snapshot">
+      <div class="tile">
+        <span>platforms</span>
+        <strong>3</strong>
+        <small>macOS, Linux, Windows</small>
+      </div>
+      <div class="tile">
+        <span>languages</span>
+        <strong>15</strong>
+        <small>with local code understanding</small>
+      </div>
+      <div class="tile">
+        <span>providers</span>
+        <strong>18</strong>
+        <small>presets, plus any compatible endpoint</small>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band" id="platforms">
     <div class="section-header">
-      <span class="eyebrow">coverage</span>
-      <h2>What Squeezy is built to work with.</h2>
+      <span class="eyebrow">platforms</span>
+      <h2>Runs natively on macOS, Linux, and Windows.</h2>
+      <p>
+        On Windows, the strongest sandboxing is not yet available, so some
+        isolation is best-effort. The permissions docs have the detail.
+      </p>
     </div>
     <div class="matrix">
       {
-        supportCoverageRows.map((row) => (
+        installRows.map((row) => (
           <article class="matrix-row">
             <div><h3>{row.name}</h3></div>
             <p>{row.detail}</p>
@@ -38,13 +63,66 @@ import { supportCoverageRows } from "../facts";
     </div>
   </section>
 
-  <section class="section band">
+  <section class="section" id="languages">
+    <div class="section-header wide">
+      <span class="eyebrow">languages</span>
+      <h2>Fifteen languages get local code understanding.</h2>
+      <p>
+        For these languages, Squeezy navigates declarations, references, and
+        structure on your machine. Files outside the list still work through
+        bounded search, targeted reads, and verifier commands.
+      </p>
+    </div>
+    <div class="matrix">
+      {
+        languageRows.map((row) => (
+          <article class="matrix-row">
+            <div><h3>{row.name}</h3></div>
+            <p>{row.detail}</p>
+          </article>
+        ))
+      }
+    </div>
+    <p class="footnote">
+      Full coverage and the per-language detail live in the
+      <a href="/docs/languages/">language docs</a>.
+    </p>
+  </section>
+
+  <section class="section band" id="providers">
+    <div class="section-header wide">
+      <span class="eyebrow">providers</span>
+      <h2>Bring your own model.</h2>
+      <p>
+        Eighteen provider presets across aggregators, first-party APIs, cloud
+        hosts, and local runtimes, plus any OpenAI-compatible endpoint. Keys
+        and credentials stay on your machine.
+      </p>
+    </div>
+    <div class="matrix">
+      {
+        providerGroups.map((row) => (
+          <article class="matrix-row">
+            <div><h3>{row.name}</h3></div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+    <p class="footnote">
+      Exact environment variables and auth methods are in the
+      <a href="/docs/providers/">provider docs</a>.
+    </p>
+  </section>
+
+  <section class="section">
     <div class="section-header wide">
       <span class="eyebrow">diagnostics</span>
       <h2>Use the in-product reporting paths first.</h2>
       <p>
-        These commands keep support tied to the actual session instead of a
-        vague bug report. Preview report bundles before sending them.
+        These keep support tied to the actual session instead of a vague bug
+        report. You can preview any report bundle before sending it.
       </p>
     </div>
     <div class="grid-3">
@@ -66,7 +144,7 @@ import { supportCoverageRows } from "../facts";
     </div>
   </section>
 
-  <section class="section">
+  <section class="section band">
     <div class="grid-2">
       <article class="card code-card">
         <span class="label">report flow</span>
@@ -80,8 +158,9 @@ squeezy sessions report &lt;session_id&gt; --send</code></pre>
         <h3>Use GitHub after you have the summary.</h3>
         <p>
           Public issues should include the sanitized symptom, platform, provider
-          route, command that failed, and feedback/report id. Do not paste
-          secrets, private code, or report archive contents into public issues.
+          route, the command that failed, and the feedback/report id. Do not
+          paste secrets, private code, or report-archive contents into public
+          issues.
         </p>
         <a class="text-link" href={SITE.issuesUrl} data-track-click="support_issues" data-track-target="github">Open GitHub issues</a>
       </article>

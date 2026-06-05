@@ -3,53 +3,69 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 ---
 
 <DocsLayout
-  title="Install · Squeezy"
-  description="Squeezy install, first-run provider selection, diagnostics, and session start."
+  title="Install & upgrade · Squeezy docs"
+  description="Install Squeezy on macOS, Linux, or Windows, verify with doctor, and start it in your repository."
   activeDoc="/docs/install/"
   eyebrow="install"
-  heading="Choose a platform, install Squeezy, run doctor."
-  lead="The install flow is platform-first: use the native package path for your OS, verify with doctor, then start Squeezy in the repository you want it to understand."
+  heading="Install Squeezy and start it in your repo."
+  lead="Install the native binary for your platform, run the first-start checks, then open Squeezy in the repository you want it to understand."
 >
   <section class="doc-block">
-    <h2>Primary install commands</h2>
-    <div class="doc-card-grid">
-      <article class="card">
-        <span class="label">macOS</span>
-        <h3>Apple Silicon and Intel release targets</h3>
-        <pre><code>curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh</code></pre>
-        <p>Targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`. Homebrew is also documented.</p>
-      </article>
-      <article class="card">
-        <span class="label">Linux</span>
-        <h3>x86_64 static binary</h3>
-        <pre><code>curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh</code></pre>
-        <p>Target: `x86_64-unknown-linux-musl`.</p>
-      </article>
-      <article class="card">
-        <span class="label">Windows</span>
-        <h3>x86_64</h3>
-        <pre><code>winget install esqueezy.Squeezy</code></pre>
-        <p>Target: `x86_64-pc-windows-msvc`. Manual zip install is also documented.</p>
-      </article>
-      <article class="card">
-        <span class="label">source</span>
-        <h3>Cargo install</h3>
-        <pre><code>cargo install squeezy --locked</code></pre>
-        <p>Use when you already have the required Rust toolchain.</p>
-      </article>
+    <div class="doc-prose">
+      <h2>Install</h2>
+      <p>
+        On macOS and Linux, the one-line installer is the simplest path. macOS
+        also has a Homebrew tap, and if you already have the Rust toolchain you
+        can install from source with Cargo.
+      </p>
+      <pre><code># macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh
+
+# macOS (Homebrew)
+brew install esqueezy/tap/squeezy
+
+# From source
+cargo install squeezy --locked
+
+# Windows
+winget install esqueezy.Squeezy</code></pre>
+      <p>
+        Release archives are published for macOS (Apple Silicon and Intel),
+        Linux <code>x86_64</code> (a static musl binary, no glibc dependency),
+        and Windows <code>x86_64</code>.
+      </p>
     </div>
   </section>
 
   <section class="doc-block">
-    <h2>First run</h2>
-    <pre><code>export OPENAI_API_KEY=...
+    <div class="doc-prose">
+      <h2>First start</h2>
+      <p>
+        Set a provider key, run <code>squeezy doctor</code> to confirm your
+        configuration and credentials are picked up, then start Squeezy from the
+        root of a repository.
+      </p>
+      <pre><code>export OPENROUTER_API_KEY=...   # or any supported provider
 squeezy doctor
 squeezy</code></pre>
-    <p>On first interactive startup, Squeezy can detect configured provider credentials and local Ollama availability, then save provider/model defaults without writing secret token values.</p>
+      <p>
+        <code>doctor</code> reports the merged configuration sources, your repo
+        profile, the configured provider credential, the session-store path,
+        and shell-sandbox availability. If startup looks wrong, it is the first
+        place to look.
+      </p>
+    </div>
   </section>
 
   <section class="doc-block">
-    <h2>Self-investigation</h2>
-    <p>Ask Squeezy about Squeezy with `/help` or natural questions such as "how does Squeezy choose providers?" Product-help questions are answered from bundled docs and redacted config before a provider call is made.</p>
+    <div class="doc-prose">
+      <h2>Ask Squeezy about itself</h2>
+      <p>
+        You do not need to leave Squeezy to learn the product. Type
+        <code>/help</code> or ask a plain question like “how does Squeezy choose
+        a provider?”, these are answered from the documentation bundled in the
+        binary, before any provider call is made.
+      </p>
+    </div>
   </section>
 </DocsLayout>

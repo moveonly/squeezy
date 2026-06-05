@@ -21,7 +21,7 @@ const softwareJsonLd = {
   description: SITE.description,
   applicationCategory: "DeveloperApplication",
   operatingSystem: "macOS, Linux, Windows",
-  url: SITE.url,
+  url: new URL("/", SITE.url).toString(),
   downloadUrl: SITE.repoUrl,
   license: "https://www.apache.org/licenses/LICENSE-2.0",
   offers: {
@@ -33,7 +33,6 @@ const softwareJsonLd = {
 
 const navItems = [
   { href: "/how-it-works/", label: "How it works", key: "how" },
-  { href: "/cost/", label: "Cost", key: "cost" },
   { href: "/benchmarks/", label: "Benchmarks", key: "benchmarks" },
   { href: "/support/", label: "Support", key: "support" },
   { href: "/install/", label: "Install", key: "install" },
@@ -47,7 +46,7 @@ const navItems = [
     <meta charset="UTF-8" />
     <meta name="description" content={description} />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#080807" />
+    <meta name="theme-color" content="#0f1320" />
     <link rel="canonical" href={canonicalUrl} />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="manifest" href="/site.webmanifest" />
@@ -107,7 +106,7 @@ const navItems = [
           <span>Squeezy</span>
         </a>
         <p>
-          A terminal coding agent built to keep model context focused.
+          The CPU does the repetitive work.<br />Your tokens do the thinking.
         </p>
         <p class="footer-meta">
           Website analytics help improve the site and documentation.
@@ -115,7 +114,7 @@ const navItems = [
       </div>
       <div class="footer-links">
         <a href="/install/" data-track-click="footer_install">Install</a>
-        <a href="/cost/" data-track-click="footer_cost">Cost</a>
+        <a href="/how-it-works/" data-track-click="footer_how">How it works</a>
         <a href="/support/" data-track-click="footer_support">Support</a>
         <a href="/docs/" data-track-click="footer_docs">Docs</a>
         <a href="/benchmarks/" data-track-click="footer_benchmarks">Benchmark</a>
