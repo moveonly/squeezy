@@ -10656,6 +10656,25 @@ fn apply_mcp_status_update_logs_transitions_to_and_from_servers() {
     // Active → empty should log (servers dropped).
     super::apply_mcp_status_update(&mut app, empty);
     assert!(app.transcript.len() > after_active);
+
+    // Every logged transition must land on the transcript rail as a
+    // `Note`, not a bare `Log` line. The previous behaviour pushed
+    // through `push_log`, which renders off-rail and breaks the
+    // visual alignment with adjacent reasoning / routed notices.
+    let last_log_kind = app
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            super::TranscriptEntryKind::Log(log) => Some(log.kind),
+            _ => None,
+        })
+        .expect("mcp status update should push at least one log entry");
+    assert_eq!(
+        last_log_kind,
+        super::LogKind::Note,
+        "mcp status transitions must use the rail-threaded Note kind"
+    );
 }
 
 #[test]

@@ -1343,8 +1343,18 @@ fn handle_mcp_browse_key(
             });
             Some(KeyOutcome::KeepOpen)
         }
-        // Toggle enabled. Enter / e / E: persist; Shift-modified: session-only.
-        (KeyCode::Enter, _) | (KeyCode::Char('e'), _) | (KeyCode::Char('E'), _) => {
+        // Toggle enabled. Enter / Space / e / E: persist; Shift-e
+        // (or capital E) flips to session-only. Space is aliased to
+        // the toggle action both because it matches the user's
+        // intuition (Space cycles bool values throughout `/config`)
+        // and because the global Space handler would otherwise call
+        // `current_field()`, which panics on the McpServers section
+        // — the page renders custom rows with no `FieldMeta`
+        // backing.
+        (KeyCode::Enter, _)
+        | (KeyCode::Char(' '), _)
+        | (KeyCode::Char('e'), _)
+        | (KeyCode::Char('E'), _) => {
             if is_add_row {
                 state.mcp_add = Some(McpAddForm::default());
                 return Some(KeyOutcome::KeepOpen);
@@ -1408,8 +1418,41 @@ fn handle_mcp_browse_key(
             state.mcp_pending_delete = Some(name);
             Some(KeyOutcome::KeepOpen)
         }
-        _ => None,
+        // Navigation keys (arrows, Tab, BackTab, Esc, Home/End,
+        // PageUp/Down, and the Ctrl-hjkl vim variants) fall through
+        // to the global keymap so the user can still move between
+        // rows, sections, and scope tabs from the `/mcp` page.
+        //
+        // Everything else is intentionally absorbed: the global
+        // browse handler reaches for `state.current_field()` in
+        // multiple arms (Space cycling, Enter editing, Ctrl+R
+        // reset), and `current_field` panics when `field_at_row`
+        // returns `None` — which it does for every row in the
+        // McpServers section. Letting an unhandled key fall through
+        // would crash the whole TUI.
+        _ if is_mcp_navigation_key(&key) => None,
+        _ => Some(KeyOutcome::KeepOpen),
     }
+}
+
+fn is_mcp_navigation_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Esc
+    ) || matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('h' | 'j' | 'k' | 'l'), KeyModifiers::CONTROL,),
+    )
 }
 
 /// Handle keys while the "remove server" confirmation is open.

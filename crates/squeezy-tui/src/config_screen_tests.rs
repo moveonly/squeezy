@@ -97,6 +97,87 @@ fn tab_cycles_through_three_scopes() {
     assert_eq!(state.scope, ConfigScope::Local);
 }
 
+/// Regression: pressing keys that aren't explicit `/mcp` bindings on
+/// the McpServers section used to fall through to the global browse
+/// keymap, which called `state.current_field()` for arms like Space
+/// and Ctrl+R. McpServers has no `FieldMeta` rows so `current_field`
+/// panicked — crashing the whole TUI when a user pressed Space on a
+/// server row. The page-specific handler now absorbs every
+/// non-navigation key and aliases Space to the toggle action.
+#[test]
+fn mcp_section_absorbs_keys_that_would_otherwise_panic_current_field() {
+    use crate::config_screen::McpAction;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::McpServers));
+    // Seed a single server so `field_index = 0` lands on a real row
+    // rather than the trailing `(add)` row.
+    state.mcp_servers.insert(
+        "bench".to_string(),
+        squeezy_core::McpServerConfig {
+            enabled: false,
+            transport: squeezy_core::McpTransport::Stdio,
+            command: Some("squeezy-fake-mcp".to_string()),
+            args: Vec::new(),
+            url: None,
+            timeout_ms: None,
+            discovery_timeout_ms: None,
+            tool_call_timeout_ms: None,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            permissions: squeezy_core::McpPermissionConfig::default(),
+            bearer_token_env_var: None,
+            http_headers: std::collections::BTreeMap::new(),
+            env_http_headers: std::collections::BTreeMap::new(),
+        },
+    );
+    state.field_index = 0;
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+
+    // Space used to panic via the global cycle-bool handler reaching
+    // for `state.current_field()`. It must now alias to the toggle
+    // action, flipping the optimistic cached state and queuing a
+    // `McpAction::Toggle { persist: true }` for the host loop.
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    assert!(
+        state.mcp_servers.get("bench").is_some_and(|s| s.enabled),
+        "Space must flip the cached enabled flag for the server at focus"
+    );
+    assert!(
+        matches!(
+            state.mcp_pending_actions.last(),
+            Some(McpAction::Toggle {
+                server,
+                enabled: true,
+                persist: true
+            }) if server == "bench"
+        ),
+        "Space must stage a persist toggle (defaults match lowercase `e`)"
+    );
+
+    // Any printable character not bound to an `/mcp` action used to
+    // fall through to the global Space handler (which panicked via
+    // `current_field`). The page handler should absorb it without
+    // staging an action.
+    let pending_before = state.mcp_pending_actions.len();
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+    );
+    assert_eq!(
+        state.mcp_pending_actions.len(),
+        pending_before,
+        "Unbound `/mcp` keys must be absorbed without staging an action or panicking"
+    );
+}
+
 #[test]
 fn themes_section_exposes_builtins_new_row_and_color_tokens() {
     let state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Themes));

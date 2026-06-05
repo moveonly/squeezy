@@ -250,6 +250,12 @@ pub(crate) struct ConfigScreenState {
     /// pressing `e`/`r` sees confirmation even before discovery
     /// completes.
     pub mcp_last_status_line: Option<String>,
+    /// Mirror of `TuiApp::animation_tick`, copied each frame by the
+    /// host so the status-indicator glyph for a server that is
+    /// currently discovering / restarting can pulse through a
+    /// short cycle (`◐ ◓ ◑ ◒`) instead of standing still. The
+    /// integer wraps; the render path only ever does `% N`.
+    pub mcp_animation_tick: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +639,7 @@ impl ConfigScreenState {
             mcp_add: None,
             mcp_pending_actions: Vec::new(),
             mcp_last_status_line: None,
+            mcp_animation_tick: 0,
         }
     }
 

@@ -896,16 +896,38 @@ async fn run_inner_with_terminal(
             apply_external_settings_reload(&mut app, &mut agent);
             app.needs_redraw = true;
         }
-        // While `/mcp` is open, refresh the cached registry view each
-        // animation tick so background discovery results (status row
-        // flipping ready/failed) appear without requiring a key press.
+        // While `/mcp` is open, keep the page fresh on two
+        // independent cadences:
+        //
+        // 1. Throttled registry snapshot (settings poll cadence) —
+        //    background discovery results (rows flipping
+        //    ready/failed) propagate without requiring a key
+        //    press.
+        // 2. Per-tick animation copy — the status-indicator glyph
+        //    for a server in the `Starting` state pulses through
+        //    `◐ ◓ ◑ ◒` so an in-flight restart looks alive. Cheap
+        //    (single u64 copy + a redraw flag).
         if app.config_screen.is_some()
-            && app.animation_tick.is_multiple_of(settings_poll_every)
             && let Some(state) = app.config_screen.as_ref()
             && state.current_section().id == squeezy_core::config_schema::SectionId::McpServers
         {
-            refresh_mcp_screen_state(&mut app, &agent);
-            app.needs_redraw = true;
+            let throttled_refresh = app.animation_tick.is_multiple_of(settings_poll_every);
+            if throttled_refresh {
+                refresh_mcp_screen_state(&mut app, &agent);
+            }
+            if let Some(state) = app.config_screen.as_mut() {
+                state.mcp_animation_tick = app.animation_tick;
+            }
+            let needs_pulse = app.config_screen.as_ref().is_some_and(|state| {
+                state
+                    .mcp_status
+                    .per_server
+                    .values()
+                    .any(|status| matches!(status, squeezy_tools::McpServerStatus::Starting))
+            });
+            if throttled_refresh || needs_pulse {
+                app.needs_redraw = true;
+            }
         }
         // Refresh the language-summary status item from the graph at
         // the same cadence as the settings poll. The agent call is

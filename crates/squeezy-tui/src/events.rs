@@ -532,7 +532,13 @@ pub(crate) fn apply_mcp_status_update(app: &mut TuiApp, snapshot: McpStatusSnaps
     app.status = format!("mcp {summary}");
     let changed = prior_summary.as_deref() != Some(&summary);
     if changed && (now_has_servers || prior_had_servers) {
-        app.push_log(format!("mcp status {summary}"));
+        // Route through `push_note` so the line threads the
+        // transcript rail with a dim `◦` connector, matching the
+        // other system-info notes (e.g. "routed …"). Using the
+        // bare `push_log` left the line floating off-rail and out
+        // of visual alignment with adjacent reasoning / routed
+        // lines.
+        app.push_note(format!("mcp status {summary}"));
     }
 }
 

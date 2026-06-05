@@ -431,10 +431,13 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
         )]));
         lines.push(Line::raw(""));
     } else {
-        // Header row.
+        // Header row. Each column has a fixed width so the
+        // status-indicator column stays aligned with the body
+        // rows. The leading "  " accounts for the `▸ ` row marker.
         lines.push(Line::from(vec![
+            Span::styled("    ", Style::default().fg(crate::render::theme::quiet())),
             Span::styled(
-                format!("  {:<18}", "NAME"),
+                format!("{:<16}", "NAME"),
                 Style::default()
                     .fg(crate::render::theme::quiet())
                     .add_modifier(Modifier::BOLD),
@@ -476,7 +479,7 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
             } else {
                 "disabled"
             };
-            let status = state
+            let status_text = state
                 .mcp_status
                 .per_server
                 .get(name)
@@ -494,17 +497,25 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
             } else {
                 Style::default()
             };
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "{marker}{:<18}{:<10}{:<8}{:<18}{}",
-                    name,
-                    state_text,
-                    server.transport.as_str(),
-                    status,
-                    endpoint
-                ),
-                row_style,
-            )]));
+            // Status indicator: a colored glyph that telegraphs the
+            // server's live state at a glance. The colour overrides
+            // the row's accent / default foreground because the
+            // semantic is more important than the focus styling —
+            // a "failed" row should read red even when focused.
+            let (icon, icon_color) = mcp_status_icon(
+                server,
+                state.mcp_status.per_server.get(name),
+                state.mcp_animation_tick,
+            );
+            lines.push(Line::from(vec![
+                Span::styled(marker, row_style),
+                Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                Span::styled(format!("{:<16}", name), row_style),
+                Span::styled(format!("{:<10}", state_text), row_style),
+                Span::styled(format!("{:<8}", server.transport.as_str()), row_style),
+                Span::styled(format!("{:<18}", status_text), row_style),
+                Span::styled(endpoint.to_string(), row_style),
+            ]));
         }
     }
 
@@ -525,7 +536,7 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
     )]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![Span::styled(
-        "Enter / e   toggle enabled    r   restart    a   add    d / x   remove",
+        "Enter / Space / e   toggle enabled    r   restart    a   add    d / x   remove",
         Style::default().fg(crate::render::theme::quiet()),
     )]));
     lines.push(Line::from(vec![Span::styled(
@@ -535,6 +546,59 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
     )]));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Pick the indicator glyph + colour for an MCP server row on the
+/// `/mcp` page.
+///
+/// The status is read primarily from the registry's per-server
+/// snapshot, but a disabled server short-circuits to a grey filled
+/// circle regardless of any stale "Ready" / "Failed" entry that
+/// might still live in `mcp_status` — disabling tears the session
+/// down but discovery's last result lingers in the snapshot until
+/// the next refresh.
+///
+/// For servers that are actively discovering (the `Starting` state,
+/// which also covers an in-flight restart) we cycle through the
+/// four half-circle moon glyphs at the animation tick so the user
+/// sees the row pulsing while it settles to ready / failed.
+pub(crate) fn mcp_status_icon(
+    server: &squeezy_core::McpServerConfig,
+    status: Option<&squeezy_tools::McpServerStatus>,
+    tick: u64,
+) -> (char, ratatui::style::Color) {
+    use squeezy_tools::McpServerStatus;
+    if !server.enabled {
+        return ('●', crate::render::theme::muted());
+    }
+    match status {
+        Some(McpServerStatus::Ready { cached: false, .. }) => ('●', crate::render::theme::green()),
+        Some(McpServerStatus::Ready { cached: true, .. }) => {
+            // Cached entries are functionally ready but came from
+            // the on-disk cache rather than a fresh discovery —
+            // distinguish with cyan so the user can tell the
+            // difference when the snapshot is stale.
+            ('●', crate::render::theme::cyan())
+        }
+        Some(McpServerStatus::Starting) => {
+            // Pulse `◐ ◓ ◑ ◒` so an in-flight discovery or restart
+            // is obviously alive. Falls back to a static `◐` if
+            // the tick happens to be zero on first render.
+            const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+            let frame = FRAMES[(tick as usize) % FRAMES.len()];
+            (frame, crate::render::theme::secondary())
+        }
+        Some(McpServerStatus::Failed { .. }) | Some(McpServerStatus::Cancelled) => {
+            ('●', crate::render::theme::red())
+        }
+        None => {
+            // The server is enabled but we have not yet received a
+            // status snapshot — render an open circle in the muted
+            // tone so the row reads as "unknown / pending" rather
+            // than "ready" or "failed".
+            ('○', crate::render::theme::quiet())
+        }
+    }
 }
 
 fn format_mcp_row_status(status: &squeezy_tools::McpServerStatus) -> String {

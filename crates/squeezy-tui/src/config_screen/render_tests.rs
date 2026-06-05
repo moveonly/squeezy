@@ -66,3 +66,86 @@ fn secret_caret_line_at_end_uses_underscore() {
     assert_eq!(caret_char_index(&line), None);
     assert_eq!(line_text(&line), "  •••_");
 }
+
+#[test]
+fn mcp_status_icon_picks_glyph_per_server_state() {
+    use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport};
+    use squeezy_tools::McpServerStatus;
+    fn server(enabled: bool) -> McpServerConfig {
+        McpServerConfig {
+            enabled,
+            transport: McpTransport::Stdio,
+            command: Some("x".to_string()),
+            args: Vec::new(),
+            url: None,
+            timeout_ms: None,
+            discovery_timeout_ms: None,
+            tool_call_timeout_ms: None,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            permissions: McpPermissionConfig::default(),
+            bearer_token_env_var: None,
+            http_headers: std::collections::BTreeMap::new(),
+            env_http_headers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    let enabled = server(true);
+    let disabled = server(false);
+
+    // Disabled wins over any stale snapshot — even if discovery
+    // left a `Ready` row behind, the row must read as muted /
+    // silver so the user can tell at a glance the server is off.
+    let ready = McpServerStatus::Ready {
+        tools_count: 3,
+        cached: false,
+    };
+    let (icon, _) = mcp_status_icon(&disabled, Some(&ready), 0);
+    assert_eq!(icon, '●', "disabled servers render a filled circle");
+
+    // Ready (fresh) = filled circle in the success palette.
+    let (icon, color) = mcp_status_icon(&enabled, Some(&ready), 0);
+    assert_eq!(icon, '●');
+    assert_eq!(color, crate::render::theme::green());
+
+    // Ready (cached) gets a distinct accent so a stale palette is
+    // visually different from a freshly-discovered one.
+    let cached = McpServerStatus::Ready {
+        tools_count: 3,
+        cached: true,
+    };
+    let (icon, color) = mcp_status_icon(&enabled, Some(&cached), 0);
+    assert_eq!(icon, '●');
+    assert_eq!(color, crate::render::theme::cyan());
+
+    // Failure modes all read red so a busted server cannot
+    // accidentally look ready.
+    for status in [
+        McpServerStatus::Failed {
+            error: "boom".to_string(),
+        },
+        McpServerStatus::Cancelled,
+    ] {
+        let (icon, color) = mcp_status_icon(&enabled, Some(&status), 0);
+        assert_eq!(icon, '●');
+        assert_eq!(color, crate::render::theme::red());
+    }
+
+    // Starting pulses through four moon glyphs; each tick yields a
+    // different frame, and the cycle wraps cleanly.
+    let starting = McpServerStatus::Starting;
+    let frames: Vec<char> = (0..4)
+        .map(|tick| mcp_status_icon(&enabled, Some(&starting), tick).0)
+        .collect();
+    assert_eq!(frames, vec!['◐', '◓', '◑', '◒']);
+    assert_eq!(
+        mcp_status_icon(&enabled, Some(&starting), 4).0,
+        '◐',
+        "starting frame cycle must wrap modulo four"
+    );
+
+    // Unknown (enabled server with no snapshot yet) reads as an
+    // open circle so it isn't confused with ready / failed.
+    assert_eq!(mcp_status_icon(&enabled, None, 0).0, '○');
+}
