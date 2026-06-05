@@ -1351,6 +1351,46 @@ object StringOps {
 }
 
 #[test]
+fn kotlin_qualified_user_type_records_leaf_not_package_segment() {
+    // A qualified type reference `com.example.Greeter` must record the LEAF
+    // type name `Greeter`, never the leading package segment `com`.
+    let source = r#"package com.example.app
+
+class Host {
+    fun make(): com.example.Greeter = TODO()
+    val cache: Container<Greeter> = TODO()
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = kotlin_record("src/main/kotlin/com/example/app/Host.kt", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(parsed.unsupported.is_none());
+
+    let type_refs: Vec<&str> = parsed
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::Type)
+        .map(|reference| reference.text.as_str())
+        .collect();
+
+    // The leaf type name is recorded.
+    assert!(
+        type_refs.contains(&"Greeter"),
+        "expected leaf `Greeter`, got {type_refs:?}"
+    );
+    // The package segment is never recorded as a type reference.
+    assert!(
+        !type_refs.contains(&"com"),
+        "package segment leaked as type reference: {type_refs:?}"
+    );
+    // A generic head still records the head, not the type argument.
+    assert!(
+        type_refs.contains(&"Container"),
+        "expected generic head `Container`, got {type_refs:?}"
+    );
+}
+
+#[test]
 fn parser_handles_kotlin_data_class_and_sealed_interface() {
     let source = r#"package com.example.services
 
@@ -2359,6 +2399,71 @@ export const RunnerView = (props: RunnerProps) => <Runner />;
     assert!(parsed.references.iter().any(|reference| {
         reference.text == "RunnerProps" && reference.kind == ReferenceKind::Type
     }));
+}
+
+#[test]
+fn js_ts_import_type_does_not_emit_bogus_type_import() {
+    // `import type ...` is a TYPE-ONLY import: the `type` keyword is a modifier,
+    // not a default binding. It must never surface as an import named/aliased
+    // `type`, while a real default import (`import Foo from ...`) still does.
+    let source = r#"
+import type { Foo } from "./m";
+import type Bar from "./n";
+import Baz from "./o";
+import { type Qux, Plain } from "./p";
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = ts_record("src/types.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // No import may be named or aliased `type`.
+    assert!(
+        !parsed
+            .imports
+            .iter()
+            .any(|import| import.alias.as_deref() == Some("type")
+                || import.path.ends_with(".type")
+                || import.imported_name.as_deref() == Some("type")),
+        "bogus `type` import emitted: {:?}",
+        parsed.imports
+    );
+
+    // The type-only named import still records its member correctly.
+    assert!(
+        parsed.imports.iter().any(|import| import.path == "./m.Foo"),
+        "expected ./m.Foo, got {:?}",
+        parsed.imports
+    );
+
+    // `import type Bar from "./n"` is a default type-only import; if recorded it
+    // must be the default binding `Bar`, never `type`.
+    assert!(
+        !parsed
+            .imports
+            .iter()
+            .any(|import| import.alias.as_deref() == Some("type") && import.path.contains("./n")),
+        "type-only default import leaked `type`: {:?}",
+        parsed.imports
+    );
+
+    // A genuine default import still records `Baz` as the default.
+    assert!(
+        parsed.imports.iter().any(|import| {
+            import.path == "./o.default" && import.alias.as_deref() == Some("Baz")
+        }),
+        "expected default Baz, got {:?}",
+        parsed.imports
+    );
+
+    // Inline `type Qux` modifier is stripped; `Plain` records normally.
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "./p.Plain"),
+        "expected ./p.Plain, got {:?}",
+        parsed.imports
+    );
 }
 
 #[test]

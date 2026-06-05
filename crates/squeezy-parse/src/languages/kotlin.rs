@@ -1398,11 +1398,18 @@ pub(crate) fn extract_kotlin_user_type_reference(
     {
         return;
     }
-    let leaf = kotlin_first_child_of_kind(node, "identifier")
+    // A qualified `user_type` such as `com.example.Greeter` has each path
+    // segment as a *direct* `identifier` child (`com`, `example`, `Greeter`).
+    // Record the LEAF type name (`Greeter`), not the leading package segment.
+    // The last direct identifier is the leaf; generic args (`Greeter<String>`)
+    // live under a nested `type_arguments` node and are skipped because we only
+    // look at direct children.
+    let (_, last_identifier) = kotlin_first_child_and_last_identifier(node);
+    let leaf = last_identifier
         .and_then(|child| node_text(child, ctx.source).ok())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| text.clone());
+        .unwrap_or_else(|| last_path_segment(&text));
 
     ctx.references.push(ParsedReference {
         file_id: ctx.file.id.clone(),
