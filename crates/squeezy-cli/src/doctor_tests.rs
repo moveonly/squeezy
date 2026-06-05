@@ -146,6 +146,31 @@ fn mcp_check_accepts_disabled_server_without_command() {
     assert!(check.detail.contains("enabled=0"));
 }
 
+#[tokio::test]
+async fn probe_mcp_reports_unreachable_stdio_server_as_fail() {
+    let mut servers = BTreeMap::new();
+    let mut broken = mcp_fixture(true, McpTransport::Stdio);
+    // A command that does not exist on PATH fails to spawn immediately, so the
+    // initialize handshake errors out without hanging on a timeout.
+    broken.command = Some("squeezy-doctor-no-such-mcp-binary-xyzzy".to_string());
+    servers.insert("broken".to_string(), broken);
+    // A disabled server must be skipped entirely: no probe row.
+    servers.insert("idle".to_string(), mcp_fixture(false, McpTransport::Stdio));
+
+    let checks = probe_mcp_servers(&servers).await;
+
+    let broken_row = checks
+        .iter()
+        .find(|check| check.name == "probe:mcp:broken")
+        .expect("enabled server must produce a probe row");
+    assert_eq!(broken_row.status, Status::Fail);
+    assert!(broken_row.detail.contains("handshake failed"));
+    assert!(
+        checks.iter().all(|check| check.name != "probe:mcp:idle"),
+        "disabled servers must not be probed"
+    );
+}
+
 fn skills_doctor_workspace(name: &str) -> std::path::PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

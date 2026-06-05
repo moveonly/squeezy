@@ -58,6 +58,10 @@ const BUNDLED_SKILL_SOURCES: &[BundledSkillSource] = &[
         dir_name: "skill-creator",
         content: include_str!("../builtin/skill-creator/SKILL.md"),
     },
+    BundledSkillSource {
+        dir_name: "trace-symbol",
+        content: include_str!("../builtin/trace-symbol/SKILL.md"),
+    },
 ];
 
 /// Return the in-binary sample skills that ship with Squeezy.

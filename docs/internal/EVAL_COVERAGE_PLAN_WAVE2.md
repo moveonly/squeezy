@@ -2,7 +2,9 @@
 
 Status: historical dispatch board for the 2026-05-30 wave-2 bug hunt. The
 provider failures and findings below are snapshot evidence, not the current
-source of truth for whether a bug is still reproducible.
+source of truth for whether a bug is still reproducible. See
+`docs/internal/eval-findings/TRIAGE.md` for each finding's current disposition
+(closed, accepted, or deferred post-0.1).
 
 Each domain gets a single agent that drives the `squeezy-eval` harness
 against the squeezy repo itself using **three live provider scenarios**

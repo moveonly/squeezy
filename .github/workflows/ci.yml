@@ -441,14 +441,24 @@ jobs:
 
       - name: Test with coverage
         shell: bash
+        # MIN_LINE_COVERAGE is a committed floor that turns main red when
+        # workspace line coverage craters. It sits well below the workspace's
+        # steady-state line coverage on purpose: it must clear on both the
+        # macOS and Linux-musl matrix legs without flaking on per-run or
+        # per-platform variance, so it gates against material regressions
+        # rather than ratcheting to the exact current number. Raise it as
+        # coverage rises.
+        env:
+          MIN_LINE_COVERAGE: "75"
         run: |
           set -o pipefail
+          status=0
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
-            cargo llvm-cov nextest --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl --summary-only | tee coverage-summary.txt
+            cargo llvm-cov nextest --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl --summary-only --fail-under-lines "$MIN_LINE_COVERAGE" | tee coverage-summary.txt || status=$?
           else
-            cargo llvm-cov nextest --workspace --all-targets --profile ci --summary-only | tee coverage-summary.txt
+            cargo llvm-cov nextest --workspace --all-targets --profile ci --summary-only --fail-under-lines "$MIN_LINE_COVERAGE" | tee coverage-summary.txt || status=$?
           fi
           {
             echo "## Coverage Summary (${{ matrix.platform }})"
@@ -457,6 +467,10 @@ jobs:
             cat coverage-summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          # Surface the report in the step summary even on a threshold/test
+          # failure, then propagate the failure (the trailing block above
+          # would otherwise mask llvm-cov's non-zero exit).
+          exit "$status"
 
   release-binaries:
     name: Release artifact (${{ matrix.platform }})

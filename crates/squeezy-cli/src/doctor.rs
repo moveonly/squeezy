@@ -12,6 +12,8 @@ use squeezy_llm::{
 use squeezy_store::{
     SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
 };
+use squeezy_tools::{McpClientRegistry, McpServerStatus};
+use tokio_util::sync::CancellationToken;
 
 use crate::update::{self, UpdateStatus};
 
@@ -23,9 +25,12 @@ pub struct DoctorArgs {
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
     pub json: bool,
-    /// Probe the configured provider by issuing a tiny request to confirm
-    /// the auth + base_url work. Opt-in because it touches the network
-    /// (and, for first-party Anthropic, may consume a handful of tokens).
+    /// Probe live connectivity: issue a tiny request to the configured
+    /// provider (confirming auth + base_url) and run the MCP `initialize`
+    /// handshake against every enabled MCP server (confirming each one starts
+    /// and advertises tools). Opt-in because it touches the network, may
+    /// consume a handful of provider tokens, and spawns the configured stdio
+    /// MCP `command`s as child processes.
     #[arg(long)]
     pub probe: bool,
     /// Remove rotated redb schema backups after reporting cache health.
@@ -188,6 +193,9 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         }
 
         checks.push(mcp_check(&config.mcp_servers));
+        if args.probe && config.mcp_servers.values().any(|server| server.enabled) {
+            checks.extend(probe_mcp_servers(&config.mcp_servers).await);
+        }
         checks.push(skills_check(config));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
@@ -608,6 +616,52 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
             detail: format!("{summary}; {issues}"),
         }
     }
+}
+
+/// Live MCP reachability probe (opt-in via `--probe`; complements the
+/// offline `mcp_check` config row). Builds a throwaway client registry from
+/// the configured servers and drives the same timeout-bounded `initialize` +
+/// tool-discovery handshake a real session uses (`refresh_tools`), so a
+/// configured-but-broken server is caught here instead of at first tool call.
+/// Emits one `probe:mcp:<name>` row per enabled server: `Ready` → ok (with the
+/// advertised tool count), `Failed` → fail (with the handshake error), and a
+/// cancelled/incomplete handshake → warn. Disabled servers are skipped. The
+/// registry is shut down afterward so any stdio child processes spawned for the
+/// handshake are terminated.
+async fn probe_mcp_servers(
+    servers: &std::collections::BTreeMap<String, McpServerConfig>,
+) -> Vec<Check> {
+    let registry = McpClientRegistry::new(servers.clone());
+    let outcome = registry.refresh_tools(CancellationToken::new()).await;
+    registry.shutdown().await;
+    outcome
+        .status
+        .per_server
+        .iter()
+        .map(|(name, server_status)| {
+            let (status, detail) = match server_status {
+                McpServerStatus::Ready { tools_count, .. } => (
+                    Status::Ok,
+                    format!("handshake ok; {tools_count} tools advertised"),
+                ),
+                McpServerStatus::Failed { error } => {
+                    (Status::Fail, format!("handshake failed: {error}"))
+                }
+                McpServerStatus::Cancelled => (
+                    Status::Warn,
+                    "handshake timed out or was cancelled".to_string(),
+                ),
+                McpServerStatus::Starting => {
+                    (Status::Warn, "handshake did not complete".to_string())
+                }
+            };
+            Check {
+                name: format!("probe:mcp:{name}"),
+                status,
+                detail,
+            }
+        })
+        .collect()
 }
 
 /// Summarize the discovered skill catalog without doing any network or

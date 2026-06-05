@@ -3,7 +3,9 @@
 Status: historical dispatch board for the 2026-05-30 bug hunt. The corresponding
 scenarios, eval harness features, and finding reports have since landed; use
 `EVAL_HARNESS.md` and `docs/internal/eval-findings/README.md` for current
-operator guidance.
+operator guidance. Every finding report is dispositioned in
+`docs/internal/eval-findings/TRIAGE.md` — all closed, accepted as a known
+limitation, or deferred post-0.1.
 
 This document inventories the areas of squeezy that should each have at
 least one driving scenario under `crates/squeezy-eval/fixtures/scenarios/`

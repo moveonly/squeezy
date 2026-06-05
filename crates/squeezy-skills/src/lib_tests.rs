@@ -1729,10 +1729,15 @@ fn install_bundled_skills_is_idempotent_and_skips_existing() {
         "first install must write at least one bundled skill"
     );
     let names_first: BTreeSet<String> = first.into_iter().collect();
-    let expected: BTreeSet<String> = ["customize-squeezy", "release-notes", "skill-creator"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let expected: BTreeSet<String> = [
+        "customize-squeezy",
+        "release-notes",
+        "skill-creator",
+        "trace-symbol",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     assert_eq!(names_first, expected);
 
     for name in &expected {

@@ -29,9 +29,9 @@ use squeezy_core::{
     SkillsConfig, SqueezyError,
 };
 use squeezy_graph::{CargoFactProvenance, GraphManager};
-use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
+use squeezy_mcp::ExternalMcpTool;
 pub use squeezy_mcp::{
-    McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
+    McpClientRegistry, McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
     McpElicitationHandler, McpElicitationKind, McpElicitationRequest, McpElicitationResponse,
     McpError, McpRefreshOutcome, McpResult, McpServerStatus, McpStatusSnapshot,
 };

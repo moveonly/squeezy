@@ -1188,7 +1188,12 @@ fn skills_install(cli: &Cli, force: bool) -> squeezy_core::Result<()> {
 /// path so the installer doesn't need to enumerate `bundled_skills()`
 /// (which would parse every body upfront).
 fn skills_bundled_dir_names() -> &'static [&'static str] {
-    &["customize-squeezy", "release-notes", "skill-creator"]
+    &[
+        "customize-squeezy",
+        "release-notes",
+        "skill-creator",
+        "trace-symbol",
+    ]
 }
 
 fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
