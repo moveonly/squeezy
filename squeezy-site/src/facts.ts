@@ -208,11 +208,11 @@ export const benchmarkRows: BenchmarkRow[] = [
 ];
 
 export const haikuBenchmarkRows: BenchmarkRow[] = [
-  { lang: "C", squeezyCost: 0.2494, baselineCost: 0.2474, ratio: 1.01, recall: 100, verdict: "LOSS" },
+  { lang: "C", squeezyCost: 0.0501, baselineCost: 0.0987, ratio: 0.51, recall: 100, verdict: "WIN" },
   { lang: "C++", squeezyCost: 0.1707, baselineCost: 0.2074, ratio: 0.82, recall: 100, verdict: "WIN" },
   { lang: "C#", squeezyCost: 0.2242, baselineCost: 0.2364, ratio: 0.95, recall: 100, verdict: "WIN" },
   { lang: "Dart", squeezyCost: 0.1326, baselineCost: 0.2275, ratio: 0.58, recall: 100, verdict: "WIN" },
-  { lang: "Go", squeezyCost: 0.2336, baselineCost: 0.1479, ratio: 1.58, recall: 100, verdict: "LOSS" },
+  { lang: "Go", squeezyCost: 0.0141, baselineCost: 0.1487, ratio: 0.09, recall: 100, verdict: "WIN" },
   { lang: "Java", squeezyCost: 0.267, baselineCost: 0.3696, ratio: 0.72, recall: 100, verdict: "WIN" },
   { lang: "JS", squeezyCost: 0.0404, baselineCost: 0.0549, ratio: 0.74, recall: 100, verdict: "WIN" },
   { lang: "Kotlin", squeezyCost: 0.1159, baselineCost: 0.2038, ratio: 0.57, recall: 100, verdict: "WIN" },
@@ -227,7 +227,7 @@ export const haikuBenchmarkRows: BenchmarkRow[] = [
 
 export const benchmarkSummary = {
   codexWins: "15 / 15",
-  claudeWins: "13 / 15",
+  claudeWins: "15 / 15",
   codexModel: "Squeezy gpt-5.4-mini vs Codex gpt-5.4-mini",
   claudeModel: "Squeezy claude-haiku-4-5 vs Claude Code haiku",
   runs: "n=10 medians",
