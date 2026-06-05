@@ -4,10 +4,10 @@ use squeezy_llm::LlmInputItem;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus, sha256_hex};
 
 use super::{
-    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, PendingToolResult,
-    SeenToolOutputs, build_compaction_summary, build_structured_compaction_prompt,
-    durable_context_lines, estimate_context, is_structured_compaction_summary, pack_tool_results,
-    strip_media_for_compaction, unresolved_question_lines,
+    COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, ContextCompactionTrigger,
+    PendingToolResult, SeenToolOutputs, build_compaction_summary, build_structured_compaction_prompt,
+    compact_conversation, durable_context_lines, estimate_context, is_structured_compaction_summary,
+    pack_tool_results, strip_media_for_compaction, unresolved_question_lines,
 };
 
 fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {
@@ -1134,5 +1134,70 @@ fn grep_count_before_content_is_not_collapsed() {
     assert_eq!(
         count_out.content.get("count").and_then(|v| v.as_u64()),
         Some(3)
+    );
+}
+
+fn config_with_window(window: Option<u64>) -> AppConfig {
+    let mut config = AppConfig::default();
+    config.context_compaction.model_context_window = window;
+    config
+}
+
+/// Eight large user items (~80K estimated tokens) sit *under* the default
+/// `recent_items` (10) and `min_items` (16). With a small enough window they
+/// cross the high-water mark and must still fold (finding #3).
+fn few_but_huge_conversation() -> Vec<LlmInputItem> {
+    (0..8)
+        .map(|i| LlmInputItem::UserText(format!("item {i}: {}", "x".repeat(40_000))))
+        .collect()
+}
+
+#[test]
+fn few_but_huge_folds_over_high_water_with_capped_recent_items() {
+    // Window 80K ⇒ high-water = 72K; the ~80K conversation crosses it. The
+    // default recent_items (10) would keep all 8 items verbatim and fold
+    // nothing, so the cap to items/2 is what makes the fold possible.
+    let mut conversation = few_but_huge_conversation();
+    let before = estimate_context(&conversation);
+    assert!(before.items <= 10, "scenario must sit under recent_items");
+    let config = config_with_window(Some(80_000));
+    assert!(before.estimated_tokens >= config.context_compaction.min_items_bypass_threshold());
+
+    let mut state = ContextCompactionState::default();
+    let report = compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        ContextCompactionTrigger::Auto,
+        false,
+    )
+    .expect("few-but-huge over high-water should fold");
+    assert!(report.record.after.bytes < report.record.before.bytes);
+    // A summary head plus the capped recent slice replaces the 8 items.
+    assert!(conversation.len() < before.items);
+}
+
+#[test]
+fn few_but_huge_does_not_fold_below_high_water() {
+    // Same conversation, but a large window keeps the high-water mark far
+    // above the payload, so recent_items stays at its default and the
+    // items <= keep guard declines (finding #3 only fires over high-water).
+    let mut conversation = few_but_huge_conversation();
+    let config = config_with_window(Some(1_000_000));
+    let mut state = ContextCompactionState::default();
+    let report = compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        ContextCompactionTrigger::Auto,
+        false,
+    );
+    assert!(
+        report.is_none(),
+        "below high-water a few-item conversation must not fold post-turn"
     );
 }

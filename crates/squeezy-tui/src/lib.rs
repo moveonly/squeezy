@@ -14440,10 +14440,12 @@ pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
 
 const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
 /// Percent of `context_compaction_threshold` at which we surface the
-/// compaction nudge. The threshold is itself a fraction of the full
-/// context window (default 80% of the model max), so firing the nudge
-/// at 70% of the threshold gives users a runway to `/pin` or `/compact`
-/// deliberately before auto-compaction kicks in at 100%.
+/// compaction nudge. The threshold is the resolved post-turn auto-compaction
+/// ceiling (`ContextCompactionConfig::post_turn_token_ceiling`): the flat
+/// budget capped at `threshold_percent` of the model window, so it is window-
+/// aware on small models yet keeps the flat 60K cost-thesis budget on large
+/// ones. Firing the nudge at 70% of that ceiling gives users a runway to
+/// `/pin` or `/compact` deliberately before auto-compaction kicks in at 100%.
 pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
@@ -15185,11 +15187,12 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
-    /// Token threshold above which auto-compaction triggers. Captured at
-    /// startup from `config.context_compaction.estimated_tokens` so the
-    /// status line can express usage as a percentage of the local cap
-    /// (Squeezy's cost thesis cares about the configured budget, not the
-    /// raw model window).
+    /// Token threshold above which post-turn auto-compaction triggers.
+    /// Captured at startup (and on config reload) from
+    /// `config.context_compaction.post_turn_token_ceiling()` — the resolved
+    /// ceiling that the gate actually fires on: the flat budget capped at
+    /// `threshold_percent` of the model window. The status line expresses usage
+    /// as a percentage of this value so the advisory matches what triggers.
     pub(crate) context_compaction_threshold: u64,
     /// Whether the "compaction imminent" advisory has been pushed for the
     /// current pre-compaction window. Reset when compaction lands so the
@@ -15649,7 +15652,7 @@ impl TuiApp {
             ),
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
-            context_compaction_threshold: config.context_compaction.estimated_tokens,
+            context_compaction_threshold: config.context_compaction.post_turn_token_ceiling(),
             context_compaction_nudge_shown: false,
             context_estimate: ContextEstimate::default(),
             checkpoints_enabled: config.checkpoints_enabled,
@@ -15771,7 +15774,7 @@ impl TuiApp {
         self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
-        self.context_compaction_threshold = config.context_compaction.estimated_tokens;
+        self.context_compaction_threshold = config.context_compaction.post_turn_token_ceiling();
         self.checkpoints_enabled = config.checkpoints_enabled;
         self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
         self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());

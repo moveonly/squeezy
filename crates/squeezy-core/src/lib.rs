@@ -518,6 +518,13 @@ pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 16_384;
 /// Trigger mid-turn compaction once the provider-reported total token usage
 /// reaches this fraction of `model_context_window` (out of 100).
 pub const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT: u8 = 80;
+/// Fraction of `model_context_window` (out of 100) above which the post-turn
+/// auto-compaction gate bypasses the `min_items` floor. A conversation of a
+/// few but enormous items (e.g. several large `read_file` pairs) can dwarf the
+/// window while sitting under `min_items`; once it crosses this high-water mark
+/// it is compacted regardless of item count. When the window is unknown the gate
+/// falls back to `2 × estimated_tokens` (see `min_items_bypass_threshold`).
+pub const HIGH_WATER_BYPASS_PCT: u64 = 90;
 /// Max output tokens to request when the model-assisted compaction strategy
 /// is active.
 pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS: u32 = 1_500;
@@ -5575,6 +5582,61 @@ impl ContextCompactionConfig {
                     .micro_compaction_keep_recent
                     .unwrap_or(DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT),
             ),
+        }
+    }
+
+    /// Token count at which post-turn auto-compaction should fire.
+    ///
+    /// Window-aware when `model_context_window` is known: the flat
+    /// `estimated_tokens` budget (the "60K" cost-thesis default) is *capped* at
+    /// `threshold_percent` of the real window so a small-window model no longer
+    /// has a post-turn trigger that sits above its own window. The `min()`
+    /// preserves the deliberate early-compaction behavior on large windows
+    /// (where `threshold_percent × window` exceeds 60K, the flat budget wins).
+    /// Falls back to the flat budget when the window is unknown.
+    pub fn post_turn_token_ceiling(&self) -> u64 {
+        match self.model_context_window {
+            Some(window) if window > 0 => self.estimated_tokens.min(
+                window
+                    .saturating_mul(self.threshold_percent.min(100) as u64)
+                    .saturating_div(100),
+            ),
+            _ => self.estimated_tokens,
+        }
+    }
+
+    /// Token threshold for mid-turn *full* compaction, or `None` when the
+    /// window is unknown (the mid-turn gate stays dormant in that case).
+    pub fn mid_turn_full_threshold(&self) -> Option<u64> {
+        self.window_fraction(self.threshold_percent)
+    }
+
+    /// Token threshold for mid-turn *micro* compaction, or `None` when the
+    /// window is unknown.
+    pub fn mid_turn_micro_threshold(&self) -> Option<u64> {
+        self.window_fraction(self.micro_compaction_threshold_percent)
+    }
+
+    /// High-water mark above which the post-turn gate bypasses the `min_items`
+    /// floor so a "few but enormous" conversation still compacts proactively.
+    /// Derived from the window when known, else `2 × estimated_tokens`.
+    pub fn min_items_bypass_threshold(&self) -> u64 {
+        match self.model_context_window {
+            Some(window) if window > 0 => window
+                .saturating_mul(HIGH_WATER_BYPASS_PCT)
+                .saturating_div(100),
+            _ => self.estimated_tokens.saturating_mul(2),
+        }
+    }
+
+    fn window_fraction(&self, percent: u8) -> Option<u64> {
+        match self.model_context_window {
+            Some(window) if window > 0 => Some(
+                window
+                    .saturating_mul(percent.min(100) as u64)
+                    .saturating_div(100),
+            ),
+            _ => None,
         }
     }
 }

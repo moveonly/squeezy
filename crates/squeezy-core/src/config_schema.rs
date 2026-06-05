@@ -9,7 +9,15 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::{
-    AppConfig, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
+    AppConfig, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
+    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS,
+    DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
+    DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES,
+    DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS,
+    DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS, DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
+    DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS, DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT,
+    DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT, DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT,
+    DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES, DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES,
     DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV, DEFAULT_EXA_MCP_URL,
     DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GITHUB_COPILOT_MODEL,
     DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
@@ -381,6 +389,8 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "openai_compatible",
 ];
 
+pub const COMPACTION_STRATEGY_OPTIONS: &[&str] =
+    &["extractive", "model_assisted", "layered_fallback"];
 pub const PROFILE_OPTIONS: &[&str] = &["cheap", "balanced", "strong"];
 pub const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh"];
 pub const SESSION_MODE_OPTIONS: &[&str] = &["build", "plan"];
@@ -1166,6 +1176,336 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 help: "Pre-flight ceiling on estimated input tokens per LLM round. \
                        Over it the agent compacts first, then gates. Unset means off.",
                 env_override: None,
+                secret: false,
+            },
+        ],
+    },
+    ConfigSectionMeta {
+        id: SectionId::Context,
+        label: "Context & Compaction",
+        description: "When and how the conversation is compacted before the model window",
+        fields: &[
+            FieldMeta {
+                label: "triggers",
+                toml_path: &["context", "_trigger_info"],
+                kind: FieldKind::Info,
+                tier: ApplyTier::Immediate,
+                get: get_context_trigger_info,
+                set: set_noop,
+                default_display: "",
+                default: || FieldValue::String(String::new()),
+                help: "Resolved window and the token points each tier fires at, for the \
+                       active model. Percentages below are of the window.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "compaction_enabled",
+                toml_path: &["context", "compaction_enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_context_compaction_enabled,
+                set: set_context_compaction_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Master switch for post-turn (between-turn) compaction.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "compaction_estimated_tokens",
+                toml_path: &["context", "compaction_estimated_tokens"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 100_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_estimated_tokens,
+                set: set_context_estimated_tokens,
+                default_display: "60000 tok",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS as i64),
+                help: "Flat post-turn budget. The trigger fires at the lesser of this and \
+                       threshold_percent of the window, so it also protects small-window models.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "compaction_min_items",
+                toml_path: &["context", "compaction_min_items"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 100_000,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_min_items,
+                set: set_context_min_items,
+                default_display: "16",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS as i64),
+                help: "Post-turn also needs at least this many items (AND-ed with the token \
+                       floor), unless the conversation is already near the window.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MIN_ITEMS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "compaction_recent_items",
+                toml_path: &["context", "compaction_recent_items"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 100_000,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_recent_items,
+                set: set_context_recent_items,
+                default_display: "10",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS as i64),
+                help: "Newest items kept verbatim through a full compaction.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_RECENT_ITEMS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "compaction_max_summary_bytes",
+                toml_path: &["context", "compaction_max_summary_bytes"],
+                kind: FieldKind::Integer {
+                    min: 256,
+                    max: 10_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_max_summary_bytes,
+                set: set_context_max_summary_bytes,
+                default_display: "12000 bytes",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES as i64),
+                help: "Cap on the generated extractive summary size.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "enabled_mid_turn",
+                toml_path: &["context", "enabled_mid_turn"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_context_enabled_mid_turn,
+                set: set_context_enabled_mid_turn,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Enable mid-turn micro + full compaction (requires a known window).",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_ENABLED_MID_TURN"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "model_context_window",
+                toml_path: &["context", "model_context_window"],
+                kind: FieldKind::OptionalInteger {
+                    min: 1,
+                    max: 100_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_model_window,
+                set: set_context_model_window,
+                default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Model token budget; all percent knobs are % of this. Unset → \
+                       auto-derived from the model registry; mid-turn dormant if underivable.",
+                env_override: Some("SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "threshold_percent",
+                toml_path: &["context", "threshold_percent"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 100,
+                    suffix: Some("%"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_threshold_percent,
+                set: set_context_threshold_percent,
+                default_display: "80 %",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT as i64),
+                help: "% of window for mid-turn full compaction (also caps the post-turn budget).",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_THRESHOLD_PERCENT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "micro_compaction_enabled",
+                toml_path: &["context", "micro_compaction_enabled"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_context_micro_enabled,
+                set: set_context_micro_enabled,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Enable the mid-turn micro pass that clears older tool-output bodies.",
+                env_override: Some("SQUEEZY_CONTEXT_MICRO_COMPACTION_ENABLED"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "micro_compaction_threshold_percent",
+                toml_path: &["context", "micro_compaction_threshold_percent"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 100,
+                    suffix: Some("%"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_micro_threshold_percent,
+                set: set_context_micro_threshold_percent,
+                default_display: "60 %",
+                default: || {
+                    FieldValue::Integer(DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT as i64)
+                },
+                help: "% of window for the mid-turn micro pass. Keep below threshold_percent so \
+                       micro reclaims tool output before the heavier full tier fires.",
+                env_override: Some("SQUEEZY_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "micro_compaction_keep_recent",
+                toml_path: &["context", "micro_compaction_keep_recent"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 10_000,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_micro_keep_recent,
+                set: set_context_micro_keep_recent,
+                default_display: "5",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT as i64),
+                help: "Newest tool outputs the micro pass keeps verbatim.",
+                env_override: Some("SQUEEZY_CONTEXT_MICRO_COMPACTION_KEEP_RECENT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "strategy",
+                toml_path: &["context", "strategy"],
+                kind: FieldKind::Enum {
+                    options: COMPACTION_STRATEGY_OPTIONS,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_strategy,
+                set: set_context_strategy,
+                default_display: "extractive",
+                default: || FieldValue::Enum(CompactionStrategy::Extractive.as_str()),
+                help: "Summary strategy. extractive = deterministic, no model call. \
+                       model_assisted / layered_fallback rewrite via a cheap model with \
+                       extractive fallback. See docs/internal/compaction-explained.md §3b.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_STRATEGY"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "model_assisted_model",
+                toml_path: &["context", "model_assisted_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_model_assisted_model,
+                set: set_context_model_assisted_model,
+                default_display: "—",
+                default: || FieldValue::String(String::new()),
+                help: "Cheap model for non-extractive strategies. Empty → resolved \
+                       small/fast model; falls back to extractive if neither resolves.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_MODEL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "model_assisted_max_output_tokens",
+                toml_path: &["context", "model_assisted_max_output_tokens"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 1_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_model_assisted_max_output_tokens,
+                set: set_context_model_assisted_max_output_tokens,
+                default_display: "1500 tok",
+                default: || {
+                    FieldValue::Integer(
+                        DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS as i64,
+                    )
+                },
+                help: "Output cap per model-assisted summary call.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "model_assisted_timeout_secs",
+                toml_path: &["context", "model_assisted_timeout_secs"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 3_600,
+                    suffix: Some("s"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_model_assisted_timeout_secs,
+                set: set_context_model_assisted_timeout_secs,
+                default_display: "30 s",
+                default: || {
+                    FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS as i64)
+                },
+                help: "Timeout before a model-assisted summary falls back to extractive.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "layered_fallback_extractive_threshold_tokens",
+                toml_path: &["context", "layered_fallback_extractive_threshold_tokens"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 100_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_layered_fallback_threshold,
+                set: set_context_layered_fallback_threshold,
+                default_display: "4000 tok",
+                default: || {
+                    FieldValue::Integer(
+                        DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS
+                            as i64,
+                    )
+                },
+                help: "In layered_fallback, only call the model when the dropped slice \
+                       exceeds this many tokens.",
+                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_LAYERED_FALLBACK_THRESHOLD_TOKENS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "repo_doc_max_bytes",
+                toml_path: &["context", "repo_doc_max_bytes"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 100_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_repo_doc_max_bytes,
+                set: set_context_repo_doc_max_bytes,
+                default_display: "32768 bytes",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES as i64),
+                help: "Cap on AGENTS.md content stitched into base instructions (0 disables).",
+                env_override: Some("SQUEEZY_CONTEXT_REPO_DOC_MAX_BYTES"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "user_memory_max_bytes",
+                toml_path: &["context", "user_memory_max_bytes"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 100_000_000,
+                    suffix: Some("bytes"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_user_memory_max_bytes,
+                set: set_context_user_memory_max_bytes,
+                default_display: "16384 bytes",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES as i64),
+                help: "Cap on ~/.squeezy/MEMORY.md stitched into base instructions (0 disables).",
+                env_override: Some("SQUEEZY_CONTEXT_USER_MEMORY_MAX_BYTES"),
                 secret: false,
             },
         ],
@@ -2621,6 +2961,241 @@ fn active_routing_provider(cfg: &AppConfig) -> &'static str {
 }
 
 fn set_noop(_cfg: &mut AppConfig, _value: FieldValue) -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ---- Context & Compaction ----
+
+/// Read-only summary of the resolved window and where each tier fires, computed
+/// from the live `ContextCompactionConfig` helpers so it always matches runtime.
+fn get_context_trigger_info(cfg: &AppConfig) -> FieldValue {
+    let cc = &cfg.context_compaction;
+    let window = match cc.model_context_window {
+        Some(w) if w > 0 => format!("window {w} tok"),
+        _ => "window — (auto-derive failed; mid-turn dormant)".to_string(),
+    };
+    let fmt = |label: &str, value: Option<u64>| match value {
+        Some(v) => format!("{label} @{v}"),
+        None => format!("{label} off"),
+    };
+    FieldValue::String(format!(
+        "{window}  ·  {}  ·  {}  ·  post-turn @{}",
+        fmt("micro", cc.mid_turn_micro_threshold()),
+        fmt("full", cc.mid_turn_full_threshold()),
+        cc.post_turn_token_ceiling(),
+    ))
+}
+
+fn ctx_integer(value: FieldValue, min: i64) -> Result<i64, &'static str> {
+    match value {
+        FieldValue::Integer(v) | FieldValue::OptionalInteger(Some(v)) if v >= min => Ok(v),
+        FieldValue::Integer(_) | FieldValue::OptionalInteger(Some(_)) => Err("value below minimum"),
+        _ => Err("expects integer"),
+    }
+}
+
+fn ctx_percent(value: FieldValue) -> Result<u8, &'static str> {
+    match value {
+        FieldValue::Integer(v) if (0..=100).contains(&v) => Ok(v as u8),
+        FieldValue::Integer(_) => Err("must be 0..=100"),
+        _ => Err("expects integer"),
+    }
+}
+
+fn ctx_bool(value: FieldValue) -> Result<bool, &'static str> {
+    match value {
+        FieldValue::Bool(v) => Ok(v),
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_context_compaction_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.context_compaction.enabled)
+}
+fn set_context_compaction_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.enabled = ctx_bool(value)?;
+    Ok(())
+}
+
+fn get_context_estimated_tokens(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.estimated_tokens as i64)
+}
+fn set_context_estimated_tokens(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.estimated_tokens = ctx_integer(value, 1)? as u64;
+    Ok(())
+}
+
+fn get_context_min_items(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.min_items as i64)
+}
+fn set_context_min_items(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.min_items = ctx_integer(value, 1)? as usize;
+    Ok(())
+}
+
+fn get_context_recent_items(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.recent_items as i64)
+}
+fn set_context_recent_items(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.recent_items = ctx_integer(value, 1)? as usize;
+    Ok(())
+}
+
+fn get_context_max_summary_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.max_summary_bytes as i64)
+}
+fn set_context_max_summary_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.max_summary_bytes = ctx_integer(value, 256)? as usize;
+    Ok(())
+}
+
+fn get_context_enabled_mid_turn(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.context_compaction.enabled_mid_turn)
+}
+fn set_context_enabled_mid_turn(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.enabled_mid_turn = ctx_bool(value)?;
+    Ok(())
+}
+
+fn get_context_model_window(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(cfg.context_compaction.model_context_window.map(|v| v as i64))
+}
+fn set_context_model_window(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.model_context_window = match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => None,
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if v < 1 {
+                return Err("must be >= 1");
+            }
+            Some(v as u64)
+        }
+        _ => return Err("expects integer"),
+    };
+    Ok(())
+}
+
+fn get_context_threshold_percent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.threshold_percent as i64)
+}
+fn set_context_threshold_percent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.threshold_percent = ctx_percent(value)?;
+    Ok(())
+}
+
+fn get_context_micro_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.context_compaction.micro_compaction_enabled)
+}
+fn set_context_micro_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.micro_compaction_enabled = ctx_bool(value)?;
+    Ok(())
+}
+
+fn get_context_micro_threshold_percent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.micro_compaction_threshold_percent as i64)
+}
+fn set_context_micro_threshold_percent(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.micro_compaction_threshold_percent = ctx_percent(value)?;
+    Ok(())
+}
+
+fn get_context_micro_keep_recent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.micro_compaction_keep_recent as i64)
+}
+fn set_context_micro_keep_recent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.micro_compaction_keep_recent = ctx_integer(value, 0)? as usize;
+    Ok(())
+}
+
+fn get_context_strategy(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.context_compaction.strategy.as_str())
+}
+fn set_context_strategy(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("strategy expects enum"),
+    };
+    cfg.context_compaction.strategy = CompactionStrategy::parse(s).ok_or("unknown strategy")?;
+    Ok(())
+}
+
+fn get_context_model_assisted_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.context_compaction
+            .model_assisted_model
+            .clone()
+            .unwrap_or_default(),
+    )
+}
+fn set_context_model_assisted_model(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let trimmed = s.trim();
+    cfg.context_compaction.model_assisted_model = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    Ok(())
+}
+
+fn get_context_model_assisted_max_output_tokens(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.model_assisted_max_output_tokens as i64)
+}
+fn set_context_model_assisted_max_output_tokens(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.model_assisted_max_output_tokens = ctx_integer(value, 1)? as u32;
+    Ok(())
+}
+
+fn get_context_model_assisted_timeout_secs(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.model_assisted_timeout_secs as i64)
+}
+fn set_context_model_assisted_timeout_secs(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.model_assisted_timeout_secs = ctx_integer(value, 1)? as u64;
+    Ok(())
+}
+
+fn get_context_layered_fallback_threshold(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.layered_fallback_extractive_threshold_tokens as i64)
+}
+fn set_context_layered_fallback_threshold(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.layered_fallback_extractive_threshold_tokens =
+        ctx_integer(value, 0)? as u32;
+    Ok(())
+}
+
+fn get_context_repo_doc_max_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.repo_doc_max_bytes as i64)
+}
+fn set_context_repo_doc_max_bytes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.repo_doc_max_bytes = ctx_integer(value, 0)? as usize;
+    Ok(())
+}
+
+fn get_context_user_memory_max_bytes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.user_memory_max_bytes as i64)
+}
+fn set_context_user_memory_max_bytes(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.user_memory_max_bytes = ctx_integer(value, 0)? as usize;
     Ok(())
 }
 

@@ -162,13 +162,7 @@ pub(crate) async fn maybe_compact_mid_turn(
     if !config.context_compaction.enabled_mid_turn {
         return None;
     }
-    let window = config.context_compaction.model_context_window?;
-    if window == 0 {
-        return None;
-    }
-    let threshold = window
-        .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
-        .saturating_div(100);
+    let threshold = config.context_compaction.mid_turn_full_threshold()?;
     let observed =
         last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
     if observed < threshold {
@@ -205,14 +199,26 @@ pub(crate) async fn maybe_compact_conversation(
     redactor: &Redactor,
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     if !config.context_compaction.enabled {
         return None;
     }
+    let cc = &config.context_compaction;
     let estimate = estimate_context(conversation);
-    if estimate.items < config.context_compaction.min_items
-        || estimate.estimated_tokens < config.context_compaction.estimated_tokens
-    {
+    // The conversation estimate omits the system instructions and tool
+    // schemas that ride along on every request; fold in the caller's measured
+    // request overhead so the gate reflects the real input size (finding #2).
+    let tokens = estimate.estimated_tokens.saturating_add(overhead_tokens);
+    // Window-aware ceiling: capped at the flat budget so large windows keep
+    // the deliberate 60K cost-thesis behavior while small windows no longer
+    // sit above their own window (findings #4/#6).
+    let ceiling = cc.post_turn_token_ceiling();
+    // A few but enormous items can dwarf the window while sitting under
+    // `min_items`; once over the high-water mark, bypass the item floor so
+    // they still compact proactively (finding #3).
+    let over_high_water = tokens >= cc.min_items_bypass_threshold();
+    if (estimate.items < cc.min_items && !over_high_water) || tokens < ceiling {
         return None;
     }
     compact_conversation_with_strategy(
@@ -240,7 +246,18 @@ pub(crate) fn compact_conversation(
     force: bool,
 ) -> Option<ContextCompactionReport> {
     let before = estimate_context(conversation);
-    let keep = config.context_compaction.recent_items.max(1);
+    let mut keep = config.context_compaction.recent_items.max(1);
+    if !force
+        && before.estimated_tokens >= config.context_compaction.min_items_bypass_threshold()
+    {
+        // Few-but-enormous: with the default `recent_items` (10) a conversation
+        // of a handful of huge items keeps everything verbatim and folds
+        // nothing, so the post-turn `min_items` bypass (finding #3) would be a
+        // no-op. Once over the high-water mark, cap `keep` so at least half the
+        // items form a foldable older slice. The `after.bytes >= before.bytes`
+        // guard below still declines if the fold cannot actually shrink.
+        keep = keep.min(before.items / 2).max(1);
+    }
     if !force && before.items <= keep {
         return None;
     }

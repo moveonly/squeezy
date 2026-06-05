@@ -7370,6 +7370,7 @@ async fn maybe_compact_conversation_honors_model_assisted_strategy() {
         &redactor,
         &config,
         ContextCompactionTrigger::Auto,
+        0,
     )
     .await
     .expect("post-turn auto-compaction should fire");
@@ -7889,6 +7890,67 @@ fn arm_then_drain_applies_swap_with_optional_provider() {
     assert_eq!(drained.display_note.as_deref(), Some("model swap"));
     assert_eq!(agent.config_snapshot().model, "claude-opus-4-7");
     assert!(agent.pending_config_swap().is_none());
+}
+
+#[test]
+fn model_switch_re_derives_context_window() {
+    // openai gpt-5.5 has a 400K registered window; anthropic claude-opus-4-7
+    // has 200K. A runtime switch must re-derive the new model's window so
+    // mid-turn thresholds stop computing against the old one (finding #1).
+    let openai: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("openai", vec![]));
+    let config = AppConfig {
+        model: "gpt-5.5".to_string(),
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, openai);
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(400_000)
+    );
+
+    let anthropic: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
+    agent.replace_provider(anthropic, "claude-opus-4-7".to_string());
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(200_000)
+    );
+}
+
+#[test]
+fn explicit_context_window_survives_model_switch() {
+    // An explicit override (squeezy.toml / SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW)
+    // must win over registry derivation across a model switch (finding #1).
+    let openai: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("openai", vec![]));
+    let mut config = AppConfig {
+        model: "gpt-5.5".to_string(),
+        ..AppConfig::default()
+    };
+    config.context_compaction.model_context_window = Some(123_456);
+    let mut agent = Agent::new(config, openai);
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(123_456)
+    );
+
+    let anthropic: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
+    agent.replace_provider(anthropic, "claude-opus-4-7".to_string());
+    assert_eq!(
+        agent
+            .config_snapshot()
+            .context_compaction
+            .model_context_window,
+        Some(123_456),
+        "explicit window override must not be clobbered by re-derivation"
+    );
 }
 
 /// Pin the hot-reload bridge between `PendingConfigSwap` and the MCP

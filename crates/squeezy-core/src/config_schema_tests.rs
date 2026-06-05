@@ -227,3 +227,147 @@ fn subagent_integer_schema_defaults_match_runtime_constants() {
         );
     }
 }
+
+#[test]
+fn context_section_integer_defaults_match_runtime_constants() {
+    let cases = [
+        (
+            "compaction_estimated_tokens",
+            crate::DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS as i64,
+        ),
+        (
+            "compaction_min_items",
+            crate::DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS as i64,
+        ),
+        (
+            "compaction_recent_items",
+            crate::DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS as i64,
+        ),
+        (
+            "compaction_max_summary_bytes",
+            crate::DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES as i64,
+        ),
+        (
+            "threshold_percent",
+            crate::DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT as i64,
+        ),
+        (
+            "micro_compaction_threshold_percent",
+            crate::DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT as i64,
+        ),
+        (
+            "micro_compaction_keep_recent",
+            crate::DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT as i64,
+        ),
+        (
+            "model_assisted_max_output_tokens",
+            crate::DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS as i64,
+        ),
+        (
+            "model_assisted_timeout_secs",
+            crate::DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS as i64,
+        ),
+        (
+            "layered_fallback_extractive_threshold_tokens",
+            crate::DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS as i64,
+        ),
+        (
+            "repo_doc_max_bytes",
+            crate::DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES as i64,
+        ),
+        (
+            "user_memory_max_bytes",
+            crate::DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES as i64,
+        ),
+    ];
+    let ctx = section(SectionId::Context).expect("Context section must be registered");
+    for (label, runtime_default) in cases {
+        let field = ctx
+            .fields
+            .iter()
+            .find(|f| f.label == label)
+            .unwrap_or_else(|| panic!("field '{label}' not found in Context section"));
+        let default_value = match (field.default)() {
+            FieldValue::Integer(v) => v,
+            other => panic!("field '{label}' default is not Integer: {other:?}"),
+        };
+        assert_eq!(default_value, runtime_default, "{label} default() mismatch");
+        let display_val: i64 = field
+            .default_display
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .unwrap_or_else(|_| panic!("field '{label}' default_display not parseable"));
+        assert_eq!(display_val, runtime_default, "{label} default_display mismatch");
+    }
+}
+
+#[test]
+fn context_section_fields_round_trip() {
+    let ctx = section(SectionId::Context).expect("Context section must be registered");
+    for f in ctx.fields {
+        let mut cfg = AppConfig::default();
+        match f.kind {
+            FieldKind::Info => {
+                // Read-only: get returns a non-empty string, set is a no-op.
+                assert!(matches!((f.get)(&cfg), FieldValue::String(_)), "{}", f.label);
+                (f.set)(&mut cfg, FieldValue::String(String::new())).unwrap();
+            }
+            FieldKind::Bool => {
+                (f.set)(&mut cfg, FieldValue::Bool(false)).unwrap();
+                assert_eq!((f.get)(&cfg), FieldValue::Bool(false), "{}", f.label);
+                (f.set)(&mut cfg, FieldValue::Bool(true)).unwrap();
+                assert_eq!((f.get)(&cfg), FieldValue::Bool(true), "{}", f.label);
+            }
+            FieldKind::Integer { min, .. } => {
+                let v = min.max(7);
+                (f.set)(&mut cfg, FieldValue::Integer(v)).unwrap();
+                assert_eq!((f.get)(&cfg), FieldValue::Integer(v), "{}", f.label);
+            }
+            FieldKind::OptionalInteger { .. } => {
+                (f.set)(&mut cfg, FieldValue::OptionalInteger(Some(4242))).unwrap();
+                assert_eq!(
+                    (f.get)(&cfg),
+                    FieldValue::OptionalInteger(Some(4242)),
+                    "{}",
+                    f.label
+                );
+                (f.set)(&mut cfg, FieldValue::OptionalInteger(None)).unwrap();
+                assert_eq!(
+                    (f.get)(&cfg),
+                    FieldValue::OptionalInteger(None),
+                    "{}",
+                    f.label
+                );
+            }
+            FieldKind::Enum { options } => {
+                for option in options {
+                    (f.set)(&mut cfg, FieldValue::Enum(option)).unwrap();
+                    assert_eq!((f.get)(&cfg), FieldValue::Enum(option), "{}", f.label);
+                }
+            }
+            FieldKind::String { .. } => {
+                (f.set)(&mut cfg, FieldValue::String("cheap-model".to_string())).unwrap();
+                assert_eq!(
+                    (f.get)(&cfg),
+                    FieldValue::String("cheap-model".to_string()),
+                    "{}",
+                    f.label
+                );
+            }
+            other => panic!("unexpected FieldKind in Context section: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn context_percent_setters_reject_out_of_range() {
+    let ctx = section(SectionId::Context).unwrap();
+    let pct = ctx
+        .fields
+        .iter()
+        .find(|f| f.label == "threshold_percent")
+        .unwrap();
+    let mut cfg = AppConfig::default();
+    assert!((pct.set)(&mut cfg, FieldValue::Integer(150)).is_err());
+    assert!((pct.set)(&mut cfg, FieldValue::Integer(80)).is_ok());
+}

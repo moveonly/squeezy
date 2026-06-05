@@ -78,57 +78,72 @@ pub(crate) fn maybe_compact_mid_turn(
     )
 }
 
-pub(crate) fn maybe_compact_conversation(
+pub(crate) async fn maybe_compact_conversation(
     conversation: &mut Vec<LlmInputItem>,
-    state: &mut ContextCompactionState,
-    attachments: &[ContextAttachment],
-    store: Option<&SqueezyStore>,
+    /* state, attachments, store, provider, session, redactor, */
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
+    overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
     if !config.context_compaction.enabled {
         return None;
     }
+    let cc = &config.context_compaction;
     let estimate = estimate_context(conversation);
-    if estimate.items < config.context_compaction.min_items
-        || estimate.estimated_tokens < config.context_compaction.estimated_tokens
-    {
+    // estimate_context omits the system instructions and tool schemas that
+    // ride along on every request; fold in the caller's measured overhead.
+    let tokens = estimate.estimated_tokens.saturating_add(overhead_tokens);
+    let ceiling = cc.post_turn_token_ceiling();
+    let over_high_water = tokens >= cc.min_items_bypass_threshold();
+    if (estimate.items < cc.min_items && !over_high_water) || tokens < ceiling {
         return None;
     }
-    compact_conversation(
-        conversation,
-        state,
-        attachments,
-        store,
-        config,
-        trigger,
-        false,
-    )
+    compact_conversation_with_strategy(/* … */, trigger, false).await
 }
 ```
 
-The two paths read different thresholds:
+The two paths read thresholds resolved by shared
+`ContextCompactionConfig` helpers (`squeezy-core/src/lib.rs`), so the TUI
+nudge and both gates agree on every model:
 
-- Post-turn (`context_compaction.rs:189`) gates on two AND-ed conditions:
-  the conversation must have at least `min_items` items *and* its estimated
-  token count must exceed `estimated_tokens`. Defaults are 16 items and
-  60,000 tokens (`squeezy-core/src/lib.rs:290-293`).
-- Mid-turn (`context_compaction.rs:158`) gates on a percentage of the
-  configured `model_context_window`. The default `threshold_percent` is 80
-  (`squeezy-core/src/lib.rs:298`). The trigger uses the provider's reported
-  `last_total_tokens` when available — the live usage figure from the
-  streaming response — and falls back to the byte-derived estimator when
-  the provider has not sent a usage event yet.
+- **Post-turn** gates on `post_turn_token_ceiling()` —
+  `min(estimated_tokens, model_context_window × threshold_percent / 100)`.
+  The `min()` keeps the deliberate flat 60K cost-thesis budget on large
+  windows while *also* protecting small-window models, whose 80%-of-window
+  ceiling now sits below the flat 60K (a 32K model triggers at ~25.6K, not
+  60K). The token count it compares is the conversation estimate **plus**
+  the instruction + tool-schema overhead from the most recent request
+  (`overhead_tokens`), so a tool-heavy config no longer under-counts the
+  real input. The `min_items` floor is bypassed once the conversation
+  crosses `min_items_bypass_threshold()` (≈90% of the window), so a
+  "few but enormous" conversation still compacts proactively.
+- **Mid-turn** gates on `mid_turn_full_threshold()`
+  (`model_context_window × threshold_percent / 100`, default 80%), and the
+  micro pass on `mid_turn_micro_threshold()` (default 60%). Both return
+  `None` when the window is unknown, leaving the mid-turn tiers dormant.
+  The trigger uses the provider's reported `last_total_tokens` when
+  available and falls back to the byte-derived estimator otherwise.
 
-Both ultimately delegate to `compact_conversation` (`context_compaction.rs:205`),
-which holds the actual splitting logic.
+Post-turn delegates through `compact_conversation_with_strategy` to
+`compact_conversation` (`context_compaction.rs`), which holds the splitting
+logic.
 
 ### Splitting older from recent
 
 ```rust
-// crates/squeezy-agent/src/context_compaction.rs:214-236
+// crates/squeezy-agent/src/context_compaction.rs
 let before = estimate_context(conversation);
-let keep = config.context_compaction.recent_items.max(1);
+let mut keep = config.context_compaction.recent_items.max(1);
+if !force
+    && before.estimated_tokens >= config.context_compaction.min_items_bypass_threshold()
+{
+    // Few-but-enormous: with the default recent_items (10) a handful of huge
+    // items would keep everything verbatim and fold nothing, making the
+    // post-turn min_items bypass inert. Over the high-water mark, cap keep so
+    // at least half the items form a foldable older slice. The no-op guard
+    // (after.bytes >= before.bytes) still declines if it can't actually shrink.
+    keep = keep.min(before.items / 2).max(1);
+}
 if !force && before.items <= keep {
     return None;
 }
@@ -456,6 +471,21 @@ When a list overflows the cap, the *chronologically oldest* paths are
 dropped first so the most recent file touches survive. Modification
 dominates: a file appearing in both read- and modify-class tool calls is
 reported only under `<modified-files>` (`:1066-1068`).
+
+**Window re-derivation on model switch.** `model_context_window` is
+auto-derived from the model registry at `Agent::build`. A runtime model
+switch (`replace_provider` / `drain_pending_swap` / `replace_config`)
+re-derives it for the new model via `re_derive_model_context_window`, so
+mid-turn thresholds and the post-turn ceiling track the *new* model's
+window for the rest of the session. An explicit override
+(`SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW` or `[context] model_context_window`)
+always wins and survives the switch.
+
+**Editing the knobs.** Every `[context]` field is editable in the
+interactive `/config → Context & Compaction` screen (all `NextPrompt`
+tier), in addition to `squeezy.toml` and the `SQUEEZY_CONTEXT_*` env vars.
+The section's `triggers` info row shows the resolved window and the token
+points each tier fires at for the active model.
 
 ## Cost intuition
 

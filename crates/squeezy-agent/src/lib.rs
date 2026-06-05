@@ -98,7 +98,8 @@ use context_compaction::{
 };
 use cost_broker::{
     CostBroker, format_cap_reached_reason, format_pressure_gate_reason,
-    format_round_input_gate_reason, llm_request_input_bytes, round_input_gate_status,
+    format_round_input_gate_reason, llm_request_input_bytes, llm_request_overhead_bytes,
+    round_input_gate_status,
 };
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use micro_compaction::{
@@ -1297,6 +1298,18 @@ pub struct Agent {
     /// `Arc<StdMutex<_>>` so the streaming loop can engage the sticky
     /// window after an escalation and the next `start_turn` picks it up.
     routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
+    /// Tokens of fixed request overhead — system instructions plus serialized
+    /// tool schemas — measured on the most recent assembled request and carried
+    /// into the next turn's post-turn compaction gate. `estimate_context` only
+    /// walks conversation items, so without this the gate under-counts the real
+    /// input size on tool-heavy configs (finding #2).
+    last_request_overhead_tokens: Arc<AtomicU64>,
+    /// The explicitly-configured `model_context_window` (from `squeezy.toml` or
+    /// `SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW`), captured *before* `build()`
+    /// auto-derives a value from the model registry. A runtime model switch
+    /// re-derives the window for the new model via `re_derive_model_context_window`
+    /// while still letting an explicit override win (finding #1).
+    configured_model_context_window: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1314,6 +1327,15 @@ pub struct PendingConfigSwap {
     pub config: AppConfig,
     pub provider: Option<Arc<dyn LlmProvider>>,
     pub display_note: Option<String>,
+}
+
+/// Look up a model's registered context-window size from the model registry.
+/// Shared by `build()` (initial derivation) and `re_derive_model_context_window`
+/// (runtime model switch) so both compute the window the same way (finding #1).
+fn derive_model_context_window(provider: &dyn LlmProvider, model: &str) -> Option<u64> {
+    squeezy_llm::model_info_for(provider.name(), model)
+        .and_then(|info| info.limits)
+        .map(|limits| limits.context_window_tokens)
 }
 
 impl Agent {
@@ -1603,15 +1625,15 @@ impl Agent {
         // transcript to the provider every round (quadratic in tool calls;
         // billed as cache-write on Anthropic). Derive the window from the
         // model's own registered context size so compaction can do its job.
-        // Explicit config (`squeezy.toml` / `SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW`)
-        // still wins via the `is_none()` guard.
-        if config.context_compaction.model_context_window.is_none()
-            && let Some(window) = squeezy_llm::model_info_for(provider.name(), &config.model)
-                .and_then(|info| info.limits)
-                .map(|limits| limits.context_window_tokens)
-        {
-            config.context_compaction.model_context_window = Some(window);
-        }
+        //
+        // Capture the operator's explicit window (if any) *before* deriving so
+        // a runtime model switch can re-derive for the new model while still
+        // letting an explicit override win (finding #1). Explicit config
+        // (`squeezy.toml` / `SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW`) takes
+        // precedence; otherwise we fall back to the registry value.
+        let configured_model_context_window = config.context_compaction.model_context_window;
+        config.context_compaction.model_context_window = configured_model_context_window
+            .or_else(|| derive_model_context_window(provider.as_ref(), &config.model));
         let output_config = ToolOutputConfig {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
             preview_bytes: config.tool_preview_bytes,
@@ -1839,6 +1861,8 @@ impl Agent {
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
+            last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
+            configured_model_context_window,
         };
         if let Some(log) = agent.session_log.as_ref() {
             agent.telemetry.set_store_session_id(log.session_id());
@@ -1926,6 +1950,12 @@ impl Agent {
         let workspace_changed = next.workspace_root != self.config.workspace_root;
         self.schedule_mcp_servers_reload_if_changed(&next);
         self.config = next;
+        // A reloaded config carries the operator's explicit window (or None) —
+        // it is not registry-derived (only `build()` derives). Refresh the
+        // explicit baseline, then re-derive for the active model so the window
+        // stays correct after a settings reload that changes the model (#1).
+        self.configured_model_context_window = self.config.context_compaction.model_context_window;
+        self.re_derive_model_context_window();
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
             // A catalog rebuild must also rebuild the hook registry: the old
@@ -2036,6 +2066,19 @@ impl Agent {
     pub fn replace_provider(&mut self, next: Arc<dyn LlmProvider>, model: String) {
         self.provider = next;
         self.config.model = model;
+        self.re_derive_model_context_window();
+    }
+
+    /// Re-derive `model_context_window` for the active provider/model after a
+    /// runtime switch (finding #1). An explicit operator override always wins;
+    /// otherwise the window is recomputed from the model registry so mid-turn
+    /// micro/full thresholds track the *new* model's window for the rest of the
+    /// session. Without this, `build()` baked in the *old* model's window and
+    /// the swap paths never recomputed it.
+    fn re_derive_model_context_window(&mut self) {
+        self.config.context_compaction.model_context_window = self
+            .configured_model_context_window
+            .or_else(|| derive_model_context_window(self.provider.as_ref(), &self.config.model));
     }
 
     /// Queue a NextPrompt-tier swap. Drained by `drain_pending_swap()` at the
@@ -2067,6 +2110,12 @@ impl Agent {
         if let Some(provider) = swap.provider.clone() {
             self.provider = provider;
         }
+        // The swapped-in config carries the operator's explicit window (or
+        // None) — it is not registry-derived. Refresh the explicit baseline,
+        // then re-derive for the (possibly new) model/provider so mid-turn
+        // thresholds track the new window for the rest of the session (#1).
+        self.configured_model_context_window = self.config.context_compaction.model_context_window;
+        self.re_derive_model_context_window();
         if skills_changed || workspace_changed {
             self.rebuild_skills_catalog();
             self.rebuild_hooks_registry();
@@ -4024,6 +4073,7 @@ impl Agent {
         let routing_state = self.routing_state.clone();
         let active_turn = self.active_turn.clone();
         set_active_turn(&active_turn, turn_id, cancel.clone());
+        let last_request_overhead_tokens = self.last_request_overhead_tokens.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -4183,6 +4233,7 @@ impl Agent {
                     transient_input_items,
                     routing_state,
                     active_turn,
+                    last_request_overhead_tokens,
                 }
                 .run(task_title.clone())
                 .await;
@@ -5203,6 +5254,11 @@ struct TurnRuntime {
     transient_input_items: Vec<LlmInputItem>,
     routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
     active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
+    /// Shared with the owning `Agent`: tokens of fixed request overhead
+    /// (instructions + tool schemas) from the most recent assembled request,
+    /// carried across turns so the post-turn compaction gate does not
+    /// under-count the real input size (finding #2).
+    last_request_overhead_tokens: Arc<AtomicU64>,
 }
 
 impl TurnRuntime {
@@ -5928,12 +5984,24 @@ impl TurnRuntime {
         // mirrors the report's before/after counts so observers can
         // measure the rewrite. The no-hook path stays allocation-free.
         let pre_compaction_estimate = estimate_context(&conversation);
-        let keep = self.config.context_compaction.recent_items.max(1);
-        let compaction_likely = self.config.context_compaction.enabled
-            && pre_compaction_estimate.items >= self.config.context_compaction.min_items
-            && pre_compaction_estimate.items > keep
-            && pre_compaction_estimate.estimated_tokens
-                >= self.config.context_compaction.estimated_tokens;
+        // Mirror the post-turn gate in `maybe_compact_conversation` so the
+        // PreCompact hook fires exactly when compaction will run: window-aware
+        // ceiling, instruction/tool overhead folded in, and the high-water
+        // `min_items` bypass with its matching `recent_items` cap.
+        let cc = &self.config.context_compaction;
+        let overhead_tokens = self.last_request_overhead_tokens.load(Ordering::Relaxed);
+        let pre_compaction_tokens = pre_compaction_estimate
+            .estimated_tokens
+            .saturating_add(overhead_tokens);
+        let over_high_water = pre_compaction_tokens >= cc.min_items_bypass_threshold();
+        let mut effective_keep = cc.recent_items.max(1);
+        if over_high_water {
+            effective_keep = effective_keep.min(pre_compaction_estimate.items / 2).max(1);
+        }
+        let compaction_likely = cc.enabled
+            && (pre_compaction_estimate.items >= cc.min_items || over_high_water)
+            && pre_compaction_estimate.items > effective_keep
+            && pre_compaction_tokens >= cc.post_turn_token_ceiling();
         if compaction_likely {
             self.dispatch_pre_compact(pre_compaction_estimate.estimated_tokens);
         }
@@ -5947,6 +6015,7 @@ impl TurnRuntime {
             &self.redactor,
             &self.config,
             ContextCompactionTrigger::Auto,
+            overhead_tokens,
         )
         .await
         {
@@ -6638,6 +6707,14 @@ impl TurnRuntime {
             let request_model = Arc::clone(&request.model);
             let mut effective_model = Arc::clone(&request_model);
             let request_input_bytes = llm_request_input_bytes(&request);
+            // Carry the fixed request overhead (system instructions + tool
+            // schemas) into the next turn's post-turn compaction gate so it
+            // does not under-count the real input size (finding #2). The
+            // bytes→tokens conversion mirrors `estimate_context`.
+            self.last_request_overhead_tokens.store(
+                llm_request_overhead_bytes(&request).saturating_add(3) / 4,
+                Ordering::Relaxed,
+            );
             self.record_replay_request(&request);
             let mut stream = self
                 .provider
@@ -15864,15 +15941,9 @@ fn mid_turn_compaction_will_fire(
     if !config.context_compaction.enabled_mid_turn {
         return false;
     }
-    let Some(window) = config.context_compaction.model_context_window else {
+    let Some(threshold) = config.context_compaction.mid_turn_full_threshold() else {
         return false;
     };
-    if window == 0 {
-        return false;
-    }
-    let threshold = window
-        .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
-        .saturating_div(100);
     let observed =
         last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
     observed >= threshold

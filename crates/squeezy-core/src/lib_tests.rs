@@ -5343,3 +5343,56 @@ fn merge_cost_snapshot_aggregates_reasoning_output_tokens() {
     merge_cost_snapshot(&mut total, &next);
     assert_eq!(total.reasoning_output_tokens, Some(18));
 }
+
+fn compaction_config_with_window(window: Option<u64>) -> ContextCompactionConfig {
+    ContextCompactionConfig {
+        model_context_window: window,
+        ..ContextCompactionConfig::default()
+    }
+}
+
+#[test]
+fn post_turn_ceiling_caps_flat_budget_on_small_windows() {
+    // 32K window: min(60K, 80% × 32K = 25.6K) = 25_600 — fixes finding #4.
+    let cfg = compaction_config_with_window(Some(32_000));
+    assert_eq!(cfg.post_turn_token_ceiling(), 25_600);
+}
+
+#[test]
+fn post_turn_ceiling_preserves_flat_budget_on_large_windows() {
+    // 200K window: min(60K, 160K) = 60K — cost-thesis behavior unchanged.
+    let big = compaction_config_with_window(Some(200_000));
+    assert_eq!(big.post_turn_token_ceiling(), 60_000);
+    // 1M window: min(60K, 800K) = 60K.
+    let huge = compaction_config_with_window(Some(1_000_000));
+    assert_eq!(huge.post_turn_token_ceiling(), 60_000);
+}
+
+#[test]
+fn post_turn_ceiling_falls_back_to_flat_budget_without_window() {
+    let cfg = compaction_config_with_window(None);
+    assert_eq!(cfg.post_turn_token_ceiling(), 60_000);
+    // A zero window is treated as unknown.
+    let zero = compaction_config_with_window(Some(0));
+    assert_eq!(zero.post_turn_token_ceiling(), 60_000);
+}
+
+#[test]
+fn mid_turn_thresholds_track_window_fractions() {
+    let cfg = compaction_config_with_window(Some(200_000));
+    assert_eq!(cfg.mid_turn_full_threshold(), Some(160_000)); // 80%
+    assert_eq!(cfg.mid_turn_micro_threshold(), Some(120_000)); // 60%
+    let dormant = compaction_config_with_window(None);
+    assert_eq!(dormant.mid_turn_full_threshold(), None);
+    assert_eq!(dormant.mid_turn_micro_threshold(), None);
+}
+
+#[test]
+fn min_items_bypass_threshold_uses_high_water_or_double_budget() {
+    // 90% of a 200K window.
+    let windowed = compaction_config_with_window(Some(200_000));
+    assert_eq!(windowed.min_items_bypass_threshold(), 180_000);
+    // No window ⇒ 2 × estimated_tokens.
+    let flat = compaction_config_with_window(None);
+    assert_eq!(flat.min_items_bypass_threshold(), 120_000);
+}

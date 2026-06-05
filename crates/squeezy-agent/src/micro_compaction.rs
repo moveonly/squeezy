@@ -131,12 +131,7 @@ pub(crate) fn maybe_micro_compact_mid_turn(
     if !cc.enabled_mid_turn || !cc.micro_compaction_enabled {
         return None;
     }
-    let window = cc.model_context_window?;
-    if window == 0 {
-        return None;
-    }
-    let percent = cc.micro_compaction_threshold_percent.min(100) as u64;
-    let threshold = window.saturating_mul(percent).saturating_div(100);
+    let threshold = cc.mid_turn_micro_threshold()?;
     let before = estimate_context(conversation);
     let observed = last_total_tokens.unwrap_or(before.estimated_tokens);
     if observed < threshold {

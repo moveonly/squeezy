@@ -13860,3 +13860,30 @@ fn subagent_view_renders_tool_results_as_rail_cards() {
     // The lifecycle breadcrumb threads the rail too (a ◦ note).
     assert!(view.contains("├─◦ explore subagent started"), "{view}");
 }
+
+#[test]
+fn context_compaction_threshold_anchors_to_resolved_post_turn_ceiling() {
+    // Small window: the nudge/status anchor tracks the window-derived ceiling
+    // (80% of 32K = 25.6K), not the flat 60K budget (finding #5).
+    let mut config = test_config(SessionMode::Build);
+    config.context_compaction.model_context_window = Some(32_000);
+    let app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+    assert_eq!(app.context_compaction_threshold, 25_600);
+
+    // Unknown window: falls back to the flat 60K budget.
+    let flat = test_config(SessionMode::Build);
+    let flat_app = TuiApp::new_with_clipboard(
+        "openai",
+        &flat,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+    assert_eq!(flat_app.context_compaction_threshold, 60_000);
+}

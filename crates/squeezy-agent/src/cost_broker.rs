@@ -470,6 +470,19 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
     total
 }
 
+/// Byte size of the request's *fixed overhead* — the system instructions and
+/// serialized tool schemas that ride along on every request but are NOT part
+/// of the conversation items. `estimate_context` only walks conversation
+/// items, so the post-turn compaction gate adds this overhead to avoid
+/// under-counting the real request size (finding #2).
+pub(crate) fn llm_request_overhead_bytes(request: &LlmRequest) -> u64 {
+    let mut total: u64 = request.instructions.len() as u64;
+    for spec in request.tools.iter() {
+        total = total.saturating_add(serialized_json_len(spec));
+    }
+    total
+}
+
 #[derive(Debug, Default)]
 struct JsonByteCounter {
     bytes: u64,
