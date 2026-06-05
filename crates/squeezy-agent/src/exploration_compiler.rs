@@ -85,15 +85,16 @@ impl ExplorationTurnState {
 
 pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
     let plan = compile_exploration_plan_inner(input)?;
-    // Hierarchy intent is exempt from the file-path gate below: it only
-    // matches on tight subclass/implementors/extends keywords, so a
-    // hierarchy plan is exactly the case where firing `hierarchy(<base>)`
-    // upfront is high-value — the model would otherwise grep across a
-    // whole folder subtree (the dart Flutter benchmark walked 1.5 GB
-    // looking for `WidgetsBindingObserver` mixers). The bare-token
-    // false-positives that motivated removing RepoMap/RouteDiscovery
-    // exemptions do not apply here: "subclass", "that mixes in", and
-    // friends are intent-specific phrases.
+    // Hierarchy (inheritance) intent is exempt from the file-path gate
+    // below: it only matches on tight subclass/implementors/extends
+    // keywords, so it is exactly the case where firing the inheritance
+    // `decl_search(attribute="base:<base>|iface:<base>|mixin:<base>",
+    // transitive=true)` upfront is high-value — the model would otherwise
+    // grep across a whole folder subtree (the dart Flutter benchmark
+    // walked 1.5 GB looking for `WidgetsBindingObserver` mixers). The
+    // bare-token false-positives that motivated removing
+    // RepoMap/RouteDiscovery exemptions do not apply here: "subclass",
+    // "that mixes in", and friends are intent-specific phrases.
     if plan.intent == ExplorationIntent::Hierarchy {
         return Some(plan);
     }
@@ -213,27 +214,37 @@ fn compile_exploration_plan_inner(input: &str) -> Option<ExplorationPlan> {
     if hierarchy_intent(&lowered)
         && let Some(query) = symbolic_query.clone()
     {
-        // A "subclasses of Foo" / "implementors of Trait" question is
-        // exactly what `hierarchy` answers — the model would otherwise
-        // grep for `extends Foo` / `: Foo` / etc. across the tree, which
-        // is both noisier and language-specific. Pre-issuing the graph
-        // call lets the model see the canonical subclass list in one
-        // round and decide whether to drill into individual subclasses.
+        // A "subclasses of Foo" / "implementors of Trait" question is an
+        // INHERITANCE query, which `decl_search` — not `hierarchy` —
+        // answers. `hierarchy` returns containment (file → module → class
+        // → members); inheritance/subtype enumeration is served by
+        // `decl_search` with `attribute="base:<T>|iface:<T>|mixin:<T>"`
+        // (extends / implements / Dart `with`), and `transitive=true` so
+        // the result is the full transitive subtype closure rather than
+        // only the direct subtypes. The model would otherwise grep for
+        // `extends Foo` / `: Foo` / etc. across the tree, which is both
+        // noisier and language-specific. Pre-issuing this one call lets it
+        // see the canonical subtype list in a single round and decide
+        // whether to drill into individual subtypes.
         //
-        // Hierarchy is checked BEFORE RouteDiscovery because
-        // `route_intent` matches anywhere `"route"` appears as a
-        // substring (lifecycle hook names like `didPopRoute` /
-        // `didPushRoute` trigger it on the dart Flutter benchmark) and
-        // would otherwise win even when the prompt is unambiguously a
-        // subclass query. Hierarchy keywords are tight enough not to
-        // false-positive.
+        // Checked BEFORE RouteDiscovery because `route_intent` matches
+        // anywhere `"route"` appears as a substring (lifecycle hook names
+        // like `didPopRoute` / `didPushRoute` trigger it on the dart
+        // Flutter benchmark) and would otherwise win even when the prompt
+        // is unambiguously a subclass query. Inheritance keywords are
+        // tight enough not to false-positive.
+        let attribute = format!("base:{query}|iface:{query}|mixin:{query}");
         return Some(ExplorationPlan {
             intent: ExplorationIntent::Hierarchy,
             query: Some(query.clone()),
             calls: vec![tool_call(
-                "planner_hierarchy",
-                "hierarchy",
-                json!({"query": query, "max_results": PLANNER_GRAPH_MAX_RESULTS}),
+                "planner_decl_search",
+                "decl_search",
+                json!({
+                    "attribute": attribute,
+                    "transitive": true,
+                    "max_results": PLANNER_GRAPH_MAX_RESULTS,
+                }),
             )],
             guard_raw_reads: true,
         });

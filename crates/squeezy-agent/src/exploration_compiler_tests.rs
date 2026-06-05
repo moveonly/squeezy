@@ -277,7 +277,12 @@ fn planner_calls_use_the_shared_graph_max_results_constant() {
 }
 
 #[test]
-fn hierarchy_intent_compiles_to_hierarchy_call() {
+fn hierarchy_intent_compiles_to_decl_search_inheritance_call() {
+    // Bug #6: a "subclasses of Foo" / "implementors of Trait" question is an
+    // INHERITANCE query. It must route to `decl_search` with an inheritance
+    // `attribute` (base:/iface:/mixin:) and `transitive=true` — the full
+    // subtype closure — NOT to `hierarchy`, which answers CONTAINMENT
+    // (file/module structure) only.
     let plan =
         compile_exploration_plan("Find every subclass of WidgetsBindingObserver").expect("plan");
     assert_eq!(plan.intent, ExplorationIntent::Hierarchy);
@@ -287,8 +292,35 @@ fn hierarchy_intent_compiles_to_hierarchy_call() {
             .iter()
             .map(|call| call.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["hierarchy"],
-        "subclass query should issue a single hierarchy call",
+        vec!["decl_search"],
+        "subclass query should issue a single decl_search call, not hierarchy",
+    );
+
+    let call = &plan.calls[0];
+    assert_eq!(call.name, "decl_search");
+    // It must NOT be a hierarchy (containment) call.
+    assert_ne!(call.name, "hierarchy");
+    assert_eq!(
+        call.arguments.get("attribute").and_then(|v| v.as_str()),
+        Some(
+            "base:WidgetsBindingObserver|iface:WidgetsBindingObserver|mixin:WidgetsBindingObserver"
+        ),
+        "attribute must enumerate extends/implements/mixin subtypes",
+    );
+    assert_eq!(
+        call.arguments.get("transitive").and_then(|v| v.as_bool()),
+        Some(true),
+        "transitive=true returns the full subtype closure",
+    );
+    // The planner does not pass the base name as a `query` — inheritance is
+    // expressed via `attribute`, per the decl_search spec.
+    assert!(
+        call.arguments.get("query").is_none(),
+        "base name belongs in `attribute`, not `query`",
+    );
+    assert_eq!(
+        call.arguments.get("max_results").and_then(|v| v.as_u64()),
+        Some(PLANNER_GRAPH_MAX_RESULTS as u64),
     );
     assert!(plan.guard_raw_reads);
 }
@@ -342,8 +374,8 @@ fn multi_cap_type_name_beats_sentence_initial_noun() {
     // Separate classes with a blank line.") — both pass
     // `looks_like_rust_symbol` (both start with uppercase), but only one
     // is a real type. Prefer the multi-uppercase CamelCase token so the
-    // planner fires `hierarchy(RequiresMessageQueue)`, not
-    // `hierarchy(Separate)`.
+    // planner fires the inheritance `decl_search` on
+    // `RequiresMessageQueue`, not `Separate`.
     let plan = compile_exploration_plan(
         "find every subclass of RequiresMessageQueue declared in akka-actor. \
          Output as a list. Separate classes with a blank line.",
@@ -355,9 +387,10 @@ fn multi_cap_type_name_beats_sentence_initial_noun() {
 
 #[test]
 fn hierarchy_intent_bypasses_file_path_gate() {
-    // Hierarchy queries fire `hierarchy(<base>)` upfront — the highest
-    // value preflight squeezy has, because the alternative is the
-    // model grepping across a whole folder subtree. The dart Flutter
+    // Inheritance queries fire an inheritance `decl_search(<base>)`
+    // upfront — the highest value preflight squeezy has, because the
+    // alternative is the model grepping across a whole folder subtree.
+    // The dart Flutter
     // benchmark mentioned `binding.dart` twice in slightly different
     // forms, the path counter saw two distinct file mentions, the gate
     // suppressed the planner, and recall floated 50–94 % across runs.

@@ -866,10 +866,10 @@ impl SemanticGraph {
             .imports_for_file(&reference.file_id)
             .filter(|import| !crate::is_package_marker_alias(import.alias.as_deref()))
             .any(|import| {
-                if import.is_glob
-                    || !import.span.contains_byte(reference.span.start_byte)
-                    || !import.span.contains_byte(reference.span.end_byte)
-                {
+                // Half-open span containment: the reference must lie fully
+                // inside the import span. A reference whose `end_byte` merely
+                // touches the import's start boundary is not contained.
+                if import.is_glob || !import.span.contains_span(reference.span) {
                     return false;
                 }
                 let alias_or_name = import
@@ -1418,10 +1418,9 @@ impl SemanticGraph {
                 matches!(edge.kind, EdgeKind::Calls | EdgeKind::InvokesMacro)
                     && edge
                         .span
-                        .map(|span| {
-                            span.contains_byte(reference.span.start_byte)
-                                && span.contains_byte(reference.span.end_byte)
-                        })
+                        // Half-open containment: the reference must sit fully
+                        // inside the edge span, not merely touch its boundary.
+                        .map(|span| span.contains_span(reference.span))
                         .unwrap_or(false)
                     && last_path_segment_str(&edge.target_text)
                         == last_path_segment_str(&reference.text)
