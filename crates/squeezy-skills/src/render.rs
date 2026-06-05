@@ -279,21 +279,78 @@ fn metrics_for_active_skills_render(
         return metrics;
     };
 
+    let rendered_skills = rendered_skill_headers(rendered);
     for skill in skills {
         let name = xml_escape(&skill.summary.name);
-        let needle = format!("<skill name=\"{name}\"");
-        if let Some(start) = rendered.find(&needle) {
+        if let Some(rendered_skill) = rendered_skills
+            .iter()
+            .find(|rendered_skill| rendered_skill.name == name)
+        {
             metrics.included += 1;
-            let rest = &rendered[start..];
-            if let Some(tag_end) = rest.find('>')
-                && rest[..tag_end].contains("truncated=\"true\"")
-            {
+            if rendered_skill.truncated {
                 metrics.body_truncated += 1;
             }
         }
     }
     metrics.dropped = metrics.total.saturating_sub(metrics.included);
     metrics
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedSkillHeader {
+    name: String,
+    truncated: bool,
+}
+
+fn rendered_skill_headers(rendered: &str) -> Vec<RenderedSkillHeader> {
+    let Some(mut pos) = rendered.find("<active_skills>") else {
+        return Vec::new();
+    };
+    pos += "<active_skills>".len();
+    if rendered[pos..].starts_with('\n') {
+        pos += 1;
+    }
+
+    let mut headers = Vec::new();
+    while pos < rendered.len() {
+        if rendered[pos..].starts_with("</active_skills>") {
+            break;
+        }
+        if rendered[pos..].starts_with('\n') {
+            pos += 1;
+            continue;
+        }
+        if !rendered[pos..].starts_with("<skill ") {
+            break;
+        }
+
+        let Some(tag_end_rel) = rendered[pos..].find('>') else {
+            break;
+        };
+        let tag_end = pos + tag_end_rel;
+        let tag = &rendered[pos..=tag_end];
+        if let Some(name) = tag_attr(tag, "name") {
+            headers.push(RenderedSkillHeader {
+                name: name.to_string(),
+                truncated: tag_attr(tag, "truncated") == Some("true"),
+            });
+        }
+
+        let content_start = tag_end + 1;
+        let Some(close_rel) = rendered[content_start..].find("\n</skill>") else {
+            break;
+        };
+        pos = content_start + close_rel + "\n</skill>".len();
+    }
+
+    headers
+}
+
+fn tag_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')?;
+    Some(&tag[start..start + end])
 }
 
 fn wrap_blocks(blocks: &[String]) -> Option<String> {

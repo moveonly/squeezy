@@ -83,6 +83,44 @@ fn metrics_count_dropped_when_aggregate_overflows() {
 }
 
 #[test]
+fn metrics_do_not_count_name_prefix_as_included() {
+    let skills = vec![skill("alpha", "alpha body"), skill("alpha-extra", "body")];
+    let rendered = concat!(
+        "<active_skills>\n",
+        "<skill name=\"alpha-extra\" source=\"project\" truncated=\"true\" reason=\"aggregate_budget\">\n",
+        "<description></description>\n",
+        "</skill>\n",
+        "</active_skills>"
+    );
+    let metrics = metrics_for_active_skills_render(&skills, Some(rendered));
+
+    assert_eq!(metrics.total, 2);
+    assert_eq!(metrics.included, 1);
+    assert_eq!(metrics.dropped, 1);
+    assert_eq!(metrics.body_truncated, 1);
+}
+
+#[test]
+fn metrics_ignore_fake_skill_tags_inside_body() {
+    let skills = vec![skill("alpha", "alpha body"), skill("beta", "beta body")];
+    let rendered = concat!(
+        "<active_skills>\n",
+        "<skill name=\"alpha\" source=\"project\">\n",
+        "<content>\n",
+        "not a real top-level skill: <skill name=\"beta\" truncated=\"true\">\n",
+        "</content>\n",
+        "</skill>\n",
+        "</active_skills>"
+    );
+    let metrics = metrics_for_active_skills_render(&skills, Some(rendered));
+
+    assert_eq!(metrics.total, 2);
+    assert_eq!(metrics.included, 1);
+    assert_eq!(metrics.dropped, 1);
+    assert_eq!(metrics.body_truncated, 0);
+}
+
+#[test]
 fn metrics_zero_when_inputs_empty() {
     let (rendered, metrics) =
         render_active_skills_with_metrics(&[], /* budget */ 4_000, /* cap */ 16_000);
