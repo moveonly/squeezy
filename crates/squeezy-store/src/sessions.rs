@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -62,6 +62,21 @@ pub const GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// [`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`] and stops rewriting until it grows
 /// again.
 pub const GLOBAL_INDEX_MAX_ENTRIES: usize = 400;
+
+static GLOBAL_INDEX_CACHE: OnceLock<StdMutex<Option<GlobalIndexCache>>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalIndexFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct GlobalIndexCache {
+    path: PathBuf,
+    fingerprint: GlobalIndexFingerprint,
+    entries: Vec<GlobalSessionIndexEntry>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -250,6 +265,14 @@ impl SessionStore {
         if !path.exists() {
             return Vec::new();
         }
+        let initial_fingerprint = fs::metadata(&path)
+            .ok()
+            .map(|metadata| global_index_fingerprint(&metadata));
+        if let Some(fingerprint) = &initial_fingerprint
+            && let Some(entries) = cached_global_index(&path, fingerprint)
+        {
+            return entries;
+        }
         let Ok(file) = fs::File::open(&path) else {
             return Vec::new();
         };
@@ -301,6 +324,7 @@ impl SessionStore {
             let _ = rewrite_global_index(&path, &ordered);
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+        cache_global_index(&path, &entries);
         entries
     }
 
@@ -2852,6 +2876,46 @@ fn skip_global_index_for_test_workspace(workspace_root: &str) -> bool {
         .map(|canonical| canonical.starts_with(&temp_dir))
         .unwrap_or(false);
     !home_under_temp
+}
+
+fn global_index_cache() -> &'static StdMutex<Option<GlobalIndexCache>> {
+    GLOBAL_INDEX_CACHE.get_or_init(|| StdMutex::new(None))
+}
+
+fn global_index_fingerprint(metadata: &fs::Metadata) -> GlobalIndexFingerprint {
+    GlobalIndexFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    }
+}
+
+fn cached_global_index(
+    path: &Path,
+    fingerprint: &GlobalIndexFingerprint,
+) -> Option<Vec<GlobalSessionIndexEntry>> {
+    let cache = global_index_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let cache = cache.as_ref()?;
+    if cache.path == path && cache.fingerprint == *fingerprint {
+        Some(cache.entries.clone())
+    } else {
+        None
+    }
+}
+
+fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let mut cache = global_index_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *cache = Some(GlobalIndexCache {
+        path: path.to_path_buf(),
+        fingerprint: global_index_fingerprint(&metadata),
+        entries: entries.to_vec(),
+    });
 }
 
 /// Replace the global session index file with the supplied entries via a

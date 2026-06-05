@@ -3670,3 +3670,57 @@ fn global_index_caps_to_most_recent_and_compacts_oversized_file() {
         );
     });
 }
+
+#[test]
+fn global_index_cache_invalidates_when_append_changes_file() {
+    let home = temp_root("global-index-cache");
+    with_home(&home, || {
+        let first = GlobalSessionIndexEntry {
+            session_id: "session-one".to_string(),
+            cwd: "/Users/dev/projects/one".to_string(),
+            workspace_root: "/Users/dev/projects/one".to_string(),
+            repo_root: None,
+            title: Some("first".to_string()),
+            display_name: None,
+            started_at_ms: 1,
+            last_event_at_ms: 1,
+            turn_count: 1,
+            resume_available: true,
+        };
+        SessionStore::append_global_index_entry(&first);
+        let listed = SessionStore::list_global_index();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.session_id == first.session_id),
+            "first append should be visible in the listed index: {listed:?}"
+        );
+
+        let second = GlobalSessionIndexEntry {
+            session_id: "session-two".to_string(),
+            cwd: "/Users/dev/projects/two".to_string(),
+            workspace_root: "/Users/dev/projects/two".to_string(),
+            repo_root: None,
+            title: Some("second".to_string()),
+            display_name: None,
+            started_at_ms: 2,
+            last_event_at_ms: 2,
+            turn_count: 1,
+            resume_available: true,
+        };
+        SessionStore::append_global_index_entry(&second);
+        let listed = SessionStore::list_global_index();
+        let first_pos = listed
+            .iter()
+            .position(|entry| entry.session_id == first.session_id)
+            .expect("first session should still be visible");
+        let second_pos = listed
+            .iter()
+            .position(|entry| entry.session_id == second.session_id)
+            .expect("second append should invalidate the unchanged-file cache");
+        assert!(
+            second_pos < first_pos,
+            "local entries should preserve newest-first order after cache invalidation: {listed:?}"
+        );
+    });
+}

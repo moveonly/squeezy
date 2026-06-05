@@ -737,13 +737,10 @@ async fn run() -> squeezy_core::Result<()> {
             ));
         }
         // Recognise the `!!` exclude-from-context prefix on each resolved
-        // prompt before we hand them to the agent loop. Print mode is the
-        // CLI sibling of the TUI bang-bang shortcut; the runtime side is
-        // pending the F01-exclude-from-context-bang-bang sibling work
-        // that adds an Agent-level `local_shell_command(input,
-        // exclude_from_context=true)` entry point, so for now `!!cmd`
-        // prompts get a visible deferral notice and are intentionally
-        // skipped from the LLM transcript.
+        // prompt before we hand them to the agent loop. Print mode feeds
+        // those prompts back through the same local-shell turn path as the
+        // TUI so the command executes while staying out of the LLM-facing
+        // conversation.
         let typed_prompts: Vec<print_mode::PromptInput> = prompts
             .into_iter()
             .map(print_mode::classify_prompt)
@@ -2860,7 +2857,7 @@ async fn run_prompts(
 /// Walk the resolved print-mode prompts and drive each one through the
 /// agent, honoring the per-prompt `exclude_from_context` flag on the way.
 /// Extracted from `run_prompts` so `main_tests.rs` can exercise the `!!`
-/// skip-the-agent semantic against a scripted provider without paying
+/// local-shell semantic against a scripted provider without paying
 /// the cost of building a real session log root.
 async fn pump_prompts<O, E>(
     agent: &Agent,
@@ -2874,65 +2871,13 @@ where
     E: Write,
 {
     for prompt in prompts {
-        if prompt.exclude_from_context {
-            announce_excluded_prompt(&prompt.content, format, stdout, stderr)?;
-            continue;
-        }
-        let rx = agent.start_turn(prompt.content, CancellationToken::new());
+        let input = if prompt.exclude_from_context {
+            format!("!!{}", prompt.content)
+        } else {
+            prompt.content
+        };
+        let rx = agent.start_turn(input, CancellationToken::new());
         pump_prompt_events(rx, format, stdout, stderr).await?;
-    }
-    Ok(())
-}
-
-/// Surface a `!!`-prefixed print-mode prompt without dispatching it to
-/// the agent.
-///
-/// The runtime side of this flag — actually executing the command via a
-/// shell-tool entry point that marks the result as
-/// `exclude_from_context = true` — depends on the sibling
-/// F01-exclude-from-context-bang-bang work. Until that
-/// lands, the print-mode bang-bang flow:
-///
-/// * recognises the prefix at argument-parse time so the rest of the
-///   `--prompt` UX (mention expansion, stdin chaining) keeps working,
-/// * intentionally **does not** call `Agent::start_turn` with the
-///   bang-bang body, which guarantees the command text never reaches the
-///   LLM transcript that subsequent prompts will see, and
-/// * tells the operator (via stderr in text mode, via a typed wire event
-///   in JSON mode) that the local execution is deferred so they aren't
-///   left wondering why their `!!cmd` "did nothing".
-///
-/// When F01-bang lands, swap this stub for a call into the new
-/// agent-level local-shell entry point that records the execution with
-/// `exclude_from_context = true`.
-fn announce_excluded_prompt<O, E>(
-    command: &str,
-    format: PromptFormat,
-    stdout: &mut O,
-    stderr: &mut E,
-) -> squeezy_core::Result<()>
-where
-    O: Write,
-    E: Write,
-{
-    const DEFERRAL_NOTE: &str = "local-shell runtime is pending the F01-bang sibling; the prefix was recognised but the command was not executed and was kept out of the LLM transcript";
-    match format {
-        PromptFormat::Default => {
-            writeln!(
-                stderr,
-                "!! exclude-from-context prompt acknowledged: {command:?}; {DEFERRAL_NOTE}",
-            )?;
-            stderr.flush()?;
-        }
-        PromptFormat::Json => {
-            emit_prompt_event(
-                stdout,
-                &PromptWireEvent::ExcludedFromContext {
-                    command: command.to_string(),
-                    note: DEFERRAL_NOTE.to_string(),
-                },
-            )?;
-        }
     }
     Ok(())
 }
@@ -2954,6 +2899,7 @@ where
 {
     let mut result: squeezy_core::Result<()> = Ok(());
     let mut completed = false;
+    let mut wrote_text_delta = false;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -2965,6 +2911,7 @@ where
                 PromptFormat::Default => {
                     write!(stdout, "{delta}")?;
                     stdout.flush()?;
+                    wrote_text_delta = true;
                 }
                 PromptFormat::Json => {
                     emit_prompt_event(stdout, &PromptWireEvent::TextDelta(delta))?;
@@ -3037,11 +2984,17 @@ where
                 let _ = response_tx.send(RequestUserInputResponse::cancelled());
             }
             AgentEvent::Completed {
-                response_id, cost, ..
+                message,
+                response_id,
+                cost,
+                ..
             } => {
                 completed = true;
                 match format {
                     PromptFormat::Default => {
+                        if !wrote_text_delta && !message.content.is_empty() {
+                            write!(stdout, "{}", message.content)?;
+                        }
                         writeln!(stdout)?;
                         stdout.flush()?;
                         writeln!(
@@ -3112,11 +3065,6 @@ where
 /// help — additive changes are fine, but breaking ones should bump that
 /// disclaimer.
 ///
-/// The `excluded_from_context` variant marks a `!!`-prefixed print-mode
-/// prompt that was recognised at parse time but not dispatched to the
-/// agent. Callers can already observe the distinction between "this
-/// prompt populates the transcript" and "this prompt is intentionally
-/// invisible to subsequent turns".
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum PromptWireEvent {
@@ -3135,10 +3083,6 @@ enum PromptWireEvent {
     },
     Failed(String),
     Cancelled,
-    ExcludedFromContext {
-        command: String,
-        note: String,
-    },
 }
 
 fn emit_prompt_event<W: Write>(

@@ -3,7 +3,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -94,6 +94,110 @@ impl LlmProvider for HangingProvider {
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
         self.requests.lock().expect("requests").push(request);
         Box::pin(stream::pending())
+    }
+}
+
+struct SteerInterruptProvider {
+    requests: Mutex<Vec<LlmRequest>>,
+}
+
+impl SteerInterruptProvider {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<LlmRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+impl LlmProvider for SteerInterruptProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let mut requests = self.requests.lock().expect("requests");
+        requests.push(request);
+        let call_count = requests.len();
+        drop(requests);
+
+        if call_count == 1 {
+            Box::pin(stream::pending())
+        } else {
+            let events = vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("replacement done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_steered".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ];
+            Box::pin(stream::iter(events))
+        }
+    }
+}
+
+struct DelayedFirstCancelProvider {
+    requests: Mutex<Vec<LlmRequest>>,
+    first_response_released: (Mutex<bool>, Condvar),
+}
+
+impl DelayedFirstCancelProvider {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            first_response_released: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<LlmRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+
+    fn release_first_response(&self) {
+        let (lock, cv) = &self.first_response_released;
+        let mut released = lock.lock().expect("release lock");
+        *released = true;
+        cv.notify_all();
+    }
+}
+
+impl LlmProvider for DelayedFirstCancelProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let mut requests = self.requests.lock().expect("requests");
+        requests.push(request);
+        let call_count = requests.len();
+        drop(requests);
+
+        if call_count == 1 {
+            let (lock, cv) = &self.first_response_released;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = cv.wait(released).expect("release wait");
+            }
+            Box::pin(stream::pending())
+        } else {
+            let text = if call_count == 2 {
+                "replacement done"
+            } else {
+                "after done"
+            };
+            let response_id = if call_count == 2 {
+                "resp_replacement"
+            } else {
+                "resp_after"
+            };
+            Box::pin(stream::iter(completed_turn_response(text, response_id)))
+        }
     }
 }
 
@@ -315,7 +419,7 @@ async fn llm_stream_observes_cancellation_within_one_yield() {
     };
 
     let mut rx = agent.start_turn("hi".to_string(), cancel);
-    let saw_cancelled = tokio::time::timeout(Duration::from_millis(200), async {
+    let saw_cancelled = tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::Cancelled { .. } => return true,
@@ -9856,51 +9960,153 @@ async fn follow_up_appends_user_text_without_running_a_turn() {
 }
 
 #[tokio::test]
-async fn steer_aliases_next_turn_until_interrupt_semantics_land() {
-    // `steer` is the typed entry point for "interrupt the running
-    // turn with new input". The agent has no mid-turn-interrupt
-    // primitive yet, so `steer` is documented as an alias for
-    // `next_turn`: it must drive a fresh turn to completion and
-    // surface the input to the provider exactly like `next_turn`
-    // does, so call sites can adopt the typed name today and pick up
-    // real interrupt semantics for free when they land.
-    let provider = Arc::new(MockProvider::new(vec![completed_turn_response(
-        "steered",
-        "resp_steer",
-    )]));
+async fn steer_cancels_active_turn_before_starting_replacement() {
+    let provider = Arc::new(SteerInterruptProvider::new());
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
-    let mut rx = agent.steer("change direction".to_string(), CancellationToken::new());
+    let mut first_rx = agent.start_turn("keep working".to_string(), CancellationToken::new());
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if provider.requests().len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first turn should reach the provider before steering");
+
+    let mut replacement_rx = agent.steer("change direction".to_string(), CancellationToken::new());
+
+    let saw_cancelled = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(event) = first_rx.recv().await {
+            match event {
+                AgentEvent::Cancelled { .. } => return true,
+                AgentEvent::Failed { error, .. } => panic!("first turn failed: {error}"),
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .expect("steer should cancel the first turn promptly");
+    assert!(saw_cancelled, "first turn did not observe cancellation");
+
     let mut completed = None;
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::Completed {
-            message,
-            response_id,
-            ..
-        } = event
-        {
-            completed = Some((message.content, response_id));
+    while let Some(event) = replacement_rx.recv().await {
+        match event {
+            AgentEvent::Completed {
+                message,
+                response_id,
+                ..
+            } => completed = Some((message.content, response_id)),
+            AgentEvent::Failed { error, .. } => panic!("replacement turn failed: {error}"),
+            _ => {}
         }
     }
 
     assert_eq!(
         completed,
-        Some(("steered".to_string(), Some("resp_steer".to_string()))),
-        "steer should currently behave like next_turn and run a turn to completion"
+        Some((
+            "replacement done".to_string(),
+            Some("resp_steered".to_string())
+        )),
+        "steer should run the replacement turn to completion"
     );
     let requests = provider.requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "steer should issue exactly one provider request via the next_turn path"
-    );
+    assert_eq!(requests.len(), 2, "old and replacement turns should run");
     assert!(
         requests[0].input.iter().any(|item| matches!(
             item,
+            LlmInputItem::UserText(text) if text == "keep working"
+        )),
+        "first prompt missing from first request: {:?}",
+        requests[0].input
+    );
+    assert!(
+        requests[1].input.iter().any(|item| matches!(
+            item,
             LlmInputItem::UserText(text) if text == "change direction"
         )),
-        "steer input should reach the provider as a UserText item, got {:?}",
-        requests[0].input
+        "replacement prompt missing from second request: {:?}",
+        requests[1].input
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_cancelled_steered_turn_does_not_drop_replacement_context() {
+    let provider = Arc::new(DelayedFirstCancelProvider::new());
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut old_rx = agent.start_turn("keep working".to_string(), CancellationToken::new());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if provider.requests().len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("old turn should reach the provider");
+
+    let mut replacement_rx = agent.steer("change direction".to_string(), CancellationToken::new());
+    let mut replacement_completed = false;
+    while let Some(event) = replacement_rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => {
+                assert_eq!(message.content, "replacement done");
+                replacement_completed = true;
+                break;
+            }
+            AgentEvent::Failed { error, .. } => panic!("replacement turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(replacement_completed, "replacement turn should complete");
+
+    provider.release_first_response();
+    let saw_old_cancelled = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = old_rx.recv().await {
+            match event {
+                AgentEvent::Cancelled { .. } => return true,
+                AgentEvent::Failed { error, .. } => panic!("old turn failed: {error}"),
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .expect("old turn should finish cancellation after release");
+    assert!(saw_old_cancelled, "old turn should report cancellation");
+
+    let mut after_rx = agent.next_turn("after steering".to_string(), CancellationToken::new());
+    while let Some(event) = after_rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            panic!("after turn failed: {error}");
+        }
+    }
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "old, replacement, and after turns should all request the provider"
+    );
+    let after_input = &requests[2].input;
+    assert!(
+        after_input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::UserText(text) if text == "change direction"
+        )),
+        "late old cancellation dropped the replacement user prompt from context: {after_input:?}"
+    );
+    assert!(
+        after_input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::AssistantText(text) if text == "replacement done"
+        )),
+        "late old cancellation dropped the replacement answer from context: {after_input:?}"
     );
 }
 

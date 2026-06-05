@@ -23,13 +23,10 @@ use squeezy_core::SqueezyError;
 /// bang-bang shortcut. The user can run `squeezy --prompt "!!cmd"` to
 /// run a side check without polluting the conversation.
 ///
-/// Today the runtime that actually executes `cmd` lives behind the
-/// F01-exclude-from-context-bang-bang sibling work; until that lands, the
-/// parser still recognises the prefix here and the print-mode pump
-/// announces the deferral instead of forwarding `!!cmd` verbatim into the
-/// agent transcript. That keeps the flag's user-visible promise — "this
-/// prompt does not pollute the conversation context" — intact even on the
-/// minimum surface.
+/// The parser stores the command body without the prefix; the print-mode
+/// pump re-adds `!!` when dispatching to the agent so the same local-shell
+/// path used by the TUI executes the command while keeping the exchange out
+/// of the LLM-facing conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptInput {
     pub content: String,

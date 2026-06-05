@@ -1054,15 +1054,13 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
 }
 
 #[tokio::test]
-async fn pump_prompts_skips_agent_for_bang_bang_prompt_in_text_mode() {
-    // Load-bearing regression for F07-print-mode-exclude-from-context:
-    // a `--prompt "!!cmd"` value must never enter the agent transcript
-    // that follow-on prompts will see. We bake exactly one scripted
-    // response for the *normal* prompt; if the `!!ls ~/.ssh` body
-    // accidentally drove `Agent::start_turn`, the second prompt would
-    // panic in the scripted provider for "scripted response present".
-    // Test passing therefore proves the bang-bang prompt was suppressed
-    // before it reached the agent loop.
+async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
+    // A `--prompt "!!cmd"` value must execute locally while staying out
+    // of the LLM transcript that follow-on prompts will see. We bake
+    // exactly one scripted response for the normal prompt; the quiet
+    // shell command should complete without consuming a provider
+    // response, and the second prompt should not see the command or its
+    // output in context.
     let root = temp_dir("pump-prompts-bang");
 
     let provider = Arc::new(PrintModeScriptedProvider::new(vec![vec![
@@ -1078,7 +1076,7 @@ async fn pump_prompts_skips_agent_for_bang_bang_prompt_in_text_mode() {
     let agent = Agent::new(config, provider.clone());
     let prompts = vec![
         print_mode::PromptInput {
-            content: "ls ~/.ssh".to_string(),
+            content: "printf quiet-bang".to_string(),
             exclude_from_context: true,
         },
         print_mode::PromptInput {
@@ -1103,20 +1101,16 @@ async fn pump_prompts_skips_agent_for_bang_bang_prompt_in_text_mode() {
     let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
 
     assert!(
+        stdout_text.contains("quiet-bang"),
+        "stdout should include the local shell command output; got: {stdout_text:?}"
+    );
+    assert!(
         stdout_text.contains("normal answer"),
         "stdout should still stream the non-! prompt's answer; got: {stdout_text:?}"
     );
     assert!(
-        stderr_text.contains("exclude-from-context prompt acknowledged"),
-        "stderr should announce the !! deferral; got: {stderr_text:?}"
-    );
-    assert!(
-        stderr_text.contains("ls ~/.ssh"),
-        "stderr should echo the suppressed command so the operator sees what was held back; got: {stderr_text:?}"
-    );
-    assert!(
-        stderr_text.contains("F01-bang"),
-        "stderr should name the gating sibling so callers know where the runtime is tracked; got: {stderr_text:?}"
+        stderr_text.contains("tool: shell") && stderr_text.contains("-> ok"),
+        "stderr should show the local shell tool execution; got: {stderr_text:?}"
     );
     assert_eq!(
         provider.captured_request_count(),
@@ -1125,28 +1119,26 @@ async fn pump_prompts_skips_agent_for_bang_bang_prompt_in_text_mode() {
     );
     let user_text = provider.captured_user_text();
     assert!(
-        !user_text.contains("ls ~/.ssh"),
-        "the suppressed `!!cmd` body must never reach the LLM transcript; observed user text: {user_text:?}"
+        !user_text.contains("printf quiet-bang") && !user_text.contains("quiet-bang"),
+        "the quiet bang exchange must never reach the LLM transcript; observed user text: {user_text:?}"
     );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
-async fn pump_prompts_emits_excluded_from_context_wire_event_in_json_mode() {
+async fn pump_prompts_emits_bang_bang_tool_events_in_json_mode() {
     // The JSON wire schema is the public contract callers consume when
-    // they pipe `--prompt --format json`. A `!!cmd` prompt must surface
-    // exactly one `excluded_from_context` event for that index, with the
-    // command body and the deferral note attached, so consumers can
-    // tell "this prompt was intentionally suppressed" apart from
-    // "this prompt completed normally".
+    // they pipe `--prompt --format json`. A `!!cmd` prompt must now look
+    // like a local shell turn: tool start, tool completion, and turn
+    // completion, without a provider request.
     let root = temp_dir("pump-prompts-bang-json");
 
     let provider = Arc::new(PrintModeScriptedProvider::new(Vec::new()));
     let config = print_mode_test_config(root.clone());
     let agent = Agent::new(config, provider.clone());
     let prompts = vec![print_mode::PromptInput {
-        content: "echo secret".to_string(),
+        content: "printf json-bang".to_string(),
         exclude_from_context: true,
     }];
 
@@ -1163,24 +1155,33 @@ async fn pump_prompts_emits_excluded_from_context_wire_event_in_json_mode() {
     .expect("pump completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
-    let mut saw_excluded = false;
+    let mut saw_tool_started = false;
+    let mut saw_tool_completed = false;
+    let mut saw_completed = false;
     for line in stdout_text.lines() {
         let value: serde_json::Value = serde_json::from_str(line)
             .unwrap_or_else(|err| panic!("non-JSON line {line:?}: {err}"));
-        if value["type"] == "excluded_from_context" {
-            saw_excluded = true;
-            assert_eq!(value["data"]["command"], "echo secret");
-            assert!(
-                value["data"]["note"]
-                    .as_str()
-                    .is_some_and(|note| note.contains("F01-bang")),
-                "wire event should name the gating sibling so RPC callers can key off it; got: {value:?}"
-            );
+        match value["type"].as_str() {
+            Some("tool_call_started") => {
+                saw_tool_started = true;
+                assert_eq!(value["data"]["name"], "shell");
+            }
+            Some("tool_call_completed") => {
+                saw_tool_completed = true;
+                assert_eq!(value["data"]["tool_name"], "shell");
+                assert_eq!(value["data"]["status"], "Success");
+                assert_eq!(value["data"]["content"]["stdout"], "json-bang");
+            }
+            Some("completed") => saw_completed = true,
+            Some("excluded_from_context") => {
+                panic!("!! prompt should execute, not emit a deferral event: {value:?}");
+            }
+            _ => {}
         }
     }
     assert!(
-        saw_excluded,
-        "expected a single `excluded_from_context` event for the !! prompt; raw stdout: {stdout_text:?}"
+        saw_tool_started && saw_tool_completed && saw_completed,
+        "expected shell tool and completion events for the !! prompt; raw stdout: {stdout_text:?}"
     );
     assert_eq!(
         provider.captured_request_count(),

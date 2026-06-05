@@ -1241,6 +1241,7 @@ pub struct Agent {
     session_metrics: Arc<Mutex<SessionMetrics>>,
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
+    active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
     ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
@@ -1296,6 +1297,12 @@ pub struct Agent {
     /// `Arc<StdMutex<_>>` so the streaming loop can engage the sticky
     /// window after an escalation and the next `start_turn` picks it up.
     routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
+}
+
+#[derive(Clone)]
+struct ActiveTurn {
+    turn_id: TurnId,
+    cancel: CancellationToken,
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -1815,6 +1822,7 @@ impl Agent {
             session_metrics,
             session_log,
             conversation_state: Arc::new(Mutex::new(conversation_state)),
+            active_turn: Arc::new(StdMutex::new(None)),
             ai_reviewer_state: Arc::new(StdMutex::new(ai_reviewer::AiReviewerState::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
@@ -3949,17 +3957,13 @@ impl Agent {
     /// `steer` should cancel the in-flight turn (if any) and replace
     /// it with a fresh turn whose first user message is `input`.
     ///
-    /// TODO: mid-turn interrupt-with-new-input is not yet implemented.
-    /// The agent currently has no built-in mechanism to cancel the
-    /// running turn from inside this call; cancellation is owned by
-    /// the caller-supplied [`CancellationToken`] for the previous
-    /// `start_turn`/`next_turn` invocation, not by the agent.
-    /// Until that wiring lands, `steer` aliases [`Agent::next_turn`]:
-    /// it starts a new turn but does *not* cancel an in-flight one.
-    /// The caller remains responsible for cancelling the previous
-    /// turn's token before calling `steer` if it wants
-    /// interrupt-then-replace behavior.
+    /// This cancels the latest active turn's token before dispatching
+    /// the replacement turn. Cancellation remains cooperative: provider
+    /// streams and tools observe the token on their normal cancellation
+    /// checkpoints, and the existing turn watchdog aborts the old task
+    /// if it does not finish within the grace window.
     pub fn steer(&self, input: String, cancel: CancellationToken) -> mpsc::Receiver<AgentEvent> {
+        self.cancel_active_turn();
         self.next_turn(input, cancel)
     }
 
@@ -4018,6 +4022,8 @@ impl Agent {
         let hooks = self.hooks.clone();
         let background_tasks = self.background_tasks.clone();
         let routing_state = self.routing_state.clone();
+        let active_turn = self.active_turn.clone();
+        set_active_turn(&active_turn, turn_id, cancel.clone());
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -4035,6 +4041,7 @@ impl Agent {
             panic_session_log,
             panic_redactor,
             panic_telemetry,
+            active_turn.clone(),
             async move {
                 let redacted_input = redactor.redact(&input);
                 let redacted_display_input = if display_input == input {
@@ -4175,6 +4182,7 @@ impl Agent {
                     display_input: redacted_display_input,
                     transient_input_items,
                     routing_state,
+                    active_turn,
                 }
                 .run(task_title.clone())
                 .await;
@@ -4228,6 +4236,53 @@ impl Agent {
 
         rx
     }
+
+    fn cancel_active_turn(&self) {
+        let current = self
+            .active_turn
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(turn) = current
+            && !turn.cancel.is_cancelled()
+        {
+            turn.cancel.cancel();
+        }
+    }
+}
+
+fn set_active_turn(
+    active_turn: &Arc<StdMutex<Option<ActiveTurn>>>,
+    turn_id: TurnId,
+    cancel: CancellationToken,
+) {
+    let mut slot = active_turn
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *slot = Some(ActiveTurn { turn_id, cancel });
+}
+
+fn clear_active_turn_if_current(active_turn: &Arc<StdMutex<Option<ActiveTurn>>>, turn_id: TurnId) {
+    let mut slot = active_turn
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|active| active.turn_id == turn_id)
+    {
+        *slot = None;
+    }
+}
+
+fn active_turn_is_current(
+    active_turn: &Arc<StdMutex<Option<ActiveTurn>>>,
+    turn_id: TurnId,
+) -> bool {
+    active_turn
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .as_ref()
+        .is_some_and(|active| active.turn_id == turn_id)
 }
 
 fn spawn_observed_turn<F>(
@@ -4237,6 +4292,7 @@ fn spawn_observed_turn<F>(
     session_log: Option<SessionHandle>,
     redactor: Arc<Redactor>,
     telemetry: TelemetryClient,
+    active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
     future: F,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -4266,6 +4322,7 @@ where
             }
             let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
         }
+        clear_active_turn_if_current(&active_turn, turn_id);
         done.notify_waiters();
     })
 }
@@ -5144,6 +5201,7 @@ struct TurnRuntime {
     display_input: String,
     transient_input_items: Vec<LlmInputItem>,
     routing_state: Arc<StdMutex<turn_router::RoutingPersistentState>>,
+    active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
 }
 
 impl TurnRuntime {
@@ -8291,6 +8349,9 @@ impl TurnRuntime {
         let assistant = TranscriptItem::assistant_cancelled(plan_mode::strip_proposed_plan_blocks(
             &partial_assistant_text,
         ));
+        if !active_turn_is_current(&self.active_turn, self.turn_id) {
+            return;
+        }
         let mut state = self.conversation_state.lock().await;
         state.conversation = conversation.clone();
         // `previous_response_id` is left alone: the provider-side response
