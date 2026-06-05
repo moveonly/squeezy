@@ -11199,6 +11199,7 @@ fn shell_sandbox_plan_metadata_carries_best_effort_fallback_record() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let parsed = shell_best_effort_fallback_from_result(&result)
         .expect("agent helper extracts the fallback descriptor");
@@ -11228,6 +11229,7 @@ fn shell_best_effort_fallback_from_result_ignores_non_shell_tools_and_clean_runs
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     assert!(shell_best_effort_fallback_from_result(&plain_result).is_none());
 
@@ -11250,6 +11252,7 @@ fn shell_best_effort_fallback_from_result_ignores_non_shell_tools_and_clean_runs
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     assert!(
         shell_best_effort_fallback_from_result(&non_shell).is_none(),

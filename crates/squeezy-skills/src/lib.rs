@@ -589,16 +589,12 @@ impl SkillCatalog {
 
     pub fn render_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
         if self.inline {
-            // Legacy behavior: inline each activated skill's full body
-            // into the system prompt, with budget-aware stub fallback.
             render::render_active_skills(
                 skills,
                 self.active_budget_chars,
                 self.active_body_cap_chars,
             )
         } else {
-            // Default behavior: emit metadata-only blocks. The model
-            // calls `load_skill` when it needs the body.
             render::render_active_skills_metadata(skills, self.active_budget_chars)
         }
     }
@@ -613,6 +609,58 @@ impl SkillCatalog {
     /// `delegate` tool) rather than executing the body inline.
     pub fn render_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
         render::render_fork_skills(skills, self.active_budget_chars, self.active_body_cap_chars)
+    }
+
+    /// Render the active-skill block and return rendering metrics alongside the
+    /// output string. The agent uses the metrics to populate skill activation
+    /// telemetry without re-walking the inputs. Uses the metrics-aware variant
+    /// (`render_active_skills_with_metrics` in render.rs) which returns accurate
+    /// inclusion/dropped/body-truncated counts from its own rendering pass.
+    pub fn render_active_skills_with_metrics(
+        &self,
+        skills: &[LoadedSkill],
+    ) -> (Option<String>, render::SkillActivationMetrics) {
+        if self.inline {
+            render::render_active_skills_with_metrics(
+                skills,
+                self.active_budget_chars,
+                self.active_body_cap_chars,
+            )
+        } else {
+            // Metadata-only mode: all included, none body-truncated.
+            let rendered = render::render_active_skills_metadata(skills, self.active_budget_chars);
+            let included = if rendered.is_some() { skills.len() } else { 0 };
+            let dropped = skills.len().saturating_sub(included);
+            (
+                rendered,
+                render::SkillActivationMetrics {
+                    total: skills.len(),
+                    included,
+                    dropped,
+                    body_truncated: 0,
+                },
+            )
+        }
+    }
+
+    /// Telemetry-friendly discovery summary: counts by source, disabled count,
+    /// and ambiguous count. Callers convert this to a `SkillActivationReport`
+    /// for the `skill_activated` telemetry event.
+    pub fn discovery_summary(&self) -> SkillDiscoverySummary {
+        let mut by_source: BTreeMap<String, u32> = BTreeMap::new();
+        let mut disabled = 0u32;
+        for entry in self.skills.values() {
+            let source_key = entry.summary.source.as_str().to_string();
+            *by_source.entry(source_key).or_default() += 1;
+            if entry.summary.disabled {
+                disabled += 1;
+            }
+        }
+        SkillDiscoverySummary {
+            by_source,
+            disabled,
+            ambiguous: self.ambiguous_names.len() as u32,
+        }
     }
 
     pub fn render_preamble(&self) -> Option<SkillPreambleRender> {
@@ -1039,6 +1087,26 @@ pub enum SkillActivationKind {
     /// Inferred from a shell command that touched a skill's `scripts/` dir
     /// or `SKILL.md`. Surfaced from the shell tool, not `activate_for_input`.
     ImplicitShell,
+}
+
+impl SkillActivationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Trigger => "trigger",
+            Self::ImplicitShell => "implicit_shell",
+        }
+    }
+}
+
+/// Plain-data discovery summary for telemetry. No telemetry-crate dependency.
+/// The agent converts this into a `SkillActivationReport` count-map.
+#[derive(Debug, Clone, Default)]
+pub struct SkillDiscoverySummary {
+    /// Skill count by `SkillSource::as_str()` key.
+    pub by_source: BTreeMap<String, u32>,
+    pub disabled: u32,
+    pub ambiguous: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

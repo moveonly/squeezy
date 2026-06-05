@@ -31,11 +31,14 @@ use squeezy_core::{
 use squeezy_graph::{CargoFactProvenance, GraphManager};
 use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 pub use squeezy_mcp::{
-    McpElicitationAction, McpElicitationHandler, McpElicitationKind, McpElicitationRequest,
-    McpElicitationResponse, McpError, McpRefreshOutcome, McpResult, McpServerStatus,
-    McpStatusSnapshot,
+    McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
+    McpElicitationHandler, McpElicitationKind, McpElicitationRequest, McpElicitationResponse,
+    McpError, McpRefreshOutcome, McpResult, McpServerStatus, McpStatusSnapshot,
 };
-use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
+use squeezy_skills::{
+    LoadedSkill, SkillActivation, SkillCatalog, SkillDiscoverySummary, SkillPreambleRender,
+    render::SkillActivationMetrics,
+};
 use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
 use squeezy_telemetry::{
     ErrorKind as TelemetryErrorKind, GraphPerfReport, GraphSequenceScope, LanguageDistribution,
@@ -293,6 +296,45 @@ fn graph_build_perf_report(manager: &GraphManager) -> GraphPerfReport {
         language_distribution: language_distribution(&report.language),
         error_kind: None,
     }
+}
+
+/// Emit `graph_refresh_completed` telemetry when a real refresh happened.
+/// Skipped for the `skipped_due_to_interval` debounce path so we only
+/// count refreshes that actually re-parsed files.
+pub(crate) fn emit_graph_refresh_telemetry(
+    telemetry: &Option<TelemetryClient>,
+    refresh: &squeezy_graph::RefreshReport,
+) {
+    if !refresh.refreshed {
+        return;
+    }
+    let Some(ref telemetry) = *telemetry else {
+        return;
+    };
+    use squeezy_telemetry::{
+        GraphPerfReport, GraphSequenceScope, OutcomeStatus, RefreshKind, TelemetryEvent,
+    };
+    let report = GraphPerfReport {
+        refresh_kind: RefreshKind::Incremental,
+        status: OutcomeStatus::Success,
+        sequence_scope: GraphSequenceScope::Repeated,
+        duration_ms: refresh.duration_ms as u64,
+        files_seen: refresh.files_seen as u64,
+        files_changed: (refresh.changed_files.len() + refresh.removed_files.len()) as u64,
+        files_parsed: refresh.reparsed_files as u64,
+        bytes_parsed: refresh.bytes_reparsed,
+        excluded_files: refresh.excluded_files as u64,
+        excluded_dirs: refresh.excluded_dirs as u64,
+        excluded_bytes: refresh.excluded_bytes,
+        persisted_files_loaded: 0,
+        persisted_files_missed: 0,
+        persistence_rebuilt: false,
+        symbols: refresh.stats.symbols as u64,
+        edges: refresh.stats.edges as u64,
+        language_distribution: language_distribution(&refresh.language),
+        error_kind: None,
+    };
+    telemetry.spawn(TelemetryEvent::graph_refresh_completed(report));
 }
 
 fn language_distribution(report: &LanguageReport) -> LanguageDistribution {
@@ -835,6 +877,33 @@ impl WebToolConfig {
     }
 }
 
+/// Coarse statistics for a web tool call (websearch or webfetch).
+/// Plain data; no `squeezy-telemetry` dependency. The agent converts
+/// this into a `WebRequestReport` and fires `TelemetryEvent::web_request`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebCallStats {
+    /// `"exa"`, `"parallel"`, or `"webfetch"` — matches `WebSearchProvider::as_str()`
+    pub provider_token: String,
+    /// `"success"`, `"error"`, or `"cancelled"`
+    pub status_token: String,
+    pub ssrf_blocked: bool,
+    pub redirect_blocked: bool,
+    /// Coarse byte bucket: `"0_1k"`, `"1k_10k"`, `"10k_100k"`, `"100k_plus"`
+    pub response_byte_bucket: String,
+    pub duration_ms: u64,
+}
+
+impl WebCallStats {
+    pub fn response_byte_bucket(bytes: usize) -> &'static str {
+        match bytes {
+            0..=1_023 => "0_1k",
+            1_024..=10_239 => "1k_10k",
+            10_240..=102_399 => "10k_100k",
+            _ => "100k_plus",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: String,
@@ -845,6 +914,8 @@ pub struct ToolResult {
     pub receipt: ToolReceipt,
     #[serde(skip)]
     pub spill_model_output: Option<String>,
+    #[serde(skip)]
+    pub web_call_stats: Option<WebCallStats>,
 }
 
 impl ToolResult {
@@ -999,6 +1070,9 @@ pub struct ToolRegistry {
     /// stub instead of re-serializing the bytes.
     pub(crate) tool_output_replay_seen:
         Arc<StdMutex<HashMap<ToolOutputReplayKey, ToolOutputReplayServed>>>,
+    /// Best-effort anonymous telemetry sink. Propagated from
+    /// [`ToolRegistryRuntime`] for graph-refresh and other per-tool events.
+    pub(crate) telemetry: Option<TelemetryClient>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1394,6 +1468,7 @@ impl ToolRegistry {
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
             tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
+            telemetry,
         })
     }
 
@@ -1443,6 +1518,7 @@ impl ToolRegistry {
             cached_specs: Arc::new(StdMutex::new(None)),
             patch_plans: Arc::new(StdMutex::new(HashMap::new())),
             tool_output_replay_seen: Arc::new(StdMutex::new(HashMap::new())),
+            telemetry: None,
         })
     }
 
@@ -1868,6 +1944,24 @@ impl ToolRegistry {
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
         self.mcp.status_snapshot()
+    }
+
+    /// Aggregate MCP server capability presence booleans.
+    /// Returns (has_resources, has_elicitation, has_experimental).
+    pub async fn aggregate_mcp_capabilities(&self) -> (bool, bool, bool) {
+        self.mcp.aggregate_capabilities().await
+    }
+
+    /// Snapshot of recent MCP elicitation audit events.
+    pub fn mcp_elicitation_audit_snapshot(&self) -> Vec<McpElicitationAuditEvent> {
+        self.mcp.elicitation_audit_log()
+    }
+
+    /// Drain and clear all new MCP elicitation audit events since the last
+    /// drain. The agent calls this in `finish_turn` so each event is only
+    /// counted once across the session.
+    pub fn drain_mcp_elicitation_audit(&self) -> Vec<McpElicitationAuditEvent> {
+        self.mcp.drain_elicitation_audit_log()
     }
 
     pub fn set_mcp_elicitation_handler(&self, handler: Option<McpElicitationHandler>) {
@@ -2671,6 +2765,18 @@ impl ToolRegistry {
     /// Returns `None` when no fork-mode skill is activated.
     pub fn format_fork_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
         self.skills_snapshot().render_fork_skills(skills)
+    }
+
+    pub fn format_active_skills_with_metrics(
+        &self,
+        skills: &[LoadedSkill],
+    ) -> (Option<String>, SkillActivationMetrics) {
+        self.skills_snapshot()
+            .render_active_skills_with_metrics(skills)
+    }
+
+    pub fn skill_discovery_summary(&self) -> SkillDiscoverySummary {
+        self.skills_snapshot().discovery_summary()
     }
 
     pub fn skills_preamble(&self) -> Option<SkillPreambleRender> {
@@ -4780,6 +4886,7 @@ impl ToolOutputStore {
             mut cost_hint,
             receipt,
             spill_model_output: _,
+            web_call_stats: _,
         } = result;
         let original_output_sha256 = receipt.output_sha256;
         let content_sha256 = receipt.content_sha256;
@@ -5950,6 +6057,7 @@ pub(crate) fn make_result(
             content_sha256,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 

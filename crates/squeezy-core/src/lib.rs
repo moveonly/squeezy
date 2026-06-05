@@ -12470,6 +12470,25 @@ pub struct TurnMetrics {
     /// means judge/cheap overhead exceeded the estimated parent cost.
     #[serde(default)]
     pub routing_estimated_net_savings_usd_micros: i64,
+    /// Normalized stop reason token for the most recent LLM completion in this
+    /// turn (e.g. `"end_turn"`, `"max_tokens"`, `"refusal"`). `None` when the
+    /// turn did not complete normally or no event was received.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_token: Option<String>,
+    /// True when the provider's completion carried `reasoning_only_stop`: the
+    /// model spent the round on hidden reasoning and produced no visible output.
+    #[serde(default)]
+    pub reasoning_only_stop: bool,
+    /// Whether prompt caching was supported for this turn (true if either
+    /// `cached_input_tokens` or `cache_write_input_tokens` was non-zero).
+    #[serde(default)]
+    pub cache_supported: bool,
+    /// Cache-write (creation) tokens for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Reasoning output tokens for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 impl TurnMetrics {

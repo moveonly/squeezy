@@ -142,16 +142,49 @@ pub struct McpStatusSnapshot {
     pub generated_unix_millis: u128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Aggregated discovery statistics for product telemetry.
+/// Plain data — no `squeezy-telemetry` dependency. The agent
+/// converts this into a `McpDiscoveryReport` and fires the event.
+#[derive(Debug, Clone, Default)]
+pub struct McpDiscoveryStats {
+    pub servers_stdio: u32,
+    pub servers_http: u32,
+    pub servers_sse: u32,
+    pub servers_enabled: u32,
+    pub servers_disabled: u32,
+    pub tools_discovered: u32,
+    pub tools_cached: u32,
+    pub tools_stale_retained: u32,
+    pub tools_dropped_disabled: u32,
+    pub discovery_errors: u32,
+    /// Coarse error kind tokens: `"timeout"`, `"transport"`, `"cancelled"`.
+    pub error_kind_tokens: Vec<String>,
+    pub has_resources: bool,
+    pub has_elicitation: bool,
+    pub has_experimental: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct McpRefreshOutcome {
     pub errors: Vec<String>,
     pub status: McpStatusSnapshot,
+    pub discovery_stats: Option<McpDiscoveryStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpElicitationKind {
     Form,
     Url,
+}
+
+impl McpElicitationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Form => "form",
+            Self::Url => "url",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +243,16 @@ pub enum McpElicitationAuditOutcome {
     AutoDeclined,
     /// Forwarded to the host handler (UI) for a user decision.
     Forwarded,
+}
+
+impl McpElicitationAuditOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AutoAccepted => "auto_accepted",
+            Self::AutoDeclined => "auto_declined",
+            Self::Forwarded => "forwarded",
+        }
+    }
 }
 
 /// Record emitted every time the MCP client takes an elicitation decision.
@@ -362,6 +405,17 @@ impl McpClientRegistry {
             .unwrap_or_default()
     }
 
+    /// Drain and return all elicitation audit events since the last drain.
+    /// Unlike `elicitation_audit_log`, this clears the ring so subsequent
+    /// calls return only new events — preventing per-turn re-emission of the
+    /// same decisions.
+    pub fn drain_elicitation_audit_log(&self) -> Vec<McpElicitationAuditEvent> {
+        self.elicitation_audit
+            .lock()
+            .map(|mut log| std::mem::take(&mut *log).into_iter().collect())
+            .unwrap_or_default()
+    }
+
     pub fn status_snapshot(&self) -> McpStatusSnapshot {
         self.status_tx.borrow().clone()
     }
@@ -371,11 +425,28 @@ impl McpClientRegistry {
     }
 
     pub async fn refresh_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
+        let discovery_started = Instant::now();
         let prior_cache = self
             .cache
             .lock()
             .map(|cache| cache.clone())
             .unwrap_or_default();
+
+        // Build per-transport server counts up-front.
+        let mut stats = McpDiscoveryStats::default();
+        let current_servers = self.servers_snapshot();
+        for server in current_servers.values() {
+            if server.enabled {
+                stats.servers_enabled += 1;
+                match server.transport {
+                    McpTransport::Stdio => stats.servers_stdio += 1,
+                    McpTransport::Http => stats.servers_http += 1,
+                    McpTransport::Sse => stats.servers_sse += 1,
+                }
+            } else {
+                stats.servers_disabled += 1;
+            }
+        }
 
         if self.has_no_enabled_servers() {
             if let Ok(mut cache) = self.cache.lock() {
@@ -386,9 +457,11 @@ impl McpClientRegistry {
                 generated_unix_millis: unix_millis(),
             };
             self.publish_status(status.clone());
+            stats.duration_ms = discovery_started.elapsed().as_millis() as u64;
             return McpRefreshOutcome {
                 errors: Vec::new(),
                 status,
+                discovery_stats: Some(stats),
             };
         }
 
@@ -430,6 +503,7 @@ impl McpClientRegistry {
         while let Some((name, result)) = futures.next().await {
             match result {
                 Ok(tools) => {
+                    stats.tools_discovered += tools.len() as u32;
                     self.write_tool_cache(&name, &tools);
                     per_server.insert(
                         name.clone(),
@@ -448,6 +522,13 @@ impl McpClientRegistry {
                         error = %error,
                         "failed to discover MCP tools"
                     );
+                    stats.discovery_errors += 1;
+                    let error_kind = match &error {
+                        McpError::Timeout { .. } => "timeout",
+                        McpError::Cancelled { .. } => "cancelled",
+                        _ => "transport",
+                    };
+                    stats.error_kind_tokens.push(error_kind.to_string());
                     let status = if matches!(error, McpError::Cancelled { .. }) {
                         McpServerStatus::Cancelled
                     } else {
@@ -476,6 +557,7 @@ impl McpClientRegistry {
                 && !succeeded.contains(&tool.server)
                 && !next.contains_key(model_name)
             {
+                stats.tools_stale_retained += 1;
                 next.insert(model_name.clone(), tool.clone());
                 per_server
                     .entry(tool.server.clone())
@@ -486,8 +568,12 @@ impl McpClientRegistry {
                             .unwrap_or_default(),
                         cached: true,
                     });
+            } else if !server_still_enabled {
+                stats.tools_dropped_disabled += 1;
             }
         }
+        // Count cached tool entries (tools loaded from persisted cache on startup).
+        stats.tools_cached = prior_cache.len() as u32;
 
         if let Ok(mut cache) = self.cache.lock() {
             *cache = next;
@@ -508,7 +594,12 @@ impl McpClientRegistry {
             generated_unix_millis: unix_millis(),
         };
         self.publish_status(status.clone());
-        McpRefreshOutcome { errors, status }
+        stats.duration_ms = discovery_started.elapsed().as_millis() as u64;
+        McpRefreshOutcome {
+            errors,
+            status,
+            discovery_stats: Some(stats),
+        }
     }
 
     /// Toggle the `enabled` flag for a single configured server and
@@ -904,6 +995,35 @@ impl McpClientRegistry {
         sessions
             .get(server_name)
             .and_then(|entry| entry.server_capabilities.clone())
+    }
+
+    /// Aggregate capability presence booleans across all connected servers.
+    /// Returns (has_resources, has_elicitation, has_experimental).
+    pub async fn aggregate_capabilities(&self) -> (bool, bool, bool) {
+        let sessions = self.sessions.lock().await;
+        let mut has_resources = false;
+        let mut has_elicitation = false;
+        let mut has_experimental = false;
+        for entry in sessions.values() {
+            if let Some(caps) = &entry.server_capabilities {
+                if caps.resources.is_some() {
+                    has_resources = true;
+                }
+                if caps
+                    .tasks
+                    .as_ref()
+                    .and_then(|t| t.requests.as_ref())
+                    .and_then(|r| r.elicitation.as_ref())
+                    .is_some()
+                {
+                    has_elicitation = true;
+                }
+                if caps.experimental.is_some() {
+                    has_experimental = true;
+                }
+            }
+        }
+        (has_resources, has_elicitation, has_experimental)
     }
 
     #[doc(hidden)]

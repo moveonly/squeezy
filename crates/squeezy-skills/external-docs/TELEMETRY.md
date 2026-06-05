@@ -56,15 +56,21 @@ before upload.
 
 Squeezy sends one typed product telemetry event per completed session:
 
-- `squeezy_session_summary`: aggregate startup route/timing, session status,
-  turn/tool counts, graph build/refresh counters, slash/config/routing/failure
+- `squeezy_session_summary`: aggregate startup route/timing/phase durations,
+  session status, turn/tool counts, graph build/refresh counters, MCP
+  discovery/capability counts, external-network (websearch/webfetch) counts,
+  skill activation/render counts, prompt-template expansion counts, subagent
+  per-kind counts, approval/permission decision counts, provider error and
+  retry counts, stop-reason and cache counts, slash/config/routing/failure
   counts, token/cost counters, and capped top-count maps for sanitized tool,
-  slash-command, failure, routing, and config-field tokens.
+  slash-command, failure, routing, config-field, and all the new domain tokens.
 
 The local ledger may contain detailed safe facts such as startup readiness,
-turn completion, tool completion, graph build/refresh, slash command use,
-config changes, routing decisions, and coarse failures. Those local facts are
-not uploaded individually by the product telemetry path.
+turn completion, tool completion, graph build/refresh, MCP discovery,
+MCP elicitation decisions, web requests, skill activation, prompt-template
+expansions, approval and permission verdicts, provider errors, slash command
+use, config changes, routing decisions, and coarse failures. Those local facts
+are not uploaded individually by the product telemetry path.
 
 Safe local facts are persisted in a durable telemetry ledger before network
 delivery. On normal CLI/TUI exit, Squeezy stores the reduced summary as pending

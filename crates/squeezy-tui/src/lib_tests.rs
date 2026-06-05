@@ -9904,6 +9904,7 @@ fn sample_tool_result(name: &str, output: &str) -> ToolResult {
             content_sha256: Some("0123456789abcdef".to_string()),
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -12195,6 +12196,7 @@ fn transcript_overlay_tool_cards_are_expanded_and_plain() {
             content_sha256: Some("0123456789abcdef".to_string()),
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     app.push_tool_result_with_call(result, Some(call));
 

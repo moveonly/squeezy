@@ -6685,6 +6685,7 @@ fn mark_intra_batch_duplicates_stamps_hint_on_second_identical_call() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let calls = vec![
         make_call("g1", "\\bfn make_widget\\b"),
@@ -8645,6 +8646,7 @@ fn shell_fallback_result(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -8716,6 +8718,7 @@ async fn shell_sandbox_fallback_ignores_clean_shell_results_and_non_shell_tools(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let read_file = squeezy_tools::ToolResult {
         call_id: "call".to_string(),
@@ -8728,6 +8731,7 @@ async fn shell_sandbox_fallback_ignores_clean_shell_results_and_non_shell_tools(
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
 
     maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(1), &clean_shell).await;
@@ -8806,6 +8810,7 @@ async fn shell_sandbox_fallback_counter_emits_per_call() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     emit_tool_telemetry(
         &config,
@@ -10052,6 +10057,7 @@ fn graph_indexing_fallback_result(tool_name: &str) -> squeezy_tools::ToolResult 
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -10071,6 +10077,7 @@ fn graph_success_result(tool_name: &str) -> squeezy_tools::ToolResult {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
@@ -10317,6 +10324,7 @@ fn tool_round_path_collector_counts_distinct_path_like_values() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let pending = SeenToolOutputs::default().prepare_results(vec![result]);
     let mut paths = BTreeSet::new();
@@ -10359,6 +10367,7 @@ fn tool_round_path_collector_ignores_dotted_non_path_tokens() {
             content_sha256: None,
         },
         spill_model_output: None,
+        web_call_stats: None,
     };
     let pending = SeenToolOutputs::default().prepare_results(vec![result]);
     let mut paths = BTreeSet::new();

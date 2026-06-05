@@ -149,6 +149,8 @@ fn durable_summary_is_pending_before_send_and_cleared_after_ack() {
             budget_denials: 0,
             subagent_calls: 0,
             subagent_failures: 0,
+            subagent_kind_counts: std::collections::BTreeMap::new(),
+            subagent_cap_rejections: 0,
         },
     );
     ended.timestamp_ms = 1_500;
@@ -350,9 +352,6 @@ fn session_summary_does_not_double_count_turn_and_tool_totals() {
             matches_returned: 1,
             ..ToolCostProperties::default()
         },
-        args_sha256: None,
-        output_sha256: None,
-        content_sha256: None,
     });
     shell.timestamp_ms = 1_600;
     shell.event_sequence = 2;
@@ -370,9 +369,6 @@ fn session_summary_does_not_double_count_turn_and_tool_totals() {
             matches_returned: 3,
             ..ToolCostProperties::default()
         },
-        args_sha256: None,
-        output_sha256: None,
-        content_sha256: None,
     });
     grep.timestamp_ms = 1_700;
     grep.event_sequence = 3;
@@ -442,9 +438,6 @@ fn tool_event_does_not_include_arguments_or_paths() {
             matches_returned: 1,
             output_bytes: 50,
         },
-        args_sha256: None,
-        output_sha256: None,
-        content_sha256: None,
     });
     let text = serde_json::to_string(&event).unwrap();
 
@@ -459,14 +452,12 @@ fn tool_event_does_not_include_arguments_or_paths() {
 }
 
 #[test]
-fn tool_completed_event_pairs_args_output_content_sha256() {
-    // F06: paired-SHA dispatch trace. Each tool_completed event must carry
-    // (args_sha256, output_sha256, content_sha256) so offline replay can
-    // answer "did we already pay for this exact call?" without re-running.
+fn tool_completed_event_never_carries_sha_fields() {
+    // SHA fields were removed from telemetry (noise removal): tool_completed
+    // must not include args_sha256, output_sha256, or content_sha256 even
+    // when a call is made. Those hashes are kept locally for dedup but must
+    // not be forwarded to the remote summary.
     let config = AppConfig::default();
-    let args = "a".repeat(64);
-    let output = "b".repeat(64);
-    let content = "c".repeat(64);
     let event = TelemetryEvent::tool_completed(ToolTelemetryReport {
         provider: &config.provider,
         model: &config.model,
@@ -481,45 +472,20 @@ fn tool_completed_event_pairs_args_output_content_sha256() {
             matches_returned: 0,
             output_bytes: 32,
         },
-        args_sha256: Some(&args),
-        output_sha256: Some(&output),
-        content_sha256: Some(&content),
     });
     let text = serde_json::to_string(&event).unwrap();
     assert!(
-        text.contains(&format!("\"args_sha256\":\"{args}\"")),
-        "args_sha256 missing: {text}"
+        !text.contains("args_sha256"),
+        "args_sha256 must be absent: {text}"
     );
     assert!(
-        text.contains(&format!("\"output_sha256\":\"{output}\"")),
-        "output_sha256 missing: {text}"
+        !text.contains("output_sha256"),
+        "output_sha256 must be absent: {text}"
     );
     assert!(
-        text.contains(&format!("\"content_sha256\":\"{content}\"")),
-        "content_sha256 missing: {text}"
+        !text.contains("content_sha256"),
+        "content_sha256 must be absent: {text}"
     );
-}
-
-#[test]
-fn tool_completed_event_omits_sha_fields_when_absent() {
-    let config = AppConfig::default();
-    let event = TelemetryEvent::tool_completed(ToolTelemetryReport {
-        provider: &config.provider,
-        model: &config.model,
-        turn_index: 1,
-        tool_sequence: 1,
-        tool_name: "grep",
-        status: ToolStatusKind::Success,
-        duration: Duration::from_millis(1),
-        cost: ToolCostProperties::default(),
-        args_sha256: None,
-        output_sha256: None,
-        content_sha256: None,
-    });
-    let text = serde_json::to_string(&event).unwrap();
-    assert!(!text.contains("args_sha256"));
-    assert!(!text.contains("output_sha256"));
-    assert!(!text.contains("content_sha256"));
 }
 
 #[test]
@@ -539,9 +505,6 @@ fn graph_navigation_tool_events_are_classified_as_graph_family() {
             matches_returned: 1,
             output_bytes: 64,
         },
-        args_sha256: None,
-        output_sha256: None,
-        content_sha256: None,
     });
     let text = serde_json::to_string(&event).unwrap();
 
@@ -650,9 +613,6 @@ async fn events_carry_consistent_trace_id_across_a_turn() {
             status: ToolStatusKind::Success,
             duration: Duration::from_millis(3),
             cost: ToolCostProperties::default(),
-            args_sha256: None,
-            output_sha256: None,
-            content_sha256: None,
         }))
         .await;
     client
@@ -916,6 +876,8 @@ fn session_ended_event_carries_aggregate_perf_and_failure_counts() {
             budget_denials: 2,
             subagent_calls: 3,
             subagent_failures: 1,
+            subagent_kind_counts: std::collections::BTreeMap::new(),
+            subagent_cap_rejections: 0,
         },
     );
     let text = serde_json::to_string(&event).unwrap();
@@ -981,4 +943,128 @@ fn config_change_event_uses_bucketed_values() {
     assert!(text.contains("\"config_prev_bucket\":\"model_custom\""));
     assert!(text.contains("\"config_new_bucket\":\"model_custom\""));
     assert!(!text.contains("gpt-5-codex"));
+}
+
+#[test]
+fn mcp_tool_name_classified_as_mcp_family() {
+    use crate::{FirstPartyToolName, ToolFamily};
+    assert_eq!(
+        FirstPartyToolName::from_tool_name("mcp__my_server__do_thing"),
+        FirstPartyToolName::Mcp
+    );
+    assert_eq!(
+        ToolFamily::from_tool_name("mcp__another__tool"),
+        ToolFamily::Mcp
+    );
+}
+
+#[test]
+fn mcp_discovery_event_folds_into_summary_counts() {
+    use crate::McpDiscoveryReport;
+    let report = McpDiscoveryReport {
+        servers_stdio: 2,
+        servers_http: 1,
+        servers_sse: 0,
+        servers_enabled: 3,
+        servers_disabled: 0,
+        tools_discovered: 5,
+        tools_cached: 0,
+        tools_stale_retained: 0,
+        tools_dropped_disabled: 0,
+        discovery_errors: 0,
+        error_kind_counts: std::collections::BTreeMap::new(),
+        has_resources: true,
+        has_elicitation: false,
+        has_experimental: false,
+        duration_ms: 120,
+    };
+    let event = TelemetryEvent::mcp_discovery(report);
+    let text = serde_json::to_string(&event).unwrap();
+    assert!(text.contains("squeezy_mcp_discovery"));
+    assert!(text.contains("transport_stdio"));
+    assert!(text.contains("cap_resources"));
+    // elicitation not present since has_elicitation = false
+    assert!(!text.contains("cap_elicitation"));
+}
+
+#[test]
+fn provider_error_event_carries_kind_token() {
+    use crate::ProviderErrorKind;
+    let event = TelemetryEvent::provider_error(ProviderErrorKind::RateLimit);
+    let text = serde_json::to_string(&event).unwrap();
+    assert!(text.contains("squeezy_provider_error"));
+    assert!(text.contains("rate_limit"));
+}
+
+#[test]
+fn skill_activation_event_folds_into_summary() {
+    use crate::SkillActivationReport;
+    let mut source_counts = std::collections::BTreeMap::new();
+    source_counts.insert("user".to_string(), 1u64);
+    let event = TelemetryEvent::skill_activated(SkillActivationReport {
+        total: 1,
+        included: 1,
+        dropped: 0,
+        body_truncated: 0,
+        preamble_emitted: true,
+        preamble_omitted_count: 0,
+        explicit_count: 1,
+        trigger_count: 0,
+        implicit_shell_count: 0,
+        source_counts,
+    });
+    let text = serde_json::to_string(&event).unwrap();
+    assert!(text.contains("squeezy_skill_activated"));
+    assert!(text.contains("source_user"));
+    assert!(text.contains("activation_explicit"));
+}
+
+#[test]
+fn session_summary_includes_new_domain_counts_when_events_present() {
+    use crate::{McpDiscoveryReport, ProviderErrorKind, SkillActivationReport};
+    let session = StoredTelemetrySession {
+        session_id: "test".to_string(),
+        trace_id: "00000000000000000000000000000001".to_string(),
+        started_at_ms: 0,
+        ended_at_ms: Some(1000),
+        clean_end: true,
+        summary_id: None,
+    };
+    let mut source_counts = std::collections::BTreeMap::new();
+    source_counts.insert("project".to_string(), 2u64);
+    let events = vec![
+        TelemetryEvent::mcp_discovery(McpDiscoveryReport {
+            servers_stdio: 1,
+            ..McpDiscoveryReport::default()
+        }),
+        TelemetryEvent::provider_error(ProviderErrorKind::Transport),
+        TelemetryEvent::skill_activated(SkillActivationReport {
+            total: 2,
+            included: 2,
+            source_counts,
+            ..SkillActivationReport::default()
+        }),
+    ];
+    let summary =
+        build_summary_from_events(&session, events, false, Some(SessionStatusKind::Completed));
+    // MCP counts populated.
+    let mcp = summary.properties.mcp_counts.as_ref().expect("mcp_counts");
+    assert!(mcp.contains_key("transport_stdio"), "mcp_counts: {mcp:?}");
+    // Provider error counts populated.
+    let pe = summary
+        .properties
+        .provider_error_counts
+        .as_ref()
+        .expect("provider_error_counts");
+    assert!(
+        pe.contains_key("transport"),
+        "provider_error_counts: {pe:?}"
+    );
+    // Skill counts populated.
+    let sc = summary
+        .properties
+        .skill_counts
+        .as_ref()
+        .expect("skill_counts");
+    assert!(sc.contains_key("source_project"), "skill_counts: {sc:?}");
 }
