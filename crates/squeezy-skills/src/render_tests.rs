@@ -111,3 +111,21 @@ fn render_active_skills_matches_metrics_variant_string() {
     let without = render_active_skills(&skills, 4_000, 16_000);
     assert_eq!(with_metrics, without);
 }
+
+#[test]
+fn render_active_skills_matches_metrics_variant_under_overflow() {
+    let body = "body ".repeat(120);
+    let skills = vec![
+        skill("alpha", &body),
+        skill("beta", &body),
+        skill("gamma", &body),
+    ];
+    let (with_metrics, metrics) = render_active_skills_with_metrics(&skills, 700, 16_000);
+    let without = render_active_skills(&skills, 700, 16_000);
+
+    assert_eq!(with_metrics, without);
+    assert!(metrics.included > 0, "{metrics:?}");
+    assert!(metrics.dropped > 0, "{metrics:?}");
+    assert_eq!(metrics.included + metrics.dropped, metrics.total);
+    assert_eq!(metrics.body_truncated, metrics.included);
+}

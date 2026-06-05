@@ -258,75 +258,42 @@ pub fn render_active_skills_with_metrics(
     budget_chars: usize,
     body_cap_chars: usize,
 ) -> (Option<String>, SkillActivationMetrics) {
+    let rendered = render_active_skills(skills, budget_chars, body_cap_chars);
+    let mut metrics = metrics_for_active_skills_render(skills, rendered.as_deref());
+    if skills.is_empty() || budget_chars == 0 {
+        metrics.dropped = 0;
+    }
+    (rendered, metrics)
+}
+
+fn metrics_for_active_skills_render(
+    skills: &[LoadedSkill],
+    rendered: Option<&str>,
+) -> SkillActivationMetrics {
     let mut metrics = SkillActivationMetrics {
         total: skills.len(),
         ..SkillActivationMetrics::default()
     };
-
-    if skills.is_empty() || budget_chars == 0 {
-        return (None, metrics);
-    }
-
-    let mut blocks = Vec::with_capacity(skills.len());
-    let mut body_cap_truncated = vec![false; skills.len()];
-    for (index, skill) in skills.iter().enumerate() {
-        let body_chars = char_count(&skill.body);
-        if body_chars > body_cap_chars {
-            body_cap_truncated[index] = true;
-            blocks.push(render_stub(skill, "body_cap", STUB_DESCRIPTION_MAX_CHARS));
-        } else {
-            blocks.push(skill.prompt_block());
-        }
-    }
-
-    if let Some(block) = wrap_blocks(&blocks)
-        && char_count(&block) <= budget_chars
-    {
-        metrics.included = skills.len();
-        metrics.body_truncated = body_cap_truncated.iter().filter(|hit| **hit).count();
-        return (Some(block), metrics);
-    }
-
-    let mut fitted = Vec::new();
-    let mut included_is_stub = Vec::<bool>::new();
-    for (index, (skill, block)) in skills.iter().zip(blocks).enumerate() {
-        let starts_as_stub = body_cap_truncated[index];
-        let candidates = if starts_as_stub {
-            vec![(block, true)]
-        } else {
-            vec![
-                (block, false),
-                (render_stub(skill, "aggregate_budget", 0), true),
-            ]
-        };
-        let mut inserted = false;
-        for (candidate, candidate_is_stub) in candidates {
-            fitted.push(candidate);
-            if let Some(rendered) = wrap_blocks(&fitted)
-                && char_count(&rendered) <= budget_chars
-            {
-                included_is_stub.push(candidate_is_stub);
-                inserted = true;
-                break;
-            }
-            fitted.pop();
-        }
-        if !inserted {
-            metrics.dropped += 1;
-        }
-    }
-
-    let rendered = wrap_blocks(&fitted).filter(|rendered| char_count(rendered) <= budget_chars);
-    if rendered.is_some() {
-        metrics.included = included_is_stub.len();
-        metrics.body_truncated = included_is_stub.iter().filter(|stub| **stub).count();
-    } else {
-        // Final wrap failed the budget — treat every block as dropped.
+    let Some(rendered) = rendered else {
         metrics.dropped = skills.len();
-        metrics.included = 0;
-        metrics.body_truncated = 0;
+        return metrics;
+    };
+
+    for skill in skills {
+        let name = xml_escape(&skill.summary.name);
+        let needle = format!("<skill name=\"{name}\"");
+        if let Some(start) = rendered.find(&needle) {
+            metrics.included += 1;
+            let rest = &rendered[start..];
+            if let Some(tag_end) = rest.find('>')
+                && rest[..tag_end].contains("truncated=\"true\"")
+            {
+                metrics.body_truncated += 1;
+            }
+        }
     }
-    (rendered, metrics)
+    metrics.dropped = metrics.total.saturating_sub(metrics.included);
+    metrics
 }
 
 fn wrap_blocks(blocks: &[String]) -> Option<String> {
