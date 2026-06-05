@@ -19,6 +19,30 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+#[test]
+fn vertex_use_oauth_builds_refreshable_key_source_without_static_env() {
+    let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::Vertex,
+        api_key_env: "SQUEEZY_TEST_VERTEX_ACCESS_TOKEN_MISSING".to_string(),
+        api_key: None,
+        base_url:
+            "https://aiplatform.googleapis.com/v1/projects/demo/locations/global/endpoints/openapi"
+                .to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+        deployment_id: None,
+        cf_ai_gateway: None,
+        use_oauth: true,
+    })
+    .expect("vertex oauth provider should not require a static env token");
+
+    let source = provider.api_key_source();
+    assert_eq!(source.provider_label(), "vertex");
+    assert!(source.can_rotate());
+}
+
 fn sample_request() -> LlmRequest {
     LlmRequest {
         model: "anthropic/claude-opus-4-7".to_string().into(),
