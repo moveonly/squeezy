@@ -6,7 +6,7 @@ use squeezy_graph::SemanticGraph;
 
 use crate::{
     accuracy::{compare_symbol_sets, increment_symbol, ratio, symbol_count},
-    oracles::common_scan::{collect_squeezy_symbol_scan, default_oracle_exclusions},
+    oracles::common_scan::{collect_kotlin_squeezy_symbol_scan, default_oracle_exclusions},
     oracles::rust_analyzer::normalize_symbol_name,
     report::{KotlinOracleReport, QueryOracleReport, QueryReport, SymbolKey, SymbolScan},
     util::{command_exists, increment},
@@ -49,7 +49,7 @@ pub(crate) fn collect_kotlin_oracle_accuracy(
             oracle_ms: None,
             status: "skipped: java not found".to_string(),
             symbols: compare_symbol_sets(
-                &collect_squeezy_symbol_scan(graph),
+                &collect_kotlin_squeezy_symbol_scan(graph),
                 &SymbolScan::default(),
             ),
             navigation: collect_kotlin_query_oracle_accuracy(queries),
@@ -63,7 +63,7 @@ pub(crate) fn collect_kotlin_oracle_accuracy(
                 "skipped: Kotlin oracle jar not built (run benchmarks/oracle/kotlin/build.sh)"
                     .to_string(),
             symbols: compare_symbol_sets(
-                &collect_squeezy_symbol_scan(graph),
+                &collect_kotlin_squeezy_symbol_scan(graph),
                 &SymbolScan::default(),
             ),
             navigation: collect_kotlin_query_oracle_accuracy(queries),
@@ -74,7 +74,7 @@ pub(crate) fn collect_kotlin_oracle_accuracy(
     match collect_kotlin_compiler_tree_symbol_scan(root) {
         Ok((oracle, status)) if status.starts_with("Kotlin oracle succeeded") => {
             let oracle_ms = started.elapsed().as_millis();
-            let squeezy_symbols = collect_squeezy_symbol_scan(graph);
+            let squeezy_symbols = collect_kotlin_squeezy_symbol_scan(graph);
             Ok(KotlinOracleReport {
                 oracle_ms: Some(oracle_ms),
                 status,
@@ -87,7 +87,7 @@ pub(crate) fn collect_kotlin_oracle_accuracy(
             oracle_ms: None,
             status: format!("skipped: {status}"),
             symbols: compare_symbol_sets(
-                &collect_squeezy_symbol_scan(graph),
+                &collect_kotlin_squeezy_symbol_scan(graph),
                 &SymbolScan::default(),
             ),
             navigation: collect_kotlin_query_oracle_accuracy(queries),
@@ -97,7 +97,7 @@ pub(crate) fn collect_kotlin_oracle_accuracy(
             oracle_ms: None,
             status: format!("skipped: Kotlin oracle failed: {err}"),
             symbols: compare_symbol_sets(
-                &collect_squeezy_symbol_scan(graph),
+                &collect_kotlin_squeezy_symbol_scan(graph),
                 &SymbolScan::default(),
             ),
             navigation: collect_kotlin_query_oracle_accuracy(queries),

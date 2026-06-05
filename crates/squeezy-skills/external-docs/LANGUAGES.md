@@ -24,6 +24,11 @@ matrix against that live registry.
 | `swift` | Swift | `swift` | `tree-sitter-swift` | `sourcekit_lsp` | no | `benchmarks/fixtures/swift/semantic-cases` | `benchmarks/specs/swift-smoke-queries.json` | swift-nio |
 | `dart` | Dart | `dart` | `tree-sitter-dart` | `dart_analyzer` with scan-only fallback | no | `benchmarks/fixtures/dart/semantic-cases` | `benchmarks/specs/dart-smoke-queries.json` | _(smoke only)_ |
 
+The `Full-tier repos` column reflects the pinned semantic-graph corpus in
+`benchmarks/corpus.json`. Separate graph-vs-no-graph eval scenarios under
+`crates/squeezy-eval/fixtures/scenarios/benchmarks/` also exercise real-world
+Scala on `akka/akka` and Dart on `flutter/flutter`.
+
 ## Rust
 
 Indexed: modules, structs, enums, unions, traits, impls, functions, methods,
@@ -75,18 +80,20 @@ companion objects, interfaces, sealed types, enums and enum entries, methods,
 secondary constructors, properties (top-level and class-level, `val`/`var`),
 typealiases, primary-constructor properties (promoted to fields), extension
 functions (receiver captured via `language_identity`), suspend / inline /
-operator / infix / tailrec attributes, override / abstract / open flags, and
-inheritance through `delegation_specifiers` (`base:<parent>` attributes).
+operator / infix / tailrec attributes, override / abstract / open flags,
+anonymous object literals as Partial synthetic class symbols, and inheritance
+through `delegation_specifiers` (`base:<parent>` attributes).
 
-Known limitations: delegated-property accessor bodies (`val x by lazy {...}`),
-inline `reified` type-parameter modeling, generated data-class members
-(`copy`, `componentN`, `equals`, `hashCode`, `toString`), anonymous-object
-expressions, and overload resolution stay heuristic for v0; the oracle
-suppresses the same set so the symbol-set gates remain symmetric. Multiplatform
+Known limitations: delegated properties expose the property and delegate target
+call, but synthetic getter/setter accessor bodies are not generated. Generated
+data-class members (`copy`, `componentN`, `equals`, `hashCode`, `toString`),
+stable compiler identities for anonymous objects, overload resolution, and full
+Kotlin type attribution stay heuristic for v0; the oracle suppresses the same
+generated member set so the symbol-set gates remain symmetric. Multiplatform
 `expect`/`actual` matching is not attempted.
 
 Known follow-ups: deeper companion-object/member lookup beyond the current
-`Host.member()` path, sealed-class child enumeration, and a Kotlin LSP-based
+`Host.member()` path, stable anonymous-object modeling, and a Kotlin LSP-based
 navigation oracle are scoped for later work once the symbol-set gates remain
 stable.
 
@@ -213,6 +220,24 @@ Oracle: Ruby Prism subprocess. CI attempts Ruby 3.3 setup with
 a `mode = "scan-only"` self-compare, so the report mode/status is part of the
 accuracy signal.
 
+## Scala
+
+Indexed: packages/imports, package objects, classes, case classes, objects,
+traits, enums, enum cases, given definitions, extension methods, vals/vars,
+constructor parameters, methods/functions, calls, infix calls, object creation
+calls, annotations, type/path/field references, literal body hits, companion
+attributes, and `language_identity` for extension receivers.
+
+Known limitations: implicit conversions, `given`/`using` call-site resolution,
+path-dependent type resolution, macro/inline expansion, overload resolution,
+inferred extension receivers, and typeclass dispatch remain outside the
+syntactic graph contract.
+
+Oracle: Scala SemanticDB when the Scala toolchain can produce protobufs, with
+scan-only fallback recorded in the report when SemanticDB is unavailable.
+The pinned semantic-graph corpus includes `utest`; the graph-vs-no-graph
+real-world eval scenarios also cover `akka/akka`.
+
 ## Swift
 
 Indexed: classes, structs, actors, protocols, enums (with associated-value cases),
@@ -255,7 +280,9 @@ are excluded from oracle precision/recall accounting via glob.
 
 Oracle: `package:analyzer` helper when the Dart oracle helper is present and
 the analyzer run succeeds; otherwise the benchmark degrades to scan-only mode and
-records that status in the report.
+records that status in the report. The pinned semantic-graph corpus is currently
+smoke-tier for Dart; the graph-vs-no-graph real-world eval scenarios also cover
+`flutter/flutter`.
 
 ## Benchmark Corpus Reporting
 

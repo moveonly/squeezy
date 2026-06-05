@@ -36,6 +36,10 @@ Kotlin-specific extraction includes:
   attributes.
 - Constructor calls, property-delegate calls, navigation expressions, and
   annotation references.
+- Delegated-property target calls, sealed-parent references for nested sealed
+  children, and `inline reified` type-parameter metadata.
+- Anonymous object literals as partial synthetic class symbols with their
+  declared members parented underneath.
 
 ## Graph Behavior
 
@@ -56,9 +60,14 @@ Kotlin oracle precision >= 0.94 and recall >= 0.85 when the oracle ran.
 ## Known Limits
 
 - Generated data-class methods such as `copy` and `componentN` are not modeled
-  as first-class graph declarations.
-- Sealed-class exhaustiveness and child discovery are not type-checked.
-- Anonymous object expressions are not emitted as local symbols.
+  as first-class graph declarations, although the data-class declaration and
+  primary-constructor properties are emitted.
+- Delegated properties expose the property and delegate target call, but
+  synthetic getter/setter accessor bodies are not modeled.
+- Sealed-class child references are syntactic; exhaustiveness is not
+  type-checked.
+- Anonymous object expressions are emitted with synthetic names and Partial
+  confidence rather than stable compiler identities.
 - Generic, nullable, nested, or inferred extension receiver types may lower
   confidence or miss call-site matching.
 - The graph does not resolve overloaded calls through Kotlin compiler type

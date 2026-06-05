@@ -17,6 +17,8 @@ fixtures, oracle, gates, and known limitations.
 - Oracle integration:
   `benchmarks/squeezy-graph-bench/src/oracles/scala_semanticdb.rs`.
 - Corpus entries: `scala-smoke` and `utest` in `benchmarks/corpus.json`.
+- Real-world graph-vs-no-graph eval scenarios exercise `akka/akka` under
+  `crates/squeezy-eval/fixtures/scenarios/benchmarks/`.
 
 ## Extracted Facts
 

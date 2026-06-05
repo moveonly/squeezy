@@ -17,6 +17,8 @@ fixtures, oracle, gates, and known limitations.
 - Oracle integration:
   `benchmarks/squeezy-graph-bench/src/oracles/dart_oracle.rs`.
 - Corpus entry: `dart-smoke` in `benchmarks/corpus.json`.
+- Real-world graph-vs-no-graph eval scenarios exercise `flutter/flutter` under
+  `crates/squeezy-eval/fixtures/scenarios/benchmarks/`.
 
 ## Extracted Facts
 

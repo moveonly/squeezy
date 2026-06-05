@@ -113,6 +113,11 @@ Current full-tier external corpus coverage:
 | Swift | swift-nio |
 | Dart | smoke only |
 
+The table above is limited to the pinned semantic-graph corpus in
+`benchmarks/corpus.json`. The separate graph-vs-no-graph agent eval scenarios
+under `crates/squeezy-eval/fixtures/scenarios/benchmarks/` include additional
+real-world coverage, including Scala `akka/akka` and Dart `flutter/flutter`.
+
 ## CI
 
 Benchmark CI is consolidated into:

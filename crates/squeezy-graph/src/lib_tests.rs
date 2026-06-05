@@ -5007,6 +5007,52 @@ data class Person(val name: String, val age: Int)
 }
 
 #[test]
+fn graph_indexes_kotlin_anonymous_object_literal_members() {
+    let mut parser = LanguageParser::new().unwrap();
+    let source = kotlin_record(
+        "src/main/kotlin/com/example/model/Factory.kt",
+        r#"package com.example.model
+
+interface Greeter {
+    fun greet(): String
+}
+
+fun buildGreeter(): Greeter = object : Greeter {
+    override fun greet(): String = "hi"
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&source, fs::read_to_string(&source.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let anonymous = graph
+        .symbols
+        .values()
+        .find(|symbol| {
+            symbol
+                .attributes
+                .iter()
+                .any(|attribute| attribute == "kotlin:anonymous-object")
+        })
+        .expect("anonymous object literal emits a partial class symbol");
+    assert_eq!(anonymous.kind, SymbolKind::Class);
+    assert_eq!(anonymous.confidence, Confidence::Partial);
+    assert!(anonymous.attributes.contains(&"base:Greeter".to_string()));
+
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| {
+            symbol.kind == SymbolKind::Method && symbol.parent_id.as_ref() == Some(&anonymous.id)
+        })
+        .expect("anonymous object method is parented under the synthetic object");
+    assert!(greet.attributes.contains(&"kotlin:override".to_string()));
+}
+
+#[test]
 fn graph_binds_kotlin_property_delegate_call_to_owning_variable() {
     // kotlin spec §4g: `val x by lazy { ... }` keeps `x` as a single Field
     // symbol and emits the delegate target (`lazy`) as a ParsedCall whose

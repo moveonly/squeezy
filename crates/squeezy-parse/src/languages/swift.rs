@@ -5,7 +5,7 @@
 //! wrappers and other `@attributes`, computed properties, and module
 //! imports. See `docs/internal/lang-specs/swift.md` for the contract.
 //!
-//! TODOs deferred to follow-up PRs (per spec §4):
+//! Out-of-scope compiler/runtime features (per spec §4):
 //! - `@dynamicMemberLookup` runtime member resolution
 //! - Full protocol-witness tracking
 //! - Objective-C bridging (`.h`/`.m` headers, `@objc(name)` mapping)

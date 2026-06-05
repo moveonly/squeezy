@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, path::Path, process::Command};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+    process::Command,
+};
 
 use serde::{Deserialize, Deserializer};
 use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolKind};
@@ -88,6 +92,73 @@ pub(crate) fn collect_squeezy_symbol_scan_excluding_files(
                     increment(&mut scan.excluded_by_kind, "OracleUnparseableFile");
                     continue;
                 }
+                increment_symbol(
+                    &mut scan.counts,
+                    SymbolKey {
+                        file: file.relative_path.clone(),
+                        kind,
+                        name: normalize_symbol_name(&symbol.name),
+                    },
+                );
+            }
+            None => increment(&mut scan.excluded_by_kind, &format!("{:?}", symbol.kind)),
+        }
+    }
+    scan
+}
+
+pub(crate) fn collect_kotlin_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
+    let mut anonymous_ids: HashSet<_> = graph
+        .symbols
+        .values()
+        .filter(|symbol| {
+            symbol
+                .attributes
+                .iter()
+                .any(|attribute| attribute == "kotlin:anonymous-object")
+        })
+        .map(|symbol| symbol.id.clone())
+        .collect();
+    loop {
+        let before = anonymous_ids.len();
+        for symbol in graph.symbols.values() {
+            if symbol
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent_id| anonymous_ids.contains(parent_id))
+            {
+                anonymous_ids.insert(symbol.id.clone());
+            }
+        }
+        if anonymous_ids.len() == before {
+            break;
+        }
+    }
+
+    let mut scan = SymbolScan::default();
+    for symbol in graph.symbols.values() {
+        let Some(file) = graph.files.get(&symbol.file_id) else {
+            increment(&mut scan.excluded_by_kind, "MissingFile");
+            continue;
+        };
+        if file.language != LanguageKind::Kotlin {
+            continue;
+        }
+        scan.raw_total += 1;
+        if anonymous_ids.contains(&symbol.id) {
+            if symbol
+                .attributes
+                .iter()
+                .any(|attribute| attribute == "kotlin:anonymous-object")
+            {
+                increment(&mut scan.excluded_by_kind, "KotlinAnonymousObject");
+            } else {
+                increment(&mut scan.excluded_by_kind, "KotlinAnonymousObjectMember");
+            }
+            continue;
+        }
+        match normalize_squeezy_kind(symbol.kind) {
+            Some(kind) => {
                 increment_symbol(
                     &mut scan.counts,
                     SymbolKey {

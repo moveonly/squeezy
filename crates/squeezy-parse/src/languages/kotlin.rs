@@ -14,10 +14,7 @@
 //   - `typealias` -> `SymbolKind::TypeAlias`
 //   - `suspend`, `inline`, `data`, `sealed`, `open`, `override` attribute flags
 //
-// Deferred (TODO comments inline, see spec sections):
-//   - data-class generated members (§4e): excluded for symmetry with oracle
-//
-// Filled in by langs/kotlin-deferred follow-up:
+// Implemented Kotlin-specific follow-ups:
 //   - delegated-property accessor binding (§4g): emit the delegate target
 //     (`lazy`, `Delegates.observable`) as a `ParsedCall` whose `caller_id` is
 //     the property symbol so cross-call resolvers can find it.
@@ -28,6 +25,10 @@
 //   - `inline reified` modeling (§4d): record each `reified` type-parameter
 //     name in `language_identity` (template the extension-function pattern)
 //     so the resolver can use it for cross-call type matching.
+//
+// Intentionally excluded for symmetry with the oracle:
+//   - data-class generated members (§4e): `copy`, `componentN`, `equals`,
+//     `hashCode`, and `toString` are not synthesized as graph declarations.
 
 use std::collections::HashSet;
 
@@ -268,6 +269,7 @@ pub(crate) fn kotlin_symbol_from_node(
     match kind_str {
         "class_declaration" => Some(kotlin_class_declaration_symbol(node, ctx, parent_symbol)),
         "object_declaration" => Some(kotlin_object_declaration_symbol(node, ctx, parent_symbol)),
+        "object_literal" => Some(kotlin_object_literal_symbol(node, ctx, parent_symbol)),
         "companion_object" => Some(kotlin_companion_object_symbol(node, ctx, parent_symbol)),
         "function_declaration" => kotlin_function_declaration_symbol(node, ctx, parent_symbol),
         "secondary_constructor" => kotlin_secondary_constructor_symbol(node, ctx, parent_symbol),
@@ -384,6 +386,61 @@ fn kotlin_object_declaration_symbol(
         attributes,
         provenance: Provenance::new("tree-sitter-kotlin", "object declaration"),
         confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
+    }
+}
+
+fn kotlin_object_literal_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> ParsedSymbol {
+    let span = span_from_node(node);
+    let name = format!(
+        "__anonymous_object_{}_{}",
+        span.start.line, span.start.column
+    );
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let body = kotlin_class_body(node);
+    let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
+    let signature = signature_text(node, body, ctx.source);
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Class,
+        &name,
+        span,
+    );
+    let mut attributes = vec![
+        "kotlin:anonymous-object".to_string(),
+        "kotlin:object".to_string(),
+    ];
+    attributes.extend(
+        kotlin_type_inheritance_names(node, ctx.source)
+            .into_iter()
+            .map(|base| format!("base:{base}")),
+    );
+    attributes.sort();
+    attributes.dedup();
+
+    ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Class,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span,
+        signature,
+        visibility: None,
+        docs: kotlin_docs_for_node(node, ctx.source),
+        attributes,
+        provenance: Provenance::new("tree-sitter-kotlin", "object literal"),
+        confidence: Confidence::Partial,
         freshness: Freshness::Fresh,
         arity: None,
     }
