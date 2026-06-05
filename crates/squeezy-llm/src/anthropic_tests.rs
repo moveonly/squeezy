@@ -94,11 +94,14 @@ async fn from_config_loads_oauth_when_static_key_missing() {
         let prev_home = std::env::var_os("HOME");
         let missing_env = "SQUEEZY_TEST_MISSING_ANTHROPIC_KEY";
         let prev_missing = std::env::var_os(missing_env);
+        let oauth_file_env = "SQUEEZY_ANTHROPIC_OAUTH_FILE";
+        let prev_oauth_file = std::env::var_os(oauth_file_env);
         // SAFETY: ANTHROPIC_OAUTH_ENV_LOCK serializes process-env mutations in
         // this module.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::remove_var(missing_env);
+            std::env::set_var(oauth_file_env, &auth_path);
         }
 
         let config = AnthropicConfig {
@@ -117,6 +120,10 @@ async fn from_config_loads_oauth_when_static_key_missing() {
             match prev_missing {
                 Some(value) => std::env::set_var(missing_env, value),
                 None => std::env::remove_var(missing_env),
+            }
+            match prev_oauth_file {
+                Some(value) => std::env::set_var(oauth_file_env, value),
+                None => std::env::remove_var(oauth_file_env),
             }
         }
 

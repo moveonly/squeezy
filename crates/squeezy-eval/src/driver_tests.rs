@@ -4,6 +4,7 @@ use crate::scenario::SqueezyOverlay;
 #[test]
 fn eval_driver_disables_product_telemetry() {
     let mut config = AppConfig::default();
+    config.telemetry.enabled = true;
     assert!(config.telemetry.enabled);
 
     disable_product_telemetry(&mut config);
