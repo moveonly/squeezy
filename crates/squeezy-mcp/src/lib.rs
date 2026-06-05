@@ -1052,21 +1052,12 @@ impl McpClientRegistry {
     pub async fn aggregate_capabilities(&self) -> (bool, bool, bool) {
         let sessions = self.sessions.lock().await;
         let mut has_resources = false;
-        let mut has_elicitation = false;
+        let has_elicitation = !sessions.is_empty();
         let mut has_experimental = false;
         for entry in sessions.values() {
             if let Some(caps) = &entry.server_capabilities {
                 if caps.resources.is_some() {
                     has_resources = true;
-                }
-                if caps
-                    .tasks
-                    .as_ref()
-                    .and_then(|t| t.requests.as_ref())
-                    .and_then(|r| r.elicitation.as_ref())
-                    .is_some()
-                {
-                    has_elicitation = true;
                 }
                 if caps.experimental.is_some() {
                     has_experimental = true;

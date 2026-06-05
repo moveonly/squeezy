@@ -1249,6 +1249,11 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         server_capabilities: Some(capabilities.clone()),
     });
     let registry = McpClientRegistry::new(BTreeMap::new());
+    assert_eq!(
+        registry.aggregate_capabilities().await,
+        (false, false, false),
+        "empty registry must not report capabilities"
+    );
     registry
         .sessions
         .lock()
@@ -1263,6 +1268,11 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         .experimental
         .expect("experimental must survive accessor round-trip");
     assert!(observed_experimental.contains_key("squeezy/test"));
+    assert_eq!(
+        registry.aggregate_capabilities().await,
+        (false, true, true),
+        "connected sessions advertise client-side elicitation even when server caps do not"
+    );
 
     assert!(
         registry
