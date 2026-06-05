@@ -1,8 +1,8 @@
 # Prompt Templates
 
-Prompt templates are reusable prompt patterns stored as plain Markdown files.
-Each template expands into a prompt when activated via `/prompt-template <name>`
-in the TUI composer.
+Prompt templates are reusable slash macros stored as plain Markdown files.
+Each template expands into a prompt when its slash name is submitted in the TUI.
+For example, `~/.squeezy/prompts/review.md` is activated with `/review`.
 
 ## Discovery Locations
 
@@ -19,7 +19,23 @@ ship workspace-specific templates that override personal defaults.
 ## File Format
 
 Each template is a plain Markdown `.md` file. The filename (without the `.md`
-extension) becomes the template name.
+extension) becomes the slash name. Names must start with an ASCII alphanumeric
+character and may contain ASCII letters, digits, `-`, or `_`.
+
+Templates may start with optional YAML-style frontmatter:
+
+```markdown
+---
+description: Review the current diff
+argument-hint: "[path]"
+args: [target]
+---
+Review {target}. Focus on correctness, edge cases, and compatibility.
+```
+
+Supported frontmatter keys are `description`, `argument-hint` (or
+`argument_hint`), and `args`. If `description` is omitted, Squeezy uses the
+first non-empty body line, truncated for the slash menu.
 
 Example — `~/.squeezy/prompts/review.md`:
 
@@ -35,24 +51,30 @@ Be concise. Use bullet points.
 Activate it with:
 
 ```
-/prompt-template review
+/review
 ```
 
 Squeezy inserts the full template text as the user's prompt for that turn.
 
 ## Argument Substitution
 
-Templates may use `{{arg}}` placeholders. When activated with arguments, each
-positional word after the template name is substituted for `{{1}}`, `{{2}}`,
-etc. Named placeholders (`{{target}}`) require a `key=value` syntax.
+Template arguments are split with shell-style quoting. The body supports:
+
+- `{1}`, `{2}`, etc. for positional arguments.
+- `{name}` for names declared in the `args` frontmatter list.
+- `{ARGUMENTS}` for all arguments joined with spaces.
+- `$1`, `$2`, `$@`, `$ARGUMENTS`, `${@:N}`, and `${@:N:L}` for compatibility
+  with shell-style templates.
+
+Unresolved tokens are left unchanged so literal braces can pass through.
 
 Example template `test-coverage.md`:
 
 ```markdown
-Add tests for {{1}} with coverage for error cases and edge conditions.
+Add tests for {1} with coverage for error cases and edge conditions.
 ```
 
-Activated as `/prompt-template test-coverage MyModule` expands to:
+Activated as `/test-coverage MyModule` expands to:
 
 ```
 Add tests for MyModule with coverage for error cases and edge conditions.
@@ -78,4 +100,4 @@ project-specific workflows without changing the user's global files.
 
 - [SKILLS.md](SKILLS.md) — for more powerful per-skill instruction injection.
 - Use `/skill <name>` to activate a full skill with structured instructions;
-  use `/prompt-template <name>` for lightweight prompt expansion.
+  use a template slash name such as `/review` for lightweight prompt expansion.

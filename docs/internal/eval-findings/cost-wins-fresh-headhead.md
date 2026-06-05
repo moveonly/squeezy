@@ -1,5 +1,11 @@
 # Fresh head-to-head cost-win investigation (perf/cost-wins)
 
+Status: historical investigation log. The committed CSVs now supersede the
+intermediate board in this document: `mini-vs-codex-realworld.csv` shows
+Mini 15/15 WIN, and `haiku-vs-cc-realworld.csv` shows Haiku 13/15 WIN. Keep
+the analysis below for methodology and root-cause history; use the CSVs and
+`realworld-scoreboard-methodology.md` for current tallies.
+
 Goal (from the PR): make **squeezy + semantic graph** cheaper than the rivals at
 equal correctness on the 15-language realworld eval —
 **gpt-5.4-mini vs Codex** (mini tier) and **Claude-Haiku vs Claude Code** (haiku
@@ -10,13 +16,10 @@ that made the prior board untrustworthy**, the **generic squeezy fixes** that
 were implemented and validated, and the **honest current board**. It is written
 to be reproducible and to state plainly what is solid and what still needs work.
 
-> TL;DR — The committed `15/15` mini board was measured against **stale,
-> more-expensive rival baselines**; re-run fresh and head-to-head with corrected
-> graders, the rivals are markedly cheaper, and several tasks are read-heavy
-> enumerations where the graph offers little cost advantage. Five **generic**
-> squeezy cost fixes (plus three eval-grader bug fixes) were implemented; with
-> them, squeezy wins **~20/30 cells** at recall parity, decisively on the
-> graph-favorable tasks. The remaining cells are documented with their causes.
+> Historical TL;DR — This pass found stale rival baselines, grader drift, and
+> read-heavy tasks where the graph offered little cost advantage. Five
+> generic squeezy cost fixes plus three eval-grader bug fixes were implemented.
+> Later CSV refreshes improved the board beyond the intermediate counts here.
 
 ---
 
@@ -156,11 +159,15 @@ gate is net `+1` win with no win lost.
 
 ---
 
-## 4. Honest current board (n=3 medians, all fixes)
+## 4. Historical board from this investigation (n=3 medians, all fixes)
+
+Superseded by the checked-in CSVs: Mini is now 15/15 WIN and Haiku is now
+13/15 WIN. The tables below are preserved as the intermediate board that
+drove the follow-up fixes.
 
 WIN = recall ≥ rival **and** cost ≤ 0.95×. (`*` = coin-flip, ~parity within noise.)
 
-### mini (squeezy gpt-5.4-mini vs Codex gpt-5.4-mini) — 11/15
+### mini (squeezy gpt-5.4-mini vs Codex gpt-5.4-mini) — historical 11/15 snapshot
 | lang | sqz $ | codex $ | ratio | verdict |
 |---|---|---|---|---|
 | c | 0.0454 | 0.0504 | 0.90 | WIN |
@@ -179,7 +186,7 @@ WIN = recall ≥ rival **and** cost ≤ 0.95×. (`*` = coin-flip, ~parity within
 | swift | 0.0134 | 0.0181 | 0.74 | WIN |
 | ts | 0.0378 | 0.0424 | 0.89 | WIN |
 
-### haiku (squeezy Claude-Haiku vs Claude Code Haiku) — 9/15
+### haiku (squeezy Claude-Haiku vs Claude Code Haiku) — historical 9/15 snapshot
 | lang | sqz $ | cc $ | ratio | verdict |
 |---|---|---|---|---|
 | c | 0.4416 | 0.2669 | 1.65 | LOSS (cost) |

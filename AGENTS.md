@@ -36,7 +36,8 @@ The crate layout separates:
 ## Storage Direction
 
 - Keep an in-memory query surface backed by persisted graph/cache partitions.
-- Use `redb` for persisted graph/cache state.
+- Use `redb` for persisted state: `state.redb` for session/cache metadata and
+  `graph.redb` for graph partitions and resolver-cache snapshots.
 - Hydrate graph partitions lazily when queries need them.
 - Add `tantivy` later for full-text ranking; do not make it part of the first graph milestone.
 

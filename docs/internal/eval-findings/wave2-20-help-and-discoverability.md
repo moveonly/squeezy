@@ -50,10 +50,9 @@ The canonical answer set:
   plus a redacted `config inspect` dump for `[agent]` / `[session]`
   / `[tools]` / `[budgets]` / `[tui]`. The actual cancel answer
   (Esc / Ctrl+C) is nowhere in the response, the model is never
-  called for that turn, and the only citations are logical external-doc paths
-  (`docs/external/AGENT_APPROACH.md`, etc., backed by
-  `crates/squeezy-skills/external-docs/`) that themselves do not name the cancel
-  keys.
+  called for that turn, and the only citations are bundled external-doc paths
+  (`crates/squeezy-skills/external-docs/AGENT_APPROACH.md`, etc.) that
+  themselves do not name the cancel keys.
 
 ### What you should see vs. what you see
 

@@ -28,10 +28,14 @@ turns so the provider's prefix-hash lookup keeps hitting.
 
 ### Central policy: `cache_policy.rs`
 
-All five provider adapters route their breakpoint-placement decisions through
-`crates/squeezy-llm/src/cache_policy.rs`. The module's job is to centralize
-the *where to mark* decision so each protocol adapter only has to emit the
-protocol-specific marker shape — not re-derive the strategy.
+The Anthropic-family adapters route their inline breakpoint-placement
+decisions through `crates/squeezy-llm/src/cache_policy.rs`: native
+Anthropic JSON, OpenAI-compatible Anthropic routes, and Bedrock's typed
+`CachePoint` blocks. OpenAI Responses uses server-side hash routing
+(`prompt_cache_key` / retention fields) rather than inline breakpoints,
+and Google currently has no client-created cache resource in Squeezy. The
+policy module centralizes the *where to mark* decision for providers that
+do accept markers; other providers only contribute usage/accounting data.
 
 The retention enum at `cache_policy.rs:42-57` is the public knob a caller
 flips: `None` (no caching, default), `Short` (provider default window —
@@ -89,12 +93,15 @@ Anthropic Messages, OpenAI-compatible aggregator routes pointed at Anthropic
 models, and the Bedrock typed `CachePoint` block all rely on this single
 function.
 
-#### Marker placement: three breakpoints
+#### Marker placement: stable breakpoints plus a tail anchor
 
 `CachePolicy::AUTO` at `cache_policy.rs:117-124` is the only policy any
 adapter currently uses; it enables tools, system, and a
-`MessageStrategy::LatestUserMessage` choice. Three markers result per
-request (semantics: "cache everything up to and including this marker"):
+`MessageStrategy::LatestUserMessage` choice. Native Anthropic can use up to
+four `cache_control` breakpoints per request: the three structural markers
+below plus a "stable-tail anchor" behind the moving latest user block when
+the marker budget has room. Semantics: cache everything up to and including
+the marker.
 
 1. **System tail.** `system_array_with_marker` (`cache_policy.rs:206-212`)
    wraps the system string in the array form Anthropic requires and pins the
@@ -108,6 +115,11 @@ request (semantics: "cache everything up to and including this marker"):
 3. **Last user block.** `mark_last_user_block` (`cache_policy.rs:216-234`)
    walks messages back-to-front, finds the most recent user message, and
    pins the marker onto its trailing content block.
+4. **Stable-tail anchor.** `mark_stable_anchor_block` walks back from the
+   message tail and marks an older user block so the just-settled tail can
+   be cache-read on the next turn instead of repeatedly cache-written. This
+   marker is optional and is the first one dropped if future marker users
+   consume the four-marker Anthropic budget.
 
 There is no separate "last assistant" marker; the next turn's history
 naturally contains everything up to the previous assistant reply, and the
@@ -197,9 +209,10 @@ cache simply never warms.
 
 Squeezy also pins routing affinity headers at `openai.rs:264-269`:
 `affinity_headers` emits `session_id` and `x-client-request-id` both set to
-the cache key. The header values carry the *unclamped* key (the
-64-codepoint limit is a body-field constraint, not a header constraint),
-giving the load balancer a larger affinity space to bin on.
+the cache key. The body field is clamped to OpenAI's 64-codepoint limit;
+the headers carry up to 256 bytes of the same key, clamped on a UTF-8
+boundary to avoid oversized request headers while still giving the load
+balancer a larger affinity space to bin on.
 
 ### Bedrock typed `CachePoint` (`bedrock.rs`)
 
@@ -209,9 +222,9 @@ JSON. `cache_point_block` (`bedrock.rs:455-462`) builds a single
 
 - **System** — `system_blocks` (`bedrock.rs:464-476`) pushes a
   `SystemContentBlock::CachePoint` after the text block.
-- **Tools** — `tool_configuration` (`bedrock.rs:637-667`) appends
-  `Tool::CachePoint` after every `ToolSpec` (line 658:
-  `tools.push(Tool::CachePoint(cache_point_block()?));`).
+- **Tools** — `tool_configuration` inserts one `Tool::CachePoint` after the
+  last non-`mcp__` tool. If every advertised tool is dynamic, the tool-level
+  cache point is omitted instead of anchoring on a volatile registry tail.
 - **Last user message** — `append_cache_point_to_last_user`
   (`bedrock.rs:583-604`) finds the last user message via `rposition`, copies
   its content, appends a `ContentBlock::CachePoint`, and rebuilds the
@@ -222,10 +235,10 @@ normalization: `usage.inputTokens` arrives as the uncached delta and gets
 folded back into the total `input_tokens` while the cached share lives in
 `cached_input_tokens` / `cache_write_input_tokens`.
 
-The Bedrock adapter does *not* skip MCP-prefixed tools when placing the
-tool-level cache point — it appends the `Tool::CachePoint` at the *literal*
-end of the tools list. The Anthropic-on-Bedrock route trades a finer
-breakpoint-selection surface for the stricter typed SDK API.
+The Bedrock adapter now follows the same stable-tool intent as the JSON
+helpers, but expressed with the typed SDK shape. It cannot place
+`cache_control` on an individual tool object; it inserts a separate
+`Tool::CachePoint` block immediately after the selected stable tool.
 
 ### Google `cachedContent` (`google.rs`)
 
@@ -257,9 +270,14 @@ What Squeezy *does* do is read the implicit-cache outcome from
 // crates/squeezy-llm/src/google.rs:365-370
 if let Some(usage) = value.get("usageMetadata") {
     cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
-    cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
     cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
-    cost.reasoning_output_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    let visible = usage.get("candidatesTokenCount").and_then(Value::as_u64);
+    let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    cost.output_tokens = match (visible, thoughts) {
+        (None, None) => None,
+        (visible, thoughts) => Some(visible.unwrap_or(0) + thoughts.unwrap_or(0)),
+    };
+    cost.reasoning_output_tokens = thoughts;
 }
 ```
 
@@ -278,9 +296,10 @@ Aggregators like OpenRouter, Vercel AI Gateway, and PortKey forward bodies
 to upstream providers. When the destination model namespace is
 `anthropic/...`, the upstream is Anthropic and the aggregator forwards
 Anthropic-style `cache_control` markers verbatim. When it's `openai/...`,
-the upstream honors `prompt_cache_key` and `prompt_cache_retention`. Squeezy
-emits both shapes unconditionally and lets the aggregator drop what the
-upstream doesn't recognize.
+the upstream honors `prompt_cache_key` and, where accepted,
+`prompt_cache_retention`. Squeezy emits the OpenAI affinity key whenever one
+is configured, but suppresses retention on presets known to reject unknown
+fields such as Mistral.
 
 The flavor decision is table-driven via `COMPAT_TABLE`
 (`compatible.rs:374-403`). Each `CompatEntry` carries `model_prefix`,
@@ -302,31 +321,33 @@ let cache_control = anthropic_caching.then(|| ephemeral_marker(cache_retention))
 The three Anthropic-style markers (system, last user block, last stable
 tool — same helpers as the native Anthropic adapter, see
 `compatible.rs:178-205` and `compatible.rs:262-281`) each gate on
-`anthropic_caching`. The OpenAI-style `prompt_cache_key` and
-`prompt_cache_retention: "24h"` are emitted *unconditionally* whenever the
-spec sets them (`compatible.rs:225-246`):
+`anthropic_caching`. The OpenAI-style `prompt_cache_key` is emitted whenever
+the spec sets it; long retention is emitted only for presets that accept it:
 
 ```rust
 // crates/squeezy-llm/src/compatible.rs:225-246 (abbreviated)
 if let Some(key) = cache_spec.key.as_deref() {
-    body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+    body["prompt_cache_key"] = json!(compatible_prompt_cache_key(key));
 }
-if cache_retention == CacheRetention::Long {
+if cache_retention == CacheRetention::Long
+    && !preset_rejects_prompt_cache_retention(preset)
+{
     body["prompt_cache_retention"] = json!("24h");
 }
 ```
 
 This way an aggregator that forwards to OpenAI-hosted upstream picks up the
 right field, an Anthropic-hosted upstream picks up the markers, and other
-upstreams ignore the unknown fields. The 64-codepoint clamp is shared with
-the native OpenAI adapter, so both routes can't drift on the limit.
+upstreams ignore the unknown fields unless a preset has proven stricter. Long
+compatible keys are hashed before the final OpenAI-style clamp so distinct
+workspace/session keys do not collapse to the same 64-codepoint prefix.
 
 ## Worked example
 
 Consider an Anthropic turn after four prior turns of editing a Rust file.
 `AnthropicProvider::request_body` produces a JSON body whose top-level keys
-are `model`, `system`, `messages`, `max_tokens`, `stream`, `tools`. Three
-markers exist in this request, at fixed positions (abbreviated):
+are `model`, `system`, `messages`, `max_tokens`, `stream`, `tools`. Up to
+four markers exist in this request, at fixed positions (abbreviated):
 
 ```json
 {
@@ -356,7 +377,7 @@ markers exist in this request, at fixed positions (abbreviated):
 }
 ```
 
-Three markers, three nested breakpoints:
+The first three markers are structural breakpoints:
 
 1. **System tail** — `anthropic_system` (`anthropic.rs:296-332`) attaches it
    to the single system text block.
@@ -365,6 +386,11 @@ Three markers, three nested breakpoints:
    (`cache_policy.rs:175-190`) walks back skipping the `mcp__` prefix.
 3. **Last user block** — `mark_last_user_block` (`cache_policy.rs:216-234`)
    pins it onto the most recent user message.
+
+When Anthropic's four-marker budget has room, Squeezy also adds a
+stable-tail anchor behind the newest user block. That extra marker keeps the
+settled message tail cache-readable on the next turn instead of repeatedly
+paying the cache-write premium.
 
 Byte-stability across turns:
 
@@ -414,13 +440,13 @@ Reason: an MCP `tools/list` refresh can re-order, add, or drop dynamic tools
 between turns. Anything *after* the cache breakpoint can change without
 invalidating the cached prefix. By placing the breakpoint on the last
 *stable* (non-MCP) tool, an MCP refresh that mutates the tail of the tools
-array leaves the cached prefix intact. If every advertised tool is dynamic
-the function falls back to the literal last index so callers still get a
-breakpoint somewhere when caching is enabled.
+array leaves the cached prefix intact. The JSON helper falls back to the
+literal last index when every advertised tool is dynamic; Bedrock's typed
+tool configuration instead omits the tool-level cache point in that case.
 
 The native Anthropic, the OpenAI-compatible Anthropic-via-aggregator path,
-and (implicitly via tool-order at the registry level) the Bedrock path all
-share this invariant: dynamic tools live at the tail.
+and the Bedrock path all share this invariant: dynamic tools live at the
+tail, while stable first-party tools remain before the cache boundary.
 
 ### How `Long` vs `Short` retention is chosen
 
@@ -480,9 +506,10 @@ Bedrock both report the write counter so the engine can apply the
 
 ## Cost intuition
 
-Take a 20-turn coding session on Anthropic Opus 4.7 with a 30 K-token
-stable prefix (8 K system + 6 K tools + 16 K accumulated history) and 2 K
-of new content per turn. Cache-read is 10% of base; cache-write is 125%.
+Take a 20-turn coding session on an Anthropic model with a 30 K-token stable
+prefix (8 K system + 6 K tools + 16 K accumulated history) and 2 K of new
+content per turn. Using Anthropic's cache-read/cache-write billing shape as
+normalized units, cache-read is 10% of base and cache-write is 125%.
 
 - **Uncached**: 20 * 32K = 640 K input tokens at base. Normalize to 640
   cost units.

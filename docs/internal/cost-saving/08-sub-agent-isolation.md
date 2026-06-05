@@ -76,21 +76,22 @@ const DELEGATE_CHAIN_MAX_STEPS: usize = 16;
 ```
 
 ```rust
-// crates/squeezy-agent/src/lib.rs:141-145
-/// Maximum number of subagents that may be active at once for a single
-/// parent Agent. The registry rejects further `start()` calls until an
-/// in-flight subagent finishes (lease drops). Keeps fanout flat and
-/// predictable rather than letting a model spawn an unbounded swarm.
-const SUBAGENT_MAX_CONCURRENT: usize = 20;
+// crates/squeezy-core/src/lib.rs
+pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: usize = 20;
+
+// crates/squeezy-agent/src/lib.rs
+context.config.subagents.max_concurrent.max(1)
 ```
 
-Concurrent fanout uses `buffer_unordered(SUBAGENT_MAX_CONCURRENT)` so
-even when the parent emits more delegate calls in the same turn than
-the cap allows, only `SUBAGENT_MAX_CONCURRENT` run at once:
+Concurrent fanout uses `buffer_unordered(config.subagents.max_concurrent)`.
+The default is 20 (`DEFAULT_SUBAGENT_MAX_CONCURRENT`), but deployments can
+lower or raise it through `[subagents].max_concurrent` /
+`SQUEEZY_SUBAGENT_MAX_CONCURRENT`. Even when the parent emits more delegate
+calls in the same turn than the cap allows, only that many run at once:
 
 ```rust
-// crates/squeezy-agent/src/lib.rs:9477-9487
-    let cap = SUBAGENT_MAX_CONCURRENT.max(1);
+// crates/squeezy-agent/src/lib.rs
+    let cap = context.config.subagents.max_concurrent.max(1);
     let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
         let context = context.clone();
         async move {
@@ -361,15 +362,15 @@ thing".
 ```
 
 Reviewer (`Cheap`, `roles.rs:125`) and Explorer (`Cheap`,
-`roles.rs:103`) drop to the provider's small/fast tier when one is
-curated. Planner stays on the parent model (`Parent`, `roles.rs:114`)
+`roles.rs:103`) drop to the provider's cheap tier when one is
+configured or curated. Planner stays on the parent model (`Parent`, `roles.rs:114`)
 because planning quality suffers under cheap-tier. `Delegate` has no
 role overlay and keeps the parent model; `DocHelp` uses the provider's cheap
 tier when available and falls back to the parent model, with a separate output
 budget floor so the user-visible answer can still be complete. There is no
 "global cheap-model fast path" — cheap-tier fires only for the kinds
-whose role catalog or subagent kind asks for it, and only when the provider has a
-curated cheap tier (`cheap_model_for`, `lib.rs:8578-8589`). A child's
+whose role catalog or subagent kind asks for it, and only when a cheap model
+resolves (`cheap_model_for`, `lib.rs:8578-8589`). A child's
 dollar savings come from two independent levers: smaller per-round
 payload (tool subsetting + lazy schemas) and, for two of the four
 kinds, a smaller per-token rate.

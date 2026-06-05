@@ -82,16 +82,15 @@ cell, joins baselines, classifies, and writes the two CSVs.
 python3 docs/internal/eval-findings/realworld-harness/board_combined.py
 ```
 
-## Snapshot tally (this PR's HEAD)
+## Snapshot tally (committed CSVs)
 
 | | Haiku w/g vs CC | Mini w/g vs Codex |
 |---|---|---|
-| WIN | 7 | 6 |
-| TIE | 2 | 2 |
-| LOSS | 6 | 5 |
-| N/A | 0 | 2 (c, ts) |
+| WIN | 13 | 15 |
+| TIE | 0 | 0 |
+| LOSS | 2 (c, go) | 0 |
+| N/A | 0 | 0 |
 
-`N/A` cells need a codex baseline run before they can be classified.
-The remaining w/g LOSSes group into three mechanism families (graph
-packet wire weight, runaway grep when the model bypasses graph,
-Haiku-delegate batch-read) — left for follow-up PRs.
+These counts come from the checked-in `haiku-vs-cc-realworld.csv` and
+`mini-vs-codex-realworld.csv`. Treat older runbooks in this directory as
+historical if their prose disagrees with those CSVs.

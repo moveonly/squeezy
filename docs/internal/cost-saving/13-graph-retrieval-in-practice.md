@@ -2,7 +2,7 @@
 
 Chapter 05 describes *why* the semantic graph is cheap in principle — signature-only slices, BM25-ranked retrieval, incremental re-parse — instead of dumping whole files. This chapter documents the work that made that principle hold up on real repositories under a cheap model, where it had quietly stopped paying off. Three things were eating the saving: the graph was too slow to build (so the agent fell back to grep), a streaming-reconnect bug was burning whole turns, and on single-file tasks the agent over-used the graph and paid a navigation tax with no benefit. Each is a cost mechanism in its own right, and each is auditable from `file:line`.
 
-The headline: with these fixes, on a 15-language realworld retrieval benchmark squeezy beats fresh Codex (gpt-5-mini tier) on **9 of 12 measured languages (1 tie, 0 losses)** and fresh Claude Code (Haiku tier) on **7 of 9 (0 ties, 2 cost-losses under investigation)**. The per-language cost numbers and methodology live in `docs/internal/eval-findings/graph-cost-wins-report.md`.
+The benchmark snapshot captured in `docs/internal/eval-findings/graph-cost-wins-report.md` reported that, at the time it was run, squeezy beat fresh Codex (gpt-5-mini tier) on **9 of 12 measured languages (1 tie, 0 losses)** and fresh Claude Code (Haiku tier) on **7 of 9 (0 ties, 2 cost-losses under investigation)**. Treat those numbers as historical eval evidence, not a current provider-price claim; rerun the report before citing live competitiveness.
 
 ## Mechanism
 
@@ -48,7 +48,7 @@ The routing heuristic (`crates/squeezy-tools/src/graph_tools.rs`, with the promp
 
 ## Cost intuition
 
-The four mechanisms target different lines of the bill from Chapter 00's taxonomy:
+The four mechanisms target different lines of the bill from the taxonomy in the README:
 
 | Mechanism | Bill line it cuts | Rough effect |
 |---|---|---|
@@ -64,4 +64,4 @@ These are validated end-to-end rather than per-mechanism: the realworld A/B (`wi
 - **Build speedup is a correctness-preserving optimization, not a heuristic.** The visited-set and index changes produce a byte-identical graph (asserted in the timing harness); they remove redundant work, they don't approximate. A regression here shows up as a wrong graph, not just a slow one, so the equality assertion is the guardrail.
 - **The read-routing heuristic must not discourage cross-file graph use.** Its trigger is deliberately narrow (same small file, repeated slices). Widening it risks pushing the agent back to whole-file reads on genuinely cross-file tasks — exactly the regression the graph was built to prevent. It is reversible via config if behaviour-risky.
 - **Single-file vs cross-file is task-shaped, not language-shaped.** Whether the graph pays off depends on how spread out the answer is, not on which language it's in. A 2-grep task does not justify the graph's build-and-navigate tax; a 50-grep cross-module task does. The routing heuristic encodes that, but the benchmark scenarios still have to be chosen so the task is big enough for the mechanism under test to matter.
-- **Two Haiku cost-losses remain open.** Python (post-routing-fix) and a borderline Ruby result are the languages where squeezy is not yet cheaper than Claude Code at the Haiku tier; both are tracked in the report rather than papered over. Honest accounting first (Chapter 00, principle 7): a loss in the table is a loss.
+- **Two Haiku cost-losses were open in the report snapshot.** Python (post-routing-fix) and a borderline Ruby result were the languages where squeezy was not cheaper than Claude Code at the Haiku tier in that run; both are tracked in the report rather than papered over. Honest accounting first: a loss in the table is a loss.

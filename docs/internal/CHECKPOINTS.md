@@ -1,10 +1,13 @@
 # Checkpoints And Rollback
 
-Every mutating tool call writes a `CheckpointRecord` into the shadow git
-repo under `.squeezy/checkpoints/git/` plus a JSONL journal entry. The
-agent can roll back individual records, but the unit of work users
-actually care about is the **turn**, and the rollback surface is shaped
-to match.
+Checkpoint-enabled edit tools capture a pre-edit snapshot, run the mutation,
+and record the delta as a `CheckpointRecord` in the shadow git repo under
+`.squeezy/checkpoints/git/` plus a JSONL journal entry. The default bridge is
+`JournalCheckpointProvider`; external integrations can replace the pre/post
+edit snapshot provider, but the built-in list/show/undo/revert tools still read
+the registry's own `CheckpointStore`. The agent can roll back individual
+records, but the unit of work users actually care about is the **turn**, and
+the rollback surface is shaped to match.
 
 ## Records, Groups, And Targets
 
@@ -15,6 +18,8 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
   emitted while handling one user turn shares this value.
 - `tool_name`, `call_id`, `status`, `before_tree`, `after_tree`, per-file
   `before_sha256` / `after_sha256`.
+- `files`, `skipped_files`, `summary`, `coverage_warnings`, and
+  `created_at_ms`.
 
 `RollbackTarget` (same file) is therefore three-way:
 
@@ -23,7 +28,9 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `Checkpoint(id)` — one specific record.
 
 Both `Atomic` and `BestEffort` rollback modes accept any of the three
-targets; the sha256 gate is identical in all cases.
+targets; the sha256 gate is identical in all cases. `checkpoint_undo` targets
+`Latest`; `checkpoint_revert` requires exactly one of `group_id` or
+`checkpoint_id`.
 
 ## Why `Group(group_id)` Is Load-Bearing
 
@@ -57,6 +64,12 @@ The shadow-repo isolation (`refs/squeezy/checkpoints/<id>/{before,after}`,
 hooks/gpg/commit-graph disabled) is what makes group rollback durable
 across `git gc` and invisible to the user's reflog. See
 `crates/squeezy-vcs/src/lib.rs` `ensure_shadow_repo` for the rationale.
+
+Checkpoint coverage is explicit. Files that exceed the checkpoint size limit
+are reported in `skipped_files` and add a coverage warning; rollback will not
+pretend those files are protected. Malformed journal lines are counted as
+`journal_warnings` and ignored rather than making the whole checkpoint list
+unreadable.
 
 ## What This Document Is Not
 

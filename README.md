@@ -7,23 +7,13 @@ packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
 > **Status:** early v0 development. The CLI/TUI is runnable; graph-backed
 > navigation, deterministic validation harnesses, local help, sessions/resume,
-> checkpoints, provider routing, MCP, skills, feedback/reporting, and telemetry
-> are implemented and still evolving. Provider coverage changes faster than this
-> README, so use
+> checkpoints, provider routing, MCP, skills, hooks, feedback/reporting, and
+> telemetry are implemented and still evolving. Provider and language support
+> change faster than this README, so use
 > [`PROVIDERS.md`](crates/squeezy-skills/external-docs/PROVIDERS.md) for exact
-> provider ids, defaults, environment variables, and model metadata. Broadly:
->
-> - **Aggregators (one key, many models):** OpenRouter, Vercel AI Gateway,
->   PortKey.
-> - **First-party vendor APIs (single vendor):** OpenAI, Anthropic, Google
->   Gemini.
-> - **Cloud-platform hosts:** Amazon Bedrock, Azure OpenAI, and Google Vertex AI.
-> - **Subscription/auth-backed providers:** OpenAI Codex and GitHub Copilot.
-> - **Local or self-hosted runtimes:** Ollama, LM Studio, vLLM, llama.cpp, and any
->   OpenAI-compatible endpoint.
-> - **Other OpenAI-compatible services:** Groq, xAI, DeepSeek, Mistral,
->   Together AI, Fireworks AI, Cerebras, DeepInfra, Baseten, Cloudflare Workers
->   AI, Cloudflare AI Gateway, and similar presets.
+> provider ids, defaults, environment variables, and model metadata, and
+> [`LANGUAGES.md`](crates/squeezy-skills/external-docs/LANGUAGES.md) for the
+> current graph-navigation coverage matrix.
 
 The **why** lives in [`docs/THESIS.md`](docs/THESIS.md). User docs live in
 [`crates/squeezy-skills/external-docs/`](crates/squeezy-skills/external-docs)
@@ -41,8 +31,11 @@ curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | 
 On macOS, Homebrew is also supported:
 
 ```sh
-brew install esqueezy/tap/squeezy
+brew install squeezy
 ```
+
+If the core formula is not available on your machine yet, use
+`brew install esqueezy/tap/squeezy`.
 
 Rust users can install with Cargo:
 
@@ -65,7 +58,7 @@ squeezy providers list            # provider registry and model counts
 squeezy sessions list             # recent local sessions
 squeezy --resume                  # open the resume picker
 
-# Fastest path: one credit, every frontier model (recommended)
+# Aggregator path: one key can route to many upstream models.
 export OPENROUTER_API_KEY=...     # https://openrouter.ai/keys
 squeezy
 

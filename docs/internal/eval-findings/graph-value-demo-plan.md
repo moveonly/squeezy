@@ -1,5 +1,11 @@
 # Plan: an UNBIASED demonstration of squeezy's semantic-graph value
 
+Status: historical execution plan. The repo-local current scoreboard lives in
+`mini-vs-codex-realworld.csv`, `haiku-vs-cc-realworld.csv`, and
+`realworld-scoreboard-methodology.md`; older branch names, `/tmp/hth` paths,
+and intermediate win counts below are retained as execution context rather
+than current instructions.
+
 > Self-contained execution plan. An agent with **no prior context** should be
 > able to pick this up and execute it. Read §1–§4 for the goal, principle, and
 > environment; §5 is the step-by-step work; §6 is the reference/runbook.
@@ -58,12 +64,10 @@ Where squeezy **loses** on a genuinely-graph-needing task, root-cause it:
   pricing/graders): `mini-vs-codex-realworld.csv`, `haiku-vs-cc-realworld.csv`.
 - Vendored harness + graders under `docs/internal/eval-findings/realworld-harness/`.
 
-**The honest board today (the starting point):**
-- **mini 11/15 WIN** — LOSS: `csharp, go, java, ruby`.
-- **haiku 8/15 WIN** — LOSS: `c, dart, go, js, php, python, ts` (`dart` is a 0.98
-  near-tie where squeezy has *higher* recall; `js` is a recall loss at 68%).
-- Union of losing langs: **c, csharp, dart, go, java, js, php, python, ruby, ts**.
-- The 5 always-winning langs: `cpp, kotlin, rust, scala, swift` (+ `dart-mini`).
+**Historical starting board:** this plan was written before the later CSV
+refresh. The checked-in CSVs now show **mini 15/15 WIN** and **haiku 13/15
+WIN** (LOSS: `c`, `go`). Treat the older loss lists in this plan as historical
+work queue notes, not the current scoreboard.
 
 **Why the residual losses happen (already investigated):** the residual-loss
 tasks are **read-heavy enumerations** ("list every X under dir Y") where grep+read
@@ -83,7 +87,7 @@ Step-4 squeezy improvement.
 
 ## 4. Environment & harness (how measurement works)
 
-- **Repo:** `/Users/abbassabra/esqueezy/new`. Work on a branch off `main`
+- **Historical repo path:** `/Users/abbassabra/esqueezy/new`. Work on a branch off `main`
   (current scratch branch `perf/graph-favorable-tasks` — rebase onto `main` or
   start fresh; it currently has nothing but this plan).
 - **Release binary** (rebuild after any squeezy code change):

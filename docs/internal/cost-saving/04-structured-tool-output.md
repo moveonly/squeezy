@@ -311,11 +311,19 @@ The recovery hint is significant — it names the tool (`read_tool_output`)
 and the parameter (`path`) so the model can pivot without inferring
 the contract from the surrounding chatter.
 
-### Shell spillover
+### Shell spillover and raw sidecars
 
 The shell tool caps in-memory capture at `output_cap` bytes and
-middle-truncates. The bytes past the boundary are routed to
-`ShellSpilloverStore`:
+middle-truncates. There are now two recovery paths:
+
+- the ordinary spill file stores the shaped/capped payload that survived
+  in-memory truncation, and
+- the raw sidecar (`{call_id}-raw.txt`) is opened before pipe readers apply
+  the hard cap, so bytes that would otherwise be dropped remain recoverable
+  on overflow.
+
+Both paths are served by `read_tool_output`, which accepts exactly one of
+`handle` or `path` plus optional `offset` / `limit`.
 
 ```rust
 // crates/squeezy-tools/src/shell_spillover.rs:1–34
@@ -328,8 +336,8 @@ middle-truncates. The bytes past the boundary are routed to
 //! would otherwise be permanently lost — discarding the signal a long
 //! build log, verbose stack trace, or other oversized output carries.
 //!
-//! [`ShellSpilloverStore`] preserves the captured raw stdout/stderr by
-//! writing it to a per-session directory under
+//! [`ShellSpilloverStore`] preserves recoverable stdout/stderr by
+//! writing spill files and raw sidecars to a per-session directory under
 //! `$TMPDIR/squeezy-spillover/<session-id>/`. The shell tool surfaces
 //! the path in the truncated result so the model can call
 //! `read_tool_output { path }` to fetch byte ranges.
@@ -340,9 +348,9 @@ middle-truncates. The bytes past the boundary are routed to
 pub(crate) const DEFAULT_SHELL_SPILLOVER_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
 ```
 
-The spill path is constructed from a sha256-prefix of the payload plus
-a sanitised call id, written under the session directory, and
-returned as a `ShellSpilloverInfo { path, bytes }`:
+The ordinary spill path is constructed from a sha256-prefix of the payload
+plus a sanitised call id, written under the session directory, and returned
+as a `ShellSpilloverInfo { path, bytes }`:
 
 ```rust
 // crates/squeezy-tools/src/shell_spillover.rs:115–146
@@ -367,7 +375,7 @@ pub(crate) fn spill(
         self.release(size);
         return None;
     }
-    let short_hash = &sha256_hex(&bytes)[..SPILL_SHORT_HASH_HEX];
+    let short_hash = &sha256_hex(payload.as_bytes())[..SPILL_SHORT_HASH_HEX];
     let sanitized = sanitize_call_id(call_id);
     let path = self
         .session_dir
@@ -380,16 +388,14 @@ pub(crate) fn spill(
 }
 ```
 
-The 100 MiB session budget bounds disk usage across an entire
-agent loop. `try_reserve` (`shell_spillover.rs:175–189`) uses a
-`compare_exchange` loop so concurrent shell calls can't double-count
-their way past the cap. `read_range`
-(`shell_spillover.rs:152–173`) canonicalises the requested path and
-rejects anything outside `session_dir_canonical`
-(`shell_spillover.rs:202–223`), which closes the obvious symlink and
-`..`-traversal escapes. The `Drop` impl
-(`shell_spillover.rs:232–239`) does best-effort `remove_dir_all` so
-spillover never outlives the registry that produced it.
+The raw sidecar uses the same per-session directory but writes incrementally
+from the stream before the cap discards bytes. `reserve_up_to` charges each
+append against the same 100 MiB session budget; once exhausted, the sidecar
+keeps whatever was already written and stops granting more bytes. `read_range`
+canonicalises path reads and rejects anything outside the session directory,
+which closes the obvious symlink and `..`-traversal escapes. The `Drop` impl
+does best-effort `remove_dir_all` so spillover never outlives the registry
+that produced it.
 
 ### Grep caps
 

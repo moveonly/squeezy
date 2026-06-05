@@ -6,9 +6,9 @@ fixtures, oracle, gates, and known limitations.
 
 ## Source Of Truth
 
-- Parser wiring: `crates/squeezy-parse/src/lib.rs` registers
-  `tree-sitter-php = "0.24"` through `LanguageKind::Php` and uses
-  `LANGUAGE_PHP` so mixed PHP/HTML files parse under one grammar.
+- Parser wiring: `crates/squeezy-parse/src/lib.rs` maps `LanguageKind::Php`
+  to `tree_sitter_php::LANGUAGE_PHP`; the grammar version is pinned as
+  `tree-sitter-php = "0.24"` in the workspace `Cargo.toml`.
 - Extractor: `crates/squeezy-parse/src/languages/php.rs`.
 - Graph resolver: `crates/squeezy-graph/src/languages/php.rs`.
 - Benchmark fixture: `benchmarks/fixtures/php/semantic-cases/`.

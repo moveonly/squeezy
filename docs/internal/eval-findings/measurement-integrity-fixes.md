@@ -51,29 +51,24 @@ sides, not just squeezy. After the fix, **codex** recall went 0→**100%**
 (python) and ~6→**100%** (rust) — confirming the bug was bad ground truth, not
 a model failure.
 
-## Corrected same-task numbers (only same-task runs, recall ≥95, equal rates)
+## Corrected same-task numbers
 
 | lang | tier | squeezy | baseline | verdict |
 |---|---|---|---|---|
-| python | Mini | $0.1038 (r≈83–100) | codex $0.0288 | **LOSS — 3.6× pricier** |
-| rust | Mini | $0.0422 (r≈100) | codex $0.0415 | TIE |
-| java | Mini | $0.1056 (r≈94) | codex $0.1175 | **WIN 10%** |
-| rust | Haiku | $0.1103 (r≈100) | CC $0.1734 | **WIN 36%** |
-| python | Haiku | re-running (regenerated toml) | CC re-running (old-task) | pending |
-| java | Haiku | re-running (regenerated toml) | CC $0.2222 | pending |
+| python | Mini | $0.0155 (r=100) | codex $0.0193 | **WIN** |
+| rust | Mini | $0.0278 (r=100) | codex $0.0355 | **WIN** |
+| java | Mini | $0.0488 (r=100) | codex $0.1094 | **WIN** |
+| rust | Haiku | $0.0858 (r=80) | CC $0.1509 | **WIN in committed CSV** |
+| python | Haiku | $0.0580 (r=100) | CC $0.1074 | **WIN** |
+| java | Haiku | $0.2670 (r=100) | CC $0.3696 | **WIN** |
 
-The other 13 languages were measured on consistent prompts and correct graders;
-their verdicts stand.
+The checked-in `mini-vs-codex-realworld.csv` and
+`haiku-vs-cc-realworld.csv` are the current source of truth. The original
+"pending" rows above were resolved by the later CSV refresh.
 
 ## The python finding (a real product signal, not a measurement artifact)
 
-After both fixes, python is a **genuine cost loss on Mini**: squeezy pays 3.6×
-codex. Cause: #201 revised python from a graph-favorable call-graph task into a
-**grep-friendly** "find every class whose direct base is in B" inventory — one
-`grep 'class .*(…Base…)'` across `src/` + `tests/` enumerates the answer.
-Codex greps it for ~$0.03; squeezy navigates it with the graph (hierarchy +
-many `read_slice`) for ~$0.10. This is the "the graph tax needs a big enough
-task to justify it" principle (cost-saving Ch.13 §13.4): squeezy should
-recognize a grep-shaped scan and **use grep instead of the graph**, rather than
-paying for cross-file navigation the task doesn't need. The fix is a squeezy
-efficiency/routing improvement (option a), not a scenario change.
+This document originally called python a Mini cost loss after the grader fix.
+That was superseded by the later committed CSV refresh, where python is a Mini
+WIN and a Haiku WIN. Keep the discussion as historical context for why prompt
+fit and same-task grading mattered; use the CSVs for current verdicts.

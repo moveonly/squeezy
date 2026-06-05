@@ -3,7 +3,8 @@
 Squeezy has two consented maintainer-intake flows.
 
 `/feedback` is for a short human-written note. The TUI accepts a few
-sentences, shows the redacted preview, and only sends after `/feedback send`.
+sentences, shows the redacted preview, and only sends after Enter or
+`/feedback send`; Esc or `/feedback cancel` discards the preview.
 The CLI equivalent is:
 
 ```sh
@@ -25,13 +26,13 @@ squeezy sessions report <session_id> --send --yes
 squeezy sessions report <session_id> --output /tmp/report.tar
 ```
 
-Report archives contain redacted version, config, repo profile, session,
-tool/cost, permission, diagnostic, and replay sections. The replay section uses
-the redacted shareable tape or omits it when size limits require truncation; raw
-local-only traces are never included in report archives. Archives are uploaded
-to private Cloudflare R2 storage; PostHog receives only report
-metadata such as `report_id`, byte size, section names, platform, and redaction
-count. If upload fails, Squeezy writes the archive locally instead.
+Report archives contain a manifest plus redacted version, config, repo profile,
+session metadata, events, tool/cost summaries, permission, diagnostic, and
+replay sections. Oversized sections are replaced with an omitted-section marker.
+Archives are uploaded to private Cloudflare R2 storage when the Worker has
+report storage configured; PostHog receives only report metadata such as
+`report_id`, byte size, section names, platform, redaction count, and the R2 key.
+If upload fails, Squeezy writes the archive locally instead.
 
 Feedback and report upload can be disabled with `SQUEEZY_FEEDBACK=off`. Test or
 staging collectors can override endpoints with `SQUEEZY_FEEDBACK_ENDPOINT` and

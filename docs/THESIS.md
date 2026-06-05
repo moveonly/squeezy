@@ -29,8 +29,10 @@ Every model token is a budgeted resource.
 - An **exploration compiler** translates model intent into a
   deterministic local query plan; only the final compact evidence
   packet ships to the model.
-- A **cost broker** enforces per-turn caps on `grep`, raw reads, and
-  tool calls, and routes trivial work to cheaper models.
+- A **cost broker** enforces per-turn caps on `grep`, raw reads, tool
+  calls, round input size, and session spend.
+- A **turn router** sends obvious low-risk work to cheaper models and
+  escalates back to the parent model when a turn stops looking simple.
 - **Failure memory** keeps the agent from repeating dead-end searches
   across compactions.
 - The static system prompt is held stable so provider caches actually
@@ -57,11 +59,14 @@ Latency is tracked along four axes:
 The semantic graph is the primary navigation surface; bounded grep is
 a labeled fallback.
 
-- Every relationship carries a **confidence label**
-  (`exact_syntax`, `import_resolved`, `candidate_set`, `external`,
-  `unknown`).
-- Every claim carries **provenance**: spans, hashes, parser/query
-  origin, freshness.
+- Every relationship carries a **confidence label** such as
+  `exact_syntax`, `import_resolved`, `heuristic`, `candidate_set`,
+  `external`, `macro_opaque`, `conditional_unknown`, `unsupported`,
+  `stale`, or `partial`.
+- Graph symbols and edges carry **provenance** and freshness internally:
+  spans, hashes, parser/query origin, and refresh state. Model-visible
+  packets keep the compact evidence needed for decisions and drop
+  decorative provenance fields when they would waste tokens.
 - **Framework-aware extensions** can expose routes and system
   functions as graph nodes when a supported adapter exists.
 - The **current branch diff** is first-class context: "what did I
@@ -75,11 +80,11 @@ a labeled fallback.
 
 Squeezy targets local semantic navigation across Rust, Python, Java,
 Kotlin, Scala, C#/.NET, Go, C/C++, JavaScript/TypeScript, PHP, Ruby,
-Swift, and Dart. Supported platforms are macOS, Linux, and Windows
-`x86_64`. The Linux release artifact is built for
-`x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is
-a TUI. Squeezy is an MCP client: external MCP servers can be installed
-and consumed as tools.
+Swift, and Dart. Supported platforms are macOS, Linux, and Windows.
+Release archives are built for macOS Intel and Apple Silicon, Linux
+x86_64 and ARM64 musl, and Windows x86_64 MSVC. The Linux artifacts do
+not depend on glibc. The UI is a TUI. Squeezy is an MCP client:
+external MCP servers can be installed and consumed as tools.
 
 ## Non-goals
 

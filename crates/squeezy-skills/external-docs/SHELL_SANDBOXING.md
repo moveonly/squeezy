@@ -86,15 +86,21 @@ not provide filesystem or network isolation: the audit record reports
 = "best_effort"` or `mode = "external"`.
 
 On **Linux**, Squeezy uses a direct syscall backend. The pre-spawn probe checks
-`/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user`. When
-namespacing is available, the spawned shell calls
+`/proc/sys/kernel/unprivileged_userns_clone`, `/proc/self/ns/user`, and
+Landlock availability. When namespacing is available, the spawned shell calls
 `unshare(CLONE_NEWUSER | CLONE_NEWNS [| CLONE_NEWNET])`, writes
 `/proc/self/{setgroups,uid_map,gid_map}` so the inner uid maps to the parent
-uid, and then `execve`s the shell. On older kernels or containers without
-user-namespace support, the backend reports unavailable; in `mode = "required"`
-the tool call is denied pre-spawn rather than running unsandboxed, and in
-`mode = "best_effort"` the command runs with the remaining shell policy
-controls (env allowlist, timeout, output cap, audit) but no OS isolation.
+uid, applies Landlock filesystem allowlists for the workspace/default roots and
+configured roots when the kernel supports it, installs a small seccomp
+deny-list, and then `execve`s the shell. The seccomp filter returns `EPERM` for
+`ptrace`, cross-process memory syscalls, and `AF_UNIX` sockets so a sandboxed
+child cannot easily reach back into the agent process through local process or
+socket channels. On older kernels or containers without user-namespace support,
+the backend reports unavailable; in `mode = "required"` the tool call is denied
+pre-spawn rather than running unsandboxed, and in `mode = "best_effort"` the
+command runs with the remaining shell policy controls (env allowlist, timeout,
+output cap, audit) but no OS isolation. In `required` mode, unavailable
+Landlock filesystem enforcement also denies pre-spawn.
 
 ## When To Use It
 

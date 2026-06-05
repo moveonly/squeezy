@@ -3,12 +3,12 @@
 ## Motivation
 
 Most user turns on a coding agent do not need the headline model. A
-session running on Opus or GPT-5.5 pays the headline rate every turn,
+session running on the configured parent model pays the parent rate every turn,
 but a sizable share of those turns are well-specified mechanical
 asks — "run `cargo test -p squeezy-llm`", "checkout main", "rename
 `frobnicate` to `process` in `src/lib.rs`", "grep TODO under `src/`".
-The same provider's small-fast tier — Anthropic Haiku, OpenAI Nano /
-Mini, Gemini Flash Lite, the cheap Bedrock variant — finishes those
+The same provider's cheap tier — Anthropic Haiku, OpenAI `gpt-5.4-mini`
+by default, Gemini Flash, the cheap Bedrock variant — finishes those
 turns correctly at roughly 1/15 the input price. The savings compound
 across an entire session: a 30-turn coding session where ~30% of turns
 are slam-dunk operational asks routes those turns to the cheap tier,
@@ -18,8 +18,8 @@ provider.
 
 Squeezy's earlier subagent infrastructure already routed Explorer and
 Reviewer subagents to the cheap tier via `RoleModelPolicy::Cheap`
-(`crates/squeezy-agent/src/roles.rs:32-52`) and
-`small_fast_model_for_provider` (`crates/squeezy-core/src/lib.rs:64`),
+(`crates/squeezy-agent/src/roles.rs`) and
+`small_fast_model_for_provider` (`crates/squeezy-core/src/lib.rs`),
 but the main user-facing turn always used `AppConfig.model`. This
 chapter covers the layer that extends cheap-tier routing to that
 headline turn — with a robust mid-turn fallback for false positives.
@@ -63,23 +63,35 @@ Layer 2 is the **provider-cheap-tier LLM judge**. It runs only when:
 - `[routing].llm_judge = true` (default true),
 - prompt is non-empty and within `judge_max_chars` (default 6_000 ≈
   1500 tokens),
-- there is no image attachment and no `/parent` override,
+- the turn is build mode, not plan mode,
+- there is no image input, no large attachment, and no `/parent` override,
+- the parent model matches the resolved reroute filter (`expensive_models`),
 - the escalation-sticky window is not engaged.
+
+Ultra-short follow-ups after a hard parent turn (`follow_up_max_chars`,
+default 24, or deictic prompts such as "continue") inherit the parent route
+without paying for a judge call.
 
 The judge dispatches a single short request via `LlmProvider::stream_response`
 to a cheap judge model. Resolution prefers `[providers.<id>].judge_model`, then
-`[routing].judge_model`, then the provider's curated mini/cheap tier via
-`judge_model_for_provider` / `cheap_model_for`. That means the judge model
-varies by provider and can differ from the routed-turn model:
+`[routing].judge_model`, then the provider's curated judge tier via
+`judge_model_for_provider`. The routed-turn model is resolved separately by
+`cheap_model_for`: `[providers.<id>].cheap_model`, then legacy
+`[model].small_fast_model`, then the same per-provider judge/mini default.
 
-| Parent provider                | Judge / routed-turn model           |
-|--------------------------------|--------------------------------------|
-| Anthropic (Opus, Sonnet)       | Claude Haiku                         |
-| OpenAI (GPT-5, GPT-5.5)        | GPT-mini / Nano                      |
-| Google (Gemini Pro)            | Gemini Flash Lite                    |
-| Bedrock                        | Cheap variant from `models.json`     |
-| OpenRouter / Vercel / Portkey  | The route's small-fast tier           |
-| Ollama / local                 | User's `[model].small_fast_model`    |
+That means OpenAI/Azure route easy turns to `gpt-5.4-mini` by default. Set
+`[providers.<id>].cheap_model = "haiku"` or `"gpt-5.4-nano"` when a deployment
+prefers the cheaper nano tier for routed turns.
+
+| Parent provider                | Built-in judge default               | Built-in routed-turn default         |
+|--------------------------------|--------------------------------------|--------------------------------------|
+| Anthropic                      | `claude-haiku-4-5-20251001`          | `claude-haiku-4-5-20251001`          |
+| OpenAI                         | `gpt-5.4-mini`                       | `gpt-5.4-mini`                       |
+| Google                         | `gemini-3.5-flash`                   | `gemini-3.5-flash`                   |
+| Azure OpenAI                   | `gpt-5.4-mini`                       | `gpt-5.4-mini`                       |
+| Bedrock                        | `anthropic.claude-haiku-4-5-20251001-v1:0` | `anthropic.claude-haiku-4-5-20251001-v1:0` |
+| OpenRouter / Vercel / Portkey  | The provider's small-fast tier       | The provider's small-fast tier       |
+| Ollama / local                 | No built-in judge tier               | Local default unless overridden      |
 
 The judge's system prompt is fixed (`turn_router.rs::JUDGE_INSTRUCTIONS`)
 and asks for a strict JSON reply `{"route":"cheap"|"parent","reason":"…"}`.
@@ -125,10 +137,9 @@ When the detector fires, the loop:
   event so transcripts, eval frames, and the TUI show the swap with
   a structured reason string.
 
-Because the swap is within-provider (`small_fast_model_for_provider`
-returns `None` and the decision degrades to `Parent` for providers
-without a curated cheap tier), the conversation state is intact
-across the swap — no replay, no `previous_response_id` reset.
+Because `cheap_model_for` never crosses providers, the conversation state is
+intact across the swap — no replay, no `previous_response_id` reset. If no
+cheap turn model can be resolved, the router degrades to `Parent`.
 
 ### Per-turn user overrides (`/cheap`, `/parent`, `/router`)
 
@@ -167,30 +178,19 @@ audit how much the router actually saved.
 
 ## Cost intuition
 
-Headline rate ratios (provider docs, snapshot at branch creation
-2026-05-31):
-
-| Provider        | Parent (per Mtok in)    | Cheap (per Mtok in)    | Cheap multiplier |
-|-----------------|-------------------------|-------------------------|------------------|
-| Anthropic Opus 4.7         | $15.00 | Haiku 4.5: $1.00     | ~15× |
-| OpenAI GPT-5.5             | $2.50  | GPT-5.4 Nano: $0.15  | ~17× |
-| Google Gemini 2.5 Pro      | $1.25  | Flash Lite: $0.10    | ~13× |
-
-A turn the heuristic routes to cheap costs ~1/13–1/17 of the
-parent-rate equivalent for the same wire bytes. With the LLM judge
-enabled, a borderline classification adds one short judge call
-(~120 input tokens + ~30 output) — the judge cost on Anthropic is
-~$0.0005 per turn it runs. The break-even point is roughly: route a
-prompt to cheap when expected parent cost ≥ 1.4× judge cost, which
-holds for essentially any non-trivial parent turn.
+The cost ratio is deliberately data-driven rather than hard-coded in this
+chapter. `TurnMetrics` records the judge cost, the cheap-tier provider usage,
+and the estimated parent-rate equivalent using model prices from
+`crates/squeezy-llm/src/models.json`. `/context` reports routed turns,
+escalations, judge spend, and signed net savings. That makes current model
+pricing a registry concern instead of a stale documentation table.
 
 ## Edge cases & limits
 
-- **Provider has no cheap tier**: `small_fast_model_for_provider`
-  returns `None` (e.g. user-provided Ollama or an unfamiliar
-  OpenAI-compatible preset). The decision degrades to `Parent` and
-  the router logs a one-shot info note for the session. Covered by
-  the path test `cheap_model_for_returns_none_falls_back_to_parent`.
+- **Provider has no cheap tier**: `cheap_model_for` can return `None`
+  for unfamiliar OpenAI-compatible presets. The decision degrades to
+  `Parent` and the router logs a one-shot info note for the session.
+  Covered by the path test `cheap_model_for_returns_none_falls_back_to_parent`.
 - **Cheap == parent**: when the configured `[model].small_fast_model`
   override resolves to the same id as `AppConfig.model`, the router
   short-circuits to `Parent` without consulting the judge — routing
@@ -199,17 +199,21 @@ holds for essentially any non-trivial parent turn.
   any turn carrying an image attachment routes to the parent model.
   Cheap tiers are typically weaker on vision and the user already
   paid for visual input.
+- **Large attachment**: `large_attachment_bypass_bytes` defaults to 4096.
+  Prompts carrying larger attached context bypass cheap routing because the
+  attached payload is usually task context, not a trivial command.
+- **Plan mode**: plan-mode turns always use the parent model. The router is
+  for build-mode execution turns.
 - **Cancellation**: the judge call rides the same `CancellationToken`
   as the parent turn. A user cancellation while the judge is mid-flight
   drops the judge and the turn dispatches on the parent model.
 - **Heuristic-bypass paths**: `/parent` forces parent; `enabled = false`
   forces parent (still honors explicit `/cheap`); the escalation-sticky
   window forces parent for K turns after a recent escalation.
-- **Within-provider only**: today the cheap tier is always the same
-  *provider*'s small-fast tier. Cross-provider routing (e.g. Opus
-  parent → Gemini Flash Lite cheap) is not in scope — would need
-  duplicated auth / token-accounting and would change the
-  prompt-cache prefix.
+- **Within-provider only**: today the cheap tier is always resolved inside
+  the same provider. Cross-provider routing (e.g. Opus parent → Gemini Flash
+  cheap) is not in scope — it would need duplicated auth / token-accounting
+  and would change the prompt-cache prefix.
 - **Subagents already routed**: the Explorer/Reviewer subagents
   separately go through `subagent_model_for_kind` with
   `RoleModelPolicy::Cheap`. This chapter's mechanism is orthogonal —
@@ -222,13 +226,18 @@ holds for essentially any non-trivial parent turn.
 ```toml
 [routing]
 enabled = true                     # opt-out master switch
-llm_judge = true           # borderline judge call
+heuristic = true                   # deterministic fast path
+llm_judge = true                   # borderline judge call
+follow_up_max_chars = 24           # short hard-task follow-ups stay parent
+expensive_models = ""              # empty = provider default reroute filter
 cheap_escalation_tool_calls = 0       # 0 = max_tool_calls_per_turn / 4
 cheap_escalation_error_threshold = 2
 escalation_sticky_turns = 3
 bypass_for_images = true
+large_attachment_bypass_bytes = 4096
 heuristic_max_chars = 2000
 judge_max_chars = 6000
+extra_heuristic_verbs = []
 ```
 
 Each key has an `SQUEEZY_ROUTING_*` env-var equivalent matching the

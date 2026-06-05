@@ -20,8 +20,8 @@ navigation surface.
 Squeezy does not adopt the alternative seen in adjacent shell-first agents
 where tree-sitter is only used to parse `apply_patch` heredocs and the model is
 expected to navigate code through `bash -lc` + grep + raw reads. That model
-sacrifices the moat — multi-language symbol resolution, capped candidate sets,
-and typed confidence per edge — that this navigation layer exists to preserve.
+loses the multi-language symbol resolution, capped candidate sets, and typed
+confidence per edge that this navigation layer exists to preserve.
 
 Squeezy also declines to ship an LSP-backed navigation tool alongside the
 tree-sitter graph. Adjacent agents expose a generic `lsp` tool that brokers
@@ -133,12 +133,18 @@ Defaults:
 - idle refresh interval: 15 seconds
 - per-tool refresh budget: 250 ms
 
-Refresh is tool-event-first with a polling fallback. Tool paths that know they
-changed files should call `record_changed_path`; the next graph query refreshes
-immediately after debounce. There is intentionally no always-on workspace file
-watcher today. If no events arrive, Squeezy polls every 15 seconds as a safety
-net. Refresh recrawls tracked files, compares stable hashes, reparses changed
-files only, removes deleted files, and preserves unchanged graph partitions.
+Refresh is pending-event-first when callers provide authoritative changed
+paths, with a polling fallback otherwise. Callers that know paths changed can
+call `record_changed_path`; the next graph query refreshes immediately after
+debounce. `GraphManager::open_watching` can attach the
+`squeezy-graph::watcher::FileWatcher`, which uses
+`notify-debouncer-full` and OS-native backends (FSEvents, inotify, or
+ReadDirectoryChangesW) to queue debounced changed paths into the same pending
+set. The default tool registry still opens the graph with `open_with_store`
+instead of `open_watching`, so normal tool calls rely on refresh calls and the
+15 second polling safety net rather than an always-on OS watcher. Refresh
+recrawls tracked files, compares stable hashes, reparses changed files only,
+removes deleted files, and preserves unchanged graph partitions.
 
 The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
 yields with `budget_exhausted=true` on the refresh report once the budget is
@@ -161,13 +167,16 @@ indexes. JS/TS config edits such as `tsconfig.json` path changes or
 `package.json` export changes rebuild the local resolver and dependent import
 edges without reparsing unchanged source files.
 
-Parsed graph partitions are persisted in a `redb` database under the configured
-cache root (`.squeezy/cache/state.redb` by default). On a later session,
-unchanged files are hydrated from persisted partitions and skip tree-sitter
-parsing; changed or missing partitions are reparsed and written back. The store
-records a schema version plus workspace, crawl-policy, language-registry, and
-graph-format metadata. A schema mismatch backs up the old database and rebuilds
-fresh state instead of mutating unknown data in place.
+Parsed graph partitions and resolver-cache snapshots are persisted in the
+split graph `redb` database under the configured cache root
+(`.squeezy/cache/graph.redb` by default). `state.redb` is reserved for
+receipt metadata, read snapshots, observations, and small session-side cache
+state. On a later session, unchanged files are hydrated from persisted
+partitions and skip tree-sitter parsing; changed or missing partitions are
+reparsed and written back. The graph store records a schema version plus
+workspace, crawl-policy, language-registry, and graph-format metadata. A schema
+mismatch backs up the old database and rebuilds fresh state instead of mutating
+unknown data in place.
 
 Tree-sitter parse work is parallelized for batches of at least eight files. Each
 worker owns its own parser instance, and the final graph merge plus index rebuild
@@ -187,7 +196,8 @@ without sending paths or source text.
 ## Compiler Facts
 
 Cargo is an explicit fact-refresh source, not a navigation dependency. The
-`refresh_compiler_facts` tool is permission-scoped as `compiler` and runs
+`refresh_compiler_facts` tool requests compiler permission metadata (`cargo
+facts:*`, or `cargo facts+check:*` when diagnostics are requested) and runs
 `cargo metadata --format-version=1 --no-deps`; when requested, it also runs
 `cargo check --message-format=json` to cache diagnostics. Navigation tools do
 not invoke cargo. They only read the cached compiler facts already attached to
@@ -238,93 +248,27 @@ be targeted by graph spans or `read_slice` ranges.
 
 ## Benchmarks
 
-Semantic graph benchmarks live under `benchmarks/`. The Rust smoke benchmark
-validates the fixture crate with the Rust compiler, builds the Squeezy graph,
-runs query specs, and writes a JSON report. The Python smoke benchmark validates
-the fixture with a slower CPython `ast` oracle and compares declaration symbols
-against Squeezy's graph. The Java smoke benchmark uses the JDK compiler tree API
-as a benchmark-only declaration oracle when `java` is available, and still runs
-deterministic query gates when it is not. The language smoke benchmarks fail if
-required expected results are missing or, when a validation oracle is available,
-Squeezy graph build plus query time is not faster than the validation pass for
-the same fixture.
+Semantic graph benchmarks live under `benchmarks/`. The benchmark CLI supports
+the same 13 `LanguageFamily` values as production indexing: Rust, Python, Java,
+C#, Go, C/C++, JavaScript/TypeScript, PHP, Ruby, Kotlin, Swift, Scala, and
+Dart. Smoke fixtures and query specs live under `benchmarks/fixtures/<family>/`
+and `benchmarks/specs/`; `benchmarks/corpus.json` is the reproducible corpus
+entry point for smoke and full-tier runs.
 
-The JS/TS smoke benchmark validates a controlled TSX fixture with query specs.
-When the `typescript` npm package is available, the benchmark also runs three
-oracle tiers: a declaration oracle (TypeScript compiler API, reports symbol
-TP/FP/FN for file/name/kind declarations), a mixed workload (all nine query
-types against real repos with a refresh probe), and a navigation oracle
-(TypeScript Language Service `getDefinitionAtPosition` / `findReferences` probes
-on sampled call-edge sites and declaration symbols — the JS/TS equivalent of the
-rust-analyzer LSP probes on the Rust benchmark). If Node or TypeScript is
-unavailable the report records that status explicitly and still runs the
-tree-sitter query spec.
+Current benchmark-only oracles are registered in
+`benchmarks/squeezy-graph-bench/src/oracles.rs`: rust-analyzer, CPython AST,
+javac, Kotlin compiler embeddable, Scala SemanticDB, Roslyn, Go parser/types
+helpers, clang, TypeScript compiler API/language service, nikic/php-parser, Ruby
+Prism, SourceKit-LSP, and the Dart analyzer. These oracles validate fixtures,
+measure declaration accuracy, and expose navigation losses; production
+navigation remains tree-sitter plus the local graph.
 
-The C and C++ smoke benchmarks validate fixtures with `clang -fsyntax-only` and
-`clang++ -fsyntax-only`, then compare declaration symbols against
-`clang -Xclang -ast-dump=json` output before running the same graph/query/spec
-harness. Clang is a benchmark oracle only; production C/C++ navigation remains
-tree-sitter and local graph analysis. External mixed benchmarks cap sampled
-oracle files by default and exclude unparseable files from Squeezy
-false-positive accounting because real projects often require generated
-headers, compile flags, SDKs, or compile command databases. Known misses must be
-documented for macros, inactive preprocessor branches, templates, overloads,
-generated code, external headers, function pointers, and virtual dispatch.
-
-The mixed benchmark runs deterministic exhaustive scenarios against a real Rust
-repo by default. It generates scenarios from every indexed symbol and resolved
-call edge, then exercises hierarchy, symbol lookup, signature search, body
-search, reference search, callers, callees, and call-chain queries. It also times
-`cargo check`, optionally times
-`rust-analyzer analysis-stats --run-all-ide-things`, and copies Rust files into a
-temporary directory to measure refresh after editing two files.
-Mixed-workload timings are reported for trend analysis rather than used as a
-hard gate.
-
-Accuracy reporting has two external rust-analyzer oracles. `rust-analyzer
-symbols` compares comparable declaration families and reports symbol TP/FP/FN,
-precision, recall, examples, raw counts, and excluded counts. Rust-analyzer
-locals, fields, and variants are excluded from symbol TP/FP/FN because the
-current Squeezy graph does not expose them as declaration symbols.
-
-The benchmark also starts rust-analyzer as an LSP server for sampled navigation
-diffs. `textDocument/definition` validates sampled Squeezy call and macro edge
-targets, while `textDocument/references` compares sampled declaration references
-against Squeezy `references_to_symbol`. This is intentionally a loss tracker
-rather than a hard product dependency: it exposes wrong targets,
-rust-analyzer-only definitions, and Squeezy-only extras while keeping production
-navigation tree-sitter-only.
-
-Python accuracy reporting uses the CPython `ast` oracle as the slower reference
-for class/function/method declaration discovery. It is benchmark-only and does
-not become a production dependency. Python files that CPython `ast` cannot parse
-are reported as `oracle_unparseable` and excluded from Squeezy false-positive
-accounting, because tree-sitter recovery is useful while editing broken or
-future-syntax code even when the oracle cannot treat that file as a module. The
-Python smoke benchmark also carries controlled navigation checks for route
-metadata, constructor-alias method calls, and property references so navigation
-heuristics are regression-tested separately from declaration accuracy.
-
-Java accuracy reporting uses the JDK compiler tree API as the reference for
-class/interface/enum/record/method/constructor declaration discovery. It is
-benchmark-only and does not become a production dependency. Java FP/FN counts
-are declaration-only; they do not prove reference, call, dispatch, overload, or
-classpath completeness. The Java smoke spec carries controlled fixture truth
-for imports, constructor calls, field-receiver method calls,
-inheritance/interface references, package-local symbols, and Maven/Gradle
-project facts. The query oracle is an `expected_contains` minimum oracle; extra
-results stay visible per query but are not counted as false positives.
-
-Go accuracy reporting uses a benchmark-only Go parser/AST oracle for
-declaration discovery. It reports symbol TP/FP/FN, precision, recall, examples,
-and heuristic-iteration notes so receiver/import/interface heuristics can be
-accepted or rejected by measured FP/FN movement. The Go oracle is not a
-production dependency and `gopls` is not used for production navigation.
-The Go oracle is declaration-only; Squeezy cold-build timing currently includes
-full graph work such as body-hit, reference, call, and edge materialization. Any
-repo where Squeezy is slower than the Go oracle should be treated as a graph
-build performance target, not as proof that the parser path is heavier than
-Go's AST parser.
+Mixed workloads generate deterministic scenarios from indexed symbols and
+resolved call edges, then exercise hierarchy, symbol lookup, signature search,
+body search, reference search, callers, callees, and call-chain queries.
+Mixed-workload support is currently enabled for C, C++, C#, Go, JavaScript,
+TypeScript, PHP, and Rust. Mixed timings are reported for trend analysis rather
+than used as a hard gate.
 
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated
@@ -364,10 +308,6 @@ Current external-oracle gaps and known losses:
   resolution, and external crate/stdlib references remain heuristic or
   lower-confidence
 
-Latest local benchmark snapshot is documented in [`BENCHMARKS.md`](BENCHMARKS.md). On the
-May 23, 2026 release run, comparable declaration symbols were 100% TP with 0 FP
-and 0 FN against `rust-analyzer symbols` on five external popular Rust repos:
-ripgrep, fd, bat, tokio, and serde. The LSP navigation oracle does show losses:
-sampled references now have much lower FP counts in the symbol-aware path, but
-FN counts remain high because unresolved cross-package, cfg/feature,
-trait/deref/autoref, macro, and external references are not guessed.
+Latest local benchmark snapshots and per-language result tables are documented
+in [`BENCHMARKS.md`](BENCHMARKS.md). Keep time-sensitive result claims there,
+not in this architecture note.

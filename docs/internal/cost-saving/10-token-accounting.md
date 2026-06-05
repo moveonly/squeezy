@@ -137,15 +137,22 @@ defends against a hypothetical negative without aborting the stream.
 
 **Google** parses `usageMetadata` on every chunk and overwrites the cost
 state — Gemini emits running totals rather than deltas, so the latest chunk
-wins:
+wins. Gemini reports visible candidate tokens and thinking tokens as disjoint
+fields; Squeezy folds them into inclusive `output_tokens` and keeps
+`reasoning_output_tokens` as the thinking subset:
 
 ```rust
 // crates/squeezy-llm/src/google.rs:365-370
 if let Some(usage) = value.get("usageMetadata") {
     cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
-    cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
     cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
-    cost.reasoning_output_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    let visible = usage.get("candidatesTokenCount").and_then(Value::as_u64);
+    let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    cost.output_tokens = match (visible, thoughts) {
+        (None, None) => None,
+        (visible, thoughts) => Some(visible.unwrap_or(0) + thoughts.unwrap_or(0)),
+    };
+    cost.reasoning_output_tokens = thoughts;
 }
 ```
 

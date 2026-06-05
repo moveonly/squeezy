@@ -6,10 +6,12 @@ telemetry spools unless a concrete producer creates a measured need.
 
 ## Current Shape
 
-- Agent turns and local tool jobs are in-process Tokio tasks.
-- Tracked jobs keep a cancellation token plus an abort handle. Cancellation is
-  cooperative first, then hard-aborted after the grace window if the task does
-  not drain.
+- Agent turns and local tool jobs are in-process Tokio tasks. Long-running
+  local jobs are registered in `JobRegistry` with a `JobStatus`, progress
+  snapshots, a `CancellationToken`, and, when spawned, an abort handle.
+- Cancellation is cooperative first. Turn and job watchdogs abort after the
+  grace window if the task does not drain, then mark the turn/job cancelled
+  rather than leaving an active slot behind.
 - Session event writes are off the async runtime. `SessionHandle::append_event`
   queues JSONL payloads to a per-session writer thread; session boundaries and
   read surfaces use `flush_events()` as the durability barrier.
@@ -28,10 +30,13 @@ folded in once it lands.
 
 Deferred off the boot path:
 
-- **Workspace graph open** — `GraphManager::open_with_store` (tree-sitter init +
-  redb hydrate) runs in a `spawn_blocking` task; graph tool calls wait on
-  `graph_ready` up to `GRAPH_READY_WAIT`. `graph.redb` is opened lazily there,
-  never eagerly at startup.
+- **Workspace graph open** — `ToolRegistry::new_with_configs_skills_and_mcp`
+  defers `GraphManager::open_with_store` (workspace crawl + tree-sitter init +
+  redb hydrate) to a `spawn_blocking` task when a Tokio runtime is present.
+  Graph tool calls wait on `graph_ready` up to `GRAPH_READY_WAIT`; sync
+  construction contexts keep the inline open so tests observe deterministic
+  graph state. `graph.redb` is opened lazily in that task, never eagerly at
+  startup.
 - **Plan housekeeping** — legacy migration, the 30-day `git log` protected-id
   scan, and plan-dir pruning run in a `spawn_blocking` task; results arrive as
   log lines via `drain_plan_housekeeping`.
@@ -52,9 +57,10 @@ sum. All four feed the light fingerprint, so none can be dropped.
 
 Measure with `SQUEEZY_STARTUP_TRACE_FILE=/path` (see
 `squeezy_core::startup_trace`): each milestone from `main_start` to
-`interactive_ready` is appended as `"<elapsed_micros> <label>"`. With the env
-var unset every `mark` is one atomic load plus a branch, so the calls stay on
-the hot path as a regression guard.
+`interactive_ready` is appended as `"<elapsed_micros> <label>"`. Milestones are
+also stored in memory for startup telemetry. With the env var unset every
+`mark` records the in-memory pair and skips the file write, so the calls stay
+on the hot path as a regression guard.
 
 ## Deferred Durable Task Queue
 

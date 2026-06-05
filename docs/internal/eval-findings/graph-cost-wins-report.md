@@ -1,5 +1,10 @@
 # Graph cost-win investigation — findings, fixes, and validation status
 
+Status: historical investigation log. The checked-in
+`mini-vs-codex-realworld.csv` and `haiku-vs-cc-realworld.csv` are the current
+scoreboard; this report preserves the earlier diagnostic pass, blockers, and
+fix history that led to later CSV refreshes.
+
 Goal: make squeezy **consistently cheaper than CC-Haiku and Codex-Mini while
 keeping recall ≥ 95%** on the 15-language realworld graph-vs-nograph eval,
 prioritising (1) graph-code bugs/heuristics, (2) task/scenario design, (3)

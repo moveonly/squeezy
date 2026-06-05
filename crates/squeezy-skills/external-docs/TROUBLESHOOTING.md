@@ -15,13 +15,17 @@ Run:
 
 ```sh
 squeezy config inspect
-squeezy --list-providers
-squeezy --list-models
+squeezy providers list --configured
+squeezy providers info <provider>
+squeezy auth status
 ```
 
 Check that the selected provider has an API key environment variable configured
-and present in the shell environment. `config inspect` redacts secret-looking
-values, so it can show which key name is configured without exposing the value.
+or a supported local credential source. `config inspect` redacts
+secret-looking values, so it can show which key name is configured without
+exposing the value. Use `squeezy refresh-models --provider <provider>` when an
+OpenAI-compatible provider's live catalog changed and the startup picker still
+shows an older cached list.
 
 ## Unexpected Permissions
 
@@ -30,11 +34,12 @@ Inspect `[permissions]`, `[[permissions.rules]]`, and
 decides whether an operation may start; shell sandboxing is an additional local
 execution boundary for approved shell commands.
 
-With no explicit `[permissions]` overrides, `permissions.mode = "auto_review"`
-allows workspace read/search/edit plus local shell, git, and compiler commands.
-Web, MCP, destructive actions, and outside-workspace file paths still ask, with
-model-backed pre-review for read/search/network/MCP prompts. In `default` and
-`auto_review`, the shell sandbox network posture is
+With no explicit `[permissions]` overrides, `permissions.mode = "default"`
+allows workspace read/search/edit plus local shell, git, and compiler commands,
+while web, MCP, destructive actions, and outside-workspace file paths still ask
+the human. `permissions.mode = "auto_review"` is opt-in and routes eligible
+permission prompts through the AI reviewer. In `default` and `auto_review`, the
+shell sandbox network posture is
 `network = "allow_when_approved"` unless explicitly configured.
 
 If a shell command fails only under sandboxing, compare the command's file and

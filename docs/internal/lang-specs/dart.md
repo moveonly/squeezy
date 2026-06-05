@@ -6,8 +6,9 @@ fixtures, oracle, gates, and known limitations.
 
 ## Source Of Truth
 
-- Parser wiring: `crates/squeezy-parse/src/lib.rs` registers
-  `tree-sitter-dart = "0.2.0"` through `LanguageKind::Dart`.
+- Parser wiring: `crates/squeezy-parse/src/lib.rs` maps `LanguageKind::Dart`
+  to `tree_sitter_dart::LANGUAGE`; the grammar version is pinned as
+  `tree-sitter-dart = "0.2.0"` in the workspace `Cargo.toml`.
 - Extractor: `crates/squeezy-parse/src/languages/dart.rs`.
 - Graph resolver: `crates/squeezy-graph/src/languages/dart.rs`.
 - Benchmark fixture: `benchmarks/fixtures/dart/semantic-cases/`.

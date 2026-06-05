@@ -12,6 +12,12 @@
 - **Auto-findings:** OpenAI 5 (`approval_unanswered`x2, `slow_first_token`, `denied_tool_call_ux`x2);
   Anthropic 2 (`approval_unanswered`, `denied_tool_call_ux`); PortKey 0 (run aborted).
 
+Status: historical snapshot. Current eval code supports
+`[squeezy] checkpoints_enabled = true`, and `drive_tui = true` slash-command
+dispatch can exercise TUI-owned surfaces. Preserve the captured findings below
+as run evidence, but re-check current `driver.rs` behavior before treating
+the overlay or TUI-only harness limitations as open defects.
+
 ## Headlines
 
 1. **`track_tree`'s `git add --all -- . :(exclude).squeezy` exits status 1
@@ -33,7 +39,7 @@
    `bd-squeezy-eol0`.
 5. **PortKey provider config missing → scenario aborted.** Severity:
    **medium** (per the wave-2 hard rule). `bd-squeezy-5lo3`.
-6. **`SqueezyOverlay` silently drops the `checkpoints_enabled`
+6. **Historical: `SqueezyOverlay` silently dropped the `checkpoints_enabled`
    scenario key.** Severity: **low**. Scenario-fidelity gap.
    `bd-squeezy-vbta`.
 
@@ -276,11 +282,15 @@ Per the rules, we did not read `~/.squeezy/settings.toml` to
 confirm the provider block; the harness's own resolution
 diagnostic is the source of truth.
 
-## Finding 6 — `checkpoints_enabled` scenario key is a no-op (bd-squeezy-vbta)
+## Finding 6 — Historical: `checkpoints_enabled` scenario key was a no-op (bd-squeezy-vbta)
 
-`crates/squeezy-eval/src/scenario.rs:110-135` defines `SqueezyOverlay`
-without a `checkpoints_enabled` field. The wave-2 git-and-vcs
-scenarios set `[squeezy] checkpoints_enabled = true`. TOML
+Current code note: `crates/squeezy-eval/src/scenario.rs` now defines
+`SqueezyOverlay.checkpoints_enabled`, and `crates/squeezy-eval/src/driver.rs`
+threads it into `AppConfig`.
+
+At the time of this run, `crates/squeezy-eval/src/scenario.rs:110-135`
+defined `SqueezyOverlay` without a `checkpoints_enabled` field. The
+wave-2 git-and-vcs scenarios set `[squeezy] checkpoints_enabled = true`. TOML
 deserialization silently drops unknown keys (no
 `deny_unknown_fields`), so the flag is a no-op; the operator must
 export `SQUEEZY_CHECKPOINTS_ENABLED=1` separately

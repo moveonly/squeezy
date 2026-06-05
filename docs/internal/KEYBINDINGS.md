@@ -61,13 +61,18 @@ new variants are added.
 | `transcript_home`                   | `Home`          | Jump to the top of the transcript when the composer is empty.           |
 | `transcript_end`                    | `End`           | Jump to the bottom of the transcript when the composer is empty.        |
 
-Use `/keymap` inside the TUI to inspect the live resolution and see
-which entries are overrides.
+Use `/keymap` inside the TUI to inspect the live resolution and see which
+entries are overrides. The card also reports unknown action names, malformed
+key specs, and binding collisions from the `[tui.keymap]` layer; the dedicated
+`keybindings.toml` file remains all-or-nothing and is ignored as a whole if it
+fails validation.
 
 Transcript-overlay expansion is not currently part of the editable keymap
 namespace. `transcript_overlay` (`Ctrl+T` by default) opens the expanded
 overlay, expands a folded subagent overlay in place, and closes an already
-expanded overlay. Keep any future expansion-specific binding in
+expanded overlay. While the overlay is open, `Esc`, `PageUp`, `PageDown`, arrow
+keys, `Home`, `End`, and bare `m` are modal overlay controls rather than
+editable keymap actions. Keep any future expansion-specific binding in
 `Action::ALL` before documenting it here.
 
 ## Key spec grammar

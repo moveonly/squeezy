@@ -13,6 +13,18 @@ to `["read", "search", "network", "mcp", "edit", "shell", "git", "compiler"]`.
 Narrow or widen that set in config to control what the reviewer may
 auto-approve.
 
+The reviewer model resolves from `[permissions.ai_reviewer].model`, then the
+active provider's small/fast model, then the parent model. `timeout_secs`
+defaults to a short bounded review call. `policy_file` can extend or replace the
+built-in policy text; if the file cannot be loaded, the request falls back to
+the ordinary human approval path.
+
+Reviewer decisions are recorded in a small in-memory audit ring surfaced by
+`/reviewer`. Repeated denials in one turn trip a circuit breaker so later
+permission prompts return to the human path. When the reviewer returns
+`allow` for a capability, target, or risk level that is outside the configured
+auto-allow ceiling, Squeezy records that downgrade and asks the human instead.
+
 When enabled, the reviewer receives only a bounded recent transcript, the
 pending permission request, and this policy. It must return a JSON object:
 

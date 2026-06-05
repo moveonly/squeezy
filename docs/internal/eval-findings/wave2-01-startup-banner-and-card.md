@@ -4,6 +4,13 @@ Domain 01 of the wave-2 bug-hunt (`docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md`).
 Re-dispatched after the rate-limit failure documented in
 `docs/internal/eval-findings/wave2-runbook.md`.
 
+Status: historical snapshot. Current code has fixed or changed several harness
+claims captured below: `TuiHarness` receives the resolved provider name,
+`drive_tui` captures `frames_tui.jsonl`/`replay.tui`, and `asserted_fail`
+statuses roll up through the `assertion_failed` rule. Preserve the run evidence
+below for provenance, but re-check current code before treating those harness
+defects as open.
+
 ## Run summary
 
 | Scenario | Run directory | Trace events | Frames | Findings (auto) | Outcome |
@@ -13,10 +20,10 @@ Re-dispatched after the rate-limit failure documented in
 | `wave2-01-startup-banner-and-card-portkey` | `target/eval/wave2-01-startup-banner-and-card-portkey-1780144063978` | 0 | 0 | 0 | provider config errored before any step: `missing PORTKEY_API_KEY or SQUEEZY_PORTKEY_KEY` despite `[providers.portkey].api_key` in `~/.squeezy/settings.toml` per the dispatch brief |
 
 All three runs used `[tui_capture] enabled = true, drive_tui = true,
-width = 120, height = 36, palette_tone = "dark"`. `frames.jsonl` is
-empty across the board because the `drive_tui` path bypasses the
-per-turn frame writer; everything below is read from `trace.jsonl`'s
-`tui_frame_contains` preview, which is the literal rendered frame.
+width = 120, height = 36, palette_tone = "dark"`. In this historical run,
+`frames.jsonl` was empty across the board because the then-current
+`drive_tui` path bypassed the per-turn frame writer; current runs should also
+inspect `frames_tui.jsonl` and `replay.tui`.
 
 ## Defects
 
@@ -119,11 +126,13 @@ permanently failing turn.
 
 ---
 
-### 03 — `TuiHarness` hard-codes provider_name "eval-harness", blocking provider-identity TUI assertions
+### 03 — Historical: `TuiHarness` hard-coded provider_name "eval-harness"
 
 #### Severity
 
-medium — every eval scenario that uses `drive_tui = true` and asserts on the banner provider row will always fail, because the harness never threads the real provider name through to `TuiApp`. This makes the entire "cross-provider banner consistency" rubric dimension unobservable from eval.
+Historical severity: medium. At the time, every eval scenario that used
+`drive_tui = true` and asserted on the banner provider row failed because the
+harness did not thread the real provider name through to `TuiApp`.
 
 #### What you should see vs. what you see
 
@@ -213,11 +222,14 @@ remediation, no portkey-based wave-2 scenario can run.
 
 ---
 
-### 05 — Eval `asserted_fail` action_steps never roll up into `findings.jsonl` / `run.json.totals.findings`
+### 05 — Historical: `asserted_fail` action_steps did not roll up into findings
 
 #### Severity
 
-medium — CI gating via `squeezy-eval check --fail-on findings` silently passes scenarios whose `assert` actions failed. Affects every wave-2 scenario that uses scripted assertions, which is most of them.
+Historical severity: medium. At the time, CI gating via
+`squeezy-eval check --fail-on findings` silently passed scenarios whose
+`assert` actions failed. Current code has an `AssertionFailed` rule that
+matches `asserted_fail` action statuses.
 
 #### What you should see vs. what you see
 
@@ -238,7 +250,8 @@ regardless of how many `asserted_fail` events the trace carries.
 
 - `target/eval/wave2-01-startup-banner-and-card-openai-1780143932257/run.json` showing `"findings": 0` despite an `asserted_fail` in the trace.
 - Same defect in the anthropic run (`target/eval/wave2-01-startup-banner-and-card-anthropic-1780144011076/run.json` → `"findings": 0`).
-- Source: `crates/squeezy-eval/src/findings.rs` registers rules for `unsupported_slash_command`, `approval_unanswered`, `repeated_turn_failure`, etc., but no rule iterates `ctx.action_steps` looking for `asserted_fail` prefixes the way `UnsupportedSlashCommand` (`crates/squeezy-eval/src/findings.rs:382`) does for its own status prefix.
+- Historical source note: `crates/squeezy-eval/src/findings.rs` did not yet
+  include the current `AssertionFailed` rule.
 - Beads: `squeezy-16d`.
 
 #### Suspected cause

@@ -72,13 +72,17 @@ Each supported `LanguageFamily` must have exactly one parse backend and one
 graph extension. Registry tests under crate-level `tests/registry.rs` enforce
 that adding a new family does not silently skip parser or graph support.
 
-Benchmark code follows the same boundary:
+Semantic-graph benchmark code follows the same ownership boundary:
 
 ```text
+benchmarks/squeezy-graph-bench/src/oracles.rs
 benchmarks/squeezy-graph-bench/src/oracles/<oracle>.rs
-benchmarks/squeezy-graph-bench/src/summary/<family>.rs
+benchmarks/squeezy-graph-bench/src/summary.rs
 ```
 
 Oracle modules are named after the validator (`rust_analyzer`, `clang`,
 `roslyn`, `javac`, `cpython_ast`, `go_types`, `tsc`) because one oracle can own
-multiple `LanguageKind` variants.
+multiple `LanguageKind` variants. Fixture and query-spec data lives outside the
+Rust crate under `benchmarks/fixtures/` and `benchmarks/specs/`; agent-driven
+graph/no-graph benchmark scenarios live under
+`crates/squeezy-eval/fixtures/scenarios/benchmarks/`.

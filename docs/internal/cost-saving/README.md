@@ -1,11 +1,17 @@
 # Squeezy Cost-Saving Architecture
 
-Squeezy keeps LLM cost down through a layered set of mechanisms — provider-side prompt caching, conversation compaction, tool-output shaping, semantic code retrieval, lazy schema loading, persistent session memory, and disciplined sub-agent isolation. This guide walks through each layer with code references so the design is auditable from the source. Every claim cites `file:line` against the repository root.
+Squeezy keeps LLM cost down through a layered set of mechanisms — provider-side prompt caching, conversation compaction, tool-output shaping, semantic code retrieval, lazy schema loading, persistent session memory, and disciplined sub-agent isolation. This directory is the canonical detailed audit for those mechanisms. The implementation details below were last reconciled with the current codebase in June 2026; benchmark snapshots and provider prices should still be rechecked before using them as current performance or billing claims.
+
+Start with [`00-unique-cost-features.md`](00-unique-cost-features.md) for the
+short "what makes Squeezy different" narrative. Use this index and the numbered
+chapters for implementation details, source references, limits, and tuning
+knobs.
 
 Each chapter sits beside this index as a numbered file:
 
 | # | Chapter | Layer | Primary files |
 |---|---------|-------|---------------|
+| [00](00-unique-cost-features.md) | Unique cost-efficiency features overview | Cross-cutting | Map of implemented layers and primary source files |
 | [01](01-provider-prompt-caching.md) | Provider-side prompt caching | Request | `crates/squeezy-llm/src/cache_policy.rs`, per-provider modules |
 | [02](02-conversation-compaction.md) | Conversation compaction | Conversation shape | `crates/squeezy-agent/src/context_compaction.rs` |
 | [03](03-tool-output-dedup-and-receipts.md) | Tool-output dedup & receipt stubs | Conversation shape | `crates/squeezy-agent/src/context_compaction.rs`, `squeezy-store` |
@@ -17,7 +23,7 @@ Each chapter sits beside this index as a numbered file:
 | [09](09-verbosity-controls.md) | User-controllable verbosity | Output shape | `crates/squeezy-core/src/lib.rs:6469+`, TUI handlers |
 | [10](10-token-accounting.md) | Token accounting & `/context` telemetry | Observability | `crates/squeezy-core/src/lib.rs:9805+`, per-provider extractors, `crates/squeezy-agent/src/lib.rs:510+` |
 | [11](11-cheap-model-fast-path.md) | Cheap-model fast path (per-turn routing) | Request | `crates/squeezy-agent/src/turn_router.rs`, `crates/squeezy-core/src/lib.rs` (`RoutingConfig`) |
-| [12](12-implemented-idea-batch.md) | Implemented idea batch (2026-06): signature_span, shell sidecar, pressure gate, per-role reasoning, expired-context masking | Multiple | `squeezy-parse`, `squeezy-tools`, `squeezy-agent` |
+| [12](12-implemented-idea-batch.md) | Implemented idea batch (2026-06): signature_span, shell sidecar, pressure gate, per-role reasoning, expired-context masking | Multiple | `squeezy-parse`, `squeezy-tools`, `squeezy-agent`, `squeezy-llm` |
 | [13](13-graph-retrieval-in-practice.md) | Graph retrieval in practice (build cost, streaming robustness, read routing) | Code-context selection | `crates/squeezy-graph`, `crates/squeezy-llm/src/retry.rs`, `crates/squeezy-tools/src/graph_tools.rs` |
 
 ---
@@ -67,7 +73,7 @@ Squeezy's architecture is a set of orthogonal mechanisms, each targeting one or 
 
 ### 01 — Provider-side prompt caching
 
-The cheapest token is one the provider never re-charges. Squeezy plants explicit cache breakpoints — `cache_control: { type: "ephemeral", ttl: "1h" }` on Anthropic, `prompt_cache_key` + `prompt_cache_retention: "24h"` on OpenAI Responses, typed `CachePoint` blocks on Bedrock, and reads `cachedContentTokenCount` on Google. The cache-policy code in `crates/squeezy-llm/src/cache_policy.rs` decides *where* the breakpoints go (system tail, last stable tool, last user block) and the per-provider modules translate that intent to the wire format. The same chapter covers the deliberate exclusion of MCP tools from the breakpoint so a `tools/list` refresh doesn't invalidate the cache.
+The cheapest token is one the provider never re-charges. Squeezy plants explicit cache breakpoints where the provider supports them — `cache_control: { type: "ephemeral", ttl: "1h" }` on Anthropic, `prompt_cache_key` + `prompt_cache_retention: "24h"` on OpenAI Responses, and typed `CachePoint` blocks on Bedrock. Google is narrower: Squeezy does not create a `cachedContent` resource, but it does read `usageMetadata.cachedContentTokenCount` when Gemini reports server-side cache hits. The cache-policy code in `crates/squeezy-llm/src/cache_policy.rs` decides *where* explicit breakpoints go (system tail, last stable tool, last user block) and the per-provider modules translate that intent to the wire format. The same chapter covers the deliberate exclusion of MCP tools from Anthropic-style stable-tool breakpoints so a `tools/list` refresh doesn't invalidate the cache.
 
 ### 02 — Conversation compaction
 
@@ -83,7 +89,7 @@ Raw `cargo build` output is 50–500KB of noise. Squeezy ships hand-written shap
 
 ### 05 — Semantic AST-based code retrieval
 
-Tree-sitter parses every supported language family (Rust, Python, Java, Kotlin, Scala, C#, Go, C/C++, JavaScript/TypeScript, PHP, Ruby, Swift, and Dart) into typed AST nodes, but the cost saving comes from the semantic layer built on top. `ParsedSymbol { signature_span, body_span }` lets `read_slice {span_kind: "signature"}` return a declaration without its body (the `signature_span` byte range is symbol-start → body-start), and `{span_kind: "body"}` does the inverse. `squeezy-graph` cross-links symbols by call, reference, and container hierarchy with trigram prefilters; `squeezy-rank` ladders Exact → CaseInsensitive → SignatureSubstring → TokenBag → Fuzzy and reranks with BM25 (K1=1.2, B=0.75). The model retrieves through this index — `definition_search` for ranked candidates, `symbol_context` for callers + callees + refs as JSON, `repo_map` for hierarchy — instead of dumping whole files. Tree-sitter `edit()` + `changed_ranges()` keeps the index incremental so re-parses touch only changed regions.
+Tree-sitter parses every supported language family (Rust, Python, Java, Kotlin, Scala, C#, Go, C/C++, JavaScript/TypeScript, PHP, Ruby, Swift, and Dart) into typed AST nodes, but the cost saving comes from the semantic layer built on top. `ParsedSymbol { signature_span, body_span }` lets `read_slice {span_kind: "signature"}` return a declaration header without its body when the extractor can anchor the body boundary; bodyless or heuristic symbols fall back to the full declaration span. `squeezy-graph` cross-links symbols by call, reference, and container hierarchy with trigram prefilters; `squeezy-rank` ladders Exact → CaseInsensitive → SignatureSubstring → TokenBag → Fuzzy and reranks with BM25 (K1=1.2, B=0.75). The model retrieves through this index — `definition_search` for ranked candidates, `symbol_context` for callers + callees + refs as JSON, `repo_map` for hierarchy — instead of dumping whole files. Tree-sitter `edit()` + `changed_ranges()` keeps the index incremental so re-parses touch only changed regions.
 
 ### 06 — Lazy schema loading
 
@@ -103,11 +109,11 @@ Three orthogonal axes. `ResponseVerbosity { Concise | Normal | Verbose }` swaps 
 
 ### 10 — Token accounting and `/context` telemetry
 
-`CostSnapshot { input_tokens, output_tokens, reasoning_output_tokens, cached_input_tokens, cache_write_input_tokens, estimated_usd_micros }` is the universal currency. Each provider's usage block is normalised back into it — Anthropic and Bedrock fold cache-read and cache-write back into the total `input_tokens`, OpenAI exposes `input_tokens_details.cached_tokens` only (no cache-write field), Google reports `cachedContentTokenCount`. `SessionAccountingSnapshot` and `ConversationShape` break the wire down by user/assistant text, function-call bytes, tool-output bytes, reasoning bytes, image bytes — that breakdown is what `/context` shows and what compaction triggers read from.
+`CostSnapshot { input_tokens, output_tokens, reasoning_output_tokens, cached_input_tokens, cache_write_input_tokens, estimated_usd_micros }` is the universal currency. Each provider's usage block is normalised back into it — Anthropic and Bedrock fold cache-read and cache-write back into the total `input_tokens`, OpenAI exposes `input_tokens_details.cached_tokens` only (no cache-write field), and Google reports `cachedContentTokenCount` when available. `SessionAccountingSnapshot` and `ConversationShape` break the local request down by user/assistant text, function-call bytes, tool-output bytes, reasoning bytes, image bytes, and attachment bytes; `/context` also calls out provider-stored context as an unknown exact current-window quantity when `store_responses=true`.
 
 ### 11 — Cheap-model fast path (per-turn routing)
 
-Each user turn is classified before its first LLM round. A strict heuristic prefilter (single sentence, ≤ 15 words, tight imperative whitelist, no compound connectors, no ambiguity markers) admits the most obvious slam-dunks (`run cargo test`, `checkout main`, `grep TODO src/lib.rs`) and dispatches them on the provider's own small-fast tier — Anthropic Haiku, OpenAI Nano / Mini, Gemini Flash Lite, the cheap Bedrock variant — via `small_fast_model_for_provider`. Anything the heuristic does not catch within `judge_max_chars` defers to a one-shot JSON-constrained LLM judge. The judge prefers a provider-specific or configured `judge_model`, then falls back to the curated cheap tier, uses `max_output_tokens = 512`, and leaves `reasoning_effort` unset. The cheap-routed turn is monitored mid-flight: tool-call ceiling (`max_tool_calls_per_turn / 4`), `tool_errors + budget_denials ≥ 2`, or a low-confidence assistant-text phrase ("i'm not sure", "this is complex", …) trips a same-turn handoff back to the parent model via `current_model` swap, plus an escalation-sticky window that forces the next 3 user prompts to skip the router. Image input always routes parent. `/cheap`, `/parent`, and `/router off|on` slash commands give the user manual control through `Agent::request_routing_force_*` and `Agent::set_routing_session_disabled`.
+Each user turn is classified before its first LLM round. A strict heuristic prefilter (single sentence, ≤ 15 words, tight imperative whitelist, no compound connectors, no ambiguity markers) admits the most obvious slam-dunks (`run cargo test`, `checkout main`, `grep TODO src/lib.rs`) and dispatches them on the provider's cheap tier resolved by `cheap_model_for`: `[providers.<id>].cheap_model`, then legacy `[model].small_fast_model`, then the provider's built-in judge/mini default. OpenAI/Azure therefore route easy turns to `gpt-5.4-mini` by default, while deployments can opt into `gpt-5.4-nano` with an explicit cheap-model override. Anything the heuristic does not catch within `judge_max_chars` defers to a one-shot JSON-constrained LLM judge. The judge prefers a provider-specific or configured `judge_model` (OpenAI/Azure default to `gpt-5.4-mini`), then falls back to the curated judge/cheap tier, uses `max_output_tokens = 512`, and leaves `reasoning_effort` unset. The cheap-routed turn is monitored mid-flight: tool-call ceiling (`max_tool_calls_per_turn / 4`), `tool_errors + budget_denials ≥ 2`, or a low-confidence assistant-text phrase ("i'm not sure", "this is complex", …) trips a same-turn handoff back to the parent model via `current_model` swap, plus an escalation-sticky window that forces the next 3 user prompts to skip the router. Image input always routes parent. `/cheap`, `/parent`, and `/router off|on` slash commands give the user manual control through `Agent::request_routing_force_*` and `Agent::set_routing_session_disabled`.
 
 ## Cross-cutting design principles
 
@@ -128,7 +134,7 @@ The architecture leaves natural extension points where future work could squeeze
 - **Dense / embedding-augmented code search.** Supplement the lexical BM25 + trigram + tier ladder with semantic embeddings so `verify_token` matches "auth checking" queries. Would feed `definition_search` and `symbol_context`.
 - **Grandchild sub-agents under governance.** Sub-agents cannot spawn more sub-agents today (`roles_tests.rs:42`). A budget-gated relaxation would enable deeper exploration trees without unbounded cost.
 - **Mid-stream cancellation at tool-call boundaries.** The Anthropic streamer already parses `tool_use` events as they arrive; cancelling the rest of the stream once a tool call is committed would shave output tokens on long reasoning passes.
-- **Tool-mediated memory append.** `remember()` exists in Rust but is not exposed as a model-callable tool today (per `MEMORY_SCOPE.md`). Lifting it would let the agent curate `~/.squeezy/memory.md` autonomously, under user-defined scope rules.
+- **Static-memory consolidation.** `notes_remember` / `notes_recall` now cover model-callable durable observations, but they are separate from the static `~/.squeezy/MEMORY.md` prompt file. A governed consolidation path could summarize high-value notes back into static startup memory without letting arbitrary turns rewrite base instructions.
 - **Retention sweeper for receipt/snapshot redb tables.** Content-hash keys make stale entries safe, but a TTL- or size-based sweeper would keep on-disk size bounded over very long projects.
 
 Each idea links back to the chapter where the prerequisite plumbing already exists.

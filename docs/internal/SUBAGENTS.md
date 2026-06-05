@@ -55,6 +55,12 @@ single-shot (serial within a turn) to avoid races on its exploration-state
 lock. `delegate_chain` manages its own sequential step loop and does not
 join the concurrent batch.
 
+`delegate` has an additional anti-redundancy gate: when the parent turn has
+already gathered substantial context, a whole-task `delegate` can be denied as
+pure overhead while the parent keeps the direct read/search/graph tools it
+already has. The scoped `delegate_plan` and `delegate_review` tools do not use
+that gate.
+
 ## Permission Derivation
 
 Subagents do not inherit the parent's full tool-permission set. Each spawn
@@ -95,6 +101,19 @@ status `"capped"` rather than queueing or blocking. This keeps fanout
 flat and predictable rather than letting one model turn spawn an
 unbounded swarm.
 
+Each admitted subagent also gets its own bounded loop:
+
+- `max_tool_calls_per_call`, `max_tool_bytes_read_per_call`, and
+  `max_search_files_per_call` replace the inherited parent per-turn caps.
+- `max_model_rounds` bounds the model/tool loop.
+- `max_runtime_secs` applies an optional wall-clock timeout; `0` disables this
+  wall-clock cap while leaving cancellation and round caps in place.
+- `max_summary_tokens` is the fallback output ceiling for normal subagents when
+  the parent has not set `max_output_tokens`. `doc_help` keeps its own answer
+  floor.
+- `include_transcript` is false by default; when true, the structured tool
+  result includes the child's assistant/tool trace for debugging.
+
 ## Cancellation
 
 Each subagent receives a `CancellationToken` derived from the parent
@@ -103,6 +122,21 @@ cancelled, the child token fires immediately. Model streaming and tool
 execution race against the token and return `ToolStatus::Cancelled`
 within the documented drain target. The lease drops on the way out so
 the next subagent can start.
+
+## Parent Visibility
+
+Subagent tool events are drained on a hidden channel so high fanout cannot fill
+the parent event buffer. The parent receives explicit lifecycle events:
+`SubagentStarted`, `SubagentActivity`, `SubagentToolResult`,
+`SubagentCompleted`, `SubagentFailed`, and `SubagentRejected`. The TUI uses
+those events for the first-class subagent pane below the status line and for
+the selected subagent transcript view. `ToolProgress` heartbeats are forwarded
+so a long-running subagent keeps the parent turn and eval harness visibly
+alive.
+
+Subagent cost and usage are folded into the parent turn. `TurnMetrics`
+separately buckets the operator-facing kinds (`delegate`, `explore`, `plan`,
+`review`); helper kinds such as `doc_help` are intentionally not bucketed.
 
 ## What This Document Is Not
 

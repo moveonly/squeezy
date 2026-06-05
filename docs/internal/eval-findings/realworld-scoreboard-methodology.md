@@ -39,39 +39,19 @@ These come from the `perf/cost-wins` branch (PR #290); see
   (it used to be undercounted; this *raised* several Haiku costs to their true value).
 - Parallelized parent reads vs delegate dispatch; `read_slice` auto-widen.
 
-## How the Haiku column is computed (read this)
+## Current CSV snapshot
 
-The Haiku numbers are **best-of-3** (n=3 reps, lowest-cost rep that holds recall) on the
-current with-graph build, vs CC baselines **re-derived from the raw CC stream logs** with the
-current grader (the cached `/tmp/cc-baseline-realworld/_results.json` is corrupt — stale
-ground-truth + `cost=0` parser artifacts — so it is NOT used). `$0.000` reps (killed by
-timeout) are excluded as invalid, not counted as wins.
+The checked-in CSVs are the current source of truth for this directory:
 
-**Current best-of-3 (recall-enforced): 8/15 WIN** — cpp, kotlin, php, ruby, rust, scala,
-swift, ts. (Win = the *same* rep is both cheaper than CC **and** at recall parity.)
+- `mini-vs-codex-realworld.csv`: 15/15 WIN.
+- `haiku-vs-cc-realworld.csv`: 13/15 WIN, with LOSS for `c` and `go`.
 
-Caveats per row:
-- **Mini 15/15 (vs Codex) is solid and separate** — Mini queries the graph early; wins
-  reproduce. There is no Mini-style 15/15 for Haiku yet.
-- **`csharp` is a LOSS once recall is enforced** — its cheapest rep ($0.175) was only 96.6%
-  (missed one `Read` override); its 100%-recall reps cost more than CC ($0.185 vs $0.182).
-  A cost-only best-of-3 wrongly counted it.
-- **`ts` is a variance win** — 2 of 3 reps hit 20/20 under CC, but rep 3 hard-failed
-  (hallucinated), so it is a best-of-3 win, not yet reproducible.
-- **Recall instability on the losses:** `js` swings 50/100/82%, `java` 94/94/100%, `python`
-  58/75/83%, `dart` 0/0/67% — several losses are recall problems, not just cost.
-- **The 6 losses split into two fixable groups:**
-  1. **Delegation cost** — `c, go, js` (and partly `java`) lose only because the parent
-     fires a whole-task `delegate` to a cold subagent that re-explores; the parent alone
-     already beats CC (c parent $0.077 vs CC $0.229). `c` is the worst — all 3 reps
-     delegated, $0.50–$1.47. Fix: curb whole-task delegation + bound subagent caps.
-  2. **Recall** — `dart` 56% (the graph can't answer the mixin query: `decl_search` docs
-     advertise only `base:` but Dart stores `with X` under `mixin:`, and no
-     `add_dart_type_edges` builds reverse inheritance edges → model falls back to a
-     single-line regex that misses multi-line `with`); `python` 42% (subclass-surface miss,
-     and CC ran a *different* python task so it has no valid baseline — marked `NA`).
-- **`dart` also times out** (~15 min) from haiku slow-first-token + sequential delegate
-  subagents — a *separate* cause from its recall miss.
+The Haiku numbers were recomputed against CC baselines re-derived from raw CC
+stream logs with the current grader. `$0.000` timeout reps are excluded as
+invalid, not counted as wins. Older prose in this directory that says Haiku is
+8/15 or that python/java are pending is historical and predates the committed
+CSV refresh.
 
-The path to 15 is iterative: fix a loss group → rerun the affected langs squeezy-only →
-update this column. No CC re-runs (CC is re-graded from its raw logs).
+The path to 15 for Haiku is now narrowed to `c` and `go`: fix the loss group,
+rerun affected squeezy cells, and update the CSVs. No CC re-runs are needed
+when the baseline answer logs are unchanged; CC is re-graded from raw logs.

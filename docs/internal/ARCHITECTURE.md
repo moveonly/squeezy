@@ -1,9 +1,10 @@
 # Architecture
 
 Squeezy is implemented in Rust and targets local, deterministic code assistance
-on macOS, Linux, and Windows. The TUI is the first interface. Navigation is built on
-tree-sitter and Squeezy's own semantic graph rather than LSP or
-`rust-analyzer`.
+on macOS, Linux, and Windows. The TUI is the first interface, with
+non-interactive CLI prompts and subcommands sharing the same core runtime.
+Navigation is built on tree-sitter and Squeezy's own semantic graph rather than
+LSP or `rust-analyzer`.
 
 ## Crate Boundaries
 
@@ -18,8 +19,9 @@ tree-sitter and Squeezy's own semantic graph rather than LSP or
 - `squeezy-core`: typed configuration, settings merge precedence, permissions,
   redaction, budgets, session mode, tool schema config, graph/cache settings,
   and user/project settings templates.
-- `squeezy-llm`: provider abstraction plus OpenAI, Anthropic, Google, Azure
-  OpenAI, Ollama, and Bedrock provider metadata/adapters.
+- `squeezy-llm`: provider abstraction plus native OpenAI/Anthropic/Google,
+  Azure OpenAI, Bedrock, Ollama, OpenAI-compatible chat providers, and local
+  OAuth credential sources.
 - `squeezy-tools`: first-party tool specs and runtimes, checkpoints, shell
   sandbox integration, web tools, graph/search/read/edit tools, and MCP tool
   wrapping.
@@ -32,8 +34,9 @@ tree-sitter and Squeezy's own semantic graph rather than LSP or
   finding-report tooling.
 - `squeezy-workspace`, `squeezy-parse`, `squeezy-graph`, `squeezy-rank`,
   `squeezy-store`, `squeezy-vcs`, `squeezy-telemetry`, and `squeezy-harness`:
-  workspace discovery, parsers, graph state, ranking helpers, persistent local
-  state, VCS/checkpoint support, anonymous telemetry, and validation tasks.
+  workspace discovery, parsers, graph state and optional watcher support,
+  ranking helpers, split redb-backed local state, VCS/checkpoint support,
+  anonymous telemetry, and validation tasks.
 
 ## Runtime Flow
 
@@ -62,9 +65,10 @@ in-product help. Contributor workflow, implementation decisions, benchmark
 oracles, release/deployment notes, and maintenance conventions belong in
 `docs/internal/`.
 
-When moving an external doc, update the help topic citations and the embedded
-doc list in `crates/squeezy-skills/src/help.rs`. Tests should fail if a topic
-cites a missing doc or if an internal doc is accidentally bundled into normal
+When moving an external doc, update help topic citations in
+`crates/squeezy-skills/src/help.rs`. The build-generated bundled-doc list is
+checked by tests: every external doc must be bundled, every help citation must
+point at a bundled path, and internal docs must not be bundled into normal
 help.
 
 ## Release Process
@@ -88,8 +92,11 @@ artifacts are built or published.
 
 ### Release Binary Hygiene
 
-The `[profile.release]` block in the root `Cargo.toml` sets
-`strip = "symbols"`. Release binaries shipped from `release.yml` therefore
+The root `Cargo.toml` keeps `[profile.release]` practical for source installs
+(`lto = false`, `codegen-units = 16`). Distribution artifacts use
+`[profile.dist]`, and `.github/workflows/release.yml` builds them with
+`cargo build --profile dist -p squeezy --target ...`. The dist profile sets
+`lto = true`, `codegen-units = 1`, and `strip = "symbols"`, so shipped archives
 carry no Rust symbol table and no DWARF debug info. The reasons:
 
 - Symbol names leak module paths (`squeezy_agent::Agent::run_turn`),
@@ -103,8 +110,8 @@ carry no Rust symbol table and no DWARF debug info. The reasons:
   `*.pdb`) that are uploaded to a private symbol store, never bundled
   into the public release tarball or the Homebrew bottle.
 
-Do not weaken this to `strip = "debuginfo"` or remove the `strip`
-directive without updating this section. If backtraces in user reports
+Do not weaken dist artifacts to `strip = "debuginfo"` or remove the dist
+`strip` directive without updating this section. If backtraces in user reports
 become a hard requirement, prefer adding private debug sidecars over
 re-enabling symbols in the public binary.
 
@@ -119,15 +126,16 @@ retired:
   not practical to reimplement, so `aws-sdk-bedrockruntime` and
   `aws-config` are the right tools.
 - **Raw `reqwest` remains the default for simple bearer-token REST
-  APIs** (Anthropic, OpenAI, Google, Azure OpenAI, Ollama). This is
+  APIs** (Anthropic, OpenAI, Google, Azure OpenAI, Ollama, and most
+  OpenAI-compatible routes). This is
   momentum, not principle. Do not rewrite an existing provider purely
   to add an SDK; only reach for one when the new provider's auth or
   protocol justifies it.
-- **No embedded HTTP server, ever.** Squeezy is CLI/TUI only. Do not
-  add `axum`, `warp`, `actix-web`, or any other framework that accepts
-  inbound connections. The current `squeezy ask` Unix-socket bridge is
-  the only acceptable form of local IPC, and it is bound to a session
-  socket — not a network port.
+- **No embedded HTTP server, ever.** Squeezy is CLI/TUI only. Do not add
+  `axum`, `warp`, `actix-web`, or any other framework that accepts inbound
+  connections. The current `squeezy ask` bridge is the only acceptable
+  Squeezy-owned local IPC: it uses a session-scoped Unix domain socket on Unix
+  and a named pipe on Windows, never a network port.
 
 ## Non-Goals
 
@@ -143,9 +151,9 @@ non-goals; reviewers should reject PRs that move toward them.
   `*-protocol`, `*-daemon`, or `sdk-*`. The 18-crate layout under
   `crates/` is the intended scope.
 - No embedded HTTP server or inbound network listener (see the
-  "Provider SDK Policy" section above for the framework-level
-  restatement of this rule). The only acceptable local IPC is the
-  session-scoped Unix socket used by `squeezy ask`.
+  "Provider SDK Policy" section above for the framework-level restatement of
+  this rule). The only acceptable Squeezy-owned local IPC is the
+  session-scoped `squeezy ask` socket/pipe bridge.
 
 Callers that need to script Squeezy invoke the CLI directly
 (`squeezy --prompt …` for one-shot non-interactive turns, or subcommands

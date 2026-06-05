@@ -6,8 +6,9 @@ fixtures, oracle, gates, and known limitations.
 
 ## Source Of Truth
 
-- Parser wiring: `crates/squeezy-parse/src/lib.rs` registers
-  `tree-sitter-ruby = "0.23"` through `LanguageKind::Ruby`.
+- Parser wiring: `crates/squeezy-parse/src/lib.rs` maps `LanguageKind::Ruby`
+  to `tree_sitter_ruby::LANGUAGE`; the grammar version is pinned as
+  `tree-sitter-ruby = "0.23"` in the workspace `Cargo.toml`.
 - Extractor: `crates/squeezy-parse/src/languages/ruby.rs`.
 - Graph resolver: `crates/squeezy-graph/src/languages/ruby.rs`.
 - Benchmark fixture: `benchmarks/fixtures/ruby/semantic-cases/`.
@@ -49,13 +50,15 @@ The Ruby graph resolver keeps Ruby matching syntactic and conservative:
 ## Oracle And Gates
 
 The benchmark oracle runs Ruby with Prism when available. If the Ruby toolchain
-or Prism is unavailable, the report degrades to scan-only mode instead of
-failing benchmark collection.
+or Prism is unavailable, the report degrades to `mode = "scan-only"` self-compare
+instead of failing benchmark collection.
 
 The active gate in `benchmarks/squeezy-graph-bench/src/gates.rs` requires Ruby
 oracle precision >= 0.90 and recall >= 0.75 when the benchmark gate is active.
-The gate accepts lower recall than static languages because dynamic dispatch is
-a real language limitation for a syntactic graph.
+Scan-only mode reports perfect self-compare numbers, so the status/mode field is
+the signal that Prism did not actually run. The gate accepts lower recall than
+static languages because dynamic dispatch is a real language limitation for a
+syntactic graph.
 
 ## Known Limits
 

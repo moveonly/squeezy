@@ -8,8 +8,8 @@ tree-sitter extractor.
 
 | Path | Role |
 |------|------|
-| `run_oracle.sh` | Spawns scalac (or sbt / mill when their build files exist) and writes `.semanticdb` files into a scratch directory. Invoked from the Rust harness in `benchmarks/squeezy-graph-bench/src/oracles/scala_semanticdb.rs`. |
-| `scala-oracle.sc` | Optional scala-cli driver retained as a reference / fallback. The bench no longer depends on it — the Rust harness parses the protobufs directly so JVM-side scala-cli is not required. |
+| `run_oracle.sh` | Spawns scalac (or sbt / mill when their build files exist) and writes `.semanticdb` files into a scratch directory. Invoked from the Rust harness in [`../../squeezy-graph-bench/src/oracles/scala_semanticdb.rs`](../../squeezy-graph-bench/src/oracles/scala_semanticdb.rs). |
+| `scala-oracle.sc` | Optional scala-cli driver retained as a reference. The bench no longer depends on it because the Rust harness parses the protobufs directly, so JVM-side scala-cli is not required. |
 
 ## Modes
 
@@ -29,8 +29,10 @@ The Rust harness picks one of two modes per run:
 
 - Coursier (preferred, matches CI):
   ```bash
-  curl -fLo cs https://github.com/coursier/launchers/raw/master/cs-x86_64-apple-darwin.gz \
-    | gunzip > cs && chmod +x cs && mv cs /usr/local/bin
+  curl -fL https://github.com/coursier/launchers/raw/master/cs-x86_64-apple-darwin.gz \
+    | gunzip > cs
+  chmod +x cs
+  sudo mv cs /usr/local/bin/cs
   cs install scala3-compiler
   ```
 - Homebrew (macOS only, slower toolchain refresh):
@@ -50,8 +52,8 @@ The resulting report has `scala_oracle.status` beginning with
 
 ## Limitations
 
-See `docs/internal/lang-specs/scala.md` §9 for the full mapping table. Key
-exclusions:
+See [`docs/internal/lang-specs/scala.md`](../../../docs/internal/lang-specs/scala.md)
+for the Scala graph contract. Key oracle comparison exclusions:
 
 - Implicit-conversion injection at call sites
 - `given` / `using` resolution at call sites

@@ -6,8 +6,9 @@ fixtures, oracle, gates, and known limitations.
 
 ## Source Of Truth
 
-- Parser wiring: `crates/squeezy-parse/src/lib.rs` registers
-  `tree-sitter-swift = "0.7.3"` through `LanguageKind::Swift`.
+- Parser wiring: `crates/squeezy-parse/src/lib.rs` maps `LanguageKind::Swift`
+  to `tree_sitter_swift::LANGUAGE`; the grammar version is pinned as
+  `tree-sitter-swift = "0.7.3"` in the workspace `Cargo.toml`.
 - Extractor: `crates/squeezy-parse/src/languages/swift.rs`.
 - Graph resolver: `crates/squeezy-graph/src/languages/swift.rs`.
 - Benchmark fixture: `benchmarks/fixtures/swift/semantic-cases/`.

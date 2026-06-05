@@ -13,6 +13,7 @@ Checkpoints are attached to mutating local tools:
 - `write_file`
 - `shell`
 - `apply_patch`
+- `notebook_edit`
 
 When checkpointing is enabled, read-only tools do not create checkpoints. A tool call that leaves the workspace unchanged does not create a checkpoint. `apply_patch` attaches a checkpoint for both successful applies and partial-failure errors, so a multi-file patch that fails after the first write is still recoverable via `checkpoint_undo`.
 

@@ -6,8 +6,9 @@ fixtures, oracle, gates, and known limitations.
 
 ## Source Of Truth
 
-- Parser wiring: `crates/squeezy-parse/src/lib.rs` registers
-  `tree-sitter-kotlin-ng = "1.1"` through `LanguageKind::Kotlin`.
+- Parser wiring: `crates/squeezy-parse/src/lib.rs` maps `LanguageKind::Kotlin`
+  to `tree_sitter_kotlin_ng::LANGUAGE`; the grammar version is pinned as
+  `tree-sitter-kotlin-ng = "1.1"` in the workspace `Cargo.toml`.
 - Extractor: `crates/squeezy-parse/src/languages/kotlin.rs`.
 - Graph resolver: `crates/squeezy-graph/src/languages/kotlin.rs`.
 - Benchmark fixture: `benchmarks/fixtures/kotlin/semantic-cases/`.

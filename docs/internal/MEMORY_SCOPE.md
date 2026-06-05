@@ -1,43 +1,50 @@
 # Memory Scope
 
-Squeezy cross-session memory is a single static file: `~/.squeezy/memory.md`,
-capped by `context_compaction.user_memory_max_bytes`
-(`crates/squeezy-core/src/lib.rs::ContextCompactionConfig::user_memory_max_bytes`)
-and stitched into the base instructions at session start. The user curates
-this file by hand; the agent has no tool that can write back to it.
+Squeezy has two separate cross-session memory surfaces today:
 
-Squeezy declines to ship a tool-mediated memory pipeline in the v1 graph
-milestone.
+- **Startup instruction memory**: `squeezy-agent` reads
+  `~/.squeezy/MEMORY.md` first, then lowercase `~/.squeezy/memory.md`, once at
+  session start. The body is capped by
+  `context_compaction.user_memory_max_bytes` and appended to the base
+  instructions. A value of `0` disables ingestion. Missing, empty, unreadable,
+  or `$HOME`-less cases are silent best-effort skips.
+- **Store-backed observations**: `notes_remember`, `notes_recall`, and
+  `observations` persist and query typed observations in the local `redb`
+  state store. Observation kinds are `preference`, `decision`, `convention`,
+  `dead_end`, and `note`. Recent observations are also summarized during
+  context compaction so durable decisions are not silently dropped from a
+  compacted turn.
 
-Supported scope:
+These surfaces are intentionally not the same store. The startup memory file is
+model-visible preamble that the user can curate directly. Store-backed
+observations are model-callable tools backed by structured local state; they do
+not rewrite `MEMORY.md` and are not injected wholesale into every session.
 
-- Read `~/.squeezy/memory.md` once at session start.
-- Apply the configured byte cap and append the trimmed body to base
-  instructions.
-- Let the user edit the file out-of-band; no in-session reload.
+## Implemented Scope
 
-Out of scope (deferred):
+- Read `~/.squeezy/MEMORY.md` or `~/.squeezy/memory.md` once at session start
+  through `ingest_user_memory`.
+- Truncate startup memory at a UTF-8 character boundary and append
+  `"[truncated]"` when capped.
+- Keep `SessionStore::remember` / `SessionStore::recall` as the canonical
+  line-oriented helper for the lowercase `memory.md` file. It appends trimmed
+  lines, preserves one-entry-per-line shape, and returns `None`/errors when
+  `$HOME` is unavailable.
+- Expose structured note persistence through the tool registry:
+  `notes_remember` writes one observation, `notes_recall` searches or lists
+  recent matches, and `observations` provides a read-only listing/search view.
 
-- A `memory_append` tool the model can call to record cross-session facts.
-- A background per-rollout extraction phase that proposes memory entries.
-- A second consolidation phase that merges or rewrites stored memories.
-- Per-project or per-thread memory partitions; the single user-global file
-  is the only durable store.
-- Automatic injection of memories beyond the single file ingestion path.
+## Out Of Scope
 
-If a future user request justifies adoption, the staged path is:
+- A separate `memory_append` tool name or an automatic write-back path from
+  observations into `MEMORY.md`.
+- Background extraction that proposes memories after every rollout.
+- Automatic consolidation that rewrites or deduplicates either `MEMORY.md` or
+  the observation store.
+- Remote memory services, plugin-owned memory stores, or hook-driven hidden
+  memory mutation.
+- Treating store-backed observations as a replacement for the explicit startup
+  memory file.
 
-1. Expose `memory_append` as a write-capability tool gated on user
-   approval. Each call persists one line to a designated section of the
-   user-global memory file. The existing approval and audit surfaces cover
-   the trust boundary; no separate hook framework is introduced.
-2. Once approved appends accumulate, add a deterministic "recent decisions"
-   section the agent writes to, so layout stays predictable for the
-   ingestion cap.
-3. Only after real usage data justifies the cost, consider a phase-2
-   consolidation pass that rewrites or deduplicates entries.
-
-Keep durable cross-session knowledge in the static memory file until
-step 1 lands. Skills, hooks, and remote runtimes are not part of the
-memory path; see `SKILLS_SCOPE.md` for the adjacent decision on
-instruction bundles.
+Skills, hooks, and remote runtimes are not part of the startup memory path; see
+`SKILLS_SCOPE.md` for the adjacent decision on local instruction bundles.

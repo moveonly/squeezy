@@ -86,12 +86,22 @@ Additional explicit live runners are available for provider smoke testing:
 
 ## CI
 
-CI runs only deterministic harness modes:
+The default local `run` command uses `default_runners()` from
+`crates/squeezy-harness/src/lib.rs`:
 
 - `mock-openai`
 - `mock-anthropic`
 - `planner-probe`
 - `planner-probe-no-planner`
 - `grep-baseline`
+
+CI is narrower. `.github/workflows/ci.yml` explicitly passes only:
+
+- `mock-openai`
+- `mock-anthropic`
+- `grep-baseline`
+
+Planner-probe runners are deterministic and safe to run locally, but they are
+not part of the current CI harness step.
 
 Costly runners are never enabled by default and require `SQUEEZY_RUN_COSTLY_TESTS=1` plus the provider API key.

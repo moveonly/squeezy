@@ -6,6 +6,10 @@ The site is intentionally static. Motion, diagrams, and interactive browser
 elements run client-side, but there is no app server, database, account system,
 or server-side rendering in the website itself.
 
+The public routes live under `src/pages/`. Product facts and public copy helpers
+are centralized in `src/facts.ts` and `src/config.ts`; keep claims grounded in
+repo docs and implementation, not roadmap intent.
+
 ## Local Development
 
 ```sh
@@ -27,6 +31,10 @@ npm run build
 
 Astro writes the generated site to `squeezy-site/dist/`, which is ignored.
 Do not commit generated top-level `dist/` output.
+
+Run `npm run build` before changing deploy-facing content. The app has no local
+server dependency after build; Cloudflare Pages serves the static `dist/`
+output.
 
 ## Cloudflare Pages
 
@@ -51,5 +59,11 @@ benchmark traces exist.
 ## Website Telemetry
 
 The site sends anonymous visitor and CTA events to the Squeezy telemetry Worker
-at `/v1/site`. The browser client respects Do Not Track, Global Privacy
-Control, and the local opt-out key `squeezy_site_telemetry_opt_out=1`.
+at `/v1/site` using the endpoint in `src/config.ts`. The browser client records
+`squeezy_site_page_view` on page load and `squeezy_site_cta_clicked` for links
+with `data-track-click`. It respects Do Not Track, Global Privacy Control, and
+the local opt-out key `squeezy_site_telemetry_opt_out=1`.
+
+Visitor IDs live in `localStorage` under `squeezy_site_visitor_id`; per-tab
+session IDs live in `sessionStorage` under `squeezy_site_session_id`. The site
+privacy page documents the same behavior for users.

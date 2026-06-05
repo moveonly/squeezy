@@ -20,9 +20,10 @@ to "see what changed" can either re-read them (paying to dump
 contents into the conversation again) or reference a recorded diff.
 
 Squeezy implements all three: checkpoint-anchored resume from
-`events.jsonl`, a single `~/.squeezy/memory.md` stitched into base
-instructions, and a journal-backed checkpoint provider that
-snapshots the worktree on every edit.
+`events.jsonl`, static user memory ingested from `~/.squeezy/MEMORY.md`
+(falling back to lowercase `memory.md`), durable note tools backed by the
+local store, and a journal-backed checkpoint provider that snapshots the
+worktree on every edit.
 
 ## Mechanism
 
@@ -192,8 +193,20 @@ keeps the fork viable as long as `events.jsonl` is intact.
 
 ### Cross-session memory
 
-The user-global memory file lives at `~/.squeezy/memory.md`. The
-path resolves to `None` when `HOME` is unset:
+There are two cross-session memory surfaces:
+
+- **Static prompt memory.** At session start the agent reads
+  `~/.squeezy/MEMORY.md` first and falls back to `~/.squeezy/memory.md`.
+  The body is truncated to `context_compaction.user_memory_max_bytes`
+  before being stitched into base instructions.
+- **Durable notes.** The model-callable `notes_remember` and `notes_recall`
+  tools store and retrieve decisions, conventions, preferences, dead ends,
+  and notes from the persistent store. These are queried during compaction
+  summaries and can be used before re-deriving old decisions.
+
+The legacy `SessionStore::memory_path`, `remember`, and `recall` helpers still
+target lowercase `~/.squeezy/memory.md`. They remain useful Rust primitives,
+but they are no longer the complete prompt-ingestion story:
 
 ```rust
 // crates/squeezy-store/src/sessions.rs:111-114
@@ -234,10 +247,9 @@ pub fn remember(line: &str) -> Result<usize> {
 }
 ```
 
-`recall` mirrors the agent's prompt-side ingestion: truncate at
-`max_bytes` on a char boundary, append `\n[truncated]` when the cap
-fires, return `None` when ingestion is disabled or the file is
-missing:
+`recall` truncates the lowercase helper file at `max_bytes` on a char
+boundary, appends `\n[truncated]` when the cap fires, and returns `None`
+when ingestion is disabled or the file is missing:
 
 ```rust
 // crates/squeezy-store/src/sessions.rs:165-185
@@ -256,28 +268,22 @@ pub fn recall(max_bytes: usize) -> Option<String> {
 }
 ```
 
-The cap is `context_compaction.user_memory_max_bytes`:
+The prompt-ingestion cap is `context_compaction.user_memory_max_bytes`:
 
 ```rust
 // crates/squeezy-core/src/lib.rs:3928-3933
 /// Maximum bytes of `~/.squeezy/MEMORY.md` (or lowercase `memory.md`)
 /// stitched into the base instructions at session start. 0 disables
-/// ingestion. The static file is the only cross-session memory
-/// surface; see `docs/internal/MEMORY_SCOPE.md` for the deferred
-/// tool-mediated pipeline decision.
+/// ingestion.
 pub user_memory_max_bytes: usize,
 ```
 
 Default is `16_384` bytes (`DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES` at
-`crates/squeezy-core/src/lib.rs:300`). Recall runs once at session
-start; the trimmed body is stitched into the base instructions. The
-agent has no in-session tool that writes back to the file —
-`docs/internal/MEMORY_SCOPE.md` is explicit:
-
-> Squeezy declines to ship a tool-mediated memory pipeline in the v1
-> graph milestone.
-
-`remember` is callable from Rust but is not surfaced as a model tool.
+`crates/squeezy-core/src/lib.rs`). Static memory ingestion runs once at
+session start. Durable notes are separate: `notes_remember` writes typed
+observations to the local store and `notes_recall` returns recent matching
+notes, so the model does not have to append arbitrary prose to the static
+prompt file.
 
 ### Global session index
 
@@ -314,9 +320,11 @@ pub fn append_global_index_entry(entry: &GlobalSessionIndexEntry) {
 ```
 
 Readers dedupe by `session_id` keeping the entry with the largest
-`last_event_at_ms`. When the file exceeds 256 KiB
-(`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`), the next read rewrites it
-in oldest-first order so future appends keep the newest at the tail:
+`last_event_at_ms`, sort newest-first for the picker, and retain at most
+`GLOBAL_INDEX_MAX_ENTRIES` entries (400). When the file exceeds 256 KiB
+(`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`), the next read rewrites it only if
+dedupe or the 400-entry cap actually removed lines; an oversized but already
+minimal all-distinct index is not rewritten on every startup.
 
 ```rust
 // crates/squeezy-store/src/sessions.rs:232-270
@@ -331,23 +339,23 @@ pub fn list_global_index() -> Vec<GlobalSessionIndexEntry> {
             _ => { by_id.insert(entry.session_id.clone(), entry); }
         }
     }
-    let should_compact = fs::metadata(&path)
-        .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
-        .unwrap_or(false);
-    if should_compact {
-        let mut entries: Vec<&GlobalSessionIndexEntry> = by_id.values().collect();
-        entries.sort_by_key(|entry| entry.started_at_ms);
-        let _ = rewrite_global_index(&path, &entries);
-    }
     let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
+    let trimmed_to_cap = entries.len() > GLOBAL_INDEX_MAX_ENTRIES;
+    entries.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+    if oversized && (trimmed_to_cap || raw_lines > entries.len()) {
+        let mut ordered: Vec<&GlobalSessionIndexEntry> = entries.iter().collect();
+        ordered.sort_by_key(|entry| entry.started_at_ms);
+        let _ = rewrite_global_index(&path, &ordered);
+    }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
     entries
 }
 ```
 
-The 256 KiB threshold is documented as roughly five hundred unique
-sessions at ~500B per entry (`sessions.rs:43-50`). Compaction is
-outside normal usage; the hot path stays a single append.
+The 256 KiB threshold is documented as roughly five hundred unique sessions
+at ~500B per entry, but the 400-entry cap is the hard bound after
+compaction. The hot path stays a single append.
 
 ### Checkpoint provider for code edits
 
@@ -445,12 +453,12 @@ append silently no-op — the per-project store is authoritative.
 real HOME, a pattern unique to `cargo test` runs that point session
 stores at sandboxes but never redirect HOME.
 
-`remember` and `recall` operate on a single file — no per-project
-partition, no per-thread scope, no session-id key. The
-`MEMORY_SCOPE.md` note is explicit that this is intentional for the
-v1 graph milestone; a model-callable `memory_append` tool, an
-extraction phase, a consolidation pass are deferred.
-`user_memory_max_bytes` truncates at a char boundary and appends
+The lowercase `remember` / `recall` helpers operate on a single file — no
+per-project partition, no per-thread scope, no session-id key. Static prompt
+ingestion prefers uppercase `MEMORY.md`, while model-callable durable notes
+use `notes_remember` / `notes_recall` in the persistent store. There is still
+no automatic consolidation path that rewrites static startup memory from the
+notes store. `user_memory_max_bytes` truncates at a char boundary and appends
 `\n[truncated]`. Default 16 KiB; zero disables ingestion.
 
 If `resume_state.json` is missing — a partial write lost on crash —

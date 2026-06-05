@@ -6,8 +6,9 @@ fixtures, oracle, gates, and known limitations.
 
 ## Source Of Truth
 
-- Parser wiring: `crates/squeezy-parse/src/lib.rs` registers
-  `tree-sitter-scala = "0.26"` through `LanguageKind::Scala`.
+- Parser wiring: `crates/squeezy-parse/src/lib.rs` maps `LanguageKind::Scala`
+  to `tree_sitter_scala::LANGUAGE`; the grammar version is pinned as
+  `tree-sitter-scala = "0.26"` in the workspace `Cargo.toml`.
 - Extractor: `crates/squeezy-parse/src/languages/scala.rs`.
 - Graph resolver: `crates/squeezy-graph/src/languages/scala.rs`.
 - Benchmark fixture: `benchmarks/fixtures/scala/semantic-cases/`.

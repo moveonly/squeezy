@@ -18,8 +18,7 @@ Each scenario drives the same four-stage script through the
 `TuiHarness` (drive_tui = true, 160×48, palette_tone = "dark"):
 
 1. `/help` (curated topic index, system transcript message).
-2. `/help providers` (curated topic answer with a logical
-   `docs/external/PROVIDERS.md` citation backed by
+2. `/help providers` (curated topic answer from
    `crates/squeezy-skills/external-docs/PROVIDERS.md`, plus an extracted
    `[model]` config-inspect section).
 3. Slash-menu fuzzy ranking: type `/com` (expect `/compact` row + GOLD

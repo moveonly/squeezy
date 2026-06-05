@@ -14,8 +14,8 @@ For the project's premise, design choices, and non-goals, see
   tools, context, and model calls.
 - [Configuration](CONFIGURATION.md): settings files, environment overrides,
   permissions, budgets, TUI options, and config inspection.
-- [Providers](PROVIDERS.md): supported provider adapters, model metadata, API
-  key environment names, and provider status.
+- [Providers](PROVIDERS.md): supported provider adapters, credential sources,
+  model metadata, auth commands, and provider status.
 - [Platform support](PLATFORMS.md): macOS, Linux, release targets, and health
   checks.
 - [Skills and built-in help](SKILLS.md): local `SKILL.md` directories and

@@ -22,10 +22,11 @@ configured as core tools, and some are discoverable through lazy schema loading.
 ## Editing, Shell, And Verification
 
 - `plan_patch`: plan a search-replace edit using graph impact context.
-- `apply_patch`, `write_file`: mutate workspace files with stale-content checks
-  and checkpoint coverage. Mutating tools preflight target paths before any
-  filesystem write and refuse paths outside writable roots or under protected
-  metadata directories such as `.git`, `.squeezy`, and `.agents`.
+- `apply_patch`, `write_file`, `notebook_edit`: mutate workspace files with
+  stale-content checks and checkpoint coverage. Mutating tools preflight target
+  paths before any filesystem write and refuse paths outside writable roots or
+  under protected metadata directories such as `.git`, `.squeezy`, and
+  `.agents`.
 - `shell`: run a bounded local shell command after permission checks and sandbox
   planning; supports `tty=true` for PTY-backed commands and exposes
   `squeezy ask` to approved shell children when in-flight permission prompts
@@ -43,8 +44,12 @@ configured as core tools, and some are discoverable through lazy schema loading.
 - `checkpoint_list`, `checkpoint_show`, `checkpoint_undo`,
   `checkpoint_revert`: inspect and roll back recent mutating tool checkpoints
   when checkpointing is enabled.
+- `notes_remember`, `notes_recall`, `observations`: record or retrieve compact
+  local notes and observations.
 - `websearch`, `webfetch`: permission-gated external lookup through configured
   web tooling.
+- `mcp_list_resources`, `mcp_list_resource_templates`, `mcp_read_resource`:
+  inspect resources exposed by enabled MCP servers.
 - External MCP tools are namespaced by server and follow each server's
   configured permission policy.
 
@@ -53,26 +58,38 @@ configured as core tools, and some are discoverable through lazy schema loading.
 The TUI supports local commands for common work without requiring a model turn:
 
 - `/help [topic]`: local Squeezy help.
+- `/config [section]`, `/model`, `/permissions`, `/mcp`: open local
+  configuration views.
 - `/plan`, `/build`: switch session mode.
+- `/plans`: manage persisted plan-mode artifacts.
 - `/cost`, `/context`: show accounting and context snapshots.
 - `/attach`, `/attachments`, `/detach`: manage context attachments.
 - `/compact`, `/pin`, `/pins`, `/unpin`: manage context compaction and pins.
-- `/sessions`, `/session <id>`, `/resume <id>`, `/session-export`,
-  `/clear`: inspect, resume, export sessions, or clear the conversation.
+- `/diff`: show tracked and untracked workspace changes.
+- `/sessions`, `/session <id>`, `/session rename <name>`,
+  `/session label <name>`, `/resume <id>`, `/session-export`,
+  `/session-export-html`, `/clear`: inspect, annotate, resume, export
+  sessions, or clear the conversation.
+- `/fork`: branch the current session into a sibling session.
 - `/feedback`, `/report`: prepare consented maintainer feedback or bug reports.
-- `/verbosity`, `/tool-verbosity`, `/tasks`: local TUI display and
-  background-task controls. (`/jobs` remains a one-release alias for `/tasks`.)
+- `/tasks`, `/task <id>`, `/task-cancel <id>`: inspect and cancel background
+  tasks.
+- `/effort`, `/cheap`, `/parent`, `/verbosity`, `/tool-verbosity`: local model
+  and display controls.
 - `/checkpoints`, `/checkpoint <id>`, `/undo`, `/revert-turn <id>`:
   available when checkpointing is enabled.
 - `/router [on|off]`: toggle cheap-model turn routing for the session; without
   args opens the routing config view.
 - `/theme [name]`: switch the TUI color theme. Built-in themes: `default`,
-  `bright`, `fun`, `starlight`. Use `/theme default` to reset.
+  `bright`, `fun`, `catppuccin`, `high-contrast`. Use `/theme default` to
+  reset.
+- `/spinner [name]`: set the working-status spinner.
 - `/reviewer`: show recent AI reviewer auto-decisions.
 - `/statusline`: configure the custom status line footer.
+- `/keymap`: list current key bindings.
 
 Prompt templates in `~/.squeezy/prompts/` and `<workspace>/.squeezy/prompts/`
-can be activated with `/prompt-template <name>`. See
+activate by their slash name, such as `/review` for `review.md`. See
 [PROMPT_TEMPLATES.md](PROMPT_TEMPLATES.md).
 
 The exact available tool set can change with mode, configuration, permissions,

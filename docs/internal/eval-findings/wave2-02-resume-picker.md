@@ -1,5 +1,10 @@
 # wave2-02-resume-picker — eval findings
 
+Status: historical snapshot. Current eval code writes TUI captures for
+`drive_tui` runs and includes style-aware TUI assertions such as
+`tui_cell_luminance_le`; keep the frame/cell harness findings below as
+pre-fix evidence, not as current capability statements.
+
 ## Area
 
 `02 resume-picker-and-restore` (per `docs/internal/EVAL_COVERAGE_PLAN_WAVE2.md`).
@@ -118,11 +123,13 @@ Visual clarity (primary). Cross-model consistency (both OpenAI and Anthropic leg
 
 ---
 
-## Finding 3: eval: `drive_tui = true` scenarios write 0 frames, causing every `expect_final_text_contains` to false-positive
+## Finding 3: historical eval gap — `drive_tui = true` scenarios wrote 0 frames
 
 ### Severity
 
-**medium** — every wave-2 scenario that uses `[tui_capture] drive_tui = true` will report an `expect_final_text_contains` finding even when the model produced the required text.
+Historical severity: medium. At the time, every wave-2 scenario that used
+`[tui_capture] drive_tui = true` reported an `expect_final_text_contains`
+finding even when the model produced the required text.
 
 ### What you should see vs. what you see
 
@@ -167,11 +174,13 @@ Functionality (harness-side regression). Cross-model consistency: affects all th
 
 ---
 
-## Finding 4: eval: `FrameCell` strips fg/bg so the dark-only palette luminance rule cannot be auto-asserted
+## Finding 4: historical eval gap — `FrameCell` stripped fg/bg
 
 ### Severity
 
-**low** — coverage gap; blocks the wave-2 visual-clarity rubric from being mechanised but doesn't itself produce wrong output.
+Historical severity: low. This was a coverage gap that blocked the wave-2
+visual-clarity rubric from being mechanised. Current `squeezy-eval` includes
+`tui_cell_luminance_le` and records style-bearing TUI captures.
 
 ### What you should see vs. what you see
 
@@ -192,7 +201,8 @@ Read source. There is no live reproducer because the limitation is in the harnes
       pub symbol: String,
   }
   ```
-- `crates/squeezy-eval/src/scenario.rs` has no `tui_cell_luminance_le` assertion variant.
+- Historical source note: `crates/squeezy-eval/src/scenario.rs` did not yet
+  have the current `tui_cell_luminance_le` assertion variant.
 
 ### Suspected cause
 

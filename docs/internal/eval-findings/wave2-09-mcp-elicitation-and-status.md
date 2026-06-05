@@ -1,10 +1,11 @@
 # wave2-09 — mcp-elicitation-and-status
 
-Status: 2026-05-30. Three live scenarios executed (openai, anthropic);
-Portkey errored at provider-config resolution. Both completed runs
-captured the wave-1 harness gap (no `mock_mcp` driver) and one
-provider-side defect each. No MCP modal frame was ever rendered so
-palette / preamble assertions could not be evaluated.
+Status: historical snapshot from 2026-05-30. Three live scenarios executed
+(openai, anthropic); Portkey errored at provider-config resolution. Both
+completed runs captured a harness gap that has since been narrowed: current
+`squeezy-eval` supports `[mcp.servers]`, `respond_elicitation`,
+`inject_mcp_elicitation`, and `unfired_action` findings. Keep this report as
+the captured run evidence, not as the current MCP scenario API.
 
 ## Run directories
 
@@ -42,7 +43,7 @@ same end-state shape:
   equal to 1024 ..."`. `frames.jsonl` empty.
 - **Beads:** `squeezy-71u`
 
-### 2. eval: harness still lacks mock_mcp driver (wave-1 regression net hole)
+### 2. eval: historical MCP elicitation harness gap
 
 - **Provider:** all (harness gap, surfaces identically on openai +
   anthropic; would also surface on portkey if configured).
@@ -50,24 +51,23 @@ same end-state shape:
   `mcp-elicitation-form` finding forward — that find documented the
   gap but never opened a Beads ticket.
 - **Rubric dimension:** Functionality (coverage hole).
-- **Headline:** No scenario can stand up a fake MCP server, so the
-  `respond_elicitation` action queued in all three wave2-09
-  scenarios terminates as `action_step.status = "unfired_no_trigger"`
-  in `trace.jsonl`. The MCP modal layer
-  (`format_mcp_elicitation_menu_lines`, `pending_mcp_elicitation`),
-  the elicitation policy gate, and the response-write path remain
-  unreachable from `squeezy-eval`. The cross-provider palette /
-  preamble probes this domain is meant to cover all silently no-op.
+- **Headline:** At the time of the captured run, the queued
+  `respond_elicitation` action in the wave2-09 scenarios terminated as
+  `action_step.status = "unfired_no_trigger"` in `trace.jsonl`, so the
+  MCP modal layer (`format_mcp_elicitation_menu_lines`,
+  `pending_mcp_elicitation`), the elicitation policy gate, and the
+  response-write path were unreachable from this scenario shape.
 - **File:line:**
-  - `crates/squeezy-eval/src/scenario.rs` (no `mcp`/`mock_mcp` field)
+  - historical: `crates/squeezy-eval/src/scenario.rs` did not yet expose
+    the current MCP/injected-elicitation surface
   - `crates/squeezy-eval/src/driver.rs:1413` (`McpElicitationRequested` arm)
   - `crates/squeezy-eval/src/driver.rs:1928` (`decide_elicitation`)
   - `crates/squeezy-mcp/src/lib.rs:300` (`set_elicitation_handler`)
   - `crates/squeezy-agent/src/lib.rs:6266` (`install_mcp_elicitation_handler`)
 - **Evidence:** trace.jsonl seq 5 in both runs — `"action":
   {"action":"respond_elicitation",...},"status":"unfired_no_trigger"`.
-  `findings.jsonl` empty — there is also no auto-finding rule for
-  "scripted elicitation never fired".
+  `findings.jsonl` empty — current code has an `unfired_action` rule for
+  this class.
 - **Beads:** `squeezy-y5i`
 
 ### 3. eval/portkey: provider config missing — scenario aborts before any capture
@@ -127,7 +127,6 @@ To complete this domain's coverage in a follow-up:
    scenario's `max_output_tokens` to >= 1025 + a safety margin.
 2. Export `PORTKEY_API_KEY` (or land `squeezy-bcz` via
    settings.toml).
-3. Land `squeezy-y5i` (mock_mcp driver) so the queued
-   `respond_elicitation` step actually exercises the modal layer
-   and the assertions for `tui_status_contains` / palette can bind
-   to a rendered frame.
+3. For current modal-only coverage, use `inject_mcp_elicitation` with
+   `[tui_capture] drive_tui = true`; for transport coverage, declare a
+   fake server under `[mcp.servers]`.

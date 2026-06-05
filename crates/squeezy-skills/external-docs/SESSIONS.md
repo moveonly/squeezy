@@ -25,10 +25,17 @@ Each session directory contains:
 Use CLI discovery commands:
 
 ```sh
+squeezy --continue
+squeezy --resume
+squeezy --no-resume-picker
+squeezy --session <session_id>
 squeezy sessions list
 squeezy sessions list --branch main --status completed --query "refactor"
 squeezy sessions show <session_id>
 squeezy sessions resume <session_id>
+squeezy sessions fork <session_id>
+squeezy sessions archive <session_id>
+squeezy sessions unarchive <session_id>
 squeezy sessions replay <session_id>
 squeezy sessions replay <session_id> --json
 squeezy sessions export <session_id>
@@ -38,11 +45,22 @@ squeezy sessions cleanup
 ```
 
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
-<session_id>`, `/session-export <session_id>`, and `/report [session_id]`.
+<session_id>`, `/session rename <title>`, `/session label <label>`,
+`/session-export <session_id>`, `/session-export-html <session_id>`, `/fork`,
+and `/report [session_id]`.
 Archiving or purging old sessions is a CLI operation (`squeezy sessions
 cleanup`). `/clear` starts a fresh conversation with an empty context
 window: the current conversation is finalized on disk and stays resumable via
 `/resume`, while a new session takes over for subsequent turns.
+
+`--continue` resumes the most recent resumable session for the current
+directory, falling back to a fresh session when none exists. `--resume` opens
+the directory-scoped resume picker, and `--session <id>` resumes an explicit
+session id. When a selected session belongs to another working directory,
+Squeezy prompts before resuming it from the current directory. The startup
+resume picker is controlled by the config setting documented in
+[`CONFIGURATION.md`](CONFIGURATION.md); `--no-resume-picker` suppresses it for
+one launch.
 Use `/cost` for cumulative session cost and tool accounting. It reports the
 provider token counters Squeezy has received so far, cache counters when the
 provider exposes them, estimated USD from local pricing metadata, tool-call

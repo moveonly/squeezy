@@ -110,8 +110,10 @@ Windows-specific notes:
 - The shell child is run through PowerShell 7 if available, otherwise
   Windows PowerShell, otherwise `cmd.exe`. `SQUEEZY_SHELL=gitbash` opts
   into Git Bash. `SQUEEZY_SHELL=<path>` sets a custom shell binary.
-- Provider credentials are read from Windows Credential Manager via the
-  `keyring` crate's `windows-native` backend.
+- Provider API keys use the same cross-platform resolution chain as other
+  hosts: inline `api_key`, `credentials.json`, env vars, then
+  `SQUEEZY_CREDENTIALS_JSON`. OAuth providers use Squeezy's local auth token
+  files.
 - The Windows release archive is currently unsigned; SmartScreen
   warnings are expected on first launch. Azure Trusted Signing
   integration is on the roadmap.

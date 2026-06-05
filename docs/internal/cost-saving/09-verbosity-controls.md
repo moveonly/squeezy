@@ -13,9 +13,11 @@ Squeezy splits the dial three ways. Assistant text is governed by
 the transcript is governed by `ToolOutputVerbosity` (`/tool-verbosity`).
 Unified-diff stdout from shell commands has its own switch,
 `ShellDiffInline` (`tui.shell_diff_inline`), because `git diff` is the
-one tool whose value collapses if you head/tail-cap it. Each setting
-is session-scoped, applies on the next turn, and maps directly onto
-the wire shape sent to the provider.
+one tool whose value collapses if you head/tail-cap it. Each setting is
+session-scoped. Response verbosity can change the provider request
+(`text_verbosity` or a short prompt fragment); tool-output verbosity and
+shell-diff folding control transcript/TUI rendering and do not shrink
+provider request bytes.
 
 ## Mechanism
 

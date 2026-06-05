@@ -1,12 +1,12 @@
 # Squeezy Telemetry Worker
 
 This Cloudflare Worker is the only component that knows the PostHog project
-token. Squeezy clients send anonymous telemetry to `/v1/batch`; the Worker
-validates the batch envelope, accepts product event names matching
+token. Squeezy clients send anonymous product telemetry to `/v1/batch`; the
+Worker validates the batch envelope, accepts product event names matching
 `squeezy_*`, and forwards only bounded safe properties to PostHog. Accepted
-property shapes are non-negative counters, booleans, token strings, and small
-count maps; raw text, paths, URLs, arrays, and arbitrary nested objects are
-dropped.
+property shapes are non-negative counters, booleans, token strings, trace/span
+ids, and small count maps; raw text, paths, URLs, arrays, and arbitrary nested
+objects are dropped.
 
 The Worker also accepts consented maintainer-intake traffic:
 
@@ -38,7 +38,10 @@ Set a Cloudflare lifecycle rule on the bucket so report archives expire after
 
 The repository intentionally commits `wrangler.example.toml`, not the production
 `wrangler.toml`. Production deployment needs a private `wrangler.toml` with the
-Worker name, account, route/workers.dev setting, and `REPORT_BUCKET` binding.
+Worker name, account, route/workers.dev setting, and, if `/v1/report` should
+accept uploads, the `REPORT_BUCKET` binding. Without that binding, product
+telemetry, website telemetry, and feedback still work, but `/v1/report` returns
+`report_storage_not_configured`.
 
 ## Deploy
 
@@ -57,16 +60,18 @@ custom domain is a production hardening option, not the committed default.
 `POST /v1/batch` accepts at most 64 KiB and 50 product events. The batch requires
 `schema_version = 1`, matching `user_id` and `install_id` UUIDs, a session id,
 app version, OS, arch, and an event array. Event names must match
-`squeezy_[a-z0-9_]{1,96}`; timestamps must be within 30 days in the past and 5
+`squeezy_[a-z0-9_]{1,96}`; timestamps must be within 30 days in the past and 10
 minutes in the future. Each event may carry up to 128 safe properties:
-non-negative numbers, booleans, safe token strings, trace ids, span ids, and
-small count maps with up to 16 entries. Arrays, raw text, paths, URLs, and
+non-negative safe integers, booleans, safe token strings, `trace_id`, `span_id`,
+and small count maps with up to 16 entries. Arrays, raw text, paths, URLs, and
 arbitrary nested objects are dropped or rejected before PostHog forwarding.
 
 `POST /v1/site` accepts at most 16 KiB and only
 `squeezy_site_page_view`, `squeezy_site_cta_clicked`, or
-`squeezy_site_outbound_clicked`. Referrer and target kinds are closed enums;
-UTM, CTA, path, and target fields are bounded site-local tokens.
+`squeezy_site_outbound_clicked`. Timestamps use the same 30-day past and
+10-minute future window. Referrer and target kinds are closed enums; UTM, CTA,
+path, and target fields are bounded site-local tokens. The Worker allows CORS
+only for `https://squeezyagent.com`.
 
 `POST /v1/feedback` accepts at most 32 KiB of JSON and a redacted message no
 larger than 16 KiB. It requires source `cli` or `tui`, matching `user_id` and
@@ -92,9 +97,16 @@ export POSTHOG_HOST=https://eu.posthog.com
 bun run setup:posthog
 ```
 
-The setup script creates usage, cost, reliability, graph, feedback, and report
-metadata insights. Product insights are based on `squeezy_session_summary`;
-website, feedback, and report endpoints keep their separate event names.
+The setup script creates four numbered dashboards:
+
+- `Squeezy - 01 Product Overview`
+- `Squeezy - 02 Reliability And Runtime`
+- `Squeezy - 03 Website`
+- `Squeezy - 04 Feedback And Reports`
+
+It also demotes the legacy `Squeezy Telemetry` dashboard when present. Product
+insights are based on `squeezy_session_summary`; website, feedback, and report
+endpoints keep their separate event names.
 
 ## Smoke Test
 
@@ -109,7 +121,7 @@ bun run smoke:worker
 For the website endpoint:
 
 ```sh
-export SITE_ENDPOINT=https://squeezy-telemetry.esqueezy.workers.dev/v1/site
+export SITE_TELEMETRY_ENDPOINT=https://squeezy-telemetry.esqueezy.workers.dev/v1/site
 bun run smoke:site
 ```
 
@@ -130,7 +142,7 @@ Recommended production controls:
 - Cloudflare WAF or rate limiting for `POST /v1/feedback` and
   `POST /v1/report`.
 - R2 lifecycle expiry for private report archives.
-- A custom domain such as `https://telemetry.squeezy.dev`.
+- A custom domain such as `https://telemetry.squeezyagent.com`.
 - PostHog project settings with person profiles disabled unless explicitly
   needed later.
 

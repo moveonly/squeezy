@@ -42,11 +42,11 @@ https://squeezy-telemetry.esqueezy.workers.dev/v1/feedback
 https://squeezy-telemetry.esqueezy.workers.dev/v1/report
 ```
 
-Those endpoints are not anonymous product telemetry from the Squeezy binary.
+Those endpoints are not automatic product telemetry from the Squeezy binary.
 `/v1/site` receives anonymous website page-view and CTA events. `/feedback`
 sends short redacted user text after explicit confirmation. `/report` uploads a
-redacted archive to private R2 storage after explicit confirmation and forwards
-only metadata to PostHog.
+redacted archive to private R2 storage after explicit confirmation when the
+Worker has report storage configured, and forwards only metadata to PostHog.
 
 ## Identity
 
@@ -109,8 +109,8 @@ Telemetry must not include:
   model family buckets instead.
 
 Website visitor telemetry is separate from product telemetry. It is limited to
-anonymous visitor/session IDs, site-local paths, coarse referrer kind, bounded
-UTM fields, and CTA/target identifiers.
+pseudonymous visitor/session IDs, site-local paths, coarse referrer kind,
+bounded UTM fields, and CTA/target identifiers.
 
 These restrictions describe automatic telemetry events. Consented feedback and
 report submission have their own preview, redaction, and size caps documented

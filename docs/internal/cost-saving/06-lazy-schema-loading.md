@@ -31,13 +31,15 @@ two files and writing a patch needs `read_file`, `read_slice`, `grep`,
 `verify`, `delegate_chain`, and the graph navigators is sent and billed
 but never invoked.
 
-Skill bodies (Markdown instruction blobs in `.claude/skills/*/SKILL.md`)
-are the same problem one layer up. Once a skill is *active* for a turn,
-its full body has historically been spliced into the system prompt; half
-a dozen active skills can add another 10-30KB of instructions that the
-model glances at and ignores. The legacy `[skills] inline = true` knob
-forces that behaviour; the modern default emits a metadata stub and lets
-the model fetch the body on demand via the `load_skill` tool.
+Skill bodies (Markdown instruction blobs discovered from
+`.squeezy/skills/*/SKILL.md`, compatibility `.agents/skills/*/SKILL.md`,
+configured extra roots, and bundled skills) are the same problem one
+layer up. Once a skill is *active* for a turn, its full body can be
+spliced into the system prompt; half a dozen active skills can add
+another 10-30KB of instructions that the model glances at and ignores.
+The legacy `[skills] inline = true` knob forces that behaviour; the
+modern default emits a metadata stub and lets the model fetch the body
+on demand via the `load_skill` tool.
 
 The lazy-schema-loading subsystem makes both costs opt-in: the model
 sees a short index of *what exists*, and only the schemas or bodies it

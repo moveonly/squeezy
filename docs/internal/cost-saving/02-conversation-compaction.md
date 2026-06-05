@@ -25,12 +25,22 @@ the immediate working state.
 
 ## Mechanism
 
-### Dual triggers
+### Micro tier plus full-compaction triggers
 
-Two entry points decide when to compact. The post-turn `maybe_compact_conversation`
-runs after every assistant turn finishes; the mid-turn
-`maybe_compact_mid_turn` runs between LLM stream events when the provider's
-running token-usage estimate spikes.
+Squeezy now has two compaction tiers. The full tier still replaces the older
+conversation prefix with a summary head, but the mid-turn path first tries a
+cheaper micro-compaction pass. `maybe_micro_compact_mid_turn` rewrites older
+compactable `FunctionCallOutput` bodies in place once the conversation reaches
+`micro_compaction_threshold_percent` of `model_context_window` (default 60%).
+It keeps the newest compactable outputs verbatim, preserves every
+`FunctionCall`/`FunctionCallOutput` pairing by `call_id`, and can avoid the
+full summary rewrite entirely. If the conversation is still over the full
+threshold, `maybe_compact_mid_turn` runs next.
+
+Two entry points decide when to run the full tier. The post-turn
+`maybe_compact_conversation` runs after every assistant turn finishes; the
+mid-turn `maybe_compact_mid_turn` runs before the next sample when the
+provider-reported token usage crosses the configured full threshold.
 
 ```rust
 // crates/squeezy-agent/src/context_compaction.rs:143-203
@@ -167,13 +177,14 @@ let summary = build_compaction_summary(
 );
 ```
 
-The strip operates on `FunctionCallOutput.output` strings (`:453-470`),
-scans for `data:<mime>;base64,` prefixes, then advances over the base64
-payload until it hits a non-base64 character. The `dropped` slice persisted
-for undo (`:273-274`) is built from the *original* `older`, not the
-stripped copy, so an undo restores the verbatim bytes the model saw at the
-time. Skipping outputs shorter than `STRIP_MEDIA_MIN_LEN = 100` bytes
-(`:437`) avoids per-token overhead on the common short-output case.
+The strip operates on both `FunctionCallOutput.output` strings and
+`content_parts`. Text parts are scanned for `data:<mime>;base64,` prefixes,
+then advanced until the first non-base64 byte. Image content parts are
+replaced by short placeholders so a screenshot cannot smuggle raw bytes into
+the compaction prompt. The `dropped` slice persisted for undo is built from
+the *original* `older`, not the stripped copy, so an undo restores the
+verbatim bytes the model saw at the time. Skipping short outputs avoids
+per-token overhead on the common short-output case.
 
 ### Extractive summary structure
 

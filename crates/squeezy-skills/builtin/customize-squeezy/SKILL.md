@@ -62,10 +62,14 @@ base_url = "https://api.openai.com/v1"
 default_model = "gpt-5.5"
 ```
 
-Squeezy never writes secret values into TOML; it stores the *name* of the
-environment variable that holds the key. On macOS, missing env vars fall
-back to the Keychain account matching the provider id (`openai`,
-`anthropic`, `google`, `azure_openai`).
+Prefer `api_key_env` for shared config. Squeezy also accepts an inline
+`api_key` in user or per-repo machine-local settings; `squeezy auth set`
+writes that field for known providers. Never commit an inline `api_key` in
+project `squeezy.toml`.
+
+A provider `api_key` value that starts with `!` is treated as a shell escape
+and resolved from stdout at config-load time. Use it only in trusted user-local
+settings.
 
 ### Add an MCP server (stdio)
 
@@ -228,7 +232,8 @@ reference, defaults, and apply-tier (immediate / next prompt / restart required)
 2. Use `squeezy config init --user` or `--project` to generate a commented
    skeleton; `--force` is required to overwrite an existing file.
 3. Make the edit. Keep secret values out of TOML; reference an env var
-   name via `api_key_env`.
+   name via `api_key_env`, or use `squeezy auth set` for local inline
+   `api_key` storage.
 4. Run `squeezy config inspect` to verify the effective merged config and
    confirm which source supplied each value.
 5. Run `squeezy doctor` to validate the merged config.

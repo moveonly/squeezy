@@ -24,7 +24,7 @@ for exploratory QA, regression diffing, and triage.
 - [Per-run output layout](#per-run-output-layout)
   - [trace.jsonl schema](#tracejsonl-schema)
   - [frames.jsonl schema](#framesjsonl-schema)
-  - [findings.jsonl + rule reference](#findingsjsonl--rule-reference)
+  - [findings.jsonl + rule reference](#findingsjsonl-rule-reference)
   - [run.json](#runjson)
   - [tickets/](#tickets)
 - [CLI reference](#cli-reference)
@@ -210,8 +210,16 @@ reasoning_effort = "low"          # optional: low | medium | high | xhigh
 tool_choice = "required"          # optional: auto | required | none
 mode = "build"                    # "plan" | "build"
 permission_mode = "ask"           # "allow" | "ask" | "deny"; applied to edit/shell/web/mcp
+batch_tool_calls_hint = true       # optional: nudge independent read-only lookups into one batch
 instructions = "..."              # optional system instructions override
+cache_root = ".squeezy/eval-cache" # optional; relative paths stay workspace-relative
 max_output_tokens = 1024
+max_tool_calls_per_turn = 16
+max_tool_bytes_read_per_turn = 10485760
+max_session_cost_usd_micros = 100000
+show_reasoning_usage = false
+checkpoints_enabled = true
+excluded_tools = ["repo_map", "decl_search"]
 ```
 
 Setting `provider = "mock"` activates the built-in scripted provider; see
@@ -225,13 +233,39 @@ that preset. You still need the matching API-key env var exported
 (`OPENAI_API_KEY`, `PORTKEY_API_KEY`, etc.) — the scenario references
 the provider by name only.
 
-Scenarios that exercise the `/diff` and `/undo` git-and-vcs surfaces
-need Squeezy's checkpoint tracking enabled. Either set
+`excluded_tools` pushes names into `AppConfig.tools.excluded`; the
+graph-vs-no-graph benchmarks use it to hide semantic-navigation tools
+from the no-graph half of the pair.
+
+Scenarios that exercise `/undo`, `/checkpoint`, `/revert-turn`, or
+other checkpoint-backed git/VCS surfaces need Squeezy's checkpoint tracking
+enabled. Either set
 `[squeezy] checkpoints_enabled = true` in the scenario overlay (the
 recommended path — keeps the scenario self-contained) or export
 `SQUEEZY_CHECKPOINTS_ENABLED=1` in the shell before running. Without
 one of those, edits do not produce checkpoint metadata and `/undo`
 becomes a no-op.
+
+### TUI capture
+
+`[tui_capture]` enables the headless TUI render path. With `enabled = true`,
+the driver writes `frames_tui.jsonl` and `replay.tui`; with
+`drive_tui = true`, prompts, slash commands, key events, modal state, and
+TUI assertions run through a live `TuiHarness` instead of only the agent-side
+dispatch path.
+
+```toml
+[tui_capture]
+enabled = true
+drive_tui = true
+width = 160
+height = 48
+palette_tone = "dark"             # "dark" (default) or "light"
+```
+
+Use `drive_tui = true` for `send_key`, `send_keys`, `tui_*`,
+`modal_active`, and `config_screen_section` assertions. Keep it off for
+pure agent-loop probes where a live TUI would add unnecessary state.
 
 ### Steps: prompts and actions
 
@@ -273,10 +307,20 @@ matches).
 | `deny` | optional `match.tool`, optional `reason` | reply Denied |
 | `slash_command` | `command = "/compact"` | run an agent slash command (see below) |
 | `edit_file` | `path` + either `content = "..."` or `replace = { find, with }` | mutate a workspace file mid-run |
+| `apply_diff` | `path`, `unified_diff` | apply a unified diff to a workspace file via `git apply` |
 | `wait_seconds` | `seconds = 5` | sleep |
 | `cancel_turn` | — | cancel the most-recently-started turn |
 | `assert` | `check = { kind = "text_contains" \| "max_tool_calls", ... }` | soft assertion; failure becomes a finding |
 | `inject_user_text` | `text = "..."` | append a user message to the conversation transcript without starting a turn |
+| `respond_elicitation` | `decision = { action = "accept" \| "decline" \| "cancel", ... }` | answer a real `McpElicitationRequested` event |
+| `inject_mcp_elicitation` | `request = { server, message, kind = "form" \| "url", ... }` | synthesize an MCP elicitation into the live TUI modal; requires `drive_tui = true` |
+| `respond_user_input` | `decision = { action = "choice" \| "freeform" \| "cancel", ... }` | answer a `request_user_input` prompt from plan mode |
+| `switch_mode` | `mode = "plan" \| "build"` | switch session mode through the slash-command path |
+| `attach_file` | `path` | attach a workspace file as context |
+| `detach_attachment` | `id` | detach a prior attachment |
+| `send_key` | `key = "Ctrl+O"` | send one key to the live TUI; requires `drive_tui = true` |
+| `send_keys` | `keys = ["Down", "Enter"]`, optional `delay_ms` | send a key sequence to the live TUI |
+| `capture_session_id` | `var = "name"` | capture the current session id for later `${name}` substitution in slash commands |
 
 Every action accepts an optional `when` predicate. When `when` is set,
 the action is queued and fires only when the trigger is observed:
@@ -294,15 +338,35 @@ on_tool = "grep"                  # fire mid-stream when grep is requested
 
 #### `slash_command` coverage
 
-Slash commands dispatch through `Agent::dispatch_command` (typed) via the
-`Agent::dispatch_command_raw` shim. Every entry in
-`squeezy-tui`'s `SLASH_COMMANDS` table is reachable; commands whose
-behaviour lives entirely in the TUI renderer (overlays, transcript pushes,
-clipboard, `/diff` snapshot) land as `DispatchOutcome::TuiOnly { command }`
-so eval traces still observe the typed entry point. Unknown heads land as
+Slash commands dispatch through the typed `DispatchCommand` parser. With
+`[tui_capture] drive_tui = true`, the driver routes the command through
+the live `TuiHarness`, so visual commands such as overlays, model/config
+screens, help, `/diff`, and TUI status updates take effect. Without
+`drive_tui`, the driver calls `Agent::dispatch_command_raw`; pure agent-state
+commands return structured statuses, and visual-only commands land as
+`DispatchOutcome::TuiOnly { command }`. Unknown heads land as
 `DispatchOutcome::Unsupported`, which surfaces as the
-`unsupported_slash_command` auto-finding so triage flags missing
-automation rather than silently no-op.
+`unsupported_slash_command` auto-finding.
+
+#### Assertion checks
+
+`action = "assert"` supports:
+
+| `check.kind` | Purpose |
+|---|---|
+| `text_contains` | latest assembled assistant output contains text |
+| `max_tool_calls` | run has observed at most `max` tool calls |
+| `tool_call_with_args` | a tool call with matching argument text fired |
+| `finding_fired` | deferred assertion that a rule id appears in findings |
+| `stop_reason` | latest stop reason equals or is not in a set |
+| `task_state_contains` | task-state snapshots contain a step/blocker substring |
+| `tui_status_contains` | live TUI status line contains text |
+| `tui_transcript_entry` | transcript entry kind/collapsed state matches |
+| `tui_frame_contains` / `tui_frame_does_not_contain` | latest rendered frame text includes/excludes text |
+| `tui_cell_luminance_le` | rendered cell foreground/background stays under a luminance cap |
+| `modal_active` | the current foreground modal is named, or no modal is active |
+| `config_screen_section` | config modal focus is on a specific section slug |
+| `action_step_status_contains` | a slash/action status contains a substring |
 
 ### Expect (soft checks)
 
@@ -313,14 +377,20 @@ Failures here produce findings, not aborts.
 final_text_contains = ["build_widget"]   # require text in the final turn's assistant output
 max_wall_clock_seconds = 120
 max_input_tokens = 50000
+max_input_tokens_per_turn = 20000
 max_tools_per_turn = 8                    # tunes the high_tool_burst auto-finding
 no_tool_errors = true
+finish_reason_not = ["length", "stop_no_action"]
+max_dropped_tool_calls = 0
+event_timeout_seconds = 120
 ```
 
 Soft expectations are converted into findings with stable
 `rule_id`s (`expect_final_text_contains`, `expect_wall_clock`,
-`expect_input_tokens`, `expect_no_tool_errors`) so they show up
-alongside the heuristics in `findings.jsonl` and `tickets/`.
+`expect_input_tokens`, `expect_input_tokens_per_turn`,
+`expect_no_tool_errors`, `expect_finish_reason`,
+`expect_dropped_tool_calls`) so they show up alongside the heuristics
+in `findings.jsonl` and `tickets/`.
 
 ### Triage
 
@@ -429,6 +499,8 @@ target/eval/<scenario-id>-<unix-ms>/
 ├── run.json
 ├── trace.jsonl
 ├── frames.jsonl
+├── frames_tui.jsonl                # only when [tui_capture] enabled = true
+├── replay.tui                      # only when [tui_capture] enabled = true
 ├── findings.jsonl
 └── tickets/
     ├── 01-<slug>.md
@@ -439,11 +511,11 @@ target/eval/<scenario-id>-<unix-ms>/
 
 ### trace.jsonl schema
 
-One JSON object per line. `schema_version = 2`. Common envelope:
+One JSON object per line. `schema_version = 3`. Common envelope:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "ts_unix_ms": 0,
   "sequence": 0,
   "turn_id": "TurnId(1)",
@@ -461,13 +533,21 @@ Variants (`kind`):
 | `turn_failed` | `error` | agent turn errors |
 | `turn_cancelled` | — | agent turn cancelled |
 | `assistant_delta` | `delta` | streaming assistant token chunk |
+| `reasoning_delta` | `delta` | streaming reasoning token chunk |
+| `reasoning_segment` | `display_text`, `payload` | completed structured reasoning segment |
+| `shell_sandbox_degraded` | `backend`, `fallback_count` | shell sandbox degraded to a best-effort backend |
 | `tool_call_queued` | `call` | agent queues a tool call |
-| `tool_call_started` | `call` | tool actually runs |
+| `tool_call_started` | `call`, `origin` | tool actually runs |
 | `tool_call_completed` | `result` | tool finishes (status `Success` / `Error` / `Cancelled`) |
+| `tool_progress` | progress payload | a running tool reports progress |
 | `approval` | `request`, `decision` | ApprovalRequested + driver's response |
 | `context_compacted` | `report` | /compact ran |
 | `task_state_updated` | `snapshot` | agent reports a task-state update |
 | `subagent_event` | `event` | subagent started / completed / failed |
+| `mcp_server_event` | server event payload | MCP server discovery/status changed |
+| `job_event` | job event payload | background job event reached the TUI |
+| `cost_update` | cost payload | cost broker emitted an update |
+| `ai_reviewer_tripped` | reviewer payload | AI-reviewer guard tripped |
 | `slash_command` | `command` | a slash_command action fired |
 | `action_step` | `action`, `status` | any other action |
 | `snapshot` | `snapshot_kind`, `payload` | misc snapshots (mcp_status, jobs, cost_warning, ai_reviewer_tripped) |
@@ -496,6 +576,7 @@ One record per assistant turn:
   "input_tokens": 14314,
   "output_tokens": 92,
   "cost_micro_usd": 17880,
+  "subagent_cost_micro_usd": 0,
   "cost_display": "$0.0179",
   "styled_lines": [{ "spans": [{ "text": "src/lib.rs", "fg": null, "bg": null, "modifiers": [] }] }],
   "ansi": "src/lib.rs defines make_widget.\n",
@@ -555,9 +636,11 @@ diffable across runs.
 | `stop_with_intent_text_no_tool_call` | major | turn finished `finish_reason=stop`, zero tool calls, assistant text contains an intent phrase like `"let me X"` / `"i'll Y"` with an action verb — the canonical Qwen3 chatty-preamble-then-stop pattern |
 | `expect_wall_clock` | minor | wall clock > `expect.max_wall_clock_seconds` |
 | `expect_input_tokens` | minor | total input tokens > `expect.max_input_tokens` |
+| `expect_input_tokens_per_turn` | minor | any turn's input tokens > `expect.max_input_tokens_per_turn` |
 | `expect_final_text_contains` | minor | the last turn's assistant_text missing a required substring |
 | `expect_no_tool_errors` | minor | any `Error`/`Cancelled` `tool_call_completed` and `expect.no_tool_errors = true` |
 | `expect_finish_reason` | major | any completed turn matches `expect.finish_reason_not` — literal match against the provider's `finish_reason`, or the sentinel `"stop_no_action"` (stop + zero tool calls) |
+| `expect_dropped_tool_calls` | major | total dropped chat-completions tool-call frames exceeds `expect.max_dropped_tool_calls` |
 
 Additional bundled rules cover graph-overfetch patterns, missing confidence
 labels, unsupported or failed TUI actions, platform mismatch, unfired scripted
@@ -588,7 +671,10 @@ totals — most rules are 10–20 lines.
     "frames": 3,
     "findings": 1,
     "cost_micro_usd": 22900,
-    "cost_display": "$0.0229"
+    "cost_display": "$0.0229",
+    "total_cost_with_subagents_micro_usd": 22900,
+    "parent_cost_micro_usd": 22900,
+    "subagent_cost_micro_usd": 0
   },
   "per_turn_costs": [{ "turn_id": "TurnId(1)", "cost_micro_usd": 18000 }],
   "findings": ["[approval_unanswered] ApprovalRequested arrived..."],
@@ -765,16 +851,18 @@ focus = "transcript-state regressions only — ignore stylistic findings"
 ---
 
 ## Limits and non-goals
-- **Slash-command coverage** is the subset that lives wholly inside
-  `Agent` (compact / plan / build / cost / jobs / permissions). TUI-only
-  commands (overlays, help text) return `Unsupported`.
+- **Slash-command coverage** is full when `drive_tui = true` and partial
+  when it is false. Non-drive runs still record visual-only commands as
+  `tui_only:<command>` action statuses, but they do not paint overlays or
+  mutate TUI-only state.
 - **`wait_for: tool_call` is signal-only.** Scenarios that want
   concurrent action dispatch attach `when.on_tool` to the action they
   want fired mid-stream.
-- **No pixel-accurate TUI capture.** `styled_lines` + `ansi` is enough
-  for presentation review; a `TestBackend` screen recorder is out of
-  scope for now.
+- **TUI capture is cell-grid based, not image based.** `frames_tui.jsonl`
+  records rendered cells, ANSI, and plain text from the headless backend;
+  it is suitable for assertions and review but does not produce screenshots.
 - **No record/replay of an eval trace through the agent.** That's a
   different problem from `squeezy-cli sessions replay`.
-- **Single-process, single-machine.** No distributed runner. CI workers
-  run scenarios serially via `squeezy-eval check`.
+- **Single-machine runner.** `squeezy-eval check` can run scenarios in
+  parallel with `--parallelism`, but each worker still runs in this process
+  and shares process-level env mutation surfaces such as TUI palette pinning.

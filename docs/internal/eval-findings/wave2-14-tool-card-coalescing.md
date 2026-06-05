@@ -5,6 +5,11 @@ Authored from scratch — this domain produced no scenarios in the
 partial wave. Three live scenarios were written + run and the
 findings below cite per-provider trace evidence.
 
+Status: historical snapshot. Current `drive_tui` dispatch has explicit
+approval handling and TUI-frame capture paths that did not exist for this run.
+Keep the approval-deadlock finding below as evidence of the captured failure,
+not as the current harness contract.
+
 ## Probe shape
 
 Brief-mandated prompt across all three providers:
@@ -47,18 +52,19 @@ overlay only flips `edit`, `shell`, `web`, `mcp`
 
 ## Defects
 
-### 01 — TuiHarness `pump_until_idle` deadlocks at 180s when a tool requires approval (`drive_tui = true`)
+### 01 — Historical: TuiHarness `pump_until_idle` deadlocked on approval
 
 #### Severity
 
-medium — this is the gating defect for wave-2 domain 14. The probe
+Historical severity: medium. This was the gating defect for wave-2 domain 14
+in the captured run. The probe
 asks the agent to issue 5 sequential `grep` calls so the rendered
 transcript can be inspected for the grouped coalesced card. With
 `drive_tui = true`, the agent's first `ApprovalRequested` is stashed
 in `app.pending_approval` and the harness pump never reaches an idle
 predicate. After 180s the pump returns `Err`, the scenario tears down,
 and `frames_tui.jsonl` / `replay.tui` are empty. No coalescing
-observation is possible against any live provider until this lands.
+observation was possible against any live provider in that run.
 
 Cross-provider: reproduces against `openai gpt-5.4-mini` and
 `anthropic claude-haiku-4-5-20251001` with identical wave-2 probe

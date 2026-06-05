@@ -1,5 +1,10 @@
 # wave2-18 theme-and-color-palette — eval findings
 
+Status: historical snapshot. Current `drive_tui` slash-command dispatch routes
+through the live TUI harness, and `TuiHarness` now receives the resolved
+provider label. Keep the provider-label and TUI-only dispatch findings below as
+captured run evidence, not current harness behavior.
+
 ## Area
 
 Wave-2 row 18 (`theme-and-color-palette`) from
@@ -74,7 +79,7 @@ flip the runtime palette on its own).
   retroactively broken.
 - **Provider:** all three (cross-cutting harness defect).
 
-### F2 — `TuiHarness::new` hardcodes provider label as `"eval-harness"` (NEW; medium)
+### F2 — Historical: `TuiHarness::new` hardcoded provider label as `"eval-harness"` (medium)
 
 - **Ticket:** `squeezy-16k6`.
 - **Rubric:** Cross-model consistency + Functionality.
@@ -181,12 +186,11 @@ flip the runtime palette on its own).
 The probe asked four questions:
 
 1. **Does `/theme dark` actually flip the runtime palette mid-session?**
-   Yes when driven through the `TuiHarness` composer (`send_keys`); no
-   when driven via `slash_command` (the eval driver routes through
-   `Agent::dispatch_command_raw` which classifies `/theme` as
-   `DispatchOutcome::TuiOnly` and returns without applying the
-   override). This is a known harness limit, not a TUI bug, but worth
-   noting for sibling scenarios that intend to test theme effects.
+   In this historical run, yes when driven through the `TuiHarness` composer
+   (`send_keys`), and no when driven through the then-current eval
+   `slash_command` path. Current `drive_tui` slash-command dispatch routes
+   through the live TUI harness, so reruns should prefer the documented
+   `slash_command` action unless they specifically need key-level coverage.
 
 2. **Does the cache invalidate on every swap?** `palette_generation()`
    (`crates/squeezy-tui/src/render/palette.rs:108-120`) bumps inside
