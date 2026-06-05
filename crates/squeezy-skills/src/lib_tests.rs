@@ -1356,6 +1356,39 @@ fn detects_implicit_skill_from_script_and_doc_read() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn detects_implicit_skill_doc_read_through_symlinked_skill_file() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("skills_implicit_symlink");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    fs::create_dir_all(&skill_dir).expect("mkdir skill");
+    let target_dir = root.join("canonical");
+    fs::create_dir_all(&target_dir).expect("mkdir canonical");
+    let target = target_dir.join("rust-nav.md");
+    fs::write(
+        &target,
+        "---\nname: rust-nav\ndescription: Rust nav\ntriggers:\n\n---\n# rust-nav\n",
+    )
+    .expect("write target skill");
+    symlink(&target, skill_dir.join("SKILL.md")).expect("symlink skill");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let doc = catalog
+        .detect_for_command("cat .squeezy/skills/rust-nav/SKILL.md", &root)
+        .expect("doc detection through symlink");
+
+    assert_eq!(doc.name, "rust-nav");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn skill_source_serializes_as_snake_case() {
     let json = serde_json::to_string(&SkillSource::CompatProject).expect("serialize");

@@ -83,6 +83,9 @@ fn doc_token_may_match_indexed_path(token: &str, by_doc_path: &BTreeMap<PathBuf,
     let Some(file_name) = Path::new(token).file_name() else {
         return false;
     };
+    if file_name == "SKILL.md" {
+        return true;
+    }
     by_doc_path
         .keys()
         .any(|path| path.file_name() == Some(file_name))

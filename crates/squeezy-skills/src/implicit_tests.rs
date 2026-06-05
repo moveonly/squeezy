@@ -52,3 +52,14 @@ fn doc_prefilter_keeps_plausible_skill_doc_tokens() {
         &by_doc_path
     ));
 }
+
+#[test]
+fn doc_prefilter_keeps_skill_doc_tokens_when_canonical_target_differs() {
+    let mut by_doc_path = BTreeMap::new();
+    by_doc_path.insert(PathBuf::from("/repo/canonical/nav.md"), "nav".to_string());
+
+    assert!(doc_token_may_match_indexed_path(
+        ".squeezy/skills/nav/SKILL.md",
+        &by_doc_path
+    ));
+}
