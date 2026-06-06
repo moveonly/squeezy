@@ -3255,7 +3255,6 @@ dependencies = [
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
- "squeezy-rank",
  "squeezy-skills",
  "squeezy-store",
  "squeezy-telemetry",

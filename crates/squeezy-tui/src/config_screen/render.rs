@@ -279,6 +279,12 @@ fn budget_subtitles(
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    // The live filter replaces the whole body — a small box on top plus the
+    // reduced match list — so the sidebar gives way to a full-width view.
+    if let Some(search) = &state.search {
+        render_filter(frame, area, search);
+        return;
+    }
     let sidebar_width = 22u16;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -302,8 +308,6 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         render_secret_entry(frame, chunks[2], entry);
     } else if let Some(picker) = &state.picker {
         render_model_picker(frame, chunks[2], picker);
-    } else if let Some(search) = &state.search {
-        render_search_overlay(frame, chunks[2], search);
     } else if state.current_section().id == SectionId::Reset {
         render_reset_section(frame, chunks[2], state);
     } else if state.current_section().id == SectionId::Themes {
@@ -1345,38 +1349,62 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(search.matches.len() + 3);
-    lines.push(Line::from(vec![
+/// Render the live filter: a small box on top showing the query, and below it
+/// the reduced, ranked, highlighted match list. Replaces the whole body while
+/// the filter is open.
+fn render_filter(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    render_filter_box(frame, chunks[0], search);
+    render_filter_list(frame, chunks[1], search);
+}
+
+fn render_filter_box(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
+    let below_threshold = search.query.chars().count() < super::FILTER_MIN_QUERY;
+    let mut spans = vec![
         Span::styled(
-            "Search",
+            "⌕ ",
             Style::default()
                 .fg(crate::render::theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled(
-            "fuzzy match field labels",
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("/", Style::default().fg(crate::render::theme::quiet())),
         Span::raw(search.query.clone()),
-        Span::styled("_", Style::default().fg(crate::render::theme::accent())),
-    ]));
-    lines.push(Line::raw(""));
+        Span::styled("▏", Style::default().fg(crate::render::theme::accent())),
+    ];
+    let tail = if below_threshold {
+        "   keep typing to filter…".to_string()
+    } else {
+        let n = search.matches.len();
+        format!("   {n} match{}", if n == 1 { "" } else { "es" })
+    };
+    spans.push(Span::styled(
+        tail,
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(crate::render::theme::quiet()))
+        .title(Span::styled(
+            " Filter settings ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+fn render_filter_list(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(search.matches.len() + 3);
     if search.matches.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no matches",
             Style::default().fg(crate::render::theme::quiet()),
         )));
     } else {
-        // Reserve rows for: 3 above (header + query + blank) and 2 below
-        // (blank + help). Below that ceiling, scroll the match window
-        // around the active cursor so navigating past the visible region
-        // doesn't park the highlight off-screen.
-        let chrome = 5u16;
+        // Reserve a blank + help row at the bottom; scroll the window around
+        // the cursor so navigating past the visible region keeps the
+        // highlighted row on-screen (mirrors the model picker).
+        let chrome = 2u16;
         let visible = area.height.saturating_sub(chrome).max(1) as usize;
         let total = search.matches.len();
         let cursor = search.cursor.min(total - 1);
@@ -1390,38 +1418,12 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
         let end = (start + visible).min(total);
         if start > 0 {
             lines.push(Line::from(Span::styled(
-                format!("  ▲ {} more above", start),
+                format!("  ▲ {start} more above"),
                 Style::default().fg(crate::render::theme::quiet()),
             )));
         }
-        for (idx, (sidx, fidx, _score)) in search.matches[start..end].iter().enumerate() {
-            let row_idx = start + idx;
-            let section = &CONFIG_SECTIONS[*sidx];
-            let field = &section.fields[*fidx];
-            let active = row_idx == cursor;
-            let prefix = if active { "› " } else { "  " };
-            let style = if active {
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(muted_fg())
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    prefix,
-                    Style::default().fg(if active {
-                        crate::render::theme::secondary()
-                    } else {
-                        crate::render::theme::quiet()
-                    }),
-                ),
-                Span::styled(
-                    format!("{:<22}", section.label),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(format!("{:<28}", field.label), style),
-            ]));
+        for (idx, m) in search.matches[start..end].iter().enumerate() {
+            lines.push(filter_match_line(&search.query, *m, start + idx == cursor));
         }
         if end < total {
             lines.push(Line::from(Span::styled(
@@ -1430,12 +1432,91 @@ fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverl
             )));
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Type to filter · ↑/↓ move · Enter jump · Esc cancel",
-        Style::default().fg(crate::render::theme::quiet()),
-    )));
+    // Controls live in the (filter-aware) footer, so the list needs no help row.
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// One result row: `Section › Option` (or just the section name for a
+/// field-less section), with the query's matched characters highlighted.
+fn filter_match_line(query: &str, m: super::SearchMatch, active: bool) -> Line<'static> {
+    let section = &CONFIG_SECTIONS[m.section_index];
+    let prefix = if active { "› " } else { "  " };
+    let prefix_style = Style::default().fg(if active {
+        crate::render::theme::secondary()
+    } else {
+        crate::render::theme::quiet()
+    });
+    let base = if active {
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(muted_fg())
+    };
+    let hit = Style::default()
+        .fg(crate::render::theme::green())
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(prefix, prefix_style)];
+    // Highlighting is computed per column (section name, then option name). The
+    // match was scored over the joined "<section> <option>" string plus the
+    // option's value/description, so a query that matched the value, the
+    // description, or straddles the column boundary may highlight nothing — the
+    // row still appears, just without emphasis. Acceptable: it under-highlights,
+    // never mis-highlights.
+    let option_label: Option<&str> = match m.target {
+        super::SearchTarget::Field(fidx) => Some(section.fields[fidx].label),
+        super::SearchTarget::SyntheticApiKey => Some("api_key"),
+        super::SearchTarget::Section => None,
+    };
+    match option_label {
+        Some(label) => {
+            // Section column stays dim (it's context), but still highlight a
+            // query that landed on the section name rather than the option.
+            let quiet = Style::default().fg(crate::render::theme::quiet());
+            spans.extend(highlight_spans(section.label, query, quiet, hit));
+            let pad = 22usize.saturating_sub(section.label.chars().count()).max(1);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.extend(highlight_spans(label, query, base, hit));
+        }
+        None => {
+            spans.extend(highlight_spans(section.label, query, base, hit));
+            spans.push(Span::styled(
+                "  · panel",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Split `text` into spans, styling the characters that `query` matches (as a
+/// subsequence) with `hit` and the rest with `base`. Falls back to a single
+/// `base` span when `query` isn't a subsequence of `text` (e.g. the row was
+/// matched on its help text, not its label).
+fn highlight_spans(text: &str, query: &str, base: Style, hit: Style) -> Vec<Span<'static>> {
+    let positions = match super::subsequence_match_positions(text, query) {
+        Some(p) if !p.is_empty() => p,
+        _ => return vec![Span::styled(text.to_string(), base)],
+    };
+    let hits: std::collections::HashSet<usize> = positions.into_iter().collect();
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_hit = false;
+    for (idx, ch) in text.chars().enumerate() {
+        let is_hit = hits.contains(&idx);
+        if !buf.is_empty() && is_hit != buf_hit {
+            spans.push(Span::styled(
+                std::mem::take(&mut buf),
+                if buf_hit { hit } else { base },
+            ));
+        }
+        buf_hit = is_hit;
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, if buf_hit { hit } else { base }));
+    }
+    spans
 }
 
 fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerState) {
@@ -2125,7 +2206,13 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
+    // While the live filter is open, Tab/Enter/Esc mean iterate/jump/cancel —
+    // not the browse-mode scope/edit/close — so swap the hint row to match.
+    if state.search.is_some() {
+        render_filter_footer(frame, area);
+        return;
+    }
     // Two rows of bindings — the original single line dropped Ctrl+R,
     // Ctrl+D, BackTab, and labelled the discard binding as a bare "X"
     // even though it requires Shift. Splitting across two lines keeps
@@ -2157,8 +2244,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
             Style::default().fg(crate::render::theme::secondary()),
         ),
         Span::raw(" cycle · "),
-        Span::styled("/", Style::default().fg(crate::render::theme::secondary())),
-        Span::raw(" search · "),
+        Span::styled(
+            "Type",
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+        Span::raw(" to filter · "),
         Span::styled(
             "Esc",
             Style::default().fg(crate::render::theme::secondary()),
@@ -2186,6 +2276,42 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
             Style::default().fg(crate::render::theme::secondary()),
         ),
         Span::raw(" discard all (with y/n) "),
+    ]);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(crate::render::theme::quiet()));
+    frame.render_widget(
+        Paragraph::new(vec![primary, secondary])
+            .style(Style::default().fg(footer_fg()))
+            .block(block),
+        area,
+    );
+}
+
+/// Footer shown while the live filter is open: iterate/jump/cancel controls and
+/// a reminder of what the query matches.
+fn render_filter_footer(frame: &mut Frame<'_>, area: Rect) {
+    let key =
+        |s: &'static str| Span::styled(s, Style::default().fg(crate::render::theme::secondary()));
+    let primary = Line::from(vec![
+        key(" ↑/↓ or Tab"),
+        Span::raw(" move · "),
+        key("Enter"),
+        Span::raw(" jump to setting · "),
+        key("Esc"),
+        Span::raw(" cancel "),
+    ]);
+    let secondary = Line::from(vec![
+        key(" Backspace"),
+        Span::raw(" delete · keep typing to refine · matches "),
+        key("section"),
+        Span::raw(" / "),
+        key("option"),
+        Span::raw(" / "),
+        key("value"),
+        Span::raw(" / "),
+        key("description"),
+        Span::raw(" "),
     ]);
     let block = Block::default()
         .borders(Borders::TOP)

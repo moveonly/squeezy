@@ -7,8 +7,8 @@ use squeezy_core::{
 
 use super::{
     ConfigFeedback, ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome,
-    ModelPickerState, PromptEditorState, SearchOverlayState, SecretEntryState,
-    Severity as NotifySeverity, ThemeEditor, ThemeRow, clear_scope_override,
+    ModelPickerState, PromptEditorState, SYNTHETIC_KEY_ROW, SearchOverlayState, SearchTarget,
+    SecretEntryState, Severity as NotifySeverity, ThemeEditor, ThemeRow, clear_scope_override,
     clear_scope_override_silent, compute_search_matches, cycle_to_next_registry_model,
     discard_all_session_writes, handle_editor_key, model_field_meta, open_editor_for,
     perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
@@ -382,11 +382,7 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('/'), m) if m.is_empty() => {
-            state.search = Some(SearchOverlayState {
-                query: String::new(),
-                cursor: 0,
-                matches: compute_search_matches(""),
-            });
+            open_filter(state, None);
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('n'), m)
@@ -501,7 +497,51 @@ pub(crate) fn handle_key(
             }
             KeyOutcome::KeepOpen
         }
+        // Any other printable key starts the live filter, seeded with that
+        // character — "just start typing" to find a setting. Placed last so
+        // every explicit browse binding above wins: `/`, the Themes n/r/d
+        // actions, Shift+X discard, and every Ctrl chord (the guard rejects
+        // Ctrl/Alt). Once the filter is open, `handle_search_key` owns input
+        // and every printable key types into the query.
+        (KeyCode::Char(c), m)
+            if (m.is_empty() || m == KeyModifiers::SHIFT)
+                && !c.is_control()
+                && !c.is_whitespace() =>
+        {
+            open_filter(state, Some(c));
+            KeyOutcome::KeepOpen
+        }
         _ => KeyOutcome::KeepOpen,
+    }
+}
+
+/// Open the live filter, optionally seeded with the character that triggered
+/// it. Mirrors the `/` entry point so typing a letter and pressing `/` land in
+/// the same state.
+fn open_filter(state: &mut ConfigScreenState, initial: Option<char>) {
+    let mut query = String::new();
+    if let Some(c) = initial {
+        query.push(c);
+    }
+    state.search = Some(SearchOverlayState {
+        query,
+        cursor: 0,
+        matches: Vec::new(),
+    });
+    refresh_filter_matches(state);
+}
+
+/// Recompute the filter matches for the current query (after any edit) and reset
+/// the cursor to the top result. Scored against the running config so option
+/// values are searchable. No-op when the filter isn't open.
+fn refresh_filter_matches(state: &mut ConfigScreenState) {
+    let Some(query) = state.search.as_ref().map(|s| s.query.clone()) else {
+        return;
+    };
+    let matches = compute_search_matches(&state.effective, &query);
+    if let Some(search) = state.search.as_mut() {
+        search.matches = matches;
+        search.cursor = 0;
     }
 }
 
@@ -1217,10 +1257,11 @@ pub(crate) fn handle_paste(state: &mut ConfigScreenState, text: &str) {
         return;
     }
 
-    if let Some(search) = state.search.as_mut() {
-        search.query.push_str(line);
-        search.matches = compute_search_matches(&search.query);
-        search.cursor = 0;
+    if state.search.is_some() {
+        if let Some(search) = state.search.as_mut() {
+            search.query.push_str(line);
+        }
+        refresh_filter_matches(state);
         return;
     }
 
@@ -1269,48 +1310,85 @@ fn insert_chars_at(draft: &mut String, cursor: &mut usize, chars: impl IntoItera
 }
 
 fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome {
-    let search = state.search.as_mut().expect("checked by caller");
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
             state.search = None;
         }
-        (KeyCode::Up, _) if !search.matches.is_empty() && search.cursor > 0 => {
-            search.cursor -= 1;
+        // Up / Shift+Tab move to the previous result; Down / Tab to the next.
+        (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
+            if let Some(s) = state.search.as_mut()
+                && !s.matches.is_empty()
+                && s.cursor > 0
+            {
+                s.cursor -= 1;
+            }
         }
-        (KeyCode::Down, _) => {
-            let n = search.matches.len();
-            if n > 0 {
-                search.cursor = (search.cursor + 1).min(n - 1);
+        (KeyCode::Down, _) | (KeyCode::Tab, _) => {
+            if let Some(s) = state.search.as_mut() {
+                let n = s.matches.len();
+                if n > 0 {
+                    s.cursor = (s.cursor + 1).min(n - 1);
+                }
+            }
+        }
+        (KeyCode::Home, _) => {
+            if let Some(s) = state.search.as_mut() {
+                s.cursor = 0;
+            }
+        }
+        (KeyCode::End, _) => {
+            if let Some(s) = state.search.as_mut() {
+                s.cursor = s.matches.len().saturating_sub(1);
             }
         }
         (KeyCode::Backspace, _) => {
-            search.query.pop();
-            search.matches = compute_search_matches(&search.query);
-            search.cursor = 0;
+            // Backspacing an already-empty query exits the filter back to the
+            // browse view; otherwise it trims the query and re-filters.
+            if state.search.as_ref().is_some_and(|s| s.query.is_empty()) {
+                state.search = None;
+            } else {
+                if let Some(s) = state.search.as_mut() {
+                    s.query.pop();
+                }
+                refresh_filter_matches(state);
+            }
         }
         (KeyCode::Char(c), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
-            search.query.push(c);
-            search.matches = compute_search_matches(&search.query);
-            search.cursor = 0;
+            if let Some(s) = state.search.as_mut() {
+                s.query.push(c);
+            }
+            refresh_filter_matches(state);
         }
         (KeyCode::Enter, _) => {
-            if let Some((sidx, fidx, _)) = search.matches.get(search.cursor).copied() {
-                state.section_index = sidx;
-                let section = &CONFIG_SECTIONS[sidx];
-                state.field_index = if section.id
-                    == squeezy_core::config_schema::SectionId::Permissions
-                    && state.effective.permissions.mode
-                        != squeezy_core::PermissionPolicyMode::Custom
-                {
-                    0
-                } else {
-                    // `field_index` is a display-row index; translate the raw
-                    // matched field index through the section's synthetic-row
-                    // layout so Models fields at/after the API-key row resolve
-                    // back to the intended field.
-                    ConfigScreenState::display_row_for_field(section, fidx)
+            let chosen = state
+                .search
+                .as_ref()
+                .and_then(|s| s.matches.get(s.cursor).copied());
+            if let Some(m) = chosen {
+                state.section_index = m.section_index;
+                let section = &CONFIG_SECTIONS[m.section_index];
+                state.field_index = match m.target {
+                    // Field-less section — focus its first row.
+                    SearchTarget::Section => 0,
+                    // The synthetic Models API-key row sits at a fixed display row.
+                    SearchTarget::SyntheticApiKey => SYNTHETIC_KEY_ROW,
+                    // Permission detail rows are hidden unless the mode is Custom;
+                    // land on the mode row (0) instead of an invisible row.
+                    SearchTarget::Field(_)
+                        if section.id == squeezy_core::config_schema::SectionId::Permissions
+                            && state.effective.permissions.mode
+                                != squeezy_core::PermissionPolicyMode::Custom =>
+                    {
+                        0
+                    }
+                    // Translate the raw field index through the section's
+                    // synthetic-row layout so Models fields at/after the API-key
+                    // row resolve back to the intended display row.
+                    SearchTarget::Field(fidx) => {
+                        ConfigScreenState::display_row_for_field(section, fidx)
+                    }
                 };
             }
             state.search = None;
@@ -1439,6 +1517,19 @@ fn handle_mcp_browse_key(
         // McpServers section. Letting an unhandled key fall through
         // would crash the whole TUI.
         _ if is_mcp_navigation_key(&key) => None,
+        // A printable, unmodified key that isn't one of the MCP action
+        // letters above starts the live filter — fall through to the main
+        // browse handler. The action letters and Space/Enter are consumed by
+        // the arms above, and the panic-prone global arms (Space/Enter/Ctrl+R
+        // reach for `current_field()`, which is `None` here) never match these
+        // Ctrl/Alt-free chars, so falling through is safe.
+        (KeyCode::Char(c), m)
+            if (m.is_empty() || m == KeyModifiers::SHIFT)
+                && !c.is_control()
+                && !c.is_whitespace() =>
+        {
+            None
+        }
         _ => Some(KeyOutcome::KeepOpen),
     }
 }
