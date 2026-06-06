@@ -34,8 +34,20 @@ pub fn render_active_skills(
     budget_chars: usize,
     body_cap_chars: usize,
 ) -> Option<String> {
+    render_active_skills_inner(skills, budget_chars, body_cap_chars).0
+}
+
+fn render_active_skills_inner(
+    skills: &[LoadedSkill],
+    budget_chars: usize,
+    body_cap_chars: usize,
+) -> (Option<String>, SkillActivationMetrics) {
+    let mut metrics = SkillActivationMetrics {
+        total: skills.len(),
+        ..SkillActivationMetrics::default()
+    };
     if skills.is_empty() || budget_chars == 0 {
-        return None;
+        return (None, metrics);
     }
 
     let mut blocks = Vec::with_capacity(skills.len());
@@ -51,6 +63,7 @@ pub fn render_active_skills(
                 "skill_truncated"
             );
             blocks.push(render_stub(skill, "body_cap", STUB_DESCRIPTION_MAX_CHARS));
+            metrics.body_truncated += 1;
         } else {
             blocks.push(skill.prompt_block());
         }
@@ -59,7 +72,8 @@ pub fn render_active_skills(
     if let Some(block) = wrap_blocks(&blocks)
         && char_count(&block) <= budget_chars
     {
-        return Some(block);
+        metrics.included = skills.len();
+        return (Some(block), metrics);
     }
 
     // Aggregate overflow: switch every skill to its minimum-stub form (zero
@@ -79,6 +93,7 @@ pub fn render_active_skills(
             break;
         };
         min_blocks.pop();
+        metrics.dropped += 1;
         warn!(
             target: "squeezy_skills",
             skill = %dropped.summary.name,
@@ -87,7 +102,9 @@ pub fn render_active_skills(
         );
     }
     if survivors.is_empty() {
-        return None;
+        metrics.dropped = skills.len();
+        metrics.body_truncated = 0;
+        return (None, metrics);
     }
 
     // Char-by-char description redistribution across the surviving skills.
@@ -142,7 +159,20 @@ pub fn render_active_skills(
         rendered.push(render_stub(skill, "aggregate_budget", allocations[index]));
     }
 
-    wrap_blocks(&rendered).filter(|out| char_count(out) <= budget_chars)
+    match wrap_blocks(&rendered).filter(|out| char_count(out) <= budget_chars) {
+        Some(out) => {
+            metrics.included = survivors.len();
+            metrics.dropped = skills.len().saturating_sub(survivors.len());
+            metrics.body_truncated = survivors.len();
+            (Some(out), metrics)
+        }
+        None => {
+            metrics.included = 0;
+            metrics.dropped = skills.len();
+            metrics.body_truncated = 0;
+            (None, metrics)
+        }
+    }
 }
 
 /// Render the active-skill block in metadata-only mode.
@@ -258,99 +288,7 @@ pub fn render_active_skills_with_metrics(
     budget_chars: usize,
     body_cap_chars: usize,
 ) -> (Option<String>, SkillActivationMetrics) {
-    let rendered = render_active_skills(skills, budget_chars, body_cap_chars);
-    let mut metrics = metrics_for_active_skills_render(skills, rendered.as_deref());
-    if skills.is_empty() || budget_chars == 0 {
-        metrics.dropped = 0;
-    }
-    (rendered, metrics)
-}
-
-fn metrics_for_active_skills_render(
-    skills: &[LoadedSkill],
-    rendered: Option<&str>,
-) -> SkillActivationMetrics {
-    let mut metrics = SkillActivationMetrics {
-        total: skills.len(),
-        ..SkillActivationMetrics::default()
-    };
-    let Some(rendered) = rendered else {
-        metrics.dropped = skills.len();
-        return metrics;
-    };
-
-    let rendered_skills = rendered_skill_headers(rendered);
-    for skill in skills {
-        let name = xml_escape(&skill.summary.name);
-        if let Some(rendered_skill) = rendered_skills
-            .iter()
-            .find(|rendered_skill| rendered_skill.name == name)
-        {
-            metrics.included += 1;
-            if rendered_skill.truncated {
-                metrics.body_truncated += 1;
-            }
-        }
-    }
-    metrics.dropped = metrics.total.saturating_sub(metrics.included);
-    metrics
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RenderedSkillHeader {
-    name: String,
-    truncated: bool,
-}
-
-fn rendered_skill_headers(rendered: &str) -> Vec<RenderedSkillHeader> {
-    let Some(mut pos) = rendered.find("<active_skills>") else {
-        return Vec::new();
-    };
-    pos += "<active_skills>".len();
-    if rendered[pos..].starts_with('\n') {
-        pos += 1;
-    }
-
-    let mut headers = Vec::new();
-    while pos < rendered.len() {
-        if rendered[pos..].starts_with("</active_skills>") {
-            break;
-        }
-        if rendered[pos..].starts_with('\n') {
-            pos += 1;
-            continue;
-        }
-        if !rendered[pos..].starts_with("<skill ") {
-            break;
-        }
-
-        let Some(tag_end_rel) = rendered[pos..].find('>') else {
-            break;
-        };
-        let tag_end = pos + tag_end_rel;
-        let tag = &rendered[pos..=tag_end];
-        if let Some(name) = tag_attr(tag, "name") {
-            headers.push(RenderedSkillHeader {
-                name: name.to_string(),
-                truncated: tag_attr(tag, "truncated") == Some("true"),
-            });
-        }
-
-        let content_start = tag_end + 1;
-        let Some(close_rel) = rendered[content_start..].find("\n</skill>") else {
-            break;
-        };
-        pos = content_start + close_rel + "\n</skill>".len();
-    }
-
-    headers
-}
-
-fn tag_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
-    let needle = format!("{attr}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')?;
-    Some(&tag[start..start + end])
+    render_active_skills_inner(skills, budget_chars, body_cap_chars)
 }
 
 fn wrap_blocks(blocks: &[String]) -> Option<String> {

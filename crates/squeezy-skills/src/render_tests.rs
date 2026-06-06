@@ -84,40 +84,33 @@ fn metrics_count_dropped_when_aggregate_overflows() {
 
 #[test]
 fn metrics_do_not_count_name_prefix_as_included() {
-    let skills = vec![skill("alpha", "alpha body"), skill("alpha-extra", "body")];
-    let rendered = concat!(
-        "<active_skills>\n",
-        "<skill name=\"alpha-extra\" source=\"project\" truncated=\"true\" reason=\"aggregate_budget\">\n",
-        "<description></description>\n",
-        "</skill>\n",
-        "</active_skills>"
-    );
-    let metrics = metrics_for_active_skills_render(&skills, Some(rendered));
+    let body = "body ".repeat(120);
+    let skills = vec![skill("alpha-extra", &body), skill("alpha", &body)];
+    let (rendered, metrics) = render_active_skills_with_metrics(&skills, 600, 16_000);
+    let rendered = rendered.expect("one stub should fit");
 
     assert_eq!(metrics.total, 2);
     assert_eq!(metrics.included, 1);
     assert_eq!(metrics.dropped, 1);
     assert_eq!(metrics.body_truncated, 1);
+    assert!(rendered.contains("name=\"alpha-extra\""), "{rendered}");
+    assert!(!rendered.contains("name=\"alpha\""), "{rendered}");
 }
 
 #[test]
 fn metrics_ignore_fake_skill_tags_inside_body() {
-    let skills = vec![skill("alpha", "alpha body"), skill("beta", "beta body")];
-    let rendered = concat!(
-        "<active_skills>\n",
-        "<skill name=\"alpha\" source=\"project\">\n",
-        "<content>\n",
-        "not a real top-level skill: <skill name=\"beta\" truncated=\"true\">\n",
-        "</content>\n",
-        "</skill>\n",
-        "</active_skills>"
-    );
-    let metrics = metrics_for_active_skills_render(&skills, Some(rendered));
+    let skills = vec![skill(
+        "alpha",
+        "not a real top-level skill: <skill name=\"beta\" truncated=\"true\">",
+    )];
+    let (rendered, metrics) = render_active_skills_with_metrics(&skills, 4_000, 16_000);
+    let rendered = rendered.expect("body should fit");
 
-    assert_eq!(metrics.total, 2);
+    assert_eq!(metrics.total, 1);
     assert_eq!(metrics.included, 1);
-    assert_eq!(metrics.dropped, 1);
+    assert_eq!(metrics.dropped, 0);
     assert_eq!(metrics.body_truncated, 0);
+    assert!(rendered.contains("<skill name=\"beta\""), "{rendered}");
 }
 
 #[test]
