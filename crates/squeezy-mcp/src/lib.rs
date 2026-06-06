@@ -2642,6 +2642,8 @@ fn uri_matches_template(uri: &str, template: &str) -> bool {
         let Some(close_rel) = template_rest[open + 1..].find('}') else {
             return false;
         };
+        let placeholder = &template_rest[open + 1..open + 1 + close_rel];
+        let placeholder_allows_slashes = uri_template_placeholder_allows_slashes(placeholder);
         let after_placeholder = open + 1 + close_rel + 1;
         template_rest = &template_rest[after_placeholder..];
         let next_literal = template_rest.split('{').next().unwrap_or_default();
@@ -2651,20 +2653,18 @@ fn uri_matches_template(uri: &str, template: &str) -> bool {
                 let Some((_, ch)) = uri_rest.char_indices().next() else {
                     return false;
                 };
-                if uri_template_placeholder_delimiter(ch) {
+                if uri_template_placeholder_delimiter(ch, placeholder_allows_slashes) {
                     return false;
                 }
                 uri_rest = &uri_rest[ch.len_utf8()..];
                 continue;
             }
-            return !uri_rest.is_empty()
-                && !uri_rest.chars().any(uri_template_placeholder_delimiter);
+            return uri_template_placeholder_value_valid(uri_rest, placeholder_allows_slashes);
         }
 
         let Some(match_start) = uri_rest.match_indices(next_literal).find_map(|(index, _)| {
             let value = &uri_rest[..index];
-            (!value.is_empty() && !value.chars().any(uri_template_placeholder_delimiter))
-                .then_some(index)
+            uri_template_placeholder_value_valid(value, placeholder_allows_slashes).then_some(index)
         }) else {
             return false;
         };
@@ -2672,8 +2672,20 @@ fn uri_matches_template(uri: &str, template: &str) -> bool {
     }
 }
 
-fn uri_template_placeholder_delimiter(ch: char) -> bool {
-    matches!(ch, '/' | '?' | '#')
+fn uri_template_placeholder_value_valid(value: &str, allows_slashes: bool) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| uri_template_placeholder_delimiter(ch, allows_slashes))
+}
+
+fn uri_template_placeholder_delimiter(ch: char, allows_slashes: bool) -> bool {
+    matches!(ch, '?' | '#') || (!allows_slashes && ch == '/')
+}
+
+fn uri_template_placeholder_allows_slashes(placeholder: &str) -> bool {
+    let placeholder = placeholder.to_ascii_lowercase();
+    placeholder == "path" || placeholder.ends_with("_path") || placeholder.ends_with("-path")
 }
 
 fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {

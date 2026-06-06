@@ -294,6 +294,14 @@ fn uri_templates_match_declared_segments() {
         "docs://api/v3/repos/{owner}/{repo}"
     ));
     assert!(uri_matches_template("db://users/rows", "db://{table}/rows"));
+    assert!(uri_matches_template(
+        "file:///tmp/project/a.txt",
+        "file:///{path}"
+    ));
+    assert!(uri_matches_template(
+        "file:///tmp/project/a.txt",
+        "file:///{path}.txt"
+    ));
     assert!(!uri_matches_template(
         "file:///etc/passwd",
         "docs://api/v3/repos/{owner}/{repo}"
@@ -306,6 +314,15 @@ fn uri_templates_match_declared_segments() {
     assert!(!uri_matches_template(
         "db://users/rows/extra",
         "db://{table}/rows"
+    ));
+    assert!(!uri_matches_template("db://users/rows", "db://{table}"));
+    assert!(!uri_matches_template(
+        "file:///tmp/project/a.rs",
+        "file:///{path}.txt"
+    ));
+    assert!(!uri_matches_template(
+        "file:///tmp/project/a.txt?raw=1",
+        "file:///{path}"
     ));
 }
 
