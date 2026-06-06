@@ -11879,9 +11879,10 @@ impl ToolLoopGuard {
             let Some(key) = repeated_tool_failure_key(result) else {
                 continue;
             };
+            let limit = repeated_tool_failure_limit(result);
             let count = self.failure_counts.entry(key).or_default();
             *count += 1;
-            if *count >= 2 {
+            if *count >= limit {
                 return Some(format!(
                     "repeated {} failure: {}; stopping before burning more tool rounds",
                     result.tool_name,
@@ -11891,6 +11892,27 @@ impl ToolLoopGuard {
         }
         None
     }
+}
+
+fn repeated_tool_failure_limit(result: &ToolResult) -> usize {
+    if is_recoverable_web_lookup_failure(result) {
+        3
+    } else {
+        2
+    }
+}
+
+fn is_recoverable_web_lookup_failure(result: &ToolResult) -> bool {
+    if result.tool_name != "webfetch" && result.tool_name != "websearch" {
+        return false;
+    }
+    let detail = tool_failure_detail(result);
+    !detail.contains("invalid tool arguments")
+        && (detail.contains("HTTP status")
+            || detail.contains("request failed")
+            || detail.contains("timed out")
+            || detail.contains("unsupported content type")
+            || detail.contains("redirect"))
 }
 
 fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
