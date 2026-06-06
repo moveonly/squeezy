@@ -1719,6 +1719,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             app.transcript.clear();
             app.selected_entry = None;
             app.next_entry_id = 0;
+            app.clear_turn_divider();
             for item in transcript {
                 hydrate_transcript_item(app, item);
             }
@@ -4263,6 +4264,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.transcript.clear();
                 app.selected_entry = None;
                 app.next_entry_id = 0;
+                app.clear_turn_divider();
                 app.render_cache_session = render::cache::next_session_id();
                 app.attachments = agent.context_attachments_snapshot().await;
                 app.context_compaction = agent.context_compaction_snapshot().await;
@@ -6948,38 +6950,128 @@ fn current_turn_duration(app: &TuiApp) -> Duration {
         .unwrap_or_default()
 }
 
-fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
-    let label = format!("─ Worked for {} ", format_turn_duration(duration));
-    let label_width = label.chars().count();
-    let fill_width = (width as usize).saturating_sub(label_width);
-    let mut text = label;
-    text.push_str(&"─".repeat(fill_width));
-    Line::from(Span::styled(
-        text,
-        Style::default().fg(crate::render::theme::quiet()),
-    ))
+fn last_turn_divider_line(app: &TuiApp, duration: Duration, width: u16) -> Line<'static> {
+    turn_divider_line(
+        TurnDividerSnapshot {
+            generation: app.turn_divider_generation,
+            visual: app.turn_visual,
+            duration,
+            transcript_len: app.transcript.len(),
+        },
+        width,
+    )
 }
 
-fn last_turn_divider_line(app: &TuiApp, duration: Duration, width: u16) -> Line<'static> {
-    let (state_label, color) = match app.turn_visual {
-        TurnVisualState::Failed => ("Failed", crate::render::theme::red()),
-        TurnVisualState::Cancelled => ("Cancelled", crate::render::theme::cyan()),
-        _ => return worked_divider_line(duration, width),
+fn turn_divider_line(snapshot: TurnDividerSnapshot, width: u16) -> Line<'static> {
+    let (state_label, color) = match snapshot.visual {
+        TurnVisualState::Failed => ("Failed after", crate::render::theme::red()),
+        TurnVisualState::Cancelled => ("Cancelled after", crate::render::theme::cyan()),
+        _ => ("Worked for", snapshot.visual.color(0)),
     };
-    let label = format!("☽ {state_label} after {}", format_turn_duration(duration));
+    let duration = format_turn_duration(snapshot.duration);
+    let label = format!("   ╰─☽ {state_label} {duration} ");
     let label_width = label.chars().count();
-    let fill_width = (width as usize).saturating_sub(label_width + 1);
+    let fill_width = (width as usize).saturating_sub(label_width);
     Line::from(vec![
+        Span::raw("   "),
+        Span::styled("╰─", Style::default().fg(crate::render::theme::quiet())),
         Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!(
-                " {state_label} after {} {}",
-                format_turn_duration(duration),
-                "─".repeat(fill_width)
-            ),
+            format!(" {state_label} {duration} {}", "─".repeat(fill_width)),
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
+}
+
+fn live_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
+    app.last_turn_duration.map(|duration| TurnDividerSnapshot {
+        generation: app.turn_divider_generation,
+        visual: app.turn_visual,
+        duration,
+        transcript_len: app.transcript.len(),
+    })
+}
+
+fn pending_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
+    app.pending_turn_divider
+        .or_else(|| live_turn_divider_snapshot(app))
+}
+
+fn overlay_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
+    if active_subagent_record(app).is_some() {
+        return None;
+    }
+    if app.pending_turn_divider.is_some() {
+        return app.pending_turn_divider;
+    }
+    if turn_in_progress(app) {
+        return None;
+    }
+    live_turn_divider_snapshot(app)
+}
+
+fn turn_divider_snapshot_for_flush(
+    app: &TuiApp,
+    transcript_flushed_to: usize,
+    flushed_generation: Option<u64>,
+) -> Option<TurnDividerSnapshot> {
+    let snapshot = pending_turn_divider_snapshot(app)?;
+    if snapshot.transcript_len > transcript_flushed_to {
+        return None;
+    }
+    if flushed_generation == Some(snapshot.generation) {
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn turn_divider_lines_for_flush(
+    app: &TuiApp,
+    width: u16,
+    transcript_flushed_to: usize,
+    flushed_generation: Option<u64>,
+) -> Vec<Line<'static>> {
+    turn_divider_snapshot_for_flush(app, transcript_flushed_to, flushed_generation)
+        .map(|snapshot| vec![turn_divider_line(snapshot, width)])
+        .unwrap_or_default()
+}
+
+fn inline_history_lines_for_flush_with_turn_divider(
+    app: &TuiApp,
+    width: u16,
+    include_startup_card: bool,
+    transcript_from: usize,
+    transcript_to: usize,
+    flushed_generation: Option<u64>,
+) -> (Vec<Line<'static>>, Option<u64>) {
+    let Some(snapshot) = turn_divider_snapshot_for_flush(app, transcript_to, flushed_generation)
+    else {
+        return (
+            inline_history_lines_for_flush(
+                app,
+                width,
+                include_startup_card,
+                transcript_from,
+                transcript_to,
+            ),
+            None,
+        );
+    };
+
+    let boundary = snapshot
+        .transcript_len
+        .clamp(transcript_from, transcript_to);
+    let mut lines =
+        inline_history_lines_for_flush(app, width, include_startup_card, transcript_from, boundary);
+    lines.push(turn_divider_line(snapshot, width));
+    lines.extend(inline_history_lines_for_flush(
+        app,
+        width,
+        false,
+        boundary,
+        transcript_to,
+    ));
+    (lines, Some(snapshot.generation))
 }
 
 fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
@@ -7187,6 +7279,7 @@ struct TranscriptOverlayRenderKey {
     transcript_revision_hash: u64,
     selected_entry: Option<usize>,
     pending_hash: u64,
+    turn_divider: Option<TurnDividerSnapshot>,
     show_reasoning_usage: bool,
     coalesce_tool_runs: bool,
     animation_tick: u64,
@@ -7325,6 +7418,7 @@ fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayR
         transcript_revision_hash: transcript_hasher.finish(),
         selected_entry: active_selected_entry(app),
         pending_hash: pending_hasher.finish(),
+        turn_divider: overlay_turn_divider_snapshot(app),
         show_reasoning_usage: app.show_reasoning_usage,
         coalesce_tool_runs: app.coalesce_tool_runs,
         animation_tick: app.animation_tick,
@@ -7688,6 +7782,9 @@ fn transcript_lines_for_overlay(
     let selected_entry = active_selected_entry(app);
     let mut prev_work = false;
     let subagent_view = active_subagent_record(app).is_some();
+    let turn_divider = overlay_turn_divider_snapshot(app);
+    let turn_divider_width = width.unwrap_or(SETTLE_MEASURE_WIDTH);
+    let mut turn_divider_pushed = false;
     for (index, entry) in entries.iter().enumerate() {
         match reasoning_run_info(entries, index) {
             Some(ReasoningRun::Suppressed) => continue,
@@ -7709,6 +7806,13 @@ fn transcript_lines_for_overlay(
                         rail_chrome(&entry.kind, subagent_view),
                     );
                 }
+                maybe_push_overlay_turn_divider(
+                    &mut lines,
+                    turn_divider,
+                    &mut turn_divider_pushed,
+                    index + 1 + extras,
+                    turn_divider_width,
+                );
                 continue;
             }
             None => {}
@@ -7731,6 +7835,13 @@ fn transcript_lines_for_overlay(
                     &mut block,
                     &mut prev_work,
                     rail_chrome(&entry.kind, subagent_view),
+                );
+                maybe_push_overlay_turn_divider(
+                    &mut lines,
+                    turn_divider,
+                    &mut turn_divider_pushed,
+                    index + 1 + extras,
+                    turn_divider_width,
                 );
                 continue;
             }
@@ -7764,7 +7875,21 @@ fn transcript_lines_for_overlay(
             lines.append(&mut block);
             prev_work = false;
         }
+        maybe_push_overlay_turn_divider(
+            &mut lines,
+            turn_divider,
+            &mut turn_divider_pushed,
+            index + 1,
+            turn_divider_width,
+        );
     }
+    maybe_push_overlay_turn_divider(
+        &mut lines,
+        turn_divider,
+        &mut turn_divider_pushed,
+        entries.len(),
+        turn_divider_width,
+    );
     let pending = active_pending_assistant_lines(app);
     if !pending.is_empty() {
         if !lines.is_empty() {
@@ -7777,6 +7902,23 @@ fn transcript_lines_for_overlay(
     } else {
         lines
     }
+}
+
+fn maybe_push_overlay_turn_divider(
+    lines: &mut Vec<Line<'static>>,
+    snapshot: Option<TurnDividerSnapshot>,
+    pushed: &mut bool,
+    transcript_index: usize,
+    width: u16,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    if *pushed || transcript_index < snapshot.transcript_len {
+        return;
+    }
+    lines.push(turn_divider_line(snapshot, width));
+    *pushed = true;
 }
 
 fn format_transcript_entry_expanded(
@@ -13351,7 +13493,7 @@ fn is_retryable_tool_result(result: &ToolResult) -> bool {
             })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TurnVisualState {
     Idle,
     Running,
@@ -13376,6 +13518,14 @@ impl TurnVisualState {
             Self::Failed => crate::render::theme::red(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TurnDividerSnapshot {
+    generation: u64,
+    visual: TurnVisualState,
+    duration: Duration,
+    transcript_len: usize,
 }
 
 fn turn_coin_span(app: &TuiApp) -> Span<'static> {
@@ -15385,6 +15535,8 @@ pub(crate) struct TuiApp {
     pub(crate) turn_visual: TurnVisualState,
     pub(crate) turn_started_at: Option<Instant>,
     pub(crate) last_turn_duration: Option<Duration>,
+    pending_turn_divider: Option<TurnDividerSnapshot>,
+    turn_divider_generation: u64,
     /// Set when a terminal resize event arrives so the next draw can wipe
     /// the inline viewport before ratatui's autoresize scrolls stale frame
     /// content up into the scrollback above the new viewport.
@@ -15617,6 +15769,11 @@ impl TuiApp {
         self.needs_redraw = true;
     }
 
+    fn clear_turn_divider(&mut self) {
+        self.last_turn_duration = None;
+        self.pending_turn_divider = None;
+    }
+
     /// Clear the click-target registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
     pub(crate) fn begin_frame_clickables(&self) {
@@ -15801,6 +15958,8 @@ impl TuiApp {
             turn_visual: TurnVisualState::Idle,
             turn_started_at: None,
             last_turn_duration: None,
+            pending_turn_divider: None,
+            turn_divider_generation: 0,
             pending_resize: false,
             terminal_clear_pending: false,
             terminal_title_state: TerminalTitleState::Cleared,
@@ -15993,7 +16152,15 @@ impl TuiApp {
 
     pub(crate) fn note_turn_finished(&mut self) {
         if let Some(started_at) = self.turn_started_at.take() {
-            self.last_turn_duration = Some(started_at.elapsed());
+            let duration = started_at.elapsed();
+            self.last_turn_duration = Some(duration);
+            self.turn_divider_generation = self.turn_divider_generation.wrapping_add(1);
+            self.pending_turn_divider = Some(TurnDividerSnapshot {
+                generation: self.turn_divider_generation,
+                visual: self.turn_visual,
+                duration,
+                transcript_len: self.transcript.len(),
+            });
         }
         self.terminal_title_state = TerminalTitleState::Notification;
         // Status-bar progress snapshots only describe a live turn. The
@@ -17187,6 +17354,7 @@ struct TerminalGuard {
     exit_hint: Option<String>,
     startup_flushed: bool,
     transcript_flushed_len: usize,
+    turn_divider_flushed_generation: Option<u64>,
     fresh_inline_origin_pending: bool,
     /// Resolved DEC 2026 synchronized-output flag. Computed once at
     /// startup from the user's [`TuiSynchronizedOutput`] policy plus
@@ -17272,6 +17440,7 @@ impl TerminalGuard {
             exit_hint: None,
             startup_flushed: false,
             transcript_flushed_len: 0,
+            turn_divider_flushed_generation: None,
             fresh_inline_origin_pending: false,
             synchronized_output,
         })
@@ -17590,6 +17759,7 @@ impl TerminalGuard {
             &mut self.startup_flushed,
             &mut self.transcript_flushed_len,
         );
+        self.turn_divider_flushed_generation = None;
         self.fresh_inline_origin_pending = true;
         Ok(())
     }
@@ -17607,13 +17777,17 @@ impl TerminalGuard {
         // animating their fold in the live region and only flush (collapsed)
         // once the fold finishes and `finalize_elapsed_settles` clears them.
         let flush_to = settling_flush_boundary(app);
-        let lines = inline_history_lines_for_flush(
+        let (lines, flushed_divider_generation) = inline_history_lines_for_flush_with_turn_divider(
             app,
             width,
             !self.startup_flushed,
             self.transcript_flushed_len,
             flush_to,
+            self.turn_divider_flushed_generation,
         );
+        if let Some(generation) = flushed_divider_generation {
+            self.turn_divider_flushed_generation = Some(generation);
+        }
         self.startup_flushed = true;
         self.transcript_flushed_len = flush_to;
         if self.fresh_inline_origin_pending {

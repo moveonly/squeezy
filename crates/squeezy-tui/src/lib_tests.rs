@@ -7060,6 +7060,171 @@ fn settling_node_is_held_from_flush_and_folds_in_live_region() {
 }
 
 #[test]
+fn turn_divider_flush_waits_for_settling_tail_and_dedupes() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "match-1\nmatch-2"));
+    complete_turn_for_test(&mut app, TurnVisualState::Cancelled, Duration::from_secs(5));
+    assert!(app.transcript[0].settle.is_some(), "a success tool folds");
+
+    let boundary = settling_flush_boundary(&app);
+    assert_eq!(boundary, 0);
+    assert!(
+        turn_divider_lines_for_flush(&app, 100, boundary, None).is_empty(),
+        "divider must wait until the settling transcript tail can flush"
+    );
+
+    app.finalize_settles_for_test();
+    let len = app.transcript.len();
+    let first = lines_to_plain_text(&turn_divider_lines_for_flush(&app, 100, len, None));
+    assert!(first.contains("╰─☽ Cancelled after 5s"), "{first}");
+    assert!(
+        turn_divider_lines_for_flush(&app, 100, len, Some(app.turn_divider_generation)).is_empty(),
+        "divider flush is a one-shot; the terminal guard tracks the persisted row"
+    );
+}
+
+#[test]
+fn cancelled_turn_scrollback_persists_connected_divider_after_warn_tail() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("What is the architecture?"));
+    app.push_note("mcp status 0/1 ready 0 tools 1 failed".to_string());
+    app.push_warn("turn cancelled".to_string());
+    complete_turn_for_test(&mut app, TurnVisualState::Cancelled, Duration::from_secs(5));
+
+    let len = app.transcript.len();
+    let mut lines = inline_history_lines_for_flush(&app, 100, false, 0, len);
+    lines.extend(turn_divider_lines_for_flush(&app, 100, len, None));
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(rendered.contains("turn cancelled"), "{rendered}");
+    assert!(
+        rendered.contains("╰─☽ Cancelled after 5s"),
+        "scrollback must persist the cyan closed moon as the turn terminator: {rendered}"
+    );
+    assert!(
+        !rendered.trim_end().ends_with('│'),
+        "a cancelled turn must not leave the rail ending on a dangling connector: {rendered}"
+    );
+}
+
+#[test]
+fn turn_divider_flush_survives_queued_prompt_auto_start_for_all_outcomes() {
+    for (visual, expected, color) in [
+        (
+            TurnVisualState::Succeeded,
+            "╰─☽ Worked for 3s",
+            crate::render::theme::green(),
+        ),
+        (
+            TurnVisualState::Failed,
+            "╰─☽ Failed after 3s",
+            crate::render::theme::red(),
+        ),
+        (
+            TurnVisualState::Cancelled,
+            "╰─☽ Cancelled after 3s",
+            crate::render::theme::cyan(),
+        ),
+    ] {
+        let mut app = test_app(SessionMode::Build);
+        app.push_transcript_item(TranscriptItem::user("first"));
+        complete_turn_for_test(&mut app, visual, Duration::from_secs(3));
+
+        // Queued prompt auto-drain starts the next turn before the next draw,
+        // which clears the live footer duration. The persisted snapshot must
+        // still be available for scrollback flush.
+        app.note_turn_started();
+        assert!(app.last_turn_duration.is_none());
+
+        let len = app.transcript.len();
+        let lines = turn_divider_lines_for_flush(&app, 100, len, None);
+        let rendered = lines_to_plain_text(&lines);
+        assert!(rendered.contains(expected), "{rendered}");
+        assert_eq!(lines[0].spans[2].style.fg, Some(color));
+    }
+}
+
+#[test]
+fn turn_divider_flush_inserts_before_queued_prompt_started_before_draw() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("first prompt"));
+    complete_turn_for_test(&mut app, TurnVisualState::Succeeded, Duration::from_secs(4));
+
+    app.note_turn_started();
+    app.push_transcript_item(TranscriptItem::user("queued prompt"));
+
+    let len = app.transcript.len();
+    let (lines, generation) =
+        inline_history_lines_for_flush_with_turn_divider(&app, 100, false, 0, len, None);
+    assert_eq!(generation, Some(app.turn_divider_generation));
+
+    let rendered_lines = lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<String>>();
+    let divider_index = rendered_lines
+        .iter()
+        .position(|line| line.contains("╰─☽ Worked for 4s"))
+        .expect("divider should render");
+    let queued_prompt_index = rendered_lines
+        .iter()
+        .position(|line| line.contains("queued prompt"))
+        .expect("queued prompt should render");
+    assert!(
+        divider_index < queued_prompt_index,
+        "the completed turn must close before the queued prompt starts:\n{}",
+        rendered_lines.join("\n")
+    );
+}
+
+#[test]
+fn transcript_overlay_appends_completed_turn_divider_after_warn_tail() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.push_transcript_item(TranscriptItem::user("What is the architecture?"));
+    app.push_note("mcp status 0/1 ready 0 tools 1 failed".to_string());
+    app.push_warn("turn cancelled".to_string());
+    complete_turn_for_test(&mut app, TurnVisualState::Cancelled, Duration::from_secs(5));
+
+    let rendered = lines_to_plain_text(&transcript_overlay_rows_for_render(&app, 100));
+
+    assert!(rendered.contains("turn cancelled"), "{rendered}");
+    assert!(
+        rendered.contains("╰─☽ Cancelled after 5s"),
+        "overlay must close the visible completed turn: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_inserts_pending_turn_divider_before_queued_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    app.push_transcript_item(TranscriptItem::user("first prompt"));
+    complete_turn_for_test(&mut app, TurnVisualState::Succeeded, Duration::from_secs(4));
+
+    app.note_turn_started();
+    app.push_transcript_item(TranscriptItem::user("queued prompt"));
+
+    let rendered_lines = transcript_overlay_rows_for_render(&app, 100)
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<String>>();
+    let divider_index = rendered_lines
+        .iter()
+        .position(|line| line.contains("╰─☽ Worked for 4s"))
+        .expect("divider should render");
+    let queued_prompt_index = rendered_lines
+        .iter()
+        .position(|line| line.contains("queued prompt"))
+        .expect("queued prompt should render");
+    assert!(
+        divider_index < queued_prompt_index,
+        "overlay must close the completed turn before showing the queued prompt:\n{}",
+        rendered_lines.join("\n")
+    );
+}
+
+#[test]
 fn inline_live_viewport_excludes_flushed_history() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("old prompt"));
@@ -7517,11 +7682,18 @@ fn completed_turn_shows_worked_duration_divider() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("why?"));
     app.push_transcript_item(TranscriptItem::assistant("Because."));
-    app.last_turn_duration = Some(Duration::from_secs(13 * 60 + 23));
+    complete_turn_for_test(
+        &mut app,
+        TurnVisualState::Succeeded,
+        Duration::from_secs(13 * 60 + 23),
+    );
 
     let output = render_to_string(&app, 120, 18);
+    let line = last_turn_divider_line(&app, Duration::from_secs(13 * 60 + 23), 80);
 
-    assert!(output.contains("─ Worked for 13m 23s"), "{output}");
+    assert!(output.contains("╰─☽ Worked for 13m 23s"), "{output}");
+    assert!(output.contains("Worked for 13m 23s"), "{output}");
+    assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::green()));
     assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
 }
@@ -7534,13 +7706,15 @@ fn failed_turn_shows_red_moon_duration_row() {
 
     let line = last_turn_divider_line(&app, Duration::from_secs(7), 80);
 
-    assert_eq!(line.spans[0].content.as_ref(), "☽");
-    assert_eq!(line.spans[0].style.fg, Some(crate::render::theme::red()));
+    assert_eq!(line.spans[1].content.as_ref(), "╰─");
+    assert_eq!(line.spans[2].content.as_ref(), "☽");
+    assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::red()));
     let text = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
+    assert!(text.contains("╰─☽"), "{text}");
     assert!(text.contains("Failed after 7s"), "{text}");
     assert!(!text.contains("Worked for"), "{text}");
 }
@@ -7553,13 +7727,15 @@ fn cancelled_turn_shows_cyan_moon_duration_row() {
 
     let line = last_turn_divider_line(&app, Duration::from_secs(5), 80);
 
-    assert_eq!(line.spans[0].content.as_ref(), "☽");
-    assert_eq!(line.spans[0].style.fg, Some(crate::render::theme::cyan()));
+    assert_eq!(line.spans[1].content.as_ref(), "╰─");
+    assert_eq!(line.spans[2].content.as_ref(), "☽");
+    assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::cyan()));
     let text = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
+    assert!(text.contains("╰─☽"), "{text}");
     assert!(text.contains("Cancelled after 5s"), "{text}");
     assert!(!text.contains("Worked for"), "{text}");
     assert!(!text.contains("Failed after"), "{text}");
@@ -10051,6 +10227,18 @@ fn rendered_line_text(line: &Line<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>()
+}
+
+fn complete_turn_for_test(app: &mut TuiApp, visual: TurnVisualState, duration: Duration) {
+    app.turn_visual = visual;
+    app.last_turn_duration = Some(duration);
+    app.turn_divider_generation = app.turn_divider_generation.wrapping_add(1);
+    app.pending_turn_divider = Some(TurnDividerSnapshot {
+        generation: app.turn_divider_generation,
+        visual,
+        duration,
+        transcript_len: app.transcript.len(),
+    });
 }
 
 fn rendered_word_styles(app: &TuiApp, word: &str) -> Vec<(Color, Color, Modifier)> {
