@@ -21,8 +21,16 @@ pub fn render_markdown(source: &str) -> Vec<Line<'static>> {
     cache::get_or_compute_markdown(source, || render_markdown_uncached(source))
 }
 
+pub(crate) fn render_markdown_full(source: &str) -> Vec<Line<'static>> {
+    render_markdown_with_mode(source, MarkdownMode::Full)
+}
+
 fn render_markdown_uncached(source: &str) -> Vec<Line<'static>> {
-    let mut writer = Writer::default();
+    render_markdown_with_mode(source, MarkdownMode::Compact)
+}
+
+fn render_markdown_with_mode(source: &str, mode: MarkdownMode) -> Vec<Line<'static>> {
+    let mut writer = Writer::new(mode);
     let options = Options::ENABLE_TABLES;
     for event in Parser::new_ext(source, options) {
         writer.event(event);
@@ -30,7 +38,12 @@ fn render_markdown_uncached(source: &str) -> Vec<Line<'static>> {
     writer.finish()
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkdownMode {
+    Compact,
+    Full,
+}
+
 struct Writer {
     lines: Vec<Line<'static>>,
     spans: Vec<Span<'static>>,
@@ -45,6 +58,7 @@ struct Writer {
     /// Active table builder. While set, all inline text routes into the
     /// builder instead of the global span buffer.
     table: Option<TableBuilder>,
+    mode: MarkdownMode,
 }
 
 #[derive(Clone, Debug)]
@@ -108,10 +122,15 @@ impl TableCell {
         self.runs.iter().map(|run| run.text.chars().count()).sum()
     }
 
-    fn render_spans(&self, width: usize, fallback_style: Style) -> Vec<Span<'static>> {
+    fn render_spans(
+        &self,
+        width: usize,
+        fallback_style: Style,
+        mode: MarkdownMode,
+    ) -> Vec<Span<'static>> {
         let mut out = Vec::new();
         let total = self.char_count();
-        let visible_limit = if total > width && width >= 3 {
+        let visible_limit = if mode == MarkdownMode::Compact && total > width && width >= 3 {
             width - 3
         } else {
             width
@@ -138,7 +157,7 @@ impl TableCell {
                 break;
             }
         }
-        if total > width && width >= 3 {
+        if mode == MarkdownMode::Compact && total > width && width >= 3 {
             out.push(Span::styled("...", fallback_style));
         }
         let visible_width: usize = out.iter().map(|span| span.content.chars().count()).sum();
@@ -186,7 +205,7 @@ impl TableBuilder {
         }
     }
 
-    fn render(self, style: Style) -> Vec<Line<'static>> {
+    fn render(self, style: Style, mode: MarkdownMode) -> Vec<Line<'static>> {
         let col_count = self
             .headers
             .len()
@@ -201,9 +220,13 @@ impl TableBuilder {
             for row in &self.rows {
                 *width = (*width).max(row.get(i).map(TableCell::char_count).unwrap_or(0));
             }
-            *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);
+            if mode == MarkdownMode::Compact {
+                *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);
+            }
         }
-        fit_table_width(&mut widths);
+        if mode == MarkdownMode::Compact {
+            fit_table_width(&mut widths);
+        }
 
         let render_row = |row: &[TableCell]| -> Line<'static> {
             let mut spans = Vec::new();
@@ -216,7 +239,7 @@ impl TableBuilder {
                 }
                 let rendered = row
                     .get(i)
-                    .map(|cell| cell.render_spans(*width, style))
+                    .map(|cell| cell.render_spans(*width, style, mode))
                     .unwrap_or_else(|| vec![Span::styled(" ".repeat(*width), style)]);
                 spans.extend(rendered);
             }
@@ -246,6 +269,21 @@ impl TableBuilder {
 }
 
 impl Writer {
+    fn new(mode: MarkdownMode) -> Self {
+        Self {
+            lines: Vec::new(),
+            spans: Vec::new(),
+            style_stack: Vec::new(),
+            current_style: Style::default(),
+            list_stack: Vec::new(),
+            quote_depth: 0,
+            code_block: None,
+            link_stack: Vec::new(),
+            table: None,
+            mode,
+        }
+    }
+
     fn event(&mut self, event: Event<'_>) {
         if self.code_block.is_some() {
             self.code_event(event);
@@ -271,12 +309,10 @@ impl Writer {
                     }
                 }
                 Event::Code(text) => {
+                    let text = self.inline_code_text(&text);
+                    let style = self.current_style.patch(inline_code_style_for(&text));
                     if let Some(table) = self.table.as_mut() {
-                        let text = compact_inline_code(&text);
-                        table.push_text(
-                            &text,
-                            self.current_style.patch(inline_code_style_for(&text)),
-                        );
+                        table.push_text(&text, style);
                     }
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -296,7 +332,7 @@ impl Writer {
                 self.push_text_with_confidence_labels(&text, self.current_style);
             }
             Event::Code(code) => {
-                let code = compact_inline_code(&code);
+                let code = self.inline_code_text(&code);
                 self.push_text(
                     &code,
                     self.current_style.patch(inline_code_style_for(&code)),
@@ -412,7 +448,7 @@ impl Writer {
                 if let Some(url) = self.link_stack.pop()
                     && !url.is_empty()
                 {
-                    let text = format!(" ({})", display_link_url(&url));
+                    let text = format!(" ({})", self.display_link_url(&url));
                     if let Some(table) = self.table.as_mut() {
                         table.push_text(&text, self.current_style);
                     } else {
@@ -440,7 +476,7 @@ impl Writer {
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
                     self.finish_line();
-                    let rendered = table.render(self.current_style);
+                    let rendered = table.render(self.current_style, self.mode);
                     self.lines.extend(rendered);
                 }
             }
@@ -535,7 +571,11 @@ impl Writer {
     }
 
     fn push_text(&mut self, text: &str, style: Style) {
-        let text = compact_unbroken_text_tokens(text);
+        let text = if self.mode == MarkdownMode::Compact {
+            compact_unbroken_text_tokens(text)
+        } else {
+            text.to_string()
+        };
         for segment in text.split_inclusive('\n') {
             self.ensure_quote_prefix();
             if let Some(line) = segment.strip_suffix('\n') {
@@ -579,6 +619,22 @@ impl Writer {
             self.lines.push(Line::from(""));
         }
         self.lines
+    }
+
+    fn inline_code_text(&self, text: &str) -> String {
+        if self.mode == MarkdownMode::Full {
+            collapse_spaces(text)
+        } else {
+            compact_inline_code(text)
+        }
+    }
+
+    fn display_link_url(&self, url: &str) -> String {
+        if self.mode == MarkdownMode::Full {
+            url.to_string()
+        } else {
+            display_link_url(url)
+        }
     }
 }
 

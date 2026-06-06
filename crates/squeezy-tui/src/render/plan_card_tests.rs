@@ -106,6 +106,45 @@ fn render_plan_card_uses_calm_heading_not_box() {
 }
 
 #[test]
+fn render_plan_card_does_not_abbreviate_plan_table_cells() {
+    let root = fresh_workspace("full_table");
+    let body = "\
+| Dimension | repo_map | sonar context |
+| --- | --- | --- |
+| Module names | Directory names from workspace inventory | Artifact IDs from dependency graph |
+| Symbol-level detail | Classes, functions, fields, and signatures | Stopped at module dependency boundaries |
+";
+    let (plan_id, path) =
+        proposed_plan::persist_plan(&root, TEST_SESSION, body, &PlanMeta::default())
+            .expect("persist plan");
+    let data = PlanCardData {
+        plan_id,
+        path,
+        parent_plan_id: None,
+    };
+
+    let rendered = render_plan_card(&data, None)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Directory names from workspace inventory"),
+        "plan card should preserve long table cells: {rendered}"
+    );
+    assert!(
+        rendered.contains("Classes, functions, fields, and signatures"),
+        "plan card should preserve long table cells: {rendered}"
+    );
+    assert!(
+        !rendered.contains("..."),
+        "plan card should not locally abbreviate plan text: {rendered}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn render_plan_card_emits_diff_when_parent_exists() {
     let root = fresh_workspace("diff_parent");
     let (parent_id, _) = proposed_plan::persist_plan(

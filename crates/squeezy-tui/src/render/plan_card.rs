@@ -54,7 +54,7 @@ pub(crate) fn render_plan_card(data: &PlanCardData, width: Option<u16>) -> Vec<L
     let mut lines = Vec::new();
     lines.push(card_path_line(&data.path));
     lines.push(blank_card_line());
-    for line in markdown::render_markdown(&body) {
+    for line in markdown::render_markdown_full(&body) {
         lines.push(line);
     }
     lines.push(blank_card_line());
