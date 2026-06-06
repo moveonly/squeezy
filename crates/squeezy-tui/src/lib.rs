@@ -18267,7 +18267,7 @@ fn inline_history_lines_for_flush(
             prev_work = false;
         }
     }
-    lines
+    wrap_transcript_overlay_rows(&lines, width)
 }
 
 #[cfg(test)]

@@ -7146,6 +7146,111 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
 }
 
 #[test]
+fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
+    let mut app = test_app(SessionMode::Build);
+    let command = concat!(
+        "echo \"=== .mcp.json ===\"; cat .mcp.json; echo; ",
+        "echo \"=== .codex/hooks.json ===\"; cat .codex/hooks.json; echo; ",
+        "echo \"=== sonar on PATH? ===\";\n",
+        "command -v sonar || echo \"no sonar binary\"; echo; ",
+        "echo \"=== docker? ===\"; command -v docker || echo \"no docker\""
+    );
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": command}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": command,
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": "ok",
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+    app.finalize_settles_for_test();
+
+    let width = 72usize;
+    let flushed =
+        inline_history_lines_for_flush(&app, width as u16, false, 0, app.transcript.len());
+    let rendered = lines_to_plain_text(&flushed);
+
+    assert!(rendered.contains("├─✔ Ran echo"), "{rendered}");
+    assert!(
+        rendered.lines().all(|line| line.chars().count() <= width),
+        "flushed shell card must be pre-wrapped before terminal scrollback insertion:\n{rendered}"
+    );
+    assert!(
+        rendered.lines().any(|line| line.starts_with("   │")),
+        "wrapped continuation should stay on the rail:\n{rendered}"
+    );
+}
+
+#[test]
+fn inline_history_flush_wraps_representative_rail_nodes_to_width() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-rail-wrap".to_string(),
+            summary: vec![format!(
+                "Plan: inspect {} and keep every continuation aligned",
+                "formatting-spill-risk ".repeat(4)
+            )],
+            encrypted_content: None,
+        },
+    ));
+    app.push_tool_result(sample_tool_result(
+        "grep",
+        &format!("match {}", "alpha-beta-gamma ".repeat(8)),
+    ));
+    app.push_tool_result(sample_tool_result("grep", &"x".repeat(140)));
+    app.push_warn(format!(
+        "configuration warning {}",
+        "long-soft-wrap ".repeat(8)
+    ));
+    app.push_subagent_note(format!(
+        "delegate subagent completed {}",
+        "long-summary-fragment ".repeat(8)
+    ));
+    let mut failed = sample_tool_result("shell", "");
+    failed.status = ToolStatus::Error;
+    failed.content = serde_json::json!({
+        "command": format!("cargo test {}", "--workspace ".repeat(8)),
+        "workdir": ".",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": format!("error: {}", "unbroken_error_token_".repeat(8)),
+    });
+    app.push_tool_result(failed);
+    app.finalize_settles_for_test();
+
+    let width = 54usize;
+    let flushed =
+        inline_history_lines_for_flush(&app, width as u16, false, 0, app.transcript.len());
+    let rendered = lines_to_plain_text(&flushed);
+
+    assert!(rendered.contains("reasoning"), "{rendered}");
+    assert!(rendered.contains("configuration warning"), "{rendered}");
+    assert!(
+        rendered.contains("delegate subagent completed"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Failed cargo test"), "{rendered}");
+    assert!(
+        rendered.lines().all(|line| line.chars().count() <= width),
+        "every flushed rail row must fit before terminal insertion:\n{rendered}"
+    );
+    for line in rendered.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            line.starts_with("   │") || line.starts_with("   ├"),
+            "rail row should keep content out of the gutter: {line:?}\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn settling_node_is_held_from_flush_and_folds_in_live_region() {
     let mut app = test_app(SessionMode::Build);
     // A success tool result arms a settle-fold (it rests collapsed).
