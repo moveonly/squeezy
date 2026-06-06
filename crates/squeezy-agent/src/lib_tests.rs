@@ -3864,6 +3864,77 @@ fn tool_loop_guard_distinguishes_shell_failures_by_command() {
     assert!(reason.contains("repeated shell failure"), "{reason}");
 }
 
+#[test]
+fn tool_loop_guard_allows_webfetch_http_error_recovery_round() {
+    let make_webfetch = |call_id: &str| {
+        let call = ToolCall {
+            call_id: call_id.to_string(),
+            name: "webfetch".to_string(),
+            arguments: json!({"url": "https://example.com/missing"}),
+        };
+        let mut result = control_tool_result(
+            &call,
+            ToolStatus::Error,
+            json!({"error": "webfetch returned HTTP status 404"}),
+        );
+        result.tool_name = "webfetch".to_string();
+        (call, result)
+    };
+
+    let (call_a, result_a) = make_webfetch("web-1");
+    let (call_b, result_b) = make_webfetch("web-2");
+    let (call_c, result_c) = make_webfetch("web-3");
+    let mut guard = ToolLoopGuard::default();
+
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call_a), &[result_a])
+            .is_none()
+    );
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call_b), &[result_b])
+            .is_none(),
+        "a repeated external docs 404 should return to the model once so it can pivot"
+    );
+    let reason = guard
+        .observe_round(&[call_c], &[result_c])
+        .expect("third identical webfetch HTTP failure should still stop");
+    assert!(reason.contains("repeated webfetch failure"), "{reason}");
+}
+
+#[test]
+fn tool_loop_guard_still_stops_repeated_invalid_webfetch_arguments() {
+    let make_webfetch = |call_id: &str| {
+        let call = ToolCall {
+            call_id: call_id.to_string(),
+            name: "webfetch".to_string(),
+            arguments: json!({}),
+        };
+        let mut result = control_tool_result(
+            &call,
+            ToolStatus::Error,
+            json!({"error": "invalid tool arguments: missing field `url`"}),
+        );
+        result.tool_name = "webfetch".to_string();
+        (call, result)
+    };
+
+    let (call_a, result_a) = make_webfetch("web-1");
+    let (call_b, result_b) = make_webfetch("web-2");
+    let mut guard = ToolLoopGuard::default();
+
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call_a), &[result_a])
+            .is_none()
+    );
+    let reason = guard
+        .observe_round(&[call_b], &[result_b])
+        .expect("repeated invalid arguments should keep the ordinary fail-fast threshold");
+    assert!(reason.contains("repeated webfetch failure"), "{reason}");
+}
+
 #[tokio::test]
 async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
