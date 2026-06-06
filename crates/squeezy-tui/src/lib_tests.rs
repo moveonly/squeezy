@@ -4103,7 +4103,8 @@ fn format_reviewer_command_handles_empty_buffer() {
 #[test]
 fn format_cost_command_renders_active_buckets() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
+        SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4158,6 +4159,8 @@ fn format_cost_command_renders_active_buckets() {
         attachments: AttachmentShape::default(),
         transmitted_request: estimate,
         full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
     };
 
     let raw = commands::format_cost_command(&snapshot);
@@ -4254,6 +4257,7 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         image: 0,
         attachments: 0,
         system: 2_100,
+        ..ContextSourceTokens::default()
     });
     assert_eq!(recs.len(), 2, "{recs:?}");
     assert_eq!(
@@ -4275,11 +4279,171 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         image: 1_000,
         attachments: 1_000,
         system: 1_000,
+        ..ContextSourceTokens::default()
     });
     assert!(balanced.is_empty(), "{balanced:?}");
 
     // An empty/fresh session has nothing actionable to say.
     assert!(context_source_recommendations(&ContextSourceTokens::default()).is_empty());
+}
+
+#[test]
+fn context_breaks_out_skills_and_mcp_sources() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, McpAccounting, McpServerAccounting,
+        McpToolAccountingEntry, SessionAccountingSnapshot, SkillAccountingEntry, SkillsAccounting,
+        TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 10_000,
+        context_window_tokens: Some(200_000),
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: Some(64_000),
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+
+    // 4_400 tool-output bytes, of which 4_000 came from load_skill: skills are
+    // carved out, leaving 400 bytes of genuine tool output.
+    let conversation = ConversationShape {
+        items: 4,
+        function_outputs: 2,
+        tool_output_bytes: 4_400,
+        skill_output_bytes: 4_000,
+        ..ConversationShape::default()
+    };
+
+    // One loaded skill (meta 400B + body 4_000B) and one discovered-only skill
+    // (meta 400B; body 800B would land on first load).
+    let skills = SkillsAccounting {
+        discovered: 2,
+        loaded: 1,
+        entries: vec![
+            SkillAccountingEntry {
+                name: "sonar-context-augmentation".to_string(),
+                description: "always invoke".to_string(),
+                loaded: true,
+                metadata_bytes: 400,
+                body_bytes: 4_000,
+            },
+            SkillAccountingEntry {
+                name: "rust-nav".to_string(),
+                description: "navigate rust".to_string(),
+                loaded: false,
+                metadata_bytes: 400,
+                body_bytes: 800,
+            },
+        ],
+        metadata_bytes_total: 800,
+        loaded_body_bytes_total: 4_000,
+    };
+
+    // Lazy MCP: search is loaded (stub 80 + full 1_200 live), fetch deferred
+    // (stub 80 live, full 800 only on first load).
+    let mcp = McpAccounting {
+        servers: vec![McpServerAccounting {
+            name: "docs".to_string(),
+            status: "ready (2 tools)".to_string(),
+            tools: vec![
+                McpToolAccountingEntry {
+                    name: "search".to_string(),
+                    description: "search the docs".to_string(),
+                    stub_bytes: 80,
+                    full_bytes: 1_200,
+                    loaded: true,
+                },
+                McpToolAccountingEntry {
+                    name: "fetch".to_string(),
+                    description: "fetch a page".to_string(),
+                    stub_bytes: 80,
+                    full_bytes: 800,
+                    loaded: false,
+                },
+            ],
+            stub_bytes: 160,
+            loaded_full_bytes: 1_200,
+            in_context_bytes: 1_360,
+        }],
+        total_tools: 2,
+        lazy: true,
+        stub_bytes_total: 160,
+        loaded_full_bytes_total: 1_200,
+        in_context_bytes_total: 1_360,
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess".to_string()),
+        provider: "scripted",
+        model: "gpt".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: SessionMetrics::default(),
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation,
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills,
+        mcp,
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
+
+    // Combined grand total at the top: skills (800+4_000)/4 = 1_200, mcp
+    // 1_360/4 = 340, together (6_160)/4 = 1_540.
+    assert!(output.contains("Skills + MCP"), "{output}");
+    assert!(output.contains("skills ~1,200 + mcp ~340"), "{output}");
+
+    // Skills section: per-skill metadata/body split, (loaded) marker, and a
+    // first-load hint for the deferred skill.
+    assert!(
+        output.contains("2 discovered, 1 loaded · meta ~200 + bodies ~1,000 = ~1,200 tok"),
+        "{output}"
+    );
+    assert!(
+        output.contains("meta ~100 + body ~1,000 = ~1,100 tok"),
+        "{output}"
+    );
+    assert!(output.contains("(loaded)"), "{output}");
+    assert!(output.contains("rust-nav"), "{output}");
+    assert!(output.contains("(+~200 if loaded)"), "{output}");
+
+    // MCPs section: per-tool stub vs full-schema split, loaded vs first-load.
+    assert!(
+        output.contains("stubs ~40 + loaded ~300 = ~340 tok"),
+        "{output}"
+    );
+    assert!(
+        output.contains("stub ~20 + schema ~300 = ~320 tok"),
+        "{output}"
+    );
+    assert!(output.contains("(+~200 on first load)"), "{output}");
+
+    // Consumption by source carves skills out of tool outputs (~4_000/4 =
+    // 1_000) and live MCP schemas out of framing (~1_360/4 = 340); the genuine
+    // tool output is the 400-byte remainder (~100).
+    assert!(
+        output.contains("tool call outputs:        ~100 tokens"),
+        "{output}"
+    );
+    assert!(
+        output.contains("skills (loaded bodies):   ~1,000 tokens"),
+        "{output}"
+    );
+    assert!(
+        output.contains("mcp tool schemas:         ~340 tokens"),
+        "{output}"
+    );
 }
 
 #[tokio::test]
@@ -7164,7 +7328,8 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
 #[test]
 fn context_snapshot_stays_expanded_in_compact_transcript() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
+        SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -7199,6 +7364,8 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         attachments: AttachmentShape::default(),
         transmitted_request: estimate,
         full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
     };
     let body = commands::format_context_command(&snapshot);
 

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::SystemTime;
 
-use squeezy_agent::{Agent, ReviewerAuditEntry, SessionAccountingSnapshot};
+use squeezy_agent::{
+    Agent, McpAccounting, ReviewerAuditEntry, SessionAccountingSnapshot, SkillsAccounting,
+};
 use squeezy_llm::RequestTokenEstimate;
 use squeezy_store::parse_bug_report_section;
 
@@ -233,7 +235,19 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     out.push('\n');
     let approx = |bytes: usize| bytes.div_ceil(4);
     let user_tokens = approx(snapshot.conversation.text_bytes);
-    let tool_tokens = approx(snapshot.conversation.tool_output_bytes);
+    // Skill bodies (load_skill outputs) are carved out of the raw tool-output
+    // total and reported as their own bucket; the remainder is the genuine
+    // tool-output cost.
+    let skill_tokens = approx(snapshot.conversation.skill_output_bytes);
+    let tool_only_bytes = snapshot
+        .conversation
+        .tool_output_bytes
+        .saturating_sub(snapshot.conversation.skill_output_bytes);
+    let tool_tokens = approx(tool_only_bytes);
+    // MCP tool schemas live in the per-request framing; carve them out of the
+    // opaque system + framing remainder computed below. Lazy loading means the
+    // live cost is the stub lines plus only the loaded full schemas.
+    let mcp_tokens = approx(snapshot.mcp.in_context_bytes_total);
     let reasoning_tokens = approx(snapshot.conversation.reasoning_bytes);
     let image_tokens = approx(snapshot.conversation.image_bytes);
     let attachment_tokens = approx(snapshot.attachments.stored_bytes);
@@ -253,10 +267,42 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         style::accent("◆"),
         style::accent_bold(&style::group_thousands(tool_tokens as u64)),
         style::muted(&format!(
-            "({} bytes from {} call(s); MCP / skill / internal split needs deeper accounting)",
-            snapshot.conversation.tool_output_bytes, snapshot.conversation.function_outputs,
+            "({} bytes from {} call(s){})",
+            tool_only_bytes,
+            snapshot.conversation.function_outputs,
+            if skill_tokens > 0 {
+                "; skill bodies carved out below"
+            } else {
+                ""
+            },
         )),
     ));
+    if skill_tokens > 0 {
+        out.push_str(&format!(
+            "  {} skills (loaded bodies):   ~{} tokens  {}\n",
+            style::accent("◆"),
+            style::accent_bold(&style::group_thousands(skill_tokens as u64)),
+            style::muted(&format!(
+                "({} bytes via load_skill; {} of {} skills loaded)",
+                snapshot.conversation.skill_output_bytes,
+                snapshot.skills.loaded,
+                snapshot.skills.discovered,
+            )),
+        ));
+    }
+    if snapshot.mcp.in_context_bytes_total > 0 {
+        out.push_str(&format!(
+            "  {} mcp tool schemas:         ~{} tokens  {}\n",
+            style::accent("◆"),
+            style::accent_bold(&style::group_thousands(mcp_tokens as u64)),
+            style::muted(&format!(
+                "({} bytes live; {} tool(s) across {} server(s))",
+                snapshot.mcp.in_context_bytes_total,
+                snapshot.mcp.total_tools,
+                snapshot.mcp.servers.len(),
+            )),
+        ));
+    }
     if snapshot.conversation.reasoning_bytes > 0 {
         out.push_str(&format!(
             "  {} reasoning content:        ~{} tokens  {}\n",
@@ -292,14 +338,20 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
             )),
         ));
     }
-    let accounted = user_tokens + tool_tokens + reasoning_tokens + image_tokens + attachment_tokens;
+    let accounted = user_tokens
+        + tool_tokens
+        + skill_tokens
+        + mcp_tokens
+        + reasoning_tokens
+        + image_tokens
+        + attachment_tokens;
     let system_estimate = consumed.saturating_sub(accounted as u64);
     out.push_str(&format!(
         "  {} system prompt + framing: ~{} tokens  {}\n",
         style::secondary("◇"),
         style::secondary(&style::group_thousands(system_estimate)),
         style::muted(
-            "(consumed minus the above; covers system prompt, tool schemas, and per-request framing)",
+            "(remainder: system prompt, built-in tool schemas, tool index, and per-request framing)",
         ),
     ));
 
@@ -310,6 +362,8 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     let recommendations = context_source_recommendations(&ContextSourceTokens {
         user: user_tokens as u64,
         tool_outputs: tool_tokens as u64,
+        skills: skill_tokens as u64,
+        mcp: mcp_tokens as u64,
         reasoning: reasoning_tokens as u64,
         image: image_tokens as u64,
         attachments: attachment_tokens as u64,
@@ -322,6 +376,17 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         for rec in &recommendations {
             out.push_str(&format!("  {} {}\n", style::warn("→"), rec));
         }
+    }
+
+    // Only surface the Skills/MCP block when there is something to show — an
+    // empty inventory would just add noise (and height) to every /context.
+    if snapshot.skills.discovered > 0 || !snapshot.mcp.servers.is_empty() {
+        out.push('\n');
+        format_skills_mcp_total(&mut out, &snapshot.skills, &snapshot.mcp);
+        out.push('\n');
+        format_skills_section(&mut out, &snapshot.skills);
+        out.push('\n');
+        format_mcp_section(&mut out, &snapshot.mcp);
     }
 
     out.push('\n');
@@ -435,6 +500,173 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     out
 }
 
+/// Truncate `value` to `max` display characters, appending `…` when cut.
+fn truncate_display(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Round bytes to the same 4-bytes/token estimate used across `/context`.
+fn approx_tokens(bytes: usize) -> u64 {
+    bytes.div_ceil(4) as u64
+}
+
+/// Render the combined "Skills + MCP" grand total that heads the two sections:
+/// the in-context cost of skill metadata + loaded bodies plus MCP stubs +
+/// loaded schemas, with the two subtotals broken out.
+fn format_skills_mcp_total(out: &mut String, skills: &SkillsAccounting, mcp: &McpAccounting) {
+    let skills_bytes = skills.metadata_bytes_total + skills.loaded_body_bytes_total;
+    let mcp_bytes = mcp.in_context_bytes_total;
+    out.push_str(&style::header("Skills + MCP"));
+    out.push(' ');
+    out.push_str(&style::muted(&format!(
+        "(~{} tok in context = skills ~{} + mcp ~{})",
+        style::group_thousands(approx_tokens(skills_bytes + mcp_bytes)),
+        style::group_thousands(approx_tokens(skills_bytes)),
+        style::group_thousands(approx_tokens(mcp_bytes)),
+    )));
+    out.push('\n');
+}
+
+/// Render the "Skills" section: every discovered skill split into its
+/// always-present metadata cost and its body cost (counted when loaded),
+/// with a `(loaded)` marker and the section subtotal in the header.
+fn format_skills_section(out: &mut String, skills: &SkillsAccounting) {
+    out.push_str(&style::header("Skills"));
+    if skills.discovered == 0 {
+        out.push('\n');
+        out.push_str(&format!("  {}\n", style::muted("none discovered")));
+        return;
+    }
+    let total_bytes = skills.metadata_bytes_total + skills.loaded_body_bytes_total;
+    out.push(' ');
+    out.push_str(&style::muted(&format!(
+        "({} discovered, {} loaded · meta ~{} + bodies ~{} = ~{} tok)",
+        skills.discovered,
+        skills.loaded,
+        style::group_thousands(approx_tokens(skills.metadata_bytes_total)),
+        style::group_thousands(approx_tokens(skills.loaded_body_bytes_total)),
+        style::group_thousands(approx_tokens(total_bytes)),
+    )));
+    out.push('\n');
+    let name_width = skills
+        .entries
+        .iter()
+        .map(|entry| entry.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for entry in &skills.entries {
+        let icon = if entry.loaded {
+            style::accent("◆")
+        } else {
+            style::secondary("◇")
+        };
+        let pad = " ".repeat(name_width.saturating_sub(entry.name.chars().count()));
+        let meta_tokens = approx_tokens(entry.metadata_bytes);
+        let body_tokens = approx_tokens(entry.body_bytes);
+        // Loaded: meta + body are both in context. Not loaded: only meta is
+        // present; show the body as the cost a first load would add.
+        let breakdown = if entry.loaded {
+            format!(
+                "meta ~{} + body ~{} = ~{} tok  {}",
+                style::group_thousands(meta_tokens),
+                style::group_thousands(body_tokens),
+                style::accent_bold(&style::group_thousands(meta_tokens + body_tokens)),
+                style::muted("(loaded)"),
+            )
+        } else {
+            format!(
+                "meta ~{} tok  {}",
+                style::accent_bold(&style::group_thousands(meta_tokens)),
+                style::muted(&format!(
+                    "(+~{} if loaded)",
+                    style::group_thousands(body_tokens)
+                )),
+            )
+        };
+        out.push_str(&format!(
+            "  {} {}{}  {}\n",
+            icon, entry.name, pad, breakdown
+        ));
+    }
+}
+
+/// Render the "MCPs" section: connected servers with live status and a
+/// per-tool split of the lazy stub cost from the full-schema (first-load)
+/// cost, with per-server and section subtotals.
+fn format_mcp_section(out: &mut String, mcp: &McpAccounting) {
+    out.push_str(&style::header("MCPs"));
+    if mcp.servers.is_empty() {
+        out.push('\n');
+        out.push_str(&format!("  {}\n", style::muted("none configured")));
+        return;
+    }
+    out.push(' ');
+    out.push_str(&style::muted(&format!(
+        "({} server(s), {} tool(s) · stubs ~{} + loaded ~{} = ~{} tok)",
+        mcp.servers.len(),
+        mcp.total_tools,
+        style::group_thousands(approx_tokens(mcp.stub_bytes_total)),
+        style::group_thousands(approx_tokens(mcp.loaded_full_bytes_total)),
+        style::group_thousands(approx_tokens(mcp.in_context_bytes_total)),
+    )));
+    out.push('\n');
+    for server in &mcp.servers {
+        out.push_str(&format!(
+            "  {} {}  {}  ~{} tok\n",
+            style::accent("●"),
+            style::accent(&server.name),
+            style::muted(&server.status),
+            style::accent_bold(&style::group_thousands(approx_tokens(
+                server.in_context_bytes
+            ))),
+        ));
+        for tool in &server.tools {
+            let stub_tokens = approx_tokens(tool.stub_bytes);
+            let full_tokens = approx_tokens(tool.full_bytes);
+            // Loaded tools carry stub + full; lazy-deferred tools carry only the
+            // stub, with the full schema shown as the first-load cost increase.
+            let cost = if tool.loaded {
+                if tool.stub_bytes > 0 {
+                    format!(
+                        "stub ~{} + schema ~{} = ~{} tok  {}",
+                        style::group_thousands(stub_tokens),
+                        style::group_thousands(full_tokens),
+                        style::group_thousands(stub_tokens + full_tokens),
+                        style::muted("(loaded)"),
+                    )
+                } else {
+                    format!(
+                        "schema ~{} tok  {}",
+                        style::group_thousands(full_tokens),
+                        style::muted("(loaded)"),
+                    )
+                }
+            } else {
+                format!(
+                    "stub ~{} tok  {}",
+                    style::group_thousands(stub_tokens),
+                    style::muted(&format!(
+                        "(+~{} on first load)",
+                        style::group_thousands(full_tokens)
+                    )),
+                )
+            };
+            out.push_str(&format!(
+                "      {} {}  {}  {}\n",
+                style::secondary("-"),
+                tool.name,
+                style::muted(&truncate_display(&tool.description, 48)),
+                cost,
+            ));
+        }
+    }
+}
+
 /// Per-source token estimates fed into [`context_source_recommendations`].
 /// Mirrors the buckets rendered under "Consumption by source" so the advice
 /// stays consistent with the breakdown the user already sees.
@@ -442,6 +674,8 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
 pub(crate) struct ContextSourceTokens {
     pub user: u64,
     pub tool_outputs: u64,
+    pub skills: u64,
+    pub mcp: u64,
     pub reasoning: u64,
     pub image: u64,
     pub attachments: u64,
@@ -460,6 +694,8 @@ pub(crate) struct ContextSourceTokens {
 pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Vec<String> {
     let total = tokens.user
         + tokens.tool_outputs
+        + tokens.skills
+        + tokens.mcp
         + tokens.reasoning
         + tokens.image
         + tokens.attachments
@@ -472,7 +708,7 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
     let pct = |value: u64| ((value as f64 / total as f64) * 100.0).round() as u64;
     // Ordered by descending share so "largest" ties break deterministically
     // toward the bucket the user is most likely to recognize as actionable.
-    let sources: [(&str, u64, &str); 6] = [
+    let sources: [(&str, u64, &str); 8] = [
         (
             "tool_outputs",
             tokens.tool_outputs,
@@ -482,6 +718,16 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
             "history",
             tokens.user,
             "run /compact to summarize older turns",
+        ),
+        (
+            "skills",
+            tokens.skills,
+            "unload skills you are done with (they reload on demand) or use metadata-only skill mode",
+        ),
+        (
+            "mcp",
+            tokens.mcp,
+            "disable unused MCP servers to shrink the advertised tool schemas",
         ),
         (
             "reasoning",

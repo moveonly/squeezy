@@ -11152,3 +11152,42 @@ fn collect_successful_edits_skips_create_delete_move_ops() {
     );
     assert_eq!(edits[0].changed_spans, vec!["stale span here".to_string()]);
 }
+
+#[test]
+fn conversation_shape_attributes_load_skill_outputs_to_skills_bucket() {
+    use serde_json::json;
+
+    let conversation = vec![
+        LlmInputItem::FunctionCall {
+            call_id: "call-skill".to_string(),
+            name: "load_skill".to_string(),
+            arguments: json!({"name": "sonar"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call-skill".to_string(),
+            output: "SKILL BODY ".repeat(10), // 110 bytes
+            content_parts: None,
+            is_error: false,
+        },
+        LlmInputItem::FunctionCall {
+            call_id: "call-grep".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "x"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call-grep".to_string(),
+            output: "match ".repeat(5), // 30 bytes
+            content_parts: None,
+            is_error: false,
+        },
+    ];
+
+    let shape = conversation_shape(&conversation);
+    // Both outputs land in tool_output_bytes; only the load_skill one is also
+    // attributed to skill_output_bytes (carved out, not double counted).
+    assert_eq!(shape.function_outputs, 2);
+    assert_eq!(shape.tool_output_bytes, 110 + 30);
+    assert_eq!(shape.skill_output_bytes, 110);
+    // A non-load_skill output never leaks into the skills bucket.
+    assert!(shape.skill_output_bytes < shape.tool_output_bytes);
+}

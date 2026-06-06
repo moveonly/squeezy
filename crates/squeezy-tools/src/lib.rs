@@ -50,6 +50,27 @@ use squeezy_vcs::{
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
 use tokio::sync::{Mutex, Semaphore};
+
+/// One connected MCP tool's contribution to the request framing, surfaced by
+/// [`ToolRegistry::mcp_tool_schema_infos`] for the `/context` accounting view.
+///
+/// MCP tools are lazily loaded: their name + one-line description sit in the
+/// `<tools_index>` (the cheap `stub_bytes` cost, always present under lazy
+/// schema loading) and the full JSON schema (`full_bytes`) is only attached to
+/// the request after `load_tool_schema` — the cost a first load adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolSchemaInfo {
+    /// Owning MCP server name.
+    pub server: String,
+    /// Tool name as advertised to the model (`model_name`).
+    pub name: String,
+    /// First line of the tool description.
+    pub description: String,
+    /// Byte size of the `<tools_index>` stub line (initial lazy cost).
+    pub stub_bytes: usize,
+    /// Serialized byte size of the full advertised `ToolSpec` (load delta).
+    pub full_bytes: usize,
+}
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
@@ -2023,6 +2044,57 @@ impl ToolRegistry {
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
         self.mcp.status_snapshot()
+    }
+
+    /// Per-tool accounting view for `/context`: every connected MCP tool with
+    /// its owning server, first-line description, and both its lazy stub cost
+    /// (the `<tools_index>` line, always present) and its full schema cost (the
+    /// load delta attached only after `load_tool_schema`). The caller decides,
+    /// from the session's loaded-schema set, which costs are live and attributes
+    /// them away from the opaque "system prompt + framing" bucket. Returns one
+    /// entry per tool, unsorted (caller groups by server).
+    pub fn mcp_tool_schema_infos(&self) -> Vec<McpToolSchemaInfo> {
+        self.mcp
+            .tools()
+            .into_iter()
+            .map(|tool| {
+                let server = tool.server.clone();
+                let name = tool.model_name.clone();
+                let description = tool
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                // Stub line mirrors the `<tools_index>` row the agent renders
+                // for a deferred tool: "- name | capability=mcp | first-line".
+                let stub_bytes = format!(
+                    "- {} | capability={} | {}",
+                    name,
+                    PermissionCapability::Mcp.as_str(),
+                    description,
+                )
+                .len();
+                // Full schema sized exactly as advertised to the model — same
+                // ToolSpec shape produced for the live request.
+                let full_bytes = serde_json::to_string(&mcp_tool_spec(tool))
+                    .map(|json| json.len())
+                    .unwrap_or(0);
+                McpToolSchemaInfo {
+                    server,
+                    name,
+                    description,
+                    stub_bytes,
+                    full_bytes,
+                }
+            })
+            .collect()
+    }
+
+    /// Per-skill context cost breakdown for `/context` (metadata block size,
+    /// body size, and load state). See [`SkillCatalog::context_breakdown`].
+    pub fn skill_context_breakdown(&self) -> Vec<squeezy_skills::SkillContextBreakdown> {
+        self.skills_snapshot().context_breakdown()
     }
 
     /// Aggregate MCP server capability presence booleans.

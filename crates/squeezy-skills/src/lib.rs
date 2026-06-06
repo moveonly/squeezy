@@ -233,6 +233,20 @@ fn is_inline_context_mode(mode: &SkillContextMode) -> bool {
     matches!(mode, SkillContextMode::Inline)
 }
 
+/// Per-skill context cost breakdown produced by [`SkillCatalog::context_breakdown`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillContextBreakdown {
+    pub name: String,
+    pub description: String,
+    /// `true` when the body is materialized in this session's cache.
+    pub loaded: bool,
+    /// Byte size of the always-present metadata block (no body).
+    pub metadata_bytes: usize,
+    /// Body byte size: exact for loaded skills, on-disk `SKILL.md` size
+    /// (first-load cost) otherwise.
+    pub body_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedSkill {
     pub summary: SkillSummary,
@@ -311,38 +325,46 @@ impl LoadedSkill {
     /// is the default rendering path for active skills; the legacy
     /// inline-body form is gated behind `[skills] inline = true`.
     pub fn metadata_block(&self) -> String {
-        let SkillSummary {
-            name,
-            description,
-            when_to_use,
-            source,
-            location,
-            disabled: _,
-            manifest,
-            context_mode: _,
-        } = &self.summary;
-        let when_to_use = when_to_use
-            .as_ref()
-            .map(|value| format!("\n<when_to_use>{}</when_to_use>", xml_escape(value)))
-            .unwrap_or_default();
-        let manifest_block = manifest
-            .as_ref()
-            .map(render_manifest_block)
-            .unwrap_or_default();
-        let instruction = format!(
-            "Skill body omitted; call load_skill with name \"{}\" to load the full instructions.",
-            name
-        );
-        format!(
-            "<skill name=\"{}\" source=\"{}\" body=\"omitted\">\n<description>{}</description>{when_to_use}\n<location>{}</location>\n<base_directory>{}</base_directory>{manifest_block}\n<instruction>{}</instruction>\n</skill>",
-            xml_escape(name),
-            source.as_str(),
-            xml_escape(description),
-            location.display(),
-            self.base_dir.display(),
-            xml_escape(&instruction),
-        )
+        render_metadata_block(&self.summary, &self.base_dir)
     }
+}
+
+/// Render the metadata-only `<skill>` block for a summary without needing the
+/// body. Shared by [`LoadedSkill::metadata_block`] and the `/context`
+/// accounting view, which sizes this block for every discovered skill
+/// (loaded or not) since it never carries the body.
+pub(crate) fn render_metadata_block(summary: &SkillSummary, base_dir: &Path) -> String {
+    let SkillSummary {
+        name,
+        description,
+        when_to_use,
+        source,
+        location,
+        disabled: _,
+        manifest,
+        context_mode: _,
+    } = summary;
+    let when_to_use = when_to_use
+        .as_ref()
+        .map(|value| format!("\n<when_to_use>{}</when_to_use>", xml_escape(value)))
+        .unwrap_or_default();
+    let manifest_block = manifest
+        .as_ref()
+        .map(render_manifest_block)
+        .unwrap_or_default();
+    let instruction = format!(
+        "Skill body omitted; call load_skill with name \"{}\" to load the full instructions.",
+        name
+    );
+    format!(
+        "<skill name=\"{}\" source=\"{}\" body=\"omitted\">\n<description>{}</description>{when_to_use}\n<location>{}</location>\n<base_directory>{}</base_directory>{manifest_block}\n<instruction>{}</instruction>\n</skill>",
+        xml_escape(name),
+        source.as_str(),
+        xml_escape(description),
+        location.display(),
+        base_dir.display(),
+        xml_escape(&instruction),
+    )
 }
 
 fn render_manifest_block(manifest: &SkillManifest) -> String {
@@ -488,6 +510,46 @@ impl SkillCatalog {
         self.skills
             .values()
             .map(|entry| entry.summary.clone())
+            .collect()
+    }
+
+    /// Per-skill context cost breakdown for `/context`: one entry per
+    /// discovered skill with the byte size of its always-present metadata
+    /// block and its body. A skill is `loaded` once its body is materialized in
+    /// this session's cache (via `load_skill`, inline activation, or a prior
+    /// `load`); the body bytes are exact for loaded skills (from the cache) and
+    /// the on-disk `SKILL.md` size for not-yet-loaded skills (the cost a first
+    /// load would add). The metadata block never carries the body, so it is
+    /// sized for every skill regardless of load state.
+    pub fn context_breakdown(&self) -> Vec<SkillContextBreakdown> {
+        let loaded_bodies: BTreeMap<String, usize> = self
+            .cache
+            .lock()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .map(|(name, loaded)| (name.clone(), loaded.body.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.skills
+            .values()
+            .map(|entry| {
+                let loaded_body = loaded_bodies.get(&entry.summary.name).copied();
+                let body_bytes = match loaded_body {
+                    Some(bytes) => bytes,
+                    None => fs::metadata(&entry.summary.location)
+                        .map(|meta| meta.len() as usize)
+                        .unwrap_or(0),
+                };
+                SkillContextBreakdown {
+                    name: entry.summary.name.clone(),
+                    description: entry.summary.description.clone(),
+                    loaded: loaded_body.is_some(),
+                    metadata_bytes: render_metadata_block(&entry.summary, &entry.base_dir).len(),
+                    body_bytes,
+                }
+            })
             .collect()
     }
 
