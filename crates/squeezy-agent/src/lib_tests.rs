@@ -4371,7 +4371,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
     let config = AppConfig {
         workspace_root: root.clone(),
         permissions: PermissionPolicy {
-            shell: PermissionMode::Deny,
+            destructive: PermissionMode::Deny,
             ..Default::default()
         },
         ..Default::default()
