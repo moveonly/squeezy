@@ -1931,13 +1931,20 @@ async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
             }),
         ],
     ]));
-    let agent = Agent::new(
-        AppConfig {
-            workspace_root: root.clone(),
-            ..AppConfig::default()
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
         },
-        provider.clone(),
-    );
+        context_compaction: ContextCompactionConfig {
+            repo_doc_max_bytes: 0,
+            user_memory_max_bytes: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config.clone(), provider.clone());
 
     let mut rx = agent.start_turn("revisit your reports".to_string(), CancellationToken::new());
     let mut completed = None;
@@ -1967,6 +1974,51 @@ async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
     assert_eq!(
         assistant.content, substantive_answer,
         "resume/transcript state must not replace the answer with the retry acknowledgement"
+    );
+
+    let session_id = agent.session_id().expect("session id");
+    let record = agent.show_session(&session_id).expect("session record");
+    let retry_event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "assistant_retry")
+        .expect("session events must record the retry decision");
+    assert_eq!(retry_event.payload["branch"], "promised_action");
+    assert_eq!(
+        retry_event.payload["preserved_visible_chars"],
+        json!(substantive_answer.chars().count()),
+        "retry event must expose how much visible text was preserved"
+    );
+
+    let replay = record.replay.expect("replay tape");
+    let retry_completion = replay
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == SessionReplayEventKind::ModelCompleted
+                && event.payload["retry"]["branch"] == "promised_action"
+        })
+        .expect("replay model_completed must carry retry metadata");
+    assert_eq!(retry_completion.payload["stop_reason"]["kind"], "end_turn");
+    assert_eq!(
+        retry_completion.payload["retry"]["preserved_visible_chars"],
+        json!(substantive_answer.chars().count()),
+    );
+
+    let report = Agent::replay_tape(
+        config,
+        session_id,
+        replay,
+        "mock",
+        AppConfig::default().model,
+        SessionMode::default(),
+    )
+    .await
+    .expect("retry session replay should consume the full tape");
+    assert!(
+        report.final_answer.contains(substantive_answer),
+        "replay must retain the substantive answer, got {:?}",
+        report.final_answer,
     );
 
     let _ = fs::remove_dir_all(root);
