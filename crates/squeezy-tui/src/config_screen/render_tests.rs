@@ -142,20 +142,80 @@ fn mcp_status_icon_picks_glyph_per_server_state() {
         assert_eq!(color, crate::render::theme::red());
     }
 
-    // Starting pulses through four moon glyphs; each tick yields a
-    // different frame, and the cycle wraps cleanly.
+    // Starting blinks slowly between open and filled circles instead of
+    // spinning every frame.
     let starting = McpServerStatus::Starting;
-    let frames: Vec<char> = (0..4)
+    let frames: Vec<char> = [0, 9, 10, 19, 20]
+        .into_iter()
         .map(|tick| mcp_status_icon(&enabled, Some(&starting), tick).0)
         .collect();
-    assert_eq!(frames, vec!['◐', '◓', '◑', '◒']);
+    assert_eq!(frames, vec!['○', '○', '●', '●', '○']);
     assert_eq!(
-        mcp_status_icon(&enabled, Some(&starting), 4).0,
-        '◐',
-        "starting frame cycle must wrap modulo four"
+        mcp_status_icon(&disabled, Some(&starting), 10).0,
+        '●',
+        "pending state must blink even while the server is toggling off"
     );
 
     // Unknown (enabled server with no snapshot yet) reads as an
     // open circle so it isn't confused with ready / failed.
     assert_eq!(mcp_status_icon(&enabled, None, 0).0, '○');
+}
+
+#[test]
+fn mcp_status_text_distinguishes_stopping_from_starting() {
+    use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport};
+
+    let mut server = McpServerConfig {
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: Some("x".to_string()),
+        args: Vec::new(),
+        url: None,
+        timeout_ms: None,
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
+        enabled_tools: None,
+        disabled_tools: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        permissions: McpPermissionConfig::default(),
+        bearer_token_env_var: None,
+        http_headers: std::collections::BTreeMap::new(),
+        env_http_headers: std::collections::BTreeMap::new(),
+    };
+    assert_eq!(
+        format_mcp_row_status_for_server(&server, &squeezy_tools::McpServerStatus::Starting),
+        "starting"
+    );
+    server.enabled = false;
+    assert_eq!(
+        format_mcp_row_status_for_server(&server, &squeezy_tools::McpServerStatus::Starting),
+        "stopping"
+    );
+}
+
+#[test]
+fn mcp_status_cell_keeps_actionable_error_prefix() {
+    let failed = squeezy_tools::McpServerStatus::Failed {
+        error: "command docs-mcp not found on PATH after restart".to_string(),
+    };
+    let text = format_mcp_row_status(&failed);
+    assert_eq!(
+        text,
+        "failed: command docs-mcp not found on PATH after restart"
+    );
+
+    let cell = mcp_status_cell(&text, MCP_STATUS_COLUMN_WIDTH);
+    assert_eq!(cell, "failed: command docs-mcp not foun...");
+    assert!(cell.chars().count() <= MCP_STATUS_COLUMN_WIDTH);
+
+    let stale = squeezy_tools::McpServerStatus::Stale {
+        tools_count: 2,
+        outcome: squeezy_tools::McpStaleOutcome::Failed {
+            error: "connection refused".to_string(),
+        },
+    };
+    assert_eq!(
+        format_mcp_row_status(&stale),
+        "stale: connection refused (2 cached)"
+    );
 }

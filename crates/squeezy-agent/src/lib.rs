@@ -1387,6 +1387,11 @@ pub struct Agent {
     /// fire-and-forget lifetime of these tasks. New tasks may still be
     /// registered after a shutdown completes; the JoinSet is reusable.
     background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
+    /// Ordered gate for background MCP config actions. `/mcp` key handling
+    /// must return immediately, but live registry mutations still need the
+    /// old sequential semantics so rapid toggle/restart/add/remove actions
+    /// settle in the same order the user requested them.
+    mcp_background_queue: Arc<McpBackgroundQueue>,
     /// Cross-turn state for the per-turn model router. Tracks the
     /// escalation-sticky window and any pending `/cheap` / `/parent` /
     /// `/router` user override. Shared with each `TurnRuntime` via
@@ -1411,6 +1416,33 @@ pub struct Agent {
 struct ActiveTurn {
     turn_id: TurnId,
     cancel: CancellationToken,
+}
+
+#[derive(Default)]
+struct McpBackgroundQueue {
+    next_ticket: AtomicU64,
+    serving: AtomicU64,
+    notify: Notify,
+}
+
+impl McpBackgroundQueue {
+    fn issue_ticket(&self) -> u64 {
+        self.next_ticket.fetch_add(1, Ordering::AcqRel)
+    }
+
+    async fn wait_for_turn(&self, ticket: u64) {
+        loop {
+            if self.serving.load(Ordering::Acquire) == ticket {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn finish_turn(&self) {
+        self.serving.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -2030,6 +2062,7 @@ impl Agent {
             pending_swap: None,
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
+            mcp_background_queue: Arc::new(McpBackgroundQueue::default()),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
@@ -2450,6 +2483,24 @@ impl Agent {
         Ok(outcome)
     }
 
+    /// Toggle an MCP server's `enabled` flag and run discovery in the
+    /// background. This is the interactive-TUI path: update the agent's
+    /// config snapshot immediately so `/mcp` reflects the requested state,
+    /// then let the registry publish `Starting` / final status without
+    /// blocking redraws.
+    pub fn set_mcp_server_enabled_in_background(&mut self, server_name: String, enabled: bool) {
+        if let Some(server) = self.config.mcp_servers.get_mut(&server_name) {
+            server.enabled = enabled;
+        }
+        let tools = self.tools.clone();
+        let task = async move {
+            let _ = tools
+                .set_mcp_server_enabled(&server_name, enabled, CancellationToken::new())
+                .await;
+        };
+        self.spawn_mcp_background_task(task);
+    }
+
     /// Restart an MCP server in place: tear down its live session and
     /// re-run discovery.
     pub async fn restart_mcp_server(
@@ -2459,6 +2510,19 @@ impl Agent {
         self.tools
             .restart_mcp_server(server_name, CancellationToken::new())
             .await
+    }
+
+    /// Restart an MCP server without blocking the caller. The registry owns
+    /// the `Starting` / `Ready` / `Failed` snapshot transitions; the TUI polls
+    /// that snapshot while this task runs.
+    pub fn restart_mcp_server_in_background(&self, server_name: String) {
+        let tools = self.tools.clone();
+        let task = async move {
+            let _ = tools
+                .restart_mcp_server(&server_name, CancellationToken::new())
+                .await;
+        };
+        self.spawn_mcp_background_task(task);
     }
 
     /// Replace the entire MCP server map without restarting the
@@ -2473,6 +2537,51 @@ impl Agent {
         self.tools
             .replace_mcp_servers(servers, CancellationToken::new())
             .await
+    }
+
+    /// Replace the MCP server map in the background, keeping the agent config
+    /// snapshot aligned immediately so `/mcp` browse rows do not wait on
+    /// discovery before reflecting add/remove operations.
+    pub fn replace_mcp_servers_in_background(
+        &mut self,
+        servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+    ) {
+        self.config.mcp_servers = servers.clone();
+        let tools = self.tools.clone();
+        let task = async move {
+            let _ = tools
+                .replace_mcp_servers(servers, CancellationToken::new())
+                .await;
+        };
+        self.spawn_mcp_background_task(task);
+    }
+
+    fn spawn_mcp_background_task<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let ticket = self.mcp_background_queue.issue_ticket();
+        let queue = self.mcp_background_queue.clone();
+        let task = async move {
+            queue.wait_for_turn(ticket).await;
+            let result = AssertUnwindSafe(task).catch_unwind().await;
+            queue.finish_turn();
+            if result.is_err() {
+                tracing::warn!(
+                    target: "squeezy::mcp",
+                    ticket,
+                    "background MCP config action panicked"
+                );
+            }
+        };
+        match self.background_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.spawn(task);
+            }
+            Err(poison) => {
+                poison.into_inner().spawn(task);
+            }
+        }
     }
 
     /// Snapshot of the registry's live server map. Mirrors

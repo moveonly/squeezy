@@ -18,6 +18,8 @@ use super::{
 };
 use crate::render::palette::{footer_fg, muted_fg};
 
+const MCP_STATUS_COLUMN_WIDTH: usize = 36;
+
 /// Pretty-print an absolute config path: replace `$HOME` with `~` so the
 /// tab subtitle stays compact, while still surfacing the per-machine
 /// project hash for the Local tier so the user can grep `~/.squeezy/projects/`
@@ -459,7 +461,11 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:<18}", "STATUS"),
+                format!(
+                    "{:<width$}",
+                    "STATUS / ERROR",
+                    width = MCP_STATUS_COLUMN_WIDTH
+                ),
                 Style::default()
                     .fg(crate::render::theme::quiet())
                     .add_modifier(Modifier::BOLD),
@@ -487,7 +493,7 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
                 .mcp_status
                 .per_server
                 .get(name)
-                .map(format_mcp_row_status)
+                .map(|status| format_mcp_row_status_for_server(server, status))
                 .unwrap_or_else(|| "—".to_string());
             let endpoint = server
                 .command
@@ -517,7 +523,14 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
                 Span::styled(format!("{:<16}", name), row_style),
                 Span::styled(format!("{:<10}", state_text), row_style),
                 Span::styled(format!("{:<8}", server.transport.as_str()), row_style),
-                Span::styled(format!("{:<18}", status_text), row_style),
+                Span::styled(
+                    format!(
+                        "{:<width$}",
+                        mcp_status_cell(&status_text, MCP_STATUS_COLUMN_WIDTH),
+                        width = MCP_STATUS_COLUMN_WIDTH
+                    ),
+                    row_style,
+                ),
                 Span::styled(endpoint.to_string(), row_style),
             ]));
         }
@@ -562,20 +575,24 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
 /// down but discovery's last result lingers in the snapshot until
 /// the next refresh.
 ///
-/// For servers that are actively discovering (the `Starting` state,
-/// which also covers an in-flight restart) we cycle through the
-/// four half-circle moon glyphs at the animation tick so the user
-/// sees the row pulsing while it settles to ready / failed.
+/// For servers that are actively discovering or stopping (the `Starting`
+/// state, which also covers an in-flight restart) we blink a plain circle at
+/// a deliberately slow cadence so the row reads as pending without becoming
+/// visually noisy.
 pub(crate) fn mcp_status_icon(
     server: &squeezy_core::McpServerConfig,
     status: Option<&squeezy_tools::McpServerStatus>,
     tick: u64,
 ) -> (char, ratatui::style::Color) {
     use squeezy_tools::McpServerStatus;
-    if !server.enabled {
-        return ('●', crate::render::theme::muted());
-    }
     match status {
+        Some(McpServerStatus::Starting) => {
+            const FRAME_HOLD_TICKS: u64 = 10;
+            let frame = (tick / FRAME_HOLD_TICKS) % 2;
+            let icon = if frame == 0 { '○' } else { '●' };
+            (icon, crate::render::theme::secondary())
+        }
+        _ if !server.enabled => ('●', crate::render::theme::muted()),
         Some(McpServerStatus::Ready { cached: false, .. }) => ('●', crate::render::theme::green()),
         Some(McpServerStatus::Ready { cached: true, .. }) => {
             // Cached entries are functionally ready but came from
@@ -585,14 +602,6 @@ pub(crate) fn mcp_status_icon(
             ('●', crate::render::theme::cyan())
         }
         Some(McpServerStatus::Stale { .. }) => ('●', crate::render::theme::cyan()),
-        Some(McpServerStatus::Starting) => {
-            // Pulse `◐ ◓ ◑ ◒` so an in-flight discovery or restart
-            // is obviously alive. Falls back to a static `◐` if
-            // the tick happens to be zero on first render.
-            const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
-            let frame = FRAMES[(tick as usize) % FRAMES.len()];
-            (frame, crate::render::theme::secondary())
-        }
         Some(McpServerStatus::Failed { .. }) | Some(McpServerStatus::Cancelled) => {
             ('●', crate::render::theme::red())
         }
@@ -603,6 +612,17 @@ pub(crate) fn mcp_status_icon(
             // than "ready" or "failed".
             ('○', crate::render::theme::quiet())
         }
+    }
+}
+
+fn format_mcp_row_status_for_server(
+    server: &squeezy_core::McpServerConfig,
+    status: &squeezy_tools::McpServerStatus,
+) -> String {
+    if matches!(status, squeezy_tools::McpServerStatus::Starting) && !server.enabled {
+        "stopping".to_string()
+    } else {
+        format_mcp_row_status(status)
     }
 }
 
@@ -623,23 +643,30 @@ fn format_mcp_row_status(status: &squeezy_tools::McpServerStatus) -> String {
         McpServerStatus::Stale {
             tools_count,
             outcome,
-        } => format!("stale·{} {tools_count}", mcp_stale_outcome_label(outcome)),
-        McpServerStatus::Failed { error } => {
-            // Trim long error strings so the row stays single-line;
-            // the user can still see the leading clause which is the
-            // most diagnostic part.
-            let trimmed: String = error.chars().take(20).collect();
-            format!("failed:{trimmed}")
-        }
+        } => match outcome {
+            squeezy_tools::McpStaleOutcome::Failed { error } => {
+                format!("stale: {error} ({tools_count} cached)")
+            }
+            squeezy_tools::McpStaleOutcome::Cancelled => {
+                format!("stale: cancelled ({tools_count} cached)")
+            }
+        },
+        McpServerStatus::Failed { error } => format!("failed: {error}"),
         McpServerStatus::Cancelled => "cancelled".to_string(),
     }
 }
 
-fn mcp_stale_outcome_label(outcome: &squeezy_tools::McpStaleOutcome) -> &'static str {
-    match outcome {
-        squeezy_tools::McpStaleOutcome::Failed { .. } => "failed",
-        squeezy_tools::McpStaleOutcome::Cancelled => "cancelled",
+fn mcp_status_cell(text: &str, width: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= width {
+        return normalized;
     }
+    let keep = width.saturating_sub(3);
+    let mut out: String = normalized.chars().take(keep).collect();
+    if keep < width {
+        out.push_str("...");
+    }
+    out
 }
 
 fn render_mcp_add_form(

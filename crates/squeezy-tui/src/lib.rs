@@ -1302,11 +1302,11 @@ async fn apply_plan_choice(
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
 /// Drain MCP actions staged by the `/mcp` config page key handlers
-/// and dispatch them through the agent. Each action is async because
-/// it reaches into the registry to (re)open sessions and run
-/// discovery; the page handler stages them on the screen state so
-/// the per-key code stays sync.
-async fn drain_mcp_actions(
+/// and dispatch them through the agent. Live registry work is scheduled in
+/// the background so restarting a slow server cannot block the TUI redraw loop;
+/// the page handler stages actions on the screen state so the per-key code
+/// stays sync.
+fn drain_mcp_actions(
     app: &mut TuiApp,
     agent: &mut Agent,
     feedback: &mut config_screen::ConfigFeedback,
@@ -1316,15 +1316,11 @@ async fn drain_mcp_actions(
         None => return,
     };
     for action in actions {
-        apply_mcp_action(app, agent, feedback, action).await;
+        apply_mcp_action(app, agent, feedback, action);
     }
-    // After every batch, refresh the cached snapshot so the next
-    // render reflects the live registry/status — even partial
-    // failures should surface the new state.
-    refresh_mcp_screen_state(app, agent);
 }
 
-async fn apply_mcp_action(
+fn apply_mcp_action(
     app: &mut TuiApp,
     agent: &mut Agent,
     feedback: &mut config_screen::ConfigFeedback,
@@ -1344,19 +1340,11 @@ async fn apply_mcp_action(
                     feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
                 }
             }
-            match agent.set_mcp_server_enabled(&server, enabled).await {
-                Ok(_) => {}
-                Err(err) => {
-                    feedback.push(format!("mcp toggle failed: {err}"), Severity::Error);
-                }
-            }
+            agent.set_mcp_server_enabled_in_background(server, enabled);
         }
-        McpAction::Restart { server } => match agent.restart_mcp_server(&server).await {
-            Ok(_) => {}
-            Err(err) => {
-                feedback.push(format!("mcp restart failed: {err}"), Severity::Error);
-            }
-        },
+        McpAction::Restart { server } => {
+            agent.restart_mcp_server_in_background(server);
+        }
         McpAction::Add {
             name,
             server,
@@ -1369,9 +1357,13 @@ async fn apply_mcp_action(
                     feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
                 }
             }
-            let mut next = agent.mcp_servers();
+            let mut next = app
+                .config_screen
+                .as_ref()
+                .map(|state| state.mcp_servers.clone())
+                .unwrap_or_else(|| agent.mcp_servers());
             next.insert(name.clone(), *server);
-            agent.replace_mcp_servers(next).await;
+            agent.replace_mcp_servers_in_background(next);
         }
         McpAction::Remove { name, persist } => {
             if persist {
@@ -1426,9 +1418,13 @@ async fn apply_mcp_action(
                     }
                 }
             }
-            let mut next = agent.mcp_servers();
+            let mut next = app
+                .config_screen
+                .as_ref()
+                .map(|state| state.mcp_servers.clone())
+                .unwrap_or_else(|| agent.mcp_servers());
             next.remove(&name);
-            agent.replace_mcp_servers(next).await;
+            agent.replace_mcp_servers_in_background(next);
         }
     }
 }
@@ -2455,7 +2451,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // Drain any MCP actions staged by `/mcp` key bindings before
         // the next draw so the user sees status updates immediately
         // rather than waiting for the next animation tick.
-        drain_mcp_actions(app, agent, &mut feedback).await;
+        drain_mcp_actions(app, agent, &mut feedback);
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             close_config_screen(app, agent, "config closed");
         }

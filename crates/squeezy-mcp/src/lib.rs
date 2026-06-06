@@ -484,16 +484,7 @@ impl McpClientRegistry {
         }
 
         let servers = self.servers_snapshot();
-        let mut starting = self.status_snapshot().per_server;
-        // Drop status rows for servers that have been removed since the
-        // last refresh — otherwise a deleted server's old status would
-        // linger forever in the snapshot.
-        starting.retain(|name, _| servers.contains_key(name));
-        for (name, _server) in servers.iter().filter(|(_, server)| server.enabled) {
-            starting
-                .entry(name.clone())
-                .or_insert(McpServerStatus::Starting);
-        }
+        let starting = starting_status_snapshot(&servers, self.status_snapshot().per_server);
         self.publish_status(McpStatusSnapshot {
             per_server: starting,
             generated_unix_millis: unix_millis(),
@@ -2410,6 +2401,17 @@ fn sanitize_name(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn starting_status_snapshot(
+    servers: &BTreeMap<String, McpServerConfig>,
+    mut prior: BTreeMap<String, McpServerStatus>,
+) -> BTreeMap<String, McpServerStatus> {
+    prior.retain(|name, _| servers.get(name).is_some_and(|server| server.enabled));
+    for (name, _server) in servers.iter().filter(|(_, server)| server.enabled) {
+        prior.insert(name.clone(), McpServerStatus::Starting);
+    }
+    prior
 }
 
 fn normalize_palette(tools: Vec<ExternalMcpTool>) -> BTreeMap<String, ExternalMcpTool> {

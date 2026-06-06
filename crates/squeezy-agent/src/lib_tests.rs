@@ -11717,3 +11717,48 @@ fn model_fits_conversation_honors_global_override() {
         "a large global window allows the reroute"
     );
 }
+
+#[tokio::test]
+async fn mcp_background_queue_serves_issued_tickets_in_order() {
+    let queue = Arc::new(McpBackgroundQueue::default());
+    let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let first = queue.issue_ticket();
+    let second = queue.issue_ticket();
+
+    let second_task = {
+        let queue = queue.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            queue.wait_for_turn(second).await;
+            events.lock().await.push("second");
+            queue.finish_turn();
+        })
+    };
+
+    tokio::task::yield_now().await;
+    assert!(
+        events.lock().await.is_empty(),
+        "later ticket must not run before the earlier issued ticket"
+    );
+
+    let first_task = {
+        let queue = queue.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            queue.wait_for_turn(first).await;
+            events.lock().await.push("first");
+            queue.finish_turn();
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), first_task)
+        .await
+        .expect("first task should finish")
+        .expect("first task should not panic");
+    tokio::time::timeout(Duration::from_secs(5), second_task)
+        .await
+        .expect("second task should finish")
+        .expect("second task should not panic");
+
+    assert_eq!(&*events.lock().await, &["first", "second"]);
+}
