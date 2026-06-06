@@ -510,6 +510,26 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "context_window",
+                toml_path: &["model_limits", "*", "context_window"],
+                kind: FieldKind::OptionalInteger {
+                    min: 1,
+                    max: 100_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_model_context_window,
+                set: set_model_context_window,
+                default_display: "auto",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Context window for THIS model. auto = resolve from override → provider \
+                       live → curated catalog → models.dev → fallback. A number pins the window \
+                       used by /context and compaction. Stored per provider:model in \
+                       [model_limits], so switching models keeps the right value.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "temperature",
                 toml_path: &["model", "temperature"],
                 kind: FieldKind::OptionalFloat { min: 0.0, max: 2.0 },
@@ -1421,9 +1441,47 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_context_model_window,
                 default_display: "—",
                 default: || FieldValue::OptionalInteger(None),
-                help: "Model token budget; all percent knobs are % of this. Unset → \
-                       auto-derived from the model registry; mid-turn dormant if underivable.",
+                help: "Global fallback model token budget; all percent knobs are % of this. The \
+                       per-model [Models].context_window override takes precedence. Unset → \
+                       auto-derived by the limit resolver; mid-turn dormant if only a low-\
+                       confidence fallback is available.",
                 env_override: Some("SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "effective_context_window_percent",
+                toml_path: &["context", "effective_context_window_percent"],
+                kind: FieldKind::OptionalInteger {
+                    min: 1,
+                    max: 100,
+                    suffix: Some("%"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_effective_percent,
+                set: set_context_effective_percent,
+                default_display: "— (95)",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Percent of the raw window treated as usable in /context (rest is \
+                       headroom). Unset uses the curated model's value, else 95.",
+                env_override: Some("SQUEEZY_CONTEXT_EFFECTIVE_CONTEXT_WINDOW_PERCENT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "baseline_reserve_tokens",
+                toml_path: &["context", "baseline_reserve_tokens"],
+                kind: FieldKind::OptionalInteger {
+                    min: 0,
+                    max: 10_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_baseline_reserve,
+                set: set_context_baseline_reserve,
+                default_display: "— (12000)",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Flat token reserve carved off the effective window for system framing. \
+                       Unset uses the built-in 12000.",
+                env_override: Some("SQUEEZY_CONTEXT_BASELINE_RESERVE_TOKENS"),
                 secret: false,
             },
             FieldMeta {
@@ -2434,6 +2492,31 @@ fn set_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str>
     }
 }
 
+fn get_model_context_window(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(
+        cfg.model_limits
+            .get(&cfg.model_limit_key())
+            .and_then(|entry| entry.context_window)
+            .map(|window| window as i64),
+    )
+}
+fn set_model_context_window(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let key = cfg.model_limit_key();
+    match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => {
+            cfg.model_limits.remove(&key);
+        }
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if v < 1 {
+                return Err("must be >= 1");
+            }
+            cfg.model_limits.entry(key).or_default().context_window = Some(v as u64);
+        }
+        _ => return Err("expects integer"),
+    }
+    Ok(())
+}
+
 fn get_profile(cfg: &AppConfig) -> FieldValue {
     FieldValue::Enum(cfg.profile.as_str())
 }
@@ -3300,6 +3383,54 @@ fn set_context_model_window(cfg: &mut AppConfig, value: FieldValue) -> Result<()
         FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
             if v < 1 {
                 return Err("must be >= 1");
+            }
+            Some(v as u64)
+        }
+        _ => return Err("expects integer"),
+    };
+    Ok(())
+}
+
+fn get_context_effective_percent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(
+        cfg.context_compaction
+            .effective_context_window_percent
+            .map(|v| v as i64),
+    )
+}
+fn set_context_effective_percent(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.effective_context_window_percent = match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => None,
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if !(1..=100).contains(&v) {
+                return Err("must be 1..=100");
+            }
+            Some(v as u8)
+        }
+        _ => return Err("expects integer"),
+    };
+    Ok(())
+}
+
+fn get_context_baseline_reserve(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(
+        cfg.context_compaction
+            .baseline_reserve_tokens
+            .map(|v| v as i64),
+    )
+}
+fn set_context_baseline_reserve(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.baseline_reserve_tokens = match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => None,
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if v < 0 {
+                return Err("must be >= 0");
             }
             Some(v as u64)
         }

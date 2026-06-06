@@ -16,9 +16,11 @@
 //! capability flags; this module supplies the *catalog of slugs + pricing +
 //! limits* that supplements the bundled defaults.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -284,6 +286,122 @@ fn price_to_micros_per_mtok(value: &Value) -> Option<u64> {
         return None;
     }
     Some((usd_per_mtok * 1_000_000.0).round() as u64)
+}
+
+/// Context/output limits for a single model, extracted from the cached
+/// models.dev catalog for the runtime resolver. Kept separate from
+/// [`ModelsDevModel`] so the resolver depends only on the two numbers it
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelsDevLimits {
+    pub context_window: Option<u64>,
+    pub max_output: Option<u64>,
+}
+
+/// Indexed, read-only view of the cached models.dev catalog keyed by
+/// `(models.dev provider id, model id)`. Built once from the on-disk cache so
+/// the hot-path resolver does a hash lookup and never touches the network or
+/// the filesystem.
+#[derive(Debug, Clone)]
+pub struct ModelsDevView {
+    index: HashMap<(String, String), ModelsDevLimits>,
+}
+
+impl ModelsDevView {
+    pub fn from_catalog(catalog: &ModelsDevCatalog) -> Self {
+        let mut index = HashMap::new();
+        for provider in &catalog.providers {
+            for model in &provider.models {
+                index.insert(
+                    (provider.id.clone(), model.id.clone()),
+                    ModelsDevLimits {
+                        context_window: model.context_window,
+                        max_output: model.max_output,
+                    },
+                );
+            }
+        }
+        Self { index }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Look up limits for a squeezy `(provider, model)` pair. Tries each
+    /// models.dev provider id mapped from the squeezy provider plus the raw
+    /// provider name, and for each tries the full model id then the
+    /// vendor-namespaced suffix (`anthropic/claude-…` → `claude-…`) so
+    /// aggregator routes resolve to the underlying vendor's entry.
+    pub fn lookup(&self, squeezy_provider: &str, model: &str) -> Option<ModelsDevLimits> {
+        let suffix = model.split_once('/').map(|(_, id)| id);
+        let provider_ids = models_dev_provider_ids(squeezy_provider)
+            .iter()
+            .copied()
+            .chain(std::iter::once(squeezy_provider));
+        for provider_id in provider_ids {
+            for candidate in std::iter::once(model).chain(suffix) {
+                if let Some(limits) = self
+                    .index
+                    .get(&(provider_id.to_string(), candidate.to_string()))
+                {
+                    return Some(*limits);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Map a squeezy provider name (see `registry::PROVIDERS`) to the models.dev
+/// provider id(s) carrying the same models. Most are 1:1; aggregators and
+/// re-hosted vendors differ, and a few squeezy providers (Codex, Copilot,
+/// Azure) proxy another vendor's models, so they fall through to that vendor.
+/// Unknown providers return an empty slice — [`ModelsDevView::lookup`] still
+/// tries the raw provider name, which covers exact matches not listed here.
+pub fn models_dev_provider_ids(squeezy_provider: &str) -> &'static [&'static str] {
+    match squeezy_provider {
+        "openai" => &["openai"],
+        "openai_codex" => &["openai"],
+        "github_copilot" => &["github-copilot", "openai"],
+        "anthropic" => &["anthropic"],
+        "google" => &["google"],
+        "azure_openai" => &["azure", "openai"],
+        "bedrock" => &["amazon-bedrock"],
+        "ollama" => &["ollama"],
+        "openrouter" => &["openrouter"],
+        "vercel" => &["vercel"],
+        "portkey" => &["portkey"],
+        "groq" => &["groq"],
+        "xai" => &["xai"],
+        "deepseek" => &["deepseek"],
+        "vertex" => &["google-vertex", "google"],
+        "mistral" => &["mistral"],
+        "together" => &["togetherai"],
+        "fireworks" => &["fireworks-ai"],
+        "cerebras" => &["cerebras"],
+        "deepinfra" => &["deepinfra"],
+        "baseten" => &["baseten"],
+        "lmstudio" => &["lmstudio"],
+        "vllm" => &["vllm"],
+        "llamacpp" => &["llamacpp"],
+        "cloudflare_workers_ai" => &["cloudflare-workers-ai"],
+        "cloudflare_ai_gateway" => &["cloudflare-ai-gateway"],
+        _ => &[],
+    }
+}
+
+static MODELS_DEV_VIEW: LazyLock<Option<ModelsDevView>> = LazyLock::new(|| {
+    let path = default_cache_path()?;
+    let catalog = read_cached(&path)?;
+    Some(ModelsDevView::from_catalog(&catalog))
+});
+
+/// Process-lifetime view of the cached models.dev catalog, or `None` when no
+/// cache file exists yet. Read-only on the hot path; the daily `refresh-models`
+/// job is what writes the cache the view is built from.
+pub fn cached_models_dev_view() -> Option<&'static ModelsDevView> {
+    MODELS_DEV_VIEW.as_ref()
 }
 
 #[cfg(test)]

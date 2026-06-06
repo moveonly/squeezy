@@ -373,11 +373,14 @@ fn context_section_fields_round_trip() {
                 (f.set)(&mut cfg, FieldValue::Integer(v)).unwrap();
                 assert_eq!((f.get)(&cfg), FieldValue::Integer(v), "{}", f.label);
             }
-            FieldKind::OptionalInteger { .. } => {
-                (f.set)(&mut cfg, FieldValue::OptionalInteger(Some(4242))).unwrap();
+            FieldKind::OptionalInteger { min, max, .. } => {
+                // Pick a value inside the field's declared range so bounded
+                // fields (e.g. a 1..=100 percent) round-trip too.
+                let v = 4242i64.clamp(min, max);
+                (f.set)(&mut cfg, FieldValue::OptionalInteger(Some(v))).unwrap();
                 assert_eq!(
                     (f.get)(&cfg),
-                    FieldValue::OptionalInteger(Some(4242)),
+                    FieldValue::OptionalInteger(Some(v)),
                     "{}",
                     f.label
                 );

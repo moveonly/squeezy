@@ -509,6 +509,39 @@ fn provider_routing_field_key(field: &FieldMeta) -> Option<&'static str> {
     }
 }
 
+/// The per-model limit fields use a `["model_limits", "*", "<key>"]`
+/// placeholder `toml_path`; the `"*"` is substituted with the active
+/// `provider:model` at write time. Returns the `<key>` (`context_window`).
+fn model_limit_field_key(field: &FieldMeta) -> Option<&'static str> {
+    match field.toml_path {
+        ["model_limits", "*", key] => Some(key),
+        _ => None,
+    }
+}
+
+/// Build a `[model_limits."<provider>:<model>"].<key>` write. "auto"/cleared
+/// removes the whole entry (its only field is the window), so the resolver
+/// falls back to the auto-resolved layers.
+fn model_limit_edit(model_key: &str, child_key: &'static str, value: &FieldValue) -> SettingsEdit {
+    match value {
+        FieldValue::Integer(v) | FieldValue::OptionalInteger(Some(v)) => SettingsEdit {
+            path: &[],
+            op: EditOp::SetTableEntry {
+                table_path: &["model_limits"],
+                key: model_key.to_string(),
+                fields: vec![(child_key, EditOp::SetInteger(*v))],
+            },
+        },
+        _ => SettingsEdit {
+            path: &[],
+            op: EditOp::RemoveTableEntry {
+                table_path: &["model_limits"],
+                key: model_key.to_string(),
+            },
+        },
+    }
+}
+
 /// Canonical slug of the active provider (the `[providers.<name>]` key).
 fn active_provider_section(state: &ConfigScreenState) -> String {
     super::active_provider_slug(&state.effective)
@@ -585,12 +618,17 @@ fn save_field_inner(
     let pre_write_bytes = std::fs::read(&target_path).ok();
     state.push_undo_snapshot(target_path.clone(), pre_write_bytes);
 
-    let mut edits: Vec<SettingsEdit> = vec![match provider_routing_field_key(field) {
+    let mut edits: Vec<SettingsEdit> = vec![if let Some(key) = provider_routing_field_key(field) {
         // Per-provider routing fields (`[providers.*].<key>`) write to the
-        // ACTIVE provider's table via a runtime-keyed table entry — the static
-        // `toml_path` can't carry the dynamic provider name.
-        Some(key) => provider_routing_edit(&active_provider_section(state), key, &value),
-        None => field_edit(field, &value),
+        // ACTIVE provider's table via a runtime-keyed table entry — the
+        // static `toml_path` can't carry the dynamic provider name.
+        provider_routing_edit(&active_provider_section(state), key, &value)
+    } else if let Some(child) = model_limit_field_key(field) {
+        // Per-model limit fields write to `[model_limits."provider:model"]`
+        // for the ACTIVE model — same runtime-keyed-table reason.
+        model_limit_edit(&state.effective.model_limit_key(), child, &value)
+    } else {
+        field_edit(field, &value)
     }];
     if is_permission_detail_field(field) {
         edits.push(SettingsEdit {

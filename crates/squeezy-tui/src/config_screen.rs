@@ -984,6 +984,22 @@ impl ConfigScreenState {
             }
             return (value, FieldSource::Default);
         }
+        // Per-model limit fields (`["model_limits","*",<key>]`) resolve against
+        // the active `provider:model`: show the resolved value via `get`, badge
+        // from whether THIS model's entry is set in the active tab's chain.
+        if let ["model_limits", "*", key] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            let map_key = self.effective.model_limit_key();
+            let real: [&str; 3] = ["model_limits", map_key.as_str(), key];
+            for (src, tier) in chain {
+                if let Some(t) = tier
+                    && t.contains_path(&real)
+                {
+                    return (value, *src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
         // AI-reviewer fields resolve against the running config so the row
         // reflects what will actually be used (the resolved reviewer model, the
         // active capability set) rather than a static, often-empty default. The
@@ -1039,6 +1055,31 @@ impl ConfigScreenState {
             let value = (field.get)(&self.effective);
             let slug = active_provider_slug(&self.effective);
             let real: [&str; 3] = ["providers", slug.as_str(), key];
+            let chain = [
+                (FieldSource::Repo, ConfigScope::Local, &self.sources.repo),
+                (
+                    FieldSource::Project,
+                    ConfigScope::Repo,
+                    &self.sources.project,
+                ),
+                (FieldSource::User, ConfigScope::User, &self.sources.user),
+            ];
+            for (src, owns_scope, tier) in chain {
+                if Some(owns_scope) == skip {
+                    continue;
+                }
+                if let Some(t) = tier
+                    && t.contains_path(&real)
+                {
+                    return (value, src);
+                }
+            }
+            return (value, FieldSource::Default);
+        }
+        if let ["model_limits", "*", key] = field.toml_path {
+            let value = (field.get)(&self.effective);
+            let map_key = self.effective.model_limit_key();
+            let real: [&str; 3] = ["model_limits", map_key.as_str(), key];
             let chain = [
                 (FieldSource::Repo, ConfigScope::Local, &self.sources.repo),
                 (

@@ -11572,3 +11572,77 @@ fn conversation_shape_attributes_load_skill_outputs_to_skills_bucket() {
     // A non-load_skill output never leaks into the skills bucket.
     assert!(shape.skill_output_bytes < shape.tool_output_bytes);
 }
+
+#[test]
+fn derive_model_context_window_arms_for_curated_dormant_for_unknown() {
+    let provider = MockProvider::named("openai", vec![]);
+    // A curated model resolves a real window and arms compaction.
+    let mut config = AppConfig {
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        ..AppConfig::default()
+    };
+    assert!(
+        derive_model_context_window(&config, &provider, None).is_some(),
+        "curated model must arm compaction with a registry window"
+    );
+    // An unknown model stays dormant rather than arming off the 272K guess.
+    config.model = "no-such-model-zzz-999".to_string();
+    assert!(
+        derive_model_context_window(&config, &provider, None).is_none(),
+        "unknown model must keep mid-turn compaction dormant"
+    );
+    // An explicit operator window arms it even for an unknown model.
+    assert_eq!(
+        derive_model_context_window(&config, &provider, Some(123_000)),
+        Some(123_000),
+    );
+}
+
+#[test]
+fn model_fits_conversation_skips_reroute_when_window_too_small() {
+    let mut config = AppConfig::default();
+    let slug = squeezy_core::provider_slug(&config.provider);
+    let key = format!("{slug}:cheap-x");
+    // ~5K tokens of conversation.
+    let convo = vec![LlmInputItem::UserText("x".repeat(20_000))];
+    // A tiny pinned window for the cheap model must NOT fit → stay on parent.
+    config.model_limits.insert(
+        key.clone(),
+        squeezy_core::ModelLimitOverride {
+            context_window: Some(100),
+        },
+    );
+    assert!(
+        !model_fits_conversation(&config, slug, None, "cheap-x", &convo, None),
+        "a conversation larger than the cheap model's window must not reroute"
+    );
+    // A roomy pinned window fits → reroute is allowed.
+    config.model_limits.insert(
+        key,
+        squeezy_core::ModelLimitOverride {
+            context_window: Some(1_000_000),
+        },
+    );
+    assert!(
+        model_fits_conversation(&config, slug, None, "cheap-x", &convo, None),
+        "a conversation that fits the cheap model's window may reroute"
+    );
+}
+
+#[test]
+fn model_fits_conversation_honors_global_override() {
+    let config = AppConfig::default();
+    let slug = squeezy_core::provider_slug(&config.provider);
+    // ~5K tokens; "cheap-y" has no per-model entry and is unknown to the catalog.
+    let convo = vec![LlmInputItem::UserText("x".repeat(20_000))];
+    // A small GLOBAL [context].model_context_window must still constrain a cheap
+    // reroute even with no per-model entry, mirroring the parent path.
+    assert!(
+        !model_fits_conversation(&config, slug, Some(100), "cheap-y", &convo, None),
+        "a small global window must block a cheap reroute"
+    );
+    assert!(
+        model_fits_conversation(&config, slug, Some(1_000_000), "cheap-y", &convo, None),
+        "a large global window allows the reroute"
+    );
+}

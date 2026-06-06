@@ -4120,6 +4120,12 @@ fn format_cost_command_renders_active_buckets() {
         used_input_percent_x100: None,
         tokenizer: TokenizerKind::OpenAiCompatible,
         estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
     };
 
     let metrics = SessionMetrics {
@@ -4308,6 +4314,12 @@ fn context_breaks_out_skills_and_mcp_sources() {
         used_input_percent_x100: None,
         tokenizer: TokenizerKind::OpenAiCompatible,
         estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
     };
 
     // 4_400 tool-output bytes, of which 4_000 came from load_skill: skills are
@@ -7641,6 +7653,12 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         used_input_percent_x100: Some(30_86),
         tokenizer: TokenizerKind::OpenAiCompatible,
         estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
     };
     let snapshot = SessionAccountingSnapshot {
         session_id: Some("sess-context".to_string()),
@@ -7663,7 +7681,10 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
     let body = commands::format_context_command(&snapshot);
 
     app.push_transcript_item(TranscriptItem::system(body));
-    let output = render_to_string(&app, 120, 40);
+    // Tall enough to render the full (provenance-enriched) /context body so the
+    // header through the per-source breakdown are all visible at once; the test
+    // is about staying expanded, not about a specific line budget.
+    let output = render_to_string(&app, 120, 50);
 
     assert!(output.contains("Context window"), "{output}");
     assert!(output.contains("Consumption by source"), "{output}");

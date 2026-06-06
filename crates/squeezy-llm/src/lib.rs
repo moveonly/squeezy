@@ -50,6 +50,7 @@ mod contribution;
 mod credentials;
 mod faux;
 mod google;
+pub mod limits;
 pub mod model_discovery;
 pub mod models_dev;
 pub mod oauth;
@@ -84,9 +85,16 @@ pub use credentials::{
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
+pub use limits::{
+    ContextLimitInput, LimitConfidence, LimitSource, ResolvedContextLimits,
+    effective_window_tokens, resolve_context_limits,
+};
 pub use model_discovery::{
     CONSERVATIVE_FALLBACK_CAPABILITIES, CapabilitySource, ResolvedCapabilities,
     resolve_capabilities, resolve_capabilities_with,
+};
+pub use models_dev::{
+    ModelsDevLimits, ModelsDevView, cached_models_dev_view, models_dev_provider_ids,
 };
 pub use oauth::{
     ANTHROPIC_OAUTH_TOKEN_PREFIX, AnthropicLoginConfig, AnthropicOAuthSource,
@@ -114,9 +122,10 @@ pub use ollama::{
 pub use openai::OpenAiProvider;
 pub use overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal};
 pub use registry::{
-    MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
-    RequestTokenEstimate, TokenPricing, TokenizerKind, capabilities_for, estimate_cost,
-    estimate_request_context, estimate_request_context_calibrated, model_info_for,
+    DEFAULT_BASELINE_RESERVE_TOKENS, MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle,
+    ModelLimits, PROVIDERS, RequestTokenEstimate, TokenPricing, TokenizerKind, capabilities_for,
+    curated_model_info_for, estimate_cost, estimate_request_context,
+    estimate_request_context_calibrated, estimate_request_context_full, model_info_for,
     models_for_provider, provider_from_config, provider_honors_output_schema, provider_name,
 };
 pub use xai::XaiProvider;

@@ -714,6 +714,13 @@ pub struct AppConfig {
     /// allowlist) without rebuilding the whole config. Routing is
     /// provider-scoped and never crosses providers.
     pub providers: BTreeMap<String, ProviderSettings>,
+    /// Per-model context-window overrides keyed by `"<provider>:<model>"`
+    /// (`[model_limits."openai:gpt-5.5"]`). The single user-facing knob for the
+    /// limit resolver; an entry for the active model wins over every
+    /// auto-resolved layer. Keyed per-model so switching models never carries a
+    /// stale window forward.
+    #[serde(default)]
+    pub model_limits: BTreeMap<String, ModelLimitOverride>,
     pub hardening: HardeningConfig,
     pub config_sources: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -726,7 +733,31 @@ pub struct ConfigWarning {
     pub field: String,
 }
 
+/// Canonical provider slug (`openai`, `anthropic`, an aggregator preset, …)
+/// used both as the `[providers.<slug>]` key and as the provider half of a
+/// `[model_limits."<provider>:<model>"]` key. One source of truth so the config
+/// screen's write key and every reader of [`AppConfig::model_limit_key`] agree.
+pub fn provider_slug(provider: &ProviderConfig) -> &'static str {
+    match provider {
+        ProviderConfig::OpenAi(_) => "openai",
+        ProviderConfig::Anthropic(_) => "anthropic",
+        ProviderConfig::Google(_) => "google",
+        ProviderConfig::AzureOpenAi(_) => "azure_openai",
+        ProviderConfig::Bedrock(_) => "bedrock",
+        ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCodex(_) => "openai_codex",
+        ProviderConfig::GitHubCopilot(_) => "github_copilot",
+        ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
+        ProviderConfig::Faux(_) => "faux",
+    }
+}
+
 impl AppConfig {
+    /// The `[model_limits]` key for the active `(provider, model)`.
+    pub fn model_limit_key(&self) -> String {
+        format!("{}:{}", provider_slug(&self.provider), self.model)
+    }
+
     pub fn from_env() -> Self {
         Self::from_env_vars(None, |name| env::var(name).ok())
     }
@@ -857,6 +888,7 @@ impl AppConfig {
             .trim()
             .to_ascii_lowercase();
         let providers = settings.providers.unwrap_or_default();
+        let model_limits = settings.model_limits.unwrap_or_default();
         let provider = match provider_name.as_str() {
             "anthropic" | "claude" => ProviderConfig::Anthropic(AnthropicConfig {
                 api_key_env: get_var("ANTHROPIC_API_KEY_ENV")
@@ -1410,6 +1442,7 @@ impl AppConfig {
             tui,
             mcp_servers,
             providers,
+            model_limits,
             hardening: HardeningConfig::from_settings(settings.hardening.unwrap_or_default()),
             config_sources: sources,
             config_warnings,
@@ -1666,6 +1699,12 @@ impl AppConfig {
         ));
         if let Some(window) = self.context_compaction.model_context_window {
             output.push_str(&format!("model_context_window = {}\n", window));
+        }
+        if let Some(percent) = self.context_compaction.effective_context_window_percent {
+            output.push_str(&format!("effective_context_window_percent = {}\n", percent));
+        }
+        if let Some(reserve) = self.context_compaction.baseline_reserve_tokens {
+            output.push_str(&format!("baseline_reserve_tokens = {}\n", reserve));
         }
         output.push_str(&format!(
             "threshold_percent = {}\n",
@@ -3415,6 +3454,33 @@ impl ReasoningEffort {
     }
 }
 
+/// One `[model_limits."<provider>:<model>"]` entry — the per-model context
+/// window override. Today it carries only the window; kept as a table (not a
+/// bare int) so future per-model limit knobs slot in without a format change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelLimitOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+impl ModelLimitOverride {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["context_window"], source, path)?;
+        Ok(Self {
+            context_window: u64_value(
+                table,
+                "context_window",
+                source,
+                &field(path, "context_window"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.context_window, next.context_window);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SettingsFile {
     pub provider: Option<String>,
@@ -3422,6 +3488,7 @@ pub struct SettingsFile {
     pub model: Option<String>,
     pub model_settings: Option<ModelSettings>,
     pub providers: Option<BTreeMap<String, ProviderSettings>>,
+    pub model_limits: Option<BTreeMap<String, ModelLimitOverride>>,
     pub agent: Option<AgentSettings>,
     pub session: Option<SessionSettings>,
     pub context: Option<ContextCompactionSettings>,
@@ -3492,6 +3559,7 @@ impl SettingsFile {
                 "profile",
                 "model",
                 "providers",
+                "model_limits",
                 "agent",
                 "session",
                 "context",
@@ -3532,6 +3600,7 @@ impl SettingsFile {
             }
         }
         settings.providers = providers_settings(table, source)?;
+        settings.model_limits = model_limits_settings(table, source)?;
         settings.agent = optional_table(table, "agent", source)?
             .map(|table| AgentSettings::from_table(table, source, "agent"))
             .transpose()?;
@@ -3621,6 +3690,7 @@ impl SettingsFile {
             ModelSettings::merge,
         );
         merge_provider_maps(&mut self.providers, next.providers);
+        merge_model_limit_maps(&mut self.model_limits, next.model_limits);
         merge_option(&mut self.agent, next.agent, AgentSettings::merge);
         merge_option(&mut self.session, next.session, SessionSettings::merge);
         merge_option(
@@ -5312,6 +5382,8 @@ pub struct ContextCompactionSettings {
     pub user_memory_max_bytes: Option<usize>,
     pub enabled_mid_turn: Option<bool>,
     pub model_context_window: Option<u64>,
+    pub effective_context_window_percent: Option<u8>,
+    pub baseline_reserve_tokens: Option<u64>,
     pub threshold_percent: Option<u8>,
     pub strategy: Option<CompactionStrategy>,
     pub model_assisted_model: Option<String>,
@@ -5337,6 +5409,8 @@ impl ContextCompactionSettings {
                 "user_memory_max_bytes",
                 "enabled_mid_turn",
                 "model_context_window",
+                "effective_context_window_percent",
+                "baseline_reserve_tokens",
                 "threshold_percent",
                 "strategy",
                 "model_assisted_model",
@@ -5404,6 +5478,18 @@ impl ContextCompactionSettings {
                 "model_context_window",
                 source,
                 &field(path, "model_context_window"),
+            )?,
+            effective_context_window_percent: u8_value(
+                table,
+                "effective_context_window_percent",
+                source,
+                &field(path, "effective_context_window_percent"),
+            )?,
+            baseline_reserve_tokens: u64_value(
+                table,
+                "baseline_reserve_tokens",
+                source,
+                &field(path, "baseline_reserve_tokens"),
             )?,
             threshold_percent: u8_value(
                 table,
@@ -5487,6 +5573,14 @@ impl ContextCompactionSettings {
         replace_if_some(&mut self.user_memory_max_bytes, next.user_memory_max_bytes);
         replace_if_some(&mut self.enabled_mid_turn, next.enabled_mid_turn);
         replace_if_some(&mut self.model_context_window, next.model_context_window);
+        replace_if_some(
+            &mut self.effective_context_window_percent,
+            next.effective_context_window_percent,
+        );
+        replace_if_some(
+            &mut self.baseline_reserve_tokens,
+            next.baseline_reserve_tokens,
+        );
         replace_if_some(&mut self.threshold_percent, next.threshold_percent);
         replace_if_some(&mut self.strategy, next.strategy);
         replace_if_some(&mut self.model_assisted_model, next.model_assisted_model);
@@ -5809,6 +5903,15 @@ pub struct ContextCompactionConfig {
     /// compaction stays dormant and the post-turn auto trigger is the only
     /// path. Squeezy does not auto-detect this per-provider yet.
     pub model_context_window: Option<u64>,
+    /// Optional override for the percent of the raw window treated as usable
+    /// (the rest is headroom). `None` lets the limit resolver use the curated
+    /// model's percent, falling back to 95. Surfaces the previously-hidden
+    /// effective-window reduction so it is inspectable and tunable.
+    pub effective_context_window_percent: Option<u8>,
+    /// Optional override for the flat token reserve carved off the effective
+    /// window for system framing. `None` uses
+    /// `squeezy_llm::DEFAULT_BASELINE_RESERVE_TOKENS` (12_000).
+    pub baseline_reserve_tokens: Option<u64>,
     /// Fraction of `model_context_window` (0..=100) at which mid-turn
     /// compaction fires. Capped to 100 on read.
     pub threshold_percent: u8,
@@ -5892,6 +5995,20 @@ impl ContextCompactionConfig {
                 .as_deref()
                 .and_then(|raw| raw.parse::<u64>().ok())
                 .or(settings.model_context_window),
+            effective_context_window_percent: get_var(
+                "SQUEEZY_CONTEXT_EFFECTIVE_CONTEXT_WINDOW_PERCENT",
+            )
+            .as_deref()
+            .and_then(|raw| raw.parse::<u8>().ok())
+            .or(settings.effective_context_window_percent)
+            // Clamp BOTH env and file values to 1..=100 — a checked-in 200 would
+            // otherwise double the usable window and 0 would zero it. The config
+            // screen enforces the same range; this guards raw TOML/env.
+            .map(|percent| percent.clamp(1, 100)),
+            baseline_reserve_tokens: get_var("SQUEEZY_CONTEXT_BASELINE_RESERVE_TOKENS")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .or(settings.baseline_reserve_tokens),
             threshold_percent: clamp_percent(
                 get_var("SQUEEZY_CONTEXT_COMPACTION_THRESHOLD_PERCENT")
                     .as_deref()
@@ -6019,6 +6136,8 @@ impl Default for ContextCompactionConfig {
             user_memory_max_bytes: DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES,
             enabled_mid_turn: true,
             model_context_window: None,
+            effective_context_window_percent: None,
+            baseline_reserve_tokens: None,
             threshold_percent: DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT,
             strategy: CompactionStrategy::default(),
             model_assisted_model: None,
@@ -12070,6 +12189,44 @@ fn merge_provider_maps(
             Entry::Occupied(mut entry) => entry.get_mut().merge(provider),
             Entry::Vacant(entry) => {
                 entry.insert(provider);
+            }
+        }
+    }
+}
+
+fn model_limits_settings(
+    table: &toml::value::Table,
+    source: &str,
+) -> Result<Option<BTreeMap<String, ModelLimitOverride>>> {
+    let Some(limits) = optional_table(table, "model_limits", source)? else {
+        return Ok(None);
+    };
+    let mut result = BTreeMap::new();
+    for (key, value) in limits {
+        let entry_table = value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field("model_limits", key), "table"))?;
+        result.insert(
+            key.clone(),
+            ModelLimitOverride::from_table(entry_table, source, &field("model_limits", key))?,
+        );
+    }
+    Ok(Some(result))
+}
+
+fn merge_model_limit_maps(
+    target: &mut Option<BTreeMap<String, ModelLimitOverride>>,
+    next: Option<BTreeMap<String, ModelLimitOverride>>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let target = target.get_or_insert_with(BTreeMap::new);
+    for (key, override_entry) in next {
+        match target.entry(key) {
+            Entry::Occupied(mut entry) => entry.get_mut().merge(override_entry),
+            Entry::Vacant(entry) => {
+                entry.insert(override_entry);
             }
         }
     }

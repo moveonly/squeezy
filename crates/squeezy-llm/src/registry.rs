@@ -13,7 +13,9 @@ use squeezy_core::{
 use crate::{
     AnthropicProvider, BedrockProvider, FauxProvider, GoogleProvider, LlmInputItem, LlmProvider,
     LlmRequest, OllamaProvider, OpenAiCodexProvider, OpenAiCompatibleProvider, OpenAiProvider,
-    XaiProvider, oauth::GitHubCopilotProvider,
+    XaiProvider,
+    limits::{ContextLimitInput, LimitConfidence, LimitSource, resolve_context_limits},
+    oauth::GitHubCopilotProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -144,6 +146,17 @@ pub struct RequestTokenEstimate {
     pub used_input_percent_x100: Option<u32>,
     pub tokenizer: TokenizerKind,
     pub estimated: bool,
+    /// Where `context_window_tokens` came from, and how much to trust it.
+    pub limit_source: LimitSource,
+    pub limit_confidence: LimitConfidence,
+    /// Set when a provider context-overflow error clamped the window.
+    pub observed_ceiling_tokens: Option<u64>,
+    /// The window models.dev reports (even if not the selected source).
+    pub models_dev_window_tokens: Option<u64>,
+    /// The percent + flat reserve used to derive `effective_context_window_tokens`,
+    /// surfaced so the previously-hidden reduction is inspectable.
+    pub effective_context_window_percent: u8,
+    pub baseline_reserve_tokens: u64,
 }
 
 pub static MODEL_REGISTRY: LazyLock<Vec<ModelInfo>> = LazyLock::new(load_models);
@@ -165,9 +178,15 @@ struct RawModelInfo {
     metadata_source: String,
 }
 
-fn default_effective_context_window_percent() -> u8 {
+pub(crate) fn default_effective_context_window_percent() -> u8 {
     95
 }
+
+/// Flat token reserve carved off every effective window for system framing
+/// (tool schemas, instructions, response scaffolding) that the per-request
+/// estimate can't see ahead of time. Exposed so the resolver and the UI share
+/// one constant instead of a buried magic number.
+pub const DEFAULT_BASELINE_RESERVE_TOKENS: u64 = 12_000;
 
 fn load_models() -> Vec<ModelInfo> {
     let raw = serde_json::from_str::<Vec<RawModelInfo>>(include_str!("models.json"))
@@ -325,10 +344,18 @@ fn is_text_model_picker_eligible(provider: &str, model: &str) -> bool {
 }
 
 pub fn model_info_for(provider: &str, model: &str) -> Option<&'static ModelInfo> {
+    curated_model_info_for(provider, model)
+        .or_else(|| Some(cached_fallback_model_info(provider, model)))
+}
+
+/// Curated registry lookup WITHOUT the synthetic-fallback tail. Returns `None`
+/// for any `(provider, model)` not hand-curated in `models.json`, so the limit
+/// resolver can distinguish a real bundled entry (trustworthy) from the 272K
+/// guess and let models.dev fill the gap in between.
+pub fn curated_model_info_for(provider: &str, model: &str) -> Option<&'static ModelInfo> {
     MODEL_REGISTRY
         .iter()
         .find(|entry| entry.provider == provider && entry.id == model)
-        .or_else(|| Some(cached_fallback_model_info(provider, model)))
 }
 
 pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
@@ -368,8 +395,10 @@ pub fn estimate_request_context(
 
 /// Variant of [`estimate_request_context`] that uses a caller-supplied
 /// [`TokenCalibration`] to convert bytes to tokens. When `calibration` is
-/// `None` we fall back to the provider's default bytes-per-token ratio, so
-/// the old behaviour is preserved exactly.
+/// `None` we fall back to the provider's default bytes-per-token ratio. Does
+/// NOT consult the models.dev cache (so unit tests stay deterministic); use
+/// [`estimate_request_context_full`] to thread the live catalog and the other
+/// resolver layers.
 pub fn estimate_request_context_calibrated(
     provider: &str,
     model: &str,
@@ -377,40 +406,50 @@ pub fn estimate_request_context_calibrated(
     context_window_override: Option<u64>,
     calibration: Option<&crate::tokens::TokenCalibration>,
 ) -> RequestTokenEstimate {
+    let mut input = ContextLimitInput::new(provider, model);
+    input.user_override = context_window_override;
+    estimate_request_context_full(&input, request, calibration)
+}
+
+/// Full estimate driven by the layered limit resolver. Callers supply whatever
+/// resolution layers they have (override, live provider window, observed
+/// ceiling, models.dev view, effective-window knobs) via [`ContextLimitInput`];
+/// the provenance of the chosen window rides back out on the estimate.
+pub fn estimate_request_context_full(
+    input: &ContextLimitInput<'_>,
+    request: &LlmRequest,
+    calibration: Option<&crate::tokens::TokenCalibration>,
+) -> RequestTokenEstimate {
+    let provider = input.provider;
+    let model = input.model;
     let bytes_per_token = calibration
         .map(|c| c.bytes_per_token(provider))
         .unwrap_or_else(|| crate::tokens::default_bytes_per_token(provider));
-    let info = model_info_for(provider, model);
-    let tokenizer = info
+    let tokenizer = curated_model_info_for(provider, model)
         .map(|entry| entry.tokenizer)
-        .unwrap_or(TokenizerKind::OpenAiCompatible);
+        .unwrap_or_else(|| fallback_tokenizer(provider, model));
     let input_tokens = estimate_request_input_tokens(request, bytes_per_token);
-    let model_limits = info.and_then(|entry| entry.limits);
-    let context_window_tokens =
-        context_window_override.or(model_limits.map(|limits| limits.context_window_tokens));
-    let effective_context_window_tokens = context_window_tokens.map(|window| {
-        let percent = model_limits
-            .map(|limits| limits.effective_context_window_percent)
-            .unwrap_or(95);
-        window
-            .saturating_mul(u64::from(percent))
-            .saturating_div(100)
-    });
-    const BASELINE_TOKENS: u64 = 12_000;
-    let effective_context_window_tokens =
-        effective_context_window_tokens.map(|window| window.saturating_sub(BASELINE_TOKENS));
+
+    let resolved = resolve_context_limits(input);
+    let context_window_tokens = resolved.context_window_tokens;
+    let effective_context_window_tokens = crate::limits::effective_window_tokens(&resolved);
     let headroom_tokens = context_window_tokens
         .zip(effective_context_window_tokens)
         .map(|(raw_window, effective_window)| raw_window.saturating_sub(effective_window));
+    // Cap an explicit request value at the model's real max output, but NOT at
+    // the synthetic 64K fallback for unknown models — that would silently
+    // shrink what the operator asked for. The cap only applies when the limit
+    // came from a trustworthy layer.
+    let max_output_cap = if matches!(resolved.source, LimitSource::SyntheticFallback) {
+        None
+    } else {
+        resolved.max_output_tokens
+    };
     let max_output_tokens = request
         .max_output_tokens
         .map(u64::from)
-        .or(model_limits.map(|limits| limits.max_output_tokens))
-        .map(|tokens| {
-            model_limits
-                .map(|limits| tokens.min(limits.max_output_tokens))
-                .unwrap_or(tokens)
-        });
+        .or(resolved.max_output_tokens)
+        .map(|tokens| max_output_cap.map(|cap| tokens.min(cap)).unwrap_or(tokens));
     let input_budget_tokens = effective_context_window_tokens
         .map(|window| window.saturating_sub(max_output_tokens.unwrap_or(0)));
     let remaining_input_tokens =
@@ -431,6 +470,12 @@ pub fn estimate_request_context_calibrated(
         used_input_percent_x100,
         tokenizer,
         estimated: true,
+        limit_source: resolved.source,
+        limit_confidence: resolved.confidence,
+        observed_ceiling_tokens: resolved.observed_ceiling_tokens,
+        models_dev_window_tokens: resolved.models_dev_window_tokens,
+        effective_context_window_percent: resolved.effective_context_window_percent,
+        baseline_reserve_tokens: resolved.baseline_reserve_tokens,
     }
 }
 

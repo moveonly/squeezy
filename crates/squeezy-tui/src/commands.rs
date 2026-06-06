@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use squeezy_agent::{
     Agent, McpAccounting, ReviewerAuditEntry, SessionAccountingSnapshot, SkillsAccounting,
 };
-use squeezy_llm::RequestTokenEstimate;
+use squeezy_llm::{LimitSource, RequestTokenEstimate};
 use squeezy_store::parse_bug_report_section;
 
 use crate::commands_style as style;
@@ -223,6 +223,67 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
             "  {} max_output_reserve: {} tokens\n",
             style::accent("◌"),
             style::accent(&style::group_thousands(max_output)),
+        ));
+    }
+
+    // Provenance: where the window came from and how much to trust it, plus the
+    // previously-hidden effective reduction — so an exact user/provider value
+    // reads differently from a 272K guess. Kept to one line in the common case.
+    let est = &snapshot.transmitted_request;
+    let mut source_line = format!(
+        "  {} source: {} ({})",
+        style::accent("◈"),
+        style::accent(est.limit_source.as_str()),
+        est.limit_confidence.as_str(),
+    );
+    if let (Some(raw), Some(effective)) = (
+        est.context_window_tokens,
+        est.effective_context_window_tokens,
+    ) {
+        source_line.push_str(&format!(
+            "  ·  effective {} {}",
+            style::accent(&style::group_thousands(effective)),
+            style::muted(&format!(
+                "({}% of {} −{} baseline)",
+                est.effective_context_window_percent,
+                style::group_thousands(raw),
+                style::group_thousands(est.baseline_reserve_tokens),
+            )),
+        ));
+    }
+    source_line.push('\n');
+    out.push_str(&source_line);
+    if matches!(est.limit_source, LimitSource::SyntheticFallback) {
+        out.push_str(&format!(
+            "  {}\n",
+            style::muted(
+                "window is a generic estimate — set context_window for this model on the Models \
+                 config page for accuracy",
+            ),
+        ));
+    }
+    if matches!(est.limit_source, LimitSource::ObservedBound)
+        && let Some(ceiling) = est.observed_ceiling_tokens
+    {
+        out.push_str(&format!(
+            "  {} {}\n",
+            style::accent("◈"),
+            style::muted(&format!(
+                "clamped to {} after a provider context-overflow this session",
+                style::group_thousands(ceiling),
+            )),
+        ));
+    }
+    if let Some(dev) = est.models_dev_window_tokens
+        && Some(dev) != est.context_window_tokens
+    {
+        out.push_str(&format!(
+            "  {} {}\n",
+            style::accent("◈"),
+            style::muted(&format!(
+                "models.dev reports {}",
+                style::group_thousands(dev)
+            )),
         ));
     }
 
@@ -808,6 +869,11 @@ fn format_request_estimate(label: &str, estimate: &RequestTokenEstimate) -> Stri
     } else {
         output.push_str(" context_window=unknown");
     }
+    output.push_str(&format!(
+        " window_source={} window_confidence={}",
+        estimate.limit_source.as_str(),
+        estimate.limit_confidence.as_str(),
+    ));
     if let Some(max_output) = estimate.max_output_tokens {
         output.push_str(&format!(" max_output_reserve={max_output}"));
     } else {
