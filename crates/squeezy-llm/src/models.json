@@ -854,6 +854,31 @@
   },
   {
     "provider": "portkey",
+    "id": "anthropic/claude-sonnet-4-6",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://portkey.ai/docs/integrations/llms/anthropic"
+  },
+  {
+    "provider": "portkey",
     "id": "anthropic/claude-haiku-4-5",
     "profile": "cheap",
     "capabilities": {
@@ -976,6 +1001,31 @@
     "tokenizer": "anthropic",
     "lifecycle": "active",
     "metadata_source": "https://vercel.com/docs/ai-gateway/models"
+  },
+  {
+    "provider": "vercel",
+    "id": "anthropic/claude-sonnet-4.6",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": true,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://vercel.com/ai-gateway/models/claude-sonnet-4.6"
   },
   {
     "provider": "vercel",

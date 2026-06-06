@@ -18,18 +18,22 @@ static GITHUB_COPILOT_AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 fn resolve_opus_alias_for_anthropic() {
     assert_eq!(
         resolve_model_alias("anthropic", "opus"),
-        Some("claude-opus-4-7"),
+        Some("claude-opus-4-8"),
     );
     assert_eq!(
         resolve_model_alias("anthropic", "OPUS"),
-        Some("claude-opus-4-7")
+        Some("claude-opus-4-8")
     );
     assert_eq!(
         resolve_model_alias("anthropic", " opus "),
-        Some("claude-opus-4-7"),
+        Some("claude-opus-4-8"),
     );
     assert_eq!(
         resolve_model_alias("anthropic", "opus-4.8"),
+        Some("claude-opus-4-8"),
+    );
+    assert_eq!(
+        resolve_model_alias("anthropic", "best"),
         Some("claude-opus-4-8"),
     );
     assert_eq!(
@@ -75,7 +79,7 @@ fn resolve_alias_passes_through_full_ids_and_unknown_inputs() {
 fn resolve_alias_for_bedrock_and_google() {
     assert_eq!(
         resolve_model_alias("bedrock", "opus"),
-        Some(DEFAULT_BEDROCK_MODEL)
+        Some("anthropic.claude-opus-4-8")
     );
     assert_eq!(
         resolve_model_alias("bedrock", "opus-4.8"),
@@ -103,7 +107,7 @@ fn resolve_alias_for_bedrock_and_google() {
 fn resolve_opus_alias_for_anthropic_gateways() {
     assert_eq!(
         resolve_model_alias("openrouter", "opus"),
-        Some(DEFAULT_OPENROUTER_MODEL)
+        Some("anthropic/claude-opus-4.8")
     );
     assert_eq!(
         resolve_model_alias("openrouter", "opus-4.8"),
@@ -111,23 +115,43 @@ fn resolve_opus_alias_for_anthropic_gateways() {
     );
     assert_eq!(
         resolve_model_alias("openrouter", "opus-4-7"),
+        Some("anthropic/claude-opus-4-7")
+    );
+    assert_eq!(
+        resolve_model_alias("openrouter", "sonnet"),
         Some(DEFAULT_OPENROUTER_MODEL)
     );
     assert_eq!(
         resolve_model_alias("vercel", "best"),
-        Some(DEFAULT_VERCEL_AI_MODEL)
+        Some("anthropic/claude-opus-4.8")
     );
     assert_eq!(
         resolve_model_alias("vercel", "opus-4-8"),
         Some("anthropic/claude-opus-4.8")
     );
     assert_eq!(
+        resolve_model_alias("vercel", "opus-4.7"),
+        Some("anthropic/claude-opus-4.7")
+    );
+    assert_eq!(
+        resolve_model_alias("vercel", "sonnet"),
+        Some(DEFAULT_VERCEL_AI_MODEL)
+    );
+    assert_eq!(
         resolve_model_alias("portkey", "opus"),
-        Some(DEFAULT_PORTKEY_MODEL)
+        Some("anthropic/claude-opus-4-8")
     );
     assert_eq!(
         resolve_model_alias("portkey", "opus-4.8"),
         Some("anthropic/claude-opus-4-8")
+    );
+    assert_eq!(
+        resolve_model_alias("portkey", "opus-4-7"),
+        Some("anthropic/claude-opus-4-7")
+    );
+    assert_eq!(
+        resolve_model_alias("portkey", "sonnet"),
+        Some(DEFAULT_PORTKEY_MODEL)
     );
     assert_eq!(
         resolve_model_alias("cloudflare_workers_ai", "opus-4.8"),
@@ -334,10 +358,30 @@ fn catalog_includes_claude_opus_4_8_across_anthropic_routes() {
 }
 
 #[test]
+fn default_anthropic_routes_are_sonnet() {
+    let expected = [
+        ("anthropic", DEFAULT_ANTHROPIC_MODEL),
+        ("bedrock", DEFAULT_BEDROCK_MODEL),
+        ("openrouter", DEFAULT_OPENROUTER_MODEL),
+        ("portkey", DEFAULT_PORTKEY_MODEL),
+        ("vercel", DEFAULT_VERCEL_AI_MODEL),
+    ];
+
+    for (provider, model) in expected {
+        let info = model_info_for(provider, model)
+            .unwrap_or_else(|| panic!("missing default Sonnet row for {provider}/{model}"));
+        assert_ne!(info.metadata_source, "fallback");
+        assert_eq!(info.profile, squeezy_core::ModelProfile::Balanced);
+        assert_eq!(info.tokenizer.as_str(), "anthropic_estimate");
+    }
+}
+
+#[test]
 fn catalog_keeps_claude_opus_4_7_across_existing_routes() {
     let expected = [
         ("anthropic", "claude-opus-4-7"),
         ("openrouter", "anthropic/claude-opus-4-7"),
+        ("openrouter", "anthropic/claude-opus-4.7"),
         ("portkey", "anthropic/claude-opus-4-7"),
         ("vercel", "anthropic/claude-opus-4.7"),
     ];

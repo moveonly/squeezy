@@ -218,11 +218,11 @@ pub fn default_judge_prompt(provider: &str) -> &'static str {
 
 // OpenAI-compatible aggregators (full preset tier — curated models in models.json, dedicated costly test).
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-sonnet-4.6";
 pub const DEFAULT_VERCEL_AI_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
-pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4.7";
+pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-sonnet-4.6";
 pub const DEFAULT_PORTKEY_BASE_URL: &str = "https://api.portkey.ai/v1";
-pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-sonnet-4-6";
 // OpenAI-compatible single-vendor (full preset tier).
 pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const DEFAULT_GROQ_MODEL: &str = "llama-3.3-70b-versatile";
@@ -300,7 +300,7 @@ pub fn vertex_base_url(project: &str, location: &str) -> String {
 
 /// Resolve a bare-name model alias (e.g. `opus`, `sonnet`, `haiku`) to the
 /// provider-preferred full model ID, so `squeezy --model opus` resolves to
-/// `claude-opus-4-7` on Anthropic (or `claude-sonnet-4-6` for `sonnet`)
+/// `claude-opus-4-8` on Anthropic (or `claude-sonnet-4-6` for `sonnet`)
 /// instead of being sent verbatim and
 /// 404-ing downstream. Lookup is case-insensitive on the alias. Returns
 /// `None` for inputs that don't match any alias, in which case callers
@@ -309,27 +309,28 @@ pub fn vertex_base_url(project: &str, location: &str) -> String {
 pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> {
     let normalized = alias.trim().to_ascii_lowercase();
     match (provider, normalized.as_str()) {
-        ("anthropic", "opus" | "best" | "opus-4.7" | "opus-4-7") => Some("claude-opus-4-7"),
-        ("anthropic", "opus-4.8" | "opus-4-8") => Some("claude-opus-4-8"),
+        ("anthropic", "opus" | "best" | "opus-4.8" | "opus-4-8") => Some("claude-opus-4-8"),
+        ("anthropic", "opus-4.7" | "opus-4-7") => Some("claude-opus-4-7"),
         ("anthropic", "sonnet") => Some("claude-sonnet-4-6"),
         ("anthropic", "haiku") => Some("claude-haiku-4-5-20251001"),
         ("openai" | "azure_openai", "opus") => Some(DEFAULT_OPENAI_MODEL),
         ("openai" | "azure_openai", "sonnet") => Some("gpt-5.4-mini"),
         ("openai" | "azure_openai", "haiku") => Some("gpt-5.4-nano"),
         ("openai" | "azure_openai", "best") => Some(DEFAULT_OPENAI_MODEL),
-        ("bedrock", "opus-4.8" | "opus-4-8") => Some("anthropic.claude-opus-4-8"),
-        ("bedrock", "opus" | "best") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "opus" | "best" | "opus-4.8" | "opus-4-8") => Some("anthropic.claude-opus-4-8"),
         ("bedrock", "sonnet") => Some(DEFAULT_BEDROCK_MODEL),
         ("bedrock", "haiku") => Some(BEDROCK_SMALL_FAST_MODEL),
-        ("openrouter", "opus" | "best") => Some(DEFAULT_OPENROUTER_MODEL),
-        ("openrouter", "opus-4.8" | "opus-4-8") => Some("anthropic/claude-opus-4.8"),
-        ("openrouter", "opus-4.7" | "opus-4-7") => Some(DEFAULT_OPENROUTER_MODEL),
-        ("vercel", "opus" | "best") => Some(DEFAULT_VERCEL_AI_MODEL),
-        ("vercel", "opus-4.8" | "opus-4-8") => Some("anthropic/claude-opus-4.8"),
-        ("vercel", "opus-4.7" | "opus-4-7") => Some(DEFAULT_VERCEL_AI_MODEL),
-        ("portkey", "opus" | "best") => Some(DEFAULT_PORTKEY_MODEL),
-        ("portkey", "opus-4.8" | "opus-4-8") => Some("anthropic/claude-opus-4-8"),
-        ("portkey", "opus-4.7" | "opus-4-7") => Some(DEFAULT_PORTKEY_MODEL),
+        ("openrouter", "opus" | "best" | "opus-4.8" | "opus-4-8") => {
+            Some("anthropic/claude-opus-4.8")
+        }
+        ("openrouter", "opus-4.7" | "opus-4-7") => Some("anthropic/claude-opus-4-7"),
+        ("openrouter", "sonnet") => Some(DEFAULT_OPENROUTER_MODEL),
+        ("vercel", "opus" | "best" | "opus-4.8" | "opus-4-8") => Some("anthropic/claude-opus-4.8"),
+        ("vercel", "opus-4.7" | "opus-4-7") => Some("anthropic/claude-opus-4.7"),
+        ("vercel", "sonnet") => Some(DEFAULT_VERCEL_AI_MODEL),
+        ("portkey", "opus" | "best" | "opus-4.8" | "opus-4-8") => Some("anthropic/claude-opus-4-8"),
+        ("portkey", "opus-4.7" | "opus-4-7") => Some("anthropic/claude-opus-4-7"),
+        ("portkey", "sonnet") => Some(DEFAULT_PORTKEY_MODEL),
         ("cloudflare_workers_ai" | "cloudflare_ai_gateway", "opus-4.8" | "opus-4-8") => {
             Some("anthropic/claude-opus-4.8")
         }
