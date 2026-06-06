@@ -2834,10 +2834,12 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     }
 
     if is_large_prompt_paste(&normalized) {
-        let chars = normalized.chars().count();
-        let placeholder =
-            insert_prompt_text_token(app, format!("[Pasted Content {chars} chars]"), normalized);
-        app.status = format!("inserted {placeholder}");
+        if expand_duplicate_paste_at_cursor(app, &normalized) {
+            app.status = "expanded pasted text".to_string();
+        } else {
+            let placeholder = insert_prompt_pasted_text_token(app, normalized);
+            app.status = format!("inserted {placeholder}");
+        }
     } else {
         insert_input_text(app, &normalized);
     }
@@ -2897,8 +2899,12 @@ fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String>
     if truncated {
         replacement.push_str("\n[truncated]");
     }
-    let placeholder =
-        insert_prompt_text_token(app, format!("[Attached file {label}]"), replacement);
+    let placeholder = insert_prompt_text_token(
+        app,
+        format!("[Attached file {label}]"),
+        replacement,
+        PromptTextAttachmentKind::AttachedFile,
+    );
     Ok(format!("inserted {placeholder}"))
 }
 
@@ -2929,14 +2935,86 @@ fn insert_prompt_text_token(
     app: &mut TuiApp,
     base_placeholder: String,
     replacement: String,
+    kind: PromptTextAttachmentKind,
 ) -> String {
     let placeholder = unique_prompt_placeholder(app, &base_placeholder);
     insert_input_text(app, &placeholder);
     app.prompt_attachments.push(PromptAttachment {
         placeholder: placeholder.clone(),
-        payload: PromptAttachmentPayload::Text { replacement },
+        payload: PromptAttachmentPayload::Text { replacement, kind },
     });
     placeholder
+}
+
+fn insert_prompt_pasted_text_token(app: &mut TuiApp, text: String) -> String {
+    let paste_id = next_pasted_text_id(app);
+    let line_breaks = pasted_text_line_break_count(&text);
+    let placeholder = if line_breaks == 0 {
+        format!("[Pasted text #{paste_id}]")
+    } else {
+        format!("[Pasted text #{paste_id} +{line_breaks} lines]")
+    };
+    insert_prompt_text_token(app, placeholder, text, PromptTextAttachmentKind::PastedText)
+}
+
+fn next_pasted_text_id(app: &TuiApp) -> usize {
+    app.prompt_attachments
+        .iter()
+        .filter_map(|attachment| {
+            let PromptAttachmentPayload::Text {
+                kind: PromptTextAttachmentKind::PastedText,
+                ..
+            } = &attachment.payload
+            else {
+                return None;
+            };
+            pasted_text_placeholder_id(&attachment.placeholder)
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn pasted_text_line_break_count(text: &str) -> usize {
+    text.matches('\n').count()
+}
+
+fn pasted_text_placeholder_id(placeholder: &str) -> Option<usize> {
+    let rest = placeholder.strip_prefix("[Pasted text #")?;
+    let id = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if id.is_empty() {
+        return None;
+    }
+    id.parse().ok()
+}
+
+fn expand_duplicate_paste_at_cursor(app: &mut TuiApp, text: &str) -> bool {
+    let cursor = input_cursor(app);
+    let Some((placeholder, start)) = app.prompt_attachments.iter().find_map(|attachment| {
+        let PromptAttachmentPayload::Text {
+            replacement,
+            kind: PromptTextAttachmentKind::PastedText,
+        } = &attachment.payload
+        else {
+            return None;
+        };
+        if replacement != text || !app.input[..cursor].ends_with(&attachment.placeholder) {
+            return None;
+        }
+        let start = cursor.saturating_sub(attachment.placeholder.len());
+        Some((attachment.placeholder.clone(), start))
+    }) else {
+        return false;
+    };
+
+    app.input.replace_range(start..cursor, text);
+    app.input_cursor = start + text.len();
+    app.prompt_attachments
+        .retain(|attachment| attachment.placeholder != placeholder);
+    true
 }
 
 fn insert_prompt_image_token(
@@ -5348,7 +5426,7 @@ fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptT
             continue;
         }
         match attachment.payload {
-            PromptAttachmentPayload::Text { replacement } => {
+            PromptAttachmentPayload::Text { replacement, .. } => {
                 model_input = model_input.replace(&attachment.placeholder, &replacement);
             }
             PromptAttachmentPayload::Image { media_type, bytes } => {
@@ -15402,11 +15480,18 @@ pub(crate) struct PromptAttachment {
 enum PromptAttachmentPayload {
     Text {
         replacement: String,
+        kind: PromptTextAttachmentKind,
     },
     Image {
         media_type: String,
         bytes: Arc<[u8]>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptTextAttachmentKind {
+    PastedText,
+    AttachedFile,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

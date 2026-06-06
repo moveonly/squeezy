@@ -4488,7 +4488,7 @@ async fn large_paste_uses_visible_prompt_token() {
         .await
         .expect("handle paste");
 
-    let placeholder = format!("[Pasted Content {} chars]", pasted.chars().count());
+    let placeholder = "[Pasted text #1]".to_string();
     assert_eq!(app.input, placeholder);
     assert_eq!(app.prompt_attachments.len(), 1);
     assert!(app.attachments.is_empty());
@@ -4526,7 +4526,69 @@ async fn deleting_large_paste_token_drops_payload_before_submit() {
 }
 
 #[tokio::test]
-async fn duplicate_large_pastes_get_unique_prompt_tokens() {
+async fn immediate_duplicate_large_paste_expands_existing_token() {
+    let root = temp_workspace("tui_large_paste_immediate_dupe");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "line 1\n".repeat(LARGE_PASTE_CHAR_THRESHOLD / 7 + 1);
+
+    handle_paste(&mut app, &mut agent, pasted.replace('\n', "\r\n"))
+        .await
+        .expect("first paste");
+    assert_eq!(
+        app.input,
+        format!(
+            "[Pasted text #1 +{} lines]",
+            pasted_text_line_break_count(&pasted)
+        )
+    );
+    assert_eq!(app.prompt_attachments.len(), 1);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("second paste");
+
+    assert_eq!(app.input, pasted);
+    assert!(app.prompt_attachments.is_empty());
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.display_input, pasted);
+    assert_eq!(prepared.model_input, pasted);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn third_duplicate_large_paste_inserts_new_token_after_expansion() {
+    let root = temp_workspace("tui_large_paste_third_dupe");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 2);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("first paste");
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("second paste expands");
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("third paste inserts token");
+
+    let placeholder = "[Pasted text #1]";
+    assert_eq!(app.input, format!("{pasted}{placeholder}"));
+    assert_eq!(app.prompt_attachments.len(), 1);
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.model_input, format!("{pasted}{pasted}"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn non_adjacent_duplicate_large_pastes_get_unique_prompt_tokens() {
     let root = temp_workspace("tui_large_paste_dupe");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_without_session_log_with_config(config.clone());
@@ -4541,8 +4603,30 @@ async fn duplicate_large_pastes_get_unique_prompt_tokens() {
         .await
         .expect("second paste");
 
-    assert!(app.input.contains("[Pasted Content 1002 chars]"));
-    assert!(app.input.contains("[Pasted Content 1002 chars #2]"));
+    assert!(app.input.contains("[Pasted text #1]"));
+    assert!(app.input.contains("[Pasted text #2]"));
+    assert_eq!(app.prompt_attachments.len(), 2);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn different_large_paste_after_token_inserts_new_token() {
+    let root = temp_workspace("tui_large_paste_different");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let first = "a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+    let second = "b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+
+    handle_paste(&mut app, &mut agent, first)
+        .await
+        .expect("first paste");
+    handle_paste(&mut app, &mut agent, second)
+        .await
+        .expect("different paste");
+
+    assert_eq!(app.input, "[Pasted text #1][Pasted text #2]");
     assert_eq!(app.prompt_attachments.len(), 2);
 
     let _ = fs::remove_dir_all(root);
@@ -4825,6 +4909,7 @@ async fn slash_clear_wipes_transcript_and_rotates_to_a_fresh_session() {
         placeholder: "@file:1".to_string(),
         payload: PromptAttachmentPayload::Text {
             replacement: "file context".to_string(),
+            kind: PromptTextAttachmentKind::AttachedFile,
         },
     });
     app.prompt_queue.push_back("queued follow-up".to_string());
