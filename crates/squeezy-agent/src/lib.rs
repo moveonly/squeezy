@@ -124,6 +124,9 @@ pub use subagent_catalog::{
 // ceiling without truncating legitimate long-running exploration.
 const MAX_TOOL_ROUNDS: usize = 200;
 const MAX_PAUSE_TURN_REISSUES: usize = 2;
+/// One shot is enough: escalation jumps straight to the model's output
+/// ceiling, so a second attempt could not raise the budget any further.
+const MAX_MAX_TOKENS_ESCALATIONS: usize = 1;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
 const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
 const LOCAL_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -5656,6 +5659,22 @@ fn effective_tool_choice(configured: Option<&str>, round: usize) -> Option<Strin
     }
 }
 
+/// The escalated `max_output_tokens` to retry a `max_tokens`-truncated
+/// round with, or `None` when escalation can't help.
+///
+/// We escalate straight to the model's `ceiling` — but ONLY when the
+/// round ran under a *known, explicit* budget below it. `None` (provider
+/// default) is left alone: we can't tell whether it already sat at the
+/// ceiling, and re-issuing an identical request would just burn a second
+/// truncated round. A budget already at/over the ceiling has no headroom.
+fn escalated_max_output_tokens(current: Option<u32>, ceiling: Option<u64>) -> Option<u32> {
+    // Output budgets are far below u32::MAX; clamp defensively rather than
+    // wrap if a catalog ever lists an implausibly large ceiling.
+    let ceiling = u32::try_from(ceiling?).unwrap_or(u32::MAX);
+    let current = current?;
+    (current < ceiling).then_some(ceiling)
+}
+
 /// Appends a "Pinned context" block to the per-turn instructions.
 ///
 /// Pins are user-curated durable facts. They must be visible to the
@@ -6677,6 +6696,15 @@ impl TurnRuntime {
         // saw in the same turn.
         let mut deferred_retry_visible_assistant = String::new();
         let mut pause_turn_reissues = 0usize;
+        // One-shot escalation of `max_output_tokens` toward the model's
+        // output ceiling when a round is truncated by `max_tokens`. A
+        // conservatively-low configured budget is the common, recoverable
+        // cause of mid-output truncation; raising it to the ceiling and
+        // re-issuing the round turns that hard failure into a complete
+        // answer. `None` (provider default) is left alone — we can't know
+        // it has headroom, so we don't burn an identical retry on it.
+        let mut max_output_tokens_override: Option<u32> = None;
+        let mut max_tokens_escalations = 0usize;
         // Per-turn model routing decision. The classifier runs once at
         // the top of the turn; `current_model` is what each round
         // dispatches on. On mid-turn escalation it is overwritten with
@@ -6844,6 +6872,13 @@ impl TurnRuntime {
                 .await;
                 return Ok(());
             }
+            // The configured output budget, possibly raised for this round
+            // by a prior `max_tokens` truncation escalation. Used for the
+            // request AND the cost-cap projection / round-input gate so the
+            // cap sees the budget we will actually spend (not the lower
+            // configured one).
+            let effective_max_output_tokens =
+                max_output_tokens_override.or(self.config.max_output_tokens);
             // Two-stage cost-cap check: the post-hoc `session_cap_reached`
             // catches a session that crossed the cap on a prior round's
             // recorded provider cost, while `projected_session_cap_overrun`
@@ -6856,7 +6891,7 @@ impl TurnRuntime {
             let cap_status = broker.session_cap_reached().or_else(|| {
                 let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
                 let projected_output_tokens = CostBroker::projected_output_tokens(
-                    self.config.max_output_tokens,
+                    effective_max_output_tokens,
                     squeezy_llm::model_info_for(self.provider.name(), &current_model)
                         .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
                 );
@@ -6938,7 +6973,7 @@ impl TurnRuntime {
                 self.provider.name(),
                 &current_model,
                 CostBroker::projected_output_tokens(
-                    self.config.max_output_tokens,
+                    effective_max_output_tokens,
                     squeezy_llm::model_info_for(self.provider.name(), &current_model)
                         .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
                 ),
@@ -7009,7 +7044,7 @@ impl TurnRuntime {
                     self.provider.name(),
                     &current_model,
                     CostBroker::projected_output_tokens(
-                        self.config.max_output_tokens,
+                        effective_max_output_tokens,
                         squeezy_llm::model_info_for(self.provider.name(), &current_model)
                             .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
                     ),
@@ -7114,7 +7149,7 @@ impl TurnRuntime {
                 model: current_model.clone(),
                 instructions: Arc::from(cached_instructions),
                 input: Arc::from(next_input.as_slice()),
-                max_output_tokens: self.config.max_output_tokens,
+                max_output_tokens: effective_max_output_tokens,
                 temperature: self.config.temperature,
                 top_p: self.config.top_p,
                 seed: self.config.seed,
@@ -7816,6 +7851,35 @@ impl TurnRuntime {
                         reasoning_only_stop,
                         None,
                     );
+                    // Recover a low-budget truncation: raise the output
+                    // budget to the model's ceiling once and re-issue the
+                    // same round. The preservation path below already keeps
+                    // the partial text on the eventual failure, so escalation
+                    // only *adds* a chance to complete — it never loses the
+                    // cut. Skipped when the budget is unset (provider default,
+                    // unknown headroom) or already at the ceiling.
+                    if max_tokens_escalations < MAX_MAX_TOKENS_ESCALATIONS
+                        && let Some(escalated) = escalated_max_output_tokens(
+                            effective_max_output_tokens,
+                            squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                                .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
+                        )
+                    {
+                        max_output_tokens_override = Some(escalated);
+                        max_tokens_escalations += 1;
+                        // The truncated partial is superseded by the
+                        // higher-budget regeneration; drop it and retry
+                        // the same input (next_input / previous_response_id
+                        // are unchanged).
+                        assistant_message.clear();
+                        tracing::debug!(
+                            target: "squeezy_agent::max_tokens_escalation",
+                            round,
+                            escalated_max_output_tokens = escalated,
+                            "retrying max_tokens-truncated round at the model output ceiling",
+                        );
+                        continue;
+                    }
                     let raw_assistant_text = std::mem::take(&mut assistant_message);
                     self.preserve_visible_assistant_before_terminal_failure(
                         merge_retried_visible_assistant_text(

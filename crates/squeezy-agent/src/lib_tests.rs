@@ -9903,6 +9903,98 @@ async fn max_tokens_stop_reason_emits_failed_with_recovery_hint() {
 }
 
 #[tokio::test]
+async fn max_tokens_truncation_escalates_budget_and_recovers() {
+    // A round truncated by `max_tokens` under a low EXPLICIT output budget
+    // is retried once at the model's ceiling instead of hard-failing — the
+    // common, recoverable "operator set the budget too low" case.
+    let provider = Arc::new(MockProvider::new(vec![
+        // Round 0: truncated at the configured low budget.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("partial".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_trunc".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::MaxTokens),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Round 1: at the escalated budget the model completes cleanly.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("The answer is 42.".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_full".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig::default();
+    // An off-catalog model resolves to the synthetic-fallback limits
+    // (64k output ceiling), so escalation has known headroom above the
+    // configured 1k budget regardless of what the default model's curated
+    // entry happens to list.
+    config.model = "unknown-test-model".to_string();
+    config.max_output_tokens = Some(1_000);
+    config.routing.enabled = false;
+    let agent = Agent::new(config, provider.clone());
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut completed_text: Option<String> = None;
+    let mut failed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed_text = Some(message.content),
+            AgentEvent::Failed { .. } => failed = true,
+            _ => {}
+        }
+    }
+    assert!(!failed, "escalation should recover the turn, not fail it");
+    assert_eq!(completed_text.as_deref(), Some("The answer is 42."));
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one truncated round plus one escalated retry"
+    );
+    assert_eq!(
+        requests[0].max_output_tokens,
+        Some(1_000),
+        "the first round uses the configured budget"
+    );
+    let escalated = requests[1]
+        .max_output_tokens
+        .expect("retry must carry an escalated budget");
+    assert!(
+        escalated > 1_000,
+        "retry budget {escalated} must exceed the configured 1000 (raised to the model ceiling)"
+    );
+}
+
+#[test]
+fn escalated_max_output_tokens_only_raises_a_known_sub_ceiling_budget() {
+    // A known explicit budget below the ceiling escalates straight to it.
+    assert_eq!(
+        escalated_max_output_tokens(Some(1_000), Some(8_000)),
+        Some(8_000)
+    );
+    // Already at or over the ceiling: no headroom, don't retry.
+    assert_eq!(escalated_max_output_tokens(Some(8_000), Some(8_000)), None);
+    assert_eq!(escalated_max_output_tokens(Some(9_000), Some(8_000)), None);
+    // Unset budget (provider default): we can't tell it has headroom, so
+    // we don't burn an identical truncated retry.
+    assert_eq!(escalated_max_output_tokens(None, Some(8_000)), None);
+    // Unknown ceiling: nothing to escalate toward.
+    assert_eq!(escalated_max_output_tokens(Some(1_000), None), None);
+    // An implausibly large catalog ceiling clamps to u32::MAX, never wraps.
+    assert_eq!(
+        escalated_max_output_tokens(Some(1_000), Some(u64::from(u32::MAX) + 10)),
+        Some(u32::MAX)
+    );
+}
+
+#[tokio::test]
 async fn refusal_stop_reason_emits_failed_with_safety_hint() {
     let provider = Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),
