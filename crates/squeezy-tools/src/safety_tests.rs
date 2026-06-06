@@ -98,6 +98,23 @@ fn pre_classify_shell_falls_through_on_cargo() {
 }
 
 #[test]
+fn pre_classify_shell_falls_through_on_sonar_cli() {
+    let result = pre_classify_shell("sonar context list --json", &sandbox());
+    assert_eq!(result, ShellPreClassification::AskAi);
+}
+
+#[test]
+fn pre_classify_shell_names_redirect_instead_of_first_token() {
+    let result = pre_classify_shell("sonar context list > report.json", &sandbox());
+    match result {
+        ShellPreClassification::AutoDeny { reason } => {
+            assert_eq!(reason, "destructive redirect");
+        }
+        other => panic!("expected AutoDeny, got {other:?}"),
+    }
+}
+
+#[test]
 fn pre_classify_shell_auto_denies_sensitive_path() {
     // Default sandbox config ships with `.ssh/**` in sensitive_path_patterns
     // (see `default_sensitive_path_patterns` in squeezy-core).

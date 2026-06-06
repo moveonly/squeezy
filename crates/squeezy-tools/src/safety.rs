@@ -4,7 +4,7 @@ use squeezy_core::ShellSandboxConfig;
 
 use crate::shell::shell_command_references_sensitive_path;
 use crate::shell_parse::{
-    expand_wrapper_segments, is_destructive_shell_segment, is_read_only_shell_segment,
+    destructive_shell_segment_reason, expand_wrapper_segments, is_read_only_shell_segment,
     path_has_unresolved_var, shell_segments,
 };
 
@@ -53,14 +53,8 @@ pub fn pre_classify_shell(
     }
     let segments = expand_wrapper_segments(raw_segments);
     for segment in &segments {
-        if is_destructive_shell_segment(segment) {
-            let label = segment
-                .split_whitespace()
-                .next()
-                .unwrap_or(segment.as_str());
-            return ShellPreClassification::AutoDeny {
-                reason: format!("destructive verb {label:?}"),
-            };
+        if let Some(reason) = destructive_shell_segment_reason(segment) {
+            return ShellPreClassification::AutoDeny { reason };
         }
         if let Some(interpreter) = dangerous_interpreter(segment) {
             return ShellPreClassification::AutoDeny {

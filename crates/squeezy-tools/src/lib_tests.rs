@@ -2716,10 +2716,10 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
 #[test]
 fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
     let root = temp_workspace("verify_nested_manifest");
-    fs::create_dir_all(root.join("tools/sonar-arch-graph/src")).expect("create crate");
+    fs::create_dir_all(root.join("tools/sample-arch-graph/src")).expect("create crate");
     fs::write(
-        root.join("tools/sonar-arch-graph/Cargo.toml"),
-        "[package]\nname = \"sonar-arch-graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        root.join("tools/sample-arch-graph/Cargo.toml"),
+        "[package]\nname = \"sample-arch-graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
     .expect("write manifest");
 
@@ -2727,13 +2727,13 @@ fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
         &root,
         VerifyScope::Diff,
         VerifyLevel::Quick,
-        &["tools/sonar-arch-graph/src/main.rs".to_string()],
+        &["tools/sample-arch-graph/src/main.rs".to_string()],
     )
     .expect("verification plan");
 
     assert_eq!(
         plan.command,
-        "cargo test --manifest-path 'tools/sonar-arch-graph/Cargo.toml' --message-format=json"
+        "cargo test --manifest-path 'tools/sample-arch-graph/Cargo.toml' --message-format=json"
     );
 
     let _ = fs::remove_dir_all(root);

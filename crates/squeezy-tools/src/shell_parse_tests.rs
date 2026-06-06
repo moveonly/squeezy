@@ -144,6 +144,16 @@ fn js_arrow_inside_heredoc_body_is_not_destructive_redirect() {
 }
 
 #[test]
+fn sonar_cli_is_not_destructive() {
+    let analysis = analyze_shell_command("sonar context list --json");
+    assert!(
+        !analysis.destructive,
+        "sonar CLI reads must not be flagged destructive: {analysis:?}",
+    );
+    assert_ne!(analysis.capability, PermissionCapability::Destructive);
+}
+
+#[test]
 fn command_unit_default_is_empty() {
     let unit = CommandUnit::default();
     assert!(unit.name.is_empty());

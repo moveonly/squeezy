@@ -3399,7 +3399,7 @@ fn tool_loop_guard_distinguishes_shell_failures_by_command() {
         (call, result)
     };
 
-    let (call_a, result_a) = make_shell("shell-1", "cargo check -p sonar-arch-graph");
+    let (call_a, result_a) = make_shell("shell-1", "cargo check -p sample-arch-graph");
     let (call_b, result_b) = make_shell("shell-2", "cargo build --workspace");
     let mut guard = ToolLoopGuard::default();
 
@@ -3415,7 +3415,7 @@ fn tool_loop_guard_distinguishes_shell_failures_by_command() {
         "different commands with same exit code must not be conflated"
     );
 
-    let (call_c, result_c) = make_shell("shell-3", "cargo check -p sonar-arch-graph");
+    let (call_c, result_c) = make_shell("shell-3", "cargo check -p sample-arch-graph");
     let reason = guard
         .observe_round(&[call_c], &[result_c])
         .expect("genuine repeat of the same shell command should still stop");
@@ -3695,6 +3695,63 @@ async fn shell_approval_event_surfaces_new_sandbox_metadata() {
         !env_label.contains("PATH="),
         "env label must not include raw env values",
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn destructive_pre_classifier_keeps_default_human_prompt() {
+    let root = temp_workspace("agent_destructive_preclassifier_prompt");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::ToolCall(LlmToolCall {
+            call_id: "call_rm".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": "rm -rf /tmp/work",
+                "description": "remove temp work"
+            }),
+        })),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_rm".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..Default::default()
+        },
+        provider,
+    );
+
+    let mut rx = agent.start_turn("clean temp".to_string(), CancellationToken::new());
+    let mut approval_seen = false;
+    let mut denied_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested {
+                request,
+                decision_tx,
+                ..
+            } => {
+                approval_seen = true;
+                assert_eq!(request.permission.metadata["command"], "rm -rf /tmp/work");
+                assert_eq!(request.reason, "default destructive permission is ask");
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "call_rm" => {
+                denied_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert!(approval_seen, "destructive shell must prompt before denial");
+    let denied_result = denied_result.expect("shell result");
+    assert_eq!(denied_result.status, ToolStatus::Denied);
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -4652,11 +4709,11 @@ fn tool_round_failure_summary_uses_shell_exit_details() {
         &ToolCall {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
-            arguments: json!({"command": "cargo check --bin sonar-arch-graph"}),
+            arguments: json!({"command": "cargo check --bin sample-arch-graph"}),
         },
         ToolStatus::Error,
         json!({
-            "command": "cargo check --bin sonar-arch-graph",
+            "command": "cargo check --bin sample-arch-graph",
             "exit_code": 101,
             "stdout": "",
             "stderr": "",

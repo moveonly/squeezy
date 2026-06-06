@@ -1034,13 +1034,17 @@ fn is_bare_shell_prefix(prefix: &str) -> bool {
 }
 
 pub(crate) fn is_destructive_shell_segment(segment: &str) -> bool {
+    destructive_shell_segment_reason(segment).is_some()
+}
+
+pub(crate) fn destructive_shell_segment_reason(segment: &str) -> Option<String> {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
     let first = tokens.first().copied().unwrap_or("");
     if matches!(
         first,
         "rm" | "rmdir" | "dd" | "truncate" | "shred" | "chown" | "sudo"
     ) {
-        return true;
+        return Some(format!("destructive verb {first:?}"));
     }
     // mv defaults to overwrite-on-dest-exists. Plain `mv a b` is treated as a
     // metadata-write-safe verb (the kernel sandbox enforces the actual write
@@ -1052,18 +1056,22 @@ pub(crate) fn is_destructive_shell_segment(segment: &str) -> bool {
             .skip(1)
             .any(|tok| *tok == "-f" || *tok == "--force")
     {
-        return true;
+        return Some("destructive forced move".to_string());
     }
-    if destructive_git_pair(&tokens) || destructive_two_word_command(&tokens) {
-        return true;
+    if destructive_git_pair(&tokens) {
+        return Some("destructive git command".to_string());
+    }
+    if destructive_two_word_command(&tokens) {
+        let command = tokens.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+        return Some(format!("destructive command {command:?}"));
     }
     if shell_segment_has_destructive_redirect(segment) {
-        return true;
+        return Some("destructive redirect".to_string());
     }
     if is_destructive_windows_segment(segment) {
-        return true;
+        return Some("destructive Windows command".to_string());
     }
-    false
+    None
 }
 
 /// Pre-spawn safe-verb allowlist for benign metadata-write commands. These

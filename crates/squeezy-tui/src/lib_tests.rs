@@ -4991,7 +4991,7 @@ fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     let mut result = sample_tool_result("shell", "");
     result.status = ToolStatus::Error;
     result.content = serde_json::json!({
-        "command": "cargo check -p sonar-arch-graph",
+        "command": "cargo check -p sample-arch-graph",
         "exit_code": 101,
         "stdout": "",
         "stderr": "error: could not find `Cargo.toml` in `/tmp/example-workspace` or any parent directory",
@@ -5001,7 +5001,7 @@ fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
     let output = render_to_string(&app, 140, 16);
 
     assert!(
-        output.contains("⚠ Not run cargo check -p sonar-arch-graph · no Cargo.toml found"),
+        output.contains("⚠ Not run cargo check -p sample-arch-graph · no Cargo.toml found"),
         "{output}"
     );
     assert!(!output.contains("✖ Failed cargo check"), "{output}");
