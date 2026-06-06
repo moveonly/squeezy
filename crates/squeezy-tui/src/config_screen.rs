@@ -543,14 +543,39 @@ pub(crate) struct ModelPickerState {
     pub current_provider: &'static str,
 }
 
-/// Fuzzy search across every field label in `CONFIG_SECTIONS`. Triggered
-/// by `/` in browse mode. Enter jumps to the matched field.
+/// Live filter over `CONFIG_SECTIONS`. Opened by typing any printable
+/// character (or `/`) in browse mode; the body collapses to a small box on
+/// top plus the reduced match list. `Enter` jumps to the matched setting,
+/// keeping the active scope tab. Matches section/field names and each
+/// field's help text.
 pub(crate) struct SearchOverlayState {
     pub query: String,
+    /// Index into `matches` of the highlighted result.
     pub cursor: usize,
-    /// (section_index, field_index, score) for matches, sorted ascending
-    /// by score (lower is better in `squeezy_rank::fuzzy::fuzzy_score`).
-    pub matches: Vec<(usize, usize, i32)>,
+    /// Matches sorted best-first (highest score; see [`compute_search_matches`]).
+    pub matches: Vec<SearchMatch>,
+}
+
+/// What a [`SearchMatch`] points at within its section. Most rows are real
+/// schema fields, but the Models section also exposes a synthetic "API key" row
+/// with no `FieldMeta`, and the field-less sections (Themes / McpServers /
+/// Reset) match at section level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchTarget {
+    /// A real schema field, by its raw index into `section.fields`.
+    Field(usize),
+    /// The synthetic API-key row in the Models section (no `FieldMeta`).
+    SyntheticApiKey,
+    /// A field-less section — focus its first row.
+    Section,
+}
+
+/// One filter result: a section plus what to focus inside it, with its score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchMatch {
+    pub section_index: usize,
+    pub target: SearchTarget,
+    pub score: i32,
 }
 
 /// Stand-alone editor state. Holds a draft buffer so cancel-on-Esc restores.
@@ -1910,26 +1935,181 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
     }
 }
 
-// ─── Search overlay ───────────────────────────────────────────────────────────
+// ─── Live filter ───────────────────────────────────────────────────────────
 
-pub(crate) fn compute_search_matches(query: &str) -> Vec<(usize, usize, i32)> {
-    let mut out: Vec<(usize, usize, i32)> = Vec::new();
+/// Minimum query length before the filter narrows the list. Below this the
+/// box stays open (showing what was typed) and the list is the full panel
+/// index, so a stray first keystroke doesn't collapse the view to noise.
+pub(crate) const FILTER_MIN_QUERY: usize = 2;
+
+/// Minimum query length before description (help-text) matching kicks in.
+/// Help matching is a permissive substring test, and a two-character query is
+/// a substring of nearly every blurb — so at 2 chars the filter narrows by
+/// name only, and descriptions join in once the query is specific enough to
+/// be meaningful.
+const HELP_MIN_QUERY: usize = 3;
+
+// Score bands (lower is better). An option-name hit ranks by the match's
+// position in the label (`0` = prefix). A panel-name hit, a value hit, and a
+// description hit fall into successively higher bands so they rank below
+// option-name hits, in that order.
+const SECTION_SCORE_BASE: i32 = 100;
+const VALUE_SCORE_BASE: i32 = 1_000;
+const DESC_SCORE: i32 = 10_000;
+
+/// Rank everything on the screen against `query` by literal, case-insensitive
+/// substring — page (section) names, option names, descriptions, and each
+/// option's current value, so "show me the rows containing what I typed".
+/// Substring (not subsequence) matching keeps it predictable: `sonnet` finds
+/// the model whose value is `claude-sonnet-4-6` but not `reasoning_effort`
+/// (where those letters only appear out of order).
+///
+/// Below [`FILTER_MIN_QUERY`] characters this returns the panel index (one
+/// section-level entry per section) so the just-opened box reads as a list of
+/// panels. Option names match from [`FILTER_MIN_QUERY`]; value, description, and
+/// panel blurbs join from [`HELP_MIN_QUERY`] (a two-character substring appears
+/// in too many values/blurbs to be useful). Ranking, best first: option name
+/// (by position) → panel name → value → description. Typing a panel name
+/// surfaces that panel's options. `effective` supplies the values. The result
+/// is uncapped — the list scrolls and ranking surfaces the best matches first.
+pub(crate) fn compute_search_matches(effective: &AppConfig, query: &str) -> Vec<SearchMatch> {
+    let query_len = query.chars().count();
+    if query_len < FILTER_MIN_QUERY {
+        return (0..CONFIG_SECTIONS.len())
+            .map(|section_index| SearchMatch {
+                section_index,
+                target: SearchTarget::Section,
+                score: 0,
+            })
+            .collect();
+    }
+    let q = query.to_lowercase();
+    let match_secondary = query_len >= HELP_MIN_QUERY;
+    let mut out: Vec<SearchMatch> = Vec::new();
     for (sidx, section) in CONFIG_SECTIONS.iter().enumerate() {
-        for (fidx, field) in section.fields.iter().enumerate() {
-            if query.is_empty() {
-                out.push((sidx, fidx, 0));
-                continue;
+        // Field-less sections (Themes / McpServers / Reset) render custom UI
+        // and have no `FieldMeta` rows, so they're only reachable by matching
+        // the section's own name or — once specific enough — a word in its blurb.
+        if section.fields.is_empty() {
+            let score = section
+                .label
+                .to_lowercase()
+                .find(&q)
+                .map(|p| p as i32)
+                .or_else(|| {
+                    (match_secondary && section.description.to_lowercase().contains(&q))
+                        .then_some(DESC_SCORE)
+                });
+            if let Some(score) = score {
+                out.push(SearchMatch {
+                    section_index: sidx,
+                    target: SearchTarget::Section,
+                    score,
+                });
             }
-            // Match against `<section>.<field>` so users can type either part.
-            let target = format!("{} {}", section.label, field.label);
-            if let Some(score) = squeezy_rank::fuzzy_score(&target, query) {
-                out.push((sidx, fidx, score));
+            continue;
+        }
+        for (fidx, field) in section.fields.iter().enumerate() {
+            // Best of: the option name (ranked by position), the panel name
+            // (surfaces every option when the panel is named), the current value
+            // (e.g. typing `anthropic` finds the provider), or the description.
+            let score = score_field(section, field, &q, match_secondary, effective);
+            if let Some(score) = score {
+                out.push(SearchMatch {
+                    section_index: sidx,
+                    target: SearchTarget::Field(fidx),
+                    score,
+                });
+            }
+        }
+        // The Models section also exposes a synthetic API-key row with no
+        // `FieldMeta` (it edits the active provider's credential), so the field
+        // loop above misses it. Match it by name, the obvious credential
+        // synonyms, or the active provider so `api_key` / `key` / `anthropic`
+        // find it.
+        if section.id == SectionId::Models {
+            let score = "api_key".find(&q).map(|p| p as i32).or_else(|| {
+                if !match_secondary {
+                    return None;
+                }
+                active_provider_slug(effective)
+                    .to_lowercase()
+                    .find(&q)
+                    .map(|p| VALUE_SCORE_BASE + p as i32)
+                    .or_else(|| {
+                        "api key credential secret"
+                            .contains(&q)
+                            .then_some(DESC_SCORE)
+                    })
+            });
+            if let Some(score) = score {
+                out.push(SearchMatch {
+                    section_index: sidx,
+                    target: SearchTarget::SyntheticApiKey,
+                    score,
+                });
             }
         }
     }
-    out.sort_by_key(|(_, _, score)| *score);
-    out.truncate(40);
+    // Lower is better; the sort is stable, so equal-scored rows keep schema
+    // order and the list doesn't jitter as the user types.
+    out.sort_by_key(|m| m.score);
     out
+}
+
+/// Best substring match score for a real field against the lowercased query
+/// `q`. See [`compute_search_matches`] for the bands. `None` if nothing matches.
+fn score_field(
+    section: &ConfigSectionMeta,
+    field: &FieldMeta,
+    q: &str,
+    match_secondary: bool,
+    effective: &AppConfig,
+) -> Option<i32> {
+    if let Some(pos) = field.label.to_lowercase().find(q) {
+        return Some(pos as i32);
+    }
+    // The panel name (e.g. typing `telemetry` lists every Telemetry option).
+    if format!("{} {}", section.label, field.label)
+        .to_lowercase()
+        .contains(q)
+    {
+        return Some(SECTION_SCORE_BASE);
+    }
+    if !match_secondary {
+        return None;
+    }
+    if let Some(pos) = (field.get)(effective).as_display().to_lowercase().find(q) {
+        return Some(VALUE_SCORE_BASE + pos as i32);
+    }
+    field.help.to_lowercase().contains(q).then_some(DESC_SCORE)
+}
+
+/// Char indices in `haystack` matched by an ASCII-case-insensitive, greedy,
+/// forward subsequence scan for `query`. A name/value match in
+/// [`compute_search_matches`] implies the query is a subsequence of that text,
+/// so this recovers which characters to emphasise. Returns `None` when `query`
+/// is not a subsequence (e.g. the row matched on its help text, not its label),
+/// so the renderer leaves that label unhighlighted.
+pub(crate) fn subsequence_match_positions(haystack: &str, query: &str) -> Option<Vec<usize>> {
+    let mut query_chars = query.chars();
+    let mut want = query_chars.next();
+    if want.is_none() {
+        return Some(Vec::new());
+    }
+    let mut positions = Vec::new();
+    for (idx, hc) in haystack.chars().enumerate() {
+        if let Some(qc) = want
+            && hc.eq_ignore_ascii_case(&qc)
+        {
+            positions.push(idx);
+            want = query_chars.next();
+            if want.is_none() {
+                break;
+            }
+        }
+    }
+    want.is_none().then_some(positions)
 }
 
 fn empty_sources_for(_cfg: &AppConfig) -> SeparatedSources {

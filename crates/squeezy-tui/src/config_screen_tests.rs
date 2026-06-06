@@ -690,7 +690,11 @@ async fn slash_opens_search_and_enter_jumps_to_field() {
     assert!(matches > 0, "fuzzy 'tele' should match Telemetry fields");
 
     // Enter jumps to the top match.
-    let (target_sidx, target_fidx, _) = state.search.as_ref().unwrap().matches[0];
+    let top = state.search.as_ref().unwrap().matches[0];
+    let target_sidx = top.section_index;
+    let SearchTarget::Field(target_fidx) = top.target else {
+        panic!("top 'tele' match should be a Telemetry field");
+    };
     handle_key(
         &mut state,
         &mut agent,
@@ -742,7 +746,9 @@ async fn search_enter_lands_on_models_field_past_synthetic_key_row() {
     search.cursor = search
         .matches
         .iter()
-        .position(|&(sidx, fidx, _)| sidx == models_sidx && fidx == target_fidx)
+        .position(|m| {
+            m.section_index == models_sidx && m.target == SearchTarget::Field(target_fidx)
+        })
         .expect("reasoning_effort is among the matches for 'reason'");
 
     handle_key(
@@ -761,6 +767,393 @@ async fn search_enter_lands_on_models_field_past_synthetic_key_row() {
     assert_eq!(
         resolved.toml_path, CONFIG_SECTIONS[models_sidx].fields[target_fidx].toml_path,
         "focused field should be reasoning_effort, not the row above it"
+    );
+}
+
+// ─── Live filter (type-to-search) ────────────────────────────────────────────
+
+fn press(state: &mut ConfigScreenState, agent: &mut Agent, q: &mut ConfigFeedback, code: KeyCode) {
+    handle_key(state, agent, q, KeyEvent::new(code, KeyModifiers::empty()));
+}
+
+fn type_str(state: &mut ConfigScreenState, agent: &mut Agent, q: &mut ConfigFeedback, s: &str) {
+    for ch in s.chars() {
+        press(state, agent, q, KeyCode::Char(ch));
+    }
+}
+
+#[tokio::test]
+async fn typing_a_letter_opens_the_filter_seeded_with_that_char() {
+    // Default focus is Models, where no bare letter is a browse action, so
+    // "just start typing" must open the filter pre-filled with the keystroke.
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    press(&mut state, &mut agent, &mut q, KeyCode::Char('t'));
+    let search = state.search.as_ref().expect("typing opens the filter");
+    assert_eq!(
+        search.query, "t",
+        "filter is seeded with the triggering char"
+    );
+}
+
+#[tokio::test]
+async fn filter_jump_keeps_active_scope_and_reaches_field_less_section() {
+    // Typing the name of a field-less section (Themes) must surface it and,
+    // on Enter, land there without disturbing the active scope tab.
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    state.scope = ConfigScope::Local;
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+
+    type_str(&mut state, &mut agent, &mut q, "theme");
+    let themes_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Themes)
+        .expect("Themes section exists");
+    let pos = state
+        .search
+        .as_ref()
+        .unwrap()
+        .matches
+        .iter()
+        .position(|m| m.section_index == themes_sidx && m.target == SearchTarget::Section)
+        .expect("the field-less Themes section is reachable by name");
+    state.search.as_mut().unwrap().cursor = pos;
+
+    press(&mut state, &mut agent, &mut q, KeyCode::Enter);
+    assert!(state.search.is_none(), "Enter closes the filter");
+    assert_eq!(state.section_index, themes_sidx);
+    assert_eq!(
+        state.field_index, 0,
+        "section-level hit focuses the first row"
+    );
+    assert_eq!(
+        state.scope,
+        ConfigScope::Local,
+        "jumping to a result keeps the active scope tab"
+    );
+}
+
+#[test]
+fn filter_below_threshold_is_the_panel_index() {
+    // Just-opened (empty) and one-character queries show every section as a
+    // panel index — no field rows — so the box doesn't collapse to noise
+    // before the user has typed enough to filter.
+    let cfg = AppConfig::default();
+    for query in ["", "t"] {
+        let matches = compute_search_matches(&cfg, query);
+        assert_eq!(
+            matches.len(),
+            CONFIG_SECTIONS.len(),
+            "below {FILTER_MIN_QUERY} chars the list is the full panel index"
+        );
+        assert!(
+            matches.iter().all(|m| m.target == SearchTarget::Section),
+            "panel-index rows are section-level"
+        );
+    }
+}
+
+#[test]
+fn filter_at_threshold_narrows_and_includes_options() {
+    let telemetry_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Telemetry)
+        .expect("Telemetry section exists");
+    let matches = compute_search_matches(&AppConfig::default(), "telemetry");
+    assert!(
+        !matches.is_empty(),
+        "'telemetry' matches at least its fields"
+    );
+    assert!(
+        matches.iter().any(
+            |m| m.section_index == telemetry_sidx && matches!(m.target, SearchTarget::Field(_))
+        ),
+        "narrowed results include the Telemetry option rows"
+    );
+}
+
+#[test]
+fn two_char_query_matches_names_only_not_values_or_descriptions() {
+    // At exactly FILTER_MIN_QUERY, value/description matching is off, so the
+    // list narrows by name (a 2-char query is a substring of too many values
+    // and blurbs). Every hit must be in the name bands, below VALUE_SCORE_BASE.
+    let cfg = AppConfig::default();
+    for q in ["re", "en", "to"] {
+        assert!(
+            compute_search_matches(&cfg, q)
+                .iter()
+                .all(|m| m.score < VALUE_SCORE_BASE),
+            "2-char query {q:?} must not include value- or description-only matches"
+        );
+    }
+    // One character past the gate, the value/description channels open.
+    assert!(
+        "tok".chars().count() >= HELP_MIN_QUERY,
+        "fixture assumes the secondary channels open at 3 chars"
+    );
+}
+
+#[test]
+fn filter_matches_a_setting_by_its_help_text() {
+    // Find a field reachable ONLY through its help text — a word that is a
+    // substring of the help but not of the panel-qualified name or the value —
+    // then confirm the filter surfaces it, ranked last (the description band).
+    let cfg = AppConfig::default();
+    let mut found = None;
+    'outer: for (sidx, section) in CONFIG_SECTIONS.iter().enumerate() {
+        for (fidx, field) in section.fields.iter().enumerate() {
+            let name = format!("{} {}", section.label, field.label).to_lowercase();
+            let value = (field.get)(&cfg).as_display().to_lowercase();
+            for word in field.help.split(|c: char| !c.is_ascii_alphanumeric()) {
+                let w = word.to_lowercase();
+                if word.len() >= 4 && !name.contains(&w) && !value.contains(&w) {
+                    found = Some((sidx, fidx, w));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let (sidx, fidx, word) = found.expect("some field is reachable only via its help text");
+    let hit = compute_search_matches(&cfg, &word)
+        .into_iter()
+        .find(|m| m.section_index == sidx && m.target == SearchTarget::Field(fidx))
+        .unwrap_or_else(|| {
+            panic!("filtering by a help-only word ({word:?}) should surface its field")
+        });
+    assert_eq!(
+        hit.score, DESC_SCORE,
+        "a description-only hit is ranked below every name/value hit"
+    );
+}
+
+#[test]
+fn filter_matches_a_field_by_its_current_value() {
+    // Typing a setting's current value should surface that setting — e.g. the
+    // provider value ("openai" / "anthropic" / …) finds the provider field.
+    let cfg = AppConfig::default();
+    let models_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Models)
+        .expect("Models section exists");
+    let provider_fidx = field_index(SectionId::Models, &["model", "provider"]);
+    let value = (CONFIG_SECTIONS[models_sidx].fields[provider_fidx].get)(&cfg).as_display();
+    assert!(
+        value.chars().count() >= HELP_MIN_QUERY,
+        "fixture assumes the provider value is long enough to match by value"
+    );
+    let hit = compute_search_matches(&cfg, &value)
+        .into_iter()
+        .find(|m| m.section_index == models_sidx && m.target == SearchTarget::Field(provider_fidx))
+        .unwrap_or_else(|| panic!("typing the provider value ({value:?}) should surface it"));
+    // It matched in the value band — below name hits, above description hits.
+    assert!(
+        (VALUE_SCORE_BASE..DESC_SCORE).contains(&hit.score),
+        "value hit should land in the value band, got {}",
+        hit.score
+    );
+}
+
+#[test]
+fn value_match_outranks_a_scattered_name_match() {
+    // Regression: typing "sonnet" must surface the model (value
+    // "claude-sonnet-4-6"), not "reasoning_effort" (whose letters merely appear
+    // out of order). The scattered name coincidence is rejected outright.
+    let mut cfg = AppConfig::default();
+    let models_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Models)
+        .expect("Models section exists");
+    let model_fidx = field_index(SectionId::Models, &["model", "model"]);
+    let reasoning_fidx = field_index(SectionId::Models, &["model", "reasoning_effort"]);
+    (CONFIG_SECTIONS[models_sidx].fields[model_fidx].set)(
+        &mut cfg,
+        FieldValue::String("claude-sonnet-4-6".to_string()),
+    )
+    .expect("model field accepts a string value");
+
+    let matches = compute_search_matches(&cfg, "sonnet");
+    assert_eq!(
+        matches.first().map(|m| m.target),
+        Some(SearchTarget::Field(model_fidx)),
+        "a clean value hit ranks first"
+    );
+    assert!(
+        !matches
+            .iter()
+            .any(|m| m.target == SearchTarget::Field(reasoning_fidx)),
+        "a scattered-only name coincidence is rejected"
+    );
+}
+
+#[tokio::test]
+async fn filter_finds_and_jumps_to_synthetic_api_key_row() {
+    // The Models API-key row has no FieldMeta; it must still be findable by
+    // name, and Enter must land on the synthetic row.
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    let models_sidx = CONFIG_SECTIONS
+        .iter()
+        .position(|s| s.id == SectionId::Models)
+        .expect("Models section exists");
+
+    type_str(&mut state, &mut agent, &mut q, "api_key");
+    let pos = state
+        .search
+        .as_ref()
+        .unwrap()
+        .matches
+        .iter()
+        .position(|m| m.section_index == models_sidx && m.target == SearchTarget::SyntheticApiKey)
+        .expect("typing api_key should surface the synthetic Models API-key row");
+    state.search.as_mut().unwrap().cursor = pos;
+
+    press(&mut state, &mut agent, &mut q, KeyCode::Enter);
+    assert_eq!(state.section_index, models_sidx);
+    assert!(
+        state.on_synthetic_api_key_row(),
+        "Enter lands on the synthetic API-key row"
+    );
+}
+
+#[test]
+fn subsequence_match_positions_tracks_case_insensitive_hits() {
+    assert_eq!(
+        subsequence_match_positions("Telemetry", "tly"),
+        Some(vec![0, 2, 8]),
+        "case-insensitive, in-order subsequence positions"
+    );
+    assert_eq!(subsequence_match_positions("model", "xyz"), None);
+    assert_eq!(subsequence_match_positions("model", ""), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn tab_and_backtab_iterate_filter_results() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    // Open empty (panel index) so iteration is deterministic across schemas.
+    press(&mut state, &mut agent, &mut q, KeyCode::Char('/'));
+    assert!(state.search.as_ref().unwrap().matches.len() >= 3);
+
+    press(&mut state, &mut agent, &mut q, KeyCode::Tab);
+    assert_eq!(state.search.as_ref().unwrap().cursor, 1);
+    press(&mut state, &mut agent, &mut q, KeyCode::Tab);
+    assert_eq!(state.search.as_ref().unwrap().cursor, 2);
+    press(&mut state, &mut agent, &mut q, KeyCode::BackTab);
+    assert_eq!(state.search.as_ref().unwrap().cursor, 1);
+
+    let last = state.search.as_ref().unwrap().matches.len() - 1;
+    press(&mut state, &mut agent, &mut q, KeyCode::End);
+    assert_eq!(
+        state.search.as_ref().unwrap().cursor,
+        last,
+        "End jumps to the last result"
+    );
+    press(&mut state, &mut agent, &mut q, KeyCode::Home);
+    assert_eq!(
+        state.search.as_ref().unwrap().cursor,
+        0,
+        "Home jumps to the first result"
+    );
+}
+
+#[tokio::test]
+async fn backspace_on_empty_query_dismisses_the_filter() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    press(&mut state, &mut agent, &mut q, KeyCode::Char('m'));
+    assert_eq!(state.search.as_ref().map(|s| s.query.as_str()), Some("m"));
+    // First backspace empties the query but keeps the filter open (back to
+    // the panel index).
+    press(&mut state, &mut agent, &mut q, KeyCode::Backspace);
+    assert_eq!(state.search.as_ref().map(|s| s.query.as_str()), Some(""));
+    // Backspacing an already-empty query returns to the browse view.
+    press(&mut state, &mut agent, &mut q, KeyCode::Backspace);
+    assert!(
+        state.search.is_none(),
+        "backspace on an empty query exits the filter"
+    );
+}
+
+#[tokio::test]
+async fn themes_action_letter_is_not_a_filter_trigger() {
+    // On Themes, `n` creates a theme — it must keep that meaning rather than
+    // opening the filter.
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Themes));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    press(&mut state, &mut agent, &mut q, KeyCode::Char('n'));
+    assert!(
+        state.search.is_none(),
+        "'n' on Themes is an action, not a filter"
+    );
+    assert!(
+        state.theme_editor.is_some(),
+        "'n' opens the theme name editor"
+    );
+
+    // A non-action letter still opens the filter on Themes.
+    let mut fresh = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Themes));
+    press(&mut fresh, &mut agent, &mut q, KeyCode::Char('c'));
+    assert_eq!(
+        fresh.search.as_ref().map(|s| s.query.as_str()),
+        Some("c"),
+        "a non-action letter opens the filter on Themes"
+    );
+}
+
+#[tokio::test]
+async fn mcp_nonaction_letter_opens_filter_but_action_letter_does_not() {
+    // `a` adds a server on the MCP page; a non-action letter falls through to
+    // the live filter even though the page absorbs most keys.
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::McpServers));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    press(&mut state, &mut agent, &mut q, KeyCode::Char('a'));
+    assert!(
+        state.search.is_none(),
+        "'a' on the MCP page opens the add form"
+    );
+    assert!(state.mcp_add.is_some());
+
+    let mut fresh = ConfigScreenState::new(AppConfig::default(), Some(SectionId::McpServers));
+    press(&mut fresh, &mut agent, &mut q, KeyCode::Char('c'));
+    assert!(
+        fresh.search.is_some(),
+        "a non-action letter opens the filter on the MCP page"
+    );
+}
+
+#[test]
+fn filter_renders_box_query_and_highlightable_match() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    let matches = compute_search_matches(&state.effective, "theme");
+    state.search = Some(SearchOverlayState {
+        query: "theme".to_string(),
+        cursor: 0,
+        matches,
+    });
+    let rendered = render_screen_to_text(&state, 120, 30);
+    assert!(
+        rendered.contains("Filter settings"),
+        "the box title is shown"
+    );
+    assert!(rendered.contains('⌕'), "the search glyph is shown");
+    assert!(
+        rendered.contains("theme"),
+        "the typed query is echoed in the box"
+    );
+    assert!(
+        rendered.contains("Themes"),
+        "the matching Themes panel appears in the reduced list"
+    );
+    assert!(
+        rendered.contains("jump to setting"),
+        "the footer shows the filter controls, not the browse-mode bindings"
     );
 }
 
@@ -1411,7 +1804,11 @@ fn search_overlay_clips_with_scroll_indicators() {
     let mut matches = Vec::new();
     for (sidx, section) in CONFIG_SECTIONS.iter().enumerate() {
         for (fidx, _field) in section.fields.iter().enumerate() {
-            matches.push((sidx, fidx, 0));
+            matches.push(SearchMatch {
+                section_index: sidx,
+                target: SearchTarget::Field(fidx),
+                score: 0,
+            });
         }
     }
     let total = matches.len();
