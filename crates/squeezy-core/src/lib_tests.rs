@@ -1501,7 +1501,7 @@ fn config_resolves_opus_alias_to_full_id() {
         _ => None,
     });
     assert!(matches!(anthropic.provider, ProviderConfig::Anthropic(_)));
-    assert_eq!(anthropic.model, "claude-opus-4-8");
+    assert_eq!(anthropic.model, "claude-opus-4-7");
 
     let openai = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("openai".to_string()),
