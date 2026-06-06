@@ -7257,6 +7257,64 @@ fn failed_assistant_marker_uses_error_color() {
 }
 
 #[test]
+fn assistant_message_never_uses_collapsed_summary() {
+    let body = (0..40)
+        .map(|i| format!("assistant-line-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let item = TranscriptItem::assistant(body);
+
+    let lines = format_message_entry(&item, true, false, MessageOutcome::Normal, "Ctrl+T");
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(rendered.contains("assistant-line-20"), "{rendered}");
+    assert!(rendered.contains("assistant-line-39"), "{rendered}");
+    assert!(
+        !rendered.contains("for full transcript"),
+        "final assistant answers must not collapse to a Ctrl+T summary: {rendered}"
+    );
+}
+
+#[test]
+fn assistant_message_tables_do_not_abbreviate_cells() {
+    let body = "\
+| Dimension | repo_map | sonar context |
+|---|---|---|
+| Module names | Directory names from the repository tree | Artifact IDs from Maven module dependencies |
+| Symbol-level detail | Classes, fields, methods, and package-level structure | Stopped at module dependency analysis |
+";
+    let item = TranscriptItem::assistant(body);
+
+    let lines = format_message_entry_with_width(
+        &item,
+        false,
+        false,
+        MessageOutcome::Normal,
+        Some(220),
+        true,
+        "Ctrl+T",
+    );
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(
+        rendered.contains("Directory names from the repository tree"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Artifact IDs from Maven module dependencies"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Classes, fields, methods, and package-level structure"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("..."),
+        "final assistant tables must not locally abbreviate cell text: {rendered}"
+    );
+}
+
+#[test]
 fn ansi_system_entry_parses_escapes_into_styled_spans() {
     // System messages whose content carries ANSI escape sequences flow
     // through `format_ansi_system_entry`, which parses each escape into
@@ -12491,6 +12549,177 @@ fn transcript_overlay_renders_entries_uncollapsed() {
     assert!(
         !output.contains("Ctrl-O to expand"),
         "overlay should not show truncation ellipsis: {output}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_generic_tool_json_content() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..700)
+        .map(|i| format!("skill-line-{i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = sample_tool_result("load_skill", "");
+    result.content = serde_json::json!({
+        "name": "fixture-skill",
+        "description": "fixture",
+        "content": body,
+    });
+    app.push_tool_result(result);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(160), true));
+
+    assert!(
+        rendered.contains("skill-line-350"),
+        "Ctrl+T must not apply the verbose 4KB generic-tool preview cap: {rendered}"
+    );
+    assert!(
+        rendered.contains("skill-line-699"),
+        "Ctrl+T must include the tail of the loaded skill body: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_repo_map_payload() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("repo_map", "");
+    result.content = serde_json::json!({
+        "stats": {"files": 1, "symbols": 2},
+        "languages": {"Rust": 1},
+        "hierarchy": [{
+            "name": "workspace-root",
+            "children": [{
+                "name": "very_unique_repo_map_child_symbol",
+                "path": "src/repo_map_child.rs"
+            }]
+        }],
+        "packets": [{
+            "name": "repo_map_packet_symbol",
+            "path": "src/repo_map_packet.rs"
+        }],
+    });
+    app.push_tool_result(result);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(180), true));
+
+    assert!(
+        rendered.contains("very_unique_repo_map_child_symbol"),
+        "Ctrl+T must show repo_map hierarchy payload, not only summary lines: {rendered}"
+    );
+    assert!(
+        rendered.contains("repo_map_packet_symbol"),
+        "Ctrl+T must show repo_map packet payload, not only summary lines: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_decl_search_payload() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("decl_search", "");
+    result.content = serde_json::json!({
+        "total_matches": 1,
+        "returned_matches": 1,
+        "counts_by_language": {"Rust": 1},
+        "counts_by_kind": {"function": 1},
+        "packets": [{
+            "name": "very_unique_decl_search_packet",
+            "kind": "function",
+            "path": "src/decl_search_packet.rs",
+            "span": {"start_line": 42},
+            "references": [{
+                "path": "src/reference.rs",
+                "symbol": "decl_search_reference_payload"
+            }]
+        }],
+    });
+    app.push_tool_result(result);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(180), true));
+
+    assert!(
+        rendered.contains("very_unique_decl_search_packet"),
+        "Ctrl+T must show decl_search packet payload, not only summary lines: {rendered}"
+    );
+    assert!(
+        rendered.contains("decl_search_reference_payload"),
+        "Ctrl+T must show nested decl_search payload fields: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_grep_matches_and_lines() {
+    let mut app = test_app(SessionMode::Build);
+    let matches = (0..24)
+        .map(|i| {
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "line": i + 1,
+                "text": format!("match-{i:02} {}", "x".repeat(180)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = sample_tool_result("grep", "");
+    result.content = serde_json::json!({
+        "count": matches.len(),
+        "paths": ["src/lib.rs"],
+        "matches": matches,
+        "metadata": {"pattern": "match", "path": "."},
+    });
+    app.push_tool_result(result);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(220), true));
+
+    assert!(
+        rendered.contains("match-20"),
+        "Ctrl+T must not keep grep at the normal six-match preview cap: {rendered}"
+    );
+    assert!(
+        rendered.contains(&"x".repeat(160)),
+        "Ctrl+T must not truncate long grep match text to 100 chars: {rendered}"
+    );
+    assert!(
+        !rendered.contains("for full transcript"),
+        "expanded Ctrl+T output must not point back to itself: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_note_text() {
+    let mut app = test_app(SessionMode::Build);
+    let message = format!("{} UNIQUE_NOTE_TAIL", "note-fragment ".repeat(40));
+    app.push_note(message);
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(140), true));
+
+    assert!(
+        rendered.contains("UNIQUE_NOTE_TAIL"),
+        "Ctrl+T must not keep note/subagent log rows at the 200-char inline preview cap: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_full_assistant_answer_even_if_collapsed() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..60)
+        .map(|i| format!("answer-row-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_transcript_item(TranscriptItem::assistant(body));
+    app.transcript[0].collapsed = true;
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(140), true));
+
+    assert!(rendered.contains("answer-row-30"), "{rendered}");
+    assert!(rendered.contains("answer-row-59"), "{rendered}");
+    assert!(
+        !rendered.contains("for full transcript"),
+        "Ctrl+T must not render final assistant answers as collapsed summaries: {rendered}"
     );
 }
 

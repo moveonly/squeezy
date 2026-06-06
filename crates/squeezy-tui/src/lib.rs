@@ -7670,12 +7670,12 @@ fn transcript_lines_for_overlay(
     width: Option<u16>,
     expand_all: bool,
 ) -> Vec<Line<'static>> {
-    // Pin Verbose when the overlay is fully expanded so the per-mode cap is
-    // lifted. Collapsed mode mirrors the inline view verbosity.
-    let overlay_verbosity = if expand_all {
-        ToolOutputVerbosity::Verbose
+    // Expanded Ctrl+T is the raw/full transcript surface. Keep it distinct
+    // from `/tool-verbosity verbose`, which is still a bounded inline preview.
+    let overlay_detail = if expand_all {
+        ToolDetailMode::Full
     } else {
-        app.tool_output_verbosity
+        ToolDetailMode::Preview(app.tool_output_verbosity)
     };
     let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
     let shortcut = shortcut.as_str();
@@ -7721,7 +7721,7 @@ fn transcript_lines_for_overlay(
                     &members,
                     !expand_all && entry.collapsed,
                     selected_entry == Some(index),
-                    overlay_verbosity,
+                    overlay_detail,
                     width,
                     ToolCardSurface::Plain,
                     shortcut,
@@ -7740,7 +7740,7 @@ fn transcript_lines_for_overlay(
             app.render_cache_session,
             entry,
             selected_entry == Some(index),
-            overlay_verbosity,
+            overlay_detail,
             message_outcome(entries, index),
             width,
             app.show_reasoning_usage,
@@ -7782,7 +7782,7 @@ fn transcript_lines_for_overlay(
 fn format_transcript_entry_expanded(
     entry: &TranscriptEntry,
     selected: bool,
-    tool_output_verbosity: ToolOutputVerbosity,
+    tool_detail_mode: ToolDetailMode,
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
@@ -7802,12 +7802,12 @@ fn format_transcript_entry_expanded(
             tool,
             false,
             selected,
-            tool_output_verbosity,
+            tool_detail_mode,
             width,
             ToolCardSurface::Plain,
             transcript_shortcut,
         ),
-        TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
+        TranscriptEntryKind::Log(entry) => format_log_entry_full(entry, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false, width),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
@@ -7855,7 +7855,7 @@ fn cached_transcript_entry_lines(
     session_id: u64,
     entry: &TranscriptEntry,
     selected: bool,
-    tool_output_verbosity: ToolOutputVerbosity,
+    tool_detail_mode: ToolDetailMode,
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
@@ -7865,7 +7865,7 @@ fn cached_transcript_entry_lines(
     let palette_generation = render::palette::palette_generation();
     let context_hash = render_context_hash(
         selected,
-        tool_output_verbosity,
+        tool_detail_mode,
         outcome,
         width,
         show_reasoning,
@@ -7883,7 +7883,7 @@ fn cached_transcript_entry_lines(
                 format_transcript_entry_expanded(
                     entry,
                     selected,
-                    tool_output_verbosity,
+                    tool_detail_mode,
                     outcome,
                     width,
                     show_reasoning,
@@ -7893,7 +7893,7 @@ fn cached_transcript_entry_lines(
                 format_transcript_entry_with_width(
                     entry,
                     selected,
-                    tool_output_verbosity,
+                    tool_detail_mode.verbosity(),
                     outcome,
                     width,
                     show_reasoning,
@@ -7918,14 +7918,15 @@ fn shortcut_hash(s: &str) -> u64 {
 /// - bit 0:      selected
 /// - bit 1:      show_reasoning
 /// - bit 2:      expanded (overlay vs inline)
-/// - bits 4-5:   tool_output_verbosity
+/// - bits 4-5:   tool output verbosity
+/// - bit 6:      full/raw tool detail
 /// - bit 8:      message outcome
 /// - bits 16-31: width value
 /// - bit 32:     width-present sentinel
 /// - bits 33-63: shortcut_hash(transcript_shortcut) (truncated)
 fn render_context_hash(
     selected: bool,
-    verbosity: ToolOutputVerbosity,
+    detail_mode: ToolDetailMode,
     outcome: MessageOutcome,
     width: Option<u16>,
     show_reasoning: bool,
@@ -7942,12 +7943,15 @@ fn render_context_hash(
     if expanded {
         h |= 1 << 2;
     }
-    let v: u64 = match verbosity {
+    let v: u64 = match detail_mode.verbosity() {
         ToolOutputVerbosity::Compact => 0,
         ToolOutputVerbosity::Normal => 1,
         ToolOutputVerbosity::Verbose => 2,
     };
     h |= v << 4;
+    if detail_mode.is_full() {
+        h |= 1 << 6;
+    }
     let o: u64 = match outcome {
         MessageOutcome::Normal => 0,
         MessageOutcome::Failed => 1,
@@ -8200,7 +8204,7 @@ fn transcript_lines_for_render(
                     &members,
                     item.collapsed,
                     selected_entry == Some(index),
-                    app.tool_output_verbosity,
+                    ToolDetailMode::Preview(app.tool_output_verbosity),
                     width,
                     ToolCardSurface::Tinted,
                     shortcut,
@@ -8219,7 +8223,7 @@ fn transcript_lines_for_render(
             app.render_cache_session,
             item,
             selected_entry == Some(index),
-            app.tool_output_verbosity,
+            ToolDetailMode::Preview(app.tool_output_verbosity),
             message_outcome(entries, index),
             width,
             app.show_reasoning_usage,
@@ -8312,7 +8316,7 @@ fn settle_folded_entry_lines(
     let expanded = format_transcript_entry_expanded(
         entry,
         selected,
-        tool_output_verbosity,
+        ToolDetailMode::Preview(tool_output_verbosity),
         outcome,
         width,
         show_reasoning,
@@ -8591,7 +8595,7 @@ fn format_transcript_entry_with_width(
             tool,
             entry.collapsed,
             selected,
-            tool_output_verbosity,
+            ToolDetailMode::Preview(tool_output_verbosity),
             width,
             ToolCardSurface::Tinted,
             transcript_shortcut,
@@ -9418,7 +9422,7 @@ fn format_assistant_message_entry(
             transcript_shortcut,
         ));
     }
-    if collapsed {
+    if collapsed && item.role != Role::Assistant {
         lines.push(assistant_line(
             selected,
             assistant_static_span(color),
@@ -9666,7 +9670,7 @@ fn format_tool_result_entry(
     tool: &ToolTranscript,
     collapsed: bool,
     selected: bool,
-    tool_output_verbosity: ToolOutputVerbosity,
+    tool_detail_mode: ToolDetailMode,
     width: Option<u16>,
     card_surface: ToolCardSurface,
     transcript_shortcut: &str,
@@ -9676,11 +9680,35 @@ fn format_tool_result_entry(
     let summary_spans = tool_result_summary_spans(tool);
     let header = action_line_spans(selected, marker, color, action, color, summary_spans);
     let body = if collapsed {
-        collapsed_tool_preview_lines(tool, tool_output_verbosity, width, transcript_shortcut)
+        collapsed_tool_preview_lines(
+            tool,
+            tool_detail_mode.verbosity(),
+            width,
+            transcript_shortcut,
+        )
     } else {
-        expanded_tool_detail_lines(tool, tool_output_verbosity, transcript_shortcut)
+        expanded_tool_detail_lines(tool, tool_detail_mode, transcript_shortcut)
     };
     render_tool_card(header, body, card_surface)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolDetailMode {
+    Preview(ToolOutputVerbosity),
+    Full,
+}
+
+impl ToolDetailMode {
+    fn verbosity(self) -> ToolOutputVerbosity {
+        match self {
+            Self::Preview(verbosity) => verbosity,
+            Self::Full => ToolOutputVerbosity::Verbose,
+        }
+    }
+
+    fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9742,7 +9770,7 @@ fn format_grouped_tool_result_entry(
     members: &[&ToolTranscript],
     collapsed: bool,
     selected: bool,
-    tool_output_verbosity: ToolOutputVerbosity,
+    tool_detail_mode: ToolDetailMode,
     width: Option<u16>,
     card_surface: ToolCardSurface,
     transcript_shortcut: &str,
@@ -9781,7 +9809,7 @@ fn format_grouped_tool_result_entry(
                 member,
                 false,
                 false,
-                tool_output_verbosity,
+                tool_detail_mode,
                 width,
                 card_surface,
                 transcript_shortcut,
@@ -9908,9 +9936,17 @@ fn collapsed_tool_preview_lines(
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     if tool_bypasses_preview_cap_for_tool(tool) {
-        return expanded_tool_detail_lines(tool, tool_output_verbosity, transcript_shortcut);
+        return expanded_tool_detail_lines(
+            tool,
+            ToolDetailMode::Preview(tool_output_verbosity),
+            transcript_shortcut,
+        );
     }
-    let detail = expanded_tool_detail_lines(tool, tool_output_verbosity, transcript_shortcut);
+    let detail = expanded_tool_detail_lines(
+        tool,
+        ToolDetailMode::Preview(tool_output_verbosity),
+        transcript_shortcut,
+    );
     let cap = tool_preview_line_cap(tool);
     head_tail_truncate_lines(detail, cap, transcript_shortcut)
 }
@@ -9947,6 +9983,18 @@ fn head_tail_truncate_lines(
             .rev(),
     );
     out
+}
+
+fn format_log_entry_full(entry: &LogEntry, selected: bool) -> Vec<Line<'static>> {
+    let color = match entry.kind {
+        LogKind::Warn => crate::render::theme::cyan(),
+        LogKind::Error => crate::render::theme::red(),
+        LogKind::Subagent => crate::render::theme::magenta(),
+        LogKind::Note => rail::dim(),
+        LogKind::Operational => palette::footer_fg(),
+        LogKind::Normal => log_color(&entry.message),
+    };
+    detail_text_lines(selected, color, &entry.message)
 }
 
 fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
@@ -10396,7 +10444,7 @@ fn assistant_text_lines(
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut first = true;
-    for mut line in render::markdown::render_markdown(content) {
+    for mut line in render::markdown::render_markdown_full(content) {
         for span in &mut line.spans {
             span.style = content_style.patch(span.style);
         }
@@ -11523,37 +11571,40 @@ fn friendly_tool_name(tool_name: &str) -> String {
 
 fn expanded_tool_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     match tool.result.tool_name.as_str() {
-        "shell" | "verify" => expanded_shell_detail_lines(tool, verbosity, transcript_shortcut),
-        "decl_search" => expanded_decl_search_detail_lines(tool, verbosity),
+        "shell" | "verify" => expanded_shell_detail_lines(tool, mode, transcript_shortcut),
+        "decl_search" if mode.is_full() => {
+            expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut)
+        }
+        "decl_search" => expanded_decl_search_detail_lines(tool, mode),
+        "repo_map" if mode.is_full() => {
+            expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut)
+        }
         "repo_map" => expanded_repo_map_detail_lines(tool),
-        "diff_context" => expanded_diff_context_detail_lines(tool),
-        "plan_patch" => expanded_plan_patch_detail_lines(tool),
-        "apply_patch" | "write_file" => {
-            expanded_edit_detail_lines(tool, verbosity, transcript_shortcut)
-        }
-        "symbol_context" => {
-            expanded_symbol_context_detail_lines(tool, verbosity, transcript_shortcut)
-        }
+        "diff_context" => expanded_diff_context_detail_lines(tool, mode),
+        "plan_patch" => expanded_plan_patch_detail_lines(tool, mode),
+        "apply_patch" | "write_file" => expanded_edit_detail_lines(tool, mode, transcript_shortcut),
+        "symbol_context" => expanded_symbol_context_detail_lines(tool, mode, transcript_shortcut),
         "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
-            expanded_read_search_detail_lines(tool, verbosity, transcript_shortcut)
+            expanded_read_search_detail_lines(tool, mode, transcript_shortcut)
         }
-        _ => expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut),
+        _ => expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut),
     }
 }
 
 fn expanded_symbol_context_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
-    let packet_cap = match verbosity {
-        ToolOutputVerbosity::Compact => 3,
-        ToolOutputVerbosity::Normal => 5,
-        ToolOutputVerbosity::Verbose => usize::MAX,
+    let packet_cap = match mode {
+        ToolDetailMode::Full => usize::MAX,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => 3,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Normal) => 5,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Verbose) => usize::MAX,
     };
     let mut lines = Vec::new();
     if let Some(call) = tool.call.as_ref()
@@ -11627,7 +11678,7 @@ fn expanded_symbol_context_detail_lines(
 
 fn expanded_shell_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = shell_output_block_lines(tool, None, transcript_shortcut);
@@ -11667,7 +11718,7 @@ fn expanded_shell_detail_lines(
     if lines.is_empty() {
         lines.extend(expanded_generic_tool_detail_lines(
             tool,
-            verbosity,
+            mode,
             transcript_shortcut,
         ));
     }
@@ -11858,7 +11909,7 @@ fn strip_ansi_escape_sequences(input: &str) -> String {
 
 fn expanded_decl_search_detail_lines(
     tool: &ToolTranscript,
-    _verbosity: ToolOutputVerbosity,
+    _mode: ToolDetailMode,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(total) = number_field(&tool.result.content, "total_matches") {
@@ -11918,7 +11969,10 @@ fn expanded_repo_map_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     lines
 }
 
-fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn expanded_diff_context_detail_lines(
+    tool: &ToolTranscript,
+    mode: ToolDetailMode,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(mode) = string_arg(&tool.result.content, "mode") {
         lines.push(detail_line(
@@ -11939,7 +11993,11 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
     }
     let diff_files = diff_context_files(tool);
     if diff_files.is_empty() {
-        lines.extend(path_detail_lines(&tool.result.content["files"], "path", 6));
+        lines.extend(path_detail_lines(
+            &tool.result.content["files"],
+            "path",
+            detail_path_cap(mode, 6),
+        ));
     } else {
         for file in diff_files {
             let mut summary = format!("file {}", file.path);
@@ -11978,7 +12036,10 @@ fn diff_context_files(tool: &ToolTranscript) -> Vec<squeezy_vcs::DiffFile> {
         .unwrap_or_default()
 }
 
-fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn expanded_plan_patch_detail_lines(
+    tool: &ToolTranscript,
+    mode: ToolDetailMode,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(objective) = string_arg(&tool.result.content, "objective") {
         lines.push(detail_line(
@@ -12007,11 +12068,16 @@ fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>>
             crate::render::theme::quiet(),
             format!("paths {}", paths.len()),
         ));
-        lines.extend(paths.iter().take(5).filter_map(|path| {
-            path.as_str().map(|path| {
-                detail_line(false, crate::render::theme::quiet(), format!("path {path}"))
-            })
-        }));
+        lines.extend(
+            paths
+                .iter()
+                .take(detail_path_cap(mode, 5))
+                .filter_map(|path| {
+                    path.as_str().map(|path| {
+                        detail_line(false, crate::render::theme::quiet(), format!("path {path}"))
+                    })
+                }),
+        );
     }
     if let Some(next) = tool.result.content["next_action"]["reason"].as_str() {
         lines.push(detail_line(
@@ -12025,7 +12091,7 @@ fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>>
 
 fn expanded_edit_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -12052,19 +12118,24 @@ fn expanded_edit_detail_lines(
         ));
     }
     if let Some(contexts) = tool.result.content["match_contexts"].as_array() {
-        lines.extend(contexts.iter().take(5).filter_map(|context| {
-            let index = context["match_index"].as_u64()?;
-            let line = context["line"].as_u64()?;
-            let preview = context["preview"].as_str()?;
-            Some(detail_line(
-                false,
-                crate::render::theme::quiet(),
-                format!("match {index} line {line}: {preview}"),
-            ))
-        }));
+        lines.extend(
+            contexts
+                .iter()
+                .take(detail_path_cap(mode, 5))
+                .filter_map(|context| {
+                    let index = context["match_index"].as_u64()?;
+                    let line = context["line"].as_u64()?;
+                    let preview = context["preview"].as_str()?;
+                    Some(detail_line(
+                        false,
+                        crate::render::theme::quiet(),
+                        format!("match {index} line {line}: {preview}"),
+                    ))
+                }),
+        );
     }
     if lines.is_empty() {
-        expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut)
+        expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut)
     } else {
         lines
     }
@@ -12072,34 +12143,32 @@ fn expanded_edit_detail_lines(
 
 fn expanded_read_search_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let lines = match tool.result.tool_name.as_str() {
-        "glob" => expanded_glob_detail_lines_v(tool, verbosity),
-        "grep" => expanded_grep_detail_lines_v(tool, verbosity),
+        "glob" => expanded_glob_detail_lines_v(tool, mode),
+        "grep" => expanded_grep_detail_lines_v(tool, mode),
         "read_file" | "read_slice" => {
-            expanded_read_file_detail_lines(tool, verbosity, transcript_shortcut)
+            expanded_read_file_detail_lines(tool, mode, transcript_shortcut)
         }
         "read_tool_output" => {
-            expanded_read_tool_output_detail_lines(tool, verbosity, transcript_shortcut)
+            expanded_read_tool_output_detail_lines(tool, mode, transcript_shortcut)
         }
-        _ => expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut),
+        _ => expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut),
     };
     if lines.is_empty() {
-        expanded_generic_tool_detail_lines(tool, verbosity, transcript_shortcut)
+        expanded_generic_tool_detail_lines(tool, mode, transcript_shortcut)
     } else {
         lines
     }
 }
 
-fn expanded_glob_detail_lines_v(
-    tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
-) -> Vec<Line<'static>> {
-    let path_cap = match verbosity {
-        ToolOutputVerbosity::Compact => 3,
-        _ => 8,
+fn expanded_glob_detail_lines_v(tool: &ToolTranscript, mode: ToolDetailMode) -> Vec<Line<'static>> {
+    let path_cap = match mode {
+        ToolDetailMode::Full => usize::MAX,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => 3,
+        ToolDetailMode::Preview(_) => 8,
     };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
@@ -12109,7 +12178,7 @@ fn expanded_glob_detail_lines_v(
             format!("pattern {pattern}"),
         ));
     }
-    if !matches!(verbosity, ToolOutputVerbosity::Compact)
+    if !matches!(mode, ToolDetailMode::Preview(ToolOutputVerbosity::Compact))
         && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
     {
         lines.push(detail_line(
@@ -12133,17 +12202,16 @@ fn expanded_glob_detail_lines_v(
     lines
 }
 
-fn expanded_grep_detail_lines_v(
-    tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
-) -> Vec<Line<'static>> {
-    let match_cap = match verbosity {
-        ToolOutputVerbosity::Compact => 3,
-        _ => 6,
+fn expanded_grep_detail_lines_v(tool: &ToolTranscript, mode: ToolDetailMode) -> Vec<Line<'static>> {
+    let match_cap = match mode {
+        ToolDetailMode::Full => usize::MAX,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => 3,
+        ToolDetailMode::Preview(_) => 6,
     };
-    let path_cap = match verbosity {
-        ToolOutputVerbosity::Compact => 3,
-        _ => 8,
+    let path_cap = match mode {
+        ToolDetailMode::Full => usize::MAX,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => 3,
+        ToolDetailMode::Preview(_) => 8,
     };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
@@ -12153,7 +12221,7 @@ fn expanded_grep_detail_lines_v(
             format!("pattern {pattern}"),
         ));
     }
-    if !matches!(verbosity, ToolOutputVerbosity::Compact)
+    if !matches!(mode, ToolDetailMode::Preview(ToolOutputVerbosity::Compact))
         && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
     {
         lines.push(detail_line(
@@ -12182,7 +12250,14 @@ fn expanded_grep_detail_lines_v(
             lines.push(detail_line(
                 false,
                 crate::render::theme::quiet(),
-                format!("{path}:{line} {}", compact_text(text, 100)),
+                format!(
+                    "{path}:{line} {}",
+                    if mode.is_full() {
+                        text.to_string()
+                    } else {
+                        compact_text(text, 100)
+                    }
+                ),
             ));
         }
     }
@@ -12191,7 +12266,7 @@ fn expanded_grep_detail_lines_v(
 
 fn expanded_read_file_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let path = string_arg(&tool.result.content, "path");
@@ -12206,7 +12281,7 @@ fn expanded_read_file_detail_lines(
     // and per-field chips dominate transcripts otherwise — and Read's full
     // text is already what the agent acted on, not something the user
     // needs to re-read here.
-    if matches!(verbosity, ToolOutputVerbosity::Compact) {
+    if matches!(mode, ToolDetailMode::Preview(ToolOutputVerbosity::Compact)) {
         let mut summary = path.clone().unwrap_or_else(|| "?".to_string());
         if let Some(bytes) = bytes {
             let total = total.unwrap_or(bytes);
@@ -12249,7 +12324,7 @@ fn expanded_read_file_detail_lines(
         lines.extend(output_block_lines(
             "content",
             &content,
-            verbosity,
+            mode.verbosity(),
             transcript_shortcut,
         ));
     }
@@ -12258,7 +12333,7 @@ fn expanded_read_file_detail_lines(
 
 fn expanded_read_tool_output_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -12296,12 +12371,12 @@ fn expanded_read_tool_output_detail_lines(
             };
             lines.extend(expanded_tool_detail_lines(
                 &nested,
-                verbosity,
+                mode,
                 transcript_shortcut,
             ));
             return lines;
         }
-        if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
+        if !mode.is_full() && !matches!(mode.verbosity(), ToolOutputVerbosity::Verbose) {
             let detail = if saved.partial {
                 "content saved tool-result JSON (partial; hidden in normal mode)"
             } else {
@@ -12325,7 +12400,7 @@ fn expanded_read_tool_output_detail_lines(
             ));
             for line in head_tail_lines(
                 &summary.messages.join("\n"),
-                saved_output_preview_limit(verbosity),
+                saved_output_preview_limit(mode),
                 transcript_shortcut,
             ) {
                 if line.truncated_marker {
@@ -12339,7 +12414,7 @@ fn expanded_read_tool_output_detail_lines(
             lines.push(detail_line(false, crate::render::theme::quiet(), "stderr"));
             for line in head_tail_lines(
                 &summary.stderr.join("\n"),
-                saved_output_preview_limit(verbosity),
+                saved_output_preview_limit(mode),
                 transcript_shortcut,
             ) {
                 if line.truncated_marker {
@@ -12349,7 +12424,7 @@ fn expanded_read_tool_output_detail_lines(
                 }
             }
         }
-        if !matches!(verbosity, ToolOutputVerbosity::Verbose) {
+        if !mode.is_full() && !matches!(mode.verbosity(), ToolOutputVerbosity::Verbose) {
             let mut detail = format!(
                 "compiler JSON hidden in normal mode ({} message lines)",
                 summary.hidden_json_lines
@@ -12363,12 +12438,10 @@ fn expanded_read_tool_output_detail_lines(
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         // Spilled tool payloads are routinely hundreds of lines of raw JSON,
-        // so fold inline even on the expanded card — the overlay (which
-        // pins Verbose) still hands the full content to anyone hitting
-        // Ctrl+T. Generic `output_block_lines` stays unbounded so the
-        // existing "expand grep → see every match" behaviour is preserved.
-        let limit = saved_output_preview_limit(verbosity);
-        let byte_limit = saved_output_line_byte_limit(verbosity);
+        // so fold inline even on the expanded card. Ctrl+T uses `Full` mode
+        // and leaves both the line count and per-line bytes unbounded.
+        let limit = saved_output_preview_limit(mode);
+        let byte_limit = saved_output_line_byte_limit(mode);
         if !content.trim().is_empty() {
             lines.push(detail_line(false, crate::render::theme::quiet(), "content"));
             for line in head_tail_lines(&content, limit, transcript_shortcut) {
@@ -12389,19 +12462,21 @@ fn expanded_read_tool_output_detail_lines(
     lines
 }
 
-fn saved_output_preview_limit(verbosity: ToolOutputVerbosity) -> usize {
-    match verbosity {
-        ToolOutputVerbosity::Compact => 12,
-        ToolOutputVerbosity::Normal => 40,
-        ToolOutputVerbosity::Verbose => usize::MAX,
+fn saved_output_preview_limit(mode: ToolDetailMode) -> usize {
+    match mode {
+        ToolDetailMode::Full => usize::MAX,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => 12,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Normal) => 40,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Verbose) => usize::MAX,
     }
 }
 
-fn saved_output_line_byte_limit(verbosity: ToolOutputVerbosity) -> usize {
-    match verbosity {
-        ToolOutputVerbosity::Compact => TOOL_PREVIEW_COMPACT_BYTES,
-        ToolOutputVerbosity::Normal => TOOL_PREVIEW_NORMAL_BYTES,
-        ToolOutputVerbosity::Verbose => usize::MAX,
+fn saved_output_line_byte_limit(mode: ToolDetailMode) -> usize {
+    match mode {
+        ToolDetailMode::Full => usize::MAX,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => TOOL_PREVIEW_COMPACT_BYTES,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Normal) => TOOL_PREVIEW_NORMAL_BYTES,
+        ToolDetailMode::Preview(ToolOutputVerbosity::Verbose) => usize::MAX,
     }
 }
 
@@ -12566,9 +12641,17 @@ fn looks_like_cargo_json_line(line: &str) -> bool {
 
 fn expanded_generic_tool_detail_lines(
     tool: &ToolTranscript,
-    verbosity: ToolOutputVerbosity,
+    mode: ToolDetailMode,
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
+    if mode.is_full() {
+        let text = tool_result_output_text(&tool.result).unwrap_or_else(|| {
+            serde_json::to_string_pretty(&tool.result.content)
+                .unwrap_or_else(|_| tool.result.content.to_string())
+        });
+        return output_block_lines("details", &text, mode.verbosity(), transcript_shortcut);
+    }
+    let verbosity = mode.verbosity();
     // Verbose mode preserves the legacy `details {...}` JSON dump so users
     // who really want the raw payload (debugging a new tool, comparing two
     // runs) can still get it via `/tool-verbosity verbose`.
@@ -12945,6 +13028,14 @@ fn path_detail_lines(
         })
         .map(|path| detail_line(false, crate::render::theme::quiet(), format!("path {path}")))
         .collect()
+}
+
+fn detail_path_cap(mode: ToolDetailMode, preview_limit: usize) -> usize {
+    if mode.is_full() {
+        usize::MAX
+    } else {
+        preview_limit
+    }
 }
 
 fn append_truncation_hint(spans: &mut Vec<Span<'static>>, tool: &ToolTranscript) {
@@ -16735,7 +16826,7 @@ impl TranscriptEntry {
         let expanded = format_transcript_entry_expanded(
             self,
             false,
-            ToolOutputVerbosity::Normal,
+            ToolDetailMode::Preview(ToolOutputVerbosity::Normal),
             MessageOutcome::Normal,
             Some(SETTLE_MEASURE_WIDTH),
             true,
@@ -17775,7 +17866,7 @@ fn inline_history_lines_for_flush(
                     &members,
                     item.collapsed,
                     false,
-                    app.tool_output_verbosity,
+                    ToolDetailMode::Preview(app.tool_output_verbosity),
                     Some(width),
                     ToolCardSurface::Tinted,
                     shortcut,

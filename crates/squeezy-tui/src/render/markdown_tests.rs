@@ -1,4 +1,4 @@
-use super::render_markdown;
+use super::{render_markdown, render_markdown_full};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
@@ -102,6 +102,35 @@ fn markdown_caps_table_column_width_for_narrow_terminals() {
         texts.iter().any(|line| line.contains("crates/squeez...")),
         "long table cells should be visibly abbreviated:\n{}",
         texts.join("\n")
+    );
+}
+
+#[test]
+fn markdown_full_preserves_table_cell_text() {
+    let source = "\
+| Dimension | repo_map | sonar context |
+|---|---|---|
+| Module names | Directory names from the repository tree | Artifact IDs from Maven module dependencies |
+| Symbol-level detail | Classes, fields, methods, and package-level structure | Stopped at module dependency analysis |
+";
+    let lines = render_markdown_full(source);
+    let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+    assert!(
+        joined.contains("Directory names from the repository tree"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("Artifact IDs from Maven module dependencies"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("Classes, fields, methods, and package-level structure"),
+        "{joined}"
+    );
+    assert!(
+        !joined.contains("..."),
+        "full markdown should not abbreviate final-answer table cells: {joined}"
     );
 }
 
