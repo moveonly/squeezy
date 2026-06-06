@@ -9995,6 +9995,58 @@ fn escalated_max_output_tokens_only_raises_a_known_sub_ceiling_budget() {
 }
 
 #[tokio::test]
+async fn malformed_function_call_retries_with_corrective_nudge() {
+    // Gemini-style malformed tool-call arguments: round 0 stops with
+    // MalformedFunctionCall and no usable tool call. The agent should
+    // inject a corrective nudge and recover on the retry instead of ending
+    // the turn empty.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_malformed".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::MalformedFunctionCall),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("The fix is in src/foo.rs.".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_clean".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig::default();
+    config.routing.enabled = false;
+    let agent = Agent::new(config, provider.clone());
+    let mut rx = agent.start_turn("find the bug".to_string(), CancellationToken::new());
+    let mut completed_text = None;
+    let mut failed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed_text = Some(message.content),
+            AgentEvent::Failed { .. } => failed = true,
+            _ => {}
+        }
+    }
+    assert!(!failed, "malformed tool call should recover, not fail");
+    assert_eq!(completed_text.as_deref(), Some("The fix is in src/foo.rs."));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "malformed round plus one corrective retry");
+    let retry = &requests[1];
+    let has_nudge = retry.input.iter().any(|item| match item {
+        LlmInputItem::UserText(text) => text.contains("could not be parsed"),
+        _ => false,
+    });
+    assert!(has_nudge, "retry must carry the corrective JSON nudge");
+}
+
+#[tokio::test]
 async fn refusal_stop_reason_emits_failed_with_safety_hint() {
     let provider = Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),

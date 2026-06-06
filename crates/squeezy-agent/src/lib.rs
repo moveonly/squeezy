@@ -6705,6 +6705,11 @@ impl TurnRuntime {
         // it has headroom, so we don't burn an identical retry on it.
         let mut max_output_tokens_override: Option<u32> = None;
         let mut max_tokens_escalations = 0usize;
+        // One-shot corrective retry for a Gemini `MALFORMED_FUNCTION_CALL`
+        // stop (tool-call arguments the upstream parser rejected, leaving
+        // no usable call). Bounded so a model that keeps emitting bad JSON
+        // can't loop the turn forever.
+        let mut malformed_retry_used = false;
         // Per-turn model routing decision. The classifier runs once at
         // the top of the turn; `current_model` is what each round
         // dispatches on. On mid-turn escalation it is overwritten with
@@ -8067,6 +8072,84 @@ impl TurnRuntime {
                 // `Some(StopReason::PauseTurn)` with tool calls present falls
                 // through (via the `_` arm) to the existing tool-execution /
                 // re-entry logic below.
+
+                // Gemini `MALFORMED_FUNCTION_CALL`: the model tried to call a
+                // tool but emitted arguments the upstream parser rejected, so
+                // no usable call survives and the turn would otherwise end
+                // with nothing. One bounded corrective retry — tell the model
+                // its arguments were unparseable and ask it to re-issue with
+                // valid JSON. Any visible text it produced first is preserved.
+                // (When valid tool calls DID survive alongside the bad one,
+                // fall through to execute them.)
+                Some(StopReason::MalformedFunctionCall)
+                    if !malformed_retry_used && tool_calls.is_empty() =>
+                {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    let preserved_visible_chars = append_deferred_visible_assistant_text(
+                        &mut deferred_retry_visible_assistant,
+                        &raw_assistant_text,
+                    );
+                    if !raw_assistant_text.trim().is_empty() {
+                        conversation.push(redact_input_item(
+                            LlmInputItem::AssistantText(raw_assistant_text.clone()),
+                            &self.redactor,
+                        ));
+                    }
+                    let retry_metadata = json!({
+                        "branch": "malformed_function_call",
+                        "round": round,
+                        "assistant_text_chars": raw_assistant_text.chars().count(),
+                        "preserved_visible_chars": preserved_visible_chars,
+                    });
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        Some(retry_metadata.clone()),
+                    );
+                    self.log_event(
+                        "assistant_retry",
+                        Some(self.turn_id),
+                        Some(
+                            "malformed_function_call retry: asked the model to re-issue valid JSON"
+                                .to_string(),
+                        ),
+                        retry_metadata,
+                    );
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    let nudge_item = redact_input_item(
+                        LlmInputItem::UserText(
+                            "Your previous tool call could not be parsed — its arguments were not \
+                             valid JSON. Re-issue the tool call now with correctly-formed JSON \
+                             arguments."
+                                .to_string(),
+                        ),
+                        &self.redactor,
+                    );
+                    conversation.push(nudge_item.clone());
+                    if self.config.store_responses {
+                        previous_response_id = response_id.clone();
+                        next_input = vec![nudge_item];
+                    } else {
+                        previous_response_id = None;
+                        next_input = conversation.clone();
+                    }
+                    malformed_retry_used = true;
+                    tracing::debug!(
+                        target: "squeezy_agent::malformed_function_call_retry",
+                        round,
+                        preserved_visible_chars,
+                        "retrying after malformed tool-call arguments",
+                    );
+                    continue;
+                }
                 _ => {}
             }
 
