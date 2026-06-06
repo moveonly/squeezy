@@ -387,12 +387,16 @@ impl ReplayRuntime {
                         event.payload.get("cost").cloned().unwrap_or(Value::Null),
                     )
                     .unwrap_or_default();
-                    // Replay logs predate the stop_reason surface; mark
-                    // replayed completions as `None` so consumers can tell
-                    // a synthesized completion from a fresh provider one.
-                    // `reasoning_only_stop` is also pulled from the payload
-                    // when present (Phase 4 newer replay traces) and
-                    // defaults to false for pre-existing replay logs.
+                    // Replay logs predate the stop_reason surface; missing
+                    // values stay `None` so older tapes remain readable.
+                    let stop_reason = serde_json::from_value::<StopReason>(
+                        event
+                            .payload
+                            .get("stop_reason")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    )
+                    .ok();
                     let reasoning_only_stop = event
                         .payload
                         .get("reasoning_only_stop")
@@ -401,7 +405,7 @@ impl ReplayRuntime {
                     events.push(LlmEvent::Completed {
                         response_id,
                         cost,
-                        stop_reason: None,
+                        stop_reason,
                         reasoning_only_stop,
                     });
                     return Ok(events);
@@ -6515,6 +6519,10 @@ impl TurnRuntime {
         // one retry per turn to prevent infinite loops if the model
         // ignores the nudge.
         let mut replan_retry_used = false;
+        // Append-only visible text from rounds that are internally retried.
+        // A retry may be useful for weak "I will call a tool" stops, but it
+        // must never let a later nudge response replace text the user already
+        // saw in the same turn.
         let mut deferred_retry_visible_assistant = String::new();
         let mut pause_turn_reissues = 0usize;
         // Per-turn model routing decision. The classifier runs once at
@@ -7578,6 +7586,25 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        None,
+                    );
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    self.preserve_visible_assistant_before_terminal_failure(
+                        merge_retried_visible_assistant_text(
+                            &mut deferred_retry_visible_assistant,
+                            &raw_assistant_text,
+                        ),
+                        raw_assistant_text,
+                        &mut conversation,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await;
                     self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
@@ -7604,6 +7631,25 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        None,
+                    );
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    self.preserve_visible_assistant_before_terminal_failure(
+                        merge_retried_visible_assistant_text(
+                            &mut deferred_retry_visible_assistant,
+                            &raw_assistant_text,
+                        ),
+                        raw_assistant_text,
+                        &mut conversation,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await;
                     self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
@@ -7630,6 +7676,25 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        None,
+                    );
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    self.preserve_visible_assistant_before_terminal_failure(
+                        merge_retried_visible_assistant_text(
+                            &mut deferred_retry_visible_assistant,
+                            &raw_assistant_text,
+                        ),
+                        raw_assistant_text,
+                        &mut conversation,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await;
                     self.stamp_routing_savings(&mut broker.metrics);
                     self.publish_terminal_task_state(
                         TaskStateStatus::Failed,
@@ -7664,7 +7729,13 @@ impl TurnRuntime {
                     {
                         self.record_replay_model_text_delta(&tail);
                     }
-                    self.record_replay_model_completed(response_id.clone(), &completed_cost);
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        None,
+                    );
                     broker.metrics.redactions += assistant_stream.total_redactions();
                     if pause_turn_reissues < MAX_PAUSE_TURN_REISSUES {
                         pause_turn_reissues += 1;
@@ -7768,12 +7839,42 @@ impl TurnRuntime {
                         LlmInputItem::AssistantText(raw_assistant_text.clone()),
                         &self.redactor,
                     ));
-                    if promised_action_branch {
+                    let retry_branch = if reasoning_only_branch {
+                        "reasoning_only"
+                    } else {
+                        "promised_action"
+                    };
+                    let preserved_visible_chars = if promised_action_branch {
                         append_deferred_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
-                        );
-                    }
+                        )
+                    } else {
+                        0
+                    };
+                    let retry_metadata = json!({
+                        "branch": retry_branch,
+                        "round": round,
+                        "plan_mode": plan_mode,
+                        "reasoning_only_stop": reasoning_only_stop,
+                        "assistant_text_chars": raw_assistant_text.chars().count(),
+                        "preserved_visible_chars": preserved_visible_chars,
+                    });
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        Some(retry_metadata.clone()),
+                    );
+                    self.log_event(
+                        "assistant_retry",
+                        Some(self.turn_id),
+                        Some(format!(
+                            "{retry_branch} retry preserved {preserved_visible_chars} visible chars",
+                        )),
+                        retry_metadata,
+                    );
                     let nudge = if reasoning_only_branch {
                         if plan_mode {
                             "You finished thinking but produced no `<proposed_plan>...</proposed_plan>` block. \
@@ -7813,16 +7914,19 @@ impl TurnRuntime {
                         reasoning_only_stop,
                         plan_mode,
                         assistant_text_chars = raw_assistant_text.chars().count(),
-                        branch = if reasoning_only_branch {
-                            "reasoning_only"
-                        } else {
-                            "promised_action"
-                        },
+                        preserved_visible_chars,
+                        branch = retry_branch,
                         "retrying turn with mode-aware nudge",
                     );
                     continue;
                 }
-                self.record_replay_model_completed(response_id.clone(), &completed_cost);
+                self.record_replay_model_completed(
+                    response_id.clone(),
+                    &completed_cost,
+                    stop_reason.as_ref(),
+                    reasoning_only_stop,
+                    None,
+                );
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let raw_assistant_text = std::mem::take(&mut assistant_message);
                 conversation.push(redact_input_item(
@@ -7868,7 +7972,13 @@ impl TurnRuntime {
                 return Ok(());
             }
 
-            self.record_replay_model_completed(response_id.clone(), &completed_cost);
+            self.record_replay_model_completed(
+                response_id.clone(),
+                &completed_cost,
+                stop_reason.as_ref(),
+                reasoning_only_stop,
+                None,
+            );
 
             let results = if let Some(replay) = &self.replay {
                 replay_tool_calls(
@@ -7936,10 +8046,15 @@ impl TurnRuntime {
                     self.record_replay_model_text_delta(&tail);
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let assistant_text = std::mem::take(&mut assistant_message);
+                let raw_assistant_text = std::mem::take(&mut assistant_message);
+                let visible_assistant_text = merge_retried_visible_assistant_text(
+                    &mut deferred_retry_visible_assistant,
+                    &raw_assistant_text,
+                );
                 self.finish_soft_completion(
                     reason,
-                    assistant_text,
+                    visible_assistant_text,
+                    raw_assistant_text,
                     &mut conversation,
                     response_id.clone(),
                     user_transcript.clone(),
@@ -8244,10 +8359,15 @@ impl TurnRuntime {
             self.record_replay_model_text_delta(&tail);
         }
         broker.metrics.redactions += assistant_stream.total_redactions();
-        let assistant_text = std::mem::take(&mut assistant_message);
+        let raw_assistant_text = std::mem::take(&mut assistant_message);
+        let visible_assistant_text = merge_retried_visible_assistant_text(
+            &mut deferred_retry_visible_assistant,
+            &raw_assistant_text,
+        );
         self.finish_soft_completion(
             format!("stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"),
-            assistant_text,
+            visible_assistant_text,
+            raw_assistant_text,
             &mut conversation,
             previous_response_id.clone(),
             user_transcript.clone(),
@@ -8595,7 +8715,8 @@ impl TurnRuntime {
     async fn finish_soft_completion(
         &self,
         stop_note: String,
-        assistant_text: String,
+        visible_assistant_text: String,
+        conversation_assistant_text: String,
         conversation: &mut Vec<LlmInputItem>,
         response_id: Option<String>,
         user_transcript: TranscriptItem,
@@ -8609,15 +8730,15 @@ impl TurnRuntime {
         // Compose the visible answer: the model's own text first (if any),
         // then a one-line note explaining the early finish. When the model
         // produced no text the note stands alone so the answer is never empty.
-        let trimmed = assistant_text.trim_end();
+        let trimmed = visible_assistant_text.trim_end();
         let answer = if trimmed.is_empty() {
             stop_note.clone()
         } else {
             format!("{trimmed}\n\n_(stopped early: {stop_note})_")
         };
-        if !assistant_text.is_empty() {
+        if !conversation_assistant_text.is_empty() {
             conversation.push(redact_input_item(
-                LlmInputItem::AssistantText(assistant_text.clone()),
+                LlmInputItem::AssistantText(conversation_assistant_text),
                 &self.redactor,
             ));
         }
@@ -8663,6 +8784,44 @@ impl TurnRuntime {
             })
             .await;
         self.finish_turn(metrics).await;
+    }
+
+    /// Preserve visible assistant text before a hard terminal failure
+    /// (`max_tokens`, context overflow, refusal). Failed turns do not go
+    /// through `persist_turn_state`, but resume/transcript state should still
+    /// retain text the user already saw in the live stream.
+    async fn preserve_visible_assistant_before_terminal_failure(
+        &self,
+        visible_assistant_text: String,
+        conversation_assistant_text: String,
+        conversation: &mut Vec<LlmInputItem>,
+        user_transcript: TranscriptItem,
+        context_compaction: ContextCompactionState,
+    ) {
+        if visible_assistant_text.trim().is_empty() {
+            return;
+        }
+        if !conversation_assistant_text.is_empty() {
+            conversation.push(redact_input_item(
+                LlmInputItem::AssistantText(conversation_assistant_text),
+                &self.redactor,
+            ));
+        }
+        if !active_turn_is_current(&self.active_turn, self.turn_id) {
+            return;
+        }
+        let mut state = self.conversation_state.lock().await;
+        state.conversation = conversation.clone();
+        state.transcript.push(user_transcript);
+        state.transcript.push(TranscriptItem::assistant(
+            plan_mode::strip_proposed_plan_blocks(&visible_assistant_text),
+        ));
+        let mut merged_compaction = context_compaction;
+        merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
+        state.context_compaction = merged_compaction;
+        if let Some(session) = &self.session_log {
+            let _ = session.write_resume_state(&state.to_resume_state());
+        }
     }
 
     /// Mirror the success path's conversation/transcript push for a turn
@@ -8781,12 +8940,22 @@ impl TurnRuntime {
         );
     }
 
-    fn record_replay_model_completed(&self, response_id: Option<String>, cost: &CostSnapshot) {
+    fn record_replay_model_completed(
+        &self,
+        response_id: Option<String>,
+        cost: &CostSnapshot,
+        stop_reason: Option<&StopReason>,
+        reasoning_only_stop: bool,
+        retry: Option<Value>,
+    ) {
         self.record_replay(
             SessionReplayEventKind::ModelCompleted,
             json!({
                 "response_id": response_id,
                 "cost": cost,
+                "stop_reason": stop_reason,
+                "reasoning_only_stop": reasoning_only_stop,
+                "retry": retry,
             }),
         );
     }
@@ -11756,15 +11925,17 @@ fn is_control_tool_name(name: &str) -> bool {
     )
 }
 
-fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) {
+fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) -> usize {
     let display_text = plan_mode::strip_proposed_plan_blocks(text);
     if display_text.trim().is_empty() {
-        return;
+        return 0;
     }
     if !deferred.is_empty() {
         deferred.push_str("\n\n");
     }
-    deferred.push_str(display_text.trim());
+    let visible = display_text.trim();
+    deferred.push_str(visible);
+    visible.chars().count()
 }
 
 fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str) -> String {
