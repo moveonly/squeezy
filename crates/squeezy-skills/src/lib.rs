@@ -586,7 +586,12 @@ impl SkillCatalog {
                         loaded.push(skill);
                         kinds.push(kind);
                     }
-                    Err(error) if matches!(kind, SkillActivationKind::Explicit) => {
+                    Err(error)
+                        if matches!(
+                            kind,
+                            SkillActivationKind::Explicit | SkillActivationKind::Trigger
+                        ) =>
+                    {
                         warnings.push(SkillActivationWarning {
                             name: name.clone(),
                             message: error.to_string(),
@@ -1091,8 +1096,8 @@ pub struct SkillActivation {
     /// hit rates are observable without re-deriving from the input.
     pub kinds: Vec<SkillActivationKind>,
     /// Non-fatal issues encountered while activating skills. Explicit
-    /// `/skill <name>` requests use this path so a typo does not discard the
-    /// user's trailing task.
+    /// `/skill <name>` requests and trigger matches use this path so stale
+    /// or mistyped skill references do not discard the user's turn.
     pub warnings: Vec<SkillActivationWarning>,
 }
 

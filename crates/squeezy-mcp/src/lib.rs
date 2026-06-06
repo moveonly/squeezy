@@ -1052,6 +1052,9 @@ impl McpClientRegistry {
     pub async fn aggregate_capabilities(&self) -> (bool, bool, bool) {
         let sessions = self.sessions.lock().await;
         let mut has_resources = false;
+        // Squeezy advertises client-side elicitation support during
+        // initialize, so this means "a connected session can ask us to
+        // elicit" rather than "a server declared an elicitation capability."
         let has_elicitation = !sessions.is_empty();
         let mut has_experimental = false;
         for entry in sessions.values() {

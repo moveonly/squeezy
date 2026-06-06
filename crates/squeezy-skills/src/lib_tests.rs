@@ -783,6 +783,37 @@ fn disabled_explicit_skill_warns_and_preserves_task() {
 }
 
 #[test]
+fn trigger_skill_load_failure_warns_and_preserves_task() {
+    let root = temp_workspace("skills_trigger_stale_file");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &["rust symbol"]);
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    fs::remove_file(skill_dir.join("SKILL.md")).expect("remove skill file after discovery");
+
+    let activation = catalog
+        .activate_for_input("please inspect this rust symbol")
+        .expect("stale trigger skill must not abort activation");
+    assert_eq!(activation.task_input, "please inspect this rust symbol");
+    assert!(activation.skills.is_empty());
+    assert!(activation.kinds.is_empty());
+    assert_eq!(activation.warnings.len(), 1);
+    assert_eq!(activation.warnings[0].name, "rust-nav");
+    assert!(
+        activation.warnings[0].message.contains("No such file")
+            || activation.warnings[0].message.contains("os error"),
+        "{:?}",
+        activation.warnings
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn activation_kind_serializes_as_snake_case() {
     let cases = [
         (SkillActivationKind::Explicit, "\"explicit\""),
