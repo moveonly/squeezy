@@ -1200,6 +1200,23 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
         };
         let key = key.trim();
         let value = value.trim();
+
+        // A YAML block scalar header (`|`/`>`, optionally with chomping/indent
+        // indicators) means the real value spans the following indented lines.
+        // This parser is line-based rather than a full YAML parser, so gather
+        // and fold those continuation lines here. It keeps SKILL.md files
+        // portable: frontmatter that other agents accept — which commonly wraps
+        // a long `description` in a `>-` block — loads here too.
+        let block_value;
+        let value = if let Some(header) = parse_block_scalar_header(value) {
+            let (folded, consumed) = parse_block_scalar(&lines[idx..], header);
+            idx += consumed;
+            block_value = folded;
+            block_value.as_str()
+        } else {
+            value
+        };
+
         match key {
             "name" => name = Some(unquote(value).to_string()),
             "description" => description = Some(unquote(value).to_string()),
@@ -1426,6 +1443,135 @@ fn parse_inline_list(value: &str) -> Vec<String> {
         .map(unquote)
         .map(str::to_string)
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct BlockScalarHeader {
+    /// `true` for literal (`|`) style, `false` for folded (`>`).
+    literal: bool,
+    chomp: BlockChomp,
+}
+
+#[derive(Clone, Copy)]
+enum BlockChomp {
+    /// `-`: strip every trailing line break.
+    Strip,
+    /// default: keep a single trailing line break.
+    Clip,
+    /// `+`: keep all trailing line breaks.
+    Keep,
+}
+
+/// Parse a YAML block scalar header such as `>`, `>-`, `|`, `|+`, or `|2-`.
+///
+/// Returns `None` when `value` is an ordinary scalar (the common case), so the
+/// caller falls back to treating the rest of the line as the value. The
+/// optional indentation-indicator digit is accepted but ignored — block
+/// indentation is detected from the first content line instead.
+fn parse_block_scalar_header(value: &str) -> Option<BlockScalarHeader> {
+    let mut chars = value.chars();
+    let literal = match chars.next()? {
+        '|' => true,
+        '>' => false,
+        _ => return None,
+    };
+    let mut chomp = BlockChomp::Clip;
+    for ch in chars {
+        match ch {
+            '-' => chomp = BlockChomp::Strip,
+            '+' => chomp = BlockChomp::Keep,
+            c if c.is_ascii_digit() => {} // explicit indentation indicator: ignored
+            _ => return None,
+        }
+    }
+    Some(BlockScalarHeader { literal, chomp })
+}
+
+/// Collect the indented continuation lines of a block scalar, returning the
+/// folded/literal text and the number of lines consumed.
+///
+/// Block indentation is taken from the first non-blank line; a later non-blank
+/// line indented less than that ends the block (and is not consumed, so the
+/// caller reparses it as the next key). Folded (`>`) style joins consecutive
+/// non-blank lines with a single space and turns blank lines into newlines;
+/// literal (`|`) style preserves line breaks verbatim.
+fn parse_block_scalar(lines: &[&str], header: BlockScalarHeader) -> (String, usize) {
+    let mut consumed = 0;
+    let mut block_indent: Option<usize> = None;
+    let mut content: Vec<String> = Vec::new();
+
+    for raw in lines {
+        let indent = raw.len() - raw.trim_start().len();
+        if raw.trim().is_empty() {
+            content.push(String::new());
+            consumed += 1;
+            continue;
+        }
+        match block_indent {
+            Some(bi) if indent < bi => break,
+            Some(_) => {}
+            None => block_indent = Some(indent),
+        }
+        content.push(strip_leading_spaces(raw, block_indent.unwrap_or(indent)));
+        consumed += 1;
+    }
+
+    // Count of trailing blank lines drives chomping; the lines themselves stay
+    // in `consumed` so the caller's cursor skips past them.
+    let mut trailing_blanks = 0;
+    while matches!(content.last(), Some(line) if line.is_empty()) {
+        content.pop();
+        trailing_blanks += 1;
+    }
+
+    let mut folded = String::new();
+    if header.literal {
+        folded = content.join("\n");
+    } else {
+        let mut at_start = true;
+        for line in &content {
+            if line.is_empty() {
+                folded.push('\n');
+                at_start = true;
+            } else {
+                if !at_start {
+                    folded.push(' ');
+                }
+                folded.push_str(line);
+                at_start = false;
+            }
+        }
+    }
+
+    match header.chomp {
+        BlockChomp::Strip => {}
+        BlockChomp::Clip if !folded.is_empty() => folded.push('\n'),
+        BlockChomp::Clip => {}
+        BlockChomp::Keep if !folded.is_empty() => {
+            for _ in 0..trailing_blanks + 1 {
+                folded.push('\n');
+            }
+        }
+        BlockChomp::Keep => {}
+    }
+    (folded, consumed)
+}
+
+/// Remove up to `n` leading space/tab characters from `raw`, preserving any
+/// indentation deeper than the block's base indent (relevant for literal
+/// blocks). Stops early at the first non-whitespace character.
+fn strip_leading_spaces(raw: &str, n: usize) -> String {
+    // `count` is the leading-whitespace char position; every char before the
+    // break is a space/tab, so it equals the number stripped so far. Defaults
+    // to the full length when the line is entirely whitespace shorter than `n`.
+    let mut start = raw.len();
+    for (count, (i, ch)) in raw.char_indices().enumerate() {
+        if count >= n || (ch != ' ' && ch != '\t') {
+            start = i;
+            break;
+        }
+    }
+    raw[start..].to_string()
 }
 
 fn unquote(value: &str) -> &str {
