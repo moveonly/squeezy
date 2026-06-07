@@ -7616,8 +7616,7 @@ fn turn_divider_flush_waits_for_settling_tail_and_dedupes() {
     app.finalize_settles_for_test();
     let len = app.transcript.len();
     let first = lines_to_plain_text(&turn_divider_lines_for_flush(&app, 100, len, None));
-    assert!(first.contains("─ Cancelled after 5s"), "{first}");
-    assert!(!first.contains("╰─☽"), "{first}");
+    assert!(first.contains("╰─☽ Cancelled after 5s"), "{first}");
     assert!(
         turn_divider_lines_for_flush(&app, 100, len, Some(app.turn_divider_generation)).is_empty(),
         "divider flush is a one-shot; the terminal guard tracks the persisted row"
@@ -7625,7 +7624,7 @@ fn turn_divider_flush_waits_for_settling_tail_and_dedupes() {
 }
 
 #[test]
-fn cancelled_turn_scrollback_persists_footer_after_warn_tail() {
+fn cancelled_turn_scrollback_persists_closing_moon_after_warn_tail() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("What is the architecture?"));
     app.push_note("mcp status 0/1 ready 0 tools 1 failed".to_string());
@@ -7639,10 +7638,9 @@ fn cancelled_turn_scrollback_persists_footer_after_warn_tail() {
 
     assert!(rendered.contains("turn cancelled"), "{rendered}");
     assert!(
-        rendered.contains("─ Cancelled after 5s"),
-        "scrollback must persist the cancelled turn footer: {rendered}"
+        rendered.contains("╰─☽ Cancelled after 5s"),
+        "scrollback must persist the cyan closed moon as the turn terminator: {rendered}"
     );
-    assert!(!rendered.contains("╰─☽ Cancelled after 5s"), "{rendered}");
     assert!(
         !rendered.trim_end().ends_with('│'),
         "a cancelled turn must not leave the rail ending on a dangling connector: {rendered}"
@@ -7651,21 +7649,24 @@ fn cancelled_turn_scrollback_persists_footer_after_warn_tail() {
 
 #[test]
 fn turn_divider_flush_survives_queued_prompt_auto_start_for_all_outcomes() {
-    for (visual, expected, color) in [
+    for (visual, expected, color, expect_closing_moon) in [
         (
             TurnVisualState::Succeeded,
             "─ Worked for 3s",
             crate::render::theme::green(),
+            false,
         ),
         (
             TurnVisualState::Failed,
-            "─ Failed after 3s",
+            "╰─☽ Failed after 3s",
             crate::render::theme::red(),
+            true,
         ),
         (
             TurnVisualState::Cancelled,
-            "─ Cancelled after 3s",
+            "╰─☽ Cancelled after 3s",
             crate::render::theme::cyan(),
+            true,
         ),
     ] {
         let mut app = test_app(SessionMode::Build);
@@ -7683,7 +7684,7 @@ fn turn_divider_flush_survives_queued_prompt_auto_start_for_all_outcomes() {
         let rendered = lines_to_plain_text(&lines);
         assert!(rendered.contains(expected), "{rendered}");
         assert_eq!(lines[0].spans[2].style.fg, Some(color));
-        assert!(!rendered.contains("╰─☽"), "{rendered}");
+        assert_eq!(rendered.contains("╰─☽"), expect_closing_moon, "{rendered}");
     }
 }
 
@@ -7722,21 +7723,24 @@ fn turn_divider_flush_inserts_before_queued_prompt_started_before_draw() {
 
 #[test]
 fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_all_outcomes() {
-    for (visual, expected, color) in [
+    for (visual, expected, color, expect_closing_moon) in [
         (
             TurnVisualState::Succeeded,
             "─ Worked for 4s",
             crate::render::theme::green(),
+            false,
         ),
         (
             TurnVisualState::Failed,
-            "─ Failed after 4s",
+            "╰─☽ Failed after 4s",
             crate::render::theme::red(),
+            true,
         ),
         (
             TurnVisualState::Cancelled,
-            "─ Cancelled after 4s",
+            "╰─☽ Cancelled after 4s",
             crate::render::theme::cyan(),
+            true,
         ),
     ] {
         let mut app = test_app(SessionMode::Build);
@@ -7771,7 +7775,12 @@ fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_a
             rendered_lines.join("\n")
         );
         assert_eq!(lines[divider_index].spans[2].style.fg, Some(color));
-        assert!(!rendered_lines[divider_index].contains("╰─☽"));
+        assert_eq!(
+            rendered_lines[divider_index].contains("╰─☽"),
+            expect_closing_moon,
+            "{}",
+            rendered_lines.join("\n")
+        );
     }
 }
 
@@ -7788,10 +7797,9 @@ fn transcript_overlay_appends_completed_turn_divider_after_warn_tail() {
 
     assert!(rendered.contains("turn cancelled"), "{rendered}");
     assert!(
-        rendered.contains("─ Cancelled after 5s"),
-        "overlay must show the completed turn footer: {rendered}"
+        rendered.contains("╰─☽ Cancelled after 5s"),
+        "overlay must close the visible cancelled turn: {rendered}"
     );
-    assert!(!rendered.contains("╰─☽ Cancelled after 5s"), "{rendered}");
 }
 
 #[test]
@@ -8440,45 +8448,43 @@ fn inline_view_hides_completed_divider_after_scrollback_flush() {
 }
 
 #[test]
-fn failed_turn_shows_red_duration_footer_without_moon() {
+fn failed_turn_shows_red_closing_moon_duration_row() {
     let mut app = test_app(SessionMode::Build);
     app.turn_visual = TurnVisualState::Failed;
     app.last_turn_duration = Some(Duration::from_secs(7));
 
     let line = last_turn_divider_line(&app, Duration::from_secs(7), 80);
 
-    assert_eq!(line.spans[1].content.as_ref(), "─ ");
-    assert_eq!(line.spans[2].content.as_ref(), "Failed after 7s");
+    assert_eq!(line.spans[1].content.as_ref(), "╰─");
+    assert_eq!(line.spans[2].content.as_ref(), "☽");
     assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::red()));
     let text = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(!text.contains("╰─☽"), "{text}");
-    assert!(!text.contains("☽"), "{text}");
+    assert!(text.contains("╰─☽"), "{text}");
     assert!(text.contains("Failed after 7s"), "{text}");
     assert!(!text.contains("Worked for"), "{text}");
 }
 
 #[test]
-fn cancelled_turn_shows_cyan_duration_footer_without_moon() {
+fn cancelled_turn_shows_cyan_closing_moon_duration_row() {
     let mut app = test_app(SessionMode::Build);
     app.turn_visual = TurnVisualState::Cancelled;
     app.last_turn_duration = Some(Duration::from_secs(5));
 
     let line = last_turn_divider_line(&app, Duration::from_secs(5), 80);
 
-    assert_eq!(line.spans[1].content.as_ref(), "─ ");
-    assert_eq!(line.spans[2].content.as_ref(), "Cancelled after 5s");
+    assert_eq!(line.spans[1].content.as_ref(), "╰─");
+    assert_eq!(line.spans[2].content.as_ref(), "☽");
     assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::cyan()));
     let text = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(!text.contains("╰─☽"), "{text}");
-    assert!(!text.contains("☽"), "{text}");
+    assert!(text.contains("╰─☽"), "{text}");
     assert!(text.contains("Cancelled after 5s"), "{text}");
     assert!(!text.contains("Worked for"), "{text}");
     assert!(!text.contains("Failed after"), "{text}");
