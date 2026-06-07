@@ -48,6 +48,7 @@ squeezy-parse.workspace = true
 seccompiler = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+squeezy-win-sandbox.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

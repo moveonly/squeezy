@@ -275,7 +275,13 @@ impl ShellSandboxPlan {
     /// capability that is guaranteed to fail with a confusing errno; the
     /// child instead gets the clear "not set" path from `squeezy ask`.
     pub(crate) fn exports_ask_socket(&self) -> bool {
-        self.backend != "linux-direct-syscalls"
+        // The Windows sandbox backends spawn via raw Win32 with a scrubbed
+        // environment and have no AF_UNIX `squeezy ask` transport wired up yet,
+        // so exporting the socket would advertise an unusable capability.
+        !matches!(
+            self.backend,
+            "linux-direct-syscalls" | "windows-restricted-token" | "windows-elevated"
+        )
     }
 }
 
@@ -321,6 +327,84 @@ pub(crate) fn macos_sandbox_exec_supported() -> bool {
             false
         }
     })
+}
+
+/// Per-platform shell-sandbox posture for `squeezy doctor`, reflecting the
+/// ACTUAL runtime backend rather than a proxy. Keeping this in `shell_sandbox`
+/// means `doctor` cannot drift from `prepare_shell_sandbox_plan_with_probe`
+/// (e.g. the historical Linux `bwrap` check that never matched the
+/// `linux-direct-syscalls` runtime).
+#[derive(Debug, Clone)]
+pub struct ShellSandboxDoctor {
+    /// The backend name the runtime would select on this platform.
+    pub backend: &'static str,
+    /// Whether that backend can actually enforce isolation right now.
+    pub available: bool,
+    /// Human-readable explanation for the doctor row.
+    pub detail: String,
+}
+
+/// Probe the active shell-sandbox backend for `doctor`.
+pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
+    #[cfg(target_os = "macos")]
+    {
+        let available = macos_sandbox_exec_supported();
+        ShellSandboxDoctor {
+            backend: "macos-sandbox-exec",
+            available,
+            detail: if available {
+                "sandbox-exec present; deny-default Seatbelt profile enforces filesystem + network"
+                    .to_string()
+            } else {
+                "/usr/bin/sandbox-exec not found; required mode denies, best_effort degrades"
+                    .to_string()
+            },
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let userns = linux_unshare_supported();
+        let landlock = linux_landlock_supported();
+        let detail = match (userns, landlock) {
+            (true, true) => {
+                "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock + seccomp available".to_string()
+            }
+            (true, false) => {
+                "user namespaces available but Landlock filesystem enforcement is not; required mode denies"
+                    .to_string()
+            }
+            (false, true) => {
+                "Landlock available but unprivileged user namespaces are disabled (unprivileged_userns_clone=0 or no /proc/self/ns/user); required mode denies"
+                    .to_string()
+            }
+            (false, false) => {
+                "neither unprivileged user namespaces nor Landlock available; required mode denies"
+                    .to_string()
+            }
+        };
+        ShellSandboxDoctor {
+            backend: "linux-direct-syscalls",
+            available: userns && landlock,
+            detail,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ShellSandboxDoctor {
+            backend: "windows-restricted-token",
+            available: true,
+            detail: "restricted-token tier enforces filesystem writes with no admin; the elevated tier (sensitive-read deny + WFP network egress control) is opt-in via `squeezy doctor --sandbox-setup` (one UAC prompt)"
+                .to_string(),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        ShellSandboxDoctor {
+            backend: "none",
+            available: false,
+            detail: "no OS shell-sandbox backend is available for this platform".to_string(),
+        }
+    }
 }
 
 pub(crate) fn prepare_shell_sandbox_plan(
@@ -492,6 +576,61 @@ fn shell_sandbox_backend_probe_status_reason(
 }
 
 #[allow(unused_variables)]
+/// Writable roots the Windows sandbox grants: the workspace, any configured
+/// write roots, and the per-user temp dirs. Mirrors `shell_writable_roots`
+/// (macOS/Linux) for the Windows tiers; deduplicated, order-preserving.
+#[cfg(target_os = "windows")]
+fn windows_writable_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vec![root.to_path_buf()];
+    for write_root in &config.write_roots {
+        if !roots.contains(write_root) {
+            roots.push(write_root.clone());
+        }
+    }
+    for var in ["TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(var) {
+            let path = PathBuf::from(value);
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
+/// Build a restricted-token-tier plan: filesystem *writes* (and write
+/// carve-outs) are enforced via the restricted token + on-disk ACLs, but reads
+/// and network are not enforceable on this tier (a `WRITE_RESTRICTED` token
+/// does not gate reads, and egress cannot be scoped without a distinct user).
+/// The posture strings (`enforced_writes_only` / `not_enforced`) report this
+/// honestly. Reused as the best-effort fallback when the elevated tier is
+/// selected but not yet provisioned.
+#[cfg(target_os = "windows")]
+fn windows_restricted_plan(
+    command: &str,
+    config: &ShellSandboxConfig,
+    root: &Path,
+    required: bool,
+    fallback_reason: Option<String>,
+) -> ShellSandboxPlan {
+    let shell = ShellProgram::for_command(command);
+    ShellSandboxPlan {
+        program: shell.program,
+        args: shell.args,
+        backend: "windows-restricted-token",
+        mode: config.mode.as_str(),
+        network: "not_enforced",
+        filesystem: "enforced_writes_only",
+        required,
+        configured_read_roots: config.read_roots.clone(),
+        configured_write_roots: config.write_roots.clone(),
+        filesystem_read_roots: Vec::new(),
+        filesystem_write_roots: windows_writable_roots(root, config),
+        fallback_reason,
+        best_effort_fallback: None,
+    }
+}
+
 pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     command: &str,
     analysis: &ShellPermissionAnalysis,
@@ -501,6 +640,14 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     linux_unshare_available: bool,
     linux_landlock_available: bool,
 ) -> std::result::Result<ShellSandboxPlan, String> {
+    // Each probe result is consumed only by its own platform's backend branch
+    // below; reference the others so the non-matching targets (and the Windows
+    // CI `clippy -D warnings` gate) don't flag them as unused.
+    #[cfg(not(target_os = "macos"))]
+    let _ = macos_sandbox_exec_available;
+    #[cfg(not(target_os = "linux"))]
+    let _ = (linux_unshare_available, linux_landlock_available);
+
     if config.mode == ShellSandboxMode::Off {
         return Ok(ShellSandboxPlan::direct(
             command,
@@ -529,7 +676,9 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let fallback_reason: Option<String>;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // The Windows branch builds its own plans and never consults
+    // `fallback_reason`; only the generic non-(macOS|Linux|Windows) tail does.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let fallback_reason: Option<String> = None;
 
     #[cfg(target_os = "macos")]
@@ -620,34 +769,88 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
 
     #[cfg(target_os = "windows")]
     {
-        if required {
-            return Err(
-                "required shell sandbox unavailable on windows: filesystem and network isolation are not provided; use mode = \"best_effort\" or mode = \"external\""
-                    .to_string(),
-            );
+        use squeezy_core::WindowsSandboxLevel;
+
+        match config.windows_sandbox_level {
+            WindowsSandboxLevel::Disabled => {
+                if required {
+                    return Err(
+                        "required shell sandbox unavailable on windows: windows_sandbox_level = \"disabled\" provides no filesystem/network isolation; set windows_sandbox_level = \"restricted_token\" (or use mode = \"best_effort\"/\"external\")"
+                            .to_string(),
+                    );
+                }
+                let shell = ShellProgram::for_command(command);
+                Ok(ShellSandboxPlan {
+                    program: shell.program,
+                    args: shell.args,
+                    backend: "windows-job-object",
+                    mode: config.mode.as_str(),
+                    network: if network == "denied" {
+                        "denied_best_effort"
+                    } else {
+                        network
+                    },
+                    filesystem: "best_effort_unavailable",
+                    required: false,
+                    configured_read_roots: config.read_roots.clone(),
+                    configured_write_roots: config.write_roots.clone(),
+                    filesystem_read_roots: Vec::new(),
+                    filesystem_write_roots: Vec::new(),
+                    fallback_reason: Some(
+                        "windows: windows_sandbox_level=disabled; process-tree cleanup via Job Object only; no FS/network isolation".to_string(),
+                    ),
+                    best_effort_fallback: None,
+                })
+            }
+            WindowsSandboxLevel::Elevated
+                if squeezy_win_sandbox::elevated_setup_is_complete(
+                    &crate::win_sandbox_spec::win_state_dir(),
+                ) =>
+            {
+                let shell = ShellProgram::for_command(command);
+                Ok(ShellSandboxPlan {
+                    program: shell.program,
+                    args: shell.args,
+                    backend: "windows-elevated",
+                    mode: config.mode.as_str(),
+                    // Network is genuinely enforced on the elevated tier: the
+                    // offline identity carries WFP egress-block filters; an
+                    // approved-network command runs under the online identity.
+                    network,
+                    filesystem: "enforced",
+                    required,
+                    configured_read_roots: config.read_roots.clone(),
+                    configured_write_roots: config.write_roots.clone(),
+                    filesystem_read_roots: config.read_roots.clone(),
+                    filesystem_write_roots: windows_writable_roots(root, config),
+                    fallback_reason: None,
+                    best_effort_fallback: None,
+                })
+            }
+            WindowsSandboxLevel::Elevated => {
+                // Selected but not provisioned. Required fails closed;
+                // best-effort degrades to the restricted-token tier (no setup
+                // needed) and records why reads + network are not enforced.
+                if required {
+                    return Err(
+                        "required shell sandbox unavailable on windows: elevated tier is not provisioned; run `squeezy doctor --sandbox-setup` once (UAC), or set windows_sandbox_level = \"restricted_token\""
+                            .to_string(),
+                    );
+                }
+                Ok(windows_restricted_plan(
+                    command,
+                    config,
+                    root,
+                    false,
+                    Some(
+                        "windows: elevated tier not provisioned (run `squeezy doctor --sandbox-setup`); fell back to restricted-token — filesystem writes enforced, reads + network not enforced".to_string(),
+                    ),
+                ))
+            }
+            WindowsSandboxLevel::RestrictedToken => Ok(windows_restricted_plan(
+                command, config, root, required, None,
+            )),
         }
-        let shell = ShellProgram::for_command(command);
-        Ok(ShellSandboxPlan {
-            program: shell.program,
-            args: shell.args,
-            backend: "windows-job-object",
-            mode: config.mode.as_str(),
-            network: if network == "denied" {
-                "denied_best_effort"
-            } else {
-                network
-            },
-            filesystem: "best_effort_unavailable",
-            required: false,
-            configured_read_roots: config.read_roots.clone(),
-            configured_write_roots: config.write_roots.clone(),
-            filesystem_read_roots: Vec::new(),
-            filesystem_write_roots: Vec::new(),
-            fallback_reason: Some(
-                "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
-            ),
-            best_effort_fallback: None,
-        })
     }
 
     #[cfg(not(target_os = "windows"))]

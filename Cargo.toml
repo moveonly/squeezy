@@ -17,6 +17,7 @@ members = [
     "crates/squeezy-tools",
     "crates/squeezy-tui",
     "crates/squeezy-vcs",
+    "crates/squeezy-win-sandbox",
     "crates/squeezy-workspace",
 ]
 resolver = "3"
@@ -129,6 +130,7 @@ squeezy-telemetry = { path = "crates/squeezy-telemetry", version = "=0.1.0" }
 squeezy-tools = { path = "crates/squeezy-tools", version = "=0.1.0" }
 squeezy-tui = { path = "crates/squeezy-tui", version = "=0.1.0" }
 squeezy-vcs = { path = "crates/squeezy-vcs", version = "=0.1.0" }
+squeezy-win-sandbox = { path = "crates/squeezy-win-sandbox", version = "=0.1.0" }
 squeezy-workspace = { path = "crates/squeezy-workspace", version = "=0.1.0" }
 
 [profile.release]
