@@ -3440,9 +3440,13 @@ fn replay_resume_state_hydrates_tool_result_cards() {
         .expect("start session");
 
     let tool_call_args = json!({"command": "ls", "workdir": "."});
-    let tool_result_payload = json!({
-        "call_id": "call-1",
-        "tool_name": "shell",
+    // The shape production actually persists: the model-facing
+    // `FunctionCallOutput` resume item, whose `output` is the
+    // `ToolResult::model_output()` string `{"status":…,"content":…}`. This is
+    // NOT a serialized `ToolResult` — `tool_name`/`status`/`content` are not
+    // top-level fields. The TUI rebuilds the full card from this on hydration
+    // (see `reconstruct_resumed_tool_result`); the store forwards it verbatim.
+    let model_output = json!({
         "status": "Success",
         "content": {
             "command": "ls",
@@ -3450,11 +3454,12 @@ fn replay_resume_state_hydrates_tool_result_cards() {
             "stderr": "",
             "exit_code": 0,
         },
-        "cost_hint": { "output_bytes": 16 },
-        "receipt": {
-            "output_sha256": "deadbeef",
-            "content_sha256": null,
-        },
+    })
+    .to_string();
+    let tool_result_payload = json!({
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": model_output,
     });
 
     handle
@@ -3531,17 +3536,34 @@ fn replay_resume_state_hydrates_tool_result_cards() {
             assert_eq!(call.call_id, "call-1");
             assert_eq!(call.tool, "shell");
             assert_eq!(call.arguments, tool_call_args);
+            // The store forwards the persisted FunctionCallOutput resume item
+            // verbatim — not a serialized ToolResult. `tool_name` comes from
+            // the paired call above; `status`/`content` live inside the
+            // `output` model_output string, which the TUI reconstructs from.
             assert_eq!(
                 result.get("call_id").and_then(|v| v.as_str()),
                 Some("call-1")
             );
             assert_eq!(
-                result.get("tool_name").and_then(|v| v.as_str()),
-                Some("shell")
+                result.get("type").and_then(|v| v.as_str()),
+                Some("function_call_output")
+            );
+            let model_output: serde_json::Value = serde_json::from_str(
+                result
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .expect("output carries the model_output string"),
+            )
+            .expect("output is model_output JSON");
+            assert_eq!(
+                model_output.get("status").and_then(|v| v.as_str()),
+                Some("Success")
             );
             assert_eq!(
-                result.get("status").and_then(|v| v.as_str()),
-                Some("Success")
+                model_output
+                    .pointer("/content/stdout")
+                    .and_then(|v| v.as_str()),
+                Some("Cargo.toml\nsrc")
             );
         }
         other => panic!("entry 1 should be a ToolResult card, got {other:?}"),

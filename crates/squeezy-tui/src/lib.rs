@@ -58,7 +58,7 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
-    McpStatusSnapshot, ToolCall, ToolResult, ToolStatus,
+    McpStatusSnapshot, ToolCall, ToolCostHint, ToolReceipt, ToolResult, ToolStatus,
 };
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -1746,43 +1746,107 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
 /// Apply one `HydratedTranscriptItem` from the resume state to the
 /// live `TuiApp`, routing each variant to the matching `push_*`
 /// helper so the rebuilt transcript renders the same shape a fresh
-/// turn would. Tool-result cards need a roundtrip from
-/// `serde_json::Value` back to the typed `squeezy_tools::ToolResult`
+/// turn would. Tool-result cards are reconstructed from the persisted
+/// `serde_json::Value` back into the typed `squeezy_tools::ToolResult`
 /// — done here so `squeezy-store` can stay independent of
-/// `squeezy-tools`. Malformed entries log a transcript warning and
-/// otherwise no-op rather than abort the whole hydration.
+/// `squeezy-tools`. See `reconstruct_resumed_tool_result` for the
+/// shape mismatch this bridges.
 fn hydrate_transcript_item(app: &mut TuiApp, item: squeezy_store::HydratedTranscriptItem) {
     match item {
         squeezy_store::HydratedTranscriptItem::Message { item } => {
             app.push_transcript_item(item);
         }
         squeezy_store::HydratedTranscriptItem::ToolResult { call, result } => {
-            let mut result = result;
-            if result.get("tool_name").is_none()
-                && let Some(tool) = call.as_ref().map(|call| call.tool.as_str())
-                && let Some(object) = result.as_object_mut()
-            {
-                object.insert(
-                    "tool_name".to_string(),
-                    serde_json::Value::String(tool.to_string()),
-                );
-            }
-            let parsed_result: ToolResult = match serde_json::from_value(result) {
-                Ok(result) => result,
-                Err(err) => {
-                    app.push_warn(format!(
-                        "resume: dropped a malformed tool-result card ({err})"
-                    ));
-                    return;
-                }
-            };
             let parsed_call = call.map(|call| ToolCall {
                 call_id: call.call_id,
                 name: call.tool,
                 arguments: call.arguments,
             });
+            let parsed_result = reconstruct_resumed_tool_result(result, parsed_call.as_ref());
             app.push_tool_result_with_call(parsed_result, parsed_call);
         }
+    }
+}
+
+/// Rebuild a `squeezy_tools::ToolResult` for a resumed tool-result card.
+///
+/// Resume hydration hands us the *persisted* tool-result payload. For every
+/// session Squeezy actually writes, that payload is the model-facing
+/// `FunctionCallOutput` resume item —
+/// `{"type":"function_call_output","call_id":…,"output":"<model_output JSON>"}`
+/// — not a serialized `ToolResult`. A naive `from_value::<ToolResult>` fails on
+/// the absent `status`/`content`/`cost_hint`/`receipt` and the card gets
+/// dropped, so a resumed session loses every tool-result card it showed before
+/// exit.
+///
+/// We reconstruct instead: `output` is `ToolResult::model_output()` =
+/// `{"status":…,"content":…}`, so `status` and `content` round-trip faithfully;
+/// `tool_name`/`call_id` come from the paired call. `cost_hint` and `receipt`
+/// are telemetry-only — never part of `model_output` — so they default to
+/// empty, costing only the size/redaction footer (not the card body) on the
+/// resumed card. A payload that already carries the full struct (a future
+/// writer, or a `resume_state.json` snapshot that pre-dates the `tool_name`
+/// field) decodes directly.
+fn reconstruct_resumed_tool_result(
+    result: serde_json::Value,
+    call: Option<&ToolCall>,
+) -> ToolResult {
+    let tool_name = call.map(|call| call.name.as_str());
+    // Fast path: a payload that already holds the full struct decodes as-is.
+    // Backfill `tool_name` from the call first so a record that predates the
+    // field still parses, and preserve its real `cost_hint`/`receipt`.
+    if result.get("status").is_some() && result.get("content").is_some() {
+        let mut value = result.clone();
+        if value.get("tool_name").is_none()
+            && let Some(tool) = tool_name
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert(
+                "tool_name".to_string(),
+                serde_json::Value::String(tool.to_string()),
+            );
+        }
+        if let Ok(parsed) = serde_json::from_value::<ToolResult>(value) {
+            return parsed;
+        }
+    }
+
+    // FunctionCallOutput reconstruction. `output` is the `model_output()` JSON
+    // string the model saw: `{"status":…,"content":…}`.
+    let model_output = result.get("output").and_then(serde_json::Value::as_str);
+    let parsed_output =
+        model_output.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let status = parsed_output
+        .as_ref()
+        .and_then(|value| value.get("status").cloned())
+        .and_then(|value| serde_json::from_value::<ToolStatus>(value).ok())
+        .unwrap_or(ToolStatus::Success);
+    let content = parsed_output
+        .as_ref()
+        .and_then(|value| value.get("content").cloned())
+        // Not a `model_output` object (corrupt, or a pre-`model_output` body):
+        // surface the raw text rather than dropping the card.
+        .or_else(|| model_output.map(|raw| serde_json::Value::String(raw.to_string())))
+        .unwrap_or(serde_json::Value::Null);
+    let call_id = result
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| call.map(|call| call.call_id.as_str()))
+        .unwrap_or_default()
+        .to_string();
+
+    ToolResult {
+        call_id,
+        tool_name: tool_name.unwrap_or_default().to_string(),
+        status,
+        content,
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+        web_call_stats: None,
     }
 }
 
