@@ -119,8 +119,8 @@ fn write_inside_workspace_allowed() {
     let workspace = fresh_workspace("write_inside");
     let out_file = workspace.join("out.txt");
 
-    let cmdline = format!(r#"echo hi > "{}""#, out_file.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let cmdline = "echo hi > out.txt";
+    let Some(status) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
@@ -174,8 +174,8 @@ fn append_inside_allowed() {
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
-    let cmdline = format!(r#"echo line2 >> "{}""#, target.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let cmdline = "echo line2 >> append.txt";
+    let Some(status) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
@@ -199,8 +199,8 @@ fn delete_inside_allowed() {
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
-    let cmdline = format!(r#"del /q "{}""#, target.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let cmdline = "del /q delme.txt";
+    let Some(status) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
@@ -222,15 +222,15 @@ fn delete_inside_allowed() {
 fn read_system_still_works() {
     let workspace = fresh_workspace("read_system");
 
-    // `dir C:\Windows` lists the directory — a read-only operation that should
-    // always succeed on the restricted-token tier.
-    let Some(status) = run_cmd(&workspace, r"dir C:\Windows") else {
+    // Keep output bounded: run_cmd waits for the process without concurrently
+    // draining stdout, so a large directory listing can fill the pipe and hang.
+    let Some(status) = run_cmd(&workspace, r"if exist C:\Windows\System32\cmd.exe echo ok") else {
         return;
     };
 
     assert!(
         status.success(),
-        "reading C:\\Windows with dir should succeed on restricted-token tier; exit={status:?}"
+        "reading C:\\Windows\\System32\\cmd.exe should succeed on restricted-token tier; exit={status:?}"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
