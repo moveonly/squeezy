@@ -623,7 +623,7 @@ impl Writer {
 
     fn inline_code_text(&self, text: &str) -> String {
         if self.mode == MarkdownMode::Full {
-            collapse_spaces(text)
+            text.to_string()
         } else {
             compact_inline_code(text)
         }

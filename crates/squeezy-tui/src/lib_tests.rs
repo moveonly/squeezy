@@ -7949,6 +7949,66 @@ fn assistant_message_tables_do_not_abbreviate_cells() {
 }
 
 #[test]
+fn assistant_message_preserves_model_authored_ascii_diagram_spacing() {
+    let body = "\
+Actual Module Dependency Graph
+gctoolkit-api <- foundation; no outbound deps
+↑
+┌────┼────────────┐
+│    │            │
+gctoolkit-parser gctoolkit-vertx gctoolkit-sample gctoolkit-integration
+";
+    let item = TranscriptItem::assistant(body);
+
+    let lines = format_message_entry_with_width(
+        &item,
+        false,
+        false,
+        MessageOutcome::Normal,
+        Some(160),
+        true,
+        "Ctrl+T",
+    );
+    let rendered = lines_to_plain_text(&lines);
+
+    assert!(
+        rendered.contains("     │    │            │"),
+        "assistant answers must preserve diagram spacing after the transcript gutter: {rendered}"
+    );
+    assert!(
+        !rendered.contains("     │ │ │"),
+        "assistant answers must not collapse diagram connector columns: {rendered}"
+    );
+}
+
+#[test]
+fn transcript_overlay_preserves_assistant_diagram_spacing() {
+    let mut app = test_app(SessionMode::Build);
+    let body = "\
+Actual Module Dependency Graph
+gctoolkit-api <- foundation; no outbound deps
+↑
+┌────┼────────────┐
+│    │            │
+gctoolkit-parser gctoolkit-vertx gctoolkit-sample gctoolkit-integration
+";
+    app.push_transcript_item(TranscriptItem::assistant(body));
+    app.transcript[0].collapsed = true;
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let rendered = lines_to_plain_text(&transcript_lines_for_overlay(&app, Some(160), true));
+
+    assert!(
+        rendered.contains("     │    │            │"),
+        "Ctrl+T must preserve assistant diagram spacing: {rendered}"
+    );
+    assert!(
+        !rendered.contains("     │ │ │"),
+        "Ctrl+T must not collapse assistant diagram connector columns: {rendered}"
+    );
+}
+
+#[test]
 fn ansi_system_entry_parses_escapes_into_styled_spans() {
     // System messages whose content carries ANSI escape sequences flow
     // through `format_ansi_system_entry`, which parses each escape into
