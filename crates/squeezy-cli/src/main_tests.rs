@@ -196,6 +196,100 @@ fn cli_prompt_format_rejects_unknown_value() {
 }
 
 #[test]
+fn cli_prompt_permission_mode_accepts_strict_modes() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "hi",
+        "--prompt-permission-mode",
+        "deny-ask",
+    ])
+    .expect("parse deny-ask");
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::DenyAsk);
+
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "hi",
+        "--prompt-permission-mode",
+        "fail-on-ask",
+    ])
+    .expect("parse fail-on-ask");
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::FailOnAsk);
+}
+
+#[test]
+fn cli_sessions_and_repo_json_flags_parse() {
+    let cli =
+        Cli::try_parse_from(["squeezy", "sessions", "list", "--json"]).expect("parse sessions");
+    match cli.command {
+        Some(Command::Sessions {
+            command: SessionsCommand::List(args),
+        }) => assert!(args.json),
+        other => panic!("expected sessions list command, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["squeezy", "sessions", "show", "abc123", "--json"])
+        .expect("parse sessions show");
+    match cli.command {
+        Some(Command::Sessions {
+            command: SessionsCommand::Show { id, json },
+        }) => {
+            assert_eq!(id, "abc123");
+            assert!(json);
+        }
+        other => panic!("expected sessions show command, got {other:?}"),
+    }
+
+    let cli =
+        Cli::try_parse_from(["squeezy", "repo", "inspect", "--json"]).expect("parse repo inspect");
+    match cli.command {
+        Some(Command::Repo {
+            command: RepoCommand::Inspect { json },
+        }) => assert!(json),
+        other => panic!("expected repo inspect command, got {other:?}"),
+    }
+}
+
+#[test]
+fn cli_doctor_and_mcp_test_flags_parse() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "doctor",
+        "--json",
+        "--probe",
+        "--only",
+        "probe:mcp:docs",
+        "--status",
+        "fail",
+        "--skip-update",
+    ])
+    .expect("parse doctor filters");
+    match cli.command {
+        Some(Command::Doctor(args)) => {
+            assert!(args.json);
+            assert!(args.probe);
+            assert_eq!(args.only, vec!["probe:mcp:docs".to_string()]);
+            assert_eq!(args.status, vec![doctor::DoctorStatusFilter::Fail]);
+            assert!(args.skip_update);
+        }
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+
+    let cli =
+        Cli::try_parse_from(["squeezy", "mcp", "test", "docs", "--json"]).expect("parse mcp test");
+    match cli.command {
+        Some(Command::Mcp {
+            command: McpCommand::Test { name, json },
+        }) => {
+            assert_eq!(name, "docs");
+            assert!(json);
+        }
+        other => panic!("expected mcp test command, got {other:?}"),
+    }
+}
+
+#[test]
 fn repo_profile_error_does_not_block_startup() {
     let mut config = AppConfig::default();
     let prepared = prepare_repo_profile_from_load(
@@ -874,9 +968,15 @@ async fn print_mode_runs_tools_through_agent_loop_in_text_mode() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
-        .await
-        .expect("print-mode turn completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::AutoApproveAsk,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("print-mode turn completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
     let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
@@ -943,9 +1043,15 @@ async fn print_mode_emits_tool_events_as_jsonl() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Json, &mut stdout, &mut stderr)
-        .await
-        .expect("print-mode JSON turn completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Json,
+        PromptPermissionMode::AutoApproveAsk,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("print-mode JSON turn completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
     let mut types = Vec::new();
@@ -1041,9 +1147,15 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
-        .await
-        .expect("pump completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::AutoApproveAsk,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
 
     let decision = decision_rx.await.expect("approval decided");
     assert!(matches!(decision, ToolApprovalDecision::AllowOnce));
@@ -1051,6 +1163,77 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
     assert!(
         stderr_text.contains("auto-approving shell"),
         "stderr should announce the auto-approval; got: {stderr_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_mode_can_deny_ask_capability_in_strict_mode() {
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "echo hi".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "echo hi".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::DenyAsk,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
+
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(matches!(decision, ToolApprovalDecision::Denied));
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("approval: denying shell"),
+        "stderr should announce the denial; got: {stderr_text:?}"
     );
 }
 
@@ -1092,6 +1275,7 @@ async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
         &agent,
         prompts,
         PromptFormat::Default,
+        PromptPermissionMode::AutoApproveAsk,
         &mut stdout,
         &mut stderr,
     )
@@ -1149,6 +1333,7 @@ async fn pump_prompts_emits_bang_bang_tool_events_in_json_mode() {
         &agent,
         prompts,
         PromptFormat::Json,
+        PromptPermissionMode::AutoApproveAsk,
         &mut stdout,
         &mut stderr,
     )
@@ -1238,6 +1423,7 @@ async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() 
         &agent,
         prompts,
         PromptFormat::Default,
+        PromptPermissionMode::AutoApproveAsk,
         &mut stdout,
         &mut stderr,
     )

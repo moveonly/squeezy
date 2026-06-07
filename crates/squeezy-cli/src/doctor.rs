@@ -1,6 +1,6 @@
 use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
@@ -20,7 +20,7 @@ use crate::update::{self, UpdateStatus};
 const STATE_CACHE_WARN_BYTES: u64 = 128 * 1024 * 1024;
 const GRAPH_CACHE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Default)]
 pub struct DoctorArgs {
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
@@ -47,6 +47,25 @@ pub struct DoctorArgs {
     /// exits without running other checks.
     #[arg(long)]
     pub sandbox_teardown: bool,
+    /// Run only matching check names. Accepts exact names like
+    /// `session_store`, prefixed families like `provider`, and probe names
+    /// like `probe:mcp:docs`. Repeat for multiple checks.
+    #[arg(long = "only", value_name = "CHECK")]
+    pub only: Vec<String>,
+    /// Print only checks with this status. Repeat for multiple statuses.
+    #[arg(long = "status", value_enum)]
+    pub status: Vec<DoctorStatusFilter>,
+    /// Skip the release update check. Useful for offline diagnostics and CI.
+    #[arg(long = "skip-update")]
+    pub skip_update: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum DoctorStatusFilter {
+    Ok,
+    Warn,
+    Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +82,15 @@ impl Status {
             Status::Warn => "warn",
             Status::Fail => "fail",
         }
+    }
+
+    fn matches_filter(self, filter: DoctorStatusFilter) -> bool {
+        matches!(
+            (self, filter),
+            (Status::Ok, DoctorStatusFilter::Ok)
+                | (Status::Warn, DoctorStatusFilter::Warn)
+                | (Status::Fail, DoctorStatusFilter::Fail)
+        )
     }
 }
 
@@ -170,74 +198,104 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
 
     let mut checks = Vec::new();
 
-    let config = match AppConfig::from_env_and_settings() {
-        Ok(config) => {
-            let labels = config.config_source_labels();
-            checks.push(Check {
-                name: "config".to_string(),
-                status: Status::Ok,
-                detail: format!("sources: {}", labels.join(", ")),
-            });
-            Some(config)
+    let config = if needs_config(args) {
+        match AppConfig::from_env_and_settings() {
+            Ok(config) => {
+                if should_include_check(args, "config") {
+                    let labels = config.config_source_labels();
+                    checks.push(Check {
+                        name: "config".to_string(),
+                        status: Status::Ok,
+                        detail: format!("sources: {}", labels.join(", ")),
+                    });
+                }
+                Some(config)
+            }
+            Err(error) => {
+                checks.push(Check {
+                    name: "config".to_string(),
+                    status: Status::Fail,
+                    detail: format!("{error}"),
+                });
+                None
+            }
         }
-        Err(error) => {
-            checks.push(Check {
-                name: "config".to_string(),
-                status: Status::Fail,
-                detail: format!("{error}"),
-            });
-            None
-        }
+    } else {
+        None
     };
 
     if let Some(config) = config.as_ref() {
-        match ensure_repo_profile(&config.workspace_root, &config.graph) {
-            Ok(loaded) => checks.push(Check {
-                name: "repo_profile".to_string(),
-                status: Status::Ok,
-                detail: format!(
-                    "status={} languages={}",
-                    loaded.status.as_str(),
-                    loaded.profile.languages.len()
-                ),
-            }),
-            Err(error) => checks.push(Check {
-                name: "repo_profile".to_string(),
-                status: Status::Warn,
-                detail: format!("{error}"),
-            }),
+        if should_include_check(args, "repo_profile") {
+            match ensure_repo_profile(&config.workspace_root, &config.graph) {
+                Ok(loaded) => checks.push(Check {
+                    name: "repo_profile".to_string(),
+                    status: Status::Ok,
+                    detail: format!(
+                        "status={} languages={}",
+                        loaded.status.as_str(),
+                        loaded.profile.languages.len()
+                    ),
+                }),
+                Err(error) => checks.push(Check {
+                    name: "repo_profile".to_string(),
+                    status: Status::Warn,
+                    detail: format!("{error}"),
+                }),
+            }
         }
 
         let (provider_name, provider_check) = provider_credential_check(&config.provider);
-        checks.push(Check {
-            name: format!("provider:{provider_name}"),
-            status: provider_check.0,
-            detail: provider_check.1,
-        });
+        let provider_check_name = format!("provider:{provider_name}");
+        if should_include_check(args, &provider_check_name) {
+            checks.push(Check {
+                name: provider_check_name,
+                status: provider_check.0,
+                detail: provider_check.1,
+            });
+        }
 
-        checks.push(providers_check(&load_user_settings()));
+        if should_include_check(args, "providers") {
+            checks.push(providers_check(&load_user_settings()));
+        }
 
-        if args.probe {
+        let provider_probe_name = format!("probe:{provider_name}");
+        if args.probe && should_include_check(args, &provider_probe_name) {
             let (status, detail) = probe_provider(&config.provider).await;
             checks.push(Check {
-                name: format!("probe:{provider_name}"),
+                name: provider_probe_name,
                 status,
                 detail,
             });
         }
 
-        checks.push(mcp_check(&config.mcp_servers));
-        if args.probe && config.mcp_servers.values().any(|server| server.enabled) {
-            checks.extend(probe_mcp_servers(&config.mcp_servers).await);
+        if should_include_check(args, "mcp") {
+            checks.push(mcp_check(&config.mcp_servers));
         }
-        checks.push(skills_check(config));
-        checks.push(session_store_check(config));
-        checks.push(state_store_check(config));
-        checks.push(cache_check(config, args.prune_cache));
+        if args.probe && config.mcp_servers.values().any(|server| server.enabled) {
+            checks.extend(probe_mcp_servers(&config.mcp_servers, args).await);
+        }
+        if should_include_check(args, "skills") {
+            checks.push(skills_check(config));
+        }
+        if should_include_check(args, "session_store") {
+            checks.push(session_store_check(config));
+        }
+        if should_include_check(args, "state_store") {
+            checks.push(state_store_check(config));
+        }
+        if should_include_check(args, "cache") {
+            checks.push(cache_check(config, args.prune_cache));
+        }
     }
 
-    checks.push(sandbox_check());
-    checks.push(update_check(update::check_for_update().await));
+    if should_include_check(args, "sandbox") {
+        checks.push(sandbox_check());
+    }
+    if !args.skip_update && should_include_check(args, "update") {
+        checks.push(update_check(update::check_for_update().await));
+    }
+
+    let checks = filter_checks(args, checks);
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
     // such but do not fail the command: smoke tests in CI / brew test run in
@@ -254,6 +312,45 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         target,
         json: args.json,
     })
+}
+
+fn needs_config(args: &DoctorArgs) -> bool {
+    if args.only.is_empty() {
+        return true;
+    }
+    args.only
+        .iter()
+        .any(|selector| !matches!(selector.as_str(), "sandbox" | "update"))
+}
+
+fn should_include_check(args: &DoctorArgs, name: &str) -> bool {
+    args.only.iter().all(|selector| selector.trim().is_empty())
+        || args
+            .only
+            .iter()
+            .any(|selector| check_name_matches(selector, name))
+}
+
+fn check_name_matches(selector: &str, name: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    name == selector || name.starts_with(&format!("{selector}:"))
+}
+
+fn filter_checks(args: &DoctorArgs, checks: Vec<Check>) -> Vec<Check> {
+    if args.status.is_empty() {
+        return checks;
+    }
+    checks
+        .into_iter()
+        .filter(|check| {
+            args.status
+                .iter()
+                .any(|filter| check.status.matches_filter(*filter))
+        })
+        .collect()
 }
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {
@@ -664,8 +761,19 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
 /// handshake are terminated.
 async fn probe_mcp_servers(
     servers: &std::collections::BTreeMap<String, McpServerConfig>,
+    args: &DoctorArgs,
 ) -> Vec<Check> {
-    let registry = McpClientRegistry::new(servers.clone());
+    let servers = servers
+        .iter()
+        .filter(|(name, server)| {
+            server.enabled && should_include_check(args, &format!("probe:mcp:{name}"))
+        })
+        .map(|(name, server)| (name.clone(), server.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    let registry = McpClientRegistry::new(servers);
     let outcome = registry.refresh_tools(CancellationToken::new()).await;
     registry.shutdown().await;
     outcome

@@ -157,7 +157,7 @@ async fn probe_mcp_reports_unreachable_stdio_server_as_fail() {
     // A disabled server must be skipped entirely: no probe row.
     servers.insert("idle".to_string(), mcp_fixture(false, McpTransport::Stdio));
 
-    let checks = probe_mcp_servers(&servers).await;
+    let checks = probe_mcp_servers(&servers, &DoctorArgs::default()).await;
 
     let broken_row = checks
         .iter()

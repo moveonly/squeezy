@@ -12,6 +12,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
 use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
@@ -42,7 +43,10 @@ use squeezy_store::{
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
-use squeezy_tools::{McpElicitationResponse, ToolCall, ToolResult, ToolStatus};
+use squeezy_tools::{
+    McpClientRegistry, McpElicitationResponse, McpServerStatus, McpStaleOutcome, ToolCall,
+    ToolResult, ToolStatus,
+};
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
@@ -57,6 +61,19 @@ use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 enum PromptFormat {
     Default,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum PromptPermissionMode {
+    /// Allow each permission request once. This preserves the historical
+    /// non-interactive behavior and keeps CI prompts from hanging.
+    AutoApproveAsk,
+    /// Deny each permission request and let the agent continue with the
+    /// denied tool result.
+    DenyAsk,
+    /// Deny the request and make the CLI command fail immediately.
+    FailOnAsk,
 }
 
 #[derive(Debug, Parser)]
@@ -104,6 +121,20 @@ struct Cli {
         default_value = "default"
     )]
     format: PromptFormat,
+    #[arg(
+        long = "prompt-permission-mode",
+        value_name = "MODE",
+        value_enum,
+        default_value_t = PromptPermissionMode::AutoApproveAsk,
+        help = "Permission behavior for non-interactive --prompt runs: auto-approve-ask, deny-ask, or fail-on-ask"
+    )]
+    prompt_permission_mode: PromptPermissionMode,
+    #[arg(
+        long = "health",
+        hide = true,
+        help = "Hidden compatibility alias for `squeezy doctor`"
+    )]
+    health: bool,
     #[arg(
         long,
         help = "Ignore saved provider/model defaults and run startup selection again"
@@ -254,6 +285,14 @@ enum McpCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "Test one configured MCP server with the session initialize/tool-discovery handshake"
+    )]
+    Test {
+        name: String,
+        #[arg(long, help = "Emit machine-readable JSON instead of a status row")]
+        json: bool,
+    },
     #[command(about = "Add an MCP server to user or project settings")]
     Add(McpAddArgs),
     #[command(about = "Enable a configured MCP server")]
@@ -360,7 +399,10 @@ struct SkillsConfigScope {
 #[derive(Debug, Subcommand)]
 enum RepoCommand {
     #[command(about = "Print the stored or freshly computed repo profile")]
-    Inspect,
+    Inspect {
+        #[arg(long, help = "Emit machine-readable JSON instead of human text")]
+        json: bool,
+    },
     #[command(about = "Recompute and persist the generated local repo profile")]
     Refresh,
     #[command(about = "Print suggested project config settings for manual adoption")]
@@ -372,7 +414,11 @@ enum SessionsCommand {
     #[command(about = "List local sessions")]
     List(SessionListArgs),
     #[command(about = "Show a local session summary")]
-    Show { id: String },
+    Show {
+        id: String,
+        #[arg(long, help = "Emit machine-readable JSON instead of key=value lines")]
+        json: bool,
+    },
     #[command(about = "Resume a local session in the TUI")]
     Resume {
         id: String,
@@ -444,6 +490,11 @@ struct SessionListArgs {
     query: Option<String>,
     #[arg(long, help = "Include archived sessions (excluded by default)")]
     include_archived: bool,
+    #[arg(
+        long,
+        help = "Emit machine-readable JSON instead of tab-separated rows"
+    )]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -552,6 +603,15 @@ async fn run() -> squeezy_core::Result<()> {
                 .to_string(),
         ));
     }
+    if cli.health {
+        let report = doctor::run(&DoctorArgs::default()).await?;
+        report.print();
+        let code = report.exit_code;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     match &cli.command {
         Some(Command::Config { command }) => {
             return handle_config_command(command.as_ref(), &cli);
@@ -561,7 +621,7 @@ async fn run() -> squeezy_core::Result<()> {
             return handle_sessions_command(command, &cli).await;
         }
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
-        Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
+        Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli).await,
         Some(Command::Skills { command }) => return handle_skills_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args).await,
         Some(Command::Auth { command }) => return handle_auth_command(command).await,
@@ -674,9 +734,10 @@ async fn run() -> squeezy_core::Result<()> {
     // sessions resume abc12` works. Ambiguous and unknown prefixes
     // fail fast with a clear message instead of being forwarded into a
     // generic "session not found" later.
+    let session_store = SessionStore::open(&config);
     let resolved_session_id: Option<String> = match cli.session.as_deref() {
         Some(id) => Some(
-            SessionStore::open(&config)
+            session_store
                 .resolve_session_id_prefix(id)
                 .map_err(|err| SqueezyError::Tool(format!("--session: {err}")))?,
         ),
@@ -695,7 +756,7 @@ async fn run() -> squeezy_core::Result<()> {
             note: None,
         }
     } else {
-        let sessions = SessionStore::open(&config)
+        let sessions = session_store
             .list(&SessionQuery::default())
             .unwrap_or_default();
         let cwd_str = config.workspace_root.display().to_string();
@@ -711,8 +772,7 @@ async fn run() -> squeezy_core::Result<()> {
     // is effectively a no-op for that path — the lookup is only on the
     // explicit `--session <id>` flow in practice.
     let resume_session_id_opt = if let Some(id) = resume_resolution.session_id.as_deref() {
-        let store = SessionStore::open(&config);
-        if !confirm_cross_project_resume_stdio(&store, id, cli.force_cross_project)? {
+        if !confirm_cross_project_resume_stdio(&session_store, id, cli.force_cross_project)? {
             println!("resume cancelled");
             flush_telemetry_best_effort(&telemetry).await;
             return Ok(());
@@ -757,6 +817,7 @@ async fn run() -> squeezy_core::Result<()> {
             provider,
             typed_prompts,
             cli.format,
+            cli.prompt_permission_mode,
             resume_resolution.session_id,
             telemetry.clone(),
         )
@@ -960,7 +1021,7 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
     }
 }
 
-fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<()> {
+async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<()> {
     match command {
         McpCommand::List { json } => {
             let config = config_from_cli(cli)?;
@@ -1030,6 +1091,76 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         w2 = widths[2],
                     );
                 }
+            }
+            Ok(())
+        }
+        McpCommand::Test { name, json } => {
+            let config = config_from_cli(cli)?;
+            let Some(server) = config.mcp_servers.get(name).cloned() else {
+                return Err(SqueezyError::Config(format!(
+                    "MCP server {name:?} is not configured"
+                )));
+            };
+            let mut servers = BTreeMap::new();
+            let mut server = server;
+            server.enabled = true;
+            servers.insert(name.clone(), server);
+            let registry = McpClientRegistry::new(servers);
+            let outcome = registry.refresh_tools(CancellationToken::new()).await;
+            registry.shutdown().await;
+            let status = outcome.status.per_server.get(name);
+            let (status_label, detail, tools_count) = match status {
+                Some(McpServerStatus::Ready { tools_count, .. }) => (
+                    "ok",
+                    format!("handshake ok; {tools_count} tools advertised"),
+                    Some(*tools_count),
+                ),
+                Some(McpServerStatus::Stale {
+                    tools_count,
+                    outcome,
+                }) => (
+                    "warn",
+                    format!(
+                        "handshake stale; serving {tools_count} cached tools after {}",
+                        mcp_stale_outcome_detail(outcome)
+                    ),
+                    Some(*tools_count),
+                ),
+                Some(McpServerStatus::Failed { error }) => {
+                    ("fail", format!("handshake failed: {error}"), None)
+                }
+                Some(McpServerStatus::Cancelled) => (
+                    "warn",
+                    "handshake timed out or was cancelled".to_string(),
+                    None,
+                ),
+                Some(McpServerStatus::Starting) => {
+                    ("warn", "handshake did not complete".to_string(), None)
+                }
+                None => (
+                    "warn",
+                    "server did not produce a probe status".to_string(),
+                    None,
+                ),
+            };
+            if *json {
+                let body = serde_json::json!({
+                    "name": name,
+                    "status": status_label,
+                    "detail": &detail,
+                    "tools_count": tools_count,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize MCP test: {err}"))
+                    })?
+                );
+            } else {
+                println!("[{status_label}] mcp:{name}  {detail}");
+            }
+            if status_label == "fail" {
+                return Err(SqueezyError::Tool(detail));
             }
             Ok(())
         }
@@ -1672,17 +1803,38 @@ fn parse_env_entry(entry: &str) -> squeezy_core::Result<(&str, &str)> {
     Ok((key, value))
 }
 
+fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
+    match outcome {
+        McpStaleOutcome::Failed { error } => format!("discovery failed: {error}"),
+        McpStaleOutcome::Cancelled => "discovery was cancelled".to_string(),
+    }
+}
+
 fn handle_repo_command(command: &RepoCommand, cli: &Cli) -> squeezy_core::Result<()> {
     let config = config_from_cli(cli)?;
     match command {
-        RepoCommand::Inspect => {
+        RepoCommand::Inspect { json } => {
             let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
-            println!("{}", loaded.profile.render_human());
-            println!(
-                "registry: {} ({})",
-                loaded.registry_path.display(),
-                loaded.status.as_str()
-            );
+            if *json {
+                let body = serde_json::json!({
+                    "status": loaded.status.as_str(),
+                    "registry_path": loaded.registry_path,
+                    "profile": loaded.profile,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize repo profile: {err}"))
+                    })?
+                );
+            } else {
+                println!("{}", loaded.profile.render_human());
+                println!(
+                    "registry: {} ({})",
+                    loaded.registry_path.display(),
+                    loaded.status.as_str()
+                );
+            }
             Ok(())
         }
         RepoCommand::Refresh => {
@@ -1705,57 +1857,75 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
     match command {
         SessionsCommand::List(args) => {
             let sessions = store.list(&session_query_from_args(args)?)?;
-            for session in sessions {
+            if args.json {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    session.session_id,
-                    session.status.as_str(),
-                    session.started_at_ms,
-                    session.branch.unwrap_or_else(|| "-".to_string()),
-                    session.provider,
-                    session
-                        .first_user_task
-                        .or(session.latest_summary)
-                        .unwrap_or_default()
-                        .replace('\n', " ")
+                    "{}",
+                    serde_json::to_string_pretty(&sessions).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize sessions: {err}"))
+                    })?
                 );
+            } else {
+                for session in sessions {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        session.session_id,
+                        session.status.as_str(),
+                        session.started_at_ms,
+                        session.branch.unwrap_or_else(|| "-".to_string()),
+                        session.provider,
+                        session
+                            .first_user_task
+                            .or(session.latest_summary)
+                            .unwrap_or_default()
+                            .replace('\n', " ")
+                    );
+                }
             }
             Ok(())
         }
-        SessionsCommand::Show { id } => {
+        SessionsCommand::Show { id, json } => {
             let record = store.show(id)?;
-            println!("id={}", record.metadata.session_id);
-            println!("status={}", record.metadata.status.as_str());
-            println!("started_at_ms={}", record.metadata.started_at_ms);
-            println!(
-                "ended_at_ms={}",
-                format_optional_u64(record.metadata.ended_at_ms)
-            );
-            println!("cwd={}", record.metadata.cwd);
-            println!("workspace_root={}", record.metadata.workspace_root);
-            println!(
-                "repo_root={}",
-                record.metadata.repo_root.unwrap_or_else(|| "-".to_string())
-            );
-            println!(
-                "branch={}",
-                record.metadata.branch.unwrap_or_else(|| "-".to_string())
-            );
-            println!("provider={}", record.metadata.provider);
-            println!("model={}", record.metadata.model);
-            println!("mode={}", record.metadata.mode.as_str());
-            println!("events={}", record.metadata.event_count);
-            println!("event_warnings={}", record.event_warnings);
-            println!("redactions={}", record.metadata.redactions);
-            println!("resume_available={}", record.metadata.resume_available);
-            if let Some(reason) = record.metadata.resume_unavailable_reason {
-                println!("resume_unavailable_reason={reason}");
-            }
-            if let Some(task) = record.metadata.first_user_task {
-                println!("first_user_task={}", task.replace('\n', " "));
-            }
-            if let Some(summary) = record.metadata.latest_summary {
-                println!("latest_summary={}", summary.replace('\n', " "));
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&record).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize session: {err}"))
+                    })?
+                );
+            } else {
+                println!("id={}", record.metadata.session_id);
+                println!("status={}", record.metadata.status.as_str());
+                println!("started_at_ms={}", record.metadata.started_at_ms);
+                println!(
+                    "ended_at_ms={}",
+                    format_optional_u64(record.metadata.ended_at_ms)
+                );
+                println!("cwd={}", record.metadata.cwd);
+                println!("workspace_root={}", record.metadata.workspace_root);
+                println!(
+                    "repo_root={}",
+                    record.metadata.repo_root.unwrap_or_else(|| "-".to_string())
+                );
+                println!(
+                    "branch={}",
+                    record.metadata.branch.unwrap_or_else(|| "-".to_string())
+                );
+                println!("provider={}", record.metadata.provider);
+                println!("model={}", record.metadata.model);
+                println!("mode={}", record.metadata.mode.as_str());
+                println!("events={}", record.metadata.event_count);
+                println!("event_warnings={}", record.event_warnings);
+                println!("redactions={}", record.metadata.redactions);
+                println!("resume_available={}", record.metadata.resume_available);
+                if let Some(reason) = record.metadata.resume_unavailable_reason {
+                    println!("resume_unavailable_reason={reason}");
+                }
+                if let Some(task) = record.metadata.first_user_task {
+                    println!("first_user_task={}", task.replace('\n', " "));
+                }
+                if let Some(summary) = record.metadata.latest_summary {
+                    println!("latest_summary={}", summary.replace('\n', " "));
+                }
             }
             Ok(())
         }
@@ -2824,6 +2994,7 @@ async fn run_prompts(
     provider: Arc<dyn LlmProvider>,
     prompts: Vec<print_mode::PromptInput>,
     format: PromptFormat,
+    permission_mode: PromptPermissionMode,
     resume_session_id: Option<String>,
     telemetry: TelemetryClient,
 ) -> squeezy_core::Result<()> {
@@ -2845,7 +3016,15 @@ async fn run_prompts(
     let stderr = io::stderr();
     let mut stdout = stdout.lock();
     let mut stderr = stderr.lock();
-    let result = pump_prompts(&agent, prompts, format, &mut stdout, &mut stderr).await;
+    let result = pump_prompts(
+        &agent,
+        prompts,
+        format,
+        permission_mode,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
     let exit_status = if result.is_ok() {
         SessionStatus::Completed
     } else {
@@ -2868,6 +3047,7 @@ async fn pump_prompts<O, E>(
     agent: &Agent,
     prompts: Vec<print_mode::PromptInput>,
     format: PromptFormat,
+    permission_mode: PromptPermissionMode,
     stdout: &mut O,
     stderr: &mut E,
 ) -> squeezy_core::Result<()>
@@ -2882,7 +3062,7 @@ where
             prompt.content
         };
         let rx = agent.start_turn(input, CancellationToken::new());
-        pump_prompt_events(rx, format, stdout, stderr).await?;
+        pump_prompt_events(rx, format, permission_mode, stdout, stderr).await?;
     }
     Ok(())
 }
@@ -2895,6 +3075,7 @@ where
 async fn pump_prompt_events<O, E>(
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     format: PromptFormat,
+    permission_mode: PromptPermissionMode,
     stdout: &mut O,
     stderr: &mut E,
 ) -> squeezy_core::Result<()>
@@ -2958,29 +3139,62 @@ where
                 decision_tx,
                 ..
             } => {
-                // There is nobody to prompt in print mode. The
-                // permission policy already filtered out the
-                // hard-default deny cases (read=Allow, edit=Allow),
-                // so anything that reaches here was flagged Ask by
-                // configuration. Approving once keeps CI moving;
-                // operators who want stricter control can set
-                // permission rules in settings.toml or pin Plan
-                // mode via `--mode plan`.
                 let tool_name = request.tool_name.clone();
                 let reason = request.reason.clone();
-                match format {
-                    PromptFormat::Default => {
-                        writeln!(stderr, "approval: auto-approving {tool_name} ({reason})")?;
-                        stderr.flush()?;
+                match permission_mode {
+                    PromptPermissionMode::AutoApproveAsk => {
+                        match format {
+                            PromptFormat::Default => {
+                                writeln!(
+                                    stderr,
+                                    "approval: auto-approving {tool_name} ({reason})"
+                                )?;
+                                stderr.flush()?;
+                            }
+                            PromptFormat::Json => {
+                                emit_prompt_event(
+                                    stdout,
+                                    &PromptWireEvent::ApprovalAutoApproved { tool_name, reason },
+                                )?;
+                            }
+                        }
+                        let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
                     }
-                    PromptFormat::Json => {
-                        emit_prompt_event(
-                            stdout,
-                            &PromptWireEvent::ApprovalAutoApproved { tool_name, reason },
-                        )?;
+                    PromptPermissionMode::DenyAsk => {
+                        match format {
+                            PromptFormat::Default => {
+                                writeln!(stderr, "approval: denying {tool_name} ({reason})")?;
+                                stderr.flush()?;
+                            }
+                            PromptFormat::Json => {
+                                emit_prompt_event(
+                                    stdout,
+                                    &PromptWireEvent::ApprovalDenied { tool_name, reason },
+                                )?;
+                            }
+                        }
+                        let _ = decision_tx.send(ToolApprovalDecision::Denied);
+                    }
+                    PromptPermissionMode::FailOnAsk => {
+                        match format {
+                            PromptFormat::Default => {
+                                writeln!(stderr, "approval: failing on {tool_name} ({reason})")?;
+                                stderr.flush()?;
+                            }
+                            PromptFormat::Json => {
+                                emit_prompt_event(
+                                    stdout,
+                                    &PromptWireEvent::ApprovalDenied { tool_name, reason },
+                                )?;
+                            }
+                        }
+                        let _ = decision_tx.send(ToolApprovalDecision::Denied);
+                        result = Err(SqueezyError::Tool(
+                            "non-interactive prompt requested permission; rerun with --prompt-permission-mode auto-approve-ask or configure an explicit permission rule"
+                                .to_string(),
+                        ));
                     }
                 }
-                let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
             }
             AgentEvent::McpElicitationRequested { response_tx, .. } => {
                 let _ = response_tx.send(McpElicitationResponse::cancel());
@@ -3070,7 +3284,7 @@ where
 /// help — additive changes are fine, but breaking ones should bump that
 /// disclaimer.
 ///
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum PromptWireEvent {
     Started,
@@ -3079,6 +3293,10 @@ enum PromptWireEvent {
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolResult),
     ApprovalAutoApproved {
+        tool_name: String,
+        reason: String,
+    },
+    ApprovalDenied {
         tool_name: String,
         reason: String,
     },
