@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,8 +9,11 @@ use squeezy_core::{GraphConfig, repo_settings_id};
 
 use super::*;
 
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn default_repo_registry_path_honors_explicit_override() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let root = temp_root("repo_registry_override");
     let override_path = root.join("custom-repos.toml");
     let previous = std::env::var_os("SQUEEZY_REPOS_PATH");
@@ -31,6 +35,7 @@ fn default_repo_registry_path_honors_explicit_override() {
 #[test]
 #[cfg(windows)]
 fn default_repo_registry_path_uses_appdata_when_home_is_unset() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let root = temp_root("repo_registry_appdata");
     let appdata = root.join("AppData").join("Roaming");
     let home_previous = std::env::var_os("HOME");
