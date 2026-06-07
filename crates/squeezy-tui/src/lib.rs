@@ -6728,13 +6728,12 @@ fn approval_block_capped(
     width: u16,
 ) -> Vec<Line<'static>> {
     let parts = approval::render_preview_parts(request);
-    let options = approval_option_lines(request, selected);
+    let mut options = approval_option_lines(request, selected);
     let footer = approval_footer_line();
     let row = |line: &Line<'static>| visual_line_count(std::slice::from_ref(line), width) as usize;
     let rows = |lines: &[Line<'static>]| visual_line_count(lines, width) as usize;
 
     let header_rows = row(&parts.header);
-    let option_rows = rows(&options);
     let footer_rows = row(&footer);
     let blank_rows = 1usize;
 
@@ -6745,7 +6744,7 @@ fn approval_block_capped(
     body.extend(parts.rule.iter().cloned());
 
     let max = max_height as usize;
-    let full = header_rows + rows(&body) + blank_rows + option_rows + footer_rows;
+    let full = header_rows + rows(&body) + blank_rows + rows(&options) + footer_rows;
     if max == 0 || full <= max {
         let mut out = Vec::with_capacity(body.len() + options.len() + 3);
         out.push(parts.header);
@@ -6755,6 +6754,15 @@ fn approval_block_capped(
         out.push(footer);
         return out;
     }
+
+    // Tight layout: compact each option onto a single row so a wrapped label
+    // can never push a decision off-screen on a narrow terminal. This is a
+    // no-op at a roomy width — the full-fit branch above keeps the untruncated,
+    // multi-row labels. The option rows are the one thing we never drop.
+    for option in &mut options {
+        truncate_line_to_width(option, width as usize);
+    }
+    let option_rows = options.len();
 
     // Shed the least-critical fixed rows first (footer, then the separator
     // blank, then the header); the option rows always survive.
@@ -6811,13 +6819,15 @@ fn approval_block_capped(
         if elide {
             let hidden = total - shown;
             if hidden > 0 {
-                out.push(Line::from(Span::styled(
+                let mut note = Line::from(Span::styled(
                     format!(
                         "  … {hidden} more line{}",
                         if hidden == 1 { "" } else { "s" }
                     ),
                     Style::default().fg(crate::render::theme::quiet()),
-                )));
+                ));
+                truncate_line_to_width(&mut note, width as usize);
+                out.push(note);
             }
         }
     }
@@ -6828,6 +6838,10 @@ fn approval_block_capped(
     if keep_footer {
         out.push(footer);
     }
+    // Hard ceiling: if the area is so short that even single-row options can't
+    // all fit, keep the leading rows rather than letting ratatui clip an
+    // unaccounted bottom row. Esc still denies, so no decision is lost.
+    out.truncate(max);
     out
 }
 

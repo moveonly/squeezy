@@ -7299,29 +7299,34 @@ fn approval_block_capped_always_keeps_options() {
         "cargo test --workspace --all-features".to_string(),
     );
 
-    let width = 80u16;
-    let full_rows = visual_line_count(&approval_block_full(&req, 0), width);
-    let labels = [
-        "Approve",
-        "Always approve this command in this repo",
-        "Deny",
-    ];
+    // Short tokens that survive label truncation at narrow widths.
+    let labels = ["Approve", "Always", "Deny"];
 
-    for max in 4u16..=full_rows + 2 {
-        let lines = approval_block_capped(&req, 0, max, width);
-        let rows = visual_line_count(&lines, width);
-        assert!(rows <= max, "max={max} produced {rows} rows");
-        let text = lines_to_plain_text(&lines);
-        for label in labels {
-            assert!(text.contains(label), "max={max} missing '{label}':\n{text}");
-        }
-        if max >= full_rows {
-            assert!(
-                text.contains("approve once"),
-                "max={max}: footer dropped with room:\n{text}"
-            );
+    // Narrow widths wrap the option labels; the capped block must still never
+    // exceed its row budget, or ratatui clips a decision off the bottom.
+    for width in [80u16, 50, 30, 24] {
+        let full_rows = visual_line_count(&approval_block_full(&req, 0), width);
+        for max in 4u16..=full_rows + 2 {
+            let lines = approval_block_capped(&req, 0, max, width);
+            let rows = visual_line_count(&lines, width);
+            assert!(rows <= max, "width={width} max={max} produced {rows} rows");
+            let text = lines_to_plain_text(&lines);
+            for label in labels {
+                assert!(
+                    text.contains(label),
+                    "width={width} max={max} missing '{label}':\n{text}"
+                );
+            }
         }
     }
+
+    // With room, the full untruncated labels and the folded footer are present.
+    let roomy = lines_to_plain_text(&approval_block_capped(&req, 0, 100, 80));
+    assert!(
+        roomy.contains("Always approve this command in this repo"),
+        "{roomy}"
+    );
+    assert!(roomy.contains("approve once"), "{roomy}");
 }
 
 #[test]
