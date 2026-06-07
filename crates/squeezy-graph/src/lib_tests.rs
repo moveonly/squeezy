@@ -5,9 +5,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use squeezy_core::{ContentHash, FileId, LanguageKind};
+use squeezy_core::{ContentHash, FileId, LanguageKind, SqueezyError};
 use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind, RustParser};
-use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
+use squeezy_workspace::{CrawlOptions, FileRecord, IndexingPolicy, stable_content_hash};
 
 use super::*;
 
@@ -2124,6 +2124,55 @@ fn graph_reports_indexing_policy_coverage() {
             .reasons
             .contains_key("lockfile")
     );
+}
+
+#[test]
+fn graph_manager_returns_config_error_for_invalid_policy_glob() {
+    let root = temp_root("graph-invalid-policy-glob");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn indexed() {}\n").unwrap();
+
+    let err = match GraphManager::open_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions {
+            policy: IndexingPolicy {
+                include: vec!["[".to_string()],
+                ..IndexingPolicy::default()
+            },
+            ..CrawlOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("invalid policy should not open a graph"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, SqueezyError::Config(_)), "{err:?}");
+}
+
+#[test]
+fn watcher_paths_skip_squeezy_cache_and_default_pruned_dirs() {
+    let root = PathBuf::from("/workspace/project");
+
+    assert!(watcher_path_should_enqueue(&root, &root.join("src/lib.rs")));
+    assert!(watcher_path_should_enqueue(
+        &root,
+        &root.join("vendor/allowed/lib.rs")
+    ));
+    assert!(watcher_path_should_enqueue(
+        &root,
+        &root.join("target/generated.rs")
+    ));
+    for path in [
+        root.join(".squeezy/cache/graph.redb"),
+        root.join(".git/index"),
+    ] {
+        assert!(
+            !watcher_path_should_enqueue(&root, &path),
+            "{} should not enqueue a graph refresh",
+            path.display()
+        );
+    }
 }
 
 #[test]

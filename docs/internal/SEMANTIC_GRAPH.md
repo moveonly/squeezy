@@ -60,7 +60,10 @@ that forwards raw LSP responses to the model.
 
 Unsupported files are retained as structured unsupported results so callers can
 fall back to bounded read/grep/list navigation without pretending the graph knows
-more than it does.
+more than it does. Files in a supported language that is disabled by
+`[graph].languages` use the same fallback record shape with a distinct disabled
+language reason, so the allow-list affects parser scheduling without hiding
+files from coverage and repo-profile diagnostics.
 
 Generated, vendored, dependency cache, build output, binary, lockfile, and large
 files are excluded from graph indexing by default with compact reason-tagged
@@ -136,15 +139,20 @@ Defaults:
 Refresh is pending-event-first when callers provide authoritative changed
 paths, with a polling fallback otherwise. Callers that know paths changed can
 call `record_changed_path`; the next graph query refreshes immediately after
-debounce. `GraphManager::open_watching` can attach the
+debounce. `GraphManager::open_watching` attaches the
 `squeezy-graph::watcher::FileWatcher`, which uses
 `notify-debouncer-full` and OS-native backends (FSEvents, inotify, or
 ReadDirectoryChangesW) to queue debounced changed paths into the same pending
-set. The default tool registry still opens the graph with `open_with_store`
-instead of `open_watching`, so normal tool calls rely on refresh calls and the
-15 second polling safety net rather than an always-on OS watcher. Refresh
-recrawls tracked files, compares stable hashes, reparses changed files only,
-removes deleted files, and preserves unchanged graph partitions.
+set. Long-lived tool registries try watcher-backed graph startup and fall back
+to polling-only graph refresh when watcher startup fails. Graph tool payloads
+include a compact `freshness_mode` value (`watcher` or `polling`) and include a
+`freshness_fallback_reason` only for watcher-startup fallback. Watcher-backed
+graph managers hard-ignore Squeezy's own `.squeezy/` cache and VCS metadata
+events so graph persistence writes do not self-trigger refresh loops; other
+default-pruned directories are left visible to the watcher so user policy such
+as `include = ["vendor/allowed/**"]` can still refresh re-included files.
+Refresh recrawls tracked files, compares stable hashes, reparses changed files
+only, removes deleted files, and preserves unchanged graph partitions.
 
 The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
 yields with `budget_exhausted=true` on the refresh report once the budget is

@@ -33,6 +33,14 @@ fn change_batch_is_empty_until_paths_are_recorded() {
 }
 
 #[test]
+fn watcher_config_default_root_prevents_empty_watch_set() {
+    let root = temp_dir("default-root");
+    let config = WatcherConfig::default().with_default_root(root.clone());
+
+    assert_eq!(config.src_dirs, vec![root]);
+}
+
+#[test]
 fn watcher_emits_change_batch_after_debounce_window() {
     let root = temp_dir("emits-batch");
     let captured: Arc<Mutex<Vec<ChangeBatch>>> = Arc::new(Mutex::new(Vec::new()));

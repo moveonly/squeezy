@@ -710,6 +710,7 @@ fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
         include_hidden: config.include_hidden,
         max_file_bytes: config.max_file_bytes,
         require_indexing_signal: config.require_indexing_signal,
+        languages: config.languages.clone(),
         policy: IndexingPolicy {
             include: config.include.clone(),
             exclude: config.exclude.clone(),

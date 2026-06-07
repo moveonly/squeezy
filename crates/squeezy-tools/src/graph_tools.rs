@@ -749,6 +749,25 @@ pub(crate) fn graph_payload(
     let mut payload = serde_json::Map::new();
     payload.insert("tool".to_string(), json!(tool));
     payload.insert("graph_available".to_string(), json!(true));
+    payload.insert(
+        "freshness_mode".to_string(),
+        json!(manager.freshness_mode().as_str()),
+    );
+    if let Some(reason) = manager.freshness_fallback_reason() {
+        payload.insert("freshness_fallback_reason".to_string(), json!(reason));
+    }
+    let indexing_decision = &manager.build_report().indexing_decision;
+    if !indexing_decision.should_index {
+        payload.insert(
+            "indexing_decision".to_string(),
+            json!({
+                "should_index": false,
+                "reason": &indexing_decision.reason,
+                "positive_signals": &indexing_decision.positive_signals,
+                "negative_signals": &indexing_decision.negative_signals,
+            }),
+        );
+    }
     // Bug #2: when the incremental refresh budget was exhausted, some changed
     // files were never reparsed and stay queued for the next refresh — the
     // graph evidence below is partially stale. A bare `graph_available=true`

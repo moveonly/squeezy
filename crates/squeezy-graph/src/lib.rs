@@ -24,7 +24,9 @@ use squeezy_parse::{
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
-use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
+use squeezy_workspace::{
+    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, WorkspaceCrawler,
+};
 
 use crate::languages::{
     csharp::{
@@ -2000,6 +2002,9 @@ pub struct GraphBuildReport {
     pub bytes_seen: u64,
     pub language: LanguageReport,
     pub stats: GraphStats,
+    pub indexing_decision: IndexingDecision,
+    pub freshness_mode: GraphFreshnessMode,
+    pub freshness_fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2023,6 +2028,23 @@ pub struct RefreshReport {
     pub stats: GraphStats,
     pub skipped_due_to_interval: bool,
     pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphFreshnessMode {
+    Watcher,
+    #[default]
+    Polling,
+}
+
+impl GraphFreshnessMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Watcher => "watcher",
+            Self::Polling => "polling",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2059,6 +2081,8 @@ pub struct GraphManager {
     store_metadata: Option<GraphStoreMetadata>,
     last_refresh: Instant,
     build_report: GraphBuildReport,
+    freshness_mode: GraphFreshnessMode,
+    freshness_fallback_reason: Option<String>,
     /// Paths the next `refresh_now` should treat as authoritatively changed.
     /// Wrapped in `Arc<Mutex<>>` so a background [`watcher::FileWatcher`]
     /// can push paths from its own thread; writers push, the single reader
@@ -2128,16 +2152,32 @@ impl GraphManager {
         watcher_config: watcher::WatcherConfig,
     ) -> Result<Self> {
         let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
+        let watcher_config = watcher_config.with_default_root(manager.root.clone());
         let handle = Arc::clone(&manager.pending_changed_paths);
+        let watched_root = manager.root.clone();
         let file_watcher = watcher::FileWatcher::start(watcher_config, move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
-                    paths.insert(path);
+                    if watcher_path_should_enqueue(&watched_root, &path) {
+                        paths.insert(path);
+                    }
                 }
             }
         })?;
+        manager.freshness_mode = GraphFreshnessMode::Watcher;
+        manager.build_report.freshness_mode = GraphFreshnessMode::Watcher;
+        manager.freshness_fallback_reason = None;
+        manager.build_report.freshness_fallback_reason = None;
         manager._watcher = Some(file_watcher);
         Ok(manager)
+    }
+
+    pub fn mark_polling_fallback(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.freshness_mode = GraphFreshnessMode::Polling;
+        self.freshness_fallback_reason = Some(reason.clone());
+        self.build_report.freshness_mode = GraphFreshnessMode::Polling;
+        self.build_report.freshness_fallback_reason = Some(reason);
     }
 
     fn open_with_optional_store(
@@ -2151,7 +2191,7 @@ impl GraphManager {
         let store_metadata = store
             .as_ref()
             .map(|_| graph_store_metadata(&root, &crawl_options));
-        let crawler = WorkspaceCrawler::new(crawl_options);
+        let crawler = WorkspaceCrawler::try_new(crawl_options)?;
         let snapshot = crawler.crawl(&root)?;
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
@@ -2193,6 +2233,9 @@ impl GraphManager {
             bytes_seen,
             language,
             stats: graph.stats(),
+            indexing_decision: snapshot.indexing_decision.clone(),
+            freshness_mode: GraphFreshnessMode::Polling,
+            freshness_fallback_reason: None,
         };
         Ok(Self {
             root,
@@ -2204,6 +2247,8 @@ impl GraphManager {
             store_metadata,
             last_refresh: Instant::now(),
             build_report,
+            freshness_mode: GraphFreshnessMode::Polling,
+            freshness_fallback_reason: None,
             pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
             _watcher: None,
         })
@@ -2219,6 +2264,14 @@ impl GraphManager {
 
     pub fn build_report(&self) -> &GraphBuildReport {
         &self.build_report
+    }
+
+    pub fn freshness_mode(&self) -> GraphFreshnessMode {
+        self.freshness_mode
+    }
+
+    pub fn freshness_fallback_reason(&self) -> Option<&str> {
+        self.freshness_fallback_reason.as_deref()
     }
 
     /// Per-language file counts derived from the current graph state.
@@ -2595,6 +2648,19 @@ impl GraphManager {
     }
 }
 
+fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    !relative.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        matches!(
+            name.to_str(),
+            Some(".git" | ".hg" | ".jj" | ".svn" | ".squeezy")
+        )
+    })
+}
+
 struct LoadedPartitions {
     parsed: Vec<ParsedFile>,
     missed_records: Vec<FileRecord>,
@@ -2678,6 +2744,7 @@ fn graph_store_metadata(root: &Path, crawl_options: &CrawlOptions) -> GraphStore
         "include_hidden": crawl_options.include_hidden,
         "max_file_bytes": crawl_options.max_file_bytes,
         "require_indexing_signal": crawl_options.require_indexing_signal,
+        "languages": crawl_options.languages,
         "include": crawl_options.policy.include,
         "exclude": crawl_options.policy.exclude,
         "include_classes": crawl_options.policy.include_classes,

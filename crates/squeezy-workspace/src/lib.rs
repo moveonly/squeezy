@@ -1,8 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env,
     ffi::OsString,
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
@@ -11,7 +12,9 @@ use std::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, SqueezyError};
+use squeezy_core::{
+    ContentHash, FileId, Freshness, LanguageFamily, LanguageKind, Result, SqueezyError,
+};
 
 pub const CRATE_NAME: &str = "squeezy-workspace";
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
@@ -70,6 +73,10 @@ pub struct CrawlOptions {
     pub include_hidden: bool,
     pub max_file_bytes: u64,
     pub require_indexing_signal: bool,
+    /// Supported graph languages to index. Empty means all supported
+    /// languages; configured callers pass the user's allow-list through so
+    /// disabled languages remain visible as fallback records.
+    pub languages: Vec<String>,
     pub policy: IndexingPolicy,
 }
 
@@ -79,6 +86,7 @@ impl Default for CrawlOptions {
             include_hidden: false,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             require_indexing_signal: true,
+            languages: Vec::new(),
             policy: IndexingPolicy::default(),
         }
     }
@@ -245,6 +253,7 @@ pub struct UnsupportedFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedReason {
     UnsupportedExtension,
+    LanguageDisabled,
     TooLarge,
     BinaryLike,
 }
@@ -350,6 +359,7 @@ impl IndexingDecisionContext {
 pub struct WorkspaceCrawler {
     options: CrawlOptions,
     compiled_policy: Arc<CompiledIndexingPolicy>,
+    enabled_languages: Arc<HashSet<LanguageKind>>,
 }
 
 impl WorkspaceCrawler {
@@ -361,17 +371,23 @@ impl WorkspaceCrawler {
             .policy
             .compile()
             .expect("policy globs must be valid; validate via IndexingPolicy::compile() first");
+        let enabled_languages = compile_language_allowlist(&options.languages).expect(
+            "graph languages must be valid; validate via WorkspaceCrawler::try_new() first",
+        );
         Self {
             options,
             compiled_policy: Arc::new(compiled_policy),
+            enabled_languages: Arc::new(enabled_languages),
         }
     }
 
     pub fn try_new(options: CrawlOptions) -> Result<Self> {
         let compiled_policy = Arc::new(options.policy.compile()?);
+        let enabled_languages = Arc::new(compile_language_allowlist(&options.languages)?);
         Ok(Self {
             options,
             compiled_policy,
+            enabled_languages,
         })
     }
 
@@ -459,11 +475,16 @@ impl WorkspaceCrawler {
                 }
             }
             let size_bytes = metadata.len();
-            let language = classify_language(&path);
+            let detected_language = classify_language(&path);
+            let language = if language_enabled(detected_language, &self.enabled_languages) {
+                detected_language
+            } else {
+                LanguageKind::Unsupported
+            };
             // Java source files frequently contain many nested declarations
             // in a single file, so we lift the default cap when the user has
             // not configured an explicit one.
-            let max_file_bytes = if language == LanguageKind::Java
+            let max_file_bytes = if detected_language == LanguageKind::Java
                 && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
             {
                 DEFAULT_JAVA_MAX_FILE_BYTES
@@ -502,8 +523,8 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            let bytes = fs::read(&path)?;
-            if looks_binary(&bytes) {
+            let (hash, prefix) = read_hash_and_prefix(&path)?;
+            if looks_binary(&prefix) {
                 if self.compiled_policy.includes_class(ExclusionReason::Binary) {
                     unsupported.push(unsupported_file(
                         &path,
@@ -524,7 +545,7 @@ impl WorkspaceCrawler {
                 }
                 continue;
             }
-            if looks_generated(&bytes)
+            if looks_generated(&prefix)
                 && !self
                     .compiled_policy
                     .includes_class(ExclusionReason::Generated)
@@ -546,7 +567,11 @@ impl WorkspaceCrawler {
                     relative_path.clone(),
                     extension_string(&path),
                     size_bytes,
-                    UnsupportedReason::UnsupportedExtension,
+                    if detected_language == LanguageKind::Unsupported {
+                        UnsupportedReason::UnsupportedExtension
+                    } else {
+                        UnsupportedReason::LanguageDisabled
+                    },
                 ));
             }
 
@@ -561,7 +586,7 @@ impl WorkspaceCrawler {
                 id: FileId::new(relative_path.clone()),
                 path,
                 relative_path,
-                hash: ContentHash::new(stable_content_hash(&bytes)),
+                hash: ContentHash::new(hash),
                 size_bytes,
                 modified_unix_millis,
                 language,
@@ -675,6 +700,69 @@ pub fn classify_language(path: &Path) -> LanguageKind {
     }
 }
 
+fn compile_language_allowlist(languages: &[String]) -> Result<HashSet<LanguageKind>> {
+    let mut enabled = HashSet::new();
+    for language in languages {
+        let kinds = parse_language_selector(language)?;
+        enabled.extend(kinds);
+    }
+    Ok(enabled)
+}
+
+fn parse_language_selector(language: &str) -> Result<Vec<LanguageKind>> {
+    let raw = language.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "c#" => return Ok(LanguageFamily::CSharp.kinds().to_vec()),
+        "c++" => return Ok(vec![LanguageKind::Cpp]),
+        "c/c++" | "c-c++" | "c_family" => return Ok(LanguageFamily::CFamily.kinds().to_vec()),
+        _ => {}
+    }
+    let normalized = language_selector_key(language);
+    let kinds: &[LanguageKind] = match normalized.as_str() {
+        "" => &[],
+        "c" => &[LanguageKind::C],
+        "cpp" | "cxx" => &[LanguageKind::Cpp],
+        "cfamily" | "c-family" | "ccpp" => LanguageFamily::CFamily.kinds(),
+        "cs" | "csharp" => LanguageFamily::CSharp.kinds(),
+        "dart" => LanguageFamily::Dart.kinds(),
+        "go" => LanguageFamily::Go.kinds(),
+        "java" => LanguageFamily::Java.kinds(),
+        "javascript" | "js" => &[LanguageKind::JavaScript, LanguageKind::Jsx],
+        "jsts" | "js-ts" | "typescript" | "ts" => LanguageFamily::JsTs.kinds(),
+        "jsx" => &[LanguageKind::Jsx],
+        "kotlin" => LanguageFamily::Kotlin.kinds(),
+        "php" => LanguageFamily::Php.kinds(),
+        "python" | "py" => LanguageFamily::Python.kinds(),
+        "ruby" | "rb" => LanguageFamily::Ruby.kinds(),
+        "rust" | "rs" => LanguageFamily::Rust.kinds(),
+        "scala" => LanguageFamily::Scala.kinds(),
+        "swift" => LanguageFamily::Swift.kinds(),
+        "tsx" => &[LanguageKind::Tsx],
+        other => {
+            return Err(SqueezyError::Config(format!(
+                "unknown graph language {other:?}; expected a supported language or family id"
+            )));
+        }
+    };
+    Ok(kinds.to_vec())
+}
+
+fn language_selector_key(language: &str) -> String {
+    language
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter_map(|ch| match ch {
+            '#' | '+' | '/' | ' ' | '_' => None,
+            ch => Some(ch),
+        })
+        .collect()
+}
+
+fn language_enabled(language: LanguageKind, enabled: &HashSet<LanguageKind>) -> bool {
+    enabled.is_empty() || !language.family().is_some() || enabled.contains(&language)
+}
+
 fn extension_string(path: &Path) -> Option<String> {
     path.extension()
         .map(|extension| extension.to_string_lossy().into_owned())
@@ -707,6 +795,9 @@ fn refine_c_family_header_languages(files: &mut [FileRecord]) {
     };
     for file in files.iter_mut() {
         if !is_plain_c_header(&file.relative_path) {
+            continue;
+        }
+        if file.language != LanguageKind::Cpp {
             continue;
         }
         let Some(stem) = path_without_extension(&file.relative_path) else {
@@ -1391,16 +1482,40 @@ fn record_excluded_dir_entry(coverage: &mut IndexCoverage, entry: &ExcludedPath)
     }
 }
 
-pub fn stable_content_hash(bytes: &[u8]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001b3;
-
+fn read_hash_and_prefix(path: &Path) -> Result<(String, Vec<u8>)> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0u8; CHUNK_BYTES];
+    let mut prefix = Vec::with_capacity(BINARY_GENERATED_PREFIX_BYTES);
     let mut hash = FNV_OFFSET;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        if prefix.len() < BINARY_GENERATED_PREFIX_BYTES {
+            let remaining = BINARY_GENERATED_PREFIX_BYTES - prefix.len();
+            prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        hash = update_stable_hash(hash, chunk);
+    }
+    Ok((format!("{hash:016x}"), prefix))
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+pub fn stable_content_hash(bytes: &[u8]) -> String {
+    format!("{:016x}", update_stable_hash(FNV_OFFSET, bytes))
+}
+
+fn update_stable_hash(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    format!("{hash:016x}")
+    hash
 }
 
 #[cfg(test)]

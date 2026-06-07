@@ -2097,6 +2097,32 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 env_override: None,
                 secret: false,
             },
+            FieldMeta {
+                label: "include_classes",
+                toml_path: &["graph", "include_classes"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::Restart,
+                get: get_graph_include_classes,
+                set: set_graph_include_classes,
+                default_display: "—",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Exclusion classes to force-include in the graph index.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "exclude_classes",
+                toml_path: &["graph", "exclude_classes"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::Restart,
+                get: get_graph_exclude_classes,
+                set: set_graph_exclude_classes,
+                default_display: "—",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Exclusion classes to force-exclude from the graph index.",
+                env_override: None,
+                secret: false,
+            },
         ],
     },
     ConfigSectionMeta {
@@ -4108,6 +4134,32 @@ fn set_graph_exclude(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'sta
     match value {
         FieldValue::StringList(items) => {
             cfg.graph.exclude = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+fn get_graph_include_classes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.include_classes.clone())
+}
+fn set_graph_include_classes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.include_classes = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+fn get_graph_exclude_classes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.exclude_classes.clone())
+}
+fn set_graph_exclude_classes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.exclude_classes = items;
             Ok(())
         }
         _ => Err("expects string list"),

@@ -370,6 +370,33 @@ fn record_graph_open(
     }
 }
 
+fn open_registry_graph(
+    root: &Path,
+    crawl_options: CrawlOptions,
+    graph_store: Option<Arc<GraphStore>>,
+) -> squeezy_core::Result<GraphManager> {
+    let opened_watching = GraphManager::open_watching(
+        root,
+        Default::default(),
+        crawl_options.clone(),
+        graph_store.clone(),
+        squeezy_graph::watcher::WatcherConfig::for_workspace_root(root.to_path_buf()),
+    );
+    match opened_watching {
+        Ok(manager) => Ok(manager),
+        Err(err) => {
+            let mut manager = GraphManager::open_with_store(
+                root,
+                Default::default(),
+                crawl_options,
+                graph_store,
+            )?;
+            manager.mark_polling_fallback(format!("watcher startup failed: {err}"));
+            Ok(manager)
+        }
+    }
+}
+
 fn graph_build_perf_report(manager: &GraphManager) -> GraphPerfReport {
     let report = manager.build_report();
     GraphPerfReport {
@@ -1496,12 +1523,8 @@ impl ToolRegistry {
                                 .map(Arc::new)
                         })
                         .flatten();
-                    let opened_result = GraphManager::open_with_store(
-                        &root_for_graph,
-                        Default::default(),
-                        crawl_options_for_graph,
-                        graph_store,
-                    );
+                    let opened_result =
+                        open_registry_graph(&root_for_graph, crawl_options_for_graph, graph_store);
                     if let Some(telemetry) = telemetry_for_graph.as_ref() {
                         emit_graph_build_telemetry(telemetry, &opened_result);
                     }
@@ -1530,12 +1553,7 @@ impl ToolRegistry {
                             .map(Arc::new)
                     })
                     .flatten();
-                let opened_result = GraphManager::open_with_store(
-                    &root,
-                    Default::default(),
-                    crawl_options.clone(),
-                    graph_store,
-                );
+                let opened_result = open_registry_graph(&root, crawl_options.clone(), graph_store);
                 if let Some(telemetry) = telemetry.as_ref() {
                     emit_graph_build_telemetry(telemetry, &opened_result);
                 }
@@ -5481,6 +5499,7 @@ fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
         include_hidden: config.include_hidden,
         max_file_bytes: config.max_file_bytes,
         require_indexing_signal: config.require_indexing_signal,
+        languages: config.languages.clone(),
         policy: IndexingPolicy {
             include: config.include.clone(),
             exclude: config.exclude.clone(),

@@ -54,6 +54,23 @@ impl Default for WatcherConfig {
     }
 }
 
+impl WatcherConfig {
+    /// Build a watcher config that recursively watches the workspace root.
+    pub fn for_workspace_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            src_dirs: vec![root.into()],
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+        }
+    }
+
+    pub(crate) fn with_default_root(mut self, root: PathBuf) -> Self {
+        if self.src_dirs.is_empty() {
+            self.src_dirs.push(root);
+        }
+        self
+    }
+}
+
 /// Batch of file-system changes delivered when the debounce window expires.
 #[derive(Debug, Default, Clone)]
 pub struct ChangeBatch {
