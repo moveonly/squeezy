@@ -19,12 +19,15 @@ pub(crate) fn spawn(
 
     tracing::debug!("restricted spawn: building capability SID set");
 
-    // Always include the read-only capability SID.
     let mut all_cap_sids: Vec<String> = Vec::new();
-    let ro_sid = cap::readonly_cap_sid(state_dir)?;
-    all_cap_sids.push(ro_sid);
+    if spec.token_mode == WinTokenMode::ReadOnlyCapability {
+        all_cap_sids.push(cap::readonly_cap_sid(state_dir)?);
+    }
 
     // For writable-roots mode, add per-root write capability SIDs and apply ACLs.
+    // Do not also include the read-only cap: write-restricted tokens require
+    // every restricting SID to pass write access, so a cap without the root's
+    // write ACE would block legitimate workspace writes.
     if spec.token_mode == WinTokenMode::WritableRootsCapability {
         tracing::debug!(
             "restricted spawn: applying writable-root ACLs for {} root(s)",
@@ -85,10 +88,9 @@ pub(crate) fn spawn(
     // from writing to pre-existing world-writable directories.  Best-effort —
     // failures are logged but never propagate.
     if spec.token_mode == WinTokenMode::WritableRootsCapability && !spec.writable_roots.is_empty() {
-        // all_cap_sids[0] = readonly cap SID; [1] = first writable-root cap SID.
         // The token carries every cap SID as a restricting SID, so denying any
         // one of them blocks the sandbox (all restricting SIDs must pass).
-        let deny_sid = &all_cap_sids[1];
+        let deny_sid = &all_cap_sids[0];
         tracing::debug!(
             "restricted spawn: running world-writable audit (deny_cap_sid={})",
             deny_sid
