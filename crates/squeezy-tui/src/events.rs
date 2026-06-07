@@ -37,6 +37,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::Started { .. } => {
                     app.status = "thinking".to_string();
                     app.turn_visual = TurnVisualState::Running;
+                    app.clear_status_context_request_tokens();
                     app.pending_reasoning.clear();
                     app.note_turn_started();
                 }
@@ -206,6 +207,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_compaction.summary = Some(report.summary.clone());
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
+                    app.clear_status_context_request_tokens();
                     app.context_compaction_nudge_shown = false;
                     app.status = compaction_status_line(&report.record);
                     app.push_status(format!(
@@ -374,6 +376,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.context_estimate = context_estimate;
+                    app.clear_status_context_request_tokens();
                     app.cancelled_prompt = None;
                     if app.last_turn_had_edits {
                         app.push_status(format!("turn complete · {}", edit_recovery_hint(app)));

@@ -38,8 +38,8 @@ use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
     Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
     JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
-    RequestUserInputRequest, RequestUserInputResponse, SubagentId, ToolApprovalDecision,
-    ToolApprovalRequest,
+    RequestUserInputRequest, RequestUserInputResponse, SessionAccountingSnapshot, SubagentId,
+    ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
@@ -839,7 +839,9 @@ async fn run_inner_with_terminal(
     app.context_estimate = agent.context_estimate_snapshot().await;
     // Seed the session-cumulative cost from the resumed session so the status
     // line shows prior spend immediately, before the first new turn completes.
-    app.cost = agent.session_accounting_snapshot().await.cost;
+    let accounting_snapshot = agent.session_accounting_snapshot().await;
+    app.apply_status_context_snapshot(&accounting_snapshot);
+    app.cost = accounting_snapshot.cost;
     app.job_rx = Some(agent.subscribe_jobs());
     app.jobs = agent
         .jobs_snapshot()
@@ -1233,6 +1235,7 @@ async fn apply_plan_choice(
                     app.context_compaction.summary = Some(report.summary.clone());
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
+                    app.clear_status_context_request_tokens();
                     app.context_compaction_nudge_shown = false;
                     app.push_status(format!(
                         "compacted prior context before executing plan {}",
@@ -3999,6 +4002,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Plans { args } => handle_plans_command(app, &args),
         DispatchCommand::Cost => {
             let snapshot = agent.session_accounting_snapshot().await;
+            app.apply_status_context_snapshot(&snapshot);
             app.status = "cost snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_cost_command(
                 &snapshot,
@@ -4006,6 +4010,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         }
         DispatchCommand::Context => {
             let snapshot = agent.session_accounting_snapshot().await;
+            app.apply_status_context_snapshot(&snapshot);
             app.status = "context snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_context_command(
                 &snapshot,
@@ -4097,6 +4102,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                     Ok(Some(record)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
                         app.context_estimate = agent.context_estimate_snapshot().await;
+                        app.clear_status_context_request_tokens();
                         app.status = format!(
                             "undid compaction gen={} ({} item(s) restored)",
                             record.generation, record.dropped_items,
@@ -4122,6 +4128,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                     Ok(Some(report)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
                         app.context_estimate = report.record.after.clone();
+                        app.clear_status_context_request_tokens();
                         app.status = compaction_status_line(&report.record);
                         app.push_log(format!(
                             "context compacted gen={} items={} tok {}->{}",
@@ -4422,6 +4429,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.attachments = agent.context_attachments_snapshot().await;
                 app.context_compaction = agent.context_compaction_snapshot().await;
                 app.context_estimate = agent.context_estimate_snapshot().await;
+                app.clear_status_context_request_tokens();
                 app.context_compaction_nudge_shown = false;
                 app.pending_assistant.clear();
                 app.pending_reasoning.clear();
@@ -15804,6 +15812,14 @@ pub(crate) struct TuiApp {
     /// nudge can fire again on the next approach to the threshold.
     pub(crate) context_compaction_nudge_shown: bool,
     pub(crate) context_estimate: ContextEstimate,
+    /// Latest request-accounting input count shown by status-line context
+    /// items. `/context` supplies the complete assembled-request estimate;
+    /// turn events clear this so live updates fall back to `context_estimate`.
+    pub(crate) status_context_input_tokens: Option<u64>,
+    /// Latest raw model context window from request accounting, shown by
+    /// `context-window-size`. Kept separate from `context_window_tokens`, which
+    /// is the effective compaction/nudge budget.
+    pub(crate) status_context_window_tokens: Option<u64>,
     pub(crate) checkpoints_enabled: bool,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) subagent_pane: SubagentPaneState,
@@ -16281,6 +16297,8 @@ impl TuiApp {
             context_compaction_nudge_shown: false,
             pin_picker_active: false,
             context_estimate: ContextEstimate::default(),
+            status_context_input_tokens: None,
+            status_context_window_tokens: None,
             checkpoints_enabled: config.checkpoints_enabled,
             transcript,
             subagent_pane: SubagentPaneState::default(),
@@ -16407,6 +16425,8 @@ impl TuiApp {
         self.context_summarize_tokens = config.context_compaction.summarize_threshold();
         self.context_warn_tokens = config.context_compaction.warn_threshold();
         self.context_recent_items = config.context_compaction.recent_items;
+        self.status_context_input_tokens = None;
+        self.status_context_window_tokens = None;
         self.checkpoints_enabled = config.checkpoints_enabled;
         self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
         self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
@@ -16493,6 +16513,15 @@ impl TuiApp {
             return;
         }
         self.turn_progress = Some(snapshot);
+    }
+
+    pub(crate) fn apply_status_context_snapshot(&mut self, snapshot: &SessionAccountingSnapshot) {
+        self.status_context_input_tokens = Some(snapshot.transmitted_request.input_tokens);
+        self.status_context_window_tokens = snapshot.transmitted_request.context_window_tokens;
+    }
+
+    pub(crate) fn clear_status_context_request_tokens(&mut self) {
+        self.status_context_input_tokens = None;
     }
 
     /// Update the active-tool elapsed clock. The tool name itself is

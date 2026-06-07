@@ -10070,6 +10070,54 @@ fn context_budget_renders_percent_of_window() {
 }
 
 #[test]
+fn status_context_uses_request_accounting_window_when_available() {
+    let mut app = test_app(SessionMode::Build);
+    // This is the effective fallback compaction budget (128K * 95% - 12K).
+    // It must not leak into user-facing context-window status once the agent
+    // has supplied a raw request-accounting window.
+    app.context_window_tokens = 109_600;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 27_400,
+        ..ContextEstimate::default()
+    };
+    app.status_context_input_tokens = Some(49_574);
+    app.status_context_window_tokens = Some(200_000);
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+    let window = status::resolve_status_item(&app, status::StatusLineItem::ContextWindowSize)
+        .expect("context window");
+
+    assert_eq!(used, "ctx 25% used");
+    assert_eq!(window, "window 200000");
+}
+
+#[test]
+fn status_context_percent_does_not_mix_live_tokens_with_snapshot_window() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 109_600;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 54_800,
+        ..ContextEstimate::default()
+    };
+    app.status_context_input_tokens = None;
+    app.status_context_window_tokens = Some(200_000);
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+    let window = status::resolve_status_item(&app, status::StatusLineItem::ContextWindowSize)
+        .expect("context window");
+    let details = format_status_details(&app);
+
+    assert_eq!(used, "ctx 50% used");
+    assert_eq!(window, "window 200000");
+    assert!(
+        details.contains("ctx 54800/109600 (50%)"),
+        "live context details must keep the live numerator paired with the live budget: {details}"
+    );
+}
+
+#[test]
 fn context_budget_hint_at_high_usage() {
     let mut app = test_app(SessionMode::Build);
     app.context_window_tokens = 6_000;

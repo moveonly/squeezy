@@ -149,9 +149,9 @@ impl StatusLineItem {
             Self::BranchChanges => "Committed branch changes against the default branch",
             Self::RunState => "Compact session run-state text (Ready, Working, Thinking)",
             Self::Mode => "Active session mode (Plan or Build)",
-            Self::ContextRemaining => "Percentage of context budget remaining",
-            Self::ContextUsed => "Percentage of context budget used",
-            Self::ContextWindowSize => "Configured context-window size in tokens",
+            Self::ContextRemaining => "Percentage of context window remaining",
+            Self::ContextUsed => "Percentage of context window used",
+            Self::ContextWindowSize => "Current model context-window size in tokens",
             Self::UsedTokens => "Total input + output tokens spent this session",
             Self::TotalInputTokens => "Total input tokens spent this session",
             Self::TotalOutputTokens => "Total output tokens spent this session",
@@ -422,11 +422,7 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
         }),
         StatusLineItem::ContextUsed => context_pct(app).map(|pct| format!("ctx {pct}% used")),
         StatusLineItem::ContextWindowSize => {
-            if app.context_window_tokens == 0 {
-                None
-            } else {
-                Some(format!("window {}", app.context_window_tokens))
-            }
+            context_window_tokens(app).map(|window| format!("window {window}"))
         }
         StatusLineItem::UsedTokens => {
             let total = app.cost.input_tokens.unwrap_or(0) + app.cost.output_tokens.unwrap_or(0);
@@ -493,13 +489,34 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn context_pct(app: &TuiApp) -> Option<u64> {
-    if app.context_window_tokens == 0 {
-        return None;
+    context_percent_window_tokens(app)
+        .map(|window| context_window_pct(context_used_tokens(app), window))
+}
+
+fn context_used_tokens(app: &TuiApp) -> u64 {
+    app.status_context_input_tokens
+        .unwrap_or(app.context_estimate.estimated_tokens)
+}
+
+fn context_window_tokens(app: &TuiApp) -> Option<u64> {
+    app.status_context_window_tokens.or({
+        if app.context_window_tokens == 0 {
+            None
+        } else {
+            Some(app.context_window_tokens)
+        }
+    })
+}
+
+fn context_percent_window_tokens(app: &TuiApp) -> Option<u64> {
+    match (
+        app.status_context_input_tokens,
+        app.status_context_window_tokens,
+    ) {
+        (Some(_), Some(window)) => Some(window),
+        _ if app.context_window_tokens > 0 => Some(app.context_window_tokens),
+        _ => None,
     }
-    Some(context_window_pct(
-        app.context_estimate.estimated_tokens,
-        app.context_window_tokens,
-    ))
 }
 
 fn format_run_state(app: &TuiApp) -> String {
@@ -618,14 +635,14 @@ pub(crate) mod segments {
     }
 
     pub(crate) fn context(app: &TuiApp) -> Option<String> {
-        let used = app.context_estimate.estimated_tokens;
-        if app.context_window_tokens == 0 {
+        let used = context_used_tokens(app);
+        let Some(window) = context_percent_window_tokens(app) else {
             return Some(format!("ctx {used}"));
-        }
-        let pct = context_window_pct(used, app.context_window_tokens);
+        };
+        let pct = context_window_pct(used, window);
         Some(format!(
             "ctx {used}/{threshold} ({pct}%)",
-            threshold = app.context_window_tokens,
+            threshold = window,
         ))
     }
 
