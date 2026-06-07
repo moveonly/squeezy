@@ -77,7 +77,13 @@ impl ShellProgram {
                 command.to_string(),
             ]
         } else {
-            vec!["-lc".to_string(), command.to_string()]
+            let flag =
+                if cfg!(windows) && (lowered.ends_with("bash.exe") || lowered.ends_with("/bash")) {
+                    "-c"
+                } else {
+                    "-lc"
+                };
+            vec![flag.to_string(), command.to_string()]
         };
         Self {
             program: path.to_string(),
@@ -122,12 +128,13 @@ impl ShellProgram {
 
     #[cfg(any(unix, target_os = "windows"))]
     fn git_bash(command: &str) -> Option<Self> {
+        let login_flag = if cfg!(windows) { "-c" } else { "-lc" };
         if let Ok(path) = std::env::var("SQUEEZY_GIT_BASH_PATH")
             && std::path::Path::new(&path).is_file()
         {
             return Some(Self {
                 program: path,
-                args: vec!["-lc".to_string(), command.to_string()],
+                args: vec![login_flag.to_string(), command.to_string()],
             });
         }
         #[cfg(windows)]
@@ -139,7 +146,7 @@ impl ShellProgram {
                 if std::path::Path::new(candidate).is_file() {
                     return Some(Self {
                         program: candidate.to_string(),
-                        args: vec!["-lc".to_string(), command.to_string()],
+                        args: vec![login_flag.to_string(), command.to_string()],
                     });
                 }
             }
@@ -147,7 +154,7 @@ impl ShellProgram {
         if let Ok(bash) = which::which("bash") {
             return Some(Self {
                 program: bash.to_string_lossy().into_owned(),
-                args: vec!["-lc".to_string(), command.to_string()],
+                args: vec![login_flag.to_string(), command.to_string()],
             });
         }
         let _ = command;
