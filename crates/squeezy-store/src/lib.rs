@@ -1275,7 +1275,7 @@ pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
             return Ok(());
         };
         let dir = fs::File::open(parent)?;
-        return match dir.sync_all() {
+        match dir.sync_all() {
             Ok(()) => Ok(()),
             Err(error)
                 if matches!(
@@ -1292,7 +1292,7 @@ pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
                 Ok(())
             }
             Err(error) => Err(error),
-        };
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
