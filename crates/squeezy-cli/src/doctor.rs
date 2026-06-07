@@ -94,7 +94,7 @@ impl Status {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Check {
     name: String,
     status: Status,
@@ -295,15 +295,21 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(update_check(update::check_for_update().await));
     }
 
-    let checks = filter_checks(args, checks);
+    let selector_failures = unmatched_selector_checks(args, &checks);
+    checks.extend(selector_failures.iter().cloned());
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
     // such but do not fail the command: smoke tests in CI / brew test run in
     // environments where keys are absent and still need the binary to come up
     // green. Only hard failures (config load broken, session store unwritable)
     // produce a non-zero exit, matching the old `--health` contract.
-    let (_, failures) = check_counts(&checks);
-    let exit_code = if failures > 0 { 1 } else { 0 };
+    let exit_code = exit_code_for_checks(&checks);
+    let mut checks = filter_checks(args, checks);
+    for failure in selector_failures {
+        if !checks.iter().any(|check| check.name == failure.name) {
+            checks.push(failure);
+        }
+    }
 
     Ok(DoctorReport {
         exit_code,
@@ -321,6 +327,11 @@ fn needs_config(args: &DoctorArgs) -> bool {
     args.only
         .iter()
         .any(|selector| !matches!(selector.as_str(), "sandbox" | "update"))
+}
+
+fn exit_code_for_checks(checks: &[Check]) -> i32 {
+    let (_, failures) = check_counts(checks);
+    if failures > 0 { 1 } else { 0 }
 }
 
 fn should_include_check(args: &DoctorArgs, name: &str) -> bool {
@@ -351,6 +362,38 @@ fn filter_checks(args: &DoctorArgs, checks: Vec<Check>) -> Vec<Check> {
                 .any(|filter| check.status.matches_filter(*filter))
         })
         .collect()
+}
+
+fn unmatched_selector_checks(args: &DoctorArgs, checks: &[Check]) -> Vec<Check> {
+    let unmatched = args
+        .only
+        .iter()
+        .filter_map(|selector| {
+            let selector = selector.trim();
+            if selector.is_empty()
+                || checks
+                    .iter()
+                    .any(|check| check_name_matches(selector, &check.name))
+                || (selector == "update" && args.skip_update)
+            {
+                None
+            } else {
+                Some(selector.to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+    if unmatched.is_empty() {
+        Vec::new()
+    } else {
+        vec![Check {
+            name: "selector".to_string(),
+            status: Status::Fail,
+            detail: format!(
+                "unknown doctor --only selector(s): {}",
+                unmatched.join(", ")
+            ),
+        }]
+    }
 }
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {

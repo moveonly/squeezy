@@ -37,6 +37,46 @@ fn credential_check_reports_ok_when_env_set() {
 }
 
 #[test]
+fn status_filter_does_not_make_hidden_failures_exit_zero() {
+    let mut args = DoctorArgs::default();
+    args.status.push(DoctorStatusFilter::Ok);
+    let checks = vec![
+        Check {
+            name: "config".to_string(),
+            status: Status::Fail,
+            detail: "broken".to_string(),
+        },
+        Check {
+            name: "sandbox".to_string(),
+            status: Status::Ok,
+            detail: "available".to_string(),
+        },
+    ];
+
+    assert_eq!(exit_code_for_checks(&checks), 1);
+    let visible = filter_checks(&args, checks);
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "sandbox");
+}
+
+#[test]
+fn unmatched_only_selector_becomes_visible_failure() {
+    let mut args = DoctorArgs::default();
+    args.only.push("sesion_store".to_string());
+    args.status.push(DoctorStatusFilter::Ok);
+    let checks = vec![Check {
+        name: "session_store".to_string(),
+        status: Status::Ok,
+        detail: "ok".to_string(),
+    }];
+
+    let selector_failures = unmatched_selector_checks(&args, &checks);
+    assert_eq!(selector_failures.len(), 1);
+    assert_eq!(selector_failures[0].status, Status::Fail);
+    assert!(selector_failures[0].detail.contains("sesion_store"));
+}
+
+#[test]
 fn credential_check_warns_when_unresolved() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     isolate_credentials_file();
