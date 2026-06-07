@@ -1625,7 +1625,7 @@ impl SessionHandle {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         file.write_all(&payload)?;
         if self.store.durability == CacheDurability::Strict {
             file.sync_all()?;
