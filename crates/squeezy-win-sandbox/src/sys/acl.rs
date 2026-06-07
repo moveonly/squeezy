@@ -140,6 +140,17 @@ pub(crate) fn add_deny_write_ace(path: &Path, sid_str: &str) -> crate::Result<()
     apply_ace(path, sid_str, mask, DENY_ACCESS, true)
 }
 
+/// Add a non-inheritable deny ACE blocking direct write operations on `path`.
+pub(crate) fn add_deny_write_ace_no_inherit(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask = FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE;
+    apply_ace(path, sid_str, mask, DENY_ACCESS, false)
+}
+
 /// Add an inheritable deny ACE blocking all read operations.
 pub(crate) fn add_deny_read_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
     apply_ace(path, sid_str, FILE_GENERIC_READ, DENY_ACCESS, true)
