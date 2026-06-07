@@ -2982,6 +2982,10 @@ async fn plan_mode_forced_shell_ask_routes_through_ai_reviewer() {
         session_mode: SessionMode::Plan,
         permissions: PermissionPolicy {
             shell: PermissionMode::Ask,
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: ShellSandboxMode::Off,
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
