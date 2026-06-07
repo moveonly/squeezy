@@ -63,7 +63,7 @@ fn duplicates_are_deduped() {
     let patterns = vec!["dup.txt".to_string()];
     let result = resolve_deny_read_paths(&patterns, std::slice::from_ref(&f), None, &tmp);
 
-    let count = result.iter().filter(|p| *p == f).count();
+    let count = result.iter().filter(|p| p.as_path() == f.as_path()).count();
     assert_eq!(
         count, 1,
         "expected exactly one entry for dup.txt; got {result:?}"
