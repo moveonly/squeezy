@@ -112,7 +112,6 @@ fn preview_patch_stream_rejects_non_json() {
 #[test]
 fn restore_tempfile_creation_skips_existing_sibling_path() {
     let root = temp_repo("restore_temp_collision");
-    let target = root.join("sample.txt");
     let collision = root.join(".sample.txt.squeezy-restore-collision.tmp");
     let next = root.join(".sample.txt.squeezy-restore-next.tmp");
     fs::write(&collision, "user temp\n").expect("write collision");
