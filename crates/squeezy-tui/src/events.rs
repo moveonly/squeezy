@@ -219,6 +219,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         report.record.after.estimated_tokens
                     ));
                 }
+                AgentEvent::ContextUsageUpdate {
+                    input_tokens,
+                    context_window_tokens,
+                    ..
+                } => {
+                    app.apply_status_context_usage(input_tokens, context_window_tokens);
+                }
                 AgentEvent::SubagentStarted {
                     id, agent, prompt, ..
                 } => {

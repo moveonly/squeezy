@@ -5971,6 +5971,19 @@ impl TurnRuntime {
             .map(|handle| format!("squeezy::{}", handle.session_id()))
     }
 
+    fn context_window_override_for_model(&self, model: &str) -> Option<u64> {
+        let key = format!(
+            "{}:{}",
+            squeezy_core::provider_slug(&self.config.provider),
+            model
+        );
+        self.config
+            .model_limits
+            .get(&key)
+            .and_then(|entry| entry.context_window)
+            .or(self.configured_model_context_window)
+    }
+
     /// Fan out a `HookPayload::PreTurn` to every registered handler.
     ///
     /// Returns the concatenation of every handler's
@@ -7343,6 +7356,25 @@ impl TurnRuntime {
                 estimated_tokens(llm_request_overhead_bytes(&request)),
                 Ordering::Relaxed,
             );
+            let observed_ceiling = {
+                let state = self.conversation_state.lock().await;
+                state
+                    .observed_context_ceilings
+                    .get(&(self.provider.name().to_string(), request_model.to_string()))
+                    .copied()
+            };
+            let mut limit_input = ContextLimitInput::new(self.provider.name(), &request_model);
+            limit_input.user_override = self.context_window_override_for_model(&request_model);
+            limit_input.observed_ceiling = observed_ceiling;
+            limit_input.models_dev = squeezy_llm::cached_models_dev_view();
+            limit_input.effective_percent_override = self
+                .config
+                .context_compaction
+                .effective_context_window_percent;
+            limit_input.baseline_reserve_override =
+                self.config.context_compaction.baseline_reserve_tokens;
+            let request_context =
+                estimate_request_context_full(&limit_input, &request, Some(&broker.calibration));
             self.record_replay_request(&request);
             let mut stream = self
                 .provider
@@ -7431,6 +7463,18 @@ impl TurnRuntime {
                             .tx
                             .send(AgentEvent::Started {
                                 turn_id: self.turn_id,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        if self
+                            .tx
+                            .send(AgentEvent::ContextUsageUpdate {
+                                turn_id: self.turn_id,
+                                input_tokens: request_context.input_tokens,
+                                context_window_tokens: request_context.context_window_tokens,
                             })
                             .await
                             .is_err()
@@ -17376,6 +17420,15 @@ pub enum AgentEvent {
     ContextCompacted {
         turn_id: TurnId,
         report: ContextCompactionReport,
+    },
+    /// Live estimate of the request context about to be sent for a provider
+    /// round. This lets the TUI status line update context usage mid-turn,
+    /// after tool results/reasoning have been appended, instead of waiting for
+    /// the final `Completed` event.
+    ContextUsageUpdate {
+        turn_id: TurnId,
+        input_tokens: u64,
+        context_window_tokens: Option<u64>,
     },
     SubagentStarted {
         turn_id: TurnId,

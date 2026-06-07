@@ -1861,6 +1861,43 @@ async fn status_line_cost_ticks_live_and_survives_cancel() {
 }
 
 #[tokio::test]
+async fn status_line_context_ticks_live_mid_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 1_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 100,
+        ..ContextEstimate::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::Started {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send started");
+    tx.send(AgentEvent::ContextUsageUpdate {
+        turn_id: TurnId::new(1),
+        input_tokens: 500,
+        context_window_tokens: Some(2_000),
+    })
+    .await
+    .expect("send context update");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+    let window = status::resolve_status_item(&app, status::StatusLineItem::ContextWindowSize)
+        .expect("context window");
+
+    assert_eq!(used, "ctx 25% used");
+    assert_eq!(window, "window 2000");
+    assert_eq!(app.status_context_input_tokens, Some(500));
+}
+
+#[tokio::test]
 async fn status_line_cost_not_clobbered_by_no_broker_failure() {
     let mut app = test_app(SessionMode::Build);
     app.cost = CostSnapshot {

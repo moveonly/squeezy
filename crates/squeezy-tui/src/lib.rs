@@ -16542,6 +16542,15 @@ impl TuiApp {
         self.status_context_window_tokens = snapshot.transmitted_request.context_window_tokens;
     }
 
+    pub(crate) fn apply_status_context_usage(
+        &mut self,
+        input_tokens: u64,
+        context_window_tokens: Option<u64>,
+    ) {
+        self.status_context_input_tokens = Some(input_tokens);
+        self.status_context_window_tokens = context_window_tokens;
+    }
+
     pub(crate) fn clear_status_context_request_tokens(&mut self) {
         self.status_context_input_tokens = None;
     }
