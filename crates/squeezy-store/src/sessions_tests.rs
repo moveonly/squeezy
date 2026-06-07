@@ -2744,13 +2744,8 @@ fn hash_payload(payload: &serde_json::Value) -> String {
         .collect()
 }
 
-// `HOME` is process-global; the memory tests below mutate it to point at a
-// temp dir so the user's real `~/.squeezy/memory.md` is never touched. The
-// lock keeps parallel test runners from racing on the env mutation.
-static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
-    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
     let previous = std::env::var_os("HOME");
     // SAFETY: the lock above serialises HOME mutations across the suite.
     unsafe {
@@ -2892,7 +2887,7 @@ fn recall_returns_none_when_max_bytes_zero_or_missing() {
 #[cfg(not(windows))]
 #[test]
 fn memory_path_is_none_when_home_unset() {
-    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
     let previous = std::env::var_os("HOME");
     unsafe {
         std::env::remove_var("HOME");
@@ -2917,7 +2912,7 @@ fn memory_path_is_none_when_home_unset() {
 #[cfg(windows)]
 #[test]
 fn memory_path_uses_windows_profile_fallback_when_home_unset() {
-    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
     let home_previous = std::env::var_os("HOME");
     let appdata_previous = std::env::var_os("APPDATA");
     let profile_previous = std::env::var_os("USERPROFILE");
@@ -3691,7 +3686,7 @@ fn global_index_caps_to_most_recent_and_compacts_oversized_file() {
         );
 
         // Invariants asserted rather than exact ids: other suite tests create
-        // sessions without taking `HOME_LOCK`, so a concurrent real append can
+        // sessions without taking `TEST_ENV_LOCK`, so a concurrent real append can
         // land in this temp index. The cap, compaction, and ordering hold
         // regardless of such interlopers.
         let listed = SessionStore::list_global_index();

@@ -47,6 +47,9 @@ pub const GRAPH_FILE_NAME: &str = "graph.redb";
 const OVERSIZED_STATE_FAST_ROTATE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
 
