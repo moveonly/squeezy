@@ -60,6 +60,127 @@ fn session_store_lists_filters_and_exports_sessions() {
 }
 
 #[test]
+fn session_store_indexes_metadata_for_later_lists() {
+    let root = temp_root("session-index-list");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let first = store.list(&SessionQuery::default()).expect("first list");
+    assert_eq!(first.len(), 1);
+
+    let diagnostics = store.session_index_diagnostics();
+    assert!(
+        diagnostics.exists,
+        "list should create {}",
+        SESSION_INDEX_FILE_NAME
+    );
+    assert_eq!(diagnostics.indexed_sessions, 1);
+    assert_eq!(
+        diagnostics.schema_version,
+        Some(SESSION_INDEX_SCHEMA_VERSION)
+    );
+
+    handle
+        .update_metadata_and_index(|metadata| {
+            metadata.branch = Some("category10".to_string());
+            metadata.labels = vec!["storage".to_string()];
+        })
+        .expect("update metadata");
+    let filtered = store
+        .list(&SessionQuery {
+            branch: Some("category10".to_string()),
+            query: Some("storage".to_string()),
+            ..SessionQuery::default()
+        })
+        .expect("filtered index list");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].session_id, handle.session_id());
+}
+
+#[test]
+fn session_store_rebuilds_partial_metadata_index_without_hiding_legacy_sessions() {
+    let root = temp_root("session-index-legacy-rebuild");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let legacy = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start legacy session");
+    fs::remove_file(store.session_index_path()).expect("remove index to simulate pre-index disk");
+
+    let current = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start indexed session");
+    let sessions = store.list(&SessionQuery::default()).expect("list sessions");
+    let ids = sessions
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(ids.contains(legacy.session_id()));
+    assert!(ids.contains(current.session_id()));
+    assert_eq!(store.session_index_diagnostics().indexed_sessions, 2);
+}
+
+#[test]
+fn session_store_index_tracks_archive_and_purge() {
+    let root = temp_root("session-index-archive");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_id = handle.session_id().to_string();
+    store.list(&SessionQuery::default()).expect("prime index");
+
+    store.archive_session(&session_id).expect("archive session");
+    assert!(
+        store
+            .list(&SessionQuery::default())
+            .expect("default list")
+            .is_empty(),
+        "archived sessions should remain hidden in indexed default list"
+    );
+    let archived = store
+        .list(&SessionQuery {
+            include_archived: true,
+            status: Some(SessionStatus::Archived),
+            ..SessionQuery::default()
+        })
+        .expect("archived list");
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].session_id, session_id);
+
+    let report = store
+        .cleanup_with(&[session_id.clone()], None, CleanupMode::Purge)
+        .expect("purge archived session");
+    assert_eq!(report.removed, vec![session_id]);
+    assert_eq!(store.session_index_diagnostics().indexed_sessions, 0);
+}
+
+#[test]
 fn fork_creates_child_with_parent_id() {
     let root = temp_root("fork-creates-child");
     let config = AppConfig {

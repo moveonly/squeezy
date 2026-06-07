@@ -14,6 +14,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,9 +38,19 @@ pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
 /// files keep loading after future schema changes without filename
 /// sniffing.
 pub const SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
+/// Redb file under the session root that indexes `metadata.json` snapshots.
+/// The JSON files remain the durable/auditable session records; this compact
+/// index exists so list/filter/resume surfaces do not have to scan every
+/// session directory on the hot path.
+pub const SESSION_INDEX_FILE_NAME: &str = "index.redb";
+pub const SESSION_INDEX_SCHEMA_VERSION: u64 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
+
+const SESSION_INDEX_META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const SESSION_INDEX_METADATA: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("session_metadata");
 
 /// Rewrite the cross-project session index when it grows beyond this many
 /// bytes. Append-only writes are cheap, but unbounded growth would slow
@@ -101,6 +113,45 @@ impl SessionStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn session_index_path(&self) -> PathBuf {
+        self.root.join(SESSION_INDEX_FILE_NAME)
+    }
+
+    pub fn session_index_diagnostics(&self) -> SessionIndexDiagnostics {
+        let path = self.session_index_path();
+        if !path.exists() {
+            return SessionIndexDiagnostics {
+                path,
+                exists: false,
+                indexed_sessions: 0,
+                schema_version: None,
+                error: None,
+            };
+        }
+        match open_session_index(&path) {
+            Ok(database) => {
+                let schema_version = session_index_schema_version(&database).ok().flatten();
+                let indexed_sessions = session_index_records(&database)
+                    .map(|sessions| sessions.len())
+                    .unwrap_or(0);
+                SessionIndexDiagnostics {
+                    path,
+                    exists: true,
+                    indexed_sessions,
+                    schema_version,
+                    error: None,
+                }
+            }
+            Err(error) => SessionIndexDiagnostics {
+                path,
+                exists: true,
+                indexed_sessions: 0,
+                schema_version: None,
+                error: Some(error.to_string()),
+            },
+        }
     }
 
     /// Path to the cross-session token calibration file. Lives next to the
@@ -347,6 +398,56 @@ impl SessionStore {
         Self::append_global_index_entry(&entry);
     }
 
+    fn write_metadata_file(&self, dir: &Path, metadata: &SessionMetadata) -> Result<()> {
+        write_json(&dir.join("metadata.json"), metadata)?;
+        self.upsert_session_index(metadata);
+        Ok(())
+    }
+
+    fn upsert_session_index(&self, metadata: &SessionMetadata) {
+        let path = self.session_index_path();
+        let Ok(database) = open_session_index(&path) else {
+            return;
+        };
+        let Ok(write) = database.begin_write().map_err(crate::store_error) else {
+            return;
+        };
+        let metadata_path = self.metadata_path_for(metadata);
+        let modified_unix_nanos = session_metadata_modified_unix_nanos(&metadata_path).unwrap_or(0);
+        let record = SessionIndexRecord {
+            metadata: metadata.clone(),
+            modified_unix_nanos,
+        };
+        if let Ok(mut table) = write.open_table(SESSION_INDEX_METADATA)
+            && let Ok(encoded) = crate::encode(&record)
+        {
+            let _ = table.insert(record.metadata.session_id.as_str(), encoded.as_slice());
+        }
+        if let Ok(mut meta) = write.open_table(SESSION_INDEX_META)
+            && let Ok(encoded) = crate::encode(&self.root.display().to_string())
+        {
+            let _ = meta.insert("root", encoded.as_slice());
+        }
+        let _ = write.commit();
+    }
+
+    fn remove_session_index_entry(&self, session_id: &str) {
+        let path = self.session_index_path();
+        if !path.exists() {
+            return;
+        }
+        let Ok(database) = open_session_index(&path) else {
+            return;
+        };
+        let Ok(write) = database.begin_write().map_err(crate::store_error) else {
+            return;
+        };
+        if let Ok(mut table) = write.open_table(SESSION_INDEX_METADATA) {
+            let _ = table.remove(session_id);
+        }
+        let _ = write.commit();
+    }
+
     /// Start a fresh session.
     ///
     /// The handle returned is in the *pending* state: no `metadata.json`
@@ -488,6 +589,25 @@ impl SessionStore {
     }
 
     pub fn list(&self, query: &SessionQuery) -> Result<Vec<SessionMetadata>> {
+        if let Some(indexed) = self.list_from_session_index(query)? {
+            return Ok(indexed);
+        }
+        let all_sessions = self.scan_session_metadata(true)?;
+        self.rebuild_session_index(&all_sessions);
+        let mut sessions = all_sessions
+            .into_iter()
+            .filter(|metadata| {
+                (query.include_archived
+                    || matches!(query.status, Some(SessionStatus::Archived))
+                    || !matches!(metadata.status, SessionStatus::Archived))
+                    && query.matches(metadata)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
+        Ok(sessions)
+    }
+
+    fn scan_session_metadata(&self, include_archived: bool) -> Result<Vec<SessionMetadata>> {
         let mut sessions = Vec::new();
         if !self.root.exists() {
             return Ok(sessions);
@@ -509,11 +629,9 @@ impl SessionStore {
             let Ok(metadata) = deserialize_session_metadata(&text) else {
                 continue;
             };
-            if query.matches(&metadata) {
-                sessions.push(metadata);
-            }
+            sessions.push(metadata);
         }
-        if query.include_archived || matches!(query.status, Some(SessionStatus::Archived)) {
+        if include_archived {
             let archived_root = self.root.join(ARCHIVED_SUBDIR);
             if archived_root.exists() {
                 for entry in fs::read_dir(&archived_root)? {
@@ -528,14 +646,151 @@ impl SessionStore {
                     let Ok(metadata) = deserialize_session_metadata(&text) else {
                         continue;
                     };
-                    if query.matches(&metadata) {
-                        sessions.push(metadata);
-                    }
+                    sessions.push(metadata);
                 }
             }
         }
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
         Ok(sessions)
+    }
+
+    fn list_from_session_index(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<Option<Vec<SessionMetadata>>> {
+        let path = self.session_index_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let Ok(database) = open_session_index(&path) else {
+            return Ok(None);
+        };
+        let Some(index_root) = session_index_root(&database).ok().flatten() else {
+            return Ok(None);
+        };
+        if index_root != self.root.display().to_string() {
+            return Ok(None);
+        }
+        let Ok(records) = session_index_records(&database) else {
+            return Ok(None);
+        };
+        if !self.session_index_matches_filesystem(&records)? {
+            return Ok(None);
+        }
+        let mut sessions = records
+            .into_iter()
+            .map(|record| record.metadata)
+            .filter(|metadata| {
+                (query.include_archived
+                    || matches!(query.status, Some(SessionStatus::Archived))
+                    || !matches!(metadata.status, SessionStatus::Archived))
+                    && query.matches(metadata)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
+        Ok(Some(sessions))
+    }
+
+    fn session_index_matches_filesystem(&self, records: &[SessionIndexRecord]) -> Result<bool> {
+        let actual = self.scan_session_metadata_fingerprints()?;
+        if actual.len() != records.len() {
+            return Ok(false);
+        }
+        for record in records {
+            if actual
+                .get(&record.metadata.session_id)
+                .is_none_or(|fingerprint| *fingerprint != record.modified_unix_nanos)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn scan_session_metadata_fingerprints(&self) -> Result<HashMap<String, u128>> {
+        let mut out = HashMap::new();
+        if !self.root.exists() {
+            return Ok(out);
+        }
+        self.collect_metadata_fingerprints_from(&self.root, &mut out)?;
+        let archived_root = self.root.join(ARCHIVED_SUBDIR);
+        if archived_root.exists() {
+            self.collect_metadata_fingerprints_from(&archived_root, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn collect_metadata_fingerprints_from(
+        &self,
+        root: &Path,
+        out: &mut HashMap<String, u128>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if entry.file_name() == ARCHIVED_SUBDIR {
+                continue;
+            }
+            let path = entry.path().join("metadata.json");
+            let Some(session_id) = entry.file_name().to_str().map(ToString::to_string) else {
+                continue;
+            };
+            let Some(modified_unix_nanos) = session_metadata_modified_unix_nanos(&path) else {
+                continue;
+            };
+            out.insert(session_id, modified_unix_nanos);
+        }
+        Ok(())
+    }
+
+    fn rebuild_session_index(&self, sessions: &[SessionMetadata]) {
+        let path = self.session_index_path();
+        let Ok(database) = open_session_index(&path) else {
+            return;
+        };
+        let Ok(write) = database.begin_write().map_err(crate::store_error) else {
+            return;
+        };
+        if let Ok(mut metadata_table) = write.open_table(SESSION_INDEX_METADATA) {
+            let keys = metadata_table
+                .iter()
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok().map(|(key, _)| key.value().to_string()))
+                .collect::<Vec<_>>();
+            for key in keys {
+                let _ = metadata_table.remove(key.as_str());
+            }
+            for metadata in sessions {
+                let path = self.metadata_path_for(metadata);
+                let record = SessionIndexRecord {
+                    metadata: metadata.clone(),
+                    modified_unix_nanos: session_metadata_modified_unix_nanos(&path).unwrap_or(0),
+                };
+                if let Ok(encoded) = crate::encode(&record) {
+                    let _ = metadata_table.insert(metadata.session_id.as_str(), encoded.as_slice());
+                }
+            }
+        }
+        if let Ok(mut meta) = write.open_table(SESSION_INDEX_META)
+            && let Ok(encoded) = crate::encode(&self.root.display().to_string())
+        {
+            let _ = meta.insert("root", encoded.as_slice());
+        }
+        let _ = write.commit();
+    }
+
+    fn metadata_path_for(&self, metadata: &SessionMetadata) -> PathBuf {
+        if matches!(metadata.status, SessionStatus::Archived) {
+            self.root
+                .join(ARCHIVED_SUBDIR)
+                .join(&metadata.session_id)
+                .join("metadata.json")
+        } else {
+            self.session_dir(&metadata.session_id).join("metadata.json")
+        }
     }
 
     /// Move a session out of the live root into `archived/<id>/` and flip
@@ -571,7 +826,7 @@ impl SessionStore {
             if metadata.ended_at_ms.is_none() {
                 metadata.ended_at_ms = Some(stamp);
             }
-            let _ = write_json(&metadata_path, &metadata);
+            let _ = self.write_metadata_file(&dest, &metadata);
             Self::record_global_index(&metadata);
         }
         Ok(())
@@ -600,7 +855,7 @@ impl SessionStore {
         {
             metadata.status = SessionStatus::Completed;
             metadata.archived_at_ms = None;
-            let _ = write_json(&metadata_path, &metadata);
+            let _ = self.write_metadata_file(&dest, &metadata);
             Self::record_global_index(&metadata);
         }
         Ok(())
@@ -812,6 +1067,7 @@ impl SessionStore {
                     if dir.exists() {
                         fs::remove_dir_all(&dir)?;
                     }
+                    self.remove_session_index_entry(&metadata.session_id);
                     removed.push(metadata.session_id);
                     continue;
                 }
@@ -834,6 +1090,7 @@ impl SessionStore {
                     if dir.exists() {
                         fs::remove_dir_all(&dir)?;
                     }
+                    self.remove_session_index_entry(&metadata.session_id);
                     removed.push(metadata.session_id);
                 }
                 continue;
@@ -865,6 +1122,7 @@ impl SessionStore {
                         if dir.exists() {
                             fs::remove_dir_all(&dir)?;
                         }
+                        self.remove_session_index_entry(&metadata.session_id);
                         removed.push(metadata.session_id);
                     }
                 }
@@ -1214,7 +1472,7 @@ fn write_session_log_append(
         // branch and rewrite byte-identical metadata.json for the rest of the
         // session.
         if !*truncated {
-            update_metadata_file(dir, |metadata| {
+            update_metadata_file(store, dir, |metadata| {
                 metadata.status = SessionStatus::Truncated;
                 metadata.resume_available = false;
                 metadata.resume_unavailable_reason =
@@ -1283,11 +1541,15 @@ fn append_payload_once(
     Ok(written)
 }
 
-fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
+fn update_metadata_file(
+    store: &SessionStore,
+    dir: &Path,
+    update: impl FnOnce(&mut SessionMetadata),
+) -> Result<()> {
     let path = dir.join("metadata.json");
     let mut metadata = read_session_metadata(&path)?;
     update(&mut metadata);
-    write_json(&path, &metadata)
+    store.write_metadata_file(dir, &metadata)
 }
 
 impl SessionHandle {
@@ -1331,7 +1593,7 @@ impl SessionHandle {
         }
         let mut metadata = self.metadata()?;
         update(&mut metadata);
-        write_json(&self.dir().join("metadata.json"), &metadata)
+        self.store.write_metadata_file(&self.dir(), &metadata)
     }
 
     /// Like [`Self::update_metadata`] but also refreshes the
@@ -1406,7 +1668,7 @@ impl SessionHandle {
         let dir = self.store.session_dir(&self.session_id);
         let prepare = || -> Result<()> {
             fs::create_dir_all(&dir)?;
-            write_json(&dir.join("metadata.json"), &pending.metadata)?;
+            self.store.write_metadata_file(&dir, &pending.metadata)?;
             write_json(
                 &dir.join("resume_state.json"),
                 &SessionResumeState {
@@ -1801,6 +2063,21 @@ pub struct GlobalSessionIndexEntry {
     #[serde(default)]
     pub turn_count: u64,
     pub resume_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIndexDiagnostics {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub indexed_sessions: usize,
+    pub schema_version: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SessionIndexRecord {
+    metadata: SessionMetadata,
+    modified_unix_nanos: u128,
 }
 
 impl GlobalSessionIndexEntry {
@@ -2669,13 +2946,15 @@ impl SessionQuery {
         }
         if let Some(query) = &self.query {
             let haystack = format!(
-                "{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 metadata.session_id,
                 metadata.cwd,
                 metadata.workspace_root,
                 metadata.repo_root.as_deref().unwrap_or(""),
                 metadata.first_user_task.as_deref().unwrap_or(""),
-                metadata.latest_summary.as_deref().unwrap_or("")
+                metadata.latest_summary.as_deref().unwrap_or(""),
+                metadata.display_name.as_deref().unwrap_or(""),
+                metadata.labels.join("\n")
             )
             .to_ascii_lowercase();
             return haystack.contains(&query.to_ascii_lowercase());
@@ -2775,6 +3054,94 @@ pub enum CleanupMode {
     /// skip the archive step; already-archived sessions named in `ids`
     /// are removed without waiting for archive retention.
     Purge,
+}
+
+fn open_session_index(path: &Path) -> Result<Database> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let initial = Database::create(path).map_err(crate::store_error)?;
+    match session_index_schema_version(&initial)? {
+        Some(SESSION_INDEX_SCHEMA_VERSION) => Ok(initial),
+        Some(on_disk_version) => {
+            drop(initial);
+            let backup = path.with_file_name(format!(
+                "session-index-schema-{on_disk_version}-{}.redb.bak",
+                now_ms()
+            ));
+            fs::rename(path, backup)?;
+            let database = Database::create(path).map_err(crate::store_error)?;
+            initialize_session_index(&database)?;
+            Ok(database)
+        }
+        None => {
+            initialize_session_index(&initial)?;
+            Ok(initial)
+        }
+    }
+}
+
+fn initialize_session_index(database: &Database) -> Result<()> {
+    let write = database.begin_write().map_err(crate::store_error)?;
+    {
+        let mut meta = write
+            .open_table(SESSION_INDEX_META)
+            .map_err(crate::store_error)?;
+        let encoded = crate::encode(&SESSION_INDEX_SCHEMA_VERSION)?;
+        meta.insert("schema_version", encoded.as_slice())
+            .map_err(crate::store_error)?;
+    }
+    write.commit().map_err(crate::store_error)
+}
+
+fn session_index_schema_version(database: &Database) -> Result<Option<u64>> {
+    let read = database.begin_read().map_err(crate::store_error)?;
+    let table = match read.open_table(SESSION_INDEX_META) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_session_index_json(&table, "schema_version")
+}
+
+fn session_index_root(database: &Database) -> Result<Option<String>> {
+    let read = database.begin_read().map_err(crate::store_error)?;
+    let table = match read.open_table(SESSION_INDEX_META) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_session_index_json(&table, "root")
+}
+
+fn session_index_records(database: &Database) -> Result<Vec<SessionIndexRecord>> {
+    let read = database.begin_read().map_err(crate::store_error)?;
+    let table = match read.open_table(SESSION_INDEX_METADATA) {
+        Ok(table) => table,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter().map_err(crate::store_error)? {
+        let (_, value) = entry.map_err(crate::store_error)?;
+        out.push(crate::decode(value.value())?);
+    }
+    Ok(out)
+}
+
+fn session_metadata_modified_unix_nanos(path: &Path) -> Option<u128> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|ts| ts.as_nanos())
+}
+
+fn read_session_index_json<T: DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<T>> {
+    let Some(value) = table.get(key).map_err(crate::store_error)? else {
+        return Ok(None);
+    };
+    crate::decode(value.value()).map(Some)
 }
 
 fn session_root(config: &AppConfig) -> PathBuf {

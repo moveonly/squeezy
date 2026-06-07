@@ -173,10 +173,12 @@ split graph `redb` database under the configured cache root
 receipt metadata, read snapshots, observations, and small session-side cache
 state. On a later session, unchanged files are hydrated from persisted
 partitions and skip tree-sitter parsing; changed or missing partitions are
-reparsed and written back. The graph store records a schema version plus
-workspace, crawl-policy, language-registry, and graph-format metadata. A schema
-mismatch backs up the old database and rebuilds fresh state instead of mutating
-unknown data in place.
+reparsed and written back. When the graph metadata and per-file fingerprints
+match, resolver exports/imports/supertypes and the import adjacency graph are
+also hydrated from `graph.redb` so cross-file resolver state survives process
+restart. The graph store records a schema version plus workspace, crawl-policy,
+language-registry, and graph-format metadata. A schema mismatch backs up the old
+database and rebuilds fresh state instead of mutating unknown data in place.
 
 Tree-sitter parse work is parallelized for batches of at least eight files. Each
 worker owns its own parser instance, and the final graph merge plus index rebuild
@@ -185,13 +187,13 @@ refreshes, including the common one- or two-file edit case, stay serial to avoid
 thread setup overhead.
 
 Graph build and refresh reports include duration, file counts, persisted
-partition hit/miss counts, reparsed byte counts, symbol/edge counts, and
-Rust/Python/JS/TS/supported/unsupported/unknown language distribution. Refresh
-reports also separate changed paths observed from events, changed paths
-discovered by polling, and unchanged event paths so file-watcher FP/FN behavior
-can be benchmarked without sending paths or source text. Telemetry callers use
-these reports for one-shot graph build events and repeated graph refresh events
-without sending paths or source text.
+partition hit/miss counts, resolver-cache hit/miss counts, reparsed byte counts,
+symbol/edge counts, and Rust/Python/JS/TS/supported/unsupported/unknown language
+distribution. Refresh reports also separate changed paths observed from events,
+changed paths discovered by polling, and unchanged event paths so file-watcher
+FP/FN behavior can be benchmarked without sending paths or source text.
+Telemetry callers use these reports for one-shot graph build events and repeated
+graph refresh events without sending paths or source text.
 
 ## Compiler Facts
 

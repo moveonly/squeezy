@@ -520,6 +520,14 @@ impl SemanticGraph {
     }
 
     pub fn from_parsed(files: Vec<ParsedFile>) -> Self {
+        Self::from_parsed_with_resolver_cache(files, None, &[]).0
+    }
+
+    fn from_parsed_with_resolver_cache(
+        files: Vec<ParsedFile>,
+        store: Option<&GraphStore>,
+        records: &[FileRecord],
+    ) -> (Self, ResolverCacheLoadReport) {
         let mut graph = Self::empty();
         graph.reserve_parsed_capacity(&files);
         for file in files {
@@ -528,9 +536,18 @@ impl SemanticGraph {
         graph.rebuild_java_project_facts();
         graph.rebuild_dotnet_project_facts();
         graph.rebuild_kotlin_project_facts();
-        graph.rebuild_semantic_edges();
+        let resolver_cache = load_resolver_cache(store, &mut graph, records).unwrap_or_else(|_| {
+            ResolverCacheLoadReport {
+                entries_loaded: 0,
+                entries_missed: records.len(),
+                import_graph_loaded: false,
+            }
+        });
+        graph.rebuild_semantic_edges_with_cached_resolver(
+            resolver_cache.entries_missed == 0 && resolver_cache.import_graph_loaded,
+        );
         graph.rebuild_indexes();
-        graph
+        (graph, resolver_cache)
     }
 
     fn reserve_parsed_capacity(&mut self, files: &[ParsedFile]) {
@@ -1612,6 +1629,13 @@ impl SemanticGraph {
     }
 
     fn rebuild_resolution_indexes(&mut self) {
+        self.rebuild_resolution_indexes_with_cached_resolver(false);
+    }
+
+    pub(crate) fn rebuild_resolution_indexes_with_cached_resolver(
+        &mut self,
+        resolver_loaded: bool,
+    ) {
         self.symbols_by_name.clear();
         self.children_by_parent.clear();
         self.arity_index.clear();
@@ -1654,8 +1678,10 @@ impl SemanticGraph {
             }
         }
 
-        self.rebuild_resolver_slots();
-        self.rebuild_importers_by_file();
+        if !resolver_loaded {
+            self.rebuild_resolver_slots();
+            self.rebuild_importers_by_file();
+        }
     }
 
     /// Populate per-file [`cross_file::ResolverSlot`] entries. The phased
@@ -1993,6 +2019,9 @@ pub struct GraphBuildReport {
     pub persisted_files_loaded: usize,
     pub persisted_files_missed: usize,
     pub persistence_rebuilt: bool,
+    pub resolver_entries_loaded: usize,
+    pub resolver_entries_missed: usize,
+    pub resolver_import_graph_loaded: bool,
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
@@ -2169,11 +2198,11 @@ impl GraphManager {
             }
             store.apply_graph_batch(&batch)?;
         }
-        let graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
+        let (graph, resolver_cache) = SemanticGraph::from_parsed_with_resolver_cache(
+            merge_parsed_by_snapshot_order(&snapshot.files, loaded.parsed, parsed_missed),
+            store.as_deref(),
             &snapshot.files,
-            loaded.parsed,
-            parsed_missed,
-        ));
+        );
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
             files_seen: snapshot.files.len(),
@@ -2186,6 +2215,9 @@ impl GraphManager {
             persisted_files_loaded: loaded.loaded_files,
             persisted_files_missed: loaded.missed_records.len(),
             persistence_rebuilt: loaded.rebuilt,
+            resolver_entries_loaded: resolver_cache.entries_loaded,
+            resolver_entries_missed: resolver_cache.entries_missed,
+            resolver_import_graph_loaded: resolver_cache.import_graph_loaded,
             excluded_files: snapshot.coverage.skipped_files,
             excluded_dirs: snapshot.coverage.skipped_dirs,
             excluded_bytes: snapshot.coverage.skipped_bytes,
@@ -2194,7 +2226,7 @@ impl GraphManager {
             language,
             stats: graph.stats(),
         };
-        Ok(Self {
+        let manager = Self {
             root,
             crawler,
             parser,
@@ -2206,7 +2238,11 @@ impl GraphManager {
             build_report,
             pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
             _watcher: None,
-        })
+        };
+        if let Some(store) = manager.store.as_deref() {
+            manager.persist_resolver_cache(store);
+        }
+        Ok(manager)
     }
 
     pub fn graph(&self) -> &SemanticGraph {
@@ -2275,6 +2311,7 @@ impl GraphManager {
     /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
     /// so persistence errors cannot poison the in-memory graph.
     fn persist_resolver_cache(&self, store: &GraphStore) {
+        let mut batch = GraphWriteBatch::new();
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2289,7 +2326,7 @@ impl GraphManager {
                 supertypes: slot.supertypes.clone(),
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
-            let _ = store.put_resolver_entry(file_id, &entry);
+            let _ = batch.upsert_resolver_entry(file_id, &entry);
         }
         let mut snapshot = resolver_cache::ResolverSnapshot::new();
         for (target, importers) in &self.graph.importers_by_file {
@@ -2297,7 +2334,10 @@ impl GraphManager {
                 snapshot.record_edge(importer, target);
             }
         }
-        let _ = store.put_import_graph(&snapshot);
+        let _ = batch.set_import_graph(&snapshot);
+        if !batch.is_empty() {
+            let _ = store.apply_graph_batch(&batch);
+        }
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -2600,6 +2640,78 @@ struct LoadedPartitions {
     missed_records: Vec<FileRecord>,
     loaded_files: usize,
     rebuilt: bool,
+}
+
+#[derive(Debug, Default)]
+struct ResolverCacheLoadReport {
+    entries_loaded: usize,
+    entries_missed: usize,
+    import_graph_loaded: bool,
+}
+
+fn load_resolver_cache(
+    store: Option<&GraphStore>,
+    graph: &mut SemanticGraph,
+    records: &[FileRecord],
+) -> Result<ResolverCacheLoadReport> {
+    let Some(store) = store else {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed: records.len(),
+            import_graph_loaded: false,
+        });
+    };
+    let ids = records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let entries = store.resolver_entries_for::<resolver_cache::ResolverFileEntry>(&ids)?;
+    let mut by_id = entries.into_iter().collect::<HashMap<_, _>>();
+    let mut report = ResolverCacheLoadReport::default();
+    for record in records {
+        let Some(entry) = by_id.remove(&record.id) else {
+            report.entries_missed += 1;
+            continue;
+        };
+        if entry.fingerprint.modified_unix_millis != record.modified_unix_millis
+            || entry.fingerprint.size_bytes != record.size_bytes
+        {
+            report.entries_missed += 1;
+            continue;
+        }
+        graph.resolver_slots.insert(
+            record.id.clone(),
+            cross_file::ResolverSlot {
+                exports: entry.exports,
+                imports: entry.imports,
+                supertypes: entry.supertypes,
+            },
+        );
+        report.entries_loaded += 1;
+    }
+    if report.entries_missed == 0
+        && let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()?
+    {
+        let known = graph.files.keys().cloned().collect::<HashSet<_>>();
+        let mut importers_by_file = HashMap::new();
+        for (target, importers) in snapshot.importers_by_file {
+            let target = FileId::new(target);
+            if !known.contains(&target) {
+                continue;
+            }
+            let importers = importers
+                .into_iter()
+                .map(FileId::new)
+                .filter(|id| known.contains(id) && id != &target)
+                .collect::<Vec<_>>();
+            if !importers.is_empty() {
+                importers_by_file.insert(target, importers);
+            }
+        }
+        graph.importers_by_file = importers_by_file;
+        report.import_graph_loaded = true;
+    }
+    Ok(report)
 }
 
 fn load_persisted_partitions(

@@ -787,6 +787,8 @@ fn persistent_graph_warm_start_skips_unchanged_parsing() {
     .unwrap();
     assert_eq!(second.build_report().parsed_files, 0);
     assert!(second.build_report().persisted_files_loaded > 0);
+    assert!(second.build_report().resolver_entries_loaded > 0);
+    assert!(second.build_report().resolver_import_graph_loaded);
     assert!(
         second
             .graph()

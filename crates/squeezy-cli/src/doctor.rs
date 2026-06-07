@@ -397,11 +397,30 @@ fn session_store_check(config: &AppConfig) -> Check {
     let store = SessionStore::open(config);
     let root = store.root().to_path_buf();
     match probe_writable(&root) {
-        Ok(()) => Check {
-            name: "session_store".to_string(),
-            status: Status::Ok,
-            detail: format!("writable: {}", root.display()),
-        },
+        Ok(()) => {
+            let index = store.session_index_diagnostics();
+            let index_detail = match index.error {
+                Some(error) => format!("metadata_index_error={error}"),
+                None if index.exists => format!(
+                    "metadata_index={} entries={} schema={}",
+                    index.path.display(),
+                    index.indexed_sessions,
+                    index
+                        .schema_version
+                        .map(|version| version.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
+                None => format!("metadata_index={} missing", index.path.display()),
+            };
+            Check {
+                name: "session_store".to_string(),
+                status: Status::Ok,
+                detail: format!(
+                    "writable JSON/JSONL logs: {}; {index_detail}",
+                    root.display()
+                ),
+            }
+        }
         Err(error) => Check {
             name: "session_store".to_string(),
             status: Status::Fail,
@@ -460,6 +479,40 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
         format_bytes(diagnostics.backup_total_bytes),
         diagnostics.cache_dir.display(),
     );
+    if let Some(stats) = diagnostics.state_stats.as_ref() {
+        if let Some(error) = &stats.error {
+            detail.push_str(&format!("; state_stats_error={error}"));
+        } else {
+            detail.push_str(&format!(
+                "; state schema={} receipts={} reads={} mcp_tools={} observations={} checkpoints={}",
+                stats
+                    .schema_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                stats.tool_receipts,
+                stats.read_snapshots,
+                stats.mcp_tool_cache_entries,
+                stats.observations,
+                stats.compaction_checkpoints,
+            ));
+        }
+    }
+    if let Some(stats) = diagnostics.graph_stats.as_ref() {
+        if let Some(error) = &stats.error {
+            detail.push_str(&format!("; graph_stats_error={error}"));
+        } else {
+            detail.push_str(&format!(
+                "; graph schema={} partitions={} resolver_entries={} import_graph={}",
+                stats
+                    .schema_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                stats.graph_partitions,
+                stats.resolver_entries,
+                stats.import_graph_present,
+            ));
+        }
+    }
     if diagnostics.state.size_bytes > STATE_CACHE_WARN_BYTES {
         status = Status::Warn;
         detail.push_str("; state.redb is unusually large");
