@@ -145,6 +145,43 @@ fn render_plan_card_does_not_abbreviate_plan_table_cells() {
 }
 
 #[test]
+fn render_plan_card_preserves_model_authored_diagram_spacing() {
+    let root = fresh_workspace("diagram");
+    let body = "\
+Actual Module Dependency Graph
+gctoolkit-api <- foundation; no outbound deps
+↑
+┌────┼────────────┐
+│    │            │
+gctoolkit-parser gctoolkit-vertx gctoolkit-sample gctoolkit-integration
+";
+    let (plan_id, path) =
+        proposed_plan::persist_plan(&root, TEST_SESSION, body, &PlanMeta::default())
+            .expect("persist plan");
+    let data = PlanCardData {
+        plan_id,
+        path,
+        parent_plan_id: None,
+    };
+
+    let rendered = render_plan_card(&data, Some(160))
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("│    │            │"),
+        "plan card should preserve diagram spacing: {rendered}"
+    );
+    assert!(
+        !rendered.contains("│ │ │"),
+        "plan card should not collapse diagram connector columns: {rendered}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn render_plan_card_emits_diff_when_parent_exists() {
     let root = fresh_workspace("diff_parent");
     let (parent_id, _) = proposed_plan::persist_plan(

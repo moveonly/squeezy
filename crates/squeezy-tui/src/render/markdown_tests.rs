@@ -135,6 +135,21 @@ fn markdown_full_preserves_table_cell_text() {
 }
 
 #[test]
+fn markdown_full_preserves_inline_code_spacing() {
+    let lines = render_markdown_full("Keep `│    │            │` aligned.");
+    let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+    assert!(
+        joined.contains("│    │            │"),
+        "full markdown must preserve model-authored inline code spacing: {joined}"
+    );
+    assert!(
+        !joined.contains("│ │ │"),
+        "full markdown must not collapse inline code connector spacing: {joined}"
+    );
+}
+
+#[test]
 fn markdown_keeps_four_column_tables_inside_eval_capture_width() {
     let source = "\
 | Surface | State | Problem | Confidence |

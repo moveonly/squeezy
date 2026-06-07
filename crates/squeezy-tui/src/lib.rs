@@ -7727,9 +7727,10 @@ fn split_spans_at_column(
 
 /// Wrap styled content to `width` cells, breaking at the last space inside each
 /// row when there is one (word wrap) and hard-breaking an over-long token
-/// otherwise. Unlike [`wrap_styled_words`] this preserves every character —
+/// otherwise. Unlike word-token wrapping this preserves every character —
 /// runs of spaces and JSON/code indentation survive — so it is the right tool
-/// for the mixed tool output shown in the transcript overlay.
+/// for model-authored answers and mixed tool output shown in the transcript
+/// overlay.
 fn wrap_cells_preserving(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
     let cells: Vec<(char, Style)> = spans
@@ -10863,7 +10864,7 @@ fn assistant_text_lines(
         for span in &mut line.spans {
             span.style = content_style.patch(span.style);
         }
-        for seg in wrap_styled_words(&line.spans, text_width) {
+        for seg in wrap_cells_preserving(&line.spans, text_width) {
             if first {
                 out.push(marker_head(seg));
                 first = false;
@@ -10880,69 +10881,6 @@ fn assistant_text_lines(
         out.push(marker_head(Vec::new()));
     }
     out
-}
-
-/// Greedy word-wrap a styled line to `width` display cells, preserving each
-/// span's style. Words longer than the width are hard-broken; runs of spaces
-/// collapse to one at a wrap point. A `usize::MAX` width returns the line as a
-/// single row (no wrapping). Width is measured in `char`s, matching the rest of
-/// the transcript layout.
-fn wrap_styled_words(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
-    let width = width.max(1);
-    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut word: Vec<(char, Style)> = Vec::new();
-    for span in spans {
-        for ch in span.content.chars() {
-            if ch == ' ' {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-            } else {
-                word.push((ch, span.style));
-            }
-        }
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    if words.is_empty() {
-        return vec![Vec::new()];
-    }
-
-    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut row: Vec<(char, Style)> = Vec::new();
-    let mut row_w = 0usize;
-    for word in words {
-        let wl = word.len();
-        if row_w != 0 && row_w + 1 + wl > width {
-            rows.push(std::mem::take(&mut row));
-            row_w = 0;
-        }
-        if row_w != 0 {
-            row.push((' ', Style::default()));
-            row_w += 1;
-        }
-        if wl <= width {
-            row.extend(word);
-            row_w += wl;
-        } else {
-            for cell in word {
-                if row_w >= width {
-                    rows.push(std::mem::take(&mut row));
-                    row_w = 0;
-                }
-                row.push(cell);
-                row_w += 1;
-            }
-        }
-    }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    if rows.is_empty() {
-        rows.push(Vec::new());
-    }
-    rows.into_iter().map(coalesce_cells_to_spans).collect()
 }
 
 /// Merge a row of per-`char` styled cells back into the fewest `Span`s, joining
