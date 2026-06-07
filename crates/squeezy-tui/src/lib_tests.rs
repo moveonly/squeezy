@@ -7859,8 +7859,10 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
     app.turn_visual = TurnVisualState::Running;
 
     let output = render_to_string(&app, 100, 12);
+    // The coin rides the horizon rule; the typed text and cursor float below.
     let coin = prompt_coin_frame(&app);
-    assert!(output.contains(&format!("{coin}  ship it┃")), "{output}");
+    assert!(output.contains(coin), "{output}");
+    assert!(output.contains("ship it┃"), "{output}");
 }
 
 #[test]
@@ -7876,14 +7878,16 @@ fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
     app.transcript.clear();
 
     app.animation_tick = 0;
-    let coin_first = prompt_coin_frame(&app);
     let first = render_to_string(&app, 100, 12);
     app.animation_tick = 8;
-    let coin_second = prompt_coin_frame(&app);
     let second = render_to_string(&app, 100, 12);
 
-    assert!(first.contains(&format!("{coin_first}  ┃")), "{first}");
-    assert!(second.contains(&format!("{coin_second}  ┃")), "{second}");
+    // Empty composer: the resting crescent rides the horizon and the cursor
+    // floats below. The coin itself is frozen, so the frames differ only
+    // because the live star spinner repaints between ticks.
+    let coin = prompt_coin_frame(&app);
+    assert!(first.contains(coin) && first.contains('┃'), "{first}");
+    assert!(second.contains(coin) && second.contains('┃'), "{second}");
     assert_ne!(
         first, second,
         "first-turn spinner frame should repaint before any assistant delta"
@@ -7897,9 +7901,10 @@ fn render_prompt_places_cursor_inside_input_text() {
     app.input_cursor = 2;
 
     let output = render_to_string(&app, 100, 12);
-    let coin = prompt_coin_frame(&app);
-    assert!(output.contains(&format!("{coin}  ab┃cd")), "{output}");
-    assert!(!output.contains(&format!("{coin}  abcd┃")), "{output}");
+    // The cursor splits the text where the caret sits; the coin rides the
+    // horizon rather than sitting inline with the text.
+    assert!(output.contains("ab┃cd"), "{output}");
+    assert!(!output.contains("abcd┃"), "{output}");
 }
 
 #[test]
@@ -7967,14 +7972,17 @@ fn active_prompt_cursor_is_vertically_centered() {
 
     let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT, 80);
 
-    // Composer at min height: top rule + top pad + content + bottom pad = 4 rows.
+    // Composer at min height: horizon rule + top pad + content + bottom pad
+    // = 4 rows. The moon rides the horizon (row 0); the cursor floats
+    // vertically centered below it (row 2).
     assert_eq!(lines.len(), 4);
     let coin = prompt_coin_frame(&app);
     let has_coin = |line: &Line<'_>| line.spans.iter().any(|s| s.content.contains(coin));
-    assert!(!has_coin(&lines[0]), "{lines:?}");
-    assert!(!has_coin(&lines[1]), "{lines:?}");
-    assert!(has_coin(&lines[2]), "{lines:?}");
-    assert!(!has_coin(&lines[3]), "{lines:?}");
+    let has_cursor = |line: &Line<'_>| line.spans.iter().any(|s| s.content.as_ref() == "┃");
+    assert!(has_coin(&lines[0]) && !has_cursor(&lines[0]), "{lines:?}");
+    assert!(!has_coin(&lines[1]) && !has_cursor(&lines[1]), "{lines:?}");
+    assert!(has_cursor(&lines[2]) && !has_coin(&lines[2]), "{lines:?}");
+    assert!(!has_coin(&lines[3]) && !has_cursor(&lines[3]), "{lines:?}");
 }
 
 #[test]
@@ -15152,20 +15160,22 @@ fn rail_gallery_renders_a_full_turn() {
 }
 
 #[test]
-fn prompt_coin_iterates_full_moon_cycle_while_typing() {
+fn prompt_coin_waxes_smoothly_while_typing() {
     let mut app = test_app(SessionMode::Build);
-    // An empty composer rests on a steady crescent.
+    // An empty composer rests on the brand crescent.
     app.input.clear();
     assert_eq!(prompt_coin_frame(&app), "☽");
-    // Each character advances exactly one phase, walking the full lunar cycle.
-    // The live typing coin is not restricted to the sent prompt's half-moons.
+    // Each character advances one phase through a single circle-fill family —
+    // waxing to full, waning back, and wrapping smoothly (◑ → ◔) rather than
+    // snapping to a new moon — so the glyph never jumps in stroke weight.
     for (typed, expected) in [
-        (1usize, "◑"),
-        (2, "●"),
-        (3, "◐"),
-        (4, "☾"),
-        (5, "○"),
-        (6, "☽"),
+        (1usize, "◔"),
+        (2, "◑"),
+        (3, "◕"),
+        (4, "●"),
+        (5, "◕"),
+        (6, "◑"),
+        (7, "◔"),
     ] {
         set_input(&mut app, "x".repeat(typed));
         assert_eq!(

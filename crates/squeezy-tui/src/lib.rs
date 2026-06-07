@@ -13828,10 +13828,11 @@ fn assistant_static_span(color: Color) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
+    let frame = prompt_coin_frame(app);
     Span::styled(
-        prompt_coin_frame(app),
+        frame,
         Style::default()
-            .fg(crate::render::theme::accent())
+            .fg(prompt_coin_color(frame))
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -13839,10 +13840,28 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
     // The prompt coin is a typing indicator: it advances one moon phase per
     // character in the composer and never animates on a timer, so it only
-    // ever turns when you do — waxing as you add text, waning as you delete.
-    // The resting state (an empty composer) is a steady crescent.
-    const FRAMES: [&str; 6] = ["☽", "◑", "●", "◐", "☾", "○"];
-    FRAMES[app.input.chars().count() % FRAMES.len()]
+    // ever turns when you do. An empty composer rests on the brand crescent;
+    // the first keystroke begins a smooth waxing cycle through a single,
+    // consistent circle-fill family — so the glyph never jumps in stroke
+    // weight, size, or baseline the way the old mixed crescent/disc set did.
+    // It waxes to full and wanes back rather than snapping at the wrap, so
+    // the motion breathes instead of clunking.
+    let typed = app.input.chars().count();
+    if typed == 0 {
+        return "☽";
+    }
+    const CYCLE: [&str; 6] = ["◔", "◑", "◕", "●", "◕", "◑"];
+    CYCLE[(typed - 1) % CYCLE.len()]
+}
+
+fn prompt_coin_color(frame: &str) -> Color {
+    // A gentle glow: the moon lifts to the warm shimmer at full and rests on
+    // the steady accent through the rest of the cycle (and at the crescent).
+    if frame == "●" {
+        crate::render::theme::shimmer()
+    } else {
+        crate::render::theme::accent()
+    }
 }
 
 fn prompt_elapsed_ms(app: &TuiApp) -> u64 {
@@ -13951,12 +13970,12 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
 }
 
 fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    // The moon coin now rides the horizon rule (see `composer_horizon_line`),
+    // so the typed content floats beneath it at a steady gutter — every line,
+    // including the first, shares the same indent rather than reserving room
+    // for a coin prefix on line one.
     if app.input.is_empty() {
-        return vec![Line::from(vec![
-            prompt_coin_span(app),
-            Span::raw("  "),
-            prompt_cursor_span(),
-        ])];
+        return vec![Line::from(vec![Span::raw("   "), prompt_cursor_span()])];
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
@@ -13965,14 +13984,8 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let mut line_start = 0usize;
     parts
         .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = if index == 0 {
-                vec![prompt_coin_span(app), Span::raw("  ")]
-            } else {
-                vec![Span::raw("   ")]
-            };
-            let mut spans = prefix;
+        .map(|line| {
+            let mut spans = vec![Span::raw("   ")];
             let line_end = line_start + line.len();
             let style_text_at = |abs_offset: usize| -> Style {
                 if bang_range
@@ -14058,10 +14071,52 @@ fn push_styled_segments(
 fn prompt_input_lines(app: &TuiApp, height: u16, width: u16) -> Vec<Line<'static>> {
     let content = prompt_input_content_lines(app);
     let cursor_line = app.input[..input_cursor(app)].matches('\n').count();
-    composer_bubble_lines(content, cursor_line, height, width)
+    let horizon = composer_horizon_line(app, width as usize);
+    composer_bubble_lines(horizon, content, cursor_line, height, width)
+}
+
+fn composer_horizon_line(app: &TuiApp, width: usize) -> Line<'static> {
+    // "Moonrise": the coin rides the left end of the rule like a moon sitting
+    // on the horizon. The rule glows warm right under the moon, then
+    // dissolves to the right — first easing down the slate ramp from the
+    // accent toward the dim `quiet`, then thinning from a solid line through
+    // dashes to dots to nothing. Every glyph is light-weight box drawing, so
+    // the rule dissolves by colour and density without ever changing stroke
+    // weight; the composer opens with a glow at the cursor and fades into the
+    // dark sky.
+    let mut spans = Vec::with_capacity(width.max(1));
+    spans.push(prompt_coin_span(app));
+    let cells = width.saturating_sub(1);
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    for i in 0..cells {
+        let p = if cells <= 1 {
+            0.0
+        } else {
+            i as f32 / (cells - 1) as f32
+        };
+        let glyph = if p < 0.62 {
+            "─"
+        } else if p < 0.80 {
+            "╌"
+        } else if p < 0.92 {
+            "┈"
+        } else {
+            " "
+        };
+        if glyph == " " {
+            spans.push(Span::raw(" "));
+            continue;
+        }
+        // Hold the glow near the moon (p^1.4) before easing to the dim slate.
+        let color = blend_color(accent, quiet, p.powf(1.4));
+        spans.push(Span::styled(glyph, Style::default().fg(color)));
+    }
+    Line::from(spans)
 }
 
 fn composer_bubble_lines(
+    top_line: Line<'static>,
     content: Vec<Line<'static>>,
     cursor_line: usize,
     height: u16,
@@ -14072,14 +14127,11 @@ fn composer_bubble_lines(
     if width < 4 || height < 2 {
         return content;
     }
-    let amber = Style::default().fg(crate::render::theme::accent());
 
-    // Open layout: a single top rule with the typed content floating
+    // Open layout: the horizon rule on top with the typed content floating
     // underneath. No vertical sides or bottom rule — the latter added a
     // heavy extra divider below the cursor and made the composer feel boxed
     // in on the default terminal background.
-    let rule = Line::from(Span::styled("─".repeat(width), amber));
-
     let interior_rows = height.saturating_sub(1);
     let mut content = content;
     if content.len() > interior_rows {
@@ -14103,7 +14155,7 @@ fn composer_bubble_lines(
     let bot_pad = spare - top_pad;
 
     let mut lines = Vec::with_capacity(height);
-    lines.push(rule);
+    lines.push(top_line);
     for _ in 0..top_pad {
         lines.push(Line::from(""));
     }
