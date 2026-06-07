@@ -11145,6 +11145,16 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
     assert_eq!(test_stderr.capability, PermissionCapability::Compiler);
     assert!(!test_stderr.destructive);
 
+    // Redirecting noise to /dev/null is stderr/stdout suppression, not a
+    // destructive filesystem write.
+    let sonar_stderr_null = analyze_shell_command("sonar context list --json 2>/dev/null");
+    assert_eq!(sonar_stderr_null.capability, PermissionCapability::Shell);
+    assert!(!sonar_stderr_null.destructive);
+
+    let cargo_stdout_null = analyze_shell_command("cargo test >/dev/null");
+    assert_eq!(cargo_stdout_null.capability, PermissionCapability::Compiler);
+    assert!(!cargo_stdout_null.destructive);
+
     // Quoted `>` is not a redirect.
     let echo_arrow = analyze_shell_command("echo 'a>b'");
     assert!(!echo_arrow.destructive);
@@ -11157,6 +11167,46 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
     // `>&-` closes a fd; not a write.
     let close_fd = analyze_shell_command("cargo test 1>&-");
     assert!(!close_fd.destructive);
+
+    // Near misses still count as real file writes.
+    let dev_null_suffix = analyze_shell_command("echo hi >/dev/null.log");
+    assert_eq!(
+        dev_null_suffix.capability,
+        PermissionCapability::Destructive
+    );
+    assert!(dev_null_suffix.destructive);
+}
+
+#[test]
+fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
+    assert!(plan_mode_shell_command_is_read_only(
+        "sonar context guidelines get --languages java 2>/dev/null"
+    ));
+    assert!(plan_mode_shell_command_is_read_only("cargo fmt --check"));
+    assert!(plan_mode_shell_command_is_read_only(
+        "cargo test -p squeezy-agent"
+    ));
+    assert!(plan_mode_shell_command_is_read_only("git status --short"));
+    assert!(plan_mode_shell_command_is_read_only("git diff -- crates"));
+
+    assert!(!plan_mode_shell_command_is_read_only("cargo fmt"));
+    assert!(!plan_mode_shell_command_is_read_only("cargo clippy --fix"));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "git diff --output=/private/tmp/sqz-pr364-diff-output-check origin/main...HEAD"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "git diff --output diff.patch origin/main...HEAD"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only("git checkout -b x"));
+    assert!(!plan_mode_shell_command_is_read_only("git branch x"));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "echo $(touch created.txt)"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "cat <(touch created.txt)"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only("make test"));
+    assert!(!plan_mode_shell_command_is_read_only("node script.js"));
 }
 
 #[test]

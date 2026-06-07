@@ -51,6 +51,10 @@ police them — but stay consistent with them:
   elevation like `sudo`, destructive verbs, sensitive-path access) is denied or
   escalated before it reaches you.
 
+If the only reason you cannot return `allow` is one of these auto-approval
+boundaries, return `ask`, not `deny`. Use `deny` only when the action itself
+should not proceed.
+
 ## Risk taxonomy — judge against these
 
 Treat a request as high-risk (prefer `deny`, or `ask` when intent is plausible)

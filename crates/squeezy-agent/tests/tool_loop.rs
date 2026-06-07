@@ -250,7 +250,7 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
 }
 
 #[tokio::test]
-async fn plan_mode_advertises_only_read_only_tools() {
+async fn plan_mode_advertises_non_mutating_core_tools() {
     let root = temp_workspace("plan_tools");
     fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![
@@ -285,6 +285,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
             "grep",
             "read_file",
             "read_tool_output",
+            "shell",
             "decl_search",
             "definition_search",
             "diff_context",
@@ -1519,7 +1520,7 @@ async fn lazy_schema_loading_disabled_sends_full_schema_set_without_tools_index(
 }
 
 #[tokio::test]
-async fn plan_mode_refuses_disallowed_discoverable_schema_loads() {
+async fn plan_mode_allows_non_mutating_discoverable_schema_loads() {
     let root = temp_workspace("lazy_schema_plan_refusal");
     let provider = Arc::new(ScriptedProvider::new(vec![
         vec![
@@ -1556,10 +1557,9 @@ async fn plan_mode_refuses_disallowed_discoverable_schema_loads() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    assert!(!tool_names(&requests[1]).contains(&"webfetch"));
+    assert!(tool_names(&requests[1]).contains(&"webfetch"));
     let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].1["status"], "Denied");
-    assert_eq!(outputs[0].1["content"]["status"], "refused");
+    assert_eq!(outputs[0].1["status"], "Success");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1802,102 +1802,133 @@ async fn plan_mode_write_is_denied_without_approval_prompt() {
 }
 
 #[tokio::test]
-async fn plan_mode_denies_hidden_shell_verify_and_webfetch_without_approval() {
-    let cases = [
-        (
-            "shell_call",
-            "shell",
-            serde_json::json!({"command": "echo should-not-run", "description": "test shell"}),
-            "plan mode refuses shell",
-        ),
-        (
-            "git_call",
-            "shell",
-            serde_json::json!({"command": "git status", "description": "git status probe"}),
-            "plan mode refuses git",
-        ),
-        (
-            "verify_call",
-            "verify",
-            serde_json::json!({}),
-            "plan mode refuses compiler",
-        ),
-        (
-            "web_call",
-            "webfetch",
-            serde_json::json!({"url": "https://example.com"}),
-            "plan mode refuses network",
-        ),
-    ];
-
-    for (call_id, tool_name, arguments, expected_reason) in cases {
-        let root = temp_workspace(&format!("plan_denies_{tool_name}"));
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            vec![
-                Ok(LlmEvent::Started),
-                Ok(LlmEvent::ToolCall(LlmToolCall {
-                    call_id: call_id.to_string(),
-                    name: tool_name.to_string(),
-                    arguments,
-                })),
-                Ok(LlmEvent::Completed {
-                    response_id: Some("resp_tools".to_string()),
-                    cost: CostSnapshot::default(),
-                    stop_reason: None,
-                    reasoning_only_stop: false,
+async fn plan_mode_routes_non_mutating_shell_through_policy() {
+    let root = temp_workspace("plan_shell_policy");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "shell_call".to_string(),
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": "echo plan-mode-probe",
+                    "description": "test non-mutating shell",
                 }),
-            ],
-            vec![
-                Ok(LlmEvent::Started),
-                Ok(LlmEvent::TextDelta("denied".to_string())),
-                Ok(LlmEvent::Completed {
-                    response_id: Some("resp_final".to_string()),
-                    cost: CostSnapshot::default(),
-                    stop_reason: None,
-                    reasoning_only_stop: false,
-                }),
-            ],
-        ]));
-        let mut config = config_for(root.clone());
-        config.session_mode = SessionMode::Plan;
-        config.permissions.shell = PermissionMode::Allow;
-        config.permissions.web = PermissionMode::Allow;
-        let agent = Agent::new(config, provider.clone());
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("probed".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.shell = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
 
-        let mut approvals_seen = 0usize;
-        let mut rx = agent.start_turn(
-            format!("attempt hidden {tool_name}"),
-            CancellationToken::new(),
-        );
-        while let Some(event) = rx.recv().await {
-            if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
-                approvals_seen += 1;
-                decision_tx
-                    .send(ToolApprovalDecision::Approved)
-                    .expect("send approval");
-            }
+    let mut approvals_seen = 0usize;
+    let mut rx = agent.start_turn("probe in plan mode".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            approvals_seen += 1;
+            decision_tx
+                .send(ToolApprovalDecision::Approved)
+                .expect("send approval");
         }
-
-        assert_eq!(approvals_seen, 0, "{tool_name} should not prompt");
-        let requests = provider.requests();
-        assert!(
-            !tool_names(&requests[0]).contains(&tool_name),
-            "{tool_name} should not be advertised in plan mode",
-        );
-        let outputs = function_outputs(&requests[1]);
-        assert_eq!(outputs[0].0, call_id);
-        assert_eq!(outputs[0].1["status"], "Denied");
-        assert!(
-            outputs[0].1["content"]["error"]
-                .as_str()
-                .expect("denial reason")
-                .contains(expected_reason),
-            "{tool_name} denial should contain {expected_reason}: {:?}",
-            outputs[0].1
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
+
+    assert_eq!(approvals_seen, 0);
+    let requests = provider.requests();
+    assert!(
+        tool_names(&requests[0]).contains(&"shell"),
+        "shell should be advertised in plan mode"
+    );
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "shell_call");
+    assert_eq!(outputs[0].1["status"], "Success");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_mode_still_denies_destructive_shell_without_approval() {
+    let root = temp_workspace("plan_destructive_shell_denied");
+    let doomed = root.join("created.txt");
+    fs::write(&doomed, "keep\n").expect("write doomed fixture");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "rm_call".to_string(),
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": "rm -rf created.txt",
+                    "description": "destructive shell",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("denied".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.destructive = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut approvals_seen = 0usize;
+    let mut rx = agent.start_turn(
+        "destructive shell in plan mode".to_string(),
+        CancellationToken::new(),
+    );
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            approvals_seen += 1;
+            decision_tx
+                .send(ToolApprovalDecision::Approved)
+                .expect("send approval");
+        }
+    }
+
+    assert_eq!(approvals_seen, 0);
+    assert!(doomed.exists(), "destructive command must not execute");
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "rm_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    assert!(
+        outputs[0].1["content"]["error"]
+            .as_str()
+            .expect("denial reason")
+            .contains("plan mode refuses mutating or unproven shell command")
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

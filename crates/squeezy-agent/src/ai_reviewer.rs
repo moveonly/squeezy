@@ -367,6 +367,20 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
             AiReviewerOutcome::NoDecision { reason }
         }
         PermissionAction::Deny => {
+            if reviewer_denial_requests_human_escalation(&decision.reason) {
+                let reason = format!("AI reviewer escalated to human: {}", decision.reason);
+                {
+                    let mut state = input.state.lock().expect("ai reviewer state");
+                    state.record_non_denial(input.turn_id);
+                    state.record_audit(
+                        input.turn_id,
+                        input.request,
+                        ReviewerAuditVerdict::NoDecision,
+                        &reason,
+                    );
+                }
+                return reviewer_result(AiReviewerOutcome::NoDecision { reason });
+            }
             let tripped = {
                 let mut state = input.state.lock().expect("ai reviewer state");
                 state.record_denial(input.turn_id)
@@ -400,6 +414,20 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
             })
         }
     })
+}
+
+fn reviewer_denial_requests_human_escalation(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    (lower.contains("escalat") && lower.contains("human"))
+        || lower.contains("reach a human")
+        || lower.contains("route to a human")
+        || lower.contains("ask the human")
+        || lower.contains("must ask")
+        || lower.contains("never auto-approved")
+        || lower.contains("not auto-approved")
+        || lower.contains("cannot auto-approve")
+        || lower.contains("can't auto-approve")
+        || lower.contains("must not auto-approve")
 }
 
 async fn collect_reviewer_text(

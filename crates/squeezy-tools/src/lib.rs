@@ -128,6 +128,7 @@ pub(crate) use shell::{
 use shell_output::insert_content_field;
 #[cfg(test)]
 use shell_output::shape_shell_output;
+pub use shell_parse::plan_mode_shell_command_is_read_only;
 use shell_parse::{analyze_shell_command, extract_shell_write_targets};
 #[cfg(test)]
 use shell_parse::{shell_coverage_warnings, shell_segments};

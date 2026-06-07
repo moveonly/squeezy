@@ -104,6 +104,12 @@ fn pre_classify_shell_falls_through_on_sonar_cli() {
 }
 
 #[test]
+fn pre_classify_shell_falls_through_on_sonar_cli_with_dev_null_redirect() {
+    let result = pre_classify_shell("sonar context list --json 2>/dev/null", &sandbox());
+    assert_eq!(result, ShellPreClassification::AskAi);
+}
+
+#[test]
 fn pre_classify_shell_names_redirect_instead_of_first_token() {
     let result = pre_classify_shell("sonar context list > report.json", &sandbox());
     match result {

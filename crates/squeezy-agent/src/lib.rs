@@ -61,8 +61,8 @@ use squeezy_tools::{
     ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback,
     ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions, ToolOutputConfig,
     ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec,
-    ToolStatus, WebToolConfig, pre_classify_shell, sha256_hex,
-    shell_best_effort_fallback_from_result,
+    ToolStatus, WebToolConfig, plan_mode_shell_command_is_read_only, pre_classify_shell,
+    sha256_hex, shell_best_effort_fallback_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -15186,10 +15186,24 @@ pub(crate) fn mode_permission_verdict(
         (SessionMode::Plan, PermissionCapability::Edit)
     ) && active_plan_path
         .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
-    if !mode_refuses_capability(mode, request.capability, plan_edit_allowed) {
+    if !mode_refuses_request(mode, request, plan_edit_allowed) {
         return None;
     }
-    let reason = if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
+    let reason = if mode == SessionMode::Plan
+        && request.tool_name == "shell"
+        && matches!(
+            request.capability,
+            PermissionCapability::Shell
+                | PermissionCapability::Git
+                | PermissionCapability::Compiler
+                | PermissionCapability::Edit
+                | PermissionCapability::Destructive
+        ) {
+        format!(
+            "{} mode refuses mutating or unproven shell command",
+            mode.as_str()
+        )
+    } else if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
         match active_plan_path {
             Some(active) => format!(
                 "Plan mode: only the active plan file is editable ({}); requested target was {}",
@@ -15217,14 +15231,43 @@ pub(crate) fn mode_permission_verdict(
     })
 }
 
+fn mode_refuses_request(
+    mode: SessionMode,
+    request: &PermissionRequest,
+    plan_edit_allowed: bool,
+) -> bool {
+    if mode == SessionMode::Plan && request.tool_name == "shell" {
+        if matches!(
+            request.capability,
+            PermissionCapability::Destructive | PermissionCapability::Edit
+        ) {
+            return true;
+        }
+        if matches!(
+            request.capability,
+            PermissionCapability::Shell
+                | PermissionCapability::Git
+                | PermissionCapability::Compiler
+        ) {
+            let Some(command) = request.metadata.get("command") else {
+                return true;
+            };
+            return !plan_mode_shell_command_is_read_only(command);
+        }
+    }
+    mode_refuses_capability(mode, request.capability, plan_edit_allowed)
+}
+
 /// Single source of truth for whether a session mode forbids a capability.
-/// Plan mode allows Read, Search, and (when `plan_edit_allowed` is true)
-/// Edit; Build mode allows everything (the configured `PermissionPolicy`
-/// still applies). The capability list is intentionally exhaustive
-/// (`match`) so adding a new capability is a compile-time prompt to
-/// decide whether plan mode admits it. `plan_edit_allowed` is computed
-/// by `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites
-/// and by `plan_mode::is_active_plan_path` at runtime (issue 2).
+/// Plan mode is mutation-gated, not shell-gated. This capability-only filter
+/// is used for schema advertisement; [`mode_refuses_request`] adds command-level
+/// shell checks at runtime so broad Git/Compiler/Shell capabilities cannot run
+/// repo-mutating commands just because the default policy allows them. The
+/// capability list is intentionally exhaustive (`match`) so adding a new
+/// capability is a compile-time prompt to decide whether plan mode admits it.
+/// `plan_edit_allowed` is computed by
+/// `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites and by
+/// `plan_mode::is_active_plan_path` at runtime (issue 2).
 fn mode_refuses_capability(
     mode: SessionMode,
     capability: PermissionCapability,
@@ -15234,14 +15277,15 @@ fn mode_refuses_capability(
         return false;
     }
     match capability {
-        PermissionCapability::Read | PermissionCapability::Search => false,
-        PermissionCapability::Edit => !plan_edit_allowed,
-        PermissionCapability::Shell
+        PermissionCapability::Read
+        | PermissionCapability::Search
+        | PermissionCapability::Shell
         | PermissionCapability::Git
         | PermissionCapability::Network
         | PermissionCapability::Mcp
-        | PermissionCapability::Compiler
-        | PermissionCapability::Destructive => true,
+        | PermissionCapability::Compiler => false,
+        PermissionCapability::Edit => !plan_edit_allowed,
+        PermissionCapability::Destructive => true,
     }
 }
 

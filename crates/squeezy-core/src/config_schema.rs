@@ -1752,7 +1752,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_session_mode,
                 default_display: "build",
                 default: || FieldValue::Enum("build"),
-                help: "Build mode runs tools freely; Plan mode is read-only and emits a structured plan.",
+                help: "Build mode runs tools freely; Plan mode allows non-mutating exploration and emits a structured plan.",
                 env_override: Some("SQUEEZY_SESSION_MODE"),
                 secret: false,
             },

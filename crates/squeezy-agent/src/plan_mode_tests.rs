@@ -109,8 +109,12 @@ fn plan_mode_instructs_exploration_before_questions() {
     // anything. The prompt must explicitly steer toward exploration
     // first.
     assert!(
-        PLAN_MODE_INSTRUCTIONS.contains("Read/Search"),
-        "PLAN_MODE_INSTRUCTIONS must mention the Read/Search exploration pass"
+        PLAN_MODE_INSTRUCTIONS.contains("targeted exploration pass"),
+        "PLAN_MODE_INSTRUCTIONS must mention the exploration pass"
+    );
+    assert!(
+        PLAN_MODE_INSTRUCTIONS.contains("read-only shell/git commands"),
+        "PLAN_MODE_INSTRUCTIONS must allow non-mutating shell/git probes"
     );
 }
 

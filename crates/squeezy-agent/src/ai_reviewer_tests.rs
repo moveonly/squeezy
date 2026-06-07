@@ -138,6 +138,19 @@ fn parse_reviewer_json_inside_text() {
 }
 
 #[test]
+fn reviewer_denial_escalation_language_routes_to_human() {
+    assert!(reviewer_denial_requests_human_escalation(
+        "destructive capability requests are never auto-approved per policy; must escalate to human"
+    ));
+    assert!(reviewer_denial_requests_human_escalation(
+        "cannot auto-approve high-risk network; route to a human"
+    ));
+    assert!(!reviewer_denial_requests_human_escalation(
+        "command deletes files outside the requested scope"
+    ));
+}
+
+#[test]
 fn circuit_trips_after_consecutive_denials() {
     let mut state = AiReviewerState::default();
     assert!(state.record_denial(TurnId::new(7)).is_none());

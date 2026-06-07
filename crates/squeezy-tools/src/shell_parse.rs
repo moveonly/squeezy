@@ -1091,7 +1091,8 @@ pub(crate) fn is_safe_metadata_write_segment(segment: &str) -> bool {
 
 /// Detects shell output redirects that write to a filename (`>`, `>>`, `>|`,
 /// `&>`, `&>>`, `<>`), while ignoring file-descriptor duplications like
-/// `2>&1`, `>&-`, and any `>` that appears inside single or double quotes.
+/// `2>&1`, `>&-`, harmless redirects to `/dev/null`, and any `>` that appears
+/// inside single or double quotes.
 fn shell_segment_has_destructive_redirect(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     let mut i = 0usize;
@@ -1147,6 +1148,10 @@ fn shell_segment_has_destructive_redirect(segment: &str) -> bool {
                         continue;
                     }
                 }
+                if redirect_target_is_dev_null(bytes, j) {
+                    i = j + "/dev/null".len();
+                    continue;
+                }
                 return true;
             }
             _ => {
@@ -1155,6 +1160,17 @@ fn shell_segment_has_destructive_redirect(segment: &str) -> bool {
         }
     }
     false
+}
+
+fn redirect_target_is_dev_null(bytes: &[u8], start: usize) -> bool {
+    let target = b"/dev/null";
+    if !bytes[start..].starts_with(target) {
+        return false;
+    }
+    let end = start + target.len();
+    bytes
+        .get(end)
+        .is_none_or(|next| next.is_ascii_whitespace() || matches!(*next, b'|' | b'&' | b';'))
 }
 
 /// Recognises the destructive git command families we want to surface
@@ -1287,16 +1303,128 @@ fn is_git_shell_segment(segment: &str) -> bool {
 }
 
 fn is_git_read_only_segment(segment: &str) -> bool {
+    is_plan_mode_read_only_git_segment(segment)
+}
+
+fn is_plan_mode_read_only_git_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    if tokens.first().map(String::as_str) != Some("git") {
+        return false;
+    }
+    match tokens.get(1).map(|token| dequote_token(token)) {
+        Some("status") => git_args_have_no_write_flags(&tokens[2..]),
+        Some("diff" | "log" | "show") => git_args_are_safe_read_only(&tokens[2..]),
+        Some("branch") => tokens.iter().skip(2).all(|token| {
+            matches!(
+                dequote_token(token),
+                "-a" | "--all"
+                    | "-r"
+                    | "--remotes"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "--list"
+                    | "--show-current"
+                    | "--contains"
+                    | "--merged"
+                    | "--no-merged"
+                    | "--color"
+                    | "--no-color"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn git_args_are_safe_read_only(args: &[String]) -> bool {
+    args.iter()
+        .map(|arg| dequote_token(arg))
+        .all(|arg| !git_arg_writes_output(arg))
+}
+
+fn git_args_have_no_write_flags(args: &[String]) -> bool {
+    args.iter()
+        .map(|arg| dequote_token(arg))
+        .all(|arg| !git_arg_writes_output(arg))
+}
+
+fn git_arg_writes_output(arg: &str) -> bool {
+    matches!(arg, "--output" | "-o") || arg.starts_with("--output=")
+}
+
+fn is_plan_mode_read_only_compiler_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    let Some(first) = tokens.first().map(|token| dequote_token(token)) else {
+        return false;
+    };
+    match first {
+        "cargo" => match tokens.get(1).map(|token| dequote_token(token)) {
+            Some("test" | "nextest" | "check" | "build") => true,
+            Some("clippy") => !tokens
+                .iter()
+                .skip(2)
+                .any(|token| matches!(dequote_token(token), "--fix")),
+            Some("fmt") => tokens
+                .iter()
+                .skip(2)
+                .any(|token| matches!(dequote_token(token), "--check")),
+            _ => false,
+        },
+        "rustc" => true,
+        _ => false,
+    }
+}
+
+fn is_sonar_context_read_only_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
     matches!(
-        shell_command_prefix(segment).as_str(),
-        "git status" | "git diff" | "git log" | "git show" | "git branch"
+        (
+            tokens.first().map(|token| dequote_token(token)),
+            tokens.get(1).map(|token| dequote_token(token))
+        ),
+        (Some("sonar"), Some("context"))
     )
+}
+
+fn is_plan_mode_read_only_shell_segment(segment: &str) -> bool {
+    is_read_only_shell_segment(segment)
+        || is_sonar_context_read_only_segment(segment)
+        || is_plan_mode_read_only_git_segment(segment)
+        || is_plan_mode_read_only_compiler_segment(segment)
+}
+
+/// Returns true when every command segment is known not to mutate repository
+/// files. Build/test probes may still write normal compiler artifacts.
+pub fn plan_mode_shell_command_is_read_only(command: &str) -> bool {
+    let normalized = collapse_whitespace(command);
+    let Some(parsed) = parse_shell_command(&normalized) else {
+        return false;
+    };
+    if parsed.dynamic {
+        return false;
+    }
+    let segments = expand_wrapper_segments(parsed.segments);
+    !segments.is_empty()
+        && !shell_segment_has_destructive_redirect(&normalized)
+        && segments
+            .iter()
+            .all(|segment| is_plan_mode_read_only_shell_segment(segment))
 }
 
 pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
     matches!(
         shell_command_prefix(segment).as_str(),
-        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "grep" | "rg"
+        "ls" | "pwd"
+            | "echo"
+            | "cat"
+            | "head"
+            | "tail"
+            | "wc"
+            | "file"
+            | "stat"
+            | "du"
+            | "grep"
+            | "rg"
     )
 }
 
