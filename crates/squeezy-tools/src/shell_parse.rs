@@ -1312,7 +1312,8 @@ fn is_plan_mode_read_only_git_segment(segment: &str) -> bool {
         return false;
     }
     match tokens.get(1).map(|token| dequote_token(token)) {
-        Some("status" | "diff" | "log" | "show") => true,
+        Some("status") => git_args_have_no_write_flags(&tokens[2..]),
+        Some("diff" | "log" | "show") => git_args_are_safe_read_only(&tokens[2..]),
         Some("branch") => tokens.iter().skip(2).all(|token| {
             matches!(
                 dequote_token(token),
@@ -1333,6 +1334,22 @@ fn is_plan_mode_read_only_git_segment(segment: &str) -> bool {
         }),
         _ => false,
     }
+}
+
+fn git_args_are_safe_read_only(args: &[String]) -> bool {
+    args.iter()
+        .map(|arg| dequote_token(arg))
+        .all(|arg| !git_arg_writes_output(arg))
+}
+
+fn git_args_have_no_write_flags(args: &[String]) -> bool {
+    args.iter()
+        .map(|arg| dequote_token(arg))
+        .all(|arg| !git_arg_writes_output(arg))
+}
+
+fn git_arg_writes_output(arg: &str) -> bool {
+    matches!(arg, "--output" | "-o") || arg.starts_with("--output=")
 }
 
 fn is_plan_mode_read_only_compiler_segment(segment: &str) -> bool {
@@ -1380,7 +1397,13 @@ fn is_plan_mode_read_only_shell_segment(segment: &str) -> bool {
 /// files. Build/test probes may still write normal compiler artifacts.
 pub fn plan_mode_shell_command_is_read_only(command: &str) -> bool {
     let normalized = collapse_whitespace(command);
-    let segments = expand_wrapper_segments(shell_segments(&normalized));
+    let Some(parsed) = parse_shell_command(&normalized) else {
+        return false;
+    };
+    if parsed.dynamic {
+        return false;
+    }
+    let segments = expand_wrapper_segments(parsed.segments);
     !segments.is_empty()
         && !shell_segment_has_destructive_redirect(&normalized)
         && segments

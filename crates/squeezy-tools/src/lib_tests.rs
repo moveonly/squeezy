@@ -11191,8 +11191,20 @@ fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
 
     assert!(!plan_mode_shell_command_is_read_only("cargo fmt"));
     assert!(!plan_mode_shell_command_is_read_only("cargo clippy --fix"));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "git diff --output=/private/tmp/sqz-pr364-diff-output-check origin/main...HEAD"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "git diff --output diff.patch origin/main...HEAD"
+    ));
     assert!(!plan_mode_shell_command_is_read_only("git checkout -b x"));
     assert!(!plan_mode_shell_command_is_read_only("git branch x"));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "echo $(touch created.txt)"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "cat <(touch created.txt)"
+    ));
     assert!(!plan_mode_shell_command_is_read_only("make test"));
     assert!(!plan_mode_shell_command_is_read_only("node script.js"));
 }

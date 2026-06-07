@@ -4711,8 +4711,13 @@ fn plan_mode_shell_requests_must_be_proven_read_only() {
     for (command, capability) in [
         ("cargo fmt", PermissionCapability::Compiler),
         ("cargo clippy --fix", PermissionCapability::Compiler),
+        (
+            "git diff --output=/private/tmp/sqz-pr364-diff-output-check origin/main...HEAD",
+            PermissionCapability::Git,
+        ),
         ("git checkout -b x", PermissionCapability::Git),
         ("git branch x", PermissionCapability::Git),
+        ("echo $(touch created.txt)", PermissionCapability::Shell),
         ("node script.js", PermissionCapability::Shell),
     ] {
         let request = shell_permission_request(command, capability, PermissionRisk::High);
