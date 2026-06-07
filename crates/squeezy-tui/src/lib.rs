@@ -205,6 +205,17 @@ const ENABLE_MOUSE_DRAG_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
+/// Startup variant of [`CLEAR_SCROLLBACK_AND_VISIBLE`]: resets the scroll
+/// region (`ESC[r`) and SGR (`ESC[0m`), homes the cursor, and clears the
+/// *visible* screen (`ESC[2J`) — but deliberately OMITS the `ESC[3J`
+/// scrollback purge. Inline mode's whole premise is that the conversation
+/// lives in the terminal's native scrollback; nuking scrollback on launch
+/// throws away whatever the user had in their terminal before starting
+/// Squeezy. Strict xterm.js (the VS Code integrated terminal) honours
+/// `ESC[3J` literally, so the old sequence wiped real history there
+/// (cf. openai/codex#14277). The explicit `/clear` command and the Drop
+/// teardown still use the scrollback-purging form, matching `clear(1)`.
+const RESET_AND_CLEAR_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
 /// DEC private mode 2026 — Begin Synchronized Update. Capable terminals
 /// buffer subsequent output and flip the cell grid atomically when they
@@ -18023,7 +18034,7 @@ impl TerminalGuard {
         // alt-screen swaps, handled by `sync_overlay_screen`.
         execute!(
             writer,
-            Print(CLEAR_SCROLLBACK_AND_VISIBLE),
+            Print(RESET_AND_CLEAR_VISIBLE),
             Print(DISABLE_MOUSE_MODES),
             DisableAlternateScroll,
             EnableBracketedPaste,
@@ -18133,54 +18144,71 @@ impl TerminalGuard {
             self.clear_scrollback_and_visible()?;
             app.terminal_clear_pending = false;
         }
-        if !use_fullscreen_render {
-            self.flush_history(app)?;
-        }
         let synchronized = self.synchronized_output && !overlay_frame;
-        let flushed_turn_divider_generation = self.turn_divider_flushed_generation;
-        let terminal = self.term();
-        // DEC 2026 Begin Synchronized Update bracket. Writing it through
-        // the backend buffer puts it ahead of the cell-diff bytes that
-        // `terminal.draw` is about to emit; capable terminals start
-        // buffering at parse time and commit the whole frame when they
-        // see the matching End Synchronized Update written below.
-        // Unsupported terminals silently ignore both sequences.
+        // DEC 2026 Begin Synchronized Update bracket — opened BEFORE
+        // `flush_history` so the `insert_before` scroll-into-scrollback AND
+        // the viewport repaint are committed as one atomic frame on capable
+        // terminals. Previously the bracket wrapped only `terminal.draw`, so
+        // the most flicker-prone step — the history flush, which scrolls the
+        // region and redraws — was emitted as an unsynchronized pre-frame and
+        // its intermediate states were visible (notably on the VS Code
+        // terminal once it gained mode-2026 support). Writing the sequence
+        // through the backend buffer puts it ahead of the flush + cell-diff
+        // bytes; unsupported terminals silently ignore both sequences.
         let begin_outcome = if synchronized {
-            terminal
+            self.term()
                 .backend_mut()
                 .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))
         } else {
             Ok(())
         };
-        // `terminal.draw` returns a value that borrows the terminal,
-        // which would block the post-draw `backend_mut` reborrow below.
-        // Collapse to `Result<(), io::Error>` immediately so the borrow
-        // ends before we reach for the backend again.
-        let draw_outcome: io::Result<()> = if let Err(err) = begin_outcome {
-            Err(err)
-        } else if use_fullscreen_render {
-            terminal.draw(|frame| render(frame, app)).map(|_| ())
-        } else {
-            terminal
-                .draw(|frame| render_inline(frame, app, flushed_turn_divider_generation))
-                .map(|_| ())
+        // Flush finished transcript into scrollback (inside the bracket), then
+        // repaint the viewport. We do NOT early-return on a flush error so the
+        // ESU below always runs and the terminal never stays parked in a
+        // buffered-update state.
+        let draw_outcome: Result<()> = match begin_outcome {
+            Err(err) => Err(err),
+            Ok(()) => {
+                let flush_outcome = if use_fullscreen_render {
+                    Ok(())
+                } else {
+                    self.flush_history(app)
+                };
+                match flush_outcome {
+                    Err(err) => Err(err),
+                    Ok(()) => {
+                        // Read AFTER `flush_history` so the divider generation
+                        // reflects what the flush just committed.
+                        let flushed_turn_divider_generation =
+                            self.turn_divider_flushed_generation;
+                        let terminal = self.term();
+                        let drawn = if use_fullscreen_render {
+                            terminal.draw(|frame| render(frame, app))
+                        } else {
+                            terminal.draw(|frame| {
+                                render_inline(frame, app, flushed_turn_divider_generation)
+                            })
+                        };
+                        drawn
+                            .map(|_| ())
+                            .map_err(|err| SqueezyError::Terminal(err.to_string()))
+                    }
+                }
+            }
         };
-        // Always emit ESU (even when draw fails) so the terminal does
-        // not stay parked in a buffered-update state — the spec lets a
-        // capable terminal time the bracket out on its own, but closing
-        // it promptly keeps the visible frame in sync with our state.
-        let end_outcome = if synchronized {
-            let backend = terminal.backend_mut();
+        // Always emit ESU (even when the flush or draw failed) so the terminal
+        // does not stay parked in a buffered-update state.
+        let end_outcome: Result<()> = if synchronized {
+            let backend = self.term().backend_mut();
             backend
                 .write_all(END_SYNCHRONIZED_UPDATE.as_bytes())
                 .and_then(|()| backend.flush())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))
         } else {
             Ok(())
         };
-        match draw_outcome.and(end_outcome) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(SqueezyError::Terminal(err.to_string())),
-        }
+        draw_outcome.and(end_outcome)
     }
 
     /// Reconcile the alt-screen-for-overlay swap state with the
