@@ -616,11 +616,7 @@ pub struct RepoRecommendation {
 pub fn default_repo_registry_path() -> PathBuf {
     env::var_os("SQUEEZY_REPOS_PATH")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".squeezy/repos.toml"))
-        })
+        .or_else(|| fs_util::user_squeezy_dir().map(|dir| dir.join("repos.toml")))
         .unwrap_or_else(|| PathBuf::from(".squeezy/repos.toml"))
 }
 
