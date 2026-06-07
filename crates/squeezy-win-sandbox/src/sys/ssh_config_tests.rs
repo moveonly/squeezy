@@ -54,7 +54,7 @@ fn none_home_returns_empty() {
 fn missing_config_returns_config_path_only() {
     let tmp = make_temp_dir("missing");
     let home = tmp.join("home");
-    // Don't create .ssh/config -- just the home dir.
+    // Don't create .ssh/config — just the home dir.
     fs::create_dir_all(&home).expect("create home");
 
     let result = ssh_config_dependency_paths(Some(&home));

@@ -2,8 +2,8 @@ use super::resolve_deny_read_paths;
 use std::fs;
 use std::path::PathBuf;
 
-/// Create a unique temporary directory under `std::env::temp_dir()` and return
-/// its path. The caller is responsible for cleanup.
+/// Create a unique temporary directory under `std::env::temp_dir()` and
+/// return its path.  The caller is responsible for cleanup.
 fn make_temp_dir(suffix: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!(
         "squeezy_deny_read_test_{suffix}_{pid}",
