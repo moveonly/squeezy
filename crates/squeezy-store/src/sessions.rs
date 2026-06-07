@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -1302,6 +1301,7 @@ fn lock_append_path(path: &Path) -> std::io::Result<fs::File> {
     }
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(lock_path)?;
     lock.lock_exclusive()?;
