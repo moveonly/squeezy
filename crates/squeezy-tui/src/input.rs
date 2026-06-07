@@ -352,12 +352,8 @@ impl SlashCommand {
         matches!(self.name, "/attach" | "/help" | "/plan" | "/build")
     }
 
-    pub(crate) fn visible_with_checkpoints(&self, checkpoints_enabled: bool) -> bool {
-        checkpoints_enabled
-            || !matches!(
-                self.name,
-                "/checkpoints" | "/checkpoint" | "/undo" | "/revert-turn"
-            )
+    pub(crate) fn visible_with_checkpoints(&self, _checkpoints_enabled: bool) -> bool {
+        true
     }
 
     /// Short label used in the slash menu badge, e.g. `net`, `read`, `edit`.

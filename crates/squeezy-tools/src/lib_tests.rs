@@ -9040,7 +9040,9 @@ fn tool_specs_are_sorted_by_name() {
     assert_eq!(
         checkpoint_names,
         vec![
+            "checkpoint_check",
             "checkpoint_list",
+            "checkpoint_restore_file",
             "checkpoint_revert",
             "checkpoint_show",
             "checkpoint_undo"

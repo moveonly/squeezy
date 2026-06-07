@@ -70,10 +70,28 @@ pub struct CheckpointStore {
     git_dir: PathBuf,
     journal_path: PathBuf,
     lock_path: PathBuf,
+    options: CheckpointStoreOptions,
     /// OS-advisory lock held for the lifetime of the store. Dropping the
     /// [`File`] releases the lock; the [`Drop`] impl also unlinks
     /// [`Self::lock_path`] so a fresh process sees a clean directory.
     _lock: Option<File>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointStoreOptions {
+    pub retention_days: u64,
+    pub max_file_bytes: u64,
+    pub cleanup_interval_secs: u64,
+}
+
+impl Default for CheckpointStoreOptions {
+    fn default() -> Self {
+        Self {
+            retention_days: DEFAULT_CHECKPOINT_RETENTION_DAYS,
+            max_file_bytes: DEFAULT_MAX_CHECKPOINT_FILE_BYTES,
+            cleanup_interval_secs: 60 * 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +308,8 @@ pub struct PatchOpPreview {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointJournal {
     pub checkpoints: Vec<CheckpointRecord>,
+    #[serde(default)]
+    pub rollbacks: Vec<RollbackJournalRecord>,
     pub journal_warnings: u64,
 }
 
@@ -303,6 +323,29 @@ pub struct RollbackResult {
     pub conflicts: Vec<RollbackConflict>,
     pub skipped: bool,
     pub applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackJournalRecord {
+    pub created_at_ms: u128,
+    pub result: RollbackResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointIntegrityReport {
+    pub ok: bool,
+    pub checkpoints_checked: usize,
+    pub journal_warnings: u64,
+    pub missing_refs: Vec<CheckpointIntegrityProblem>,
+    pub missing_objects: Vec<CheckpointIntegrityProblem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointIntegrityProblem {
+    pub checkpoint_id: String,
+    pub path: Option<String>,
+    pub side: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -857,6 +900,13 @@ impl GitVcs {
 
 impl CheckpointStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(root, CheckpointStoreOptions::default())
+    }
+
+    pub fn open_with_options(
+        root: impl AsRef<Path>,
+        options: CheckpointStoreOptions,
+    ) -> Result<Self> {
         let root = canonicalize_workspace_root(root.as_ref())
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let dir = root.join(".squeezy").join("checkpoints");
@@ -874,10 +924,21 @@ impl CheckpointStore {
             git_dir,
             journal_path,
             lock_path,
+            options: CheckpointStoreOptions {
+                retention_days: nonzero_u64(
+                    options.retention_days,
+                    DEFAULT_CHECKPOINT_RETENTION_DAYS,
+                ),
+                max_file_bytes: nonzero_u64(
+                    options.max_file_bytes,
+                    DEFAULT_MAX_CHECKPOINT_FILE_BYTES,
+                ),
+                cleanup_interval_secs: options.cleanup_interval_secs,
+            },
             _lock: Some(lock),
         };
         store.ensure_shadow_repo()?;
-        store.cleanup_old_checkpoints(DEFAULT_CHECKPOINT_RETENTION_DAYS)?;
+        store.cleanup_old_checkpoints_if_due()?;
         Ok(store)
     }
 
@@ -986,7 +1047,7 @@ impl CheckpointStore {
             "kind": "checkpoint",
             "record": record,
         }))?;
-        self.cleanup_old_checkpoints(DEFAULT_CHECKPOINT_RETENTION_DAYS)?;
+        self.cleanup_old_checkpoints_if_due()?;
         Ok(Some(record))
     }
 
@@ -1000,32 +1061,54 @@ impl CheckpointStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(CheckpointJournal {
                     checkpoints: Vec::new(),
+                    rollbacks: Vec::new(),
                     journal_warnings: 0,
                 });
             }
             Err(err) => return Err(err.into()),
         };
         let mut records = Vec::new();
+        let mut rollbacks = Vec::new();
         let mut journal_warnings = 0;
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 journal_warnings += 1;
                 continue;
             };
-            if value.get("kind").and_then(|kind| kind.as_str()) != Some("checkpoint") {
-                continue;
-            }
-            if let Some(record) = value.get("record")
-                && let Ok(mut record) = serde_json::from_value::<CheckpointRecord>(record.clone())
-            {
-                record.journal_warnings = journal_warnings;
-                records.push(record);
-            } else {
-                journal_warnings += 1;
+            match value.get("kind").and_then(|kind| kind.as_str()) {
+                Some("checkpoint") => {
+                    if let Some(record) = value.get("record")
+                        && let Ok(mut record) =
+                            serde_json::from_value::<CheckpointRecord>(record.clone())
+                    {
+                        record.journal_warnings = journal_warnings;
+                        records.push(record);
+                    } else {
+                        journal_warnings += 1;
+                    }
+                }
+                Some("rollback") => {
+                    if let Some(result) = value.get("result")
+                        && let Ok(result) = serde_json::from_value::<RollbackResult>(result.clone())
+                    {
+                        rollbacks.push(RollbackJournalRecord {
+                            created_at_ms: value
+                                .get("created_at_ms")
+                                .and_then(|value| value.as_u64())
+                                .map(u128::from)
+                                .unwrap_or(0),
+                            result,
+                        });
+                    } else {
+                        journal_warnings += 1;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(CheckpointJournal {
             checkpoints: records,
+            rollbacks,
             journal_warnings,
         })
     }
@@ -1058,6 +1141,7 @@ impl CheckpointStore {
         }
         let conflicts = self.preflight_conflicts(&selected)?;
         let planned_files = selected.iter().map(|record| record.files.len()).sum();
+        let mut operations = Vec::new();
 
         let mut result = RollbackResult {
             mode,
@@ -1086,10 +1170,18 @@ impl CheckpointStore {
             return Ok(result);
         }
         for record in &selected {
-            self.rollback_record(record, &mut result)?;
+            self.plan_rollback_record(record, &result.conflicts, &mut operations)?;
+        }
+        match mode {
+            RollbackMode::Atomic => {
+                self.apply_atomic_operations(&operations, &mut result)?;
+            }
+            RollbackMode::BestEffort => {
+                self.apply_operations(&operations, &mut result)?;
+            }
         }
         self.track_tree()?;
-        result.applied = true;
+        result.applied = !result.restored_files.is_empty() || !result.deleted_files.is_empty();
         self.append_journal(json!({
             "kind": "rollback",
             "created_at_ms": now_ms(),
@@ -1103,18 +1195,182 @@ impl CheckpointStore {
         for record in self.selected_rollback_records(target)? {
             for file in record.files {
                 paths.insert(file.path);
+                if let Some(from_path) = file.from_path {
+                    paths.insert(from_path);
+                }
             }
         }
         Ok(paths.into_iter().collect())
+    }
+
+    pub fn restore_checkpoint_file(
+        &self,
+        checkpoint_id: &str,
+        path: &str,
+        mode: RollbackMode,
+    ) -> Result<RollbackResult> {
+        let Some(record) = self.show_checkpoint(checkpoint_id)? else {
+            return Ok(RollbackResult {
+                mode,
+                checkpoint_ids: Vec::new(),
+                planned_files: 0,
+                restored_files: Vec::new(),
+                deleted_files: Vec::new(),
+                conflicts: Vec::new(),
+                skipped: true,
+                applied: false,
+            });
+        };
+        let files = record
+            .files
+            .iter()
+            .filter(|file| file.path == path || file.from_path.as_deref() == Some(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            return Ok(RollbackResult {
+                mode,
+                checkpoint_ids: vec![record.id],
+                planned_files: 0,
+                restored_files: Vec::new(),
+                deleted_files: Vec::new(),
+                conflicts: Vec::new(),
+                skipped: true,
+                applied: false,
+            });
+        }
+        let record = CheckpointRecord { files, ..record };
+        let selected = vec![record];
+        let conflicts = self.preflight_conflicts(&selected)?;
+        let mut result = RollbackResult {
+            mode,
+            checkpoint_ids: vec![checkpoint_id.to_string()],
+            planned_files: selected[0].files.len(),
+            restored_files: Vec::new(),
+            deleted_files: Vec::new(),
+            conflicts,
+            skipped: false,
+            applied: false,
+        };
+        if mode == RollbackMode::Atomic && !result.conflicts.is_empty() {
+            return Ok(result);
+        }
+        let mut operations = Vec::new();
+        self.plan_rollback_record(&selected[0], &result.conflicts, &mut operations)?;
+        match mode {
+            RollbackMode::Atomic => self.apply_atomic_operations(&operations, &mut result)?,
+            RollbackMode::BestEffort => self.apply_operations(&operations, &mut result)?,
+        }
+        self.track_tree()?;
+        result.applied = !result.restored_files.is_empty() || !result.deleted_files.is_empty();
+        Ok(result)
+    }
+
+    pub fn restore_checkpoint_file_paths(
+        &self,
+        checkpoint_id: &str,
+        path: &str,
+    ) -> Result<Vec<String>> {
+        let Some(record) = self.show_checkpoint(checkpoint_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut paths = BTreeSet::new();
+        for file in record
+            .files
+            .iter()
+            .filter(|file| file.path == path || file.from_path.as_deref() == Some(path))
+        {
+            paths.insert(file.path.clone());
+            if let Some(from_path) = file.from_path.as_ref() {
+                paths.insert(from_path.clone());
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
+    pub fn integrity_report(&self) -> Result<CheckpointIntegrityReport> {
+        let journal = self.read_journal()?;
+        let mut missing_refs = Vec::new();
+        let mut missing_objects = Vec::new();
+        for record in &journal.checkpoints {
+            for side in ["before", "after"] {
+                let reference = checkpoint_ref(&record.id, side);
+                if self
+                    .git_vec_allow_status(
+                        vec![
+                            "show-ref".to_string(),
+                            "--verify".to_string(),
+                            "--quiet".to_string(),
+                            reference.clone(),
+                        ],
+                        &[0, 1],
+                    )?
+                    .status
+                    .code()
+                    != Some(0)
+                {
+                    missing_refs.push(CheckpointIntegrityProblem {
+                        checkpoint_id: record.id.clone(),
+                        path: None,
+                        side: side.to_string(),
+                        reason: format!("{reference} is missing"),
+                    });
+                }
+            }
+            for file in &record.files {
+                let before_path = file.from_path.as_deref().unwrap_or(&file.path);
+                if file.before_sha256.is_some()
+                    && self.blob_bytes(&record.before_tree, before_path).is_err()
+                {
+                    missing_objects.push(CheckpointIntegrityProblem {
+                        checkpoint_id: record.id.clone(),
+                        path: Some(before_path.to_string()),
+                        side: "before".to_string(),
+                        reason: "before blob is missing".to_string(),
+                    });
+                }
+                if file.after_sha256.is_some()
+                    && self.blob_bytes(&record.after_tree, &file.path).is_err()
+                {
+                    missing_objects.push(CheckpointIntegrityProblem {
+                        checkpoint_id: record.id.clone(),
+                        path: Some(file.path.clone()),
+                        side: "after".to_string(),
+                        reason: "after blob is missing".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(CheckpointIntegrityReport {
+            ok: journal.journal_warnings == 0
+                && missing_refs.is_empty()
+                && missing_objects.is_empty(),
+            checkpoints_checked: journal.checkpoints.len(),
+            journal_warnings: journal.journal_warnings,
+            missing_refs,
+            missing_objects,
+        })
     }
 
     fn selected_rollback_records(
         &self,
         target: RollbackTarget<'_>,
     ) -> Result<Vec<CheckpointRecord>> {
-        let records = self.list_checkpoints()?;
+        let journal = self.read_journal()?;
+        let rolled_back = journal
+            .rollbacks
+            .iter()
+            .filter(|rollback| rollback.result.applied && rollback.result.conflicts.is_empty())
+            .flat_map(|rollback| rollback.result.checkpoint_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let records = journal.checkpoints;
         let mut selected = match target {
-            RollbackTarget::Latest => records.into_iter().rev().take(1).collect::<Vec<_>>(),
+            RollbackTarget::Latest => records
+                .into_iter()
+                .rev()
+                .find(|record| !rolled_back.contains(&record.id))
+                .into_iter()
+                .collect::<Vec<_>>(),
             RollbackTarget::Group(group_id) => records
                 .into_iter()
                 .filter(|record| record.group_id == group_id)
@@ -1274,6 +1530,19 @@ impl CheckpointStore {
                 };
                 if let Some(conflict) = self.rollback_conflict(record, file, current_sha256)? {
                     conflicts.push(conflict);
+                    continue;
+                }
+                if file.status == DiffFileStatus::Renamed {
+                    if let Some(conflict) =
+                        self.rollback_rename_source_conflict(record, file, &mut virtual_hashes)?
+                    {
+                        conflicts.push(conflict);
+                        continue;
+                    }
+                    virtual_hashes.insert(file.path.clone(), None);
+                    if let Some(from_path) = file.from_path.as_ref() {
+                        virtual_hashes.insert(from_path.clone(), file.before_sha256.clone());
+                    }
                 } else {
                     virtual_hashes.insert(file.path.clone(), file.before_sha256.clone());
                 }
@@ -1282,54 +1551,143 @@ impl CheckpointStore {
         Ok(conflicts)
     }
 
-    fn rollback_record(
+    fn plan_rollback_record(
         &self,
         record: &CheckpointRecord,
-        result: &mut RollbackResult,
+        conflicts: &[RollbackConflict],
+        operations: &mut Vec<RollbackOperation>,
     ) -> Result<()> {
         for file in &record.files {
-            if result
-                .conflicts
-                .iter()
-                .any(|conflict| conflict.checkpoint_id == record.id && conflict.path == file.path)
-            {
+            if self.file_has_rollback_conflict(record, file, conflicts) {
                 continue;
             }
-            let path = self.root.join(&file.path);
 
             if file.status == DiffFileStatus::Renamed {
-                // Reverse a rename: remove the new path, restore the source path
-                // (whose original content is at `from_path` in the before tree).
-                if path.exists() {
-                    fs::remove_file(&path)?;
-                }
-                result.deleted_files.push(file.path.clone());
+                operations.push(RollbackOperation::Delete {
+                    path: file.path.clone(),
+                });
                 if let Some(from_path) = file.from_path.as_deref()
                     && let Ok(bytes) = self.blob_bytes(&record.before_tree, from_path)
                 {
-                    let restore_path = self.root.join(from_path);
-                    if let Some(parent) = restore_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&restore_path, bytes)?;
-                    result.restored_files.push(from_path.to_string());
+                    operations.push(RollbackOperation::Write {
+                        path: from_path.to_string(),
+                        bytes,
+                    });
                 }
                 continue;
             }
 
             match self.blob_bytes(&record.before_tree, &file.path) {
-                Ok(bytes) => {
-                    if let Some(parent) = path.parent() {
+                Ok(bytes) => operations.push(RollbackOperation::Write {
+                    path: file.path.clone(),
+                    bytes,
+                }),
+                Err(_) => operations.push(RollbackOperation::Delete {
+                    path: file.path.clone(),
+                }),
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_operations(
+        &self,
+        operations: &[RollbackOperation],
+        result: &mut RollbackResult,
+    ) -> Result<()> {
+        for operation in operations {
+            self.apply_operation(operation, result)?;
+        }
+        Ok(())
+    }
+
+    fn apply_atomic_operations(
+        &self,
+        operations: &[RollbackOperation],
+        result: &mut RollbackResult,
+    ) -> Result<()> {
+        let touched = operations
+            .iter()
+            .map(RollbackOperation::path)
+            .collect::<BTreeSet<_>>();
+        let backups = touched
+            .iter()
+            .map(|path| {
+                let abs = self.root.join(path);
+                let bytes = if abs.exists() {
+                    Some(fs::read(&abs)?)
+                } else {
+                    None
+                };
+                Ok(((*path).to_string(), bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut applied = RollbackResult {
+            mode: result.mode,
+            checkpoint_ids: result.checkpoint_ids.clone(),
+            planned_files: result.planned_files,
+            restored_files: Vec::new(),
+            deleted_files: Vec::new(),
+            conflicts: result.conflicts.clone(),
+            skipped: result.skipped,
+            applied: false,
+        };
+        if let Err(err) = self.apply_operations(operations, &mut applied) {
+            let _ = self.restore_backups(&backups);
+            return Err(err);
+        }
+        result.restored_files = applied.restored_files;
+        result.deleted_files = applied.deleted_files;
+        Ok(())
+    }
+
+    fn apply_operation(
+        &self,
+        operation: &RollbackOperation,
+        result: &mut RollbackResult,
+    ) -> Result<()> {
+        match operation {
+            RollbackOperation::Write { path, bytes } => {
+                let abs = self.root.join(path);
+                if let Some(parent) = abs.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let tmp = abs.with_extension(format!(
+                    "{}.squeezy-rollback-tmp",
+                    CHECKPOINT_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+                ));
+                fs::write(&tmp, bytes)?;
+                if abs.exists() {
+                    fs::remove_file(&abs)?;
+                }
+                fs::rename(&tmp, &abs)?;
+                result.restored_files.push(path.clone());
+            }
+            RollbackOperation::Delete { path } => {
+                let abs = self.root.join(path);
+                if abs.exists() {
+                    fs::remove_file(&abs)?;
+                }
+                result.deleted_files.push(path.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_backups(&self, backups: &[(String, Option<Vec<u8>>)]) -> Result<()> {
+        for (path, bytes) in backups {
+            let abs = self.root.join(path);
+            match bytes {
+                Some(bytes) => {
+                    if let Some(parent) = abs.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    fs::write(&path, bytes)?;
-                    result.restored_files.push(file.path.clone());
+                    fs::write(abs, bytes)?;
                 }
-                Err(_) => {
-                    if path.exists() {
-                        fs::remove_file(&path)?;
+                None => {
+                    if abs.exists() {
+                        fs::remove_file(abs)?;
                     }
-                    result.deleted_files.push(file.path.clone());
                 }
             }
         }
@@ -1352,12 +1710,13 @@ impl CheckpointStore {
                     .to_string(),
             }));
         }
-        if self.tree_has_path(&record.before_tree, &file.path)? {
-            let blob = self.blob_bytes(&record.before_tree, &file.path);
+        let before_path = file.from_path.as_deref().unwrap_or(&file.path);
+        if self.tree_has_path(&record.before_tree, before_path)? {
+            let blob = self.blob_bytes(&record.before_tree, before_path);
             if blob.is_err() {
                 return Ok(Some(RollbackConflict {
                     checkpoint_id: record.id.clone(),
-                    path: file.path.clone(),
+                    path: before_path.to_string(),
                     expected_sha256: file.after_sha256.clone(),
                     current_sha256,
                     reason: "checkpoint object is missing; leaving current content untouched"
@@ -1366,6 +1725,53 @@ impl CheckpointStore {
             }
         }
         Ok(None)
+    }
+
+    fn rollback_rename_source_conflict(
+        &self,
+        record: &CheckpointRecord,
+        file: &CheckpointFile,
+        virtual_hashes: &mut BTreeMap<String, Option<String>>,
+    ) -> Result<Option<RollbackConflict>> {
+        let Some(from_path) = file.from_path.as_ref() else {
+            return Ok(None);
+        };
+        let current_sha256 = match virtual_hashes.get(from_path) {
+            Some(hash) => hash.clone(),
+            None => {
+                let path = self.root.join(from_path);
+                let hash = if path.exists() {
+                    Some(sha256_hex(&fs::read(&path)?))
+                } else {
+                    None
+                };
+                virtual_hashes.insert(from_path.clone(), hash.clone());
+                hash
+            }
+        };
+        if current_sha256.is_some() {
+            return Ok(Some(RollbackConflict {
+                checkpoint_id: record.id.clone(),
+                path: from_path.clone(),
+                expected_sha256: None,
+                current_sha256,
+                reason: "file changed after checkpoint; leaving current content untouched"
+                    .to_string(),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn file_has_rollback_conflict(
+        &self,
+        record: &CheckpointRecord,
+        file: &CheckpointFile,
+        conflicts: &[RollbackConflict],
+    ) -> bool {
+        conflicts.iter().any(|conflict| {
+            conflict.checkpoint_id == record.id
+                && (conflict.path == file.path || file.from_path.as_ref() == Some(&conflict.path))
+        })
     }
 
     fn tree_has_path(&self, tree: &str, path: &str) -> Result<bool> {
@@ -1449,13 +1855,16 @@ impl CheckpointStore {
             {
                 continue;
             }
-            if self.is_git_ignored(&path)? {
-                continue;
-            }
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
+                if self.is_git_ignored(&path)? {
+                    continue;
+                }
                 self.collect_large_file_fingerprints(&path, files)?;
-            } else if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
+            } else if metadata.is_file() && metadata.len() > self.options.max_file_bytes {
+                if self.is_git_ignored(&path)? {
+                    continue;
+                }
                 let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
                 files.push(LargeFileFingerprint {
                     path: rel_path(&self.root, &path),
@@ -1521,12 +1930,43 @@ impl CheckpointStore {
                 checkpoint_ref(&record.id, "after"),
             ]);
         }
-        self.rewrite_checkpoint_journal(&keep)?;
+        self.rewrite_checkpoint_journal_with_rollbacks(&keep, &journal.rollbacks)?;
         let _ = self.git(["gc", "--prune=now"]);
         Ok(())
     }
 
+    fn cleanup_old_checkpoints_if_due(&self) -> Result<()> {
+        if self.options.cleanup_interval_secs == 0 {
+            return self.cleanup_old_checkpoints(self.options.retention_days);
+        }
+        let marker = self
+            .journal_path
+            .parent()
+            .unwrap_or(&self.root)
+            .join("last-cleanup");
+        let fresh = fs::metadata(&marker)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed.as_secs() < self.options.cleanup_interval_secs);
+        if fresh {
+            return Ok(());
+        }
+        self.cleanup_old_checkpoints(self.options.retention_days)?;
+        let _ = fs::write(marker, now_ms().to_string());
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn rewrite_checkpoint_journal(&self, records: &[CheckpointRecord]) -> Result<()> {
+        self.rewrite_checkpoint_journal_with_rollbacks(records, &[])
+    }
+
+    fn rewrite_checkpoint_journal_with_rollbacks(
+        &self,
+        records: &[CheckpointRecord],
+        rollbacks: &[RollbackJournalRecord],
+    ) -> Result<()> {
         if let Some(parent) = self.journal_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1537,6 +1977,20 @@ impl CheckpointStore {
                 &json!({
                     "kind": "checkpoint",
                     "record": record,
+                }),
+            )
+            .map_err(|err| {
+                SqueezyError::Tool(format!("failed to rewrite checkpoint journal: {err}"))
+            })?;
+            file.write_all(b"\n")?;
+        }
+        for rollback in rollbacks {
+            serde_json::to_writer(
+                &mut file,
+                &json!({
+                    "kind": "rollback",
+                    "created_at_ms": rollback.created_at_ms,
+                    "result": rollback.result,
                 }),
             )
             .map_err(|err| {
@@ -1640,6 +2094,20 @@ impl CheckpointStore {
             .chain(args)
             .collect();
         git_output_vec_allow_status(&self.root, full_args, success).map_err(SqueezyError::Tool)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RollbackOperation {
+    Write { path: String, bytes: Vec<u8> },
+    Delete { path: String },
+}
+
+impl RollbackOperation {
+    fn path(&self) -> &str {
+        match self {
+            RollbackOperation::Write { path, .. } | RollbackOperation::Delete { path } => path,
+        }
     }
 }
 
@@ -2259,6 +2727,10 @@ fn parse_hunk_range(value: &str) -> (u32, u32) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
     (start, lines)
+}
+
+fn nonzero_u64(value: u64, fallback: u64) -> u64 {
+    if value == 0 { fallback } else { value }
 }
 
 /// `true` when every non-empty line of `git add` stderr is part of the

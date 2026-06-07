@@ -1909,6 +1909,11 @@ impl Agent {
                 shell_sandbox: config.permissions.shell_sandbox.clone(),
                 mcp_servers: config.mcp_servers.clone(),
                 checkpoints_enabled: config.checkpoints_enabled,
+                checkpoint_store: squeezy_vcs::CheckpointStoreOptions {
+                    retention_days: config.tools.checkpoint_retention_days,
+                    max_file_bytes: config.tools.checkpoint_max_file_bytes,
+                    cleanup_interval_secs: config.tools.checkpoint_cleanup_interval_secs,
+                },
                 full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
             },
             config.skills.clone(),
@@ -1928,6 +1933,11 @@ impl Agent {
                     shell_sandbox: config.permissions.shell_sandbox.clone(),
                     mcp_servers: config.mcp_servers.clone(),
                     checkpoints_enabled: config.checkpoints_enabled,
+                    checkpoint_store: squeezy_vcs::CheckpointStoreOptions {
+                        retention_days: config.tools.checkpoint_retention_days,
+                        max_file_bytes: config.tools.checkpoint_max_file_bytes,
+                        cleanup_interval_secs: config.tools.checkpoint_cleanup_interval_secs,
+                    },
                     full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
                 },
                 config.skills.clone(),

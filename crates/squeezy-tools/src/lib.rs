@@ -45,8 +45,8 @@ use squeezy_telemetry::{
     OutcomeStatus, RefreshKind, TelemetryClient, TelemetryEvent,
 };
 use squeezy_vcs::{
-    CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs,
-    canonicalize_workspace_root, strip_verbatim_prefix,
+    CheckpointStore, CheckpointStoreOptions, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    DiffSnapshot, GitVcs, canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
 use tokio::sync::{Mutex, Semaphore};
@@ -139,15 +139,16 @@ use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
 use shell_program::ShellProgram;
 use specs::{
-    apply_patch_spec, checkpoint_list_spec, checkpoint_revert_spec, checkpoint_show_spec,
-    checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
-    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
-    mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
-    plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
-    read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec, repo_map_spec,
-    shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
-    websearch_spec, write_file_spec,
+    apply_patch_spec, checkpoint_check_spec, checkpoint_list_spec, checkpoint_restore_file_spec,
+    checkpoint_revert_spec, checkpoint_show_spec, checkpoint_undo_spec, decl_search_spec,
+    definition_search_spec, diff_context_spec, downstream_flow_spec, glob_spec, grep_spec,
+    hierarchy_spec, list_skills_spec, load_skill_spec, mcp_list_resource_templates_spec,
+    mcp_list_resources_spec, mcp_read_resource_spec, mcp_tool_spec, notebook_edit_spec,
+    notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec,
+    prepare_path_arguments, read_file_spec, read_slice_spec, read_tool_output_spec,
+    reference_search_spec, refresh_compiler_facts_spec, repo_map_spec, shell_spec,
+    symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec,
+    write_file_spec,
 };
 pub use squeezy_graph::LanguageReport;
 
@@ -779,6 +780,8 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
         "checkpoint_show" => "inspecting a checkpoint".to_string(),
         "checkpoint_undo" => "undoing to a checkpoint".to_string(),
         "checkpoint_revert" => "reverting to a checkpoint".to_string(),
+        "checkpoint_restore_file" => "restoring a checkpoint file".to_string(),
+        "checkpoint_check" => "checking checkpoint integrity".to_string(),
         "list_skills" => "listing skills".to_string(),
         "load_skill" => match s("name") {
             Some(n) => format!("loading skill `{n}`"),
@@ -913,6 +916,7 @@ pub struct ToolRuntimeConfig {
     pub shell_sandbox: ShellSandboxConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub checkpoints_enabled: bool,
+    pub checkpoint_store: CheckpointStoreOptions,
     pub full_access: bool,
 }
 
@@ -1387,6 +1391,7 @@ impl ToolRegistry {
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
                 checkpoints_enabled: false,
+                checkpoint_store: CheckpointStoreOptions::default(),
                 full_access: false,
             },
             skills,
@@ -1435,6 +1440,7 @@ impl ToolRegistry {
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
                 checkpoints_enabled: false,
+                checkpoint_store: CheckpointStoreOptions::default(),
                 full_access: false,
             },
             skills,
@@ -1556,7 +1562,10 @@ impl ToolRegistry {
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
         let checkpoints = if config.checkpoints_enabled {
-            Some(Arc::new(CheckpointStore::open(&root)?))
+            Some(Arc::new(CheckpointStore::open_with_options(
+                &root,
+                config.checkpoint_store,
+            )?))
         } else {
             None
         };
@@ -1728,6 +1737,14 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return Ok(None);
         };
+        for path in checkpoints.rollback_paths(squeezy_vcs::RollbackTarget::Latest)? {
+            if let Err(err) = safety::assess_write_path(&path, &self.root, &self.shell_sandbox) {
+                return Err(SqueezyError::Tool(format!(
+                    "checkpoint undo denied for {path}: {}",
+                    err.message()
+                )));
+            }
+        }
         let result = checkpoints.rollback(
             squeezy_vcs::RollbackTarget::Latest,
             mode.unwrap_or_default(),
@@ -1976,7 +1993,9 @@ impl ToolRegistry {
         }
         if self.checkpoints.is_some() {
             specs.extend([
+                checkpoint_check_spec(),
                 checkpoint_list_spec(),
+                checkpoint_restore_file_spec(),
                 checkpoint_revert_spec(),
                 checkpoint_show_spec(),
                 checkpoint_undo_spec(),
@@ -2193,7 +2212,9 @@ impl ToolRegistry {
             return PermissionScope::Mcp;
         }
         match call.name.as_str() {
-            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
+            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => {
+                PermissionScope::Edit
+            }
             "write_file" | "notebook_edit" => PermissionScope::Edit,
             "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
@@ -2207,11 +2228,11 @@ impl ToolRegistry {
             "read_slice" if self.read_slice_targets_ignored_policy(&call.arguments) => {
                 PermissionScope::IgnoredSearch
             }
-            "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
-            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
-            | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill"
-            | "observations" => PermissionScope::Read,
+            "checkpoint_check" | "checkpoint_list" | "checkpoint_show" | "decl_search"
+            | "definition_search" | "diff_context" | "downstream_flow" | "glob" | "grep"
+            | "hierarchy" | "plan_patch" | "read_file" | "read_slice" | "read_tool_output"
+            | "reference_search" | "repo_map" | "symbol_context" | "upstream_flow"
+            | "list_skills" | "load_skill" | "observations" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
@@ -2284,7 +2305,7 @@ impl ToolRegistry {
                 }
                 (PermissionCapability::Edit, target, PermissionRisk::High)
             }
-            "checkpoint_undo" | "checkpoint_revert" => (
+            "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => (
                 PermissionCapability::Edit,
                 "workspace:*".to_string(),
                 PermissionRisk::High,
@@ -2565,6 +2586,7 @@ impl ToolRegistry {
                 PermissionRisk::Low,
             ),
             "checkpoint_list"
+            | "checkpoint_check"
             | "checkpoint_show"
             | "diff_context"
             | "downstream_flow"
@@ -3127,6 +3149,8 @@ impl ToolRegistry {
                 "checkpoint_show" => self.execute_checkpoint_show(&call).await,
                 "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
                 "checkpoint_revert" => self.execute_checkpoint_revert(&call).await,
+                "checkpoint_restore_file" => self.execute_checkpoint_restore_file(&call).await,
+                "checkpoint_check" => self.execute_checkpoint_check(&call).await,
                 "repo_map" | "decl_search" | "definition_search" | "reference_search"
                 | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice"
                 | "symbol_context" => self.execute_graph_tool(&call).await,

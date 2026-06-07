@@ -23,14 +23,17 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 
 `RollbackTarget` (same file) is therefore three-way:
 
-- `Latest` — the most recent record.
+- `Latest` — the most recent record that has not already been fully rolled
+  back by a successful rollback journal entry.
 - `Group(group_id)` — every record tagged with that turn id.
 - `Checkpoint(id)` — one specific record.
 
 Both `Atomic` and `BestEffort` rollback modes accept any of the three
 targets; the sha256 gate is identical in all cases. `checkpoint_undo` targets
 `Latest`; `checkpoint_revert` requires exactly one of `group_id` or
-`checkpoint_id`.
+`checkpoint_id`. `checkpoint_restore_file` uses the same sha256 conflict gate
+but restores only one file and does not mark the whole checkpoint consumed for
+future `Latest` undo selection.
 
 ## Why `Group(group_id)` Is Load-Bearing
 
@@ -71,11 +74,21 @@ pretend those files are protected. Malformed journal lines are counted as
 `journal_warnings` and ignored rather than making the whole checkpoint list
 unreadable.
 
+The store options are configured from `[tools]`: `checkpoint_retention_days`,
+`checkpoint_max_file_bytes`, and `checkpoint_cleanup_interval_secs`. Cleanup is
+throttled by the interval so ordinary edit checkpoints do not synchronously
+rewrite the journal and run `git gc` on every mutation.
+
+Rollback path preflight returns every path a rollback may write or delete. For
+renames that includes both the destination path and the restored source path,
+so current workspace write policy is checked before any rollback target can
+recreate a source file.
+
 ## What This Document Is Not
 
 This is not a user manual. The agent-visible tools (`checkpoint_list`,
-`checkpoint_show`, `checkpoint_undo`, `checkpoint_revert`) are
-documented in their own specs under `crates/squeezy-tools/src/`. This
-file records *why* the `group_id` axis exists so a future refactor
-does not pare it down to `Latest` + `Checkpoint(id)` on the grounds
-that `Group` looks redundant.
+`checkpoint_show`, `checkpoint_undo`, `checkpoint_revert`,
+`checkpoint_restore_file`, `checkpoint_check`) are documented in their own
+specs under `crates/squeezy-tools/src/`. This file records *why* the
+`group_id` axis exists so a future refactor does not pare it down to `Latest`
++ `Checkpoint(id)` on the grounds that `Group` looks redundant.

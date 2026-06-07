@@ -11269,6 +11269,12 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         "diff_context" => diff_context_summary_spans(tool),
         "plan_patch" => plan_patch_summary_spans(tool),
         "apply_patch" | "write_file" => edit_summary_spans(tool),
+        "checkpoint_list"
+        | "checkpoint_show"
+        | "checkpoint_undo"
+        | "checkpoint_revert"
+        | "checkpoint_restore_file"
+        | "checkpoint_check" => checkpoint_summary_spans(tool),
         "webfetch" | "websearch" => web_summary_spans(tool),
         _ => vec![Span::styled(
             result.tool_name.clone(),
@@ -12001,6 +12007,107 @@ fn web_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     )]
 }
 
+fn checkpoint_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        checkpoint_label(tool),
+        Style::default().fg(palette::muted_fg()),
+    )];
+    let detail = match tool.result.tool_name.as_str() {
+        "checkpoint_list" => {
+            if tool.result.content["enabled"].as_bool() == Some(false) {
+                string_arg(&tool.result.content, "message")
+            } else {
+                let count = tool.result.content["checkpoints"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                Some(format!("{count} checkpoints"))
+            }
+        }
+        "checkpoint_show" => tool.result.content["checkpoint"]["group_id"]
+            .as_str()
+            .map(|group_id| format!("/revert-turn {group_id}")),
+        "checkpoint_check" => {
+            let integrity = &tool.result.content["integrity"];
+            if integrity["ok"].as_bool() == Some(true) {
+                Some("integrity ok".to_string())
+            } else {
+                let refs = integrity["missing_refs"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                let objects = integrity["missing_objects"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                Some(format!("{refs} missing refs · {objects} missing objects"))
+            }
+        }
+        "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => {
+            checkpoint_rollback_detail(&tool.result.content["rollback"])
+        }
+        _ => None,
+    };
+    if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            compact_text(&detail, 120),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    spans
+}
+
+fn checkpoint_label(tool: &ToolTranscript) -> String {
+    match tool.result.tool_name.as_str() {
+        "checkpoint_list" => "checkpoints".to_string(),
+        "checkpoint_show" => tool
+            .result
+            .content
+            .get("checkpoint")
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str())
+            .map(|id| format!("checkpoint {id}"))
+            .unwrap_or_else(|| tool_call_label_or_name(tool)),
+        "checkpoint_undo" => "undo checkpoint".to_string(),
+        "checkpoint_revert" => "revert checkpoint".to_string(),
+        "checkpoint_restore_file" => "restore checkpoint file".to_string(),
+        "checkpoint_check" => "checkpoint check".to_string(),
+        _ => tool_call_label_or_name(tool),
+    }
+}
+
+fn checkpoint_rollback_detail(rollback: &serde_json::Value) -> Option<String> {
+    if rollback["skipped"].as_bool() == Some(true) && rollback["applied"].as_bool() != Some(true) {
+        return Some("nothing to undo".to_string());
+    }
+    let conflicts = rollback["conflicts"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let restored = rollback["restored_files"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let deleted = rollback["deleted_files"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let applied = rollback["applied"].as_bool().unwrap_or(false);
+    if conflicts > 0 && !applied {
+        return Some("conflict, no files changed".to_string());
+    }
+    if conflicts > 0 {
+        return Some(format!(
+            "best-effort partial restore · {restored} restored · {deleted} deleted · {conflicts} conflicts"
+        ));
+    }
+    Some(format!("{restored} restored · {deleted} deleted"))
+}
+
 fn tool_call_label_or_name(tool: &ToolTranscript) -> String {
     tool.call
         .as_ref()
@@ -12076,6 +12183,22 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
         "write_file" => string_arg(&call.arguments, "path")
             .map(|path| format!("write {path}"))
             .unwrap_or_else(|| "write file".to_string()),
+        "checkpoint_list" => "checkpoints".to_string(),
+        "checkpoint_show" => string_arg(&call.arguments, "checkpoint_id")
+            .map(|id| format!("checkpoint {id}"))
+            .unwrap_or_else(|| "checkpoint".to_string()),
+        "checkpoint_undo" => "undo checkpoint".to_string(),
+        "checkpoint_revert" => string_arg(&call.arguments, "group_id")
+            .map(|group_id| format!("revert turn {group_id}"))
+            .or_else(|| {
+                string_arg(&call.arguments, "checkpoint_id")
+                    .map(|id| format!("revert checkpoint {id}"))
+            })
+            .unwrap_or_else(|| "revert checkpoint".to_string()),
+        "checkpoint_restore_file" => string_arg(&call.arguments, "path")
+            .map(|path| format!("restore {path}"))
+            .unwrap_or_else(|| "restore checkpoint file".to_string()),
+        "checkpoint_check" => "checkpoint check".to_string(),
         "webfetch" => string_arg(&call.arguments, "url")
             .map(|url| format!("fetch {url}"))
             .unwrap_or_else(|| "web fetch".to_string()),
@@ -12179,6 +12302,11 @@ fn active_tool_args(call: &ToolCall) -> String {
         "read_file" | "read_slice" | "write_file" => {
             string_arg(&call.arguments, "path").unwrap_or_default()
         }
+        "checkpoint_show" => string_arg(&call.arguments, "checkpoint_id").unwrap_or_default(),
+        "checkpoint_revert" => string_arg(&call.arguments, "group_id")
+            .or_else(|| string_arg(&call.arguments, "checkpoint_id"))
+            .unwrap_or_default(),
+        "checkpoint_restore_file" => string_arg(&call.arguments, "path").unwrap_or_default(),
         "plan_patch" => string_arg(&call.arguments, "objective").unwrap_or_default(),
         "webfetch" => string_arg(&call.arguments, "url").unwrap_or_default(),
         _ => String::new(),

@@ -31,6 +31,18 @@ pub(crate) struct CheckpointRevertArgs {
     mode: Option<RollbackMode>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointRestoreFileArgs {
+    pub(crate) checkpoint_id: String,
+    pub(crate) path: String,
+    mode: Option<RollbackMode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointCheckArgs {}
+
 impl ToolRegistry {
     pub(crate) async fn execute_checkpoint_list(&self, call: &ToolCall) -> ToolResult {
         if let Err(err) = serde_json::from_value::<CheckpointListArgs>(call.arguments.clone()) {
@@ -110,6 +122,9 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
+        if let Some(result) = self.assess_rollback_paths(call, RollbackTarget::Latest) {
+            return result;
+        }
         match checkpoints.rollback(RollbackTarget::Latest, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
@@ -167,29 +182,8 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
-        match checkpoints.rollback_paths(target) {
-            Ok(paths) => {
-                for path in paths {
-                    if let Err(err) =
-                        safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
-                    {
-                        return make_result(
-                            call,
-                            ToolStatus::Denied,
-                            json!({
-                                "error": err.message(),
-                                "path": path,
-                                "reason": err.code(),
-                                "permission_denied": true,
-                                "policy_denied": true,
-                            }),
-                            ToolCostHint::default(),
-                            None,
-                        );
-                    }
-                }
-            }
-            Err(err) => return tool_error(call, err),
+        if let Some(result) = self.assess_rollback_paths(call, target) {
+            return result;
         }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
@@ -208,5 +202,113 @@ impl ToolRegistry {
             }
             Err(err) => tool_error(call, err),
         }
+    }
+
+    pub(crate) async fn execute_checkpoint_restore_file(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<CheckpointRestoreFileArgs>(call.arguments.clone())
+        {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        let paths = match checkpoints.restore_checkpoint_file_paths(&args.checkpoint_id, &args.path)
+        {
+            Ok(paths) if paths.is_empty() => vec![args.path.clone()],
+            Ok(paths) => paths,
+            Err(err) => return tool_error(call, err),
+        };
+        for path in paths {
+            if let Err(err) = safety::assess_write_path(&path, &self.root, &self.shell_sandbox) {
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": err.message(),
+                        "path": path,
+                        "reason": err.code(),
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+        }
+        match checkpoints.restore_checkpoint_file(
+            &args.checkpoint_id,
+            &args.path,
+            args.mode.unwrap_or_default(),
+        ) {
+            Ok(result) => {
+                self.invalidate_diff_cache();
+                make_result(
+                    call,
+                    if result.conflicts.is_empty() && !result.skipped && result.applied {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Stale
+                    },
+                    json!({ "rollback": result }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    pub(crate) async fn execute_checkpoint_check(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<CheckpointCheckArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.integrity_report() {
+            Ok(report) => make_result(
+                call,
+                if report.ok {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Stale
+                },
+                json!({ "integrity": report }),
+                ToolCostHint::default(),
+                None,
+            ),
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    fn assess_rollback_paths(
+        &self,
+        call: &ToolCall,
+        target: RollbackTarget<'_>,
+    ) -> Option<ToolResult> {
+        let checkpoints = self.checkpoints.as_ref()?;
+        let paths = match checkpoints.rollback_paths(target) {
+            Ok(paths) => paths,
+            Err(err) => return Some(tool_error(call, err)),
+        };
+        for path in paths {
+            if let Err(err) = safety::assess_write_path(&path, &self.root, &self.shell_sandbox) {
+                return Some(make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": err.message(),
+                        "path": path,
+                        "reason": err.code(),
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                ));
+            }
+        }
+        None
     }
 }
