@@ -107,10 +107,11 @@ pub(crate) struct CostBroker {
     /// micros. Seeded from the resumed conversation state and updated after
     /// every provider response we record.
     session_cost_usd_micros: u64,
-    /// Cumulative session cost as a full [`CostSnapshot`] (token distribution
-    /// + USD), seeded from the resumed session and advanced on every recorded
-    /// round. Mirrors `session_cost_usd_micros` on the dollar field but also
-    /// carries input/output/cache tokens, so the live status line can show a
+    /// Cumulative session cost as a full [`CostSnapshot`] (token distribution and
+    /// USD), seeded from the resumed session and advanced on every recorded round.
+    ///
+    /// Mirrors `session_cost_usd_micros` on the dollar field but also carries
+    /// input/output/cache tokens, so the live status line can show a
     /// session-cumulative cost+token snapshot without re-reading conversation
     /// state. Does not include out-of-band reviewer spend recorded straight to
     /// the session (a small, next-turn-reconciled lag).

@@ -27,6 +27,22 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
 
+/// Agent turn + replay tests nest deep async state machines; debug builds on
+/// Windows' smaller default thread stacks can overflow without a larger pool.
+fn run_high_stack_async_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build high-stack test runtime");
+    runtime.block_on(async move {
+        tokio::spawn(future)
+            .await
+            .expect("high-stack test task should not panic");
+    });
+}
+
 struct MockProvider {
     name: &'static str,
     responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
@@ -1887,332 +1903,337 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
-    let root = temp_workspace("agent_promised_action_retry_transcript");
-    fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
-    // A genuine stall: a substantive verdict followed by a trailing,
-    // undelivered intent. The final clause is the unresolved action, so the
-    // sharpened detector fires the retry — exercising the preservation path.
-    let substantive_answer = "## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.\n\nNow let me re-run each scenario directly to double-check the compacted summary.";
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_1".to_string(),
-                name: "grep".to_string(),
-                arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::ToolUse),
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_2".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::EndTurn),
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(
-                "The previous output is the complete answer. All scenarios were re-tested."
-                    .to_string(),
-            )),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_3".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::EndTurn),
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        session_logs: SessionLogConfig {
-            log_dir: Some(PathBuf::from(".squeezy/sessions")),
-            ..SessionLogConfig::default()
-        },
-        context_compaction: ContextCompactionConfig {
-            repo_doc_max_bytes: 0,
-            user_memory_max_bytes: 0,
-            ..ContextCompactionConfig::default()
-        },
-        ..AppConfig::default()
-    };
-    let agent = Agent::new(config.clone(), provider.clone());
-
-    let mut rx = agent.start_turn("revisit your reports".to_string(), CancellationToken::new());
-    let mut completed = None;
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::Completed { message, .. } = event {
-            completed = Some(message.content);
-        }
-    }
-
-    let completed = completed.expect("turn should complete");
-    assert_eq!(
-        completed, substantive_answer,
-        "a substantive answer that triggered the one-shot retry must remain the visible turn output"
-    );
-    assert_eq!(
-        provider.requests().len(),
-        3,
-        "the test must exercise the promised-action retry round"
-    );
-
-    let state = agent.conversation_state.lock().await;
-    let assistant = state
-        .transcript
-        .iter()
-        .find(|item| item.role == squeezy_core::Role::Assistant)
-        .expect("transcript must persist the completed assistant turn");
-    assert_eq!(
-        assistant.content, substantive_answer,
-        "resume/transcript state must not replace the answer with the retry acknowledgement"
-    );
-
-    let session_id = agent.session_id().expect("session id");
-    let record = agent.show_session(&session_id).expect("session record");
-    let retry_event = record
-        .events
-        .iter()
-        .find(|event| event.kind == "assistant_retry")
-        .expect("session events must record the retry decision");
-    assert_eq!(retry_event.payload["branch"], "promised_action");
-    assert_eq!(
-        retry_event.payload["preserved_visible_chars"],
-        json!(substantive_answer.chars().count()),
-        "retry event must expose how much visible text was preserved"
-    );
-
-    let replay = record.replay.expect("replay tape");
-    let retry_completion = replay
-        .events
-        .iter()
-        .find(|event| {
-            event.kind == SessionReplayEventKind::ModelCompleted
-                && event.payload["retry"]["branch"] == "promised_action"
-        })
-        .expect("replay model_completed must carry retry metadata");
-    assert_eq!(retry_completion.payload["stop_reason"]["kind"], "end_turn");
-    assert_eq!(
-        retry_completion.payload["retry"]["preserved_visible_chars"],
-        json!(substantive_answer.chars().count()),
-    );
-
-    let report = Agent::replay_tape(
-        config,
-        session_id,
-        replay,
-        "mock",
-        AppConfig::default().model,
-        SessionMode::default(),
-    )
-    .await
-    .expect("retry session replay should consume the full tape");
-    assert!(
-        report.final_answer.contains(substantive_answer),
-        "replay must retain the substantive answer, got {:?}",
-        report.final_answer,
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn promised_action_retry_preserves_prior_visible_answer_on_terminal_failure() {
-    let root = temp_workspace("agent_promised_action_retry_terminal_failure");
-    fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
-    let substantive_answer =
-        "The report was already complete.\n\nNow let me inspect the result directly to confirm.";
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_1".to_string(),
-                name: "grep".to_string(),
-                arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::ToolUse),
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_2".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::EndTurn),
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_3".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::MaxTokens),
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        session_logs: SessionLogConfig {
-            log_dir: Some(PathBuf::from(".squeezy/sessions")),
-            ..SessionLogConfig::default()
-        },
-        ..AppConfig::default()
-    };
-    let agent = Agent::new(config, provider);
-
-    let mut rx = agent.start_turn("revisit your reports".to_string(), CancellationToken::new());
-    let mut failed = None;
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::Failed { error, .. } = event {
-            failed = Some(error.to_string());
-        }
-    }
-
-    assert!(
-        failed
-            .as_deref()
-            .is_some_and(|error| error.contains("max_tokens")),
-        "turn should surface max_tokens failure, got {failed:?}",
-    );
-    let state = agent.conversation_state.lock().await;
-    let assistant = state
-        .transcript
-        .iter()
-        .find(|item| item.role == squeezy_core::Role::Assistant)
-        .expect("failed turn transcript must preserve visible assistant text");
-    assert_eq!(
-        assistant.content, substantive_answer,
-        "terminal failure after retry must not drop the answer the user already saw",
-    );
-
-    let session_id = agent.session_id().expect("session id");
-    let record = agent.show_session(&session_id).expect("session record");
-    let resume_state = record
-        .resume_state
-        .expect("terminal failure should write durable resume state");
-    let durable_assistant = resume_state
-        .transcript
-        .iter()
-        .find(|item| item.role == squeezy_core::Role::Assistant)
-        .expect("resume_state transcript must preserve visible assistant text");
-    assert_eq!(
-        durable_assistant.content, substantive_answer,
-        "terminal failure must persist preserved text to resume_state.json",
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn promised_action_retry_preserves_prior_visible_answer_on_soft_completion() {
-    let root = temp_workspace("agent_promised_action_retry_soft_completion");
-    let bad_args = json!({
-        INVALID_TOOL_ARGUMENTS_KEY: true,
-        INVALID_TOOL_ARGUMENTS_ERROR_KEY: "EOF while parsing a string at line 1 column 59",
-        INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
-    });
-    let substantive_answer =
-        "The useful answer is already here.\n\nNow let me inspect the failed lookup directly.";
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_bad_1".to_string(),
-                name: "definition_search".to_string(),
-                arguments: bad_args.clone(),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::ToolUse),
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_2".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::EndTurn),
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_bad_2".to_string(),
-                name: "definition_search".to_string(),
-                arguments: bad_args,
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_3".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: Some(StopReason::ToolUse),
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(
-        AppConfig {
+#[test]
+fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("agent_promised_action_retry_transcript");
+        fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
+        // A genuine stall: a substantive verdict followed by a trailing,
+        // undelivered intent. The final clause is the unresolved action, so the
+        // sharpened detector fires the retry — exercising the preservation path.
+        let substantive_answer = "## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.\n\nNow let me re-run each scenario directly to double-check the compacted summary.";
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "The previous output is the complete answer. All scenarios were re-tested."
+                        .to_string(),
+                )),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_3".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
             workspace_root: root.clone(),
+            session_logs: SessionLogConfig {
+                log_dir: Some(PathBuf::from(".squeezy/sessions")),
+                ..SessionLogConfig::default()
+            },
             context_compaction: ContextCompactionConfig {
                 repo_doc_max_bytes: 0,
                 user_memory_max_bytes: 0,
                 ..ContextCompactionConfig::default()
             },
             ..AppConfig::default()
-        },
-        provider,
-    );
+        };
+        let agent = Agent::new(config.clone(), provider.clone());
 
-    let mut rx = agent.start_turn("find getFoo".to_string(), CancellationToken::new());
-    let mut completed = None;
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::Completed { message, .. } = event {
-            completed = Some(message.content);
+        let mut rx = agent.start_turn("revisit your reports".to_string(), CancellationToken::new());
+        let mut completed = None;
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Completed { message, .. } = event {
+                completed = Some(message.content);
+            }
         }
-    }
 
-    let completed = completed.expect("turn should soft-complete");
-    assert!(
-        completed.starts_with(substantive_answer),
-        "soft completion must preserve the answer the user already saw, got {completed:?}",
-    );
-    assert!(
-        completed.contains("stopped early: repeated definition_search failure"),
-        "soft completion should explain the loop guard, got {completed:?}",
-    );
-    let state = agent.conversation_state.lock().await;
-    let assistant = state
-        .transcript
-        .iter()
-        .find(|item| item.role == squeezy_core::Role::Assistant)
-        .expect("soft-completed transcript must include assistant");
-    assert!(
-        assistant.content.starts_with(substantive_answer),
-        "soft completion transcript must preserve retried visible text",
-    );
+        let completed = completed.expect("turn should complete");
+        assert_eq!(
+            completed, substantive_answer,
+            "a substantive answer that triggered the one-shot retry must remain the visible turn output"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            3,
+            "the test must exercise the promised-action retry round"
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let state = agent.conversation_state.lock().await;
+        let assistant = state
+            .transcript
+            .iter()
+            .find(|item| item.role == squeezy_core::Role::Assistant)
+            .expect("transcript must persist the completed assistant turn");
+        assert_eq!(
+            assistant.content, substantive_answer,
+            "resume/transcript state must not replace the answer with the retry acknowledgement"
+        );
+
+        let session_id = agent.session_id().expect("session id");
+        let record = agent.show_session(&session_id).expect("session record");
+        let retry_event = record
+            .events
+            .iter()
+            .find(|event| event.kind == "assistant_retry")
+            .expect("session events must record the retry decision");
+        assert_eq!(retry_event.payload["branch"], "promised_action");
+        assert_eq!(
+            retry_event.payload["preserved_visible_chars"],
+            json!(substantive_answer.chars().count()),
+            "retry event must expose how much visible text was preserved"
+        );
+
+        let replay = record.replay.expect("replay tape");
+        let retry_completion = replay
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == SessionReplayEventKind::ModelCompleted
+                    && event.payload["retry"]["branch"] == "promised_action"
+            })
+            .expect("replay model_completed must carry retry metadata");
+        assert_eq!(retry_completion.payload["stop_reason"]["kind"], "end_turn");
+        assert_eq!(
+            retry_completion.payload["retry"]["preserved_visible_chars"],
+            json!(substantive_answer.chars().count()),
+        );
+
+        let report = Agent::replay_tape(
+            config,
+            session_id,
+            replay,
+            "mock",
+            AppConfig::default().model,
+            SessionMode::default(),
+        )
+        .await
+        .expect("retry session replay should consume the full tape");
+        assert!(
+            report.final_answer.contains(substantive_answer),
+            "replay must retain the substantive answer, got {:?}",
+            report.final_answer,
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn promised_action_retry_preserves_prior_visible_answer_on_terminal_failure() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("agent_promised_action_retry_terminal_failure");
+        fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
+        let substantive_answer = "The report was already complete.\n\nNow let me inspect the result directly to confirm.";
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_3".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::MaxTokens),
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            session_logs: SessionLogConfig {
+                log_dir: Some(PathBuf::from(".squeezy/sessions")),
+                ..SessionLogConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let agent = Agent::new(config, provider);
+
+        let mut rx = agent.start_turn("revisit your reports".to_string(), CancellationToken::new());
+        let mut failed = None;
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Failed { error, .. } = event {
+                failed = Some(error.to_string());
+            }
+        }
+
+        assert!(
+            failed
+                .as_deref()
+                .is_some_and(|error| error.contains("max_tokens")),
+            "turn should surface max_tokens failure, got {failed:?}",
+        );
+        let state = agent.conversation_state.lock().await;
+        let assistant = state
+            .transcript
+            .iter()
+            .find(|item| item.role == squeezy_core::Role::Assistant)
+            .expect("failed turn transcript must preserve visible assistant text");
+        assert_eq!(
+            assistant.content, substantive_answer,
+            "terminal failure after retry must not drop the answer the user already saw",
+        );
+
+        let session_id = agent.session_id().expect("session id");
+        let record = agent.show_session(&session_id).expect("session record");
+        let resume_state = record
+            .resume_state
+            .expect("terminal failure should write durable resume state");
+        let durable_assistant = resume_state
+            .transcript
+            .iter()
+            .find(|item| item.role == squeezy_core::Role::Assistant)
+            .expect("resume_state transcript must preserve visible assistant text");
+        assert_eq!(
+            durable_assistant.content, substantive_answer,
+            "terminal failure must persist preserved text to resume_state.json",
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn promised_action_retry_preserves_prior_visible_answer_on_soft_completion() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("agent_promised_action_retry_soft_completion");
+        let bad_args = json!({
+            INVALID_TOOL_ARGUMENTS_KEY: true,
+            INVALID_TOOL_ARGUMENTS_ERROR_KEY: "EOF while parsing a string at line 1 column 59",
+            INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
+        });
+        let substantive_answer =
+            "The useful answer is already here.\n\nNow let me inspect the failed lookup directly.";
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_bad_1".to_string(),
+                    name: "definition_search".to_string(),
+                    arguments: bad_args.clone(),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(substantive_answer.to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_bad_2".to_string(),
+                    name: "definition_search".to_string(),
+                    arguments: bad_args,
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_3".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(
+            AppConfig {
+                workspace_root: root.clone(),
+                context_compaction: ContextCompactionConfig {
+                    repo_doc_max_bytes: 0,
+                    user_memory_max_bytes: 0,
+                    ..ContextCompactionConfig::default()
+                },
+                ..AppConfig::default()
+            },
+            provider,
+        );
+
+        let mut rx = agent.start_turn("find getFoo".to_string(), CancellationToken::new());
+        let mut completed = None;
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Completed { message, .. } = event {
+                completed = Some(message.content);
+            }
+        }
+
+        let completed = completed.expect("turn should soft-complete");
+        assert!(
+            completed.starts_with(substantive_answer),
+            "soft completion must preserve the answer the user already saw, got {completed:?}",
+        );
+        assert!(
+            completed.contains("stopped early: repeated definition_search failure"),
+            "soft completion should explain the loop guard, got {completed:?}",
+        );
+        let state = agent.conversation_state.lock().await;
+        let assistant = state
+            .transcript
+            .iter()
+            .find(|item| item.role == squeezy_core::Role::Assistant)
+            .expect("soft-completed transcript must include assistant");
+        assert!(
+            assistant.content.starts_with(substantive_answer),
+            "soft completion transcript must preserve retried visible text",
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
