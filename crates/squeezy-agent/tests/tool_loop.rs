@@ -2292,81 +2292,84 @@ async fn successful_read_result_persists_model_visible_snapshot() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn repeated_read_result_returns_receipt_stub_across_sessions() {
-    let root = temp_workspace("receipt_stub_cross_session");
-    fs::write(root.join("sample.txt"), "durable content\n").expect("write sample");
-    let first_provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_session_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let first_agent = Agent::new(config_for(root.clone()), first_provider);
-    drain_turn(first_agent.start_turn("read once".to_string(), CancellationToken::new())).await;
-    drop(first_agent);
+#[test]
+fn repeated_read_result_returns_receipt_stub_across_sessions() {
+    run_high_stack_test(async {
+        let root = temp_workspace("receipt_stub_cross_session");
+        fs::write(root.join("sample.txt"), "durable content\n").expect("write sample");
+        let first_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_session_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let first_agent = Agent::new(config_for(root.clone()), first_provider);
+        drain_turn(first_agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+        drop(first_agent);
 
-    let second_provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_session_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("deduped".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let second_agent = Agent::new(config_for(root.clone()), second_provider.clone());
-    drain_turn(second_agent.start_turn("read again".to_string(), CancellationToken::new())).await;
+        let second_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_session_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("deduped".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let second_agent = Agent::new(config_for(root.clone()), second_provider.clone());
+        drain_turn(second_agent.start_turn("read again".to_string(), CancellationToken::new()))
+            .await;
 
-    let requests = second_provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].0, "second_session_read");
-    assert_eq!(outputs[0].1["content"]["receipt_stub"], true);
-    assert_eq!(
-        outputs[0].1["content"]["same_as_call_id"],
-        "first_session_read"
-    );
-    assert!(outputs[0].1["content"]["content"].is_null());
+        let requests = second_provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].0, "second_session_read");
+        assert_eq!(outputs[0].1["content"]["receipt_stub"], true);
+        assert_eq!(
+            outputs[0].1["content"]["same_as_call_id"],
+            "first_session_read"
+        );
+        assert!(outputs[0].1["content"]["content"].is_null());
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
