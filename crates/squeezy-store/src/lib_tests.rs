@@ -7,7 +7,8 @@ use squeezy_core::FileId;
 
 use crate::{
     CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
-    SqueezyStore, graph_path, sessions::ResumeItem, state_path,
+    SqueezyStore, StorageMountClassification, cache_dir_path, graph_path, sessions::ResumeItem,
+    state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -177,6 +178,69 @@ fn oversized_state_file_rotates_without_redb_open() {
 }
 
 #[test]
+fn xdg_cache_root_resolves_under_xdg_cache_home_with_repo_id() {
+    let root = temp_root("xdg-cache-root");
+    let xdg = temp_root("xdg-cache-home");
+    let previous = std::env::var_os("XDG_CACHE_HOME");
+    unsafe {
+        std::env::set_var("XDG_CACHE_HOME", &xdg);
+    }
+
+    let resolved = cache_dir_path(&root, Some(Path::new("xdg")));
+
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("XDG_CACHE_HOME", value);
+        },
+        None => unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+        },
+    }
+    assert!(
+        resolved.starts_with(&xdg),
+        "resolved={}",
+        resolved.display()
+    );
+    let expected_parent = xdg.join("squeezy");
+    assert_eq!(resolved.parent(), Some(expected_parent.as_path()));
+    assert!(
+        resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("xdg-cache-root")),
+        "repo id should preserve a readable workspace prefix: {}",
+        resolved.display()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
+    let entries = super::parse_linux_mountinfo(
+        "31 23 0:27 / / rw,relatime - ext4 /dev/sda1 rw\n\
+         32 23 0:28 / /mnt/share rw,relatime - nfs4 server:/share rw\n\
+         33 23 0:29 / /work rw,relatime - overlay overlay rw\n",
+    );
+
+    let nfs = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/mnt/share"))
+        .expect("nfs mount");
+    assert_eq!(
+        super::classify_filesystem(&nfs.fs_type),
+        StorageMountClassification::Network
+    );
+    let overlay = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/work"))
+        .expect("overlay mount");
+    assert_eq!(
+        super::classify_filesystem(&overlay.fs_type),
+        StorageMountClassification::Virtual
+    );
+}
+
+#[test]
 fn graph_write_batch_applies_resolver_cache_changes() {
     let (_root, store) = open_graph_store("resolver-batch");
     let first = FileId::new("src/first.rs");
@@ -189,7 +253,10 @@ fn graph_write_batch_applies_resolver_cache_changes() {
     batch
         .upsert_resolver_entry(&second, &json!({"exports": ["Second"]}))
         .expect("encode second resolver entry");
-    assert_eq!(batch.len(), 2);
+    batch
+        .set_import_graph(&json!({"src/first.rs": ["src/second.rs"]}))
+        .expect("encode import graph");
+    assert_eq!(batch.len(), 3);
     store
         .apply_graph_batch(&batch)
         .expect("apply resolver batch");
@@ -204,6 +271,11 @@ fn graph_write_batch_applies_resolver_cache_changes() {
         .expect("load second")
         .expect("second present");
     assert_eq!(second_entry["exports"][0], "Second");
+    let import_graph: serde_json::Value = store
+        .import_graph()
+        .expect("load import graph")
+        .expect("import graph present");
+    assert_eq!(import_graph["src/first.rs"][0], "src/second.rs");
 
     let mut update = GraphWriteBatch::new();
     update.remove_resolver_entry(&first);

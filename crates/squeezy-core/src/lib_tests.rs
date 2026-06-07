@@ -2522,6 +2522,7 @@ exclude_classes = ["generated"]
 [cache]
 root = ".squeezy/cache"
 tool_outputs = ".squeezy/tool_outputs"
+durability = "turn"
 
 [tools]
 checkpoints_enabled = true
@@ -2588,6 +2589,7 @@ reason = "docs lookups are safe"
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
+    assert_eq!(config.cache.durability, CacheDurability::Turn);
     assert!(config.checkpoints_enabled);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"webfetch".to_string()));
@@ -4297,8 +4299,28 @@ fn inspect_omits_optional_cache_keys_when_unset() {
     let inspect = config.inspect_redacted();
 
     assert!(inspect.contains("[cache]"));
+    assert!(inspect.contains("durability = \"fast\""));
     assert!(!inspect.contains("root ="));
     assert!(!inspect.contains("tool_outputs ="));
+}
+
+#[test]
+fn cache_durability_rejects_unknown_values() {
+    let error = SettingsFile::from_toml_str(
+        r#"
+[cache]
+durability = "forever"
+"#,
+        "test",
+    )
+    .expect_err("unknown durability should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of fast, turn, strict"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -9,8 +9,9 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::{
-    AppConfig, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
-    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
+    AppConfig, CacheDurability, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL,
+    DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
+    DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES, DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
@@ -417,6 +418,7 @@ pub const PROFILE_OPTIONS: &[&str] = &["cheap", "balanced", "strong"];
 pub const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh"];
 pub const SESSION_MODE_OPTIONS: &[&str] = &["build", "plan"];
 pub const SESSION_RESUME_PICKER_OPTIONS: &[&str] = &["ask", "never"];
+pub const CACHE_DURABILITY_OPTIONS: &[&str] = &["fast", "turn", "strict"];
 pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
@@ -2133,6 +2135,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "<inherits cache.root>",
                 default: || FieldValue::Path(std::path::PathBuf::from("")),
                 help: "Directory for spilled tool-output blobs. Empty inherits cache.root.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "durability",
+                toml_path: &["cache", "durability"],
+                kind: FieldKind::Enum {
+                    options: CACHE_DURABILITY_OPTIONS,
+                },
+                tier: ApplyTier::Restart,
+                get: get_cache_durability,
+                set: set_cache_durability,
+                default_display: "fast",
+                default: || FieldValue::Enum("fast"),
+                help: "Session JSONL durability: fast avoids fsync, turn syncs on explicit session flushes, strict syncs each durable append.",
                 env_override: None,
                 secret: false,
             },
@@ -4147,6 +4164,22 @@ fn set_cache_tool_outputs(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
     } else {
         Some(p)
     };
+    Ok(())
+}
+
+fn get_cache_durability(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.cache.durability.as_str())
+}
+fn set_cache_durability(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let raw = match value {
+        FieldValue::Enum(s) => s,
+        FieldValue::String(s) => {
+            cfg.cache.durability = CacheDurability::parse(&s).ok_or("unknown durability")?;
+            return Ok(());
+        }
+        _ => return Err("expects enum"),
+    };
+    cfg.cache.durability = CacheDurability::parse(raw).ok_or("unknown durability")?;
     Ok(())
 }
 

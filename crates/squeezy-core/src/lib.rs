@@ -2230,6 +2230,10 @@ impl AppConfig {
                 toml_string(&tool_outputs.display().to_string())
             ));
         }
+        output.push_str(&format!(
+            "durability = {}\n",
+            toml_string(self.cache.durability.as_str())
+        ));
         output.push('\n');
 
         output.push_str("[tools]\n");
@@ -9091,6 +9095,7 @@ impl GraphSettings {
 pub struct CacheConfig {
     pub root: Option<PathBuf>,
     pub tool_outputs: Option<PathBuf>,
+    pub durability: CacheDurability,
 }
 
 impl CacheConfig {
@@ -9098,6 +9103,7 @@ impl CacheConfig {
         Self {
             root: settings.root,
             tool_outputs: settings.tool_outputs,
+            durability: settings.durability.unwrap_or_default(),
         }
     }
 }
@@ -9106,20 +9112,51 @@ impl CacheConfig {
 pub struct CacheSettings {
     pub root: Option<PathBuf>,
     pub tool_outputs: Option<PathBuf>,
+    pub durability: Option<CacheDurability>,
 }
 
 impl CacheSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["root", "tool_outputs"], source, path)?;
+        reject_unknown_keys(table, &["root", "tool_outputs", "durability"], source, path)?;
         Ok(Self {
             root: path_value(table, "root", source, &field(path, "root"))?,
             tool_outputs: path_value(table, "tool_outputs", source, &field(path, "tool_outputs"))?,
+            durability: cache_durability_value(table, "durability", source, path)?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.root, next.root);
         replace_if_some(&mut self.tool_outputs, next.tool_outputs);
+        replace_if_some(&mut self.durability, next.durability);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDurability {
+    #[default]
+    Fast,
+    Turn,
+    Strict,
+}
+
+impl CacheDurability {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "turn" => Some(Self::Turn),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Turn => "turn",
+            Self::Strict => "strict",
+        }
     }
 }
 
@@ -10223,7 +10260,9 @@ pub fn project_settings_template() -> &'static str {
 [cache]
 # Relative paths are resolved against the project root (the directory
 # containing this squeezy.toml).
+# root = ".squeezy/cache"          # or "xdg" on Linux for XDG cache storage
 # tool_outputs = ".squeezy/tool_outputs"
+# durability = "fast"             # fast | turn | strict
 
 # [tools]
 # checkpoints_enabled = false
@@ -11651,6 +11690,23 @@ fn path_value(
     path: &str,
 ) -> Result<Option<PathBuf>> {
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
+}
+
+fn cache_durability_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<CacheDurability>> {
+    let Some(value) = string_value(table, key, source, &field(path, key))? else {
+        return Ok(None);
+    };
+    CacheDurability::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {}: expected one of fast, turn, strict",
+            field(path, key)
+        ))
+    })
 }
 
 fn path_array_value(

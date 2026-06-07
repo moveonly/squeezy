@@ -5,7 +5,9 @@ resumed without remembering a provider response id.
 
 By default, session state lives under `.squeezy/sessions/` in the workspace.
 If `[cache].root` is set and `[session].log_dir` is unset, sessions live under
-`<cache.root>/sessions`. `[session].log_retention_days` defaults to 30 days.
+`<cache.root>/sessions`. With `[cache].root = "xdg"` on Linux, that resolves
+under `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`.
+`[session].log_retention_days` defaults to 30 days.
 
 Each session directory contains:
 
@@ -21,6 +23,11 @@ Each session directory contains:
 - `replay.jsonl`: append-only versioned redacted replay tape with model
   requests, model stream events, tool calls/results, cost decisions, timestamps,
   and stable hashes used to detect replay divergence.
+
+`[cache].durability` controls how aggressively `events.jsonl` and
+`replay.jsonl` are synced. The default `fast` mode keeps appends cheap; `turn`
+syncs at explicit session flush/shutdown boundaries; `strict` syncs every
+durable JSONL append.
 
 Use CLI discovery commands:
 

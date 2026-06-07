@@ -191,10 +191,13 @@ rm /usr/local/bin/squeezy
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\squeezy"
 ```
 
-Squeezy stores user settings and local runtime state under `~/.squeezy` on
-Unix and `%APPDATA%\squeezy` on Windows. Remove that directory only if you
-also want to delete settings, sessions, caches, reports, and local repo
-profiles:
+Squeezy stores user settings and global indexes under `~/.squeezy` on Unix and
+`%APPDATA%\squeezy` on Windows. Workspace-local sessions and caches default to
+`.squeezy/sessions` and `.squeezy/cache` unless `[session].log_dir` or
+`[cache].root` overrides them. On Linux, `squeezy doctor --storage` reports
+cache/session paths, mount types, redb backup age, and network or virtual
+filesystem warnings. Remove `~/.squeezy` only if you also want to delete
+settings, global indexes, reports, and local repo profiles:
 
 ```sh
 rm -rf ~/.squeezy

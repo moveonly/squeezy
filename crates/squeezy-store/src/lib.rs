@@ -14,14 +14,14 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
+    env, fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use squeezy_core::{FileId, Result, SqueezyError};
+use squeezy_core::{FileId, Result, SqueezyError, repo_settings_id};
 
 pub mod migrations;
 pub mod repo_profile;
@@ -101,6 +101,7 @@ impl SqueezyStore {
         if oversized_state_needs_fast_rotate(&path)? {
             let backup = backup_path_with_label(&path, "oversized-state");
             fs::rename(&path, &backup)?;
+            sync_parent_dir(&backup)?;
             bootstrap_store(workspace_root, cache_root)?;
             tracing::warn!(
                 target: "squeezy::store",
@@ -125,6 +126,7 @@ impl SqueezyStore {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
                 fs::rename(&path, &backup)?;
+                sync_parent_dir(&backup)?;
                 bootstrap_store(workspace_root, cache_root)?;
                 copy_state_tables(&backup, &path)?;
                 tracing::warn!(
@@ -173,13 +175,14 @@ impl SqueezyStore {
         self.graph_store()?.clear_graph_partitions()
     }
 
-    /// Apply a coherent set of graph changes (metadata + partition upserts and
-    /// removals) inside a single redb write transaction. Callers should batch
-    /// per-refresh churn through this rather than calling
-    /// [`set_graph_metadata`], [`put_graph_partition`], or
-    /// [`remove_graph_partition`] in a tight loop: each of those commits
-    /// independently and pays a fresh fsync, which dominates wall-clock cost
-    /// on a cold workspace crawl.
+    /// Apply a coherent set of graph changes (metadata, partition upserts and
+    /// removals, resolver snapshots, and resolver import graph) inside a
+    /// single redb write transaction. Callers should batch per-refresh churn
+    /// through this rather than calling [`set_graph_metadata`],
+    /// [`put_graph_partition`], [`remove_graph_partition`], or
+    /// [`put_import_graph`] in a tight loop: each of those commits
+    /// independently and pays a fresh fsync, which dominates wall-clock cost on
+    /// a cold workspace crawl.
     pub fn apply_graph_batch(&self, batch: &GraphWriteBatch) -> Result<()> {
         self.graph_store()?.apply_graph_batch(batch)
     }
@@ -561,6 +564,7 @@ impl GraphStore {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
                 fs::rename(&path, &backup)?;
+                sync_parent_dir(&backup)?;
                 tracing::warn!(
                     target: "squeezy::store",
                     on_disk_version,
@@ -670,6 +674,14 @@ impl GraphStore {
                 table.remove(key.as_str()).map_err(store_error)?;
             }
         }
+        if let Some(import_graph) = &batch.import_graph {
+            let mut table = write
+                .open_table(RESOLVER_IMPORT_GRAPH)
+                .map_err(store_error)?;
+            table
+                .insert("resolver_import_graph", import_graph.as_slice())
+                .map_err(store_error)?;
+        }
         write.commit().map_err(store_error)
     }
 
@@ -721,14 +733,9 @@ impl GraphStore {
     }
 
     pub fn put_import_graph<T: Serialize>(&self, graph: &T) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            let mut table = write
-                .open_table(RESOLVER_IMPORT_GRAPH)
-                .map_err(store_error)?;
-            insert_json(&mut table, "resolver_import_graph", graph)?;
-        }
-        write.commit().map_err(store_error)
+        let mut batch = GraphWriteBatch::new();
+        batch.set_import_graph(graph)?;
+        self.apply_graph_batch(&batch)
     }
 
     pub fn import_graph<T: DeserializeOwned>(&self) -> Result<Option<T>> {
@@ -764,6 +771,7 @@ pub struct GraphWriteBatch {
     removals: Vec<String>,
     resolver_upserts: Vec<(String, Vec<u8>)>,
     resolver_removals: Vec<String>,
+    import_graph: Option<Vec<u8>>,
 }
 
 impl GraphWriteBatch {
@@ -803,12 +811,18 @@ impl GraphWriteBatch {
         self.resolver_removals.push(file_id.0.clone());
     }
 
+    pub fn set_import_graph<T: Serialize>(&mut self, graph: &T) -> Result<()> {
+        self.import_graph = Some(encode(graph)?);
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.metadata.is_none()
             && self.upserts.is_empty()
             && self.removals.is_empty()
             && self.resolver_upserts.is_empty()
             && self.resolver_removals.is_empty()
+            && self.import_graph.is_none()
     }
 
     pub fn len(&self) -> usize {
@@ -816,6 +830,7 @@ impl GraphWriteBatch {
             + self.removals.len()
             + self.resolver_upserts.len()
             + self.resolver_removals.len()
+            + usize::from(self.import_graph.is_some())
     }
 }
 
@@ -896,6 +911,7 @@ pub struct CacheFileReport {
     pub path: PathBuf,
     pub exists: bool,
     pub size_bytes: u64,
+    pub modified_unix_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -905,6 +921,36 @@ pub struct CacheDiagnostics {
     pub graph: CacheFileReport,
     pub backups: Vec<CacheFileReport>,
     pub backup_total_bytes: u64,
+    pub storage: Vec<StoragePathReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoragePathReport {
+    pub label: String,
+    pub path: PathBuf,
+    pub mount_source: Option<String>,
+    pub filesystem_type: Option<String>,
+    pub classification: StorageMountClassification,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageMountClassification {
+    Local,
+    Network,
+    Virtual,
+    Unknown,
+}
+
+impl StorageMountClassification {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Network => "network",
+            Self::Virtual => "virtual",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -917,18 +963,34 @@ pub fn cache_diagnostics(
     workspace_root: impl AsRef<Path>,
     cache_root: Option<&Path>,
 ) -> Result<CacheDiagnostics> {
+    cache_diagnostics_with_session_dir(workspace_root, cache_root, None)
+}
+
+pub fn cache_diagnostics_with_session_dir(
+    workspace_root: impl AsRef<Path>,
+    cache_root: Option<&Path>,
+    session_log_dir: Option<&Path>,
+) -> Result<CacheDiagnostics> {
     let workspace_root = workspace_root.as_ref();
     let cache_dir = cache_dir_path(workspace_root, cache_root);
     let state = cache_file_report(state_path(workspace_root, cache_root));
     let graph = cache_file_report(graph_path(workspace_root, cache_root));
     let backups = cache_backups(&cache_dir)?;
     let backup_total_bytes = backups.iter().map(|file| file.size_bytes).sum();
+    let session_dir = session_dir_path(workspace_root, cache_root, session_log_dir);
+    let storage = storage_reports([
+        ("cache", cache_dir.as_path()),
+        ("sessions", session_dir.as_path()),
+        ("state.redb", state.path.as_path()),
+        ("graph.redb", graph.path.as_path()),
+    ]);
     Ok(CacheDiagnostics {
         cache_dir,
         state,
         graph,
         backups,
         backup_total_bytes,
+        storage,
     })
 }
 
@@ -975,10 +1037,25 @@ fn bootstrap_graph_store(path: &Path) -> Result<()> {
 
 pub fn cache_dir_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
     match cache_root {
+        Some(path) if is_xdg_cache_root(path) => xdg_cache_dir_path(workspace_root),
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => workspace_root.join(path),
         None => workspace_root.join(".squeezy").join("cache"),
     }
+}
+
+pub fn session_dir_path(
+    workspace_root: &Path,
+    cache_root: Option<&Path>,
+    session_log_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = session_log_dir {
+        return resolve_workspace_path(workspace_root, path);
+    }
+    if let Some(root) = cache_root {
+        return cache_dir_path(workspace_root, Some(root)).join("sessions");
+    }
+    workspace_root.join(".squeezy").join("sessions")
 }
 
 pub fn state_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
@@ -1080,11 +1157,17 @@ fn cache_file_report(path: PathBuf) -> CacheFileReport {
             path,
             exists: true,
             size_bytes: metadata.len(),
+            modified_unix_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis()),
         },
         Err(_) => CacheFileReport {
             path,
             exists: false,
             size_bytes: 0,
+            modified_unix_ms: None,
         },
     }
 }
@@ -1126,6 +1209,243 @@ fn backup_path(path: &Path, on_disk_version: u64) -> PathBuf {
 fn backup_path_with_label(path: &Path, label: &str) -> PathBuf {
     let suffix = format!("{label}-{}.redb.bak", unix_millis());
     path.with_file_name(suffix)
+}
+
+pub(crate) fn is_xdg_cache_root(path: &Path) -> bool {
+    path == Path::new("xdg")
+}
+
+fn xdg_cache_dir_path(workspace_root: &Path) -> PathBuf {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| workspace_root.join(".squeezy").join("cache"));
+    base.join("squeezy").join(repo_settings_id(workspace_root))
+}
+
+fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = unique_tmp_path(path);
+    let result = (|| -> io::Result<()> {
+        {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            use std::io::Write as _;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let stamp = unix_millis();
+    let counter = NEXT_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{name}.{pid}.{stamp}.{counter}.tmp")),
+        None => path.with_extension(format!("{pid}.{stamp}.{counter}.tmp")),
+    }
+}
+
+static NEXT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let dir = fs::File::open(parent)?;
+        return match dir.sync_all() {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ) =>
+            {
+                tracing::warn!(
+                    target: "squeezy::store",
+                    path = %parent.display(),
+                    error = %error,
+                    "filesystem rejected directory fsync after atomic rename",
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn storage_reports<'a>(
+    paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Vec<StoragePathReport> {
+    paths
+        .into_iter()
+        .map(|(label, path)| storage_report(label, path))
+        .collect()
+}
+
+fn storage_report(label: &str, path: &Path) -> StoragePathReport {
+    let mount = mount_for_path(path);
+    let filesystem_type = mount.as_ref().map(|mount| mount.fs_type.clone());
+    let mount_source = mount.as_ref().map(|mount| mount.source.clone());
+    let classification = filesystem_type
+        .as_deref()
+        .map(classify_filesystem)
+        .unwrap_or(StorageMountClassification::Unknown);
+    let warning = storage_warning(classification, filesystem_type.as_deref());
+    StoragePathReport {
+        label: label.to_string(),
+        path: path.to_path_buf(),
+        mount_source,
+        filesystem_type,
+        classification,
+        warning,
+    }
+}
+
+fn storage_warning(
+    classification: StorageMountClassification,
+    filesystem_type: Option<&str>,
+) -> Option<String> {
+    match classification {
+        StorageMountClassification::Network => Some(format!(
+            "{} filesystems can surprise redb locking, mmap, rename, or fsync; move [cache].root to a local SSD path",
+            filesystem_type.unwrap_or("network")
+        )),
+        StorageMountClassification::Virtual => Some(format!(
+            "{} filesystems can make cache locking or fsync slower or less durable; prefer a local SSD cache path",
+            filesystem_type.unwrap_or("virtual")
+        )),
+        StorageMountClassification::Local | StorageMountClassification::Unknown => None,
+    }
+}
+
+fn classify_filesystem(fs_type: &str) -> StorageMountClassification {
+    let fs_type = fs_type.to_ascii_lowercase();
+    match fs_type.as_str() {
+        "nfs" | "nfs4" | "cifs" | "smb" | "smb2" | "smb3" | "sshfs" | "9p" | "afs" | "ceph"
+        | "glusterfs" | "davfs" => StorageMountClassification::Network,
+        "fuse" | "fuseblk" | "fuse.sshfs" | "overlay" | "overlayfs" | "aufs" | "unionfs"
+        | "virtiofs" => StorageMountClassification::Virtual,
+        "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "apfs" | "hfs" | "hfsplus" | "zfs"
+        | "tmpfs" | "f2fs" | "ufs" => StorageMountClassification::Local,
+        _ => StorageMountClassification::Unknown,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MountEntry {
+    mount_point: PathBuf,
+    fs_type: String,
+    source: String,
+}
+
+fn mount_for_path(path: &Path) -> Option<MountEntry> {
+    #[cfg(target_os = "linux")]
+    {
+        let entries = parse_linux_mountinfo(&fs::read_to_string("/proc/self/mountinfo").ok()?);
+        let canonical = path
+            .canonicalize()
+            .or_else(|_| {
+                path.parent()
+                    .map(Path::canonicalize)
+                    .unwrap_or_else(|| Ok(path.to_path_buf()))
+            })
+            .unwrap_or_else(|_| path.to_path_buf());
+        entries
+            .into_iter()
+            .filter(|entry| canonical.starts_with(&entry.mount_point))
+            .max_by_key(|entry| entry.mount_point.to_string_lossy().len())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_mountinfo(contents: &str) -> Vec<MountEntry> {
+    contents
+        .lines()
+        .filter_map(parse_linux_mountinfo_line)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_mountinfo_line(line: &str) -> Option<MountEntry> {
+    let (pre, post) = line.split_once(" - ")?;
+    let mut pre_fields = pre.split_whitespace();
+    let _mount_id = pre_fields.next()?;
+    let _parent_id = pre_fields.next()?;
+    let _major_minor = pre_fields.next()?;
+    let _root = pre_fields.next()?;
+    let mount_point = unescape_mountinfo_path(pre_fields.next()?);
+    let mut post_fields = post.split_whitespace();
+    let fs_type = post_fields.next()?.to_string();
+    let source = post_fields.next().unwrap_or("").to_string();
+    Some(MountEntry {
+        mount_point: PathBuf::from(mount_point),
+        fs_type,
+        source,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo_path(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let mut octal = String::new();
+            for _ in 0..3 {
+                match chars.peek().copied() {
+                    Some(next) if next.is_ascii_digit() => {
+                        octal.push(next);
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+            if octal.len() == 3
+                && let Ok(byte) = u8::from_str_radix(&octal, 8)
+            {
+                out.push(byte as char);
+                continue;
+            }
+            out.push(ch);
+            out.push_str(&octal);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn insert_json<T: Serialize>(

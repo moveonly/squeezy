@@ -10,7 +10,8 @@ use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
 };
 use squeezy_store::{
-    SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
+    GraphStore, SessionStore, SqueezyStore, StoragePathReport, cache_diagnostics_with_session_dir,
+    ensure_repo_profile, prune_cache_backups,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use tokio_util::sync::CancellationToken;
@@ -47,6 +48,10 @@ pub struct DoctorArgs {
     /// exits without running other checks.
     #[arg(long)]
     pub sandbox_teardown: bool,
+    /// Include Linux-focused cache/session storage paths, mount types, and
+    /// backup age details in the cache diagnostic row.
+    #[arg(long)]
+    pub storage: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +238,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(skills_check(config));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
-        checks.push(cache_check(config, args.prune_cache));
+        checks.push(cache_check(config, args.prune_cache, args.storage));
     }
 
     checks.push(sandbox_check());
@@ -434,14 +439,41 @@ fn state_store_check(config: &AppConfig) -> Check {
         Err(error) => Check {
             name: "state_store".to_string(),
             status: Status::Fail,
-            detail: format!("{error}"),
+            detail: format!("{} ({})", error, storage_error_hint(&error.to_string())),
         },
     }
 }
 
-fn cache_check(config: &AppConfig, prune: bool) -> Check {
-    let diagnostics = match cache_diagnostics(&config.workspace_root, config.cache.root.as_deref())
+fn storage_error_hint(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("lock") || lower.contains("busy") || lower.contains("would block") {
+        "likely lock contention"
+    } else if lower.contains("permission denied") || lower.contains("access denied") {
+        "likely permission problem"
+    } else if lower.contains("no space") || lower.contains("enospc") {
+        "likely disk full"
+    } else if lower.contains("corrupt")
+        || lower.contains("checksum")
+        || lower.contains("invalid database")
+        || lower.contains("invalid magic")
     {
+        "possible redb corruption"
+    } else if lower.contains("unsupported")
+        || lower.contains("operation not supported")
+        || lower.contains("not supported")
+    {
+        "possible unsupported filesystem behavior"
+    } else {
+        "storage open failed"
+    }
+}
+
+fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
+    let diagnostics = match cache_diagnostics_with_session_dir(
+        &config.workspace_root,
+        config.cache.root.as_deref(),
+        config.session_logs.log_dir.as_deref(),
+    ) {
         Ok(diagnostics) => diagnostics,
         Err(error) => {
             return Check {
@@ -472,6 +504,41 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
         status = Status::Warn;
         detail.push_str("; run `squeezy doctor --prune-cache` to remove backups");
     }
+    let storage_warnings: Vec<&StoragePathReport> = diagnostics
+        .storage
+        .iter()
+        .filter(|report| report.warning.is_some())
+        .collect();
+    if !storage_warnings.is_empty() {
+        status = Status::Warn;
+        detail.push_str("; storage warning: ");
+        detail.push_str(
+            &storage_warnings
+                .iter()
+                .map(|report| {
+                    format!(
+                        "{}={}({})",
+                        report.label,
+                        report.filesystem_type.as_deref().unwrap_or("unknown"),
+                        report.classification.as_str()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        detail.push_str("; move [cache].root to a local SSD path");
+    }
+    if storage {
+        detail.push_str("; storage: ");
+        detail.push_str(&format_storage_reports(&diagnostics.storage));
+        detail.push_str("; probes: ");
+        detail.push_str(&format_storage_probes(config));
+        if !diagnostics.backups.is_empty() {
+            detail.push_str("; backups: ");
+            detail.push_str(&format_backup_details(&diagnostics.backups));
+            detail.push_str("; prune command: squeezy doctor --prune-cache");
+        }
+    }
     if prune {
         match prune_cache_backups(&config.workspace_root, config.cache.root.as_deref()) {
             Ok(report) => {
@@ -496,6 +563,85 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
         name: "cache".to_string(),
         status,
         detail,
+    }
+}
+
+fn format_storage_probes(config: &AppConfig) -> String {
+    let state = match SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref()) {
+        Ok(store) => format!("state.redb=open({})", store.path().display()),
+        Err(error) => format!(
+            "state.redb=fail:{}({})",
+            storage_error_hint(&error.to_string()),
+            error
+        ),
+    };
+    let graph = match GraphStore::open(&config.workspace_root, config.cache.root.as_deref()) {
+        Ok(store) => format!("graph.redb=open({})", store.path().display()),
+        Err(error) => format!(
+            "graph.redb=fail:{}({})",
+            storage_error_hint(&error.to_string()),
+            error
+        ),
+    };
+    format!("{state}, {graph}")
+}
+
+fn format_storage_reports(reports: &[StoragePathReport]) -> String {
+    reports
+        .iter()
+        .map(|report| {
+            let fs_type = report.filesystem_type.as_deref().unwrap_or("unknown");
+            let source = report.mount_source.as_deref().unwrap_or("unknown");
+            format!(
+                "{}={} fs={} source={} class={}",
+                report.label,
+                report.path.display(),
+                fs_type,
+                source,
+                report.classification.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn format_backup_details(backups: &[squeezy_store::CacheFileReport]) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis());
+    backups
+        .iter()
+        .map(|backup| {
+            let age = match (now_ms, backup.modified_unix_ms) {
+                (Some(now), Some(modified)) if now >= modified => {
+                    format_age_ms(now.saturating_sub(modified))
+                }
+                _ => "age unknown".to_string(),
+            };
+            format!(
+                "{} {} {}",
+                backup.path.display(),
+                format_bytes(backup.size_bytes),
+                age
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_age_ms(age_ms: u128) -> String {
+    const MINUTE: u128 = 60_000;
+    const HOUR: u128 = 60 * MINUTE;
+    const DAY: u128 = 24 * HOUR;
+    if age_ms >= DAY {
+        format!("{}d old", age_ms / DAY)
+    } else if age_ms >= HOUR {
+        format!("{}h old", age_ms / HOUR)
+    } else if age_ms >= MINUTE {
+        format!("{}m old", age_ms / MINUTE)
+    } else {
+        "less than 1m old".to_string()
     }
 }
 

@@ -14,13 +14,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload,
-    ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, CacheDurability, ContextAttachment, ContextCompactionState, CostSnapshot,
+    ReasoningPayload, ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError,
+    TranscriptItem,
 };
+
+use crate::{atomic_replace, session_dir_path, sync_parent_dir};
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -85,6 +89,7 @@ pub struct SessionStore {
     retention_archive_days: u64,
     max_event_bytes: usize,
     max_session_bytes: usize,
+    durability: CacheDurability,
 }
 
 impl SessionStore {
@@ -96,6 +101,7 @@ impl SessionStore {
             retention_archive_days: config.session_logs.log_retention_archive_days,
             max_event_bytes: config.session_logs.max_event_bytes,
             max_session_bytes: config.session_logs.max_session_bytes,
+            durability: config.cache.durability,
         }
     }
 
@@ -238,17 +244,17 @@ impl SessionStore {
         let Some(path) = Self::global_index_path() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let Ok(mut payload) = serde_json::to_vec(entry) else {
             return;
         };
         payload.push(b'\n');
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
-            return;
-        };
-        let _ = file.write_all(&payload);
+        let _ = with_global_index_lock(&path, || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(&payload)
+        });
     }
 
     /// Read the cross-project session index, deduping by `session_id` and
@@ -321,7 +327,7 @@ impl SessionStore {
             // Compact in oldest-first order so future appends keep the newest
             // entries at the tail — matches how readers see time.
             ordered.sort_by_key(|entry| entry.started_at_ms);
-            let _ = rewrite_global_index(&path, &ordered);
+            let _ = with_global_index_lock(&path, || rewrite_global_index(&path, &ordered));
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
         cache_global_index(&path, &entries);
@@ -1182,9 +1188,37 @@ fn run_session_log_writer(
                 }
             }
             SessionLogCmd::Flush { ack } => {
+                if terminal_failure.is_none()
+                    && matches!(
+                        store.durability,
+                        CacheDurability::Turn | CacheDurability::Strict
+                    )
+                    && let Err(error) =
+                        sync_file_if_exists(&path).and_then(|()| sync_parent_dir(&path))
+                {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
                 let _ = ack.send(session_log_writer_result(terminal_failure.as_deref()));
             }
             SessionLogCmd::Shutdown { ack } => {
+                if terminal_failure.is_none()
+                    && matches!(
+                        store.durability,
+                        CacheDurability::Turn | CacheDurability::Strict
+                    )
+                    && let Err(error) =
+                        sync_file_if_exists(&path).and_then(|()| sync_parent_dir(&path))
+                {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
                 let _ = ack.send(session_log_writer_result(terminal_failure.as_deref()));
                 break;
             }
@@ -1225,6 +1259,10 @@ fn write_session_log_append(
         return Ok(());
     }
     append_payload_with_recovery(path, &append.payload, current_size)?;
+    if store.durability == CacheDurability::Strict {
+        sync_file_if_exists(path)?;
+        sync_parent_dir(path)?;
+    }
     Ok(())
 }
 
@@ -1281,6 +1319,14 @@ fn append_payload_once(
         }
     }
     Ok(written)
+}
+
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::File::open(path) {
+        Ok(file) => file.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
@@ -1368,7 +1414,16 @@ impl SessionHandle {
                 InnerState::Transitioning => unreachable!(),
             }
         };
-        writer.flush()
+        writer.flush()?;
+        if matches!(
+            self.store.durability,
+            CacheDurability::Turn | CacheDurability::Strict
+        ) {
+            let replay_path = self.dir().join("replay.jsonl");
+            sync_file_if_exists(&replay_path)?;
+            sync_parent_dir(&replay_path)?;
+        }
+        Ok(())
     }
 
     /// Promote a pending session to the live form: create the session
@@ -1572,6 +1627,10 @@ impl SessionHandle {
 
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(&payload)?;
+        if self.store.durability == CacheDurability::Strict {
+            file.sync_all()?;
+            sync_parent_dir(&path)?;
+        }
         Ok(())
     }
 
@@ -2778,21 +2837,11 @@ pub enum CleanupMode {
 }
 
 fn session_root(config: &AppConfig) -> PathBuf {
-    if let Some(path) = &config.session_logs.log_dir {
-        return resolve_workspace_path(&config.workspace_root, path);
-    }
-    if let Some(root) = &config.cache.root {
-        return resolve_workspace_path(&config.workspace_root, root).join("sessions");
-    }
-    config.workspace_root.join(".squeezy").join("sessions")
-}
-
-fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
+    session_dir_path(
+        &config.workspace_root,
+        config.cache.root.as_deref(),
+        config.session_logs.log_dir.as_deref(),
+    )
 }
 
 /// Return whether the file at `path` ends with a `\n` byte. Used by the
@@ -2811,38 +2860,17 @@ fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
     Ok(buf[0] == b'\n')
 }
 
-/// Serialize `value` to `path` atomically: write to a sibling temp file,
-/// `sync_all`, then `fs::rename` over the target. A reader (and a crash)
-/// therefore only ever observes the previous complete file or the new
-/// complete file, never a truncated/torn one. This matters because
-/// `metadata.json` is rewritten on essentially every turn; a non-atomic
-/// in-place write left a torn metadata file that silently hid an
-/// otherwise-recoverable session from `list()`/`resume()`. Mirrors the
-/// tmp + `sync_all` + `rename` pattern in [`rewrite_global_index`].
+/// Serialize `value` to `path` atomically: write to a unique sibling temp
+/// file, `sync_all`, `fs::rename` over the target, then fsync the parent
+/// directory. A reader (and a Linux crash) therefore only ever observes the
+/// previous complete file or the new complete file, never a truncated/torn
+/// one or an unsynced directory entry. This matters because `metadata.json`
+/// is rewritten on essentially every turn; a non-atomic in-place write left a
+/// torn metadata file that silently hid an otherwise-recoverable session from
+/// `list()`/`resume()`.
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    // Per-pid temp name so concurrent writers to the same path don't
-    // clobber each other's in-flight temp file before the rename.
-    let tmp = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
-        None => path.with_extension("tmp"),
-    };
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error.into());
-    }
+    atomic_replace(path, &bytes)?;
     Ok(())
 }
 
@@ -2923,27 +2951,67 @@ fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
 /// caller chooses the iteration order; readers re-sort by
 /// `started_at_ms`.
 fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let mut bytes = Vec::new();
+    for entry in entries {
+        let mut payload = match serde_json::to_vec(entry) {
+            Ok(payload) => payload,
+            Err(_) => continue,
+        };
+        payload.push(b'\n');
+        bytes.extend_from_slice(&payload);
+    }
+    atomic_replace(path, &bytes)
+}
+
+fn with_global_index_lock<T>(
+    path: &Path,
+    action: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let lock = global_index_lock_path(path);
+    if let Some(parent) = lock.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        for entry in entries {
-            let mut payload = match serde_json::to_vec(entry) {
-                Ok(payload) => payload,
-                Err(_) => continue,
-            };
-            payload.push(b'\n');
-            file.write_all(&payload)?;
-        }
-        file.sync_all()?;
+    let lock_file = acquire_global_index_lock(&lock)?;
+    let result = action();
+    let unlock_result = lock_file.unlock();
+    match (result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
     }
-    fs::rename(&tmp, path)
+}
+
+fn global_index_lock_path(path: &Path) -> PathBuf {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{name}.compact.lock")),
+        None => path.with_extension("lock"),
+    }
+}
+
+fn acquire_global_index_lock(path: &Path) -> std::io::Result<fs::File> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if is_lock_contention(&error) => {
+                last_error = Some(error);
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("global index lock unavailable")))
+}
+
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    let contended = fs2::lock_contended_error();
+    error.kind() == contended.kind() || error.raw_os_error() == contended.raw_os_error()
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
