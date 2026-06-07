@@ -10043,13 +10043,10 @@ async fn max_tokens_escalation_skipped_when_it_would_overrun_the_cap() {
     );
     // The partial the user already saw is preserved on the failure.
     let state = agent.conversation_state.lock().await;
-    let preserved = state
-        .transcript
-        .iter()
-        .any(|item| {
-            item.role == squeezy_core::Role::Assistant
-                && item.content.contains("partial truncated output")
-        });
+    let preserved = state.transcript.iter().any(|item| {
+        item.role == squeezy_core::Role::Assistant
+            && item.content.contains("partial truncated output")
+    });
     drop(state);
     assert!(
         preserved,
@@ -10123,7 +10120,11 @@ async fn malformed_function_call_retries_with_corrective_nudge() {
     assert!(!failed, "malformed tool call should recover, not fail");
     assert_eq!(completed_text.as_deref(), Some("The fix is in src/foo.rs."));
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "malformed round plus one corrective retry");
+    assert_eq!(
+        requests.len(),
+        2,
+        "malformed round plus one corrective retry"
+    );
     let retry = &requests[1];
     let has_nudge = retry.input.iter().any(|item| match item {
         LlmInputItem::UserText(text) => text.contains("could not be parsed"),
