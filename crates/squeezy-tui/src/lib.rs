@@ -6648,38 +6648,187 @@ fn format_request_user_input_menu_lines(
     lines
 }
 
+fn approval_option_lines(request: &ToolApprovalRequest, selected: usize) -> Vec<Line<'static>> {
+    let options = approval_options_for(request);
+    let max_index = options.len().saturating_sub(1);
+    options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let is_selected = index == selected.min(max_index);
+            let marker = if is_selected { "› " } else { "  " };
+            // Tint the active cursor + bold its label so the highlighted choice
+            // is unmistakable; unselected rows stay calm.
+            let marker_style = if is_selected {
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(crate::render::theme::quiet())
+            };
+            let label_style = if is_selected {
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette::muted_fg())
+            };
+            Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::styled(option.label.to_string(), label_style),
+                Span::styled(
+                    format!(" · {}", option.hint),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+            ])
+        })
+        .collect()
+}
+
 fn format_approval_menu_lines(
     request: &ToolApprovalRequest,
     selected: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = approval::render_preview(request);
-    let options = approval_options_for(request);
-    let max_index = options.len().saturating_sub(1);
-    for (index, option) in options.iter().enumerate() {
-        let is_selected = index == selected.min(max_index);
-        let marker = if is_selected { "› " } else { "  " };
-        let label_style = if is_selected {
-            Style::default().fg(crate::render::theme::secondary())
-        } else {
-            Style::default().fg(palette::muted_fg())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                marker,
-                Style::default().fg(if is_selected {
-                    crate::render::theme::secondary()
-                } else {
-                    crate::render::theme::quiet()
-                }),
-            ),
-            Span::styled(option.label.to_string(), label_style),
-            Span::styled(
-                format!(" · {}", option.hint),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-        ]));
-    }
+    lines.extend(approval_option_lines(request, selected));
     lines
+}
+
+/// The decision keybindings, folded into the bottom of the approval block so
+/// they travel with the options they describe. The status line no longer
+/// carries them.
+fn approval_keybind_hint() -> &'static str {
+    "Up/Down choose · Enter/Y approve once · A/P always approve repo · N/D deny · Esc cancel"
+}
+
+fn approval_footer_line() -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {}", approval_keybind_hint()),
+        Style::default().fg(crate::render::theme::footer()),
+    ))
+}
+
+/// The complete approval block including the folded keybind footer — used to
+/// measure the block's desired height.
+fn approval_block_full(request: &ToolApprovalRequest, selected: usize) -> Vec<Line<'static>> {
+    let mut lines = format_approval_menu_lines(request, selected);
+    lines.push(approval_footer_line());
+    lines
+}
+
+/// Render the approval block to fit `max_height` visible rows at `width`,
+/// eliding the *preview* (command / rationale / rule) — never the decision
+/// options or their key hints — when space is tight. This makes it
+/// structurally impossible for the options to be clipped behind the status
+/// line on a short terminal.
+fn approval_block_capped(
+    request: &ToolApprovalRequest,
+    selected: usize,
+    max_height: u16,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let parts = approval::render_preview_parts(request);
+    let options = approval_option_lines(request, selected);
+    let footer = approval_footer_line();
+    let row = |line: &Line<'static>| visual_line_count(std::slice::from_ref(line), width) as usize;
+    let rows = |lines: &[Line<'static>]| visual_line_count(lines, width) as usize;
+
+    let header_rows = row(&parts.header);
+    let option_rows = rows(&options);
+    let footer_rows = row(&footer);
+    let blank_rows = 1usize;
+
+    // Body in display order (matches `render_preview`): rationale, subject, rule.
+    let mut body: Vec<Line<'static>> = Vec::new();
+    body.extend(parts.context.iter().cloned());
+    body.extend(parts.subject.iter().cloned());
+    body.extend(parts.rule.iter().cloned());
+
+    let max = max_height as usize;
+    let full = header_rows + rows(&body) + blank_rows + option_rows + footer_rows;
+    if max == 0 || full <= max {
+        let mut out = Vec::with_capacity(body.len() + options.len() + 3);
+        out.push(parts.header);
+        out.extend(body);
+        out.push(Line::raw(""));
+        out.extend(options);
+        out.push(footer);
+        return out;
+    }
+
+    // Shed the least-critical fixed rows first (footer, then the separator
+    // blank, then the header); the option rows always survive.
+    let reserved = |hdr: bool, blk: bool, ftr: bool| -> usize {
+        (if hdr { header_rows } else { 0 })
+            + (if blk { blank_rows } else { 0 })
+            + option_rows
+            + (if ftr { footer_rows } else { 0 })
+    };
+    let mut keep_header = true;
+    let mut keep_blank = true;
+    let mut keep_footer = true;
+    if reserved(keep_header, keep_blank, keep_footer) > max {
+        keep_footer = false;
+    }
+    if reserved(keep_header, keep_blank, keep_footer) > max {
+        keep_blank = false;
+    }
+    if reserved(keep_header, keep_blank, keep_footer) > max {
+        keep_header = false;
+    }
+    let preview_budget = max.saturating_sub(reserved(keep_header, keep_blank, keep_footer));
+
+    // Elided preview: command/subject first (it is the thing being approved),
+    // then the rationale, then the rule; summarise the remainder in one note.
+    let mut ordered: Vec<Line<'static>> = Vec::new();
+    ordered.extend(parts.subject);
+    ordered.extend(parts.context);
+    ordered.extend(parts.rule);
+    let total = ordered.len();
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if keep_header {
+        out.push(parts.header);
+    }
+    if preview_budget > 0 {
+        let elide = rows(&ordered) > preview_budget;
+        let line_budget = if elide {
+            preview_budget.saturating_sub(1)
+        } else {
+            preview_budget
+        };
+        let mut used = 0usize;
+        let mut shown = 0usize;
+        for line in ordered.iter() {
+            let r = row(line);
+            if used + r > line_budget {
+                break;
+            }
+            used += r;
+            out.push(line.clone());
+            shown += 1;
+        }
+        if elide {
+            let hidden = total - shown;
+            if hidden > 0 {
+                out.push(Line::from(Span::styled(
+                    format!(
+                        "  … {hidden} more line{}",
+                        if hidden == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(crate::render::theme::quiet()),
+                )));
+            }
+        }
+    }
+    if keep_blank {
+        out.push(Line::raw(""));
+    }
+    out.extend(options);
+    if keep_footer {
+        out.push(footer);
+    }
+    out
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -6712,6 +6861,20 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         Some(h)
     } else {
         None
+    };
+    // Cap the approval block against the screen height so `input + approval +
+    // status` can never over-constrain the layout — otherwise ratatui clips the
+    // bottom of the block (the decision options) on a short terminal. The
+    // capped renderer elides the preview, not the options. The subagent pane
+    // and transcript yield to the active approval, so they are not reserved.
+    let approval_height = if app.pending_approval.is_some() {
+        let reserve = input_height
+            .saturating_add(2)
+            .saturating_add(plan_indicator_height)
+            .saturating_add(task_height.unwrap_or(0));
+        approval_height.min(area.height.saturating_sub(reserve))
+    } else {
+        approval_height
     };
     let required_height = task_height
         .unwrap_or(0)
@@ -6882,6 +7045,17 @@ fn render_inline(
     live_lines.extend(pending_assistant_lines(app));
     let live_visual_height = visual_line_count(&live_lines, area.width);
     let live_gap = if live_visual_height > 0 { 1 } else { 0 };
+    // Cap the approval block so the options can never be clipped behind the
+    // status line on a short terminal (see the matching note in `render`).
+    let approval_height = if app.pending_approval.is_some() {
+        let reserve = input_height
+            .saturating_add(status_height)
+            .saturating_add(plan_indicator_height)
+            .saturating_add(task_height.unwrap_or(0));
+        approval_height.min(area.height.saturating_sub(reserve))
+    } else {
+        approval_height
+    };
     let required_height = task_height
         .unwrap_or(0)
         .saturating_add(input_height)
@@ -7455,7 +7629,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
     // and live regions and is safe (it rounds up per line, never down).
     if let Some(pending) = app.pending_approval.as_ref() {
         visual_line_count(
-            &format_approval_menu_lines(&pending.request, app.approval_selection_index),
+            &approval_block_full(&pending.request, app.approval_selection_index),
             width,
         )
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
@@ -7486,16 +7660,27 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
 }
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(approval_lines(app))
+    // Approvals render through the height-capped builder so the decision
+    // options always fit the chunk the layout reserved for them; the other
+    // pending prompts keep their existing (uncapped) rendering.
+    let lines = if let Some(pending) = app.pending_approval.as_ref() {
+        approval_block_capped(
+            &pending.request,
+            app.approval_selection_index,
+            area.height,
+            area.width,
+        )
+    } else {
+        approval_lines(app)
+    };
+    let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(crate::render::theme::quiet()))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    if let Some(pending) = app.pending_approval.as_ref() {
-        format_approval_menu_lines(&pending.request, app.approval_selection_index)
-    } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
+    if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
         format_mcp_elicitation_menu_lines(
             &pending.request,
             app.mcp_elicitation_selection_index,
@@ -15120,8 +15305,9 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         }
         return "Enter accept · N decline · Esc cancel".to_string();
     } else if app.pending_approval.is_some() {
-        return "Up/Down choose · Enter/Y approve once · A/P always approve repo · N/D deny · Esc cancel"
-            .to_string();
+        // The approval keybindings now live in the block footer, folded in with
+        // the options they drive, so the status hint row stays clear.
+        return String::new();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
     } else if app.cancel.is_some() {
