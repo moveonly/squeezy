@@ -25,7 +25,7 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler, filesystem_paths_match,
+    CrawlOptions, FileRecord, IndexCoverage, PathConflict, WorkspaceCrawler, filesystem_paths_match,
 };
 
 use crate::languages::{
@@ -1998,6 +1998,7 @@ pub struct GraphBuildReport {
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
+    pub path_conflicts: Vec<PathConflict>,
     pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub language: LanguageReport,
@@ -2018,6 +2019,7 @@ pub struct RefreshReport {
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
+    pub path_conflicts: Vec<PathConflict>,
     pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub bytes_reparsed: u64,
@@ -2191,6 +2193,7 @@ impl GraphManager {
             excluded_files: snapshot.coverage.skipped_files,
             excluded_dirs: snapshot.coverage.skipped_dirs,
             excluded_bytes: snapshot.coverage.skipped_bytes,
+            path_conflicts: snapshot.path_conflicts.clone(),
             coverage: snapshot.coverage.clone(),
             bytes_seen,
             language,
@@ -2322,6 +2325,7 @@ impl GraphManager {
                 excluded_files: self.build_report.excluded_files,
                 excluded_dirs: self.build_report.excluded_dirs,
                 excluded_bytes: self.build_report.excluded_bytes,
+                path_conflicts: self.build_report.path_conflicts.clone(),
                 coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
@@ -2350,6 +2354,7 @@ impl GraphManager {
                 excluded_files: self.build_report.excluded_files,
                 excluded_dirs: self.build_report.excluded_dirs,
                 excluded_bytes: self.build_report.excluded_bytes,
+                path_conflicts: self.build_report.path_conflicts.clone(),
                 coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
@@ -2363,6 +2368,7 @@ impl GraphManager {
         let snapshot = self.crawler.crawl(&self.root)?;
         let files_seen = snapshot.files.len();
         let coverage = snapshot.coverage.clone();
+        let path_conflicts = snapshot.path_conflicts.clone();
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let current = snapshot
@@ -2573,6 +2579,7 @@ impl GraphManager {
             }
             self.last_refresh = Instant::now();
         }
+        self.build_report.path_conflicts = path_conflicts.clone();
         Ok(RefreshReport {
             refreshed: reparsed_files > 0 || !removed_files.is_empty() || metadata_refresh_needed,
             changed_files,
@@ -2586,6 +2593,7 @@ impl GraphManager {
             excluded_files: coverage.skipped_files,
             excluded_dirs: coverage.skipped_dirs,
             excluded_bytes: coverage.skipped_bytes,
+            path_conflicts,
             coverage,
             bytes_seen,
             bytes_reparsed,

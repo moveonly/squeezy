@@ -1030,11 +1030,12 @@ impl WorkspaceRootKind {
         if is_windows_profile_container(&lowered) {
             return Self::WindowsProfileRoot;
         }
-        if path
-            .rsplit('/')
-            .find(|part| !part.is_empty())
-            .map(is_cloud_sync_root_name)
-            .unwrap_or(false)
+        if looks_windows_path(path)
+            && path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .map(is_cloud_sync_root_name)
+                .unwrap_or(false)
         {
             return Self::WindowsCloudRoot;
         }

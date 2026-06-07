@@ -402,6 +402,23 @@ fn windows_root_profiles_classify_broad_roots() {
 }
 
 #[test]
+fn cloud_folder_names_only_block_when_path_is_windows_shaped() {
+    let root = Path::new("/tmp/OneDrive");
+    let profile = WorkspaceRootProfile::from_path(root);
+    assert_eq!(profile.kind, WorkspaceRootKind::Other);
+
+    let decision = decide_indexing(root, true);
+    assert!(
+        !decision
+            .negative_signals
+            .iter()
+            .any(|signal| signal.contains("cloud-synced Windows folder")),
+        "{:?}",
+        decision.negative_signals
+    );
+}
+
+#[test]
 fn windows_broad_roots_block_indexing_even_with_positive_markers() {
     let decision = decide_indexing(Path::new(r"C:\Users"), true);
     assert!(!decision.should_index);

@@ -110,7 +110,8 @@ File records keep their exact slash-normalized relative paths, but the workspace
 snapshot also reports `path_conflicts`: groups whose lowercase normalized
 relative path collides. That catches Linux-valid states such as `src/Foo.rs` and
 `src/foo.rs` before they become fragile on default NTFS or case-insensitive
-Windows-compatible mounts.
+Windows-compatible mounts. Graph tool payloads include a compact
+`path_conflicts` count and sample list when conflicts exist.
 
 - Direct calls resolve when the target is same-file, explicitly imported, or
   syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
