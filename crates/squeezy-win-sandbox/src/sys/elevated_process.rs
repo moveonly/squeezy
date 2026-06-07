@@ -10,8 +10,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW, CreateProcessWithLogonW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessWithLogonW,
 };
 
 use super::winutil::{ScopedHandle, err, to_wide, to_wide_path};
@@ -133,7 +134,10 @@ pub(crate) fn spawn_with_logon(
             LOGON_WITH_PROFILE,
             std::ptr::null(),          // lpApplicationName — use command line
             command_line.as_mut_ptr(),
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            // CREATE_SUSPENDED so the child is bound to its kill-on-close Job
+            // Object before it can spawn descendants (no escape race) — the
+            // elevated tier MUST have tree-kill just like every other backend.
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
             env_ptr,
             cwd_wide.as_ptr(),
             &si,
@@ -154,8 +158,13 @@ pub(crate) fn spawn_with_logon(
         )));
     }
 
-    // ── Close hThread immediately ────────────────────────────────────────────
+    // ── Bind to a kill-on-close Job Object, then resume ──────────────────────
+    // We created the process, so we hold `pi.hProcess` with full rights and can
+    // assign it to our job even though it runs as the sandbox user. Doing this
+    // while suspended binds every descendant into the job. Best-effort.
+    let job = super::job::create_and_assign(pi.hProcess);
     unsafe {
+        ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
     }
 
@@ -181,5 +190,6 @@ pub(crate) fn spawn_with_logon(
         stdout_read: RawHandle(raw_stdout_read as isize),
         stderr_read: RawHandle(raw_stderr_read as isize),
         stdin_write: stdin_write_out,
+        job: RawHandle(job.map_or(0, |j| j as isize)),
     })
 }

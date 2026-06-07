@@ -140,6 +140,10 @@ pub struct WinSandboxChildHandles {
     pub stdout_read: RawHandle,
     pub stderr_read: RawHandle,
     pub stdin_write: Option<RawHandle>,
+    /// Kill-on-close Job Object the child (and every descendant) is bound to, so
+    /// timeout/cancel tears down the whole tree. `NULL` if the job could not be
+    /// created/assigned (best-effort; the child then has no tree-kill).
+    pub job: RawHandle,
 }
 
 /// Summary of what `teardown_machine_state` removed, for `doctor` reporting.

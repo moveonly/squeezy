@@ -9,8 +9,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, CreateProcessAsUserW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, CreateProcessAsUserW,
 };
 
 use super::proc_thread_attr::ProcThreadAttrList;
@@ -117,7 +117,12 @@ pub(crate) fn spawn_with_token(
             std::ptr::null(),          // lpProcessAttributes
             std::ptr::null(),          // lpThreadAttributes
             1,                         // bInheritHandles = TRUE
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+            // CREATE_SUSPENDED so the child is assigned to its kill-on-close Job
+            // Object before it can spawn any descendants (no escape race).
+            CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NO_WINDOW
+                | EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_SUSPENDED,
             env_ptr as *mut _,
             cwd_wide.as_ptr(),
             // Cast STARTUPINFOEXW* → STARTUPINFOW*: the API accepts the extended
@@ -137,12 +142,14 @@ pub(crate) fn spawn_with_token(
         )));
     }
 
-    // ── Close child-side handles in the parent and hThread ───────────────────
-    // These are now owned by _stdout_write / _stderr_write / _stdin_read above
-    // so they'll close when those ScopedHandles drop — but we need to drop them
-    // NOW before returning, which they will at the end of this scope.
-    // Also close hThread immediately.
+    // ── Bind to a kill-on-close Job Object, then resume ──────────────────────
+    // The child is suspended, so assigning it to the job now guarantees every
+    // descendant it spawns is also bound into the job (process-tree kill on
+    // timeout/cancel and on handle close). Best-effort: if the job can't be
+    // created/assigned we still resume so the command runs.
+    let job = super::job::create_and_assign(pi.hProcess);
     unsafe {
+        ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
     }
 
@@ -170,5 +177,6 @@ pub(crate) fn spawn_with_token(
         stdout_read: RawHandle(raw_stdout_read as isize),
         stderr_read: RawHandle(raw_stderr_read as isize),
         stdin_write: stdin_write_out,
+        job: RawHandle(job.map_or(0, |j| j as isize)),
     })
 }

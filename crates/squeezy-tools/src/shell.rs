@@ -724,11 +724,17 @@ impl ToolRegistry {
 
         // Windows analog to Unix process groups: a Job Object created with
         // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills every descendant when either
-        // `terminate(...)` is called or the handle drops at function exit. The
-        // elevated sandbox child runs as a different user — the runner owns the
-        // tree and we cannot assign it to our Job Object — so it is skipped.
+        // `terminate(...)` is called or the handle drops at function exit.
+        //
+        // Both Windows sandbox tiers (restricted-token AND elevated) bind their
+        // child + descendants into a kill-on-close Job Object INSIDE
+        // `squeezy-win-sandbox` (created CREATE_SUSPENDED → assigned → resumed,
+        // so there is no escape race), and `terminate_shell_child` tears that
+        // job down via `WinSandboxChild::kill`. So we only need a `ShellJob`
+        // here for the non-sandboxed tokio path (e.g. windows_sandbox_level =
+        // "disabled"); assigning one to a sandbox child would be redundant.
         #[cfg(windows)]
-        let shell_job: Option<ShellJob> = if sandbox_plan.backend == "windows-elevated" {
+        let shell_job: Option<ShellJob> = if win_sandbox_backend {
             None
         } else {
             match ShellJob::new() {

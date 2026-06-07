@@ -15,6 +15,7 @@ mod elevated_exec;
 mod elevated_process;
 mod helper_materialization;
 mod identity;
+mod job;
 mod path_norm;
 mod proc_thread_attr;
 mod process;

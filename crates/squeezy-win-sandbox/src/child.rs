@@ -12,6 +12,7 @@ use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
 };
@@ -22,6 +23,8 @@ use crate::{RawHandle, WinSandboxChildHandles};
 pub struct WinSandboxChild {
     pid: u32,
     process: isize,
+    /// Kill-on-close Job Object the child + descendants are bound to (0 if none).
+    job: isize,
     stdout: Option<tokio::fs::File>,
     stderr: Option<tokio::fs::File>,
     stdin: Option<isize>,
@@ -33,6 +36,7 @@ impl WinSandboxChild {
         Self {
             pid: handles.pid,
             process: handles.process.0,
+            job: handles.job.0,
             stdout: wrap_pipe(handles.stdout_read),
             stderr: wrap_pipe(handles.stderr_read),
             stdin: handles.stdin_write.map(|h| h.0),
@@ -75,11 +79,16 @@ impl WinSandboxChild {
         Ok(ExitStatus::from_raw(code))
     }
 
-    /// Force-terminate the process tree root.
+    /// Force-terminate the whole process tree (job), or the root process if no
+    /// job is bound.
     pub fn kill(&self) {
-        // SAFETY: `process` is a live process handle owned by this struct.
+        // SAFETY: `job`/`process` are live handles owned by this struct.
         unsafe {
-            TerminateProcess(self.process as HANDLE, 1);
+            if self.job != 0 {
+                TerminateJobObject(self.job as HANDLE, 1);
+            } else {
+                TerminateProcess(self.process as HANDLE, 1);
+            }
         }
     }
 }
@@ -87,7 +96,9 @@ impl WinSandboxChild {
 impl Drop for WinSandboxChild {
     fn drop(&mut self) {
         // SAFETY: handles owned by this struct; closed exactly once on drop.
-        // The stdout/stderr `tokio::fs::File`s close their own handles.
+        // The stdout/stderr `tokio::fs::File`s close their own handles. Closing
+        // the job handle last triggers JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        // reaping any descendants that outlived the root.
         unsafe {
             if self.process != 0 {
                 CloseHandle(self.process as HANDLE);
@@ -96,6 +107,9 @@ impl Drop for WinSandboxChild {
                 && stdin != 0
             {
                 CloseHandle(stdin as HANDLE);
+            }
+            if self.job != 0 {
+                CloseHandle(self.job as HANDLE);
             }
         }
     }
