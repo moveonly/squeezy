@@ -240,6 +240,16 @@ pub struct CheckpointFile {
     pub patch_truncated: bool,
 }
 
+impl CheckpointFile {
+    fn before_entry_state(&self) -> WorkspaceEntryState {
+        WorkspaceEntryState {
+            sha256: self.before_sha256.clone(),
+            file_type: self.before_file_type,
+            mode: self.before_mode.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointFileType {
@@ -1134,7 +1144,7 @@ impl CheckpointStore {
             self.rollback_record(record, &mut result)?;
         }
         self.track_tree()?;
-        result.applied = true;
+        result.applied = !result.file_actions.is_empty();
         self.append_journal(json!({
             "kind": "rollback",
             "created_at_ms": now_ms(),
@@ -1320,22 +1330,49 @@ impl CheckpointStore {
 
     fn preflight_conflicts(&self, records: &[CheckpointRecord]) -> Result<Vec<RollbackConflict>> {
         let mut conflicts = Vec::new();
-        let mut virtual_hashes = BTreeMap::<String, Option<String>>::new();
+        let mut virtual_states = BTreeMap::<String, WorkspaceEntryState>::new();
         for record in records {
             for file in &record.files {
                 let path = safe_workspace_path(&self.root, &file.path)?;
-                let current_sha256 = match virtual_hashes.get(&file.path) {
-                    Some(hash) => hash.clone(),
+                let current_state = match virtual_states.get(&file.path) {
+                    Some(state) => state.clone(),
                     None => {
-                        let hash = workspace_entry_hash(&path)?;
-                        virtual_hashes.insert(file.path.clone(), hash.clone());
-                        hash
+                        let state = workspace_entry_state(&path)?;
+                        virtual_states.insert(file.path.clone(), state.clone());
+                        state
                     }
                 };
-                if let Some(conflict) = self.rollback_conflict(record, file, current_sha256)? {
+                if let Some(conflict) =
+                    self.rollback_conflict(record, file, &file.path, &current_state)?
+                {
                     conflicts.push(conflict);
+                    continue;
+                }
+
+                if let Some(from_path) = file.from_path.as_deref() {
+                    let source_path = safe_workspace_path(&self.root, from_path)?;
+                    let source_state = match virtual_states.get(from_path) {
+                        Some(state) => state.clone(),
+                        None => {
+                            let state = workspace_entry_state(&source_path)?;
+                            virtual_states.insert(from_path.to_string(), state.clone());
+                            state
+                        }
+                    };
+                    if !source_state.is_absent() {
+                        conflicts.push(RollbackConflict {
+                            checkpoint_id: record.id.clone(),
+                            path: from_path.to_string(),
+                            expected_sha256: None,
+                            current_sha256: source_state.sha256.clone(),
+                            reason: "rename source path changed after checkpoint; leaving current content untouched".to_string(),
+                        });
+                        continue;
+                    }
+                    virtual_states.insert(from_path.to_string(), file.before_entry_state());
+                    virtual_states.insert(file.path.clone(), WorkspaceEntryState::absent());
                 } else {
-                    virtual_hashes.insert(file.path.clone(), file.before_sha256.clone());
+                    virtual_states.insert(file.path.clone(), file.before_entry_state());
                 }
             }
         }
@@ -1348,11 +1385,7 @@ impl CheckpointStore {
         result: &mut RollbackResult,
     ) -> Result<()> {
         for file in &record.files {
-            if result
-                .conflicts
-                .iter()
-                .any(|conflict| conflict.checkpoint_id == record.id && conflict.path == file.path)
-            {
+            if rollback_file_has_conflict(result, record, file) {
                 continue;
             }
             let path = safe_workspace_path(&self.root, &file.path)?;
@@ -1408,30 +1441,43 @@ impl CheckpointStore {
         &self,
         record: &CheckpointRecord,
         file: &CheckpointFile,
-        current_sha256: Option<String>,
+        path: &str,
+        current_state: &WorkspaceEntryState,
     ) -> Result<Option<RollbackConflict>> {
         if let Some(expected_type) = file.after_file_type {
-            let path = safe_workspace_path(&self.root, &file.path)?;
-            let current_type = workspace_checkpoint_file_type(&path)?;
-            if current_type != Some(expected_type) {
+            if current_state.file_type != Some(expected_type) {
                 return Ok(Some(RollbackConflict {
                     checkpoint_id: record.id.clone(),
-                    path: file.path.clone(),
+                    path: path.to_string(),
                     expected_sha256: file.after_sha256.clone(),
-                    current_sha256,
+                    current_sha256: current_state.sha256.clone(),
                     reason: format!(
                         "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
-                        expected_type, current_type
+                        expected_type, current_state.file_type
                     ),
                 }));
             }
         }
-        if current_sha256 != file.after_sha256 {
+        if let Some(expected_mode) = file.after_mode.as_deref()
+            && current_state.mode.as_deref() != Some(expected_mode)
+        {
             return Ok(Some(RollbackConflict {
                 checkpoint_id: record.id.clone(),
-                path: file.path.clone(),
+                path: path.to_string(),
                 expected_sha256: file.after_sha256.clone(),
-                current_sha256,
+                current_sha256: current_state.sha256.clone(),
+                reason: format!(
+                    "file mode changed after checkpoint; expected {expected_mode}, got {}; leaving current content untouched",
+                    current_state.mode.as_deref().unwrap_or("absent")
+                ),
+            }));
+        }
+        if current_state.sha256 != file.after_sha256 {
+            return Ok(Some(RollbackConflict {
+                checkpoint_id: record.id.clone(),
+                path: path.to_string(),
+                expected_sha256: file.after_sha256.clone(),
+                current_sha256: current_state.sha256.clone(),
                 reason: "file changed after checkpoint; leaving current content untouched"
                     .to_string(),
             }));
@@ -1443,9 +1489,9 @@ impl CheckpointStore {
             {
                 return Ok(Some(RollbackConflict {
                     checkpoint_id: record.id.clone(),
-                    path: file.path.clone(),
+                    path: path.to_string(),
                     expected_sha256: file.after_sha256.clone(),
-                    current_sha256,
+                    current_sha256: current_state.sha256.clone(),
                     reason: "checkpoint object is missing; leaving current content untouched"
                         .to_string(),
                 }));
@@ -1760,6 +1806,27 @@ struct TreeEntry {
     object_type: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceEntryState {
+    sha256: Option<String>,
+    file_type: Option<CheckpointFileType>,
+    mode: Option<String>,
+}
+
+impl WorkspaceEntryState {
+    fn absent() -> Self {
+        Self {
+            sha256: None,
+            file_type: None,
+            mode: None,
+        }
+    }
+
+    fn is_absent(&self) -> bool {
+        self.sha256.is_none() && self.file_type.is_none() && self.mode.is_none()
+    }
+}
+
 impl TreeEntry {
     fn checkpoint_file_type(&self) -> CheckpointFileType {
         if self.is_symlink() {
@@ -1813,21 +1880,39 @@ fn parse_tree_entry(output: &[u8]) -> Result<Option<TreeEntry>> {
 }
 
 fn workspace_entry_hash(path: &Path) -> Result<Option<String>> {
+    Ok(workspace_entry_state(path)?.sha256)
+}
+
+fn workspace_entry_state(path: &Path) -> Result<WorkspaceEntryState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceEntryState::absent());
+        }
         Err(err) => return Err(err.into()),
     };
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(path)?;
-        return Ok(Some(sha256_hex(&path_bytes(target.as_os_str()))));
+        return Ok(WorkspaceEntryState {
+            sha256: Some(sha256_hex(&path_bytes(target.as_os_str()))),
+            file_type: Some(CheckpointFileType::Symlink),
+            mode: Some("120000".to_string()),
+        });
     }
     if metadata.is_file() {
-        return Ok(Some(sha256_file(path)?));
+        return Ok(WorkspaceEntryState {
+            sha256: Some(sha256_file(path)?),
+            file_type: Some(CheckpointFileType::RegularFile),
+            mode: Some(workspace_regular_file_git_mode(&metadata)),
+        });
     }
-    Ok(Some(sha256_hex(
-        format!("unsupported-file-type:{}", rel_display(path)).as_bytes(),
-    )))
+    Ok(WorkspaceEntryState {
+        sha256: Some(sha256_hex(
+            format!("unsupported-file-type:{}", rel_display(path)).as_bytes(),
+        )),
+        file_type: Some(CheckpointFileType::Other),
+        mode: None,
+    })
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -1860,19 +1945,19 @@ fn path_bytes(path: &OsStr) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
-fn workspace_checkpoint_file_type(path: &Path) -> Result<Option<CheckpointFileType>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    if metadata.file_type().is_symlink() {
-        Ok(Some(CheckpointFileType::Symlink))
-    } else if metadata.is_file() {
-        Ok(Some(CheckpointFileType::RegularFile))
+#[cfg(unix)]
+fn workspace_regular_file_git_mode(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        "100755".to_string()
     } else {
-        Ok(Some(CheckpointFileType::Other))
+        "100644".to_string()
     }
+}
+
+#[cfg(not(unix))]
+fn workspace_regular_file_git_mode(_metadata: &fs::Metadata) -> String {
+    "100644".to_string()
 }
 
 fn symlink_target_display(bytes: &[u8]) -> String {
@@ -1963,6 +2048,21 @@ fn remove_workspace_file(path: &Path) -> Result<bool> {
     fs::remove_file(path)?;
     sync_parent_dir(path);
     Ok(true)
+}
+
+fn rollback_file_has_conflict(
+    result: &RollbackResult,
+    record: &CheckpointRecord,
+    file: &CheckpointFile,
+) -> bool {
+    result.conflicts.iter().any(|conflict| {
+        conflict.checkpoint_id == record.id
+            && (conflict.path == file.path
+                || file
+                    .from_path
+                    .as_deref()
+                    .is_some_and(|from_path| conflict.path == from_path))
+    })
 }
 
 fn path_exists_no_follow(path: &Path) -> bool {

@@ -679,6 +679,44 @@ fn checkpoint_rollback_restores_chmod_only_change() {
 
 #[cfg(unix)]
 #[test]
+fn checkpoint_rollback_conflicts_on_user_chmod_after_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_repo("checkpoint_chmod_conflict");
+    let script = root.join("run.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).expect("chmod before");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod after");
+    store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).expect("user chmod");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback chmod conflict");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert!(
+        rollback.conflicts[0].reason.contains("file mode changed"),
+        "{:?}",
+        rollback.conflicts
+    );
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
 fn checkpoint_rollback_keeps_case_sensitive_paths_distinct() {
     let root = temp_repo("checkpoint_case_sensitive");
     fs::write(root.join("Foo.rs"), "upper\n").expect("write upper");
@@ -950,6 +988,53 @@ fn checkpoint_records_rename_as_single_renamed_entry() {
     assert!(!root.join("beta.txt").exists());
     assert_eq!(
         fs::read_to_string(root.join("alpha.txt")).expect("alpha restored"),
+        "alpha contents\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_rollback_conflicts_when_rename_source_was_recreated() {
+    let root = temp_repo("checkpoint_rename_source_conflict");
+    fs::write(root.join("alpha.txt"), "alpha contents\n").expect("seed alpha");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::rename(root.join("alpha.txt"), root.join("beta.txt")).expect("rename");
+    store
+        .create_checkpoint(
+            &before,
+            "apply_patch",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::write(root.join("alpha.txt"), "user recreated\n").expect("user recreated source");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(rollback.conflicts[0].path, "alpha.txt");
+    assert!(
+        rollback.conflicts[0]
+            .reason
+            .contains("rename source path changed"),
+        "{:?}",
+        rollback.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("alpha.txt")).expect("alpha preserved"),
+        "user recreated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("beta.txt")).expect("beta preserved"),
         "alpha contents\n"
     );
 
