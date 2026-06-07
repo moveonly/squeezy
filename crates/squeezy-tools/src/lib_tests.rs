@@ -6373,6 +6373,22 @@ async fn shell_returns_bounded_output_and_exit_code() {
 #[tokio::test]
 async fn shell_default_sandbox_runs_benign_command() {
     let root = temp_workspace("shell_default_sandbox");
+    #[cfg(windows)]
+    // Windows CI runs the test process with SQUEEZY_SHELL=gitbash so POSIX
+    // shell fixtures work. The restricted-token backend itself is covered by
+    // squeezy-win-sandbox smoke tests; this assertion is about default
+    // best_effort shell metadata and benign command execution.
+    let registry = registry_with_runtime_config(
+        &root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                windows_sandbox_level: squeezy_core::WindowsSandboxLevel::Disabled,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            ..ToolRuntimeConfig::default()
+        },
+    );
+    #[cfg(not(windows))]
     let registry = ToolRegistry::new(&root).expect("registry");
 
     let result = registry
