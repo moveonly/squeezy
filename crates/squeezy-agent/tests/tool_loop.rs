@@ -1836,6 +1836,7 @@ async fn plan_mode_routes_non_mutating_shell_through_policy() {
     let mut config = config_for(root.clone());
     config.session_mode = SessionMode::Plan;
     config.permissions.shell = PermissionMode::Allow;
+    config.permissions.shell_sandbox.mode = squeezy_core::ShellSandboxMode::Off;
     let agent = Agent::new(config, provider.clone());
 
     let mut approvals_seen = 0usize;
