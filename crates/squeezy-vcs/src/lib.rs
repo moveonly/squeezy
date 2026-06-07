@@ -1287,6 +1287,8 @@ impl CheckpointStore {
             let after = self.blob_bytes(after_tree, &path).ok();
             let before_entry = self.tree_entry(before_tree, before_lookup)?;
             let after_entry = self.tree_entry(after_tree, &path)?;
+            let before_hardlink_paths = hardlink_paths_for(before_hardlinks, before_lookup);
+            let after_hardlink_paths = hardlink_paths_for(after_hardlinks, &path);
             let patch = match status {
                 DiffFileStatus::Renamed => match (&from_path, &before, &after) {
                     (Some(_old), Some(_), Some(_)) => self
@@ -1320,8 +1322,8 @@ impl CheckpointStore {
                     .filter(|entry| entry.is_symlink())
                     .and(after.as_deref())
                     .map(symlink_target_display),
-                before_hardlink_paths: hardlink_paths_for(before_hardlinks, before_lookup),
-                after_hardlink_paths: hardlink_paths_for(after_hardlinks, &path),
+                before_hardlink_paths,
+                after_hardlink_paths,
                 before_sha256: before.as_deref().map(sha256_hex),
                 after_sha256: after.as_deref().map(sha256_hex),
                 additions: stat.additions,
@@ -1645,6 +1647,7 @@ impl CheckpointStore {
             SqueezyError::Tool(format!("checkpoint object for {rel} is missing: {err}"))
         })?;
         let file_type = entry.checkpoint_file_type();
+        let mode = entry.mode.clone();
         let action = if entry.is_symlink() {
             restore_symlink_atomic(&path, &bytes)?;
             RollbackFileActionKind::RestoreSymlink
@@ -1656,7 +1659,7 @@ impl CheckpointStore {
             checkpoint_id: String::new(),
             path: rel.to_string(),
             action,
-            mode: Some(entry.mode),
+            mode: Some(mode.clone()),
             file_type: Some(file_type),
             verified_after_rollback: verify_restored_entry(
                 rel,
@@ -1664,7 +1667,7 @@ impl CheckpointStore {
                 &WorkspaceEntryState {
                     sha256: Some(sha256_hex(&bytes)),
                     file_type: Some(file_type),
-                    mode: Some(entry.mode),
+                    mode: Some(mode),
                 },
             )?,
         }))
