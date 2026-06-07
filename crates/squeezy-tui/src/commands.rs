@@ -476,20 +476,20 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         + reasoning_tokens
         + image_tokens
         + attachment_tokens;
-    let system_estimate = consumed.saturating_sub(accounted as u64);
+    let overhead_estimate = consumed.saturating_sub(accounted as u64);
     out.push_str(&format!(
-        "  {} system prompt + framing: ~{} tokens  {}\n",
+        "  {} base request overhead:  ~{} tokens  {}\n",
         style::secondary("◇"),
-        style::secondary(&style::group_thousands(system_estimate)),
+        style::secondary(&style::group_thousands(overhead_estimate)),
         style::muted(
-            "(remainder: system prompt, built-in tool schemas, tool index, and per-request framing)",
+            "(remainder: Squeezy instructions, repo profile, built-in tool schemas, tool index, and estimation slack)",
         ),
     ));
 
     // Actionable per-source advice derived from the same per-source token
     // shares rendered above. Purely additive: the breakdown numbers are
-    // unchanged; this block only suggests what to do about the largest
-    // contributors. Deterministic — no model call, fixed thresholds.
+    // unchanged; this block only suggests what to do about contributors the
+    // user can directly influence. Deterministic — no model call, fixed thresholds.
     let recommendations = context_source_recommendations(&ContextSourceTokens {
         user: user_tokens as u64,
         tool_outputs: tool_tokens as u64,
@@ -498,7 +498,7 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         reasoning: reasoning_tokens as u64,
         image: image_tokens as u64,
         attachments: attachment_tokens as u64,
-        system: system_estimate,
+        overhead: overhead_estimate,
     });
     if !recommendations.is_empty() {
         out.push('\n');
@@ -799,8 +799,8 @@ fn format_mcp_section(out: &mut String, mcp: &McpAccounting) {
 }
 
 /// Per-source token estimates fed into [`context_source_recommendations`].
-/// Mirrors the buckets rendered under "Consumption by source" so the advice
-/// stays consistent with the breakdown the user already sees.
+/// Mirrors the buckets rendered under "Consumption by source"; fixed request
+/// overhead stays in the denominator but is not itself a recommendation target.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ContextSourceTokens {
     pub user: u64,
@@ -810,7 +810,7 @@ pub(crate) struct ContextSourceTokens {
     pub reasoning: u64,
     pub image: u64,
     pub attachments: u64,
-    pub system: u64,
+    pub overhead: u64,
 }
 
 /// Deterministic, data-only cut recommendations derived from the existing
@@ -819,9 +819,9 @@ pub(crate) struct ContextSourceTokens {
 /// context is effectively empty (nothing actionable to say yet).
 ///
 /// The rule is intentionally simple and explainable: identify the single
-/// largest source by share, and — when it crosses a meaningful fraction of
-/// the assembled request — emit a targeted suggestion plus any secondary
-/// callouts (history/reasoning) that are individually large enough to act on.
+/// largest actionable source by share, and — when it crosses a meaningful
+/// fraction of the assembled request — emit a targeted suggestion plus any
+/// secondary callouts that are individually large enough to act on.
 pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Vec<String> {
     let total = tokens.user
         + tokens.tool_outputs
@@ -830,16 +830,19 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
         + tokens.reasoning
         + tokens.image
         + tokens.attachments
-        + tokens.system;
+        + tokens.overhead;
     // Nothing assembled yet (fresh session): no actionable advice.
     if total == 0 {
         return Vec::new();
     }
 
     let pct = |value: u64| ((value as f64 / total as f64) * 100.0).round() as u64;
-    // Ordered by descending share so "largest" ties break deterministically
-    // toward the bucket the user is most likely to recognize as actionable.
-    let sources: [(&str, u64, &str); 8] = [
+    // Ordered by descending share so "largest actionable" ties break
+    // deterministically toward the bucket the user is most likely to recognize
+    // as actionable. Base request overhead is intentionally excluded from this
+    // list: it is mostly Squeezy-owned instructions and tool-advertising cost,
+    // not a direct user cleanup knob.
+    let sources: [(&str, u64, &str); 7] = [
         (
             "tool_outputs",
             tokens.tool_outputs,
@@ -875,11 +878,6 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
             tokens.image,
             "downscale images or remove ones no longer referenced",
         ),
-        (
-            "system",
-            tokens.system,
-            "trim custom system prompt / tool schemas if customizable",
-        ),
     ];
 
     let mut recs = Vec::new();
@@ -892,7 +890,10 @@ pub(crate) fn context_source_recommendations(tokens: &ContextSourceTokens) -> Ve
         .max_by_key(|(_, value, _)| *value)
         .filter(|(_, value, _)| pct(*value) >= LARGEST_THRESHOLD_PCT)
     {
-        recs.push(format!("largest: {name} {}% → {action}", pct(value)));
+        recs.push(format!(
+            "largest actionable: {name} {}% → {action}",
+            pct(value)
+        ));
     }
 
     // Secondary callouts: any *other* source that is independently large

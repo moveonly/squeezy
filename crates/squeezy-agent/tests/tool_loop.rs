@@ -1925,7 +1925,151 @@ async fn plan_mode_still_denies_destructive_shell_without_approval() {
         outputs[0].1["content"]["error"]
             .as_str()
             .expect("denial reason")
-            .contains("plan mode refuses mutating or unproven shell command")
+            .contains("plan mode refuses mutating shell command")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_mode_asks_for_unproven_shell_even_when_shell_policy_allows() {
+    let root = temp_workspace("plan_unproven_shell_asks");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "node_call".to_string(),
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": "node script.js",
+                    "description": "ambiguous shell",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("denied".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.shell = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut approvals_seen = 0usize;
+    let mut approval_reason = String::new();
+    let mut rx = agent.start_turn(
+        "ambiguous shell in plan mode".to_string(),
+        CancellationToken::new(),
+    );
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested {
+            request,
+            decision_tx,
+            ..
+        } = event
+        {
+            approvals_seen += 1;
+            approval_reason = request.reason;
+            decision_tx
+                .send(ToolApprovalDecision::Denied)
+                .expect("send approval");
+        }
+    }
+
+    assert_eq!(approvals_seen, 1);
+    assert!(
+        approval_reason.contains("requires approval for unproven shell command"),
+        "approval reason should describe plan-mode shell uncertainty: {approval_reason}",
+    );
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "node_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_mode_unproven_shell_preserves_policy_deny() {
+    let root = temp_workspace("plan_unproven_shell_policy_deny");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "node_call".to_string(),
+                name: "shell".to_string(),
+                arguments: serde_json::json!({
+                    "command": "node script.js",
+                    "description": "ambiguous shell",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("denied".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.shell = PermissionMode::Allow;
+    config.permissions.rules.push(PermissionRule::new(
+        "shell",
+        "node:*",
+        PermissionAction::Deny,
+        PermissionRuleSource::User,
+        Some("deny node shell".to_string()),
+    ));
+    let agent = Agent::new(config, provider.clone());
+
+    let mut approvals_seen = 0usize;
+    let mut rx = agent.start_turn(
+        "ambiguous shell denied in plan mode".to_string(),
+        CancellationToken::new(),
+    );
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            approvals_seen += 1;
+            decision_tx
+                .send(ToolApprovalDecision::Approved)
+                .expect("send approval");
+        }
+    }
+
+    assert_eq!(approvals_seen, 0);
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "node_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    assert!(
+        outputs[0].1["content"]["error"]
+            .as_str()
+            .expect("denial reason")
+            .contains("deny node shell")
     );
 
     let _ = fs::remove_dir_all(root);

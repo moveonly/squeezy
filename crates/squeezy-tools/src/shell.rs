@@ -48,6 +48,8 @@ use crate::shell_sandbox::{
 use crate::shell_spillover::{RawSidecar, ShellSpilloverInfo};
 #[cfg(windows)]
 use crate::win_job::ShellJob;
+#[cfg(windows)]
+use crate::win_sandbox_spec::build_win_spec;
 use crate::{
     DEFAULT_SHELL_OUTPUT_BYTE_CAP, DEFAULT_SHELL_TIMEOUT_MS, IO_DRAIN_TIMEOUT_MS, IpcEndpoint,
     IpcStream, MAX_SHELL_OUTPUT_BYTE_CAP, MAX_SHELL_TIMEOUT_MS, OutputMode,
@@ -587,97 +589,165 @@ impl ToolRegistry {
             command_text,
             shell_ask_approver,
         } = request;
-        let mut command = Command::new(&sandbox_plan.program);
-        command
-            .args(&sandbox_plan.args)
-            .current_dir(workdir)
-            .kill_on_drop(true);
-        let pty_master = if tty {
-            #[cfg(unix)]
+        // Spawn strategy. The Windows restricted-token / elevated sandbox child
+        // is created via raw Win32 (it cannot go through
+        // `tokio::process::Command`: that always uses the caller's token, and
+        // Windows has no `pre_exec`). Everything else uses the standard tokio
+        // command path. `pty_master`/`ask_server` apply only to the tokio path.
+        #[cfg(windows)]
+        let win_sandbox_backend = matches!(
+            sandbox_plan.backend,
+            "windows-restricted-token" | "windows-elevated"
+        );
+        #[cfg(not(windows))]
+        let win_sandbox_backend = false;
+
+        let pty_master: Option<std::fs::File>;
+        let ask_server: Option<ShellAskServer>;
+        let mut child: ShellChild;
+
+        if win_sandbox_backend {
+            #[cfg(windows)]
             {
-                let pty = open_shell_pty().map_err(ShellRunError::Io)?;
-                command
-                    .stdin(Stdio::from(
-                        pty.slave.try_clone().map_err(ShellRunError::Io)?,
-                    ))
-                    .stdout(Stdio::from(
-                        pty.slave.try_clone().map_err(ShellRunError::Io)?,
-                    ))
-                    .stderr(Stdio::from(pty.slave));
-                Some(pty.master)
+                // The Windows sandbox owns its own pipes + scrubbed env; the PTY
+                // and `squeezy ask` socket paths do not apply on this backend.
+                let _ = tty;
+                drop(shell_ask_approver);
+                let spec = build_win_spec(&self.shell_sandbox, &self.root, sandbox_plan);
+                let mut argv = Vec::with_capacity(1 + sandbox_plan.args.len());
+                argv.push(sandbox_plan.program.clone());
+                argv.extend(sandbox_plan.args.iter().cloned());
+                let env = preserved_env_string_map(&self.shell_sandbox);
+                let spawned = if sandbox_plan.backend == "windows-elevated" {
+                    squeezy_win_sandbox::spawn_elevated(&spec, &argv, workdir, &env, false)
+                } else {
+                    squeezy_win_sandbox::spawn_restricted_token(&spec, &argv, workdir, &env, false)
+                };
+                let win_child = match spawned {
+                    Ok(win_child) => win_child,
+                    Err(err) if sandbox_plan.required => {
+                        return Err(ShellRunError::SandboxStartDenied(format!(
+                            "shell sandbox backend {} failed to start: {err}",
+                            sandbox_plan.backend
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(ShellRunError::Io(std::io::Error::other(err.to_string())));
+                    }
+                };
+                pty_master = None;
+                ask_server = None;
+                child = ShellChild::WinSandbox(win_child);
             }
-            #[cfg(not(unix))]
+            #[cfg(not(windows))]
             {
-                // Windows: ConPTY is not yet wired up; degrade to non-TTY
-                // pipes. The shell still runs with the requested sandbox
-                // backend, just without an allocated controlling terminal.
+                unreachable!("windows sandbox backend selected on a non-windows target");
+            }
+        } else {
+            let mut command = Command::new(&sandbox_plan.program);
+            command
+                .args(&sandbox_plan.args)
+                .current_dir(workdir)
+                .kill_on_drop(true);
+            pty_master = if tty {
+                #[cfg(unix)]
+                {
+                    let pty = open_shell_pty().map_err(ShellRunError::Io)?;
+                    command
+                        .stdin(Stdio::from(
+                            pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                        ))
+                        .stdout(Stdio::from(
+                            pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                        ))
+                        .stderr(Stdio::from(pty.slave));
+                    Some(pty.master)
+                }
+                #[cfg(not(unix))]
+                {
+                    // Windows non-sandbox path: ConPTY is not yet wired up;
+                    // degrade to non-TTY pipes. The shell still runs with the
+                    // requested backend, just without a controlling terminal.
+                    command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    None
+                }
+            } else {
                 command
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
                 None
-            }
-        } else {
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            None
-        };
-        configure_shell_process_group(&mut command);
-        configure_linux_shell_sandbox(&mut command, sandbox_plan);
-        apply_shell_environment_policy(&mut command, &self.shell_sandbox);
-        // Only export the `squeezy ask` socket when the active backend
-        // permits the child's `socket(AF_UNIX, …)` connect. The
-        // linux-direct-syscalls seccomp filter denies AF_UNIX sockets, so
-        // exporting `SQUEEZY_ASK_SOCKET` there would advertise an escalation
-        // path that is guaranteed to fail with a confusing `EPERM`.
-        let ask_server = if let Some(approver) =
-            shell_ask_approver.filter(|_| sandbox_plan.exports_ask_socket())
-        {
-            match ShellAskServer::start(
-                &self.root,
-                &call.call_id,
-                command_text,
-                workdir,
-                approver,
-                cancel.clone(),
-            )
-            .await
+            };
+            configure_shell_process_group(&mut command);
+            configure_linux_shell_sandbox(&mut command, sandbox_plan);
+            apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+            // Only export the `squeezy ask` socket when the active backend
+            // permits the child's `socket(AF_UNIX, …)` connect. The
+            // linux-direct-syscalls seccomp filter denies AF_UNIX sockets, so
+            // exporting `SQUEEZY_ASK_SOCKET` there would advertise an escalation
+            // path that is guaranteed to fail with a confusing `EPERM`.
+            ask_server = if let Some(approver) =
+                shell_ask_approver.filter(|_| sandbox_plan.exports_ask_socket())
             {
-                Ok(server) => {
-                    command.env(SQUEEZY_ASK_SOCKET_ENV, server.env_value());
-                    command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
-                    Some(server)
+                match ShellAskServer::start(
+                    &self.root,
+                    &call.call_id,
+                    command_text,
+                    workdir,
+                    approver,
+                    cancel.clone(),
+                )
+                .await
+                {
+                    Ok(server) => {
+                        command.env(SQUEEZY_ASK_SOCKET_ENV, server.env_value());
+                        command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
+                        Some(server)
+                    }
+                    Err(_err) => None,
                 }
-                Err(_err) => None,
-            }
-        } else {
-            None
-        };
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) if sandbox_plan.required => {
-                return Err(ShellRunError::SandboxStartDenied(format!(
-                    "shell sandbox backend {} failed to start: {err}",
-                    sandbox_plan.backend
-                )));
-            }
-            Err(err) => return Err(ShellRunError::Io(err)),
-        };
+            } else {
+                None
+            };
+            child = match command.spawn() {
+                Ok(child) => ShellChild::Tokio(child),
+                Err(err) if sandbox_plan.required => {
+                    return Err(ShellRunError::SandboxStartDenied(format!(
+                        "shell sandbox backend {} failed to start: {err}",
+                        sandbox_plan.backend
+                    )));
+                }
+                Err(err) => return Err(ShellRunError::Io(err)),
+            };
+        }
+
         // Windows analog to Unix process groups: a Job Object created with
-        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills every descendant when
-        // either `terminate(...)` is called or the handle drops at
-        // function exit.
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills every descendant when either
+        // `terminate(...)` is called or the handle drops at function exit.
+        //
+        // Both Windows sandbox tiers (restricted-token AND elevated) bind their
+        // child + descendants into a kill-on-close Job Object INSIDE
+        // `squeezy-win-sandbox` (created CREATE_SUSPENDED → assigned → resumed,
+        // so there is no escape race), and `terminate_shell_child` tears that
+        // job down via `WinSandboxChild::kill`. So we only need a `ShellJob`
+        // here for the non-sandboxed tokio path (e.g. windows_sandbox_level =
+        // "disabled"); assigning one to a sandbox child would be redundant.
         #[cfg(windows)]
-        let shell_job: Option<ShellJob> = match ShellJob::new() {
-            Ok(job) => {
-                if let Some(pid) = child.id() {
-                    let _ = job.assign_process(pid);
+        let shell_job: Option<ShellJob> = if win_sandbox_backend {
+            None
+        } else {
+            match ShellJob::new() {
+                Ok(job) => {
+                    if let Some(pid) = child.id() {
+                        let _ = job.assign_process(pid);
+                    }
+                    Some(job)
                 }
-                Some(job)
+                Err(_) => None,
             }
-            Err(_) => None,
         };
 
         let stdout_capture = ShellStreamCapture::default();
@@ -692,7 +762,8 @@ impl ToolRegistry {
         let raw_sidecar = self.shell_spillover.open_raw_sidecar(&call.call_id);
         let stdout_task = if let Some(master) = pty_master {
             tokio::spawn(read_limited_pipe(
-                Some(tokio::fs::File::from_std(master)),
+                Some(Box::new(tokio::fs::File::from_std(master))
+                    as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
                 output_cap,
                 stdout_capture.clone(),
                 raw_sidecar.clone(),
@@ -700,7 +771,7 @@ impl ToolRegistry {
             ))
         } else {
             tokio::spawn(read_limited_pipe(
-                child.stdout.take(),
+                child.take_stdout(),
                 output_cap,
                 stdout_capture.clone(),
                 raw_sidecar.clone(),
@@ -708,7 +779,7 @@ impl ToolRegistry {
             ))
         };
         let stderr_task = tokio::spawn(read_limited_pipe(
-            child.stderr.take(),
+            child.take_stderr(),
             output_cap,
             stderr_capture.clone(),
             raw_sidecar.clone(),
@@ -1356,22 +1427,90 @@ fn sanitize_shell_call_id(call_id: &str) -> String {
     }
 }
 
-async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        kill_process_group(pid, libc::SIGTERM);
-        if time::timeout(Duration::from_millis(grace_ms), child.wait())
-            .await
-            .is_ok()
-        {
-            return;
+/// A spawned shell child. Abstracts over the standard `tokio` process (macOS,
+/// Linux, and the non-sandboxed Windows path) and the Windows restricted-token
+/// / elevated sandbox child, which is spawned via raw Win32 and therefore
+/// cannot be a `tokio::process::Child` (that type always uses the caller's
+/// token and Windows has no `pre_exec`). The capture / timeout / cancel loop in
+/// `run_shell_plan` drives every child through this uniform surface.
+enum ShellChild {
+    Tokio(tokio::process::Child),
+    #[cfg(windows)]
+    WinSandbox(squeezy_win_sandbox::WinSandboxChild),
+}
+
+impl ShellChild {
+    // Only consulted by the Windows Job Object assignment.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn id(&self) -> Option<u32> {
+        match self {
+            ShellChild::Tokio(child) => child.id(),
+            #[cfg(windows)]
+            ShellChild::WinSandbox(child) => Some(child.id()),
         }
-        kill_process_group(pid, libc::SIGKILL);
     }
-    #[cfg(not(unix))]
-    let _ = grace_ms;
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>> {
+        match self {
+            ShellChild::Tokio(child) => child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+            #[cfg(windows)]
+            ShellChild::WinSandbox(child) => child
+                .take_stdout()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>> {
+        match self {
+            ShellChild::Tokio(child) => child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+            #[cfg(windows)]
+            ShellChild::WinSandbox(child) => child
+                .take_stderr()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            ShellChild::Tokio(child) => child.wait().await,
+            #[cfg(windows)]
+            ShellChild::WinSandbox(child) => child.wait().await,
+        }
+    }
+}
+
+async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) {
+    match child {
+        ShellChild::Tokio(child) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                kill_process_group(pid, libc::SIGTERM);
+                if time::timeout(Duration::from_millis(grace_ms), child.wait())
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                kill_process_group(pid, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = grace_ms;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        #[cfg(windows)]
+        ShellChild::WinSandbox(child) => {
+            let _ = grace_ms;
+            child.kill();
+            let _ = child.wait().await;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1381,7 +1520,11 @@ fn kill_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxConfig) {
+/// Compute the env-allowlist-filtered environment that a sandboxed shell child
+/// should inherit. Shared by the tokio command path
+/// ([`apply_shell_environment_policy`]) and the Windows sandbox spawn path
+/// ([`preserved_env_string_map`]) so both apply identical env scrubbing.
+fn compute_preserved_env(config: &ShellSandboxConfig) -> BTreeMap<String, OsString> {
     let mut preserved = BTreeMap::<String, OsString>::new();
     for (name, value) in env::vars_os() {
         let Some(name) = name.to_str() else {
@@ -1391,11 +1534,29 @@ fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxCo
             preserved.insert(name.to_string(), value);
         }
     }
+    preserved
+}
 
+fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxConfig) {
+    let preserved = compute_preserved_env(config);
     command.env_clear();
     for (name, value) in &preserved {
         command.env(name, value);
     }
+}
+
+/// The Windows sandbox spawn path takes a fully-formed environment block rather
+/// than mutating a `Command`, so flatten the allowlisted environment into the
+/// `HashMap<String, String>` the crate expects (lossy for the rare non-UTF-16
+/// value, which is acceptable for a scrubbed sandbox environment).
+#[cfg(windows)]
+fn preserved_env_string_map(
+    config: &ShellSandboxConfig,
+) -> std::collections::HashMap<String, String> {
+    compute_preserved_env(config)
+        .into_iter()
+        .map(|(name, value)| (name, value.to_string_lossy().into_owned()))
+        .collect()
 }
 
 pub(crate) fn shell_env_should_preserve(name: &str, allowlist: &[String]) -> bool {

@@ -15,9 +15,12 @@ on:
 permissions:
   contents: read
 
+# Cancel any in-flight run for the same ref when a newer commit arrives.
+# This keeps the free GitHub Actions queue short: stale runs on superseded
+# commits are wasteful and block capacity for the run that actually matters.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

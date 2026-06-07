@@ -199,10 +199,18 @@ fn approval_preview_separates_rationale_command_rule_and_choices() {
         .position(|line| line.contains("Rule: command prefix cargo test"))
         .expect("rule line");
 
-    assert_eq!(rendered.get(command - 1).map(String::as_str), Some(""));
-    assert_eq!(rendered.get(rule - 1).map(String::as_str), Some(""));
-    assert_eq!(rendered.get(rule + 1).map(String::as_str), Some(""));
     assert!(why < command && command < rule, "{rendered:#?}");
+    // The rationale → command → rule group is tight: no blank lines between
+    // them (the old loose layout was confusing to read).
+    for line in &rendered[why..=rule] {
+        assert_ne!(
+            line.as_str(),
+            "",
+            "unexpected blank inside preview: {rendered:#?}"
+        );
+    }
+    // A single trailing blank separates the preview from the decision options.
+    assert_eq!(rendered.get(rule + 1).map(String::as_str), Some(""));
 }
 
 #[test]
@@ -219,26 +227,28 @@ fn approval_preview_header_and_labels_avoid_accent_colors() {
     let quiet = crate::render::theme::quiet();
     let accent = crate::render::theme::accent();
     let secondary = crate::render::theme::secondary();
-    let foreground = crate::render::theme::foreground();
+    let blue = crate::render::theme::blue();
     let header = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "Approval needed")
         .expect("approval header");
+    // The title uses the cool starlight blue for legibility, never the
+    // rationed gold (accent/secondary).
     assert_eq!(
         header.style.fg,
-        Some(foreground),
-        "header should be neutral"
+        Some(blue),
+        "header should use the cool title accent"
     );
     assert_ne!(
         header.style.fg,
         Some(accent),
-        "header should not use accent"
+        "header should not use gold accent"
     );
     assert_ne!(
         header.style.fg,
         Some(secondary),
-        "header should not use secondary accent"
+        "header should not use gold secondary"
     );
 
     let label_spans = lines
@@ -249,6 +259,67 @@ fn approval_preview_header_and_labels_avoid_accent_colors() {
     for span in label_spans {
         assert_eq!(span.style.fg, Some(quiet), "label should be quiet");
         assert_ne!(span.style.fg, Some(accent), "label should not use accent");
+    }
+}
+
+#[test]
+fn header_dedupes_shell_tool_and_capability() {
+    // tool_name "shell" == capability "shell" → collapse to one token so the
+    // header reads "Approval needed · shell · …" rather than "· shell · shell".
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    let header = flatten(&render_preview(&req))
+        .lines()
+        .next()
+        .expect("header line")
+        .to_string();
+    assert!(header.contains("Approval needed"), "{header}");
+    assert!(!header.contains("shell · shell"), "{header}");
+    assert_eq!(header.matches("shell").count(), 1, "{header}");
+
+    // When the tool differs from its capability, both are shown.
+    let edit = request_with(
+        "apply_patch",
+        PermissionCapability::Edit,
+        "src/lib.rs",
+        &[("path", "src/lib.rs")],
+    );
+    let edit_header = flatten(&render_preview(&edit))
+        .lines()
+        .next()
+        .expect("header line")
+        .to_string();
+    assert!(edit_header.contains("apply_patch"), "{edit_header}");
+    assert!(edit_header.contains("edit"), "{edit_header}");
+}
+
+#[test]
+fn header_colors_risk_by_severity() {
+    let red = crate::render::theme::red();
+    let green = crate::render::theme::green();
+    for (risk, expected) in [
+        (PermissionRisk::Low, green),
+        (PermissionRisk::High, red),
+        (PermissionRisk::Critical, red),
+    ] {
+        let mut req = request_with(
+            "shell",
+            PermissionCapability::Shell,
+            "x",
+            &[("command", "x")],
+        );
+        req.permission.risk = risk;
+        let lines = render_preview(&req);
+        let risk_span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == risk.as_str())
+            .unwrap_or_else(|| panic!("risk span for {risk:?}"));
+        assert_eq!(risk_span.style.fg, Some(expected), "risk {risk:?}");
     }
 }
 

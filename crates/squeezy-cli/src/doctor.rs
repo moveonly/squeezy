@@ -37,6 +37,17 @@ pub struct DoctorArgs {
     /// Remove rotated redb schema backups after reporting cache health.
     #[arg(long)]
     pub prune_cache: bool,
+    /// Windows only: provision the elevated shell-sandbox tier (one-time, UAC
+    /// prompt). Creates the hidden local sandbox users and installs the WFP
+    /// network egress-block filters, enabling `windows_sandbox_level =
+    /// "elevated"`. Performs the action and exits without running other checks.
+    #[arg(long)]
+    pub sandbox_setup: bool,
+    /// Windows only: remove all elevated shell-sandbox machine state (sandbox
+    /// users, WFP filters, registry entries, secrets). Performs the action and
+    /// exits without running other checks.
+    #[arg(long)]
+    pub sandbox_teardown: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +146,29 @@ fn check_counts(checks: &[Check]) -> (usize, usize) {
 pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     let version = env!("CARGO_PKG_VERSION");
     let target = env!("SQUEEZY_TARGET_TRIPLE");
+
+    // `--sandbox-setup` / `--sandbox-teardown` are actions, not diagnostics:
+    // perform the one requested and report just its result.
+    if args.sandbox_setup || args.sandbox_teardown {
+        let check = if args.sandbox_teardown {
+            sandbox_teardown_action()
+        } else {
+            sandbox_setup_action(AppConfig::from_env_and_settings().ok().as_ref())
+        };
+        let exit_code = if matches!(check.status, Status::Fail) {
+            1
+        } else {
+            0
+        };
+        return Ok(DoctorReport {
+            exit_code,
+            checks: vec![check],
+            version,
+            target,
+            json: args.json,
+        });
+    }
+
     let mut checks = Vec::new();
 
     let config = match AppConfig::from_env_and_settings() {
@@ -795,59 +829,64 @@ fn update_check(status: UpdateStatus) -> Check {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// Report the active shell-sandbox backend. Delegates to
+/// `squeezy_tools::shell_sandbox_doctor`, the single source of truth shared
+/// with the runtime — so this row reflects the backend the sandbox actually
+/// uses (e.g. Linux `linux-direct-syscalls`, not the long-stale `bwrap` proxy),
+/// and the Windows restricted-token / elevated tiers.
 fn sandbox_check() -> Check {
-    if which("sandbox-exec").is_some() {
-        Check {
-            name: "sandbox".to_string(),
-            status: Status::Ok,
-            detail: "sandbox-exec is on PATH".to_string(),
-        }
-    } else {
-        Check {
-            name: "sandbox".to_string(),
-            status: Status::Warn,
-            detail: "sandbox-exec not found; shell sandboxing will be limited".to_string(),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn sandbox_check() -> Check {
-    if which("bwrap").is_some() {
-        Check {
-            name: "sandbox".to_string(),
-            status: Status::Ok,
-            detail: "bwrap is on PATH".to_string(),
-        }
-    } else {
-        Check {
-            name: "sandbox".to_string(),
-            status: Status::Warn,
-            detail: "bwrap not found; install bubblewrap for shell sandboxing".to_string(),
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn sandbox_check() -> Check {
+    let report = squeezy_tools::shell_sandbox_doctor();
     Check {
         name: "sandbox".to_string(),
-        status: Status::Warn,
-        detail: "no sandbox backend known for this OS".to_string(),
+        status: if report.available {
+            Status::Ok
+        } else {
+            Status::Warn
+        },
+        detail: format!("backend {}: {}", report.backend, report.detail),
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn which(bin: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    for dir in env::split_paths(&path) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+/// `doctor --sandbox-setup`: provision the Windows elevated shell-sandbox tier.
+fn sandbox_setup_action(config: Option<&AppConfig>) -> Check {
+    let Some(config) = config else {
+        return Check {
+            name: "sandbox-setup".to_string(),
+            status: Status::Fail,
+            detail: "could not load configuration; cannot provision the sandbox".to_string(),
+        };
+    };
+    match squeezy_tools::windows_sandbox_setup(
+        &config.permissions.shell_sandbox,
+        &config.workspace_root,
+    ) {
+        Ok(detail) => Check {
+            name: "sandbox-setup".to_string(),
+            status: Status::Ok,
+            detail,
+        },
+        Err(detail) => Check {
+            name: "sandbox-setup".to_string(),
+            status: Status::Fail,
+            detail,
+        },
     }
-    None
+}
+
+/// `doctor --sandbox-teardown`: remove the Windows elevated-tier machine state.
+fn sandbox_teardown_action() -> Check {
+    match squeezy_tools::windows_sandbox_teardown() {
+        Ok(detail) => Check {
+            name: "sandbox-teardown".to_string(),
+            status: Status::Ok,
+            detail,
+        },
+        Err(detail) => Check {
+            name: "sandbox-teardown".to_string(),
+            status: Status::Fail,
+            detail,
+        },
+    }
 }
 
 /// Live probe of the configured provider. Returns `(Status, detail)` so the

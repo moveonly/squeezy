@@ -1388,27 +1388,123 @@ fn is_sonar_context_read_only_segment(segment: &str) -> bool {
 
 fn is_plan_mode_read_only_shell_segment(segment: &str) -> bool {
     is_read_only_shell_segment(segment)
+        || is_plan_mode_read_only_find_segment(segment)
+        || is_plan_mode_read_only_filter_segment(segment)
+        || is_plan_mode_read_only_python_filter_segment(segment)
         || is_sonar_context_read_only_segment(segment)
         || is_plan_mode_read_only_git_segment(segment)
         || is_plan_mode_read_only_compiler_segment(segment)
 }
 
-/// Returns true when every command segment is known not to mutate repository
-/// files. Build/test probes may still write normal compiler artifacts.
-pub fn plan_mode_shell_command_is_read_only(command: &str) -> bool {
-    let normalized = collapse_whitespace(command);
-    let Some(parsed) = parse_shell_command(&normalized) else {
+fn is_plan_mode_mutating_compiler_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    let Some(first) = tokens.first().map(|token| dequote_token(token)) else {
         return false;
     };
-    if parsed.dynamic {
+    match first {
+        "cargo" => match tokens.get(1).map(|token| dequote_token(token)) {
+            Some("fmt") => !tokens
+                .iter()
+                .skip(2)
+                .any(|token| matches!(dequote_token(token), "--check")),
+            Some("clippy") => tokens
+                .iter()
+                .skip(2)
+                .any(|token| matches!(dequote_token(token), "--fix")),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_plan_mode_mutating_git_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    if tokens.first().map(|token| dequote_token(token)) != Some("git") {
         return false;
     }
+    match tokens.get(1).map(|token| dequote_token(token)) {
+        Some("checkout" | "switch" | "restore" | "reset" | "clean" | "add" | "commit") => true,
+        Some("branch") => !is_plan_mode_read_only_git_segment(segment),
+        Some("diff" | "log" | "show") => tokens
+            .iter()
+            .skip(2)
+            .map(|token| dequote_token(token))
+            .any(git_arg_writes_output),
+        _ => false,
+    }
+}
+
+fn dynamic_shell_text_contains_mutator(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    [
+        "rm ",
+        "rmdir ",
+        "touch ",
+        "mkdir ",
+        "mv ",
+        "cp ",
+        "tee ",
+        "sed -i",
+        "chmod ",
+        "chown ",
+        "truncate ",
+        "dd ",
+        "git checkout",
+        "git switch",
+        "git reset",
+        "git clean",
+        "cargo fmt",
+        "clippy --fix",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn is_plan_mode_mutating_shell_segment(segment: &str) -> bool {
+    is_destructive_shell_segment(segment)
+        || is_safe_metadata_write_segment(segment)
+        || is_plan_mode_mutating_compiler_segment(segment)
+        || is_plan_mode_mutating_git_segment(segment)
+}
+
+/// Classify a shell command for Plan mode's additional mutation boundary.
+/// `NeedsApproval` means the command is neither proven read-only nor a known
+/// mutation; the normal policy layer should ask the user instead of denying.
+pub fn classify_plan_mode_shell_command(command: &str) -> PlanModeShellSafety {
+    let normalized = collapse_whitespace(command);
+    let Some(parsed) = parse_shell_command(&normalized) else {
+        return PlanModeShellSafety::NeedsApproval;
+    };
+    if parsed.dynamic && dynamic_shell_text_contains_mutator(&normalized) {
+        return PlanModeShellSafety::Mutating;
+    }
+    if shell_segment_has_destructive_redirect(&normalized) {
+        return PlanModeShellSafety::Mutating;
+    }
     let segments = expand_wrapper_segments(parsed.segments);
-    !segments.is_empty()
-        && !shell_segment_has_destructive_redirect(&normalized)
+    if segments.is_empty() {
+        return PlanModeShellSafety::NeedsApproval;
+    }
+    if segments
+        .iter()
+        .any(|segment| is_plan_mode_mutating_shell_segment(segment))
+    {
+        return PlanModeShellSafety::Mutating;
+    }
+    if !parsed.dynamic
         && segments
             .iter()
             .all(|segment| is_plan_mode_read_only_shell_segment(segment))
+    {
+        return PlanModeShellSafety::ReadOnly;
+    }
+    PlanModeShellSafety::NeedsApproval
+}
+
+/// Returns true when every command segment is known not to mutate repository
+/// files. Build/test probes may still write normal compiler artifacts.
+pub fn plan_mode_shell_command_is_read_only(command: &str) -> bool {
+    classify_plan_mode_shell_command(command) == PlanModeShellSafety::ReadOnly
 }
 
 pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
@@ -1426,6 +1522,145 @@ pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
             | "grep"
             | "rg"
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanModeShellSafety {
+    ReadOnly,
+    NeedsApproval,
+    Mutating,
+}
+
+fn is_plan_mode_read_only_find_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    if tokens.first().map(|token| dequote_token(token)) != Some("find") {
+        return false;
+    }
+    !tokens.iter().skip(1).any(|token| {
+        matches!(
+            dequote_token(token),
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+        )
+    })
+}
+
+fn is_plan_mode_read_only_filter_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    let Some(first) = tokens.first().map(|token| dequote_token(token)) else {
+        return false;
+    };
+    match first {
+        "true" | "cut" | "tr" | "jq" => true,
+        "sort" => !tokens.iter().skip(1).any(|token| {
+            matches!(
+                dequote_token(token),
+                "-o" | "--output" | "--output-document"
+            ) || dequote_token(token).starts_with("--output=")
+        }),
+        "uniq" => {
+            let positionals = tokens
+                .iter()
+                .skip(1)
+                .filter(|token| !dequote_token(token).starts_with('-'))
+                .count();
+            positionals <= 1
+        }
+        _ => false,
+    }
+}
+
+fn is_plan_mode_read_only_python_filter_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    let Some(first) = tokens.first().map(|token| dequote_token(token)) else {
+        return false;
+    };
+    if !matches!(first, "python" | "python2" | "python3") {
+        return false;
+    }
+    let Some(script) = tokens.windows(2).find_map(|pair| {
+        matches!(dequote_token(&pair[0]), "-c" | "--command").then(|| dequote_token(&pair[1]))
+    }) else {
+        return false;
+    };
+    python_inline_script_is_read_only_filter(script)
+}
+
+fn python_inline_script_is_read_only_filter(script: &str) -> bool {
+    let lowered = script.to_ascii_lowercase();
+    let banned = [
+        "__",
+        "open(",
+        "exec(",
+        "eval(",
+        "compile(",
+        "os.",
+        "subprocess",
+        "socket",
+        "requests",
+        "urllib",
+        "pathlib",
+        "shutil",
+        "glob",
+        "system(",
+        "popen",
+        "remove(",
+        "unlink(",
+        "mkdir(",
+        "rmdir(",
+        "rename(",
+        "replace(",
+        "chmod(",
+        "chown(",
+        ".write(",
+        "write(",
+    ];
+    if banned.iter().any(|needle| lowered.contains(needle)) {
+        return false;
+    }
+    python_inline_imports_are_read_only(script)
+}
+
+fn python_inline_imports_are_read_only(script: &str) -> bool {
+    for statement in script.split([';', '\n']) {
+        let trimmed = statement.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for module in rest.split(',') {
+                let name = module
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("");
+                if !matches!(
+                    name,
+                    "sys"
+                        | "json"
+                        | "csv"
+                        | "re"
+                        | "collections"
+                        | "itertools"
+                        | "math"
+                        | "statistics"
+                ) {
+                    return false;
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("from ") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if !matches!(name, "json" | "csv" | "re" | "collections" | "itertools") {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Extract candidate filesystem write-target path strings from the

@@ -4692,6 +4692,14 @@ fn plan_mode_shell_requests_must_be_proven_read_only() {
             "sonar context guidelines get --languages java 2>/dev/null",
             PermissionCapability::Shell,
         ),
+        (
+            "find . -name \"*.java\" -not -path \"*/target/*\" | head -60",
+            PermissionCapability::Shell,
+        ),
+        (
+            "sonar context navigation search-signatures --pattern \".*\" --fields \"fqn,file_path,start_line\" --limit 20 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(x['fqn'],'->',x['file_path']) for x in d.get('results',[])]\" 2>/dev/null || true",
+            PermissionCapability::Shell,
+        ),
         ("cargo fmt --check", PermissionCapability::Compiler),
         (
             "cargo test -p squeezy-agent",
@@ -4718,20 +4726,34 @@ fn plan_mode_shell_requests_must_be_proven_read_only() {
         ("git checkout -b x", PermissionCapability::Git),
         ("git branch x", PermissionCapability::Git),
         ("echo $(touch created.txt)", PermissionCapability::Shell),
-        ("node script.js", PermissionCapability::Shell),
     ] {
         let request = shell_permission_request(command, capability, PermissionRisk::High);
         let verdict = mode_permission_verdict(SessionMode::Plan, &request, None)
             .expect("mutating shell command should be denied in plan mode");
         assert_eq!(verdict.action, PermissionAction::Deny);
         assert!(
-            verdict
-                .reason
-                .contains("mutating or unproven shell command"),
+            verdict.reason.contains("refuses mutating shell command"),
             "{command} denial reason should name shell mutation: {}",
             verdict.reason
         );
     }
+}
+
+#[test]
+fn plan_mode_asks_for_ambiguous_shell_instead_of_denying() {
+    let request = shell_permission_request(
+        "node script.js",
+        PermissionCapability::Shell,
+        PermissionRisk::High,
+    );
+    let verdict = mode_permission_verdict(SessionMode::Plan, &request, None)
+        .expect("ambiguous shell should require approval in plan mode");
+    assert_eq!(verdict.action, PermissionAction::Ask);
+    assert!(
+        verdict.reason.contains("requires approval"),
+        "approval reason should describe plan-mode shell uncertainty: {}",
+        verdict.reason
+    );
 }
 
 #[test]

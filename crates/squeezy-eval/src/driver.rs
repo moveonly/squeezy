@@ -2671,6 +2671,7 @@ impl Driver {
                     break;
                 }
                 AgentEvent::TurnRouted { .. } => {}
+                AgentEvent::ContextUsageUpdate { .. } => {}
                 AgentEvent::CostCapUnenforceable { .. } => {}
             }
             if should_break_on_text {

@@ -58,11 +58,11 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback,
-    ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions, ToolOutputConfig,
-    ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec,
-    ToolStatus, WebToolConfig, plan_mode_shell_command_is_read_only, pre_classify_shell,
-    sha256_hex, shell_best_effort_fallback_from_result,
+    PlanModeShellSafety, ShellAskApprover, ShellAskDecision, ShellAskRequest,
+    ShellBestEffortFallback, ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions,
+    ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult,
+    ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, classify_plan_mode_shell_command,
+    pre_classify_shell, sha256_hex, shell_best_effort_fallback_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -5971,6 +5971,28 @@ impl TurnRuntime {
             .map(|handle| format!("squeezy::{}", handle.session_id()))
     }
 
+    fn context_window_override_for_model(&self, model: &str) -> Option<u64> {
+        let key = format!(
+            "{}:{}",
+            squeezy_core::provider_slug(&self.config.provider),
+            model
+        );
+        self.config
+            .model_limits
+            .get(&key)
+            .and_then(|entry| entry.context_window)
+            .or(self.configured_model_context_window)
+    }
+
+    async fn provider_live_context_window_for_model(&self, model: &str) -> Option<u64> {
+        match &self.config.provider {
+            ProviderConfig::Ollama(ollama) => {
+                fetch_ollama_context_window(&ollama.base_url, model).await
+            }
+            _ => None,
+        }
+    }
+
     /// Fan out a `HookPayload::PreTurn` to every registered handler.
     ///
     /// Returns the concatenation of every handler's
@@ -7343,6 +7365,28 @@ impl TurnRuntime {
                 estimated_tokens(llm_request_overhead_bytes(&request)),
                 Ordering::Relaxed,
             );
+            let observed_ceiling = {
+                let state = self.conversation_state.lock().await;
+                state
+                    .observed_context_ceilings
+                    .get(&(self.provider.name().to_string(), request_model.to_string()))
+                    .copied()
+            };
+            let mut limit_input = ContextLimitInput::new(self.provider.name(), &request_model);
+            limit_input.user_override = self.context_window_override_for_model(&request_model);
+            limit_input.provider_live_window = self
+                .provider_live_context_window_for_model(&request_model)
+                .await;
+            limit_input.observed_ceiling = observed_ceiling;
+            limit_input.models_dev = squeezy_llm::cached_models_dev_view();
+            limit_input.effective_percent_override = self
+                .config
+                .context_compaction
+                .effective_context_window_percent;
+            limit_input.baseline_reserve_override =
+                self.config.context_compaction.baseline_reserve_tokens;
+            let request_context =
+                estimate_request_context_full(&limit_input, &request, Some(&broker.calibration));
             self.record_replay_request(&request);
             let mut stream = self
                 .provider
@@ -7431,6 +7475,18 @@ impl TurnRuntime {
                             .tx
                             .send(AgentEvent::Started {
                                 turn_id: self.turn_id,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        if self
+                            .tx
+                            .send(AgentEvent::ContextUsageUpdate {
+                                turn_id: self.turn_id,
+                                input_tokens: request_context.input_tokens,
+                                context_window_tokens: request_context.context_window_tokens,
                             })
                             .await
                             .is_err()
@@ -14648,18 +14704,40 @@ async fn permission_decision_for_request(
         &context.config.workspace_root,
         session_id_for_plan_mode.as_deref(),
     );
+    let mut mode_ask_verdict = None;
     if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
-        if let Some(registry) = context.hooks.as_ref() {
-            dispatch_permission_denied(registry, context.turn_id, call, &request, &verdict.reason);
+        match verdict.action {
+            PermissionAction::Deny => {
+                if let Some(registry) = context.hooks.as_ref() {
+                    dispatch_permission_denied(
+                        registry,
+                        context.turn_id,
+                        call,
+                        &request,
+                        &verdict.reason,
+                    );
+                }
+                return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
+            }
+            PermissionAction::Ask => {
+                mode_ask_verdict = Some(verdict);
+            }
+            PermissionAction::Allow => return approved_decision(context, &request),
         }
-        return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
+    let mut mode_forced_ask = false;
     let mut verdict = context
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
+    if let Some(mode_verdict) = mode_ask_verdict
+        && verdict.action != PermissionAction::Deny
+    {
+        mode_forced_ask = true;
+        verdict = mode_verdict;
+    }
     // The structural pre-classifier runs for every shell call, not just those
     // whose policy verdict is already Ask. Its hazardous-shape floor
     // (dangerous interpreter, destructive verb, sensitive path) must be able to
@@ -14673,8 +14751,9 @@ async fn permission_decision_for_request(
         match pre_classify_shell(command, &context.config.permissions.shell_sandbox) {
             ShellPreClassification::AutoAllow { reason } => {
                 // Only relax an Ask to Allow; never re-affirm an existing Allow
-                // nor weaken a Deny.
-                if verdict.action == PermissionAction::Ask {
+                // nor weaken a Deny. Plan-mode forced asks must still reach the
+                // user instead of being relaxed by the shell pre-classifier.
+                if verdict.action == PermissionAction::Ask && !mode_forced_ask {
                     let reason = format!("pre-classifier auto-allow: {reason}");
                     log_session_event(
                         context.session_log.as_ref(),
@@ -14732,7 +14811,10 @@ async fn permission_decision_for_request(
             ShellPreClassification::AskAi => {}
         }
     }
-    if verdict.action == PermissionAction::Ask && context.config.permissions.ai_reviewer.enabled {
+    if verdict.action == PermissionAction::Ask
+        && !mode_forced_ask
+        && context.config.permissions.ai_reviewer.enabled
+    {
         let transcript = if let Some(conversation_state) = &context.conversation_state {
             let state = conversation_state.lock().await;
             Some(ai_reviewer::AiReviewerTranscriptSnapshot {
@@ -14839,7 +14921,8 @@ async fn permission_decision_for_request(
             }
         }
     }
-    if should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
+    if !mode_forced_ask
+        && should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
             &context.config,
@@ -15186,24 +15269,59 @@ pub(crate) fn mode_permission_verdict(
         (SessionMode::Plan, PermissionCapability::Edit)
     ) && active_plan_path
         .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
-    if !mode_refuses_request(mode, request, plan_edit_allowed) {
-        return None;
-    }
-    let reason = if mode == SessionMode::Plan
-        && request.tool_name == "shell"
-        && matches!(
+    if mode == SessionMode::Plan && request.tool_name == "shell" {
+        if matches!(
+            request.capability,
+            PermissionCapability::Destructive | PermissionCapability::Edit
+        ) {
+            return Some(PermissionVerdict {
+                action: PermissionAction::Deny,
+                matched_rule: None,
+                reason: format!("{} mode refuses mutating shell command", mode.as_str()),
+                silent: false,
+            });
+        }
+        if matches!(
             request.capability,
             PermissionCapability::Shell
                 | PermissionCapability::Git
                 | PermissionCapability::Compiler
-                | PermissionCapability::Edit
-                | PermissionCapability::Destructive
         ) {
-        format!(
-            "{} mode refuses mutating or unproven shell command",
-            mode.as_str()
-        )
-    } else if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
+            let Some(command) = request.metadata.get("command") else {
+                return Some(PermissionVerdict {
+                    action: PermissionAction::Deny,
+                    matched_rule: None,
+                    reason: format!(
+                        "{} mode refuses shell command with no command text",
+                        mode.as_str()
+                    ),
+                    silent: false,
+                });
+            };
+            return match classify_plan_mode_shell_command(command) {
+                PlanModeShellSafety::ReadOnly => None,
+                PlanModeShellSafety::Mutating => Some(PermissionVerdict {
+                    action: PermissionAction::Deny,
+                    matched_rule: None,
+                    reason: format!("{} mode refuses mutating shell command", mode.as_str()),
+                    silent: false,
+                }),
+                PlanModeShellSafety::NeedsApproval => Some(PermissionVerdict {
+                    action: PermissionAction::Ask,
+                    matched_rule: None,
+                    reason: format!(
+                        "{} mode requires approval for unproven shell command",
+                        mode.as_str()
+                    ),
+                    silent: false,
+                }),
+            };
+        }
+    }
+    if !mode_refuses_capability(mode, request.capability, plan_edit_allowed) {
+        return None;
+    }
+    let reason = if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
         match active_plan_path {
             Some(active) => format!(
                 "Plan mode: only the active plan file is editable ({}); requested target was {}",
@@ -15231,38 +15349,12 @@ pub(crate) fn mode_permission_verdict(
     })
 }
 
-fn mode_refuses_request(
-    mode: SessionMode,
-    request: &PermissionRequest,
-    plan_edit_allowed: bool,
-) -> bool {
-    if mode == SessionMode::Plan && request.tool_name == "shell" {
-        if matches!(
-            request.capability,
-            PermissionCapability::Destructive | PermissionCapability::Edit
-        ) {
-            return true;
-        }
-        if matches!(
-            request.capability,
-            PermissionCapability::Shell
-                | PermissionCapability::Git
-                | PermissionCapability::Compiler
-        ) {
-            let Some(command) = request.metadata.get("command") else {
-                return true;
-            };
-            return !plan_mode_shell_command_is_read_only(command);
-        }
-    }
-    mode_refuses_capability(mode, request.capability, plan_edit_allowed)
-}
-
 /// Single source of truth for whether a session mode forbids a capability.
 /// Plan mode is mutation-gated, not shell-gated. This capability-only filter
-/// is used for schema advertisement; [`mode_refuses_request`] adds command-level
-/// shell checks at runtime so broad Git/Compiler/Shell capabilities cannot run
-/// repo-mutating commands just because the default policy allows them. The
+/// is used for schema advertisement; [`mode_permission_verdict`] adds
+/// command-level shell checks at runtime so broad Git/Compiler/Shell
+/// capabilities cannot run repo-mutating commands just because the default
+/// policy allows them. The
 /// capability list is intentionally exhaustive (`match`) so adding a new
 /// capability is a compile-time prompt to decide whether plan mode admits it.
 /// `plan_edit_allowed` is computed by
@@ -17340,6 +17432,15 @@ pub enum AgentEvent {
     ContextCompacted {
         turn_id: TurnId,
         report: ContextCompactionReport,
+    },
+    /// Live estimate of the request context about to be sent for a provider
+    /// round. This lets the TUI status line update context usage mid-turn,
+    /// after tool results/reasoning have been appended, instead of waiting for
+    /// the final `Completed` event.
+    ContextUsageUpdate {
+        turn_id: TurnId,
+        input_tokens: u64,
+        context_window_tokens: Option<u64>,
     },
     SubagentStarted {
         turn_id: TurnId,

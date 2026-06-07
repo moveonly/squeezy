@@ -11,7 +11,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use squeezy_agent::ToolApprovalRequest;
-use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRule};
+use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionRule};
 
 use crate::compact_text;
 
@@ -22,32 +22,61 @@ use crate::compact_text;
 const APPROVAL_DIFF_BODY_CAP: usize = 18;
 const APPROVAL_CONTEXT_WRAP: usize = 96;
 
-/// Render the preview block above the option menu.
-pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>> {
+/// The preview block split into its regions, so the renderer can elide the
+/// lower-priority rows (rationale, rule) before the command line — and never
+/// the decision options — when the terminal is too short to show everything.
+pub(crate) struct PreviewParts {
+    pub header: Line<'static>,
+    /// The `Why: …` rationale (empty when the request carries no context).
+    pub context: Vec<Line<'static>>,
+    /// The capability subject — `$ command`, `✎ path`, diff body, etc.
+    pub subject: Vec<Line<'static>>,
+    /// The `Rule: …` line the project-scope option would persist.
+    pub rule: Vec<Line<'static>>,
+}
+
+/// Build the preview block as separate regions. See [`PreviewParts`].
+pub(crate) fn render_preview_parts(request: &ToolApprovalRequest) -> PreviewParts {
     let permission = &request.permission;
     let header = header_line(request);
-    let mut lines = vec![header];
-    let mut rendered_context = false;
+    let mut context = Vec::new();
     if let Some(ctx) = request.context.as_deref() {
-        rendered_context = append_context(&mut lines, ctx);
+        append_context(&mut context, ctx);
     }
-    if rendered_context {
-        lines.push(Line::raw(""));
-    }
+    let mut subject = Vec::new();
     match permission.capability {
-        PermissionCapability::Shell => append_shell(&mut lines, permission),
-        PermissionCapability::Edit => append_edit(&mut lines, permission),
+        PermissionCapability::Shell => append_shell(&mut subject, permission),
+        PermissionCapability::Edit => append_edit(&mut subject, permission),
         PermissionCapability::Read | PermissionCapability::Search => {
-            append_read(&mut lines, permission)
+            append_read(&mut subject, permission)
         }
-        PermissionCapability::Network => append_network(&mut lines, permission),
-        PermissionCapability::Mcp => append_mcp(&mut lines, permission, &request.tool_name),
+        PermissionCapability::Network => append_network(&mut subject, permission),
+        PermissionCapability::Mcp => append_mcp(&mut subject, permission, &request.tool_name),
         PermissionCapability::Git
         | PermissionCapability::Compiler
-        | PermissionCapability::Destructive => append_generic(&mut lines, permission),
+        | PermissionCapability::Destructive => append_generic(&mut subject, permission),
     }
-    lines.push(Line::raw(""));
-    append_rule_preview(&mut lines, permission);
+    let mut rule = Vec::new();
+    append_rule_preview(&mut rule, permission);
+    PreviewParts {
+        header,
+        context,
+        subject,
+        rule,
+    }
+}
+
+/// Render the preview block above the option menu: the header, then a tight
+/// `Why → command → Rule` group with no blank lines between them, then a
+/// single trailing blank that separates the preview from the decision options.
+pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>> {
+    let parts = render_preview_parts(request);
+    let mut lines =
+        Vec::with_capacity(2 + parts.context.len() + parts.subject.len() + parts.rule.len());
+    lines.push(parts.header);
+    lines.extend(parts.context);
+    lines.extend(parts.subject);
+    lines.extend(parts.rule);
     lines.push(Line::raw(""));
     lines
 }
@@ -88,23 +117,42 @@ fn append_context(lines: &mut Vec<Line<'static>>, context: &str) -> bool {
 
 fn header_line(request: &ToolApprovalRequest) -> Line<'static> {
     let permission = &request.permission;
+    let capability = permission.capability.as_str();
+    // For the shell tool, `tool_name` and `capability` are both "shell"; drop
+    // the duplicate so the header reads "Approval needed · shell · high".
+    let meta = if request.tool_name == capability {
+        format!(" · {capability} · ")
+    } else {
+        format!(" · {} · {} · ", request.tool_name, capability)
+    };
     Line::from(vec![
         Span::styled(
             "Approval needed",
             Style::default()
-                .fg(crate::render::theme::foreground())
+                .fg(crate::render::theme::blue())
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(meta, Style::default().fg(crate::render::theme::quiet())),
         Span::styled(
-            format!(
-                " · {} · {} · {}",
-                request.tool_name,
-                permission.capability.as_str(),
-                permission.risk.as_str(),
-            ),
-            Style::default().fg(crate::render::theme::quiet()),
+            permission.risk.as_str().to_string(),
+            risk_style(permission.risk),
         ),
     ])
+}
+
+/// Colour the risk word on a green → amber → red severity ramp so dangerous
+/// commands stand out at a glance. An approval is a rare, deliberate moment,
+/// so the amber rung reads as a meaningful caution signal rather than chrome.
+fn risk_style(risk: PermissionRisk) -> Style {
+    use crate::render::theme;
+    match risk {
+        PermissionRisk::Low => Style::default().fg(theme::green()),
+        PermissionRisk::Medium => Style::default().fg(theme::accent()),
+        PermissionRisk::High => Style::default().fg(theme::red()),
+        PermissionRisk::Critical => Style::default()
+            .fg(theme::red())
+            .add_modifier(Modifier::BOLD),
+    }
 }
 
 fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {

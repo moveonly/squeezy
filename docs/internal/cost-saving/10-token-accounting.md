@@ -300,8 +300,8 @@ If the model registry has no window entry, it prints only `consumed` with a
 "context window unknown" caveat.
 
 The per-source section converts each byte counter from `ConversationShape`
-into approximate tokens at four bytes per token, then derives the
-system/schema share by subtraction so it reconciles to `consumed`:
+into approximate tokens at four bytes per token, then derives the base request
+overhead share by subtraction so it reconciles to `consumed`:
 
 ```rust
 // crates/squeezy-tui/src/commands.rs:174-214 (excerpt)
@@ -312,11 +312,14 @@ let reasoning_tokens = approx(snapshot.conversation.reasoning_bytes);
 let image_tokens = approx(snapshot.conversation.image_bytes);
 let attachment_tokens = approx(snapshot.attachments.stored_bytes);
 let accounted = user_tokens + tool_tokens + reasoning_tokens + image_tokens + attachment_tokens;
-let system_estimate = consumed.saturating_sub(accounted as u64);
+let request_overhead_estimate = consumed.saturating_sub(accounted as u64);
 ```
 
-The system/framing line is `consumed - accounted`, so the breakdown always
-reconciles. The Session block restates the provider tally — turns, input,
+The base request overhead line is `consumed - accounted`, so the breakdown
+always reconciles. It is a remainder for Squeezy instructions, repo profile
+text, built-in tool schemas, the tool index, per-request framing, and
+estimation slack; `/context` does not present it as a user cleanup
+recommendation. The Session block restates the provider tally — turns, input,
 output, reasoning, cached input, cache-write input — and the Request
 estimates block prints `transmitted_request` and `full_history_request` side
 by side. The redaction count comes from `AttachmentShape::redactions`.
@@ -340,7 +343,7 @@ per-source block runs `div_ceil(4)` over each byte counter:
 
 - user + assistant text: `~22_100 tokens`
 - tool call outputs: `~48_000 tokens`
-- system prompt + framing: `~24_020 tokens` (the remainder)
+- base request overhead: `~24_020 tokens` (the remainder)
 
 Tool outputs are 51% of the consumed budget. The user runs
 `/compact`. On the next turn, stale raw tool outputs are replaced by compact

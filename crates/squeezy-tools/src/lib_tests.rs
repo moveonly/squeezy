@@ -11182,6 +11182,12 @@ fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
     assert!(plan_mode_shell_command_is_read_only(
         "sonar context guidelines get --languages java 2>/dev/null"
     ));
+    assert!(plan_mode_shell_command_is_read_only(
+        "find . -name \"*.java\" -not -path \"*/target/*\" | head -60"
+    ));
+    assert!(plan_mode_shell_command_is_read_only(
+        "sonar context navigation search-signatures --pattern \".*\" --fields \"fqn,file_path,start_line\" --limit 20 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(x['fqn'],'->',x['file_path']) for x in d.get('results',[])]\" 2>/dev/null || true"
+    ));
     assert!(plan_mode_shell_command_is_read_only("cargo fmt --check"));
     assert!(plan_mode_shell_command_is_read_only(
         "cargo test -p squeezy-agent"
@@ -11207,6 +11213,12 @@ fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
     ));
     assert!(!plan_mode_shell_command_is_read_only("make test"));
     assert!(!plan_mode_shell_command_is_read_only("node script.js"));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "sort -o out.txt input.txt"
+    ));
+    assert!(!plan_mode_shell_command_is_read_only(
+        "uniq input.txt out.txt"
+    ));
 }
 
 #[test]

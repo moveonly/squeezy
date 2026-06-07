@@ -3228,6 +3228,7 @@ dependencies = [
  "squeezy-store",
  "squeezy-telemetry",
  "squeezy-vcs",
+ "squeezy-win-sandbox",
  "squeezy-workspace",
  "tokio",
  "tokio-util",
@@ -3298,6 +3299,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "squeezy-core",
+]
+
+[[package]]
+name = "squeezy-win-sandbox"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.4.2",
+ "globset",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
