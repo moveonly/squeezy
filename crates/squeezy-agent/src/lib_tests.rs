@@ -2934,6 +2934,98 @@ async fn ai_reviewer_escalation_denial_reaches_user_prompt() {
 }
 
 #[tokio::test]
+async fn plan_mode_forced_shell_ask_routes_through_ai_reviewer() {
+    let root = temp_workspace("agent_plan_mode_ai_reviewer_shell");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "shell_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf hi",
+                    "description": "ambiguous non-mutating shell probe"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"allow","reason":"non-mutating probe"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        session_mode: SessionMode::Plan,
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    config.permissions.ai_reviewer.allow_capabilities = vec![PermissionCapability::Shell];
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn(
+        "plan with shell probe".to_string(),
+        CancellationToken::new(),
+    );
+    let mut approvals_seen = 0usize;
+    let mut shell_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "shell_1" => {
+                shell_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(approvals_seen, 0, "auto-review should handle Plan Mode Ask");
+    assert_eq!(
+        shell_result.expect("shell result").status,
+        ToolStatus::Success
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        matches!(&requests[1].input[0], LlmInputItem::UserText(text) if text.contains("Approval policy") && text.contains("\"tool_name\":\"shell\"")),
+        "reviewer prompt should carry the shell permission request: {:?}",
+        requests[1].input
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
     let root = temp_workspace("agent_ai_reviewer_edit_escalates");
     let provider = Arc::new(MockProvider::new(vec![

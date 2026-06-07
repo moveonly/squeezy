@@ -14813,10 +14813,7 @@ async fn permission_decision_for_request(
             ShellPreClassification::AskAi => {}
         }
     }
-    if verdict.action == PermissionAction::Ask
-        && !mode_forced_ask
-        && context.config.permissions.ai_reviewer.enabled
-    {
+    if verdict.action == PermissionAction::Ask && context.config.permissions.ai_reviewer.enabled {
         let transcript = if let Some(conversation_state) = &context.conversation_state {
             let state = conversation_state.lock().await;
             Some(ai_reviewer::AiReviewerTranscriptSnapshot {
