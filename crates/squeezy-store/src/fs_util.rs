@@ -84,8 +84,7 @@ pub fn user_squeezy_dir_detail() -> String {
         None => {
             #[cfg(windows)]
             {
-                return "user_global unavailable: HOME, APPDATA, and USERPROFILE are unset"
-                    .to_string();
+                "user_global unavailable: HOME, APPDATA, and USERPROFILE are unset".to_string()
             }
             #[cfg(not(windows))]
             {
