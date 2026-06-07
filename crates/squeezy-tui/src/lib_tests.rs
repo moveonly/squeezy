@@ -7871,6 +7871,23 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
 }
 
 #[test]
+fn empty_composer_starts_cursor_at_normal_input_column() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 100, 12);
+    let cursor_line = output
+        .lines()
+        .find(|line| line.contains('┃'))
+        .expect("prompt cursor line");
+    let cursor_column = cursor_line
+        .chars()
+        .position(|ch| ch == '┃')
+        .expect("prompt cursor column");
+
+    assert_eq!(cursor_column, 1, "{output}");
+}
+
+#[test]
 fn first_turn_empty_composer_spinner_animates_before_streaming_output() {
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(1);

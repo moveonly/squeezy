@@ -13968,7 +13968,7 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
 }
 
 fn prompt_visual_line_count(input: &str, width: u16) -> usize {
-    let content_width = width.saturating_sub(4).max(1) as usize;
+    let content_width = width.saturating_sub(1).max(1) as usize;
     if input.is_empty() {
         return 1;
     }
@@ -13983,11 +13983,10 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
 
 fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     // The moon coin now rides the horizon rule (see `composer_horizon_line`),
-    // so the typed content floats beneath it at a steady gutter — every line,
-    // including the first, shares the same indent rather than reserving room
-    // for a coin prefix on line one.
+    // so the typed content floats beneath it with only the open-layout pad
+    // added by `composer_bubble_lines`.
     if app.input.is_empty() {
-        return vec![Line::from(vec![Span::raw("   "), prompt_cursor_span()])];
+        return vec![Line::from(prompt_cursor_span())];
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
@@ -13997,7 +13996,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     parts
         .iter()
         .map(|line| {
-            let mut spans = vec![Span::raw("   ")];
+            let mut spans = Vec::new();
             let line_end = line_start + line.len();
             let style_text_at = |abs_offset: usize| -> Style {
                 if bang_range
