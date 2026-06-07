@@ -2,20 +2,6 @@ use super::*;
 use squeezy_core::SessionLogConfig;
 use squeezy_llm::{LlmInputItem, LlmToolCall};
 
-fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(16 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build high-stack test runtime");
-    runtime.block_on(async move {
-        tokio::spawn(future)
-            .await
-            .expect("high-stack test task should not panic");
-    });
-}
-
 #[test]
 fn harness_disables_product_telemetry() {
     let mut config = AppConfig::default();
@@ -366,68 +352,66 @@ async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cos
     assert_eq!(output.metrics.matches_returned, 1);
 }
 
-#[test]
-fn planner_probe_compares_enabled_and_disabled_runs() {
-    run_high_stack_test(async {
-        let task = TaskSpec {
-            id: "planner-probe".to_string(),
-            title: "Planner probe".to_string(),
-            prompt: "Which file defines make_widget?".to_string(),
-            workspace: WorkspaceSpec {
-                files: vec![
-                    WorkspaceFile {
-                        path: "Cargo.toml".to_string(),
-                        content:
-                            "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
-                                .to_string(),
-                    },
-                    WorkspaceFile {
-                        path: "src/lib.rs".to_string(),
-                        content: "pub fn make_widget() {}\n".to_string(),
-                    },
-                ],
-            },
-            expect: ExpectSpec {
-                contains: vec!["src/lib.rs".to_string()],
-            },
-            mock: None,
-            replay: None,
-            baseline: Some(BaselineSpec {
-                pattern: "make_widget".to_string(),
-                include: vec!["*.rs".to_string()],
-                mode: BaselineMode::Paths,
-                read_path: None,
-            }),
-        };
+#[tokio::test]
+async fn planner_probe_compares_enabled_and_disabled_runs() {
+    let task = TaskSpec {
+        id: "planner-probe".to_string(),
+        title: "Planner probe".to_string(),
+        prompt: "Which file defines make_widget?".to_string(),
+        workspace: WorkspaceSpec {
+            files: vec![
+                WorkspaceFile {
+                    path: "Cargo.toml".to_string(),
+                    content:
+                        "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+                            .to_string(),
+                },
+                WorkspaceFile {
+                    path: "src/lib.rs".to_string(),
+                    content: "pub fn make_widget() {}\n".to_string(),
+                },
+            ],
+        },
+        expect: ExpectSpec {
+            contains: vec!["src/lib.rs".to_string()],
+        },
+        mock: None,
+        replay: None,
+        baseline: Some(BaselineSpec {
+            pattern: "make_widget".to_string(),
+            include: vec!["*.rs".to_string()],
+            mode: BaselineMode::Paths,
+            read_path: None,
+        }),
+    };
 
-        let enabled = run_task(&task, RunnerKind::PlannerProbe, None).await;
-        let disabled = run_task(&task, RunnerKind::PlannerProbeNoPlanner, None).await;
+    let enabled = run_task(&task, RunnerKind::PlannerProbe, None).await;
+    let disabled = run_task(&task, RunnerKind::PlannerProbeNoPlanner, None).await;
 
-        assert_eq!(enabled.status, TaskStatus::Passed);
-        assert_eq!(disabled.status, TaskStatus::Passed);
-        assert_eq!(enabled.metrics.planner_turns, 1);
-        assert!(enabled.metrics.planner_tool_calls > 0);
-        assert_eq!(disabled.metrics.planner_turns, 0);
-        // Compare a planner-specific invariant: when the planner is enabled the
-        // preflight block carries the deterministic navigation work, so the
-        // model itself should issue strictly fewer tool calls than the
-        // planner-off baseline. This avoids coupling the assertion to
-        // graph-tool byte counts, which would drift whenever the graph payload
-        // shape changes.
-        let enabled_model_calls = enabled
-            .metrics
-            .tool_calls
-            .saturating_sub(enabled.metrics.planner_tool_calls);
-        let disabled_model_calls = disabled
-            .metrics
-            .tool_calls
-            .saturating_sub(disabled.metrics.planner_tool_calls);
-        assert!(
-            enabled_model_calls < disabled_model_calls,
-            "planner-on should leave fewer model-issued tool calls than planner-off; \
-             enabled_model_calls={enabled_model_calls}, disabled_model_calls={disabled_model_calls}",
-        );
-    });
+    assert_eq!(enabled.status, TaskStatus::Passed);
+    assert_eq!(disabled.status, TaskStatus::Passed);
+    assert_eq!(enabled.metrics.planner_turns, 1);
+    assert!(enabled.metrics.planner_tool_calls > 0);
+    assert_eq!(disabled.metrics.planner_turns, 0);
+    // Compare a planner-specific invariant: when the planner is enabled the
+    // preflight block carries the deterministic navigation work, so the
+    // model itself should issue strictly fewer tool calls than the
+    // planner-off baseline. This avoids coupling the assertion to
+    // graph-tool byte counts, which would drift whenever the graph payload
+    // shape changes.
+    let enabled_model_calls = enabled
+        .metrics
+        .tool_calls
+        .saturating_sub(enabled.metrics.planner_tool_calls);
+    let disabled_model_calls = disabled
+        .metrics
+        .tool_calls
+        .saturating_sub(disabled.metrics.planner_tool_calls);
+    assert!(
+        enabled_model_calls < disabled_model_calls,
+        "planner-on should leave fewer model-issued tool calls than planner-off; \
+         enabled_model_calls={enabled_model_calls}, disabled_model_calls={disabled_model_calls}",
+    );
 }
 
 #[derive(Debug)]
