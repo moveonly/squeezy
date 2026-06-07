@@ -7245,15 +7245,19 @@ fn turn_divider_line(snapshot: TurnDividerSnapshot, width: u16) -> Line<'static>
         _ => ("Worked for", snapshot.visual.color(0)),
     };
     let duration = format_turn_duration(snapshot.duration);
-    let label = format!("   ╰─☽ {state_label} {duration} ");
+    let state_text = format!("{state_label} {duration}");
+    let label = format!("   ─ {state_text} ");
     let label_width = label.chars().count();
     let fill_width = (width as usize).saturating_sub(label_width);
     Line::from(vec![
         Span::raw("   "),
-        Span::styled("╰─", Style::default().fg(crate::render::theme::quiet())),
-        Span::styled("☽", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled("─ ", Style::default().fg(crate::render::theme::quiet())),
         Span::styled(
-            format!(" {state_label} {duration} {}", "─".repeat(fill_width)),
+            state_text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", "─".repeat(fill_width)),
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
