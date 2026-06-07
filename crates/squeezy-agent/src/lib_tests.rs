@@ -9988,6 +9988,76 @@ async fn max_tokens_truncation_escalates_budget_and_recovers() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn max_tokens_escalation_skipped_when_it_would_overrun_the_cap() {
+    // Guard for the escalation/cap interaction: round 0 truncates AND its
+    // recorded cost pushes the session over the cap. Escalating would
+    // re-run the loop-top cap check at the bigger budget and fail there —
+    // after the partial was already cleared — surfacing nothing. So
+    // escalation must be skipped, and the truncated partial preserved on
+    // the (now unavoidable) failure.
+    let root = temp_workspace("agent_max_tokens_escalation_capped");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("partial truncated output".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_trunc".to_string()),
+            cost: CostSnapshot {
+                estimated_usd_micros: Some(2_000_000),
+                ..CostSnapshot::default()
+            },
+            stop_reason: Some(StopReason::MaxTokens),
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let mut config = AppConfig::default();
+    config.workspace_root = root.clone();
+    config.session_logs = SessionLogConfig {
+        log_dir: Some(PathBuf::from(".squeezy/sessions")),
+        ..SessionLogConfig::default()
+    };
+    config.model = "unknown-test-model".to_string();
+    config.max_output_tokens = Some(1_000);
+    config.max_session_cost_usd_micros = Some(1_000_000);
+    config.routing.enabled = false;
+    let agent = Agent::new(config, provider.clone());
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            failed = Some(error.to_string());
+        }
+    }
+    // Escalation skipped -> only the original truncated round ran (no
+    // second request), and the turn failed rather than silently retrying.
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "must not escalate into a cap failure"
+    );
+    assert!(
+        failed
+            .as_deref()
+            .is_some_and(|error| error.contains("max_tokens")),
+        "capped truncation should surface the max_tokens failure, got {failed:?}",
+    );
+    // The partial the user already saw is preserved on the failure.
+    let state = agent.conversation_state.lock().await;
+    let preserved = state
+        .transcript
+        .iter()
+        .any(|item| {
+            item.role == squeezy_core::Role::Assistant
+                && item.content.contains("partial truncated output")
+        });
+    drop(state);
+    assert!(
+        preserved,
+        "the truncated partial must be preserved when escalation is skipped",
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn escalated_max_output_tokens_only_raises_a_known_sub_ceiling_budget() {
     // A known explicit budget below the ceiling escalates straight to it.

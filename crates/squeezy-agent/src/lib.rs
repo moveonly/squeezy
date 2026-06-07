@@ -7858,17 +7858,34 @@ impl TurnRuntime {
                     );
                     // Recover a low-budget truncation: raise the output
                     // budget to the model's ceiling once and re-issue the
-                    // same round. The preservation path below already keeps
-                    // the partial text on the eventual failure, so escalation
-                    // only *adds* a chance to complete — it never loses the
-                    // cut. Skipped when the budget is unset (provider default,
-                    // unknown headroom) or already at the ceiling.
+                    // same round. Escalation only *adds* a chance to
+                    // complete — the preserve path below keeps the partial
+                    // on the eventual failure. Skipped when the budget is
+                    // unset (provider default, unknown headroom) or already
+                    // at the ceiling.
+                    let model_output_ceiling =
+                        squeezy_llm::model_info_for(self.provider.name(), &current_model)
+                            .and_then(|info| info.limits.map(|limits| limits.max_output_tokens));
                     if max_tokens_escalations < MAX_MAX_TOKENS_ESCALATIONS
-                        && let Some(escalated) = escalated_max_output_tokens(
-                            effective_max_output_tokens,
-                            squeezy_llm::model_info_for(self.provider.name(), &current_model)
-                                .and_then(|info| info.limits.map(|limits| limits.max_output_tokens)),
-                        )
+                        && let Some(escalated) =
+                            escalated_max_output_tokens(effective_max_output_tokens, model_output_ceiling)
+                        // Only escalate when the bigger round still fits the
+                        // session cost cap. The re-issue re-runs the loop-top
+                        // cap check against the raised budget, and we are about
+                        // to discard the partial — so escalating into a cap
+                        // trip would surface NOTHING instead of the preserved
+                        // truncation. (The input gate can't newly trip: the
+                        // re-issue sends the same input.) When it wouldn't fit,
+                        // fall through to preserve the partial and fail.
+                        && broker.session_cap_reached().is_none()
+                        && broker
+                            .projected_session_cap_overrun(
+                                self.provider.name(),
+                                &current_model,
+                                estimate_context(&conversation).estimated_tokens,
+                                CostBroker::projected_output_tokens(Some(escalated), model_output_ceiling),
+                            )
+                            .is_none()
                     {
                         max_output_tokens_override = Some(escalated);
                         max_tokens_escalations += 1;
