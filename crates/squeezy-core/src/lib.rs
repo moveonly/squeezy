@@ -517,27 +517,39 @@ pub const DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 131_072;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
-// Absolute fallback for the per-turn compaction trigger when
-// `model_context_window` is not set in `squeezy.toml`. Modern models
-// run with 128k+ context windows; the percent-of-context path (~90%)
-// is the right shape and takes over once the window is auto-derived
-// from `model_info_for`. This fallback is only the safety net for the
-// unknown-model case.
-pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 60_000;
+// Window used for the percent-of-window compaction thresholds when the
+// active model's real context window is unknown (no registry entry and none
+// set in `squeezy.toml`). Every compaction threshold is a fraction of the
+// resolved window; this value only stands in when that window cannot be
+// determined. 128k matches the smallest window common to modern models.
+pub const DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS: u64 = 128_000;
+/// Percent of the raw window treated as usable when no per-model curated value
+/// or explicit override is set. Mirrors the limit resolver's
+/// `default_effective_context_window_percent` so compaction and request sizing
+/// agree on the usable budget.
+pub const DEFAULT_CONTEXT_EFFECTIVE_WINDOW_PERCENT: u8 = 95;
+/// Flat token reserve carved off the effective window for system framing when
+/// no override is set. Mirrors `squeezy_llm::DEFAULT_BASELINE_RESERVE_TOKENS`.
+pub const DEFAULT_CONTEXT_BASELINE_RESERVE_TOKENS: u64 = 12_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
 pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 10;
 pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
 pub const DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES: usize = 32_768;
 pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 16_384;
-/// Trigger mid-turn compaction once the provider-reported total token usage
-/// reaches this fraction of `model_context_window` (out of 100).
+/// Deprecated: the legacy summarize/mid-turn threshold percent. Retained only
+/// as the default for the parsed-but-unused `threshold_percent` config field so
+/// older configs keep loading; no longer drives compaction (summarize now fires
+/// at the effective window).
 pub const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT: u8 = 80;
-/// Fraction of `model_context_window` (out of 100) above which the post-turn
-/// auto-compaction gate bypasses the `min_items` floor. A conversation of a
-/// few but enormous items (e.g. several large `read_file` pairs) can dwarf the
-/// window while sitting under `min_items`; once it crosses this high-water mark
-/// it is compacted regardless of item count. When the window is unknown the gate
-/// falls back to `2 × estimated_tokens` (see `min_items_bypass_threshold`).
+/// Fraction of the resolved context window (out of 100) at which the
+/// pre-summarize nudge fires. Sits below the summarize threshold so the user
+/// is warned, and can `/pin`, before any lossy summarize runs.
+pub const DEFAULT_CONTEXT_WARN_AT_PERCENT: u8 = 85;
+/// Fraction of the resolved context window (out of 100) above which the
+/// post-turn summarize gate bypasses the `min_items` floor. A conversation of
+/// a few but enormous items (e.g. several large `read_file` pairs) can dwarf
+/// the window while sitting under `min_items`; once it crosses this high-water
+/// mark it is summarized regardless of item count.
 pub const HIGH_WATER_BYPASS_PCT: u64 = 90;
 /// Max output tokens to request when the model-assisted compaction strategy
 /// is active.
@@ -548,13 +560,11 @@ pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS: u64 = 30;
 /// When strategy = LayeredFallback, model-assist only kicks in once the
 /// dropped slice exceeds this many tokens; smaller slices stay extractive.
 pub const DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS: u32 = 4_000;
-/// Mid-tier micro-compaction fires below the full-compaction threshold so
-/// the heavy tool-result bodies are reclaimed before the all-or-nothing
-/// summary head replaces the older slice. 60% leaves a 20-percentage-point
-/// band between micro and the 80% full-compaction default, which is the
-/// span where local tool clearing has the highest leverage (one large
-/// `read_file` or `shell` output dwarfs a few text messages).
-pub const DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT: u8 = 60;
+/// Fraction of the resolved context window (out of 100) at which the trim
+/// (micro) tier fires. Set low: trimming only clears older bulky tool-output
+/// bodies in place (structure preserved, no summary), so it runs early and
+/// keeps the working set lean long before the lossy summarize tier.
+pub const DEFAULT_CONTEXT_TRIM_AT_PERCENT: u8 = 40;
 /// Keep this many newest compactable tool results verbatim during
 /// micro-compaction; older results are rewritten to a placeholder. 5
 /// is enough to resolve typical "what did the last read of foo.rs
@@ -1670,9 +1680,12 @@ impl AppConfig {
             self.context_compaction.enabled
         ));
         output.push_str(&format!(
-            "compaction_estimated_tokens = {}\n",
-            self.context_compaction.estimated_tokens
+            "fallback_window_tokens = {}\n",
+            self.context_compaction.fallback_window_tokens
         ));
+        if let Some(cap) = self.context_compaction.max_context_tokens {
+            output.push_str(&format!("max_context_tokens = {}\n", cap));
+        }
         output.push_str(&format!(
             "compaction_min_items = {}\n",
             self.context_compaction.min_items
@@ -1707,8 +1720,8 @@ impl AppConfig {
             output.push_str(&format!("baseline_reserve_tokens = {}\n", reserve));
         }
         output.push_str(&format!(
-            "threshold_percent = {}\n",
-            self.context_compaction.threshold_percent
+            "warn_at_percent = {}\n",
+            self.context_compaction.warn_at_percent
         ));
         output.push_str(&format!(
             "strategy = {}\n",
@@ -1735,8 +1748,8 @@ impl AppConfig {
             self.context_compaction.micro_compaction_enabled
         ));
         output.push_str(&format!(
-            "micro_compaction_threshold_percent = {}\n",
-            self.context_compaction.micro_compaction_threshold_percent
+            "trim_at_percent = {}\n",
+            self.context_compaction.trim_at_percent
         ));
         output.push_str(&format!(
             "micro_compaction_keep_recent = {}\n\n",
@@ -5384,6 +5397,11 @@ pub struct ContextCompactionSettings {
     pub model_context_window: Option<u64>,
     pub effective_context_window_percent: Option<u8>,
     pub baseline_reserve_tokens: Option<u64>,
+    pub fallback_window_tokens: Option<u64>,
+    pub max_context_tokens: Option<u64>,
+    pub trim_at_percent: Option<u8>,
+    pub warn_at_percent: Option<u8>,
+    /// Deprecated; parsed for back-compat with older configs.
     pub threshold_percent: Option<u8>,
     pub strategy: Option<CompactionStrategy>,
     pub model_assisted_model: Option<String>,
@@ -5411,6 +5429,10 @@ impl ContextCompactionSettings {
                 "model_context_window",
                 "effective_context_window_percent",
                 "baseline_reserve_tokens",
+                "fallback_window_tokens",
+                "max_context_tokens",
+                "trim_at_percent",
+                "warn_at_percent",
                 "threshold_percent",
                 "strategy",
                 "model_assisted_model",
@@ -5490,6 +5512,30 @@ impl ContextCompactionSettings {
                 "baseline_reserve_tokens",
                 source,
                 &field(path, "baseline_reserve_tokens"),
+            )?,
+            fallback_window_tokens: u64_value(
+                table,
+                "fallback_window_tokens",
+                source,
+                &field(path, "fallback_window_tokens"),
+            )?,
+            max_context_tokens: u64_value(
+                table,
+                "max_context_tokens",
+                source,
+                &field(path, "max_context_tokens"),
+            )?,
+            trim_at_percent: u8_value(
+                table,
+                "trim_at_percent",
+                source,
+                &field(path, "trim_at_percent"),
+            )?,
+            warn_at_percent: u8_value(
+                table,
+                "warn_at_percent",
+                source,
+                &field(path, "warn_at_percent"),
             )?,
             threshold_percent: u8_value(
                 table,
@@ -5581,6 +5627,13 @@ impl ContextCompactionSettings {
             &mut self.baseline_reserve_tokens,
             next.baseline_reserve_tokens,
         );
+        replace_if_some(
+            &mut self.fallback_window_tokens,
+            next.fallback_window_tokens,
+        );
+        replace_if_some(&mut self.max_context_tokens, next.max_context_tokens);
+        replace_if_some(&mut self.trim_at_percent, next.trim_at_percent);
+        replace_if_some(&mut self.warn_at_percent, next.warn_at_percent);
         replace_if_some(&mut self.threshold_percent, next.threshold_percent);
         replace_if_some(&mut self.strategy, next.strategy);
         replace_if_some(&mut self.model_assisted_model, next.model_assisted_model);
@@ -5881,7 +5934,14 @@ impl CompactionStrategy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionConfig {
     pub enabled: bool,
-    pub estimated_tokens: u64,
+    /// Context window assumed when the active model's real window is unknown.
+    /// Every percent threshold resolves against the real window when known,
+    /// else this value.
+    pub fallback_window_tokens: u64,
+    /// Optional hard cap (in tokens) on the summarize threshold, independent of
+    /// the window. `None` lets thresholds scale with the window; set it to keep
+    /// requests small on very large windows (an opt-in economy cap).
+    pub max_context_tokens: Option<u64>,
     pub min_items: usize,
     pub recent_items: usize,
     pub max_summary_bytes: usize,
@@ -5894,14 +5954,14 @@ pub struct ContextCompactionConfig {
     /// surface; see `docs/internal/MEMORY_SCOPE.md` for the deferred
     /// tool-mediated pipeline decision.
     pub user_memory_max_bytes: usize,
-    /// When true, the turn loop re-checks token usage between LLM events and
-    /// triggers compaction once usage crosses `threshold_percent` of
-    /// `model_context_window`. Defaults to true; the trigger only fires
-    /// when `model_context_window` is also set.
+    /// When true, the turn loop runs the trim (micro) pass between LLM events
+    /// so a long tool-heavy turn reclaims older tool-output bytes before it can
+    /// outgrow the window. Summarize never runs mid-turn; it waits for the turn
+    /// boundary or the forced overflow path.
     pub enabled_mid_turn: bool,
-    /// Configured token budget for the active model. When `None`, mid-turn
-    /// compaction stays dormant and the post-turn auto trigger is the only
-    /// path. Squeezy does not auto-detect this per-provider yet.
+    /// Token budget for the active model. When `None`, thresholds resolve
+    /// against `fallback_window_tokens`. Normally auto-derived from the model
+    /// registry; an explicit value here overrides the registry.
     pub model_context_window: Option<u64>,
     /// Optional override for the percent of the raw window treated as usable
     /// (the rest is headroom). `None` lets the limit resolver use the curated
@@ -5912,8 +5972,12 @@ pub struct ContextCompactionConfig {
     /// window for system framing. `None` uses
     /// `squeezy_llm::DEFAULT_BASELINE_RESERVE_TOKENS` (12_000).
     pub baseline_reserve_tokens: Option<u64>,
-    /// Fraction of `model_context_window` (0..=100) at which mid-turn
-    /// compaction fires. Capped to 100 on read.
+    /// Fraction of the effective window (0..=100) at which the pre-summarize
+    /// nudge fires. Sits below the summarize point (the effective window).
+    /// Capped to 100 on read.
+    pub warn_at_percent: u8,
+    /// Deprecated; retained for back-compat config parsing but no longer drives
+    /// compaction (summarize now fires at the effective window).
     pub threshold_percent: u8,
     /// Summary generation strategy. Default `Extractive` preserves current
     /// behavior; other variants opt-in to model-assisted summarization with
@@ -5932,10 +5996,11 @@ pub struct ContextCompactionConfig {
     /// through to full compaction. Disabled callers go straight from
     /// no-op to full compaction.
     pub micro_compaction_enabled: bool,
-    /// Token-window fraction (0..=100) at which micro-compaction fires.
-    /// Should sit below `threshold_percent` so micro reclaims tool-output
-    /// bytes before the full tier's all-or-nothing summary kicks in.
-    pub micro_compaction_threshold_percent: u8,
+    /// Fraction of the effective window (0..=100) at which the trim (micro) pass
+    /// fires. Sits well below the summarize point (the effective window) so
+    /// trimming reclaims tool-output bytes long before the lossy summarize tier.
+    /// Capped to 100.
+    pub trim_at_percent: u8,
     /// Keep this many newest compactable tool results verbatim; older
     /// results are rewritten to a structured placeholder.
     pub micro_compaction_keep_recent: usize,
@@ -5951,12 +6016,18 @@ impl ContextCompactionConfig {
                 .as_deref()
                 .map(parse_enabled_bool)
                 .unwrap_or(settings.compaction_enabled.unwrap_or(true)),
-            estimated_tokens: parse_u64(
-                get_var("SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS"),
+            fallback_window_tokens: parse_u64(
+                get_var("SQUEEZY_CONTEXT_FALLBACK_WINDOW_TOKENS")
+                    .or_else(|| get_var("SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS")),
                 settings
-                    .compaction_estimated_tokens
-                    .unwrap_or(DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS),
+                    .fallback_window_tokens
+                    .or(settings.compaction_estimated_tokens)
+                    .unwrap_or(DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS),
             ),
+            max_context_tokens: get_var("SQUEEZY_CONTEXT_MAX_CONTEXT_TOKENS")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .or(settings.max_context_tokens),
             min_items: parse_usize(
                 get_var("SQUEEZY_CONTEXT_COMPACTION_MIN_ITEMS"),
                 settings
@@ -6016,6 +6087,13 @@ impl ContextCompactionConfig {
                     .or(settings.threshold_percent)
                     .unwrap_or(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT),
             ),
+            warn_at_percent: clamp_percent(
+                get_var("SQUEEZY_CONTEXT_WARN_AT_PERCENT")
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<u8>().ok())
+                    .or(settings.warn_at_percent)
+                    .unwrap_or(DEFAULT_CONTEXT_WARN_AT_PERCENT),
+            ),
             strategy: get_var("SQUEEZY_CONTEXT_COMPACTION_STRATEGY")
                 .as_deref()
                 .and_then(CompactionStrategy::parse)
@@ -6048,12 +6126,14 @@ impl ContextCompactionConfig {
                 .as_deref()
                 .map(parse_enabled_bool)
                 .unwrap_or(settings.micro_compaction_enabled.unwrap_or(true)),
-            micro_compaction_threshold_percent: clamp_percent(
-                get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT")
+            trim_at_percent: clamp_percent(
+                get_var("SQUEEZY_CONTEXT_TRIM_AT_PERCENT")
+                    .or_else(|| get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT"))
                     .as_deref()
                     .and_then(|raw| raw.parse::<u8>().ok())
+                    .or(settings.trim_at_percent)
                     .or(settings.micro_compaction_threshold_percent)
-                    .unwrap_or(DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT),
+                    .unwrap_or(DEFAULT_CONTEXT_TRIM_AT_PERCENT),
             ),
             micro_compaction_keep_recent: parse_usize(
                 get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_KEEP_RECENT"),
@@ -6064,59 +6144,78 @@ impl ContextCompactionConfig {
         }
     }
 
-    /// Token count at which post-turn auto-compaction should fire.
-    ///
-    /// Window-aware when `model_context_window` is known: the flat
-    /// `estimated_tokens` budget (the "60K" cost-thesis default) is *capped* at
-    /// `threshold_percent` of the real window so a small-window model no longer
-    /// has a post-turn trigger that sits above its own window. The `min()`
-    /// preserves the deliberate early-compaction behavior on large windows
-    /// (where `threshold_percent × window` exceeds 60K, the flat budget wins).
-    /// Falls back to the flat budget when the window is unknown.
-    pub fn post_turn_token_ceiling(&self) -> u64 {
+    /// The model's real context window when known, else `fallback_window_tokens`.
+    /// This is the raw window; the usable budget thresholds resolve against is
+    /// [`effective_window`](Self::effective_window).
+    pub fn resolve_window(&self) -> u64 {
         match self.model_context_window {
-            Some(window) if window > 0 => self.estimated_tokens.min(
-                window
-                    .saturating_mul(self.threshold_percent.min(100) as u64)
-                    .saturating_div(100),
-            ),
-            _ => self.estimated_tokens,
+            Some(window) if window > 0 => window,
+            _ => self.fallback_window_tokens,
         }
     }
 
-    /// Token threshold for mid-turn *full* compaction, or `None` when the
-    /// window is unknown (the mid-turn gate stays dormant in that case).
-    pub fn mid_turn_full_threshold(&self) -> Option<u64> {
-        self.window_fraction(self.threshold_percent)
+    /// The usable context budget every threshold resolves against: the raw
+    /// window reduced to `effective_context_window_percent` of itself, minus the
+    /// `baseline_reserve_tokens` carved off for system framing, and finally
+    /// bounded by the opt-in `max_context_tokens` economy cap. This mirrors the
+    /// limit resolver's `effective_window_tokens` so compaction folds at the
+    /// same usable budget the request sizer targets. The percent/reserve
+    /// overrides default to the resolver's 95% / 12K when unset (the
+    /// curated-per-model values live in the resolver, not here).
+    pub fn effective_window(&self) -> u64 {
+        let raw = self.resolve_window();
+        let percent = self
+            .effective_context_window_percent
+            .unwrap_or(DEFAULT_CONTEXT_EFFECTIVE_WINDOW_PERCENT)
+            .clamp(1, 100) as u64;
+        let reserve = self
+            .baseline_reserve_tokens
+            .unwrap_or(DEFAULT_CONTEXT_BASELINE_RESERVE_TOKENS);
+        let usable = raw
+            .saturating_mul(percent)
+            .saturating_div(100)
+            .saturating_sub(reserve);
+        let capped = match self.max_context_tokens {
+            Some(cap) if cap > 0 => usable.min(cap),
+            _ => usable,
+        };
+        capped.max(1)
     }
 
-    /// Token threshold for mid-turn *micro* compaction, or `None` when the
-    /// window is unknown.
-    pub fn mid_turn_micro_threshold(&self) -> Option<u64> {
-        self.window_fraction(self.micro_compaction_threshold_percent)
+    /// `percent` of the effective window.
+    fn window_fraction(&self, percent: u8) -> u64 {
+        self.effective_window()
+            .saturating_mul(percent.min(100) as u64)
+            .saturating_div(100)
     }
 
-    /// High-water mark above which the post-turn gate bypasses the `min_items`
-    /// floor so a "few but enormous" conversation still compacts proactively.
-    /// Derived from the window when known, else `2 × estimated_tokens`.
+    /// Token usage at which the trim (micro) pass fires. Trimming is cheap and
+    /// structure-preserving, so this is intentionally low.
+    pub fn trim_threshold(&self) -> u64 {
+        self.window_fraction(self.trim_at_percent)
+    }
+
+    /// Token usage at which the pre-summarize nudge fires.
+    pub fn warn_threshold(&self) -> u64 {
+        self.window_fraction(self.warn_at_percent)
+    }
+
+    /// Token usage at which the lossy summarize tier fires: the full effective
+    /// (usable) window. Trim and warn are fractions of the same effective
+    /// window, so `trim < warn < summarize` holds for every window size and
+    /// economy cap (the `baseline_reserve_tokens` reduction already in
+    /// `effective_window` is what keeps room for the next turn's reply).
+    pub fn summarize_threshold(&self) -> u64 {
+        self.effective_window()
+    }
+
+    /// High-water mark above which the post-turn summarize gate bypasses the
+    /// `min_items` floor so a "few but enormous" conversation still summarizes
+    /// proactively.
     pub fn min_items_bypass_threshold(&self) -> u64 {
-        match self.model_context_window {
-            Some(window) if window > 0 => window
-                .saturating_mul(HIGH_WATER_BYPASS_PCT)
-                .saturating_div(100),
-            _ => self.estimated_tokens.saturating_mul(2),
-        }
-    }
-
-    fn window_fraction(&self, percent: u8) -> Option<u64> {
-        match self.model_context_window {
-            Some(window) if window > 0 => Some(
-                window
-                    .saturating_mul(percent.min(100) as u64)
-                    .saturating_div(100),
-            ),
-            _ => None,
-        }
+        self.effective_window()
+            .saturating_mul(HIGH_WATER_BYPASS_PCT)
+            .saturating_div(100)
     }
 }
 
@@ -6128,7 +6227,8 @@ impl Default for ContextCompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            estimated_tokens: DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS,
+            fallback_window_tokens: DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS,
+            max_context_tokens: None,
             min_items: DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
             recent_items: DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS,
             max_summary_bytes: DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES,
@@ -6138,6 +6238,7 @@ impl Default for ContextCompactionConfig {
             model_context_window: None,
             effective_context_window_percent: None,
             baseline_reserve_tokens: None,
+            warn_at_percent: DEFAULT_CONTEXT_WARN_AT_PERCENT,
             threshold_percent: DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT,
             strategy: CompactionStrategy::default(),
             model_assisted_model: None,
@@ -6147,7 +6248,7 @@ impl Default for ContextCompactionConfig {
             layered_fallback_extractive_threshold_tokens:
                 DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
             micro_compaction_enabled: true,
-            micro_compaction_threshold_percent: DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT,
+            trim_at_percent: DEFAULT_CONTEXT_TRIM_AT_PERCENT,
             micro_compaction_keep_recent: DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT,
         }
     }
@@ -8570,7 +8671,9 @@ impl SkillsSettings {
 pub const DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS: usize = 4_000;
 pub const DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS: usize = 16_000;
 pub const DEFAULT_SKILLS_PREAMBLE_ENABLED: bool = true;
-pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
+/// Must fit the fixed `<available_skills>` wrapper (intro + usage contract)
+/// plus at least one catalog line; the contract alone is ~900 chars.
+pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 1_200;
 /// Default for `[skills] inline`. The metadata-only default keeps skill
 /// bodies out of the system prompt; users that want the legacy behavior
 /// of inlining each activated skill's body can set `[skills] inline = true`.
@@ -9684,17 +9787,23 @@ pub fn user_settings_template() -> &'static str {
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 60000
+# fallback_window_tokens = 128000  # window assumed when the model's real window is unknown
+# max_context_tokens = 200000      # optional hard cap on the summarize threshold (omit to scale with the window)
 # compaction_min_items = 16
-# compaction_recent_items = 6
+# compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
 # repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
 # user_memory_max_bytes = 8192  # cap on ~/.squeezy/MEMORY.md content stitched into base instructions (0 disables)
-# enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
-# model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
-# threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
-# strategy = "extractive"                          # extractive | model_assisted | layered_fallback
-# model_assisted_model = "gpt-5-nano"              # cheap model used when strategy != "extractive"
+# enabled_mid_turn = true       # run the trim pass between LLM events within a turn
+# model_context_window = 200000 # token budget for the active model; auto-derived from the model registry when unset
+# effective_context_window_percent = 95  # % of the raw window treated as usable; summarize folds at this budget
+# baseline_reserve_tokens = 12000        # tokens reserved off the effective window for system framing
+# trim_at_percent = 40          # % of the effective window at which old tool output is trimmed in place
+# warn_at_percent = 85          # % of the effective window at which the pre-summarize /pin nudge fires
+# micro_compaction_enabled = true   # master switch for the trim tier
+# micro_compaction_keep_recent = 5  # newest tool outputs the trim pass keeps verbatim
+# strategy = "extractive"           # extractive | model_assisted | layered_fallback
+# model_assisted_model = "gpt-5-nano"  # cheap model used when strategy != "extractive"
 # model_assisted_max_output_tokens = 500
 # model_assisted_timeout_secs = 30
 # layered_fallback_extractive_threshold_tokens = 4000
@@ -9854,7 +9963,7 @@ pub fn user_settings_template() -> &'static str {
 # active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true
-# preamble_budget_chars = 800         # legacy absolute cap; used only when preamble_budget_mode is unset
+# preamble_budget_chars = 1200        # legacy absolute cap; used only when preamble_budget_mode is unset
 # active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
 # preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
 # inline = false                      # default; emit only metadata for active skills and let the model call load_skill on demand
@@ -9939,17 +10048,23 @@ pub fn project_settings_template() -> &'static str {
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 60000
+# fallback_window_tokens = 128000  # window assumed when the model's real window is unknown
+# max_context_tokens = 200000      # optional hard cap on the summarize threshold (omit to scale with the window)
 # compaction_min_items = 16
-# compaction_recent_items = 6
+# compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
 # repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
 # user_memory_max_bytes = 8192  # cap on ~/.squeezy/MEMORY.md content stitched into base instructions (0 disables)
-# enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
-# model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
-# threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
-# strategy = "extractive"                          # extractive | model_assisted | layered_fallback
-# model_assisted_model = "gpt-5-nano"              # cheap model used when strategy != "extractive"
+# enabled_mid_turn = true       # run the trim pass between LLM events within a turn
+# model_context_window = 200000 # token budget for the active model; auto-derived from the model registry when unset
+# effective_context_window_percent = 95  # % of the raw window treated as usable; summarize folds at this budget
+# baseline_reserve_tokens = 12000        # tokens reserved off the effective window for system framing
+# trim_at_percent = 40          # % of the effective window at which old tool output is trimmed in place
+# warn_at_percent = 85          # % of the effective window at which the pre-summarize /pin nudge fires
+# micro_compaction_enabled = true   # master switch for the trim tier
+# micro_compaction_keep_recent = 5  # newest tool outputs the trim pass keeps verbatim
+# strategy = "extractive"           # extractive | model_assisted | layered_fallback
+# model_assisted_model = "gpt-5-nano"  # cheap model used when strategy != "extractive"
 # model_assisted_max_output_tokens = 500
 # model_assisted_timeout_secs = 30
 # layered_fallback_extractive_threshold_tokens = 4000

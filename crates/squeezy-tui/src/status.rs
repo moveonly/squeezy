@@ -422,10 +422,10 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
         }),
         StatusLineItem::ContextUsed => context_pct(app).map(|pct| format!("ctx {pct}% used")),
         StatusLineItem::ContextWindowSize => {
-            if app.context_compaction_threshold == 0 {
+            if app.context_window_tokens == 0 {
                 None
             } else {
-                Some(format!("window {}", app.context_compaction_threshold))
+                Some(format!("window {}", app.context_window_tokens))
             }
         }
         StatusLineItem::UsedTokens => {
@@ -493,12 +493,12 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn context_pct(app: &TuiApp) -> Option<u64> {
-    if app.context_compaction_threshold == 0 {
+    if app.context_window_tokens == 0 {
         return None;
     }
     Some(context_window_pct(
         app.context_estimate.estimated_tokens,
-        app.context_compaction_threshold,
+        app.context_window_tokens,
     ))
 }
 
@@ -619,13 +619,13 @@ pub(crate) mod segments {
 
     pub(crate) fn context(app: &TuiApp) -> Option<String> {
         let used = app.context_estimate.estimated_tokens;
-        if app.context_compaction_threshold == 0 {
+        if app.context_window_tokens == 0 {
             return Some(format!("ctx {used}"));
         }
-        let pct = context_window_pct(used, app.context_compaction_threshold);
+        let pct = context_window_pct(used, app.context_window_tokens);
         Some(format!(
             "ctx {used}/{threshold} ({pct}%)",
-            threshold = app.context_compaction_threshold,
+            threshold = app.context_window_tokens,
         ))
     }
 

@@ -111,27 +111,31 @@ pub struct MicroCompactionReport {
     pub after_estimated_tokens: u64,
 }
 
-/// Run a mid-turn micro-compaction pass when the configured token window
-/// is approaching pressure. Returns `Some(report)` when at least one
-/// `FunctionCallOutput` body was rewritten; `None` when the feature is
-/// disabled, the window isn't configured, the threshold hasn't been
-/// crossed, or there's nothing left to clear.
+/// Run a trim (micro) pass when token usage crosses the trim threshold.
+/// Returns `Some(report)` when at least one `FunctionCallOutput` body was
+/// rewritten; `None` when the trim tier is disabled, the threshold hasn't
+/// been crossed, or there's nothing left to clear.
+///
+/// Callers run this both between LLM events (mid-turn, gated by
+/// `enabled_mid_turn`) and as a pre-pass at the post-turn boundary before the
+/// lossy summarize tier. The gate here only checks `micro_compaction_enabled`;
+/// the mid-turn caller additionally honors `enabled_mid_turn`.
 ///
 /// The placeholder rewrite is *in place*: `conversation.len()` does not
 /// change, every `FunctionCall` still pairs with its `FunctionCallOutput`
-/// by `call_id`. Downstream `compact_conversation` (the full tier) sees
+/// by `call_id`. Downstream `compact_conversation` (the summarize tier) sees
 /// the cleared bodies as already-shrunk text and can decide on its own
 /// whether to fold them into a summary head.
-pub(crate) fn maybe_micro_compact_mid_turn(
+pub(crate) fn maybe_micro_compact(
     conversation: &mut [LlmInputItem],
     config: &AppConfig,
     last_total_tokens: Option<u64>,
 ) -> Option<MicroCompactionReport> {
     let cc = &config.context_compaction;
-    if !cc.enabled_mid_turn || !cc.micro_compaction_enabled {
+    if !cc.micro_compaction_enabled {
         return None;
     }
-    let threshold = cc.mid_turn_micro_threshold()?;
+    let threshold = cc.trim_threshold();
     let before = estimate_context(conversation);
     let observed = last_total_tokens.unwrap_or(before.estimated_tokens);
     if observed < threshold {

@@ -124,10 +124,12 @@ Plus **receipt stubs** (SHA dedup) that run alongside compaction: direct tool pa
 
 #### Tier A — Macro compaction (`context_compaction.rs`)
 
-**Triggers:**
-
-- **Post-turn:** `min_items` (default 16) **and** `estimated_tokens` (default 60k).
-- **Mid-turn:** `threshold_percent` of `model_context_window` (default 80%), using provider `last_total_tokens` when available.
+**Trigger:** post-turn only (or via forced overflow). Fires at
+`summarize_at_percent` (default **95%**) of the effective window —
+`min(model_context_window or fallback_window_tokens, max_context_tokens)` —
+once `min_items` (default 16) is satisfied, held 16K below the window so the
+next reply fits. Summarize never runs mid-turn; mid-turn pressure is handled
+by trim (Tier B).
 
 **What survives:** pinned items + last `keep_recent_items`; dropped slice → synthetic head with `## Goal / ## Progress / ## Decisions / ## Next`, durable tool-call lines, receipt table, file lineage (`<read-files>` / `<modified-files>`), attachment previews.
 
@@ -142,7 +144,7 @@ After:  [summary_head, pin, …, last 8 items]              → bounded growth
 
 #### Tier B — Micro compaction (`micro_compaction.rs`)
 
-**Trigger:** mid-turn at `micro_compaction_threshold_percent` (default **60%** of window) — *earlier* than macro compaction.
+**Trigger:** `trim_at_percent` (default **40%** of the effective window) — *earlier* than macro compaction. Runs both between tool rounds (mid-turn, gated by `enabled_mid_turn`) and as a pre-pass at the post-turn boundary, before the summarize gate is evaluated.
 
 **Mechanism:** replaces `FunctionCallOutput.output` text with `[Old tool output cleared …]` for tools in `COMPACTABLE_TOOL_NAMES`, keeping the **same** `call_id` / `FunctionCall` wrapper (provider-safe).
 

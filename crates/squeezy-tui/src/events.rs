@@ -10,12 +10,11 @@ use squeezy_tools::{McpElicitationResponse, McpStatusSnapshot, ToolStatus};
 use tokio::sync::broadcast;
 
 use crate::{
-    CONTEXT_NUDGE_THRESHOLD_RATIO_PCT, PendingApproval, PendingMcpElicitation, PendingPlanChoice,
-    PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compaction_status_line,
-    context_window_pct, dedupe_assistant_repeated_tool_output, format_approval_status_line,
-    format_error_status, format_mcp_elicitation_status_line, format_mcp_status_snapshot, input,
-    is_control_tool_name, proposed_plan, render, strip_plan_handoff_prefix, tool_call_label,
-    tool_result_status_text,
+    PendingApproval, PendingMcpElicitation, PendingPlanChoice, PendingRequestUserInput,
+    TranscriptItem, TuiApp, TurnVisualState, compaction_status_line, context_window_pct,
+    dedupe_assistant_repeated_tool_output, format_approval_status_line, format_error_status,
+    format_mcp_elicitation_status_line, format_mcp_status_snapshot, input, is_control_tool_name,
+    proposed_plan, render, strip_plan_handoff_prefix, tool_call_label, tool_result_status_text,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -586,34 +585,40 @@ pub(crate) fn cancel_pending_request_user_input(app: &mut TuiApp) {
     }
 }
 
-/// Push a one-shot system transcript advisory when the post-turn context
-/// estimate is closing in on the auto-compaction threshold. We surface
-/// this *before* the next turn so the user has a chance to `/pin` or
-/// `/compact` deliberately rather than discovering after the fact that
-/// the conversation has been rewritten.
+/// Push a one-shot system transcript advisory when the context estimate is
+/// approaching the lossy summarize threshold. We surface this *before*
+/// summarize would run so the user can `/pin` (or `/compact`) deliberately
+/// rather than discovering after the fact that older turns were condensed.
 ///
-/// The nudge fires at [`CONTEXT_NUDGE_THRESHOLD_RATIO_PCT`] of the
-/// compaction threshold (well before the 100% mark that triggers
-/// auto-compaction) and is suppressed once the estimate has already
-/// reached the threshold — by that point the auto-compaction surface
-/// is the actionable signal and a "consider /compact" advisory is
-/// stale advice.
+/// Fires only inside the `[warn, summarize)` band of the resolved window, and
+/// only when a summarize would actually fire (there is more history than the
+/// verbatim-kept recent tail) — so it never warns about a summarize that will
+/// not happen. The cheaper trim tier runs silently below this band; only the
+/// lossy summarize tier is worth a nudge. One-shot until reset after a
+/// compaction lands.
 pub(crate) fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
-    if app.context_compaction_threshold == 0 || app.context_compaction_nudge_shown {
+    if app.context_compaction_nudge_shown
+        || app.context_warn_tokens == 0
+        || app.context_summarize_tokens == 0
+    {
         return;
     }
-    let pct = context_window_pct(
-        app.context_estimate.estimated_tokens,
-        app.context_compaction_threshold,
-    );
-    if !(CONTEXT_NUDGE_THRESHOLD_RATIO_PCT..100).contains(&pct) {
+    let used = app.context_estimate.estimated_tokens;
+    // Inside the warn band only: at/above warn, but below the summarize point
+    // (past which the summarize itself is the actionable signal).
+    if used < app.context_warn_tokens || used >= app.context_summarize_tokens {
         return;
     }
+    // Mirror the summarize gate's will-shrink check: nothing to condense when
+    // the conversation is no longer than the verbatim-kept recent tail.
+    if app.context_estimate.items <= app.context_recent_items {
+        return;
+    }
+    let pct = context_window_pct(used, app.context_window_tokens);
     app.context_compaction_nudge_shown = true;
     app.push_log(format!(
-        "context {pct}% of auto-compact threshold ({used}/{threshold} tok) — /pin to keep what matters · /compact to summarize before auto-compaction triggers",
-        used = app.context_estimate.estimated_tokens,
-        threshold = app.context_compaction_threshold,
+        "context {pct}% of the {window} tok window — older tool output is auto-trimmed; near the top, older turns get summarized into a recap (recent turns kept · revert with /compact undo). /pin to keep specifics · /compact to summarize now",
+        window = app.context_window_tokens,
     ));
 }
 

@@ -94,7 +94,7 @@ use context_compaction::build_compaction_summary;
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation, compact_conversation_with_strategy,
     drop_orphan_function_call_outputs, estimate_context, estimated_tokens,
-    maybe_compact_conversation, maybe_compact_mid_turn, next_context_pin_id, pack_tool_results,
+    maybe_compact_conversation, next_context_pin_id, pack_tool_results,
     repair_orphan_function_calls,
 };
 use cost_broker::{
@@ -103,9 +103,7 @@ use cost_broker::{
     round_input_gate_status,
 };
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
-use micro_compaction::{
-    SuccessfulEdit, mask_expired_reads_after_edits, maybe_micro_compact_mid_turn,
-};
+use micro_compaction::{SuccessfulEdit, mask_expired_reads_after_edits, maybe_micro_compact};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
@@ -1387,6 +1385,11 @@ pub struct Agent {
     /// fire-and-forget lifetime of these tasks. New tasks may still be
     /// registered after a shutdown completes; the JoinSet is reusable.
     background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
+    /// Ordered gate for background MCP config actions. `/mcp` key handling
+    /// must return immediately, but live registry mutations still need the
+    /// old sequential semantics so rapid toggle/restart/add/remove actions
+    /// settle in the same order the user requested them.
+    mcp_background_queue: Arc<McpBackgroundQueue>,
     /// Cross-turn state for the per-turn model router. Tracks the
     /// escalation-sticky window and any pending `/cheap` / `/parent` /
     /// `/router` user override. Shared with each `TurnRuntime` via
@@ -1411,6 +1414,33 @@ pub struct Agent {
 struct ActiveTurn {
     turn_id: TurnId,
     cancel: CancellationToken,
+}
+
+#[derive(Default)]
+struct McpBackgroundQueue {
+    next_ticket: AtomicU64,
+    serving: AtomicU64,
+    notify: Notify,
+}
+
+impl McpBackgroundQueue {
+    fn issue_ticket(&self) -> u64 {
+        self.next_ticket.fetch_add(1, Ordering::AcqRel)
+    }
+
+    async fn wait_for_turn(&self, ticket: u64) {
+        loop {
+            if self.serving.load(Ordering::Acquire) == ticket {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    fn finish_turn(&self) {
+        self.serving.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
 }
 
 /// A configuration change that has been written to disk but is waiting for
@@ -2030,6 +2060,7 @@ impl Agent {
             pending_swap: None,
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
+            mcp_background_queue: Arc::new(McpBackgroundQueue::default()),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
@@ -2450,6 +2481,24 @@ impl Agent {
         Ok(outcome)
     }
 
+    /// Toggle an MCP server's `enabled` flag and run discovery in the
+    /// background. This is the interactive-TUI path: update the agent's
+    /// config snapshot immediately so `/mcp` reflects the requested state,
+    /// then let the registry publish `Starting` / final status without
+    /// blocking redraws.
+    pub fn set_mcp_server_enabled_in_background(&mut self, server_name: String, enabled: bool) {
+        if let Some(server) = self.config.mcp_servers.get_mut(&server_name) {
+            server.enabled = enabled;
+        }
+        let tools = self.tools.clone();
+        let task = async move {
+            let _ = tools
+                .set_mcp_server_enabled(&server_name, enabled, CancellationToken::new())
+                .await;
+        };
+        self.spawn_mcp_background_task(task);
+    }
+
     /// Restart an MCP server in place: tear down its live session and
     /// re-run discovery.
     pub async fn restart_mcp_server(
@@ -2459,6 +2508,19 @@ impl Agent {
         self.tools
             .restart_mcp_server(server_name, CancellationToken::new())
             .await
+    }
+
+    /// Restart an MCP server without blocking the caller. The registry owns
+    /// the `Starting` / `Ready` / `Failed` snapshot transitions; the TUI polls
+    /// that snapshot while this task runs.
+    pub fn restart_mcp_server_in_background(&self, server_name: String) {
+        let tools = self.tools.clone();
+        let task = async move {
+            let _ = tools
+                .restart_mcp_server(&server_name, CancellationToken::new())
+                .await;
+        };
+        self.spawn_mcp_background_task(task);
     }
 
     /// Replace the entire MCP server map without restarting the
@@ -2473,6 +2535,51 @@ impl Agent {
         self.tools
             .replace_mcp_servers(servers, CancellationToken::new())
             .await
+    }
+
+    /// Replace the MCP server map in the background, keeping the agent config
+    /// snapshot aligned immediately so `/mcp` browse rows do not wait on
+    /// discovery before reflecting add/remove operations.
+    pub fn replace_mcp_servers_in_background(
+        &mut self,
+        servers: std::collections::BTreeMap<String, squeezy_core::McpServerConfig>,
+    ) {
+        self.config.mcp_servers = servers.clone();
+        let tools = self.tools.clone();
+        let task = async move {
+            let _ = tools
+                .replace_mcp_servers(servers, CancellationToken::new())
+                .await;
+        };
+        self.spawn_mcp_background_task(task);
+    }
+
+    fn spawn_mcp_background_task<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let ticket = self.mcp_background_queue.issue_ticket();
+        let queue = self.mcp_background_queue.clone();
+        let task = async move {
+            queue.wait_for_turn(ticket).await;
+            let result = AssertUnwindSafe(task).catch_unwind().await;
+            queue.finish_turn();
+            if result.is_err() {
+                tracing::warn!(
+                    target: "squeezy::mcp",
+                    ticket,
+                    "background MCP config action panicked"
+                );
+            }
+        };
+        match self.background_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.spawn(task);
+            }
+            Err(poison) => {
+                poison.into_inner().spawn(task);
+            }
+        }
     }
 
     /// Snapshot of the registry's live server map. Mirrors
@@ -6389,6 +6496,33 @@ impl TurnRuntime {
             conversation.push(image_item.clone());
         }
         let mut context_compaction = prior_state.context_compaction.clone();
+        // Trim pre-pass: before the lossy summarize gate, reclaim older bulky
+        // `FunctionCallOutput` bodies (reads/shell/web) in place so they are
+        // cleared before any summary head replaces the older slice. Cheap and
+        // structure-preserving. It rewrites earlier items, so a successful trim
+        // invalidates response-id reuse below (forces a full resend).
+        let post_turn_trimmed =
+            if let Some(report) = maybe_micro_compact(&mut conversation, &self.config, None) {
+                self.log_event(
+                    "context_micro_compacted",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "post-turn trim cleared {} tool outputs, freed {} bytes",
+                        report.cleared_call_ids.len(),
+                        report.bytes_saved,
+                    )),
+                    json!({
+                        "cleared_call_ids": &report.cleared_call_ids,
+                        "bytes_saved": report.bytes_saved,
+                        "before_estimated_tokens": report.before_estimated_tokens,
+                        "after_estimated_tokens": report.after_estimated_tokens,
+                        "phase": "post_turn",
+                    }),
+                );
+                true
+            } else {
+                false
+            };
         // PreCompact hook fires only when the auto trigger's
         // thresholds are crossed so handlers don't see a hook on every
         // turn — only when compaction will actually run. PostCompact
@@ -6412,7 +6546,7 @@ impl TurnRuntime {
         let compaction_likely = cc.enabled
             && (pre_compaction_estimate.items >= cc.min_items || over_high_water)
             && pre_compaction_estimate.items > effective_keep
-            && pre_compaction_tokens >= cc.post_turn_token_ceiling();
+            && pre_compaction_tokens >= cc.summarize_threshold();
         if compaction_likely {
             self.dispatch_pre_compact(pre_compaction_estimate.estimated_tokens);
         }
@@ -6466,7 +6600,12 @@ impl TurnRuntime {
         // previous_response_id must be invalidated the same way to keep
         // the provider state consistent.
         let mut previous_response_id = if self.config.store_responses {
-            if context_compaction.generation == prior_state.context_compaction.generation {
+            // A post-turn trim rewrote earlier outputs in place; reusing the
+            // server-side response id would leave the provider on its untrimmed
+            // copy, so force a full resend just like a generation bump does.
+            if !post_turn_trimmed
+                && context_compaction.generation == prior_state.context_compaction.generation
+            {
                 prior_state.previous_response_id.take()
             } else {
                 None
@@ -6703,6 +6842,11 @@ impl TurnRuntime {
         // saw in the same turn.
         let mut deferred_retry_visible_assistant = String::new();
         let mut pause_turn_reissues = 0usize;
+        // One-shot corrective retry for a Gemini `MALFORMED_FUNCTION_CALL`
+        // stop (tool-call arguments the upstream parser rejected, leaving
+        // no usable call). Bounded so a model that keeps emitting bad JSON
+        // can't loop the turn forever.
+        let mut malformed_retry_used = false;
         // Per-turn model routing decision. The classifier runs once at
         // the top of the turn; `current_model` is what each round
         // dispatches on. On mid-turn escalation it is overwritten with
@@ -8054,6 +8198,84 @@ impl TurnRuntime {
                 // `Some(StopReason::PauseTurn)` with tool calls present falls
                 // through (via the `_` arm) to the existing tool-execution /
                 // re-entry logic below.
+
+                // Gemini `MALFORMED_FUNCTION_CALL`: the model tried to call a
+                // tool but emitted arguments the upstream parser rejected, so
+                // no usable call survives and the turn would otherwise end
+                // with nothing. One bounded corrective retry — tell the model
+                // its arguments were unparseable and ask it to re-issue with
+                // valid JSON. Any visible text it produced first is preserved.
+                // (When valid tool calls DID survive alongside the bad one,
+                // fall through to execute them.)
+                Some(StopReason::MalformedFunctionCall)
+                    if !malformed_retry_used && tool_calls.is_empty() =>
+                {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    let preserved_visible_chars = append_deferred_visible_assistant_text(
+                        &mut deferred_retry_visible_assistant,
+                        &raw_assistant_text,
+                    );
+                    if !raw_assistant_text.trim().is_empty() {
+                        conversation.push(redact_input_item(
+                            LlmInputItem::AssistantText(raw_assistant_text.clone()),
+                            &self.redactor,
+                        ));
+                    }
+                    let retry_metadata = json!({
+                        "branch": "malformed_function_call",
+                        "round": round,
+                        "assistant_text_chars": raw_assistant_text.chars().count(),
+                        "preserved_visible_chars": preserved_visible_chars,
+                    });
+                    self.record_replay_model_completed(
+                        response_id.clone(),
+                        &completed_cost,
+                        stop_reason.as_ref(),
+                        reasoning_only_stop,
+                        Some(retry_metadata.clone()),
+                    );
+                    self.log_event(
+                        "assistant_retry",
+                        Some(self.turn_id),
+                        Some(
+                            "malformed_function_call retry: asked the model to re-issue valid JSON"
+                                .to_string(),
+                        ),
+                        retry_metadata,
+                    );
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    let nudge_item = redact_input_item(
+                        LlmInputItem::UserText(
+                            "Your previous tool call could not be parsed — its arguments were not \
+                             valid JSON. Re-issue the tool call now with correctly-formed JSON \
+                             arguments."
+                                .to_string(),
+                        ),
+                        &self.redactor,
+                    );
+                    conversation.push(nudge_item.clone());
+                    if self.config.store_responses {
+                        previous_response_id = response_id.clone();
+                        next_input = vec![nudge_item];
+                    } else {
+                        previous_response_id = None;
+                        next_input = conversation.clone();
+                    }
+                    malformed_retry_used = true;
+                    tracing::debug!(
+                        target: "squeezy_agent::malformed_function_call_retry",
+                        round,
+                        preserved_visible_chars,
+                        "retrying after malformed tool-call arguments",
+                    );
+                    continue;
+                }
                 _ => {}
             }
 
@@ -8158,10 +8380,17 @@ impl TurnRuntime {
                              Respond directly to the user now."
                         }
                     } else {
-                        "You described a follow-up action but did not call any tool. \
-                         If you need to call a tool to complete the user's request, \
-                         call it now. If the previous output is enough, give the final \
-                         answer directly instead."
+                        // G2 (action safety): grant permission to finish,
+                        // do not command an action. A model that was
+                        // actually done replies `DONE` (recognized as an
+                        // ack, so its prior visible text is kept verbatim);
+                        // a model that genuinely stalled picks up the work.
+                        // This is what lets the same recovery run harmlessly
+                        // on a strong model that didn't fail.
+                        "If your previous response already fully answers the request, \
+                         reply with just `DONE` and nothing else. Otherwise, finish the \
+                         work now — call the tool you described, or give the final answer \
+                         directly. Do not repeat what you already said."
                     };
                     let nudge_item = redact_input_item(
                         LlmInputItem::UserText(nudge.to_string()),
@@ -8489,37 +8718,26 @@ impl TurnRuntime {
                 }
             }
 
-            // Mid-turn compaction (F75): if the provider reported usage
-            // crossing the configured fraction of `model_context_window`,
-            // shrink the conversation before the next sample. Bumps the
-            // compaction generation, which forces previous_response_id
-            // off the next request to keep the provider state consistent
-            // with the new history.
-            //
-            // The PreCompact / PostCompact hook fan-out mirrors the
-            // pre-turn path: PreCompact fires only when the mid-turn
-            // gate will trip; PostCompact carries the report's
-            // before/after counts when the rewrite landed.
+            // Mid-turn trim: between tool rounds, reclaim older bulky
+            // `FunctionCallOutput` bodies in place when usage (provider-reported
+            // when available, else the local estimate) crosses the trim
+            // threshold, so a long tool-heavy turn does not outgrow the window.
+            // Summarize never runs mid-turn — it waits for the post-turn boundary
+            // or the forced overflow path. Trimming rewrites *earlier* outputs,
+            // so it forces the same response-id invalidation + full resend that
+            // expired-context masking does.
             let mid_turn_observed_tokens = total_tokens_from_cost(&completed_cost);
-            // Mid-tier micro-compaction (F12-cc-microcompaction): rewrite
-            // older `FunctionCallOutput` payloads in place before falling
-            // through to the all-or-nothing full tier. When the
-            // micro-threshold sits below the full-compaction threshold a
-            // successful micro pass can keep the conversation under the
-            // full gate, preserving per-turn tool-call structure. Pass the
-            // provider-reported total when we have one so the gate matches
-            // what the model actually saw.
-            let micro_report = maybe_micro_compact_mid_turn(
-                &mut conversation,
-                &self.config,
-                mid_turn_observed_tokens,
-            );
+            let micro_report = if self.config.context_compaction.enabled_mid_turn {
+                maybe_micro_compact(&mut conversation, &self.config, mid_turn_observed_tokens)
+            } else {
+                None
+            };
             if let Some(report) = micro_report.as_ref() {
                 self.log_event(
                     "context_micro_compacted",
                     Some(self.turn_id),
                     Some(format!(
-                        "mid-turn micro-compaction cleared {} tool outputs, freed {} bytes",
+                        "mid-turn trim cleared {} tool outputs, freed {} bytes",
                         report.cleared_call_ids.len(),
                         report.bytes_saved,
                     )),
@@ -8532,77 +8750,7 @@ impl TurnRuntime {
                     }),
                 );
             }
-            // After a micro pass the conversation is smaller; the
-            // provider-reported total reflects the pre-rewrite payload
-            // size and would over-fire the full-tier gate. Switch to the
-            // local estimate so full only fires if micro alone was not
-            // enough.
-            let full_gate_observed_tokens = if micro_report.is_some() {
-                Some(estimate_context(&conversation).estimated_tokens)
-            } else {
-                mid_turn_observed_tokens
-            };
-            let mid_turn_compaction_likely = mid_turn_compaction_will_fire(
-                &self.config,
-                &conversation,
-                full_gate_observed_tokens,
-            );
-            if mid_turn_compaction_likely {
-                let pre_estimate = full_gate_observed_tokens
-                    .unwrap_or_else(|| estimate_context(&conversation).estimated_tokens);
-                self.dispatch_pre_compact(pre_estimate);
-            }
-            let mid_turn_report = maybe_compact_mid_turn(
-                &mut conversation,
-                &mut context_compaction,
-                &active_attachments,
-                self.store.as_deref(),
-                &self.provider,
-                self.session_log.as_ref(),
-                &self.redactor,
-                &self.config,
-                full_gate_observed_tokens,
-            )
-            .await;
-            // Either tier mutates `conversation`, so the response-id reuse
-            // path must invalidate the cached id and resend the full
-            // conversation instead of the per-round outputs. Expired-context
-            // masking rewrites *earlier* outputs in place, so it must force
-            // the same full-resend — otherwise the per-round `outputs` would
-            // carry the verbatim bodies and the provider's server-side state
-            // would diverge from the locally-masked `conversation`.
-            let mid_turn_compacted =
-                mid_turn_report.is_some() || micro_report.is_some() || expired_context_masked;
-            if let Some(report) = mid_turn_report {
-                self.dispatch_post_compact(
-                    report.record.before.estimated_tokens,
-                    report.record.after.estimated_tokens,
-                );
-                self.log_event(
-                    "context_compacted",
-                    Some(self.turn_id),
-                    Some(format!(
-                        "mid-turn compacted gen={} {}->{} estimated tokens",
-                        report.record.generation,
-                        report.record.before.estimated_tokens,
-                        report.record.after.estimated_tokens,
-                    )),
-                    json!({
-                        "record": report.record,
-                        "summary": report.summary,
-                        "replacement_id": report.record.replacement_id,
-                        "conversation": report.post_compact,
-                        "phase": "mid_turn",
-                    }),
-                );
-                let _ = self
-                    .tx
-                    .send(AgentEvent::ContextCompacted {
-                        turn_id: self.turn_id,
-                        report,
-                    })
-                    .await;
-            }
+            let mid_turn_compacted = micro_report.is_some() || expired_context_masked;
 
             if self.config.store_responses {
                 previous_response_id = if implicit_instructions_added || mid_turn_compacted {
@@ -12298,37 +12446,158 @@ fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str)
 
 fn assistant_text_is_retry_ack(text: &str) -> bool {
     let lower = text.trim().to_ascii_lowercase();
-    lower.starts_with("the previous output is")
-        || lower.starts_with("the previous answer is")
-        || lower.contains("previous output is the complete answer")
-        || lower.contains("previous output was the complete answer")
-}
-
-/// Heuristic: does the assistant text contain an intent phrase that
-/// implies the model promised follow-up tool work it never delivered?
-///
-/// True when ALL of the following hold:
-///   1. The text is non-empty (an actually visible message, not just whitespace).
-///   2. The text contains at least one intent phrase (`let me`, `i'll`,
-///      `i will`, `going to`, `i need to`, etc.).
-///   3. The intent phrase is followed within ~40 chars by an action verb
-///      that maps to a tool the model has access to (`scan`, `search`,
-///      `read`, `explore`, `find`, ...).
-///
-/// Skipped when the text contains a `<proposed_plan>` block (plan-mode
-/// output is a legitimate finish_reason=stop) or a fenced final-answer
-/// marker (`final answer:`, `here is the answer:`).
-fn assistant_text_has_unresolved_intent(text: &str) -> bool {
-    if text.trim().is_empty() {
+    // Bare `DONE` confirmation from the G2 "reply DONE if complete" nudge,
+    // tolerant of trailing/wrapping punctuation, quotes, or markdown
+    // emphasis ("`DONE`", "**Done.**"). Only an *essentially empty*
+    // confirmation collapses to the prior answer; if the model added real
+    // content alongside it, that content is merged (G1 never drops text).
+    // Note: `?` is deliberately NOT trimmed — "Done?" is the model asking,
+    // not confirming, so it must not collapse to the prior answer.
+    let bare = lower.trim_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '`' | '*' | '_'
+        )
+    });
+    if bare == "done" {
+        return true;
+    }
+    // Beyond the bare token, only an explicit AND essentially content-free
+    // completeness confirmation collapses to the prior answer. A response
+    // that adds real content — even one that opens "the previous response
+    // is ..." but then negates it or supplies the missing content (e.g.
+    // "the previous response is incomplete; the missing file is foo.rs") —
+    // must be MERGED (appended), never dropped. So: short, affirms
+    // completeness, and carries no negation/continuation signal.
+    let chars = lower.chars().count();
+    if chars > 120
+        || lower.contains("incomplete")
+        || lower.contains("not complete")
+        || lower.contains("missing")
+    {
         return false;
     }
-    let lower = text.to_ascii_lowercase();
+    const COMPLETE_AFFIRMATIONS: &[&str] = &[
+        "is the complete answer",
+        "was the complete answer",
+        "previous response is complete",
+        "previous output is complete",
+        "previous answer is complete",
+        "already complete",
+        "nothing to add",
+        "no changes needed",
+    ];
+    COMPLETE_AFFIRMATIONS
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Phrases that turn an "intent" verb into an *offer* rather than a
+/// commitment to act now. "Let me know if you'd like me to check the
+/// other files" parses structurally like "let me ... check" but is a
+/// closing offer, not abandoned work. Excluding these (when they appear
+/// in the final clause) removes the dominant strong-model false-positive
+/// class for [`assistant_text_has_unresolved_intent`].
+///
+/// Kept tight to phrases that are *structurally* a trailing offer. Looser
+/// markers like "happy to" / "feel free to" were dropped: they can sit in
+/// front of a genuine stall ("I'm happy to fix this — let me edit it now")
+/// and would wrongly suppress it.
+const STALL_OFFER_MARKERS: &[&str] = &[
+    "let me know",
+    "if you'd like",
+    "if you would like",
+    "if you want",
+    "if you'd prefer",
+    "would you like",
+    "do you want",
+];
+
+/// Return the trailing sentence/clause of an already-lowercased,
+/// already-trimmed message. A stalled model ends *on* an intent ("Now
+/// let me search the codebase."); a complete answer ends *on* a
+/// conclusion. Anchoring the intent check to this final clause — rather
+/// than scanning the whole body — is the model-agnostic discriminator
+/// that keeps a strong model's mid-answer "let me check: yes, the bug is
+/// in foo.rs. The fix is ..." from reading as an unresolved promise.
+fn assistant_final_clause(lower_trimmed: &str) -> &str {
+    // Drop trailing sentence punctuation / dangling separators so
+    // "...the bug. let me fix it." and "...let me fix it:" both expose
+    // the real final clause. A trailing ':' or '...' is itself an "about
+    // to act" signal, so we keep the clause that precedes it.
+    let core = lower_trimmed.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | '!' | '?' | ':' | ';' | ' ' | '\t' | '\n' | '\r' | '"' | '\'' | ')'
+        )
+    });
+    if core.is_empty() {
+        return lower_trimmed;
+    }
+    // Split on the rightmost *sentence* boundary: a terminator (`.!?`)
+    // immediately followed by whitespace, or a bare newline. We do NOT
+    // split on a bare `.`, so dotted tokens ("src/lib.rs", "v1.2") stay
+    // intact — splitting there would drop the intent that precedes them.
+    // ASCII terminators/whitespace are single-byte and never collide with
+    // UTF-8 continuation bytes, so the byte scan is boundary-safe.
+    let bytes = core.as_bytes();
+    let mut idx = core.len();
+    while idx >= 1 {
+        idx -= 1;
+        let c = bytes[idx];
+        if c == b'\n' {
+            return core[idx..].trim();
+        }
+        if idx >= 1
+            && (c == b' ' || c == b'\t' || c == b'\r')
+            && matches!(bytes[idx - 1], b'.' | b'!' | b'?')
+        {
+            return core[idx..].trim();
+        }
+    }
+    core.trim()
+}
+
+/// Heuristic: does the assistant's FINAL clause announce follow-up tool
+/// work the model never delivered (the "promised action then stopped"
+/// stall)?
+///
+/// True when ALL of the following hold:
+///   1. The message is non-empty visible text (not just whitespace).
+///   2. It is not plan-mode output (`<proposed_plan>`) or an explicit
+///      final-answer marker (`final answer:`, `in summary:`, ...).
+///   3. The FINAL clause contains an intent phrase (`let me`, `i'll`,
+///      `going to`, ...) followed shortly by an action verb that maps to
+///      a tool (`scan`, `read`, `search`, ...), and is not an *offer*
+///      ("let me know if you'd like me to ...").
+///
+/// This is deliberately model-agnostic — the same rule for strong and
+/// weak models. It is NOT relied on to be perfect: callers pair it with
+/// the carried-visible-output invariant (already-shown text is never
+/// dropped) and a "confirm-or-continue" nudge (a model that was actually
+/// done just confirms), so a residual false positive costs at most one
+/// bounded recovery round and can neither drop text nor force an unwanted
+/// action.
+///
+/// The tradeoff is intentional and asymmetric. Final-clause anchoring
+/// trades *recall* for *precision*: a genuine stall whose announced
+/// action is not the last clause (e.g. "Let me search.\nThanks!") is
+/// missed. We accept that — under-firing only means a weak model that was
+/// already failing gets no extra recovery round; it never hurts a model
+/// that succeeded. Over-firing is what hurt strong models (the spurious
+/// retry that drove unrequested edits), so precision is what matters here.
+pub fn assistant_text_has_unresolved_intent(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
     // Plan-mode output: a `<proposed_plan>` block is the expected
     // end-of-turn shape; not a chatty-stop bug.
     if lower.contains("<proposed_plan>") {
         return false;
     }
-    // Final-answer markers: model is signaling "this is my answer".
+    // Final-answer markers anywhere: model is signaling "this is my answer".
     const FINAL_MARKERS: &[&str] = &[
         "final answer:",
         "here is the answer:",
@@ -12336,6 +12605,11 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
         "to summarize:",
     ];
     if FINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    let clause = assistant_final_clause(&lower);
+    // Offer idioms in the final clause are closings, not abandoned work.
+    if STALL_OFFER_MARKERS.iter().any(|m| clause.contains(m)) {
         return false;
     }
     const INTENT_PATTERNS: &[&str] = &[
@@ -12383,13 +12657,13 @@ fn assistant_text_has_unresolved_intent(text: &str) -> bool {
         "run ",
     ];
     for intent in INTENT_PATTERNS {
-        if let Some(idx) = lower.find(intent) {
+        if let Some(idx) = clause.find(intent) {
             let tail_start = idx + intent.len();
-            let mut tail_end = (tail_start + 40).min(lower.len());
-            while tail_end > tail_start && !lower.is_char_boundary(tail_end) {
+            let mut tail_end = (tail_start + 40).min(clause.len());
+            while tail_end > tail_start && !clause.is_char_boundary(tail_end) {
                 tail_end -= 1;
             }
-            let tail = &lower[tail_start..tail_end];
+            let tail = &clause[tail_start..tail_end];
             if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
                 return true;
             }
@@ -16824,28 +17098,6 @@ fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
         total = total.saturating_add(value);
     }
     if saw_any { Some(total) } else { None }
-}
-
-/// Mirror of the gate inside `maybe_compact_mid_turn`. Returns `true`
-/// when the configured threshold is crossed so the agent can fire a
-/// `HookEvent::PreCompact` before the rewrite call. Kept here (rather
-/// than in `context_compaction.rs`) because the hook fan-out is an
-/// agent-loop concern; the function reads only public config and
-/// estimator state so it stays a thin predicate.
-fn mid_turn_compaction_will_fire(
-    config: &AppConfig,
-    conversation: &[LlmInputItem],
-    last_total_tokens: Option<u64>,
-) -> bool {
-    if !config.context_compaction.enabled_mid_turn {
-        return false;
-    }
-    let Some(threshold) = config.context_compaction.mid_turn_full_threshold() else {
-        return false;
-    };
-    let observed =
-        last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
-    observed >= threshold
 }
 
 pub(crate) fn compact_text(text: &str, max_chars: usize) -> String {

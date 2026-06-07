@@ -10,15 +10,14 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::{
     AppConfig, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
-    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS,
-    DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
+    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES, DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
-    DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS, DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT,
-    DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT,
-    DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT, DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES,
-    DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES, DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV,
+    DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS, DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS,
+    DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT, DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES,
+    DEFAULT_CONTEXT_TRIM_AT_PERCENT, DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES,
+    DEFAULT_CONTEXT_WARN_AT_PERCENT, DEFAULT_COST_WARN_PERCENT, DEFAULT_EXA_API_KEY_ENV,
     DEFAULT_EXA_MCP_URL, DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES,
     DEFAULT_GITHUB_COPILOT_MODEL, DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS,
     DEFAULT_MAX_SEARCH_FILES_PER_TURN, DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
@@ -1344,21 +1343,39 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
-                label: "compaction_estimated_tokens",
-                toml_path: &["context", "compaction_estimated_tokens"],
+                label: "fallback_window_tokens",
+                toml_path: &["context", "fallback_window_tokens"],
                 kind: FieldKind::Integer {
                     min: 1,
                     max: 100_000_000,
                     suffix: Some("tok"),
                 },
                 tier: ApplyTier::NextPrompt,
-                get: get_context_estimated_tokens,
-                set: set_context_estimated_tokens,
-                default_display: "60000 tok",
-                default: || FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS as i64),
-                help: "Flat post-turn budget. The trigger fires at the lesser of this and \
-                       threshold_percent of the window, so it also protects small-window models.",
-                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS"),
+                get: get_context_fallback_window,
+                set: set_context_fallback_window,
+                default_display: "128000 tok",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS as i64),
+                help: "Window assumed for the percent thresholds when the model's real window \
+                       is unknown. Only a fallback; set model_context_window otherwise.",
+                env_override: Some("SQUEEZY_CONTEXT_FALLBACK_WINDOW_TOKENS"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_context_tokens",
+                toml_path: &["context", "max_context_tokens"],
+                kind: FieldKind::OptionalInteger {
+                    min: 1,
+                    max: 100_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_context_max_context_tokens,
+                set: set_context_max_context_tokens,
+                default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
+                help: "Optional hard cap on the summarize threshold, independent of the window. \
+                       Unset → thresholds scale with the window; set it to keep requests small.",
+                env_override: Some("SQUEEZY_CONTEXT_MAX_CONTEXT_TOKENS"),
                 secret: false,
             },
             FieldMeta {
@@ -1424,7 +1441,8 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_context_enabled_mid_turn,
                 default_display: "true",
                 default: || FieldValue::Bool(true),
-                help: "Enable mid-turn micro + full compaction (requires a known window).",
+                help: "Run the trim pass between LLM events within a turn. Summarize never \
+                       runs mid-turn; it waits for the turn boundary or forced overflow.",
                 env_override: Some("SQUEEZY_CONTEXT_COMPACTION_ENABLED_MID_TURN"),
                 secret: false,
             },
@@ -1443,8 +1461,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::OptionalInteger(None),
                 help: "Global fallback model token budget; all percent knobs are % of this. The \
                        per-model [Models].context_window override takes precedence. Unset → \
-                       auto-derived by the limit resolver; mid-turn dormant if only a low-\
-                       confidence fallback is available.",
+                       auto-derived by the limit resolver, else fallback_window_tokens.",
                 env_override: Some("SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW"),
                 secret: false,
             },
@@ -1461,8 +1478,9 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_context_effective_percent,
                 default_display: "— (95)",
                 default: || FieldValue::OptionalInteger(None),
-                help: "Percent of the raw window treated as usable in /context (rest is \
-                       headroom). Unset uses the curated model's value, else 95.",
+                help: "Percent of the raw window treated as usable (rest is headroom); the \
+                       summarize tier folds at this usable budget. Unset uses the curated \
+                       model's value, else 95.",
                 env_override: Some("SQUEEZY_CONTEXT_EFFECTIVE_CONTEXT_WINDOW_PERCENT"),
                 secret: false,
             },
@@ -1485,22 +1503,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
-                label: "threshold_percent",
-                toml_path: &["context", "threshold_percent"],
+                label: "warn_at_percent",
+                toml_path: &["context", "warn_at_percent"],
                 kind: FieldKind::Integer {
                     min: 0,
                     max: 100,
                     suffix: Some("%"),
                 },
                 tier: ApplyTier::NextPrompt,
-                get: get_context_threshold_percent,
-                set: set_context_threshold_percent,
-                default_display: "80 %",
-                default: || {
-                    FieldValue::Integer(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT as i64)
-                },
-                help: "% of window for mid-turn full compaction (also caps the post-turn budget).",
-                env_override: Some("SQUEEZY_CONTEXT_COMPACTION_THRESHOLD_PERCENT"),
+                get: get_context_warn_at_percent,
+                set: set_context_warn_at_percent,
+                default_display: "85 %",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_WARN_AT_PERCENT as i64),
+                help: "% of the effective window at which the pre-summarize /pin nudge fires. \
+                       Sits below the summarize point so you can pin before any lossy summarize.",
+                env_override: Some("SQUEEZY_CONTEXT_WARN_AT_PERCENT"),
                 secret: false,
             },
             FieldMeta {
@@ -1512,28 +1529,27 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_context_micro_enabled,
                 default_display: "true",
                 default: || FieldValue::Bool(true),
-                help: "Enable the mid-turn micro pass that clears older tool-output bodies.",
+                help: "Master switch for the trim tier that clears older tool-output bodies \
+                       in place (runs both mid-turn and as a post-turn pre-pass).",
                 env_override: Some("SQUEEZY_CONTEXT_MICRO_COMPACTION_ENABLED"),
                 secret: false,
             },
             FieldMeta {
-                label: "micro_compaction_threshold_percent",
-                toml_path: &["context", "micro_compaction_threshold_percent"],
+                label: "trim_at_percent",
+                toml_path: &["context", "trim_at_percent"],
                 kind: FieldKind::Integer {
                     min: 0,
                     max: 100,
                     suffix: Some("%"),
                 },
                 tier: ApplyTier::NextPrompt,
-                get: get_context_micro_threshold_percent,
-                set: set_context_micro_threshold_percent,
-                default_display: "60 %",
-                default: || {
-                    FieldValue::Integer(DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT as i64)
-                },
-                help: "% of window for the mid-turn micro pass. Keep below threshold_percent so \
-                       micro reclaims tool output before the heavier full tier fires.",
-                env_override: Some("SQUEEZY_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT"),
+                get: get_context_trim_at_percent,
+                set: set_context_trim_at_percent,
+                default_display: "40 %",
+                default: || FieldValue::Integer(DEFAULT_CONTEXT_TRIM_AT_PERCENT as i64),
+                help: "% of window at which old tool output is trimmed in place. Low by design \
+                       (cheap, structure-preserving), so it runs well before summarize.",
+                env_override: Some("SQUEEZY_CONTEXT_TRIM_AT_PERCENT"),
                 secret: false,
             },
             FieldMeta {
@@ -1568,7 +1584,7 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Enum(CompactionStrategy::Extractive.as_str()),
                 help: "Summary strategy. extractive = deterministic, no model call. \
                        model_assisted / layered_fallback rewrite via a cheap model with \
-                       extractive fallback. See docs/internal/compaction-explained.md §3b.",
+                       extractive fallback. See docs/internal/cost-saving/02-conversation-compaction.md.",
                 env_override: Some("SQUEEZY_CONTEXT_COMPACTION_STRATEGY"),
                 secret: false,
             },
@@ -3258,32 +3274,25 @@ fn get_context_trigger_info(cfg: &AppConfig) -> FieldValue {
     let cc = &cfg.context_compaction;
     let window = match cc.model_context_window {
         Some(w) if w > 0 => format!("window {w} tok"),
-        _ => "window — (unknown; mid-turn dormant)".to_string(),
+        _ => format!("window {} tok (fallback)", cc.fallback_window_tokens),
     };
-    let fmt_mid_turn = |label: &str, enabled: bool, percent: u8, value: Option<u64>| {
-        if !enabled {
-            return format!("{label} off");
-        }
-        match value {
-            Some(v) => format!("{label} on @{v}"),
-            None => format!("{label} on (dormant @{percent}%)"),
-        }
+    let trim = if cc.micro_compaction_enabled {
+        format!("trim @{} ({}%)", cc.trim_threshold(), cc.trim_at_percent)
+    } else {
+        "trim off".to_string()
+    };
+    let warn = format!("warn @{} ({}%)", cc.warn_threshold(), cc.warn_at_percent);
+    let summarize = if cc.enabled {
+        format!("summarize @{} (effective window)", cc.summarize_threshold())
+    } else {
+        "summarize off".to_string()
+    };
+    let cap = match cc.max_context_tokens {
+        Some(c) if c > 0 => format!("  ·  cap {c} tok"),
+        _ => String::new(),
     };
     FieldValue::String(format!(
-        "{window}  ·  {}  ·  {}  ·  post-turn @{}",
-        fmt_mid_turn(
-            "micro",
-            cc.micro_compaction_enabled,
-            cc.micro_compaction_threshold_percent,
-            cc.mid_turn_micro_threshold(),
-        ),
-        fmt_mid_turn(
-            "full",
-            cc.enabled_mid_turn,
-            cc.threshold_percent,
-            cc.mid_turn_full_threshold(),
-        ),
-        cc.post_turn_token_ceiling(),
+        "{window}  ·  {trim}  ·  {warn}  ·  {summarize}{cap}"
     ))
 }
 
@@ -3321,14 +3330,31 @@ fn set_context_compaction_enabled(
     Ok(())
 }
 
-fn get_context_estimated_tokens(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Integer(cfg.context_compaction.estimated_tokens as i64)
+fn get_context_fallback_window(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.fallback_window_tokens as i64)
 }
-fn set_context_estimated_tokens(
+fn set_context_fallback_window(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.fallback_window_tokens = ctx_integer(value, 1)? as u64;
+    Ok(())
+}
+
+fn get_context_max_context_tokens(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalInteger(cfg.context_compaction.max_context_tokens.map(|v| v as i64))
+}
+fn set_context_max_context_tokens(
     cfg: &mut AppConfig,
     value: FieldValue,
 ) -> Result<(), &'static str> {
-    cfg.context_compaction.estimated_tokens = ctx_integer(value, 1)? as u64;
+    cfg.context_compaction.max_context_tokens = match value {
+        FieldValue::OptionalInteger(None) | FieldValue::Unset => None,
+        FieldValue::OptionalInteger(Some(v)) | FieldValue::Integer(v) => {
+            if v < 1 {
+                return Err("must be >= 1");
+            }
+            Some(v as u64)
+        }
+        _ => return Err("expects integer"),
+    };
     Ok(())
 }
 
@@ -3439,14 +3465,11 @@ fn set_context_baseline_reserve(
     Ok(())
 }
 
-fn get_context_threshold_percent(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Integer(cfg.context_compaction.threshold_percent as i64)
+fn get_context_warn_at_percent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.warn_at_percent as i64)
 }
-fn set_context_threshold_percent(
-    cfg: &mut AppConfig,
-    value: FieldValue,
-) -> Result<(), &'static str> {
-    cfg.context_compaction.threshold_percent = ctx_percent(value)?;
+fn set_context_warn_at_percent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.warn_at_percent = ctx_percent(value)?;
     Ok(())
 }
 
@@ -3458,14 +3481,11 @@ fn set_context_micro_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(
     Ok(())
 }
 
-fn get_context_micro_threshold_percent(cfg: &AppConfig) -> FieldValue {
-    FieldValue::Integer(cfg.context_compaction.micro_compaction_threshold_percent as i64)
+fn get_context_trim_at_percent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.context_compaction.trim_at_percent as i64)
 }
-fn set_context_micro_threshold_percent(
-    cfg: &mut AppConfig,
-    value: FieldValue,
-) -> Result<(), &'static str> {
-    cfg.context_compaction.micro_compaction_threshold_percent = ctx_percent(value)?;
+fn set_context_trim_at_percent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.context_compaction.trim_at_percent = ctx_percent(value)?;
     Ok(())
 }
 

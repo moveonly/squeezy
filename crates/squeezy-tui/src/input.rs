@@ -211,7 +211,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash("/tasks", "list background tasks"),
     slash_args("/task", "show a background task", true, "<id>"),
     slash_args("/task-cancel", "cancel a background task", true, "<id>"),
-    slash_args("/pin", "pin transcript context", false, "<id>"),
+    SlashCommand {
+        name: "/pin",
+        description: "pin a transcript item (opens a picker)",
+        available_during_task: false,
+        parameter_hint: None,
+        capabilities: &[],
+    },
     slash("/pins", "list pinned context"),
     slash_args("/unpin", "remove pinned context", false, "<id>"),
     slash_caps(

@@ -200,6 +200,46 @@ async fn restart_server_invalidates_session_and_runs_refresh() {
     assert!(matches!(err, McpError::UnknownServer { .. }));
 }
 
+#[test]
+fn starting_status_snapshot_replaces_old_enabled_statuses() {
+    let mut servers = BTreeMap::new();
+    servers.insert("docs".to_string(), fixture_server(true, Some("docs-mcp")));
+    servers.insert("off".to_string(), fixture_server(false, Some("off-mcp")));
+
+    let mut prior = BTreeMap::new();
+    prior.insert(
+        "docs".to_string(),
+        McpServerStatus::Ready {
+            tools_count: 3,
+            cached: false,
+        },
+    );
+    prior.insert(
+        "off".to_string(),
+        McpServerStatus::Failed {
+            error: "old failure".to_string(),
+        },
+    );
+    prior.insert(
+        "removed".to_string(),
+        McpServerStatus::Ready {
+            tools_count: 1,
+            cached: false,
+        },
+    );
+
+    let snapshot = starting_status_snapshot(&servers, prior);
+    assert_eq!(snapshot.get("docs"), Some(&McpServerStatus::Starting));
+    assert!(
+        !snapshot.contains_key("off"),
+        "disabled servers should not preserve stale visible status"
+    );
+    assert!(
+        !snapshot.contains_key("removed"),
+        "removed servers should not preserve stale visible status"
+    );
+}
+
 #[tokio::test]
 async fn replace_servers_swaps_map_and_drops_cached_tools_for_removed() {
     let mut servers = BTreeMap::new();

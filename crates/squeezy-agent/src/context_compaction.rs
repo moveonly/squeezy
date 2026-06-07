@@ -136,61 +136,11 @@ pub struct ContextCompactionReport {
     pub post_compact: Vec<ResumeItem>,
 }
 
-/// Trigger compaction mid-turn when the configured context window is in
-/// danger. Returns the produced compaction report when it fired; `None`
-/// when the feature is disabled, the window isn't configured, or the
-/// threshold hasn't been crossed.
-///
-/// Routes through `compact_conversation_with_strategy` so a configured
-/// `ModelAssisted`/`LayeredFallback` strategy applies to the automatic
-/// mid-turn path, not only manual `/compact`. The strategy-aware path
-/// runs the extractive pipeline first and falls back to it on any model
-/// timeout/error/empty output, so the gate's contract is unchanged when
-/// the strategy is `Extractive` or no model is configured.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn maybe_compact_mid_turn(
-    conversation: &mut Vec<LlmInputItem>,
-    state: &mut ContextCompactionState,
-    attachments: &[ContextAttachment],
-    store: Option<&SqueezyStore>,
-    provider: &Arc<dyn LlmProvider>,
-    session: Option<&SessionHandle>,
-    redactor: &Redactor,
-    config: &AppConfig,
-    last_total_tokens: Option<u64>,
-) -> Option<ContextCompactionReport> {
-    if !config.context_compaction.enabled_mid_turn {
-        return None;
-    }
-    let threshold = config.context_compaction.mid_turn_full_threshold()?;
-    let observed =
-        last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
-    if observed < threshold {
-        return None;
-    }
-    compact_conversation_with_strategy(
-        conversation,
-        state,
-        attachments,
-        store,
-        provider,
-        session,
-        redactor,
-        config,
-        ContextCompactionTrigger::Auto,
-        true,
-        // Forced mid-turn path shrinks via the `force` branch; overhead is
-        // already reflected in the provider-reported `last_total_tokens` gate.
-        0,
-    )
-    .await
-}
-
-/// Trigger post-turn auto-compaction when the conversation crosses the
-/// configured item/token budget. Routes through
-/// `compact_conversation_with_strategy` so the configured strategy
-/// applies to the automatic path as well as manual `/compact`; see
-/// `maybe_compact_mid_turn` for the extractive-fallback guarantee.
+/// Trigger post-turn summarize when the conversation crosses the
+/// `summarize_threshold`. Routes through `compact_conversation_with_strategy`
+/// so the configured strategy applies to the automatic path as well as manual
+/// `/compact`; the strategy-aware path runs the extractive pipeline first and
+/// falls back to it on any model timeout/error/empty output.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn maybe_compact_conversation(
     conversation: &mut Vec<LlmInputItem>,
@@ -213,13 +163,13 @@ pub(crate) async fn maybe_compact_conversation(
     // schemas that ride along on every request; fold in the caller's measured
     // request overhead so the gate reflects the real input size (finding #2).
     let tokens = estimate.estimated_tokens.saturating_add(overhead_tokens);
-    // Window-aware ceiling: capped at the flat budget so large windows keep
-    // the deliberate 60K cost-thesis behavior while small windows no longer
-    // sit above their own window (findings #4/#6).
-    let ceiling = cc.post_turn_token_ceiling();
+    // Lossy summarize fires only once usage crosses the window-relative
+    // summarize threshold. The cheap trim pre-pass runs before this (at the
+    // call site) so tool-output bytes are reclaimed before any summary head.
+    let ceiling = cc.summarize_threshold();
     // A few but enormous items can dwarf the window while sitting under
     // `min_items`; once over the high-water mark, bypass the item floor so
-    // they still compact proactively (finding #3).
+    // they still summarize proactively.
     let over_high_water = tokens >= cc.min_items_bypass_threshold();
     if (estimate.items < cc.min_items && !over_high_water) || tokens < ceiling {
         return None;

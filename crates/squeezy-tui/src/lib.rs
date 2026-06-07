@@ -1305,11 +1305,11 @@ async fn apply_plan_choice(
 /// session — the most common cause is mid-write (the editor truncating the
 /// file before re-writing) and the next poll will see the finished file.
 /// Drain MCP actions staged by the `/mcp` config page key handlers
-/// and dispatch them through the agent. Each action is async because
-/// it reaches into the registry to (re)open sessions and run
-/// discovery; the page handler stages them on the screen state so
-/// the per-key code stays sync.
-async fn drain_mcp_actions(
+/// and dispatch them through the agent. Live registry work is scheduled in
+/// the background so restarting a slow server cannot block the TUI redraw loop;
+/// the page handler stages actions on the screen state so the per-key code
+/// stays sync.
+fn drain_mcp_actions(
     app: &mut TuiApp,
     agent: &mut Agent,
     feedback: &mut config_screen::ConfigFeedback,
@@ -1319,15 +1319,11 @@ async fn drain_mcp_actions(
         None => return,
     };
     for action in actions {
-        apply_mcp_action(app, agent, feedback, action).await;
+        apply_mcp_action(app, agent, feedback, action);
     }
-    // After every batch, refresh the cached snapshot so the next
-    // render reflects the live registry/status — even partial
-    // failures should surface the new state.
-    refresh_mcp_screen_state(app, agent);
 }
 
-async fn apply_mcp_action(
+fn apply_mcp_action(
     app: &mut TuiApp,
     agent: &mut Agent,
     feedback: &mut config_screen::ConfigFeedback,
@@ -1347,19 +1343,11 @@ async fn apply_mcp_action(
                     feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
                 }
             }
-            match agent.set_mcp_server_enabled(&server, enabled).await {
-                Ok(_) => {}
-                Err(err) => {
-                    feedback.push(format!("mcp toggle failed: {err}"), Severity::Error);
-                }
-            }
+            agent.set_mcp_server_enabled_in_background(server, enabled);
         }
-        McpAction::Restart { server } => match agent.restart_mcp_server(&server).await {
-            Ok(_) => {}
-            Err(err) => {
-                feedback.push(format!("mcp restart failed: {err}"), Severity::Error);
-            }
-        },
+        McpAction::Restart { server } => {
+            agent.restart_mcp_server_in_background(server);
+        }
         McpAction::Add {
             name,
             server,
@@ -1372,9 +1360,13 @@ async fn apply_mcp_action(
                     feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
                 }
             }
-            let mut next = agent.mcp_servers();
+            let mut next = app
+                .config_screen
+                .as_ref()
+                .map(|state| state.mcp_servers.clone())
+                .unwrap_or_else(|| agent.mcp_servers());
             next.insert(name.clone(), *server);
-            agent.replace_mcp_servers(next).await;
+            agent.replace_mcp_servers_in_background(next);
         }
         McpAction::Remove { name, persist } => {
             if persist {
@@ -1429,9 +1421,13 @@ async fn apply_mcp_action(
                     }
                 }
             }
-            let mut next = agent.mcp_servers();
+            let mut next = app
+                .config_screen
+                .as_ref()
+                .map(|state| state.mcp_servers.clone())
+                .unwrap_or_else(|| agent.mcp_servers());
             next.remove(&name);
-            agent.replace_mcp_servers(next).await;
+            agent.replace_mcp_servers_in_background(next);
         }
     }
 }
@@ -2386,6 +2382,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
+    // The /pin picker is fully modal: it owns ↑/↓/Enter/Esc until it closes,
+    // so the highlighted candidate can't be cleared by stray input.
+    if app.pin_picker_active {
+        return Ok(handle_pin_picker_key(app, agent, key).await);
+    }
+
     // Chord follow-ups run BEFORE any single-key dispatch so the second
     // stroke of a chord never accidentally fires a normal keybinding.
     if app.transcript_overlay.is_some() {
@@ -2458,7 +2460,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // Drain any MCP actions staged by `/mcp` key bindings before
         // the next draw so the user sees status updates immediately
         // rather than waiting for the next animation tick.
-        drain_mcp_actions(app, agent, &mut feedback).await;
+        drain_mcp_actions(app, agent, &mut feedback);
         if matches!(outcome, config_screen::KeyOutcome::Close) {
             close_config_screen(app, agent, "config closed");
         }
@@ -2837,10 +2839,12 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     }
 
     if is_large_prompt_paste(&normalized) {
-        let chars = normalized.chars().count();
-        let placeholder =
-            insert_prompt_text_token(app, format!("[Pasted Content {chars} chars]"), normalized);
-        app.status = format!("inserted {placeholder}");
+        if expand_duplicate_paste_at_cursor(app, &normalized) {
+            app.status = "expanded pasted text".to_string();
+        } else {
+            let placeholder = insert_prompt_pasted_text_token(app, normalized);
+            app.status = format!("inserted {placeholder}");
+        }
     } else {
         insert_input_text(app, &normalized);
     }
@@ -2900,8 +2904,12 @@ fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String>
     if truncated {
         replacement.push_str("\n[truncated]");
     }
-    let placeholder =
-        insert_prompt_text_token(app, format!("[Attached file {label}]"), replacement);
+    let placeholder = insert_prompt_text_token(
+        app,
+        format!("[Attached file {label}]"),
+        replacement,
+        PromptTextAttachmentKind::AttachedFile,
+    );
     Ok(format!("inserted {placeholder}"))
 }
 
@@ -2932,14 +2940,86 @@ fn insert_prompt_text_token(
     app: &mut TuiApp,
     base_placeholder: String,
     replacement: String,
+    kind: PromptTextAttachmentKind,
 ) -> String {
     let placeholder = unique_prompt_placeholder(app, &base_placeholder);
     insert_input_text(app, &placeholder);
     app.prompt_attachments.push(PromptAttachment {
         placeholder: placeholder.clone(),
-        payload: PromptAttachmentPayload::Text { replacement },
+        payload: PromptAttachmentPayload::Text { replacement, kind },
     });
     placeholder
+}
+
+fn insert_prompt_pasted_text_token(app: &mut TuiApp, text: String) -> String {
+    let paste_id = next_pasted_text_id(app);
+    let line_breaks = pasted_text_line_break_count(&text);
+    let placeholder = if line_breaks == 0 {
+        format!("[Pasted text #{paste_id}]")
+    } else {
+        format!("[Pasted text #{paste_id} +{line_breaks} lines]")
+    };
+    insert_prompt_text_token(app, placeholder, text, PromptTextAttachmentKind::PastedText)
+}
+
+fn next_pasted_text_id(app: &TuiApp) -> usize {
+    app.prompt_attachments
+        .iter()
+        .filter_map(|attachment| {
+            let PromptAttachmentPayload::Text {
+                kind: PromptTextAttachmentKind::PastedText,
+                ..
+            } = &attachment.payload
+            else {
+                return None;
+            };
+            pasted_text_placeholder_id(&attachment.placeholder)
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn pasted_text_line_break_count(text: &str) -> usize {
+    text.matches('\n').count()
+}
+
+fn pasted_text_placeholder_id(placeholder: &str) -> Option<usize> {
+    let rest = placeholder.strip_prefix("[Pasted text #")?;
+    let id = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if id.is_empty() {
+        return None;
+    }
+    id.parse().ok()
+}
+
+fn expand_duplicate_paste_at_cursor(app: &mut TuiApp, text: &str) -> bool {
+    let cursor = input_cursor(app);
+    let Some((placeholder, start)) = app.prompt_attachments.iter().find_map(|attachment| {
+        let PromptAttachmentPayload::Text {
+            replacement,
+            kind: PromptTextAttachmentKind::PastedText,
+        } = &attachment.payload
+        else {
+            return None;
+        };
+        if replacement != text || !app.input[..cursor].ends_with(&attachment.placeholder) {
+            return None;
+        }
+        let start = cursor.saturating_sub(attachment.placeholder.len());
+        Some((attachment.placeholder.clone(), start))
+    }) else {
+        return false;
+    };
+
+    app.input.replace_range(start..cursor, text);
+    app.input_cursor = start + text.len();
+    app.prompt_attachments
+        .retain(|attachment| attachment.placeholder != placeholder);
+    true
 }
 
 fn insert_prompt_image_token(
@@ -4013,7 +4093,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 set_status_with_notice(
                     app,
                     "no pinned context",
-                    "No pinned context yet. Use `/pin selected` or `/pin last` to keep an important transcript item through compaction.",
+                    "No pinned context yet. Run `/pin` to pick a transcript item (or `/pin last`) to keep it through compaction.",
                 );
             } else {
                 app.status = format!(
@@ -4025,9 +4105,12 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 )));
             }
         }
-        DispatchCommand::Pin { target } => {
-            let target_str = target.as_deref().unwrap_or("selected");
-            match pin_source(app, target_str) {
+        DispatchCommand::Pin { target } => match target.as_deref() {
+            // Bare `/pin` (or the legacy `selected`) opens the picker so the
+            // user can choose which transcript item to pin; `/pin last` keeps
+            // the no-prompt shortcut for the most recent item.
+            None | Some("selected") => open_pin_picker(app),
+            Some("last") => match pin_source(app, "last") {
                 PinSourceResult::Found(label, summary, source) => {
                     match agent.pin_context_entry(label, summary, source).await {
                         Ok(pin) => {
@@ -4044,14 +4127,17 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                     set_status_with_notice(
                         app,
                         "no transcript entry to pin",
-                        "No transcript entry is available to pin yet. Select a transcript row first, or run `/pin last` after there is something in the transcript.",
+                        "Nothing in the transcript to pin yet.",
                     );
                 }
                 PinSourceResult::UnknownTarget => {
-                    set_status_notice(app, "usage: /pin selected|last");
+                    set_status_notice(app, "usage: /pin (opens a picker) · /pin last");
                 }
+            },
+            Some(_) => {
+                set_status_notice(app, "usage: /pin (opens a picker) · /pin last");
             }
-        }
+        },
         DispatchCommand::Unpin { id } => match agent.unpin_context_entry(&id).await {
             Ok(pin) => {
                 app.context_compaction = agent.context_compaction_snapshot().await;
@@ -4892,6 +4978,98 @@ fn last_pinnable_entry(app: &TuiApp) -> Option<&TranscriptEntry> {
         .find(|entry| !matches!(entry.kind, TranscriptEntryKind::SlashEcho(_)))
 }
 
+/// Open the `/pin` picker on the last pinnable transcript entry. While open,
+/// `handle_pin_picker_key` owns the keyboard (↑/↓ move, Enter pins, Esc
+/// cancels), so the candidate survives until the user commits it.
+fn open_pin_picker(app: &mut TuiApp) {
+    let Some(start) = app
+        .transcript
+        .iter()
+        .rposition(|entry| !matches!(entry.kind, TranscriptEntryKind::SlashEcho(_)))
+    else {
+        set_status_notice(app, "nothing in the transcript to pin yet");
+        return;
+    };
+    app.selected_entry = Some(start);
+    app.pin_picker_active = true;
+    update_pin_picker_status(app);
+}
+
+/// Step the picker highlight by `dir` (±1) to the nearest pinnable entry,
+/// clamping at the transcript ends.
+fn move_pin_picker(app: &mut TuiApp, dir: isize) {
+    let len = app.transcript.len();
+    if len == 0 {
+        return;
+    }
+    let mut idx = app.selected_entry.unwrap_or(0) as isize;
+    loop {
+        let next = idx + dir;
+        if next < 0 || next >= len as isize {
+            break;
+        }
+        idx = next;
+        if !matches!(
+            app.transcript[idx as usize].kind,
+            TranscriptEntryKind::SlashEcho(_)
+        ) {
+            app.selected_entry = Some(idx as usize);
+            break;
+        }
+    }
+    update_pin_picker_status(app);
+}
+
+fn update_pin_picker_status(app: &mut TuiApp) {
+    let preview = app
+        .selected_entry
+        .and_then(|index| app.transcript.get(index))
+        .map(|entry| entry.pin_payload().0)
+        .unwrap_or_else(|| "—".to_string());
+    app.status = format!("pin: {preview} · ↑/↓ choose · Enter pin · Esc cancel");
+}
+
+async fn handle_pin_picker_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => move_pin_picker(app, -1),
+        KeyCode::Down => move_pin_picker(app, 1),
+        KeyCode::Enter => {
+            app.pin_picker_active = false;
+            if let Some(index) = app.selected_entry.take() {
+                pin_transcript_index(app, agent, index).await;
+            }
+        }
+        KeyCode::Esc => {
+            app.pin_picker_active = false;
+            app.selected_entry = None;
+            app.status = "pin cancelled".to_string();
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.pin_picker_active = false;
+            app.selected_entry = None;
+            app.status = "pin cancelled".to_string();
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn pin_transcript_index(app: &mut TuiApp, agent: &mut Agent, index: usize) {
+    let payload = app.transcript.get(index).map(|entry| entry.pin_payload());
+    let Some((label, summary, source)) = payload else {
+        set_status_notice(app, "no transcript entry to pin");
+        return;
+    };
+    match agent.pin_context_entry(label, summary, source).await {
+        Ok(pin) => {
+            app.context_compaction = agent.context_compaction_snapshot().await;
+            app.status = format!("pinned {}", pin.id);
+            app.push_log(format!("pinned context {}", pin.id));
+        }
+        Err(error) => set_status_notice(app, format!("pin failed: {error}")),
+    }
+}
+
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
     app.jobs = agent
         .jobs_snapshot()
@@ -5351,7 +5529,7 @@ fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptT
             continue;
         }
         match attachment.payload {
-            PromptAttachmentPayload::Text { replacement } => {
+            PromptAttachmentPayload::Text { replacement, .. } => {
                 model_input = model_input.replace(&attachment.placeholder, &replacement);
             }
             PromptAttachmentPayload::Image { media_type, bytes } => {
@@ -14799,16 +14977,6 @@ pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
     ratio.clamp(0.0, 999.0).round() as u64
 }
 
-const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
-/// Percent of `context_compaction_threshold` at which we surface the
-/// compaction nudge. The threshold is the resolved post-turn auto-compaction
-/// ceiling (`ContextCompactionConfig::post_turn_token_ceiling`): the flat
-/// budget capped at `threshold_percent` of the model window, so it is window-
-/// aware on small models yet keeps the flat 60K cost-thesis budget on large
-/// ones. Firing the nudge at 70% of that ceiling gives users a runway to
-/// `/pin` or `/compact` deliberately before auto-compaction kicks in at 100%.
-pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
-
 fn format_status_hints(app: &TuiApp) -> String {
     let base = format_status_hint_base(app);
     // `app.status` carries the per-action acknowledgement string set
@@ -14901,13 +15069,12 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · {} full transcript · /help",
         key_hint(app, keymap::Action::ToggleTranscriptOverlay)
     );
-    if app.context_compaction_threshold > 0
-        && context_window_pct(
-            app.context_estimate.estimated_tokens,
-            app.context_compaction_threshold,
-        ) >= CONTEXT_BUDGET_HINT_PCT
+    if app.context_warn_tokens > 0
+        && app.context_estimate.estimated_tokens >= app.context_warn_tokens
     {
-        base.push_str(" · /pin to keep important context · /compact to summarize");
+        base.push_str(
+            " · /pin to keep context · /compact to summarize now (/compact undo reverts)",
+        );
     }
     if !app.prompt_queue.is_empty() {
         base.push_str(&format!(
@@ -15405,11 +15572,18 @@ pub(crate) struct PromptAttachment {
 enum PromptAttachmentPayload {
     Text {
         replacement: String,
+        kind: PromptTextAttachmentKind,
     },
     Image {
         media_type: String,
         bytes: Arc<[u8]>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptTextAttachmentKind {
+    PastedText,
+    AttachedFile,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -15556,13 +15730,21 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
-    /// Token threshold above which post-turn auto-compaction triggers.
-    /// Captured at startup (and on config reload) from
-    /// `config.context_compaction.post_turn_token_ceiling()` — the resolved
-    /// ceiling that the gate actually fires on: the flat budget capped at
-    /// `threshold_percent` of the model window. The status line expresses usage
-    /// as a percentage of this value so the advisory matches what triggers.
-    pub(crate) context_compaction_threshold: u64,
+    /// The resolved context window (real model window when known, else the
+    /// configured fallback). Captured at startup and on config reload. The
+    /// status line expresses usage as a percentage of this so the advisory
+    /// reflects how full the actual window is.
+    pub(crate) context_window_tokens: u64,
+    /// Usage at which the lossy summarize tier fires, and at which the
+    /// pre-summarize /pin nudge stops (its upper band edge). Captured with
+    /// `context_window_tokens`.
+    pub(crate) context_summarize_tokens: u64,
+    /// Usage at which the pre-summarize /pin nudge starts (its lower band edge).
+    pub(crate) context_warn_tokens: u64,
+    /// Newest items kept verbatim through a summarize; used by the nudge to
+    /// mirror the summarize gate's will-shrink check (don't warn when nothing
+    /// would actually be summarized).
+    pub(crate) context_recent_items: usize,
     /// Whether the "compaction imminent" advisory has been pushed for the
     /// current pre-compaction window. Reset when compaction lands so the
     /// nudge can fire again on the next approach to the threshold.
@@ -15572,6 +15754,10 @@ pub(crate) struct TuiApp {
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) subagent_pane: SubagentPaneState,
     pub(crate) selected_entry: Option<usize>,
+    /// When true, `/pin` has opened the transcript picker: keys are captured
+    /// modally (↑/↓ move the highlighted entry, Enter pins it, Esc cancels)
+    /// and `selected_entry` holds the candidate to pin.
+    pub(crate) pin_picker_active: bool,
     pub(crate) next_entry_id: u64,
     /// Per-app discriminator for the global entry render cache. Allocated
     /// once at `TuiApp::new`; every cache lookup is `(session, entry_id)`
@@ -16034,8 +16220,12 @@ impl TuiApp {
             ),
             attachments: Vec::new(),
             context_compaction: ContextCompactionState::default(),
-            context_compaction_threshold: config.context_compaction.post_turn_token_ceiling(),
+            context_window_tokens: config.context_compaction.effective_window(),
+            context_summarize_tokens: config.context_compaction.summarize_threshold(),
+            context_warn_tokens: config.context_compaction.warn_threshold(),
+            context_recent_items: config.context_compaction.recent_items,
             context_compaction_nudge_shown: false,
+            pin_picker_active: false,
             context_estimate: ContextEstimate::default(),
             checkpoints_enabled: config.checkpoints_enabled,
             transcript,
@@ -16159,7 +16349,10 @@ impl TuiApp {
         self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
-        self.context_compaction_threshold = config.context_compaction.post_turn_token_ceiling();
+        self.context_window_tokens = config.context_compaction.effective_window();
+        self.context_summarize_tokens = config.context_compaction.summarize_threshold();
+        self.context_warn_tokens = config.context_compaction.warn_threshold();
+        self.context_recent_items = config.context_compaction.recent_items;
         self.checkpoints_enabled = config.checkpoints_enabled;
         self.cost_cap_usd_micros = config.max_session_cost_usd_micros.filter(|cap| *cap > 0);
         self.status_line_items = parse_status_line_items(config.tui.status_line.as_deref());
@@ -18190,7 +18383,7 @@ fn inline_history_lines_for_flush(
             prev_work = false;
         }
     }
-    lines
+    wrap_transcript_overlay_rows(&lines, width)
 }
 
 #[cfg(test)]

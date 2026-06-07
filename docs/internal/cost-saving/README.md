@@ -77,7 +77,7 @@ The cheapest token is one the provider never re-charges. Squeezy plants explicit
 
 ### 02 — Conversation compaction
 
-When a conversation grows past `threshold_percent` of the model window, `maybe_compact_mid_turn` triggers in `crates/squeezy-agent/src/context_compaction.rs`. Older items are folded into a four-slot summary head — `## Goal / ## Progress / ## Decisions / ## Next` — while the recent N items and a pinned list survive intact. There's a post-turn variant for slow growth and a `LayeredFallback` that only pays for an LLM-assisted rewrite when the dropped span exceeds a token threshold. The original messages stay in a checkpoint so the user can undo.
+Compaction reduces the conversation in escalating steps keyed to fractions of the effective window (`min(model_context_window or fallback_window_tokens, max_context_tokens)`). A cheap trim pass clears older tool-output bodies in place at `trim_at_percent` (40%), running both between tool rounds and as a pre-pass at the turn boundary. Only at `summarize_at_percent` (95%) — post-turn, or reactively on a provider overflow error — does `compact_conversation` in `crates/squeezy-agent/src/context_compaction.rs` fold older items into a four-slot summary head (`## Goal / ## Progress / ## Decisions / ## Next`), keeping the recent N items and a pinned list intact. A `LayeredFallback` only pays for an LLM-assisted rewrite when the dropped span exceeds a token threshold. The original messages stay in a checkpoint so the user can `/compact undo`.
 
 ### 03 — Tool-output dedup and receipt stubs
 

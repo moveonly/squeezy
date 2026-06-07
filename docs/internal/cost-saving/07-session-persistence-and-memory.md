@@ -408,9 +408,9 @@ Day one. A user debugs nondeterminism in a parallel kernel for four
 hours. The agent reads the kernel source (a few thousand tokens),
 walks three suspect call sites with `apply_patch`/`cargo test`/
 `apply_patch` cycles (each edit hits `JournalCheckpointProvider`
-for `track_tree` then `create_checkpoint`), and hits the mid-turn
-compaction trigger four times because `cargo test` output keeps
-pushing the window past `threshold_percent`. Each compaction emits
+for `track_tree` then `create_checkpoint`), and hits the post-turn
+summarize trigger four times because `cargo test` output keeps
+pushing the window past `summarize_at_percent`. Each compaction emits
 a `ContextCompacted` event with `conversation` populated. After the
 fourth, the resume snapshot is small — verbose tool outputs are
 summarised; load-bearing turns remain. The user closes the laptop.

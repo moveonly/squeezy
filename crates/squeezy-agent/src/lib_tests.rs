@@ -1891,7 +1891,10 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
 async fn promised_action_retry_preserves_prior_visible_answer_in_transcript() {
     let root = temp_workspace("agent_promised_action_retry_transcript");
     fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
-    let substantive_answer = "Let me re-run each bug scenario directly rather than trusting the compacted summary.\n\n## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.";
+    // A genuine stall: a substantive verdict followed by a trailing,
+    // undelivered intent. The final clause is the unresolved action, so the
+    // sharpened detector fires the retry — exercising the preservation path.
+    let substantive_answer = "## Bug-by-Bug Verdict\nBug 1 confirmed. Bug 2 retracted.\n\nNow let me re-run each scenario directly to double-check the compacted summary.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -2029,7 +2032,7 @@ async fn promised_action_retry_preserves_prior_visible_answer_on_terminal_failur
     let root = temp_workspace("agent_promised_action_retry_terminal_failure");
     fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
     let substantive_answer =
-        "Let me inspect the result directly.\n\nThe report was already complete.";
+        "The report was already complete.\n\nNow let me inspect the result directly to confirm.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -2127,7 +2130,7 @@ async fn promised_action_retry_preserves_prior_visible_answer_on_soft_completion
         INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
     });
     let substantive_answer =
-        "Let me inspect the failed lookup directly.\n\nThe useful answer is already here.";
+        "The useful answer is already here.\n\nNow let me inspect the failed lookup directly.";
     let provider = Arc::new(MockProvider::new(vec![
         vec![
             Ok(LlmEvent::Started),
@@ -5733,219 +5736,6 @@ fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
     items
 }
 
-fn config_with_mid_turn(window: u64, threshold: u8) -> AppConfig {
-    AppConfig {
-        context_compaction: ContextCompactionConfig {
-            enabled_mid_turn: true,
-            model_context_window: Some(window),
-            threshold_percent: threshold,
-            ..ContextCompactionConfig::default()
-        },
-        ..AppConfig::default()
-    }
-}
-
-/// Empty no-model provider for the mid-turn gate tests. The gate either
-/// bails before reaching the model or runs with the default `Extractive`
-/// strategy, so the provider is never streamed.
-fn gate_test_provider() -> Arc<dyn LlmProvider> {
-    Arc::new(MockProvider::new(Vec::new()))
-}
-
-#[tokio::test]
-async fn mid_turn_compaction_skips_when_disabled() {
-    let mut config = config_with_mid_turn(100_000, 80);
-    config.context_compaction.enabled_mid_turn = false;
-    let mut conversation = mid_turn_test_conversation();
-    let mut state = ContextCompactionState::default();
-    let provider = gate_test_provider();
-    let redactor = Redactor::default();
-    let report = super::maybe_compact_mid_turn(
-        &mut conversation,
-        &mut state,
-        &[],
-        None,
-        &provider,
-        None,
-        &redactor,
-        &config,
-        Some(90_000),
-    )
-    .await;
-    assert!(report.is_none());
-}
-
-#[tokio::test]
-async fn mid_turn_compaction_skips_without_window() {
-    let mut config = config_with_mid_turn(100_000, 80);
-    config.context_compaction.model_context_window = None;
-    let mut conversation = mid_turn_test_conversation();
-    let mut state = ContextCompactionState::default();
-    let provider = gate_test_provider();
-    let redactor = Redactor::default();
-    let report = super::maybe_compact_mid_turn(
-        &mut conversation,
-        &mut state,
-        &[],
-        None,
-        &provider,
-        None,
-        &redactor,
-        &config,
-        Some(90_000),
-    )
-    .await;
-    assert!(report.is_none());
-}
-
-#[tokio::test]
-async fn mid_turn_compaction_skips_below_threshold() {
-    let config = config_with_mid_turn(100_000, 80);
-    let mut conversation = mid_turn_test_conversation();
-    let mut state = ContextCompactionState::default();
-    let provider = gate_test_provider();
-    let redactor = Redactor::default();
-    let report = super::maybe_compact_mid_turn(
-        &mut conversation,
-        &mut state,
-        &[],
-        None,
-        &provider,
-        None,
-        &redactor,
-        &config,
-        Some(50_000),
-    )
-    .await;
-    assert!(report.is_none());
-}
-
-#[tokio::test]
-async fn mid_turn_compaction_fires_at_threshold() {
-    let config = config_with_mid_turn(100_000, 80);
-    let mut conversation = mid_turn_test_conversation();
-    let original_len = conversation.len();
-    let mut state = ContextCompactionState::default();
-    let provider = gate_test_provider();
-    let redactor = Redactor::default();
-    let report = super::maybe_compact_mid_turn(
-        &mut conversation,
-        &mut state,
-        &[],
-        None,
-        &provider,
-        None,
-        &redactor,
-        &config,
-        Some(80_001),
-    )
-    .await
-    .expect("mid-turn compaction should fire");
-    assert!(matches!(
-        report.record.trigger,
-        ContextCompactionTrigger::Auto
-    ));
-    assert!(
-        conversation.len() < original_len,
-        "conversation should shrink after compaction: {} -> {}",
-        original_len,
-        conversation.len(),
-    );
-    assert!(state.last.is_some(), "history should record the run");
-}
-
-#[tokio::test]
-async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
-    // End-to-end acceptance for F12-mid-turn-cw-aware-compaction: a real
-    // turn loop with a provider that streams `usage.total = 80_001` on the
-    // first response observes mid-turn compaction firing before the next
-    // sample with `trigger=Auto`. Matches the audit acceptance literally.
-    let root = temp_workspace("mid_turn_e2e");
-    fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
-    let provider = Arc::new(MockProvider::new(vec![
-        // Turn-loop round 1: assistant calls `grep`, then `Completed` carries
-        // a usage snapshot whose total (input + output + reasoning) crosses
-        // the 80% threshold of a 100_000 window.
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_1".to_string(),
-                name: "grep".to_string(),
-                arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(80_000),
-                    output_tokens: Some(1),
-                    reasoning_output_tokens: None,
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    estimated_usd_micros: None,
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        // Turn-loop round 2: assistant finalizes with plain text after the
-        // mid-turn compaction has rewritten the conversation.
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_2".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        context_compaction: ContextCompactionConfig {
-            enabled_mid_turn: true,
-            model_context_window: Some(100_000),
-            threshold_percent: 80,
-            // Keep the function-call/output pair together in `recent` and
-            // let the seed user message land in `older`. With `recent_items=1`
-            // the snap-split absorbs the function-call output back into the
-            // older slice and produces an empty split, so the compaction
-            // never fires on a 3-item conversation.
-            recent_items: 2,
-            ..ContextCompactionConfig::default()
-        },
-        ..AppConfig::default()
-    };
-    let agent = Agent::new(config, provider);
-
-    let mut rx = agent.start_turn("find marker".to_string(), CancellationToken::new());
-    let mut compaction_report = None;
-    let mut completed_message = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::ContextCompacted { report, .. } => compaction_report = Some(report),
-            AgentEvent::Completed { message, .. } => completed_message = Some(message.content),
-            _ => {}
-        }
-    }
-
-    let report = compaction_report.expect("mid-turn compaction should fire");
-    assert!(
-        matches!(report.record.trigger, ContextCompactionTrigger::Auto),
-        "mid-turn trigger should be Auto, got {:?}",
-        report.record.trigger,
-    );
-    assert!(
-        report.record.before.estimated_tokens >= 80_000
-            || report.record.before.estimated_tokens > 0,
-        "before.estimated_tokens should reflect the pre-compaction estimate, got {}",
-        report.record.before.estimated_tokens,
-    );
-    assert_eq!(completed_message.as_deref(), Some("done"));
-
-    let _ = fs::remove_dir_all(root);
-}
-
 #[test]
 fn total_tokens_from_cost_sums_present_fields() {
     // `reasoning_output_tokens` is the subset of `output_tokens` that was
@@ -5981,47 +5771,6 @@ fn total_tokens_from_cost_excludes_reasoning_subset() {
 fn total_tokens_from_cost_returns_none_when_no_fields() {
     let cost = CostSnapshot::default();
     assert!(super::total_tokens_from_cost(&cost).is_none());
-}
-
-#[test]
-fn mid_turn_compaction_will_fire_matches_maybe_compact_mid_turn_gate() {
-    let config = config_with_mid_turn(100_000, 80);
-    let conversation = mid_turn_test_conversation();
-
-    // Below the configured threshold, the predicate must report `false`
-    // so the agent does not fire a `PreCompact` hook on a turn that
-    // never reaches the rewrite path.
-    assert!(!super::mid_turn_compaction_will_fire(
-        &config,
-        &conversation,
-        Some(50_000),
-    ));
-
-    // At/above the threshold, the predicate must report `true` so the
-    // hook fires before `maybe_compact_mid_turn` mutates conversation.
-    assert!(super::mid_turn_compaction_will_fire(
-        &config,
-        &conversation,
-        Some(80_001),
-    ));
-
-    // Mid-turn disabled disables the predicate too.
-    let mut disabled = config.clone();
-    disabled.context_compaction.enabled_mid_turn = false;
-    assert!(!super::mid_turn_compaction_will_fire(
-        &disabled,
-        &conversation,
-        Some(80_001),
-    ));
-
-    // Missing window short-circuits the predicate.
-    let mut no_window = config;
-    no_window.context_compaction.model_context_window = None;
-    assert!(!super::mid_turn_compaction_will_fire(
-        &no_window,
-        &conversation,
-        Some(80_001),
-    ));
 }
 
 /// HookHandler that counts how many times each variant fires and
@@ -6118,7 +5867,9 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
             enabled: true,
             min_items: 1,
             recent_items: 1,
-            estimated_tokens: 0,
+            // Tiny window ⇒ the summarize threshold floors at 1 token, so any
+            // non-trivial conversation crosses it and post-turn summarize fires.
+            model_context_window: Some(1),
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7204,7 +6955,7 @@ async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_ti
             model_assisted_timeout_secs: 1,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7256,7 +7007,7 @@ async fn manual_compact_does_not_hold_conversation_lock_across_model_assisted_ca
             model_assisted_timeout_secs: 30,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7334,7 +7085,7 @@ fn compaction_persists_checkpoint_and_stamps_replacement_id() {
         context_compaction: ContextCompactionConfig {
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7372,7 +7123,7 @@ fn compaction_without_store_leaves_replacement_id_none() {
         context_compaction: ContextCompactionConfig {
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7432,7 +7183,7 @@ fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls
         context_compaction: ContextCompactionConfig {
             recent_items: 4,
             min_items: 1,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7686,7 +7437,7 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
             model_assisted_model: None,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7750,7 +7501,7 @@ async fn compact_with_strategy_accepts_structured_template_output() {
             model_assisted_timeout_secs: 5,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7838,7 +7589,7 @@ async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
             model_assisted_timeout_secs: 5,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -7877,83 +7628,6 @@ async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
 }
 
 #[tokio::test]
-async fn maybe_compact_mid_turn_honors_model_assisted_strategy() {
-    // Regression for #235: the automatic mid-turn path must honor a
-    // configured `ModelAssisted` strategy, not silently emit the
-    // extractive blob the way it did before it routed through
-    // `compact_conversation_with_strategy`.
-    let structured = "## Goal\nbuild a parser\n\n\
-                      ## Progress\n- wrote lexer\n\n\
-                      ## Decisions\n- use tree-sitter\n\n\
-                      ## Next\n- wire grammar tests\n";
-    let provider = Arc::new(MockProvider::new(vec![vec![
-        Ok(LlmEvent::Started),
-        Ok(LlmEvent::TextDelta(structured.to_string())),
-        Ok(LlmEvent::Completed {
-            response_id: Some("compaction".to_string()),
-            cost: CostSnapshot::default(),
-            stop_reason: None,
-            reasoning_only_stop: false,
-        }),
-    ]]));
-    let config = AppConfig {
-        context_compaction: ContextCompactionConfig {
-            enabled_mid_turn: true,
-            model_context_window: Some(100_000),
-            threshold_percent: 80,
-            strategy: CompactionStrategy::ModelAssisted,
-            model_assisted_model: Some("test-model".to_string()),
-            model_assisted_timeout_secs: 5,
-            recent_items: 2,
-            ..ContextCompactionConfig::default()
-        },
-        ..AppConfig::default()
-    };
-    let mut conversation = mid_turn_test_conversation();
-    let mut state = ContextCompactionState::default();
-    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
-    let redactor = Redactor::default();
-    let report = super::maybe_compact_mid_turn(
-        &mut conversation,
-        &mut state,
-        &[],
-        None,
-        &provider_trait,
-        None,
-        &redactor,
-        &config,
-        Some(80_001),
-    )
-    .await
-    .expect("mid-turn compaction should fire over threshold");
-
-    assert_eq!(
-        report.summary.trim(),
-        structured.trim(),
-        "mid-turn summary head must be the model-assisted output, not the extractive blob"
-    );
-    assert_eq!(
-        conversation.first().and_then(|item| match item {
-            LlmInputItem::UserText(text) => Some(text.as_str()),
-            _ => None,
-        }),
-        Some(structured.trim()),
-        "synthetic summary head must carry the model-assisted output"
-    );
-    assert!(
-        !report
-            .summary
-            .contains("Squeezy compacted conversation context"),
-        "model-assisted mid-turn output must replace the extractive summary"
-    );
-    assert_eq!(
-        provider.requests().len(),
-        1,
-        "the configured strategy must issue exactly one model-assisted request"
-    );
-}
-
-#[tokio::test]
 async fn maybe_compact_conversation_honors_model_assisted_strategy() {
     // Regression for #235: the post-turn auto-compaction path must honor a
     // configured `ModelAssisted` strategy. Before the fix it called the
@@ -7979,7 +7653,7 @@ async fn maybe_compact_conversation_honors_model_assisted_strategy() {
             model_assisted_timeout_secs: 5,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -8064,7 +7738,7 @@ async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compac
             model_assisted_timeout_secs: 5,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -9438,7 +9112,7 @@ async fn provider_context_overflow_compacts_and_retries_once() {
             enabled_mid_turn: false,
             recent_items: 2,
             min_items: 4,
-            estimated_tokens: 0,
+            fallback_window_tokens: 0,
             ..ContextCompactionConfig::default()
         },
         ..AppConfig::default()
@@ -9912,6 +9586,62 @@ async fn max_tokens_stop_reason_emits_failed_with_recovery_hint() {
 }
 
 #[tokio::test]
+async fn malformed_function_call_retries_with_corrective_nudge() {
+    // Gemini-style malformed tool-call arguments: round 0 stops with
+    // MalformedFunctionCall and no usable tool call. The agent should
+    // inject a corrective nudge and recover on the retry instead of ending
+    // the turn empty.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_malformed".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::MalformedFunctionCall),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("The fix is in src/foo.rs.".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_clean".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig::default();
+    config.routing.enabled = false;
+    let agent = Agent::new(config, provider.clone());
+    let mut rx = agent.start_turn("find the bug".to_string(), CancellationToken::new());
+    let mut completed_text = None;
+    let mut failed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed_text = Some(message.content),
+            AgentEvent::Failed { .. } => failed = true,
+            _ => {}
+        }
+    }
+    assert!(!failed, "malformed tool call should recover, not fail");
+    assert_eq!(completed_text.as_deref(), Some("The fix is in src/foo.rs."));
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "malformed round plus one corrective retry"
+    );
+    let retry = &requests[1];
+    let has_nudge = retry.input.iter().any(|item| match item {
+        LlmInputItem::UserText(text) => text.contains("could not be parsed"),
+        _ => false,
+    });
+    assert!(has_nudge, "retry must carry the corrective JSON nudge");
+}
+
+#[tokio::test]
 async fn refusal_stop_reason_emits_failed_with_safety_hint() {
     let provider = Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),
@@ -10262,6 +9992,143 @@ fn assistant_text_has_unresolved_intent_handles_multibyte_tail() {
     // panic: `é` lands at byte 44/45, exactly the slice end for `"i'll "`.
     let text = format!("I'll {}é and continue", "x".repeat(39));
     let _ = assistant_text_has_unresolved_intent(&text);
+}
+
+#[test]
+fn unresolved_intent_anchors_on_final_clause_not_midanswer() {
+    // Strong-model shape: an intent phrase used mid-answer, but the
+    // message CONCLUDES. Anchoring on the final clause means this is not
+    // treated as an unresolved promise (the dominant false positive).
+    assert!(!assistant_text_has_unresolved_intent(
+        "Let me check: yes, the bug is in foo.rs. The fix is to add a guard.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_skips_offer_idiom() {
+    // "Let me know if you'd like me to check ..." is a closing offer,
+    // not abandoned tool work.
+    assert!(!assistant_text_has_unresolved_intent(
+        "I fixed the parser. Let me know if you'd like me to check the other files.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_fires_when_final_clause_announces_action() {
+    // Multi-sentence message that ENDS on an announced, undelivered action.
+    assert!(assistant_text_has_unresolved_intent(
+        "I read the file. Now let me search the repository for callers.",
+    ));
+}
+
+#[test]
+fn unresolved_intent_fires_on_dangling_colon() {
+    // A trailing ':' is itself an "about to act" signal.
+    assert!(assistant_text_has_unresolved_intent(
+        "Now let me grep for the symbol:",
+    ));
+}
+
+#[test]
+fn unresolved_intent_keeps_dotted_tokens_intact() {
+    // The '.' in "src/lib.rs" must not be read as a sentence boundary,
+    // or the intent that precedes it would be lost.
+    assert!(assistant_text_has_unresolved_intent(
+        "I'll edit src/lib.rs to add the guard.",
+    ));
+}
+
+#[test]
+fn retry_ack_recognizes_bare_done_confirmation() {
+    // The G2 "reply DONE if complete" path: a bare confirmation collapses
+    // back to the prior answer, but added content does not.
+    assert!(assistant_text_is_retry_ack("DONE"));
+    assert!(assistant_text_is_retry_ack("Done."));
+    assert!(assistant_text_is_retry_ack("`DONE`"));
+    assert!(assistant_text_is_retry_ack("**Done.**"));
+    // A short, content-free completeness confirmation is still an ack.
+    assert!(assistant_text_is_retry_ack(
+        "The previous output is the complete answer."
+    ));
+    assert!(!assistant_text_is_retry_ack(
+        "Done — I also updated the changelog.",
+    ));
+    // A response that OPENS like a confirmation ("the previous response
+    // is ...") but actually negates it and supplies the missing content
+    // must NOT be treated as an ack — it carries the real continuation.
+    assert!(!assistant_text_is_retry_ack(
+        "The previous response is incomplete; the missing file is src/foo.rs.",
+    ));
+    assert!(!assistant_text_is_retry_ack(
+        "The previous answer is wrong — the correct value is 42 because the cache resets at midnight UTC.",
+    ));
+}
+
+#[test]
+fn merge_retried_keeps_prior_answer_when_retry_confirms_done() {
+    // G1+G2: confirm-or-continue nudge -> a done model replies DONE, and
+    // the prior substantive answer is preserved verbatim (nothing dropped).
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(
+        &mut deferred,
+        "The function `needle` is defined once in src/lib.rs at line 12.",
+    );
+    let merged = merge_retried_visible_assistant_text(&mut deferred, "DONE");
+    assert_eq!(
+        merged,
+        "The function `needle` is defined once in src/lib.rs at line 12."
+    );
+}
+
+#[test]
+fn merge_retried_appends_real_continuation() {
+    // A genuine stall recovery: the retry produced new substantive text,
+    // appended after the prior visible text — nothing is dropped.
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(&mut deferred, "I scanned the tree.");
+    let merged =
+        merge_retried_visible_assistant_text(&mut deferred, "The entrypoint is `main` in cli.rs.");
+    assert_eq!(
+        merged,
+        "I scanned the tree.\n\nThe entrypoint is `main` in cli.rs."
+    );
+}
+
+#[test]
+fn merge_retried_appends_continuation_that_references_the_prior() {
+    // The retry response opens by referencing the prior output but then
+    // negates it and delivers the missing content. It is a real
+    // continuation and must be APPENDED, not discarded as an ack.
+    let mut deferred = String::new();
+    append_deferred_visible_assistant_text(&mut deferred, "I summarized the config.");
+    let continuation = "The previous response is incomplete; the missing file is src/foo.rs.";
+    let merged = merge_retried_visible_assistant_text(&mut deferred, continuation);
+    assert_eq!(
+        merged,
+        format!("I summarized the config.\n\n{continuation}"),
+    );
+}
+
+#[test]
+fn unresolved_intent_skips_real_complete_answer_ending_in_question() {
+    // Regression witness from a real incident (gctoolkit session
+    // 1780784071532-67685-1, turn-2): the user asked "what model are you
+    // and why didn't you load the skill yet?". The model gave a complete,
+    // well-behaved 2.2k-char answer that ENDS on a permission question,
+    // but whose BODY contains mid-answer intent phrases ("I'll find out
+    // when I try", "I'll run them") that the old whole-text scan matched —
+    // firing a spurious `promised_action` retry whose pushy "call the tool
+    // now" nudge then drove unrequested file edits. Anchoring on the final
+    // clause clears the answer, so no retry fires.
+    let answer = "You're right to call that out — let me address both honestly. \
+On the model: I don't have a reliable way to verify my exact underlying model \
+from inside this environment, so I won't guess. I operate here as \"Squeezy\". \
+Those commands may or may not run in this shell — I'll find out when I try, and \
+I'll run them and surface any config/auth errors to you rather than retrying \
+blindly. So before I touch CPUSummary.java (a clean record conversion, ~4 caller \
+sites), the correct next step per the skill is to run `guidelines get`. Want me \
+to proceed with that and continue the modernization?";
+    assert!(!assistant_text_has_unresolved_intent(answer));
 }
 
 // F17-dispatch-command-completeness: each typed `DispatchCommand`
@@ -11728,4 +11595,49 @@ fn model_fits_conversation_honors_global_override() {
         model_fits_conversation(&config, slug, Some(1_000_000), "cheap-y", &convo, None),
         "a large global window allows the reroute"
     );
+}
+
+#[tokio::test]
+async fn mcp_background_queue_serves_issued_tickets_in_order() {
+    let queue = Arc::new(McpBackgroundQueue::default());
+    let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let first = queue.issue_ticket();
+    let second = queue.issue_ticket();
+
+    let second_task = {
+        let queue = queue.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            queue.wait_for_turn(second).await;
+            events.lock().await.push("second");
+            queue.finish_turn();
+        })
+    };
+
+    tokio::task::yield_now().await;
+    assert!(
+        events.lock().await.is_empty(),
+        "later ticket must not run before the earlier issued ticket"
+    );
+
+    let first_task = {
+        let queue = queue.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            queue.wait_for_turn(first).await;
+            events.lock().await.push("first");
+            queue.finish_turn();
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), first_task)
+        .await
+        .expect("first task should finish")
+        .expect("first task should not panic");
+    tokio::time::timeout(Duration::from_secs(5), second_task)
+        .await
+        .expect("second task should finish")
+        .expect("second task should not panic");
+
+    assert_eq!(&*events.lock().await, &["first", "second"]);
 }

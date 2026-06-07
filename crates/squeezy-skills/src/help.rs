@@ -1150,9 +1150,12 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/pin",
-        what: "Protect the latest (or selected) transcript item from compaction.",
-        syntax: "/pin <id>",
-        examples: &["/pin 3  — pin transcript item with id 3 (see /context for ids)"],
+        what: "Protect a transcript item from summarize compaction.",
+        syntax: "/pin",
+        examples: &[
+            "/pin  — open a picker (↑/↓ choose · Enter pin · Esc cancel)",
+            "/pin last  — pin the most recent item without prompting",
+        ],
         available_during_turn: false,
         capability_note: None,
         related: &["sessions", "cost"],

@@ -496,6 +496,34 @@ fn expect_input_tokens_per_turn_quiet_when_unset() {
 }
 
 #[test]
+fn expect_final_text_not_contains_flags_forbidden_substring() {
+    let mut ctx = ctx_from_events(vec![]);
+    ctx.last_assistant_text = "Result: UNREQUESTED EXTRA WORK leaked in.".to_string();
+    let mut scenario = empty_scenario();
+    scenario.expect.final_text_not_contains = vec!["UNREQUESTED EXTRA WORK".into()];
+    let out = ExpectationsAsFindings.check(&ctx, &scenario);
+    assert!(
+        out.iter()
+            .any(|f| f.rule_id == "expect_final_text_not_contains"),
+        "forbidden substring in the final output must produce a finding",
+    );
+}
+
+#[test]
+fn expect_final_text_not_contains_quiet_when_absent() {
+    let mut ctx = ctx_from_events(vec![]);
+    ctx.last_assistant_text = "A clean final answer.".to_string();
+    let mut scenario = empty_scenario();
+    scenario.expect.final_text_not_contains = vec!["UNREQUESTED EXTRA WORK".into()];
+    let out = ExpectationsAsFindings.check(&ctx, &scenario);
+    assert!(
+        !out.iter()
+            .any(|f| f.rule_id == "expect_final_text_not_contains"),
+        "a clean final output must not trip the forbidden-substring check",
+    );
+}
+
+#[test]
 fn ungrounded_citation_flags_zero_tools_with_path() {
     let events = vec![
         EvalEvent {

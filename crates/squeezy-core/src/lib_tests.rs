@@ -282,7 +282,8 @@ compaction_max_summary_bytes = 4096
     });
 
     assert!(config.context_compaction.enabled);
-    assert_eq!(config.context_compaction.estimated_tokens, 2048);
+    // Legacy env var still feeds the renamed `fallback_window_tokens` field.
+    assert_eq!(config.context_compaction.fallback_window_tokens, 2048);
     assert_eq!(config.context_compaction.min_items, 7);
     assert_eq!(config.context_compaction.recent_items, 3);
     assert_eq!(config.context_compaction.max_summary_bytes, 4096);
@@ -5772,49 +5773,88 @@ fn compaction_config_with_window(window: Option<u64>) -> ContextCompactionConfig
 }
 
 #[test]
-fn post_turn_ceiling_caps_flat_budget_on_small_windows() {
-    // 32K window: min(60K, 80% × 32K = 25.6K) = 25_600 — fixes finding #4.
-    let cfg = compaction_config_with_window(Some(32_000));
-    assert_eq!(cfg.post_turn_token_ceiling(), 25_600);
+fn trim_warn_summarize_scale_with_the_effective_window() {
+    // Effective window = raw × 95% − 12K reserve; trim 40% / warn 85% /
+    // summarize 100% of that effective window.
+    let big = compaction_config_with_window(Some(1_000_000));
+    assert_eq!(big.effective_window(), 938_000); // 950_000 − 12_000
+    assert_eq!(big.trim_threshold(), 375_200);
+    assert_eq!(big.warn_threshold(), 797_300);
+    assert_eq!(big.summarize_threshold(), 938_000);
+
+    let mid = compaction_config_with_window(Some(270_000));
+    assert_eq!(mid.effective_window(), 244_500); // 256_500 − 12_000
+    assert_eq!(mid.trim_threshold(), 97_800);
+    assert_eq!(mid.summarize_threshold(), 244_500);
+
+    // The headline fix: summarize is NOT clamped to a flat 60K on large windows.
+    assert!(big.summarize_threshold() > 60_000);
+    assert!(mid.summarize_threshold() > 60_000);
 }
 
 #[test]
-fn post_turn_ceiling_preserves_flat_budget_on_large_windows() {
-    // 200K window: min(60K, 160K) = 60K — cost-thesis behavior unchanged.
-    let big = compaction_config_with_window(Some(200_000));
-    assert_eq!(big.post_turn_token_ceiling(), 60_000);
-    // 1M window: min(60K, 800K) = 60K.
-    let huge = compaction_config_with_window(Some(1_000_000));
-    assert_eq!(huge.post_turn_token_ceiling(), 60_000);
+fn trim_warn_summarize_stay_ordered_on_small_and_capped_windows() {
+    // trim < warn < summarize must hold for every window size and the economy
+    // cap — all three are fractions of the same effective window.
+    let capped = {
+        let mut c = compaction_config_with_window(Some(1_000_000));
+        c.max_context_tokens = Some(40_000);
+        c
+    };
+    for cfg in [
+        compaction_config_with_window(Some(60_000)),
+        compaction_config_with_window(Some(32_000)),
+        capped,
+    ] {
+        assert!(
+            cfg.trim_threshold() < cfg.warn_threshold()
+                && cfg.warn_threshold() < cfg.summarize_threshold(),
+            "ordering broken: trim={} warn={} summarize={}",
+            cfg.trim_threshold(),
+            cfg.warn_threshold(),
+            cfg.summarize_threshold(),
+        );
+    }
 }
 
 #[test]
-fn post_turn_ceiling_falls_back_to_flat_budget_without_window() {
-    let cfg = compaction_config_with_window(None);
-    assert_eq!(cfg.post_turn_token_ceiling(), 60_000);
-    // A zero window is treated as unknown.
+fn unknown_window_uses_the_fallback() {
+    // None ⇒ 128K fallback; a zero window is treated as unknown too.
+    let unknown = compaction_config_with_window(None);
+    assert_eq!(
+        unknown.resolve_window(),
+        crate::DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS
+    );
+    assert_eq!(unknown.effective_window(), 109_600); // 128K × 95% − 12K
+    assert_eq!(unknown.trim_threshold(), 43_840);
+    assert_eq!(unknown.summarize_threshold(), 109_600);
     let zero = compaction_config_with_window(Some(0));
-    assert_eq!(zero.post_turn_token_ceiling(), 60_000);
+    assert_eq!(
+        zero.resolve_window(),
+        crate::DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS
+    );
 }
 
 #[test]
-fn mid_turn_thresholds_track_window_fractions() {
-    let cfg = compaction_config_with_window(Some(200_000));
-    assert_eq!(cfg.mid_turn_full_threshold(), Some(160_000)); // 80%
-    assert_eq!(cfg.mid_turn_micro_threshold(), Some(120_000)); // 60%
-    let dormant = compaction_config_with_window(None);
-    assert_eq!(dormant.mid_turn_full_threshold(), None);
-    assert_eq!(dormant.mid_turn_micro_threshold(), None);
+fn max_context_tokens_caps_the_effective_window() {
+    let mut cfg = compaction_config_with_window(Some(1_000_000));
+    assert_eq!(cfg.effective_window(), 938_000);
+    // The cap shrinks the effective window, so every tier scales to it and the
+    // trim < warn < summarize ordering still holds.
+    cfg.max_context_tokens = Some(200_000);
+    assert_eq!(cfg.effective_window(), 200_000);
+    assert_eq!(cfg.trim_threshold(), 80_000); // 40% of 200K
+    assert_eq!(cfg.summarize_threshold(), 200_000);
 }
 
 #[test]
-fn min_items_bypass_threshold_uses_high_water_or_double_budget() {
-    // 90% of a 200K window.
+fn min_items_bypass_threshold_is_90pct_of_effective_window() {
+    // 90% of the effective window, so the few-but-enormous bypass is satisfied
+    // by the time usage reaches the summarize point.
     let windowed = compaction_config_with_window(Some(200_000));
-    assert_eq!(windowed.min_items_bypass_threshold(), 180_000);
-    // No window ⇒ 2 × estimated_tokens.
-    let flat = compaction_config_with_window(None);
-    assert_eq!(flat.min_items_bypass_threshold(), 120_000);
+    assert_eq!(windowed.effective_window(), 178_000);
+    assert_eq!(windowed.min_items_bypass_threshold(), 160_200);
+    assert!(windowed.min_items_bypass_threshold() <= windowed.summarize_threshold());
 }
 
 #[test]

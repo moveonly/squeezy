@@ -26,11 +26,13 @@ fn config_with_micro(window: u64, threshold: u8, keep_recent: usize) -> AppConfi
         context_compaction: ContextCompactionConfig {
             enabled_mid_turn: true,
             model_context_window: Some(window),
-            // Keep the full-tier gate above the micro threshold so micro
-            // can demonstrably fire before full.
-            threshold_percent: 95,
+            // Neutralize the effective-window reduction so `trim_threshold` is a
+            // clean percent of the small test window (the 12K baseline reserve
+            // would otherwise swallow these sub-window budgets).
+            effective_context_window_percent: Some(100),
+            baseline_reserve_tokens: Some(0),
             micro_compaction_enabled: true,
-            micro_compaction_threshold_percent: threshold,
+            trim_at_percent: threshold,
             micro_compaction_keep_recent: keep_recent,
             ..ContextCompactionConfig::default()
         },
@@ -45,7 +47,7 @@ fn micro_compact_preserves_recent_n() {
     for n in 0..12 {
         conversation.extend(read_file_pair(n, 4_000));
     }
-    let report = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000))
+    let report = maybe_micro_compact(&mut conversation, &config, Some(9_000))
         .expect("micro-compaction should fire at saturation");
     assert_eq!(
         report.cleared_call_ids.len(),
@@ -86,7 +88,7 @@ fn micro_compact_preserves_message_structure() {
     }
     conversation.push(LlmInputItem::AssistantText("thinking".to_string()));
     let original_len = conversation.len();
-    let _ = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000))
+    let _ = maybe_micro_compact(&mut conversation, &config, Some(9_000))
         .expect("micro-compaction should fire");
     assert_eq!(
         conversation.len(),
@@ -120,13 +122,12 @@ fn micro_compact_then_full_compact_works() {
     let mut config = config_with_micro(10_000, 50, 5);
     config.context_compaction.recent_items = 4;
     config.context_compaction.min_items = 1;
-    config.context_compaction.estimated_tokens = 1;
     let mut conversation = Vec::new();
     for n in 0..12 {
         conversation.extend(read_file_pair(n, 4_000));
     }
-    let micro = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000))
-        .expect("micro should fire");
+    let micro =
+        maybe_micro_compact(&mut conversation, &config, Some(9_000)).expect("micro should fire");
     assert!(micro.bytes_saved > 0);
 
     let mut state = squeezy_core::ContextCompactionState::default();
@@ -160,7 +161,7 @@ fn micro_compact_skips_when_disabled() {
     for n in 0..12 {
         conversation.extend(read_file_pair(n, 4_000));
     }
-    let report = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000));
+    let report = maybe_micro_compact(&mut conversation, &config, Some(9_000));
     assert!(report.is_none());
 }
 
@@ -171,7 +172,7 @@ fn micro_compact_skips_below_threshold() {
     for n in 0..12 {
         conversation.extend(read_file_pair(n, 4_000));
     }
-    let report = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(1_000));
+    let report = maybe_micro_compact(&mut conversation, &config, Some(1_000));
     assert!(report.is_none());
 }
 
@@ -194,7 +195,7 @@ fn micro_compact_skips_non_compactable_tools() {
             is_error: false,
         });
     }
-    let report = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000));
+    let report = maybe_micro_compact(&mut conversation, &config, Some(9_000));
     assert!(
         report.is_none(),
         "notes_recall is not in the compactable set; nothing should clear",
@@ -208,9 +209,9 @@ fn micro_compact_is_idempotent_on_already_cleared_outputs() {
     for n in 0..12 {
         conversation.extend(read_file_pair(n, 4_000));
     }
-    let _first = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000))
+    let _first = maybe_micro_compact(&mut conversation, &config, Some(9_000))
         .expect("first pass should fire");
-    let second = maybe_micro_compact_mid_turn(&mut conversation, &config, Some(9_000));
+    let second = maybe_micro_compact(&mut conversation, &config, Some(9_000));
     assert!(
         second.is_none(),
         "second micro pass should be a no-op when older outputs already carry the placeholder",

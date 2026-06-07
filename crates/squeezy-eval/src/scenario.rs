@@ -710,6 +710,14 @@ pub enum TranscriptIndex {
 pub struct Expect {
     #[serde(default)]
     pub final_text_contains: Vec<String>,
+    /// Substrings that must NOT appear in the final assistant output. The
+    /// counterpart to `final_text_contains`: each match produces an
+    /// `expect_final_text_not_contains` finding. Useful as a regression
+    /// witness for spurious internal retries — script a trap round whose
+    /// distinct text would only surface if the retry wrongly fired, then
+    /// forbid that text here.
+    #[serde(default)]
+    pub final_text_not_contains: Vec<String>,
     #[serde(default)]
     pub max_wall_clock_seconds: Option<u64>,
     #[serde(default)]

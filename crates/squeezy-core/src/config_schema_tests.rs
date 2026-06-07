@@ -42,7 +42,7 @@ fn absent_field_values_render_as_dash() {
 }
 
 #[test]
-fn context_trigger_info_distinguishes_dormant_from_disabled() {
+fn context_trigger_info_reflects_thresholds_and_toggles() {
     let ctx = section(SectionId::Context).expect("Context section must be registered");
     let triggers = ctx
         .fields
@@ -50,28 +50,29 @@ fn context_trigger_info_distinguishes_dormant_from_disabled() {
         .find(|field| field.label == "triggers")
         .expect("Context section exposes trigger summary");
 
+    // Default config has no model window, so the summary marks the window as a
+    // fallback and lists each tier's resolved firing point.
     let default_summary = (triggers.get)(&AppConfig::default()).as_display();
+    assert!(default_summary.contains("(fallback)"), "{default_summary}");
+    assert!(default_summary.contains("trim @"), "{default_summary}");
+    assert!(default_summary.contains("warn @"), "{default_summary}");
+    assert!(default_summary.contains("summarize @"), "{default_summary}");
+    assert!(!default_summary.contains("trim off"), "{default_summary}");
     assert!(
-        default_summary.contains("window — (unknown; mid-turn dormant)"),
+        !default_summary.contains("summarize off"),
         "{default_summary}"
     );
-    assert!(
-        default_summary.contains("micro on (dormant @60%)"),
-        "{default_summary}"
-    );
-    assert!(
-        default_summary.contains("full on (dormant @80%)"),
-        "{default_summary}"
-    );
-    assert!(!default_summary.contains("micro off"), "{default_summary}");
-    assert!(!default_summary.contains("full off"), "{default_summary}");
 
+    // Toggling the tiers off is reflected distinctly.
     let mut disabled = AppConfig::default();
     disabled.context_compaction.micro_compaction_enabled = false;
-    disabled.context_compaction.enabled_mid_turn = false;
+    disabled.context_compaction.enabled = false;
     let disabled_summary = (triggers.get)(&disabled).as_display();
-    assert!(disabled_summary.contains("micro off"), "{disabled_summary}");
-    assert!(disabled_summary.contains("full off"), "{disabled_summary}");
+    assert!(disabled_summary.contains("trim off"), "{disabled_summary}");
+    assert!(
+        disabled_summary.contains("summarize off"),
+        "{disabled_summary}"
+    );
 }
 
 #[test]
@@ -275,8 +276,8 @@ fn subagent_integer_schema_defaults_match_runtime_constants() {
 fn context_section_integer_defaults_match_runtime_constants() {
     let cases = [
         (
-            "compaction_estimated_tokens",
-            crate::DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS as i64,
+            "fallback_window_tokens",
+            crate::DEFAULT_CONTEXT_FALLBACK_WINDOW_TOKENS as i64,
         ),
         (
             "compaction_min_items",
@@ -291,12 +292,12 @@ fn context_section_integer_defaults_match_runtime_constants() {
             crate::DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES as i64,
         ),
         (
-            "threshold_percent",
-            crate::DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT as i64,
+            "warn_at_percent",
+            crate::DEFAULT_CONTEXT_WARN_AT_PERCENT as i64,
         ),
         (
-            "micro_compaction_threshold_percent",
-            crate::DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT as i64,
+            "trim_at_percent",
+            crate::DEFAULT_CONTEXT_TRIM_AT_PERCENT as i64,
         ),
         (
             "micro_compaction_keep_recent",
@@ -418,7 +419,7 @@ fn context_percent_setters_reject_out_of_range() {
     let pct = ctx
         .fields
         .iter()
-        .find(|f| f.label == "threshold_percent")
+        .find(|f| f.label == "warn_at_percent")
         .unwrap();
     let mut cfg = AppConfig::default();
     assert!((pct.set)(&mut cfg, FieldValue::Integer(150)).is_err());

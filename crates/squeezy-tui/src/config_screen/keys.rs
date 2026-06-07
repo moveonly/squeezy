@@ -1458,6 +1458,10 @@ fn handle_mcp_browse_key(
             if let Some(entry) = state.mcp_servers.get_mut(&name) {
                 entry.enabled = next_enabled;
             }
+            state
+                .mcp_status
+                .per_server
+                .insert(name.clone(), squeezy_tools::McpServerStatus::Starting);
             state.mcp_pending_actions.push(McpAction::Toggle {
                 server: name.clone(),
                 enabled: next_enabled,
@@ -1486,6 +1490,10 @@ fn handle_mcp_browse_key(
                 notifications.push("no MCP server at this row", NotifySeverity::Warn);
                 return Some(KeyOutcome::KeepOpen);
             };
+            state
+                .mcp_status
+                .per_server
+                .insert(name.clone(), squeezy_tools::McpServerStatus::Starting);
             state.mcp_pending_actions.push(McpAction::Restart {
                 server: name.clone(),
             });
@@ -1572,6 +1580,7 @@ fn handle_mcp_delete_confirm_key(
     );
     if confirm_persist || confirm_session {
         state.mcp_servers.remove(&name);
+        state.mcp_status.per_server.remove(&name);
         state.mcp_pending_delete = None;
         let persist = confirm_persist;
         state.mcp_pending_actions.push(McpAction::Remove {
@@ -1694,6 +1703,10 @@ fn handle_mcp_add_form_key(
             state
                 .mcp_servers
                 .insert(trimmed_name.clone(), server.clone());
+            state.mcp_status.per_server.insert(
+                trimmed_name.clone(),
+                squeezy_tools::McpServerStatus::Starting,
+            );
             state.mcp_pending_actions.push(McpAction::Add {
                 name: trimmed_name.clone(),
                 server: Box::new(server),

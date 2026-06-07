@@ -4685,7 +4685,7 @@ async fn large_paste_uses_visible_prompt_token() {
         .await
         .expect("handle paste");
 
-    let placeholder = format!("[Pasted Content {} chars]", pasted.chars().count());
+    let placeholder = "[Pasted text #1]".to_string();
     assert_eq!(app.input, placeholder);
     assert_eq!(app.prompt_attachments.len(), 1);
     assert!(app.attachments.is_empty());
@@ -4723,7 +4723,69 @@ async fn deleting_large_paste_token_drops_payload_before_submit() {
 }
 
 #[tokio::test]
-async fn duplicate_large_pastes_get_unique_prompt_tokens() {
+async fn immediate_duplicate_large_paste_expands_existing_token() {
+    let root = temp_workspace("tui_large_paste_immediate_dupe");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "line 1\n".repeat(LARGE_PASTE_CHAR_THRESHOLD / 7 + 1);
+
+    handle_paste(&mut app, &mut agent, pasted.replace('\n', "\r\n"))
+        .await
+        .expect("first paste");
+    assert_eq!(
+        app.input,
+        format!(
+            "[Pasted text #1 +{} lines]",
+            pasted_text_line_break_count(&pasted)
+        )
+    );
+    assert_eq!(app.prompt_attachments.len(), 1);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("second paste");
+
+    assert_eq!(app.input, pasted);
+    assert!(app.prompt_attachments.is_empty());
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.display_input, pasted);
+    assert_eq!(prepared.model_input, pasted);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn third_duplicate_large_paste_inserts_new_token_after_expansion() {
+    let root = temp_workspace("tui_large_paste_third_dupe");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let pasted = "z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 2);
+
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("first paste");
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("second paste expands");
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("third paste inserts token");
+
+    let placeholder = "[Pasted text #1]";
+    assert_eq!(app.input, format!("{pasted}{placeholder}"));
+    assert_eq!(app.prompt_attachments.len(), 1);
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.model_input, format!("{pasted}{pasted}"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn non_adjacent_duplicate_large_pastes_get_unique_prompt_tokens() {
     let root = temp_workspace("tui_large_paste_dupe");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_without_session_log_with_config(config.clone());
@@ -4738,8 +4800,30 @@ async fn duplicate_large_pastes_get_unique_prompt_tokens() {
         .await
         .expect("second paste");
 
-    assert!(app.input.contains("[Pasted Content 1002 chars]"));
-    assert!(app.input.contains("[Pasted Content 1002 chars #2]"));
+    assert!(app.input.contains("[Pasted text #1]"));
+    assert!(app.input.contains("[Pasted text #2]"));
+    assert_eq!(app.prompt_attachments.len(), 2);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn different_large_paste_after_token_inserts_new_token() {
+    let root = temp_workspace("tui_large_paste_different");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let first = "a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+    let second = "b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+
+    handle_paste(&mut app, &mut agent, first)
+        .await
+        .expect("first paste");
+    handle_paste(&mut app, &mut agent, second)
+        .await
+        .expect("different paste");
+
+    assert_eq!(app.input, "[Pasted text #1][Pasted text #2]");
     assert_eq!(app.prompt_attachments.len(), 2);
 
     let _ = fs::remove_dir_all(root);
@@ -5022,6 +5106,7 @@ async fn slash_clear_wipes_transcript_and_rotates_to_a_fresh_session() {
         placeholder: "@file:1".to_string(),
         payload: PromptAttachmentPayload::Text {
             replacement: "file context".to_string(),
+            kind: PromptTextAttachmentKind::AttachedFile,
         },
     });
     app.prompt_queue.push_back("queued follow-up".to_string());
@@ -7258,6 +7343,111 @@ fn inline_history_flush_contains_startup_and_new_transcript() {
 }
 
 #[test]
+fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
+    let mut app = test_app(SessionMode::Build);
+    let command = concat!(
+        "echo \"=== .mcp.json ===\"; cat .mcp.json; echo; ",
+        "echo \"=== .codex/hooks.json ===\"; cat .codex/hooks.json; echo; ",
+        "echo \"=== sonar on PATH? ===\";\n",
+        "command -v sonar || echo \"no sonar binary\"; echo; ",
+        "echo \"=== docker? ===\"; command -v docker || echo \"no docker\""
+    );
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": command}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": command,
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": "ok",
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+    app.finalize_settles_for_test();
+
+    let width = 72usize;
+    let flushed =
+        inline_history_lines_for_flush(&app, width as u16, false, 0, app.transcript.len());
+    let rendered = lines_to_plain_text(&flushed);
+
+    assert!(rendered.contains("├─✔ Ran echo"), "{rendered}");
+    assert!(
+        rendered.lines().all(|line| line.chars().count() <= width),
+        "flushed shell card must be pre-wrapped before terminal scrollback insertion:\n{rendered}"
+    );
+    assert!(
+        rendered.lines().any(|line| line.starts_with("   │")),
+        "wrapped continuation should stay on the rail:\n{rendered}"
+    );
+}
+
+#[test]
+fn inline_history_flush_wraps_representative_rail_nodes_to_width() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_reasoning_segment(squeezy_core::ReasoningSnapshot::from_payload(
+        squeezy_core::ReasoningPayload::OpenAi {
+            item_id: "rsn-rail-wrap".to_string(),
+            summary: vec![format!(
+                "Plan: inspect {} and keep every continuation aligned",
+                "formatting-spill-risk ".repeat(4)
+            )],
+            encrypted_content: None,
+        },
+    ));
+    app.push_tool_result(sample_tool_result(
+        "grep",
+        &format!("match {}", "alpha-beta-gamma ".repeat(8)),
+    ));
+    app.push_tool_result(sample_tool_result("grep", &"x".repeat(140)));
+    app.push_warn(format!(
+        "configuration warning {}",
+        "long-soft-wrap ".repeat(8)
+    ));
+    app.push_subagent_note(format!(
+        "delegate subagent completed {}",
+        "long-summary-fragment ".repeat(8)
+    ));
+    let mut failed = sample_tool_result("shell", "");
+    failed.status = ToolStatus::Error;
+    failed.content = serde_json::json!({
+        "command": format!("cargo test {}", "--workspace ".repeat(8)),
+        "workdir": ".",
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": format!("error: {}", "unbroken_error_token_".repeat(8)),
+    });
+    app.push_tool_result(failed);
+    app.finalize_settles_for_test();
+
+    let width = 54usize;
+    let flushed =
+        inline_history_lines_for_flush(&app, width as u16, false, 0, app.transcript.len());
+    let rendered = lines_to_plain_text(&flushed);
+
+    assert!(rendered.contains("reasoning"), "{rendered}");
+    assert!(rendered.contains("configuration warning"), "{rendered}");
+    assert!(
+        rendered.contains("delegate subagent completed"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Failed cargo test"), "{rendered}");
+    assert!(
+        rendered.lines().all(|line| line.chars().count() <= width),
+        "every flushed rail row must fit before terminal insertion:\n{rendered}"
+    );
+    for line in rendered.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            line.starts_with("   │") || line.starts_with("   ├"),
+            "rail row should keep content out of the gutter: {line:?}\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn settling_node_is_held_from_flush_and_folds_in_live_region() {
     let mut app = test_app(SessionMode::Build);
     // A success tool result arms a settle-fold (it rests collapsed).
@@ -8966,7 +9156,7 @@ async fn slash_pins_empty_renders_guidance() {
     assert_eq!(app.status, "no pinned context");
     let rendered = last_message_content(&app).expect("system guidance");
     assert!(rendered.contains("No pinned context yet"), "{rendered}");
-    assert!(rendered.contains("/pin selected"), "{rendered}");
+    assert!(rendered.contains("`/pin`"), "{rendered}");
 }
 
 #[tokio::test]
@@ -9672,9 +9862,9 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
 }
 
 #[test]
-fn context_budget_renders_percent_and_threshold() {
+fn context_budget_renders_percent_of_window() {
     let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
+    app.context_window_tokens = 6_000;
     app.context_estimate = ContextEstimate {
         estimated_tokens: 4_500,
         ..ContextEstimate::default()
@@ -9682,14 +9872,15 @@ fn context_budget_renders_percent_and_threshold() {
     let details = format_status_details(&app);
     assert!(
         details.contains("ctx 4500/6000 (75%)"),
-        "expected context cell with percent; got: {details}"
+        "expected context cell as a percent of the window; got: {details}"
     );
 }
 
 #[test]
 fn context_budget_hint_at_high_usage() {
     let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
+    app.context_window_tokens = 6_000;
+    app.context_warn_tokens = 5_100;
     app.context_estimate = ContextEstimate {
         estimated_tokens: 5_800,
         ..ContextEstimate::default()
@@ -9697,14 +9888,15 @@ fn context_budget_hint_at_high_usage() {
     let hint = format_status_hints(&app);
     assert!(
         hint.contains("/pin") && hint.contains("/compact"),
-        "expected /pin and /compact hints when near threshold; got: {hint}"
+        "expected /pin and /compact hints at/above the warn threshold; got: {hint}"
     );
 }
 
 #[test]
-fn context_budget_hint_omitted_below_threshold() {
+fn context_budget_hint_omitted_below_warn() {
     let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
+    app.context_window_tokens = 6_000;
+    app.context_warn_tokens = 5_100;
     app.context_estimate = ContextEstimate {
         estimated_tokens: 2_000,
         ..ContextEstimate::default()
@@ -9712,45 +9904,52 @@ fn context_budget_hint_omitted_below_threshold() {
     let hint = format_status_hints(&app);
     assert!(
         !hint.contains("/pin to keep"),
-        "low usage must not surface /pin hint; got: {hint}"
+        "low usage must not surface the /pin hint; got: {hint}"
     );
 }
 
-/// Helper: count post-turn compaction-nudge log entries in the transcript.
-/// We key on the "auto-compact" wording the nudge introduces — that phrase
-/// is unique to this advisory, so the filter doubles as proof that the
-/// rendered text references the auto-trigger explicitly (the whole point
-/// of the nudge is to be actionable advice *before* auto-compaction
-/// rewrites the conversation).
-fn count_auto_compact_nudges(app: &TuiApp) -> usize {
+/// Count pre-summarize nudge log entries. We key on the recap wording the
+/// nudge introduces — unique to this advisory, so the filter doubles as proof
+/// the rendered text explains what summarize does (recent kept, undoable).
+fn count_compaction_nudges(app: &TuiApp) -> usize {
     app.transcript
         .iter()
         .filter(|entry| {
             matches!(&entry.kind, TranscriptEntryKind::Log(LogEntry { message, .. })
-                if message.contains("auto-compact"))
+                if message.contains("summarized into a recap"))
         })
         .count()
 }
 
-#[tokio::test]
-async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
-    let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
+/// Arm the warn/summarize band the nudge fires inside, with a low
+/// `recent_items` so a few items satisfy the will-shrink check.
+fn arm_nudge_band(app: &mut TuiApp) {
+    app.context_window_tokens = 6_000;
+    app.context_warn_tokens = 4_200;
+    app.context_summarize_tokens = 5_700;
+    app.context_recent_items = 2;
+}
 
+/// A post-turn estimate inside the band with more items than `recent_items`,
+/// so a summarize would actually shrink and the nudge is warranted.
+fn nudge_estimate(estimated_tokens: u64) -> ContextEstimate {
+    ContextEstimate {
+        estimated_tokens,
+        items: 20,
+        ..ContextEstimate::default()
+    }
+}
+
+async fn send_completed_with_estimate(app: &mut TuiApp, turn: u64, estimate: ContextEstimate) {
     let (tx, rx) = mpsc::channel(4);
     app.turn_rx = Some(rx);
     tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(1),
+        turn_id: TurnId::new(turn),
         message: TranscriptItem::assistant("ok"),
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate {
-            // 5_800 / 6_000 ≈ 97% of the auto-compact threshold — comfortably
-            // above the 70% nudge floor and below the 100% suppression edge.
-            estimated_tokens: 5_800,
-            ..ContextEstimate::default()
-        },
+        context_estimate: estimate,
         stop_reason: None,
         reasoning_only_stop: false,
         session_cost: None,
@@ -9758,173 +9957,118 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     .await
     .expect("send completed");
     drop(tx);
-    drain_agent_events(&mut app).await;
+    drain_agent_events(app).await;
+}
 
+#[tokio::test]
+async fn pre_compaction_nudge_fires_once_until_reset() {
+    let mut app = test_app(SessionMode::Build);
+    arm_nudge_band(&mut app);
+
+    // 4_500 is inside [warn 4_200, summarize 5_700) with 20 > recent_items.
+    send_completed_with_estimate(&mut app, 1, nudge_estimate(4_500)).await;
     assert_eq!(
-        count_auto_compact_nudges(&app),
+        count_compaction_nudges(&app),
         1,
-        "nudge must fire exactly once on first crossing"
+        "nudge must fire once on first crossing into the warn band"
     );
 
-    // A second high-usage turn must not fire the nudge again until
-    // compaction resets the latch.
-    let (tx, rx) = mpsc::channel(4);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(2),
-        message: TranscriptItem::assistant("ok"),
-        response_id: None,
-        cost: CostSnapshot::default(),
-        metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate {
-            estimated_tokens: 5_900,
-            ..ContextEstimate::default()
-        },
-        stop_reason: None,
-        reasoning_only_stop: false,
-        session_cost: None,
-    })
-    .await
-    .expect("send completed");
-    drop(tx);
-    drain_agent_events(&mut app).await;
-
+    // A second in-band turn must not fire the nudge again until compaction
+    // resets the latch.
+    send_completed_with_estimate(&mut app, 2, nudge_estimate(4_800)).await;
     assert_eq!(
-        count_auto_compact_nudges(&app),
+        count_compaction_nudges(&app),
         1,
-        "nudge must not fire again until compaction"
+        "nudge must not fire again until compaction resets the latch"
     );
 }
 
-/// The nudge must fire as soon as estimated tokens reach 70% of the
-/// auto-compact threshold (well before the 100% mark that triggers
-/// compaction), and the rendered text must reference the auto-trigger so
-/// the advice is actionable — otherwise users only see "consider
-/// /compact" *after* compaction has already rewritten the conversation.
+/// Inside the warn band the nudge fires, and its text explains that summarize
+/// condenses older turns (recent kept) and is reversible — so the advice is
+/// actionable rather than naming an undefined "auto-compact threshold".
 #[tokio::test]
-async fn pre_compaction_nudge_fires_at_seventy_percent_of_threshold() {
+async fn pre_compaction_nudge_fires_in_warn_band_and_explains_summarize() {
     let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
+    arm_nudge_band(&mut app);
 
-    let (tx, rx) = mpsc::channel(4);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(1),
-        message: TranscriptItem::assistant("ok"),
-        response_id: None,
-        cost: CostSnapshot::default(),
-        metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate {
-            // 4_200 / 6_000 = 70.0% — exactly at the firing point.
-            estimated_tokens: 4_200,
-            ..ContextEstimate::default()
-        },
-        stop_reason: None,
-        reasoning_only_stop: false,
-        session_cost: None,
-    })
-    .await
-    .expect("send completed");
-    drop(tx);
-    drain_agent_events(&mut app).await;
+    send_completed_with_estimate(&mut app, 1, nudge_estimate(4_500)).await;
 
     let message = app
         .transcript
         .iter()
         .find_map(|entry| match &entry.kind {
             TranscriptEntryKind::Log(LogEntry { message: text, .. })
-                if text.contains("auto-compact") =>
+                if text.contains("summarized into a recap") =>
             {
                 Some(text.clone())
             }
             _ => None,
         })
-        .expect("nudge must fire at 70% of the auto-compact threshold");
-    // Text must reference the auto-trigger explicitly so the advice is
-    // actionable — without "auto-compact" in the message, users can't tell
-    // why /pin or /compact would help.
-    assert!(
-        message.contains("auto-compact"),
-        "nudge must reference the auto-trigger; got: {message}"
-    );
+        .expect("nudge must fire inside the warn band");
     assert!(
         message.contains("/pin") && message.contains("/compact"),
         "nudge must surface the deliberate actions; got: {message}"
     );
-}
-
-/// Once estimated tokens reach or pass the auto-compact threshold the
-/// nudge must stay silent — auto-compaction is already taking over the
-/// UI, and a stale "consider /compact" advisory would just clutter the
-/// post-compaction transcript with advice the user can no longer act on.
-#[tokio::test]
-async fn pre_compaction_nudge_suppressed_at_or_past_threshold() {
-    let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
-
-    let (tx, rx) = mpsc::channel(4);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(1),
-        message: TranscriptItem::assistant("ok"),
-        response_id: None,
-        cost: CostSnapshot::default(),
-        metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate {
-            // 6_100 / 6_000 ≈ 102% — past the threshold, so we're already in
-            // auto-compaction territory. The nudge would be useless advice.
-            estimated_tokens: 6_100,
-            ..ContextEstimate::default()
-        },
-        stop_reason: None,
-        reasoning_only_stop: false,
-        session_cost: None,
-    })
-    .await
-    .expect("send completed");
-    drop(tx);
-    drain_agent_events(&mut app).await;
-
-    assert_eq!(
-        count_auto_compact_nudges(&app),
-        0,
-        "nudge must not fire once usage has already crossed the auto-compact threshold",
+    assert!(
+        message.contains("/compact undo"),
+        "nudge must say summarize is reversible; got: {message}"
     );
 }
 
-/// Below 70% of the auto-compact threshold the nudge should stay silent —
-/// firing earlier would be alarmist for routine sessions.
+/// At or past the summarize point the nudge stays silent — the summarize
+/// itself is now the actionable signal, so a "consider /compact" advisory
+/// would just clutter the transcript.
 #[tokio::test]
-async fn pre_compaction_nudge_silent_below_seventy_percent() {
+async fn pre_compaction_nudge_suppressed_at_or_past_summarize() {
     let mut app = test_app(SessionMode::Build);
-    app.context_compaction_threshold = 6_000;
+    arm_nudge_band(&mut app);
 
-    let (tx, rx) = mpsc::channel(4);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(1),
-        message: TranscriptItem::assistant("ok"),
-        response_id: None,
-        cost: CostSnapshot::default(),
-        metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate {
-            // 4_100 / 6_000 ≈ 68% — just under the 70% firing floor.
-            estimated_tokens: 4_100,
-            ..ContextEstimate::default()
-        },
-        stop_reason: None,
-        reasoning_only_stop: false,
-        session_cost: None,
-    })
-    .await
-    .expect("send completed");
-    drop(tx);
-    drain_agent_events(&mut app).await;
+    // 5_800 is at/above the 5_700 summarize point.
+    send_completed_with_estimate(&mut app, 1, nudge_estimate(5_800)).await;
 
     assert_eq!(
-        count_auto_compact_nudges(&app),
+        count_compaction_nudges(&app),
         0,
-        "nudge must stay silent below the 70% firing floor",
+        "nudge must not fire once usage has reached the summarize point",
+    );
+}
+
+/// Below the warn threshold the nudge stays silent — trimming runs quietly
+/// here and firing earlier would be alarmist for routine sessions.
+#[tokio::test]
+async fn pre_compaction_nudge_silent_below_warn() {
+    let mut app = test_app(SessionMode::Build);
+    arm_nudge_band(&mut app);
+
+    // 4_100 is just under the 4_200 warn threshold.
+    send_completed_with_estimate(&mut app, 1, nudge_estimate(4_100)).await;
+
+    assert_eq!(
+        count_compaction_nudges(&app),
+        0,
+        "nudge must stay silent below the warn threshold",
+    );
+}
+
+/// In the warn band but with fewer items than `recent_items`: a summarize
+/// would not actually shrink anything, so the nudge must stay silent rather
+/// than warn about a summarize that will not happen.
+#[tokio::test]
+async fn pre_compaction_nudge_suppressed_when_nothing_to_summarize() {
+    let mut app = test_app(SessionMode::Build);
+    arm_nudge_band(&mut app);
+
+    let estimate = ContextEstimate {
+        estimated_tokens: 4_500,
+        items: 1,
+        ..ContextEstimate::default()
+    };
+    send_completed_with_estimate(&mut app, 1, estimate).await;
+
+    assert_eq!(
+        count_compaction_nudges(&app),
+        0,
+        "nudge must not fire when there is nothing older than the kept recent items",
     );
 }
 
@@ -11912,7 +12056,7 @@ fn status_segments_render_in_priority_order() {
     app.cost.cache_write_input_tokens = Some(3);
     app.cost.estimated_usd_micros = Some(2_500);
     app.context_estimate.estimated_tokens = 4096;
-    app.context_compaction_threshold = 10_000;
+    app.context_window_tokens = 10_000;
     app.metrics.tool_calls = 5;
     app.metrics.bytes_read = 1024;
     app.metrics.redactions = 1;
@@ -15107,9 +15251,8 @@ fn subagent_view_renders_tool_results_as_rail_cards() {
 }
 
 #[test]
-fn context_compaction_threshold_anchors_to_resolved_post_turn_ceiling() {
-    // Small window: the nudge/status anchor tracks the window-derived ceiling
-    // (80% of 32K = 25.6K), not the flat 60K budget (finding #5).
+fn context_window_anchors_to_resolved_effective_window() {
+    // The status/nudge anchor is the effective (usable) window: raw × 95% − 12K.
     let mut config = test_config(SessionMode::Build);
     config.context_compaction.model_context_window = Some(32_000);
     let app = TuiApp::new_with_clipboard(
@@ -15119,9 +15262,9 @@ fn context_compaction_threshold_anchors_to_resolved_post_turn_ceiling() {
         None,
         Box::new(NoopClipboard),
     );
-    assert_eq!(app.context_compaction_threshold, 25_600);
+    assert_eq!(app.context_window_tokens, 18_400); // 32_000 × 95% − 12_000
 
-    // Unknown window: falls back to the flat 60K budget.
+    // Unknown window: falls back to the configured fallback window (128K × 95% − 12K).
     let flat = test_config(SessionMode::Build);
     let flat_app = TuiApp::new_with_clipboard(
         "openai",
@@ -15130,5 +15273,5 @@ fn context_compaction_threshold_anchors_to_resolved_post_turn_ceiling() {
         None,
         Box::new(NoopClipboard),
     );
-    assert_eq!(flat_app.context_compaction_threshold, 60_000);
+    assert_eq!(flat_app.context_window_tokens, 109_600);
 }

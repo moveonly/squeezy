@@ -1,0 +1,97 @@
+id = "strong-model-complete-answer-no-retry"
+title = "Regression: a complete answer that ends on a question must NOT trigger the promised-action retry"
+description = """
+Models a real incident (gctoolkit session 1780784071532-67685-1,
+turn-2): the user asks "what model are you and why didn't you load the
+skill yet?". After a legitimate tool round, the model emits a complete,
+well-behaved answer whose BODY contains mid-answer intent phrases
+("I'll find out when I try", "I'll run them") but which ENDS on a
+permission question ("Want me to proceed?").
+
+The old whole-text intent heuristic matched the body phrases and fired a
+spurious `promised_action` retry; the pushy "call the tool now" nudge
+then drove unrequested file edits and buried the answer. The sharpened,
+final-clause-anchored detector must clear this answer so the turn
+completes at round 1 with no retry.
+
+Witness: round 2 is a TRAP that only gets requested if a spurious retry
+fires. It emits the sentinel text "UNREQUESTED EXTRA WORK", which the
+recovery path would merge into the visible turn output. `final_text_not_contains`
+forbids that sentinel, so a fired retry fails the scenario; with the fix,
+round 2 is never requested and the sentinel never appears. (The eval
+harness has no per-round visibility — it sees one turn-completion per
+turn — so this merged-text footprint is the reliable signal, not the
+`stop_no_action` sentinel which can't observe an intra-turn retry.)
+
+Runs entirely offline against the mock provider.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "what model are you and why you didn't load the skill yet?"
+wait_for = "turn_completed"
+
+[expect]
+# The complete answer is preserved verbatim (G1: never drop visible text)...
+final_text_contains = ["Want me to proceed with that and continue the modernization"]
+# ...and no spurious retry fired: the round-2 trap's sentinel must never
+# surface in the visible output (it only would if a retry merged it in).
+final_text_not_contains = ["UNREQUESTED EXTRA WORK"]
+finish_reason_not = ["stop_no_action"]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback: no scripted turn for this prompt)"
+
+# Round 0: a legitimate read-only tool call, so the answer lands on
+# round > 0 (the structural gate for the promised-action branch).
+[[mock.turns]]
+text = ""
+input_tokens = 40
+output_tokens = 4
+finish_reason = "tool_calls"
+
+[[mock.turns.tool_calls]]
+name = "grep"
+arguments = { pattern = "needle", include = ["*.rs"] }
+
+# Round 1: the complete answer. Mid-text intent phrases ("I'll find out
+# when I try", "I'll run them") are present, but the message ENDS on a
+# permission question — so the sharpened detector must NOT retry, and the
+# turn completes here.
+[[mock.turns]]
+text = """
+You're right to call that out — let me address both honestly. On the \
+model: I don't have a reliable way to verify my exact underlying model \
+from inside this environment, so I won't guess. I operate here as \
+"Squeezy". Those commands may or may not run in this shell — I'll find \
+out when I try, and I'll run them and surface any config/auth errors to \
+you rather than retrying blindly. So before I touch CPUSummary.java (a \
+clean record conversion, ~4 caller sites), the correct next step per the \
+skill is to run `guidelines get`. Want me to proceed with that and \
+continue the modernization?
+"""
+input_tokens = 120
+output_tokens = 240
+finish_reason = "stop"
+
+# Round 2: TRAP. Only requested if a spurious promised-action retry
+# fires. Its sentinel text would be merged into the visible turn output,
+# tripping `final_text_not_contains` and failing the scenario. With the
+# fix this round is never requested.
+[[mock.turns]]
+text = "UNREQUESTED EXTRA WORK: the retry wrongly fired and the model kept going."
+input_tokens = 130
+output_tokens = 20
+finish_reason = "stop"
+
+[triage]
+enabled = false
