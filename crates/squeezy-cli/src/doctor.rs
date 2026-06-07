@@ -104,6 +104,8 @@ struct Check {
 #[derive(Debug)]
 pub struct DoctorReport {
     pub exit_code: i32,
+    warnings: usize,
+    failures: usize,
     checks: Vec<Check>,
     version: &'static str,
     target: &'static str,
@@ -112,29 +114,16 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn print(&self) {
-        let (warnings, failures) = check_counts(&self.checks);
         if self.json {
-            let body = json!({
-                "version": self.version,
-                "target": self.target,
-                "ok": failures == 0,
-                "warnings": warnings,
-                "failures": failures,
-                "checks": self.checks.iter().map(|c| json!({
-                    "name": c.name,
-                    "status": c.status.as_str(),
-                    "detail": c.detail,
-                })).collect::<Vec<_>>(),
-            });
             println!(
                 "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
+                serde_json::to_string_pretty(&self.json_body()).unwrap_or_default()
             );
             return;
         }
         let header = if self.exit_code != 0 {
             "squeezy: fail"
-        } else if warnings > 0 {
+        } else if self.warnings > 0 {
             "squeezy: ok (warnings)"
         } else {
             "squeezy: ok"
@@ -157,6 +146,21 @@ impl DoctorReport {
                 name_width = name_width,
             );
         }
+    }
+
+    fn json_body(&self) -> serde_json::Value {
+        json!({
+            "version": self.version,
+            "target": self.target,
+            "ok": self.failures == 0,
+            "warnings": self.warnings,
+            "failures": self.failures,
+            "checks": self.checks.iter().map(|c| json!({
+                "name": c.name,
+                "status": c.status.as_str(),
+                "detail": c.detail,
+            })).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -189,6 +193,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         };
         return Ok(DoctorReport {
             exit_code,
+            warnings: usize::from(matches!(check.status, Status::Warn)),
+            failures: usize::from(matches!(check.status, Status::Fail)),
             checks: vec![check],
             version,
             target,
@@ -303,6 +309,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     // environments where keys are absent and still need the binary to come up
     // green. Only hard failures (config load broken, session store unwritable)
     // produce a non-zero exit, matching the old `--health` contract.
+    let (warnings, failures) = check_counts(&checks);
     let exit_code = exit_code_for_checks(&checks);
     let mut checks = filter_checks(args, checks);
     for failure in selector_failures {
@@ -313,6 +320,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
 
     Ok(DoctorReport {
         exit_code,
+        warnings,
+        failures,
         checks,
         version,
         target,

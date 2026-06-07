@@ -60,6 +60,29 @@ fn status_filter_does_not_make_hidden_failures_exit_zero() {
 }
 
 #[test]
+fn json_summary_counts_full_result_even_when_rows_are_filtered() {
+    let report = DoctorReport {
+        exit_code: 1,
+        warnings: 0,
+        failures: 1,
+        checks: vec![Check {
+            name: "sandbox".to_string(),
+            status: Status::Ok,
+            detail: "available".to_string(),
+        }],
+        version: "test",
+        target: "test-target",
+        json: true,
+    };
+
+    let body = report.json_body();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["failures"], 1);
+    assert_eq!(body["checks"].as_array().expect("checks").len(), 1);
+    assert_eq!(body["checks"][0]["name"], "sandbox");
+}
+
+#[test]
 fn unmatched_only_selector_becomes_visible_failure() {
     let mut args = DoctorArgs::default();
     args.only.push("sesion_store".to_string());
