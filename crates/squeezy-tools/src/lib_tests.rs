@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -18,6 +19,34 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
+static TEST_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+struct ScopedEnvVar {
+    name: &'static str,
+    original: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn remove(name: &'static str) -> Self {
+        let original = std::env::var_os(name);
+        unsafe {
+            std::env::remove_var(name);
+        }
+        Self { name, original }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
@@ -6370,31 +6399,39 @@ async fn shell_returns_bounded_output_and_exit_code() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn shell_default_sandbox_runs_benign_command() {
-    let root = temp_workspace("shell_default_sandbox");
-    let registry = ToolRegistry::new(&root).expect("registry");
+#[test]
+fn shell_default_sandbox_runs_benign_command() {
+    let _env_lock = TEST_ENV_LOCK.lock().expect("lock test env");
+    let _shell_env = ScopedEnvVar::remove("SQUEEZY_SHELL");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime");
+    runtime.block_on(async {
+        let root = temp_workspace("shell_default_sandbox");
+        let registry = ToolRegistry::new(&root).expect("registry");
 
-    let result = registry
-        .execute(
-            ToolCall {
-                call_id: "call_default_shell".to_string(),
-                name: "shell".to_string(),
-                arguments: json!({
-                    "command": "printf ok",
-                    "description": "check default shell sandbox posture"
-                }),
-            },
-            CancellationToken::new(),
-        )
-        .await;
+        let result = registry
+            .execute(
+                ToolCall {
+                    call_id: "call_default_shell".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({
+                        "command": "printf ok",
+                        "description": "check default shell sandbox posture"
+                    }),
+                },
+                CancellationToken::new(),
+            )
+            .await;
 
-    assert_eq!(result.status, ToolStatus::Success);
-    assert_eq!(result.content["stdout"], "ok");
-    let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
-    assert!(audit.contains("\"mode\":\"best_effort\""));
+        assert_eq!(result.status, ToolStatus::Success);
+        assert_eq!(result.content["stdout"], "ok");
+        let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
+        assert!(audit.contains("\"mode\":\"best_effort\""));
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
