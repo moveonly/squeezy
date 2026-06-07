@@ -5692,6 +5692,94 @@ fn resume_hydration_backfills_legacy_tool_name_from_call() {
 }
 
 #[test]
+fn resume_hydration_reconstructs_function_call_output_card() {
+    // The shape Squeezy actually persists for a tool result is the
+    // model-facing FunctionCallOutput resume item, NOT a serialized
+    // ToolResult. Hydration must reconstruct a card from it instead of
+    // dropping it (which left resumed sessions with no tool-result cards).
+    let mut app = test_app(SessionMode::Build);
+    let model_output = sample_tool_result("shell", "Cargo.toml\nsrc").model_output();
+    let result = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": model_output,
+    });
+
+    hydrate_transcript_item(
+        &mut app,
+        squeezy_store::HydratedTranscriptItem::ToolResult {
+            call: Some(squeezy_store::HydratedToolCall {
+                call_id: "call-1".to_string(),
+                tool: "shell".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            }),
+            result,
+        },
+    );
+
+    assert!(
+        app.transcript.iter().all(|entry| !matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(log) if log.message.contains("malformed tool-result")
+        )),
+        "function-call-output result should hydrate without a warning: {:?}",
+        app.transcript
+    );
+    let entry = app.transcript.first().expect("hydrated tool card");
+    let tool = match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => tool,
+        other => panic!("expected hydrated tool result, got {other:?}"),
+    };
+    // status + content come back faithfully from model_output(); tool_name and
+    // call_id from the paired call.
+    assert_eq!(tool.result.tool_name, "shell");
+    assert_eq!(tool.result.call_id, "call-1");
+    assert_eq!(tool.result.status, ToolStatus::Success);
+    assert_eq!(
+        tool.result.content,
+        serde_json::json!({ "output": "Cargo.toml\nsrc" })
+    );
+    assert_eq!(
+        tool.call.as_ref().map(|call| call.name.as_str()),
+        Some("shell")
+    );
+}
+
+#[test]
+fn resume_hydration_reconstructs_card_without_paired_call() {
+    // A tool result whose ToolCall event is missing still has to render — the
+    // store guards against a missing call_id, so call_id survives, but the
+    // tool name is unknown. The card must show rather than drop, and a
+    // non-Success status must round-trip.
+    let mut app = test_app(SessionMode::Build);
+    let mut denied = sample_tool_result("shell", "nope");
+    denied.status = ToolStatus::Denied;
+    let result = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "call-9",
+        "output": denied.model_output(),
+    });
+
+    hydrate_transcript_item(
+        &mut app,
+        squeezy_store::HydratedTranscriptItem::ToolResult { call: None, result },
+    );
+
+    let entry = app
+        .transcript
+        .first()
+        .expect("hydrated tool card even without a paired call");
+    let tool = match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => tool,
+        other => panic!("expected hydrated tool result, got {other:?}"),
+    };
+    assert_eq!(tool.result.status, ToolStatus::Denied);
+    assert_eq!(tool.result.call_id, "call-9");
+    assert!(tool.result.tool_name.is_empty());
+    assert!(tool.call.is_none());
+}
+
+#[test]
 fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
     let mut app = test_app(SessionMode::Build);
 
