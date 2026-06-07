@@ -705,6 +705,28 @@ fn crawler_indexes_internal_symlinked_source_files() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn crawler_records_dangling_symlink_as_walk_error_without_failing() {
+    let root = temp_root("crawler_records_dangling_symlink_as_walk_error");
+    fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+    std::os::unix::fs::symlink(root.join("missing.rs"), root.join("dangling.rs")).unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.indexing_decision.should_index);
+    assert!(
+        snapshot
+            .walk_errors
+            .iter()
+            .any(|error| error.contains("dangling.rs")),
+        "expected dangling symlink to be recorded as a walk error, got {:?}",
+        snapshot.walk_errors
+    );
+}
+
 #[test]
 fn crawler_allows_larger_java_sources_by_default() {
     let root = temp_root("crawler_allows_larger_java_sources_by_default");
@@ -899,6 +921,16 @@ fn ancestor_vcs_scan_stops_at_cached_home_boundary() {
 }
 
 #[test]
+fn linux_pseudo_filesystem_roots_are_protected_but_package_roots_are_not() {
+    for root in ["/proc", "/sys", "/run", "/boot", "/snap"] {
+        assert!(is_protected_root(Path::new(root)), "{root}");
+    }
+    for root in ["/opt", "/usr", "/var"] {
+        assert!(!is_protected_root(Path::new(root)), "{root}");
+    }
+}
+
+#[test]
 fn git_worktree_file_is_an_indexing_signal() {
     let root = temp_root("git_worktree_file_is_an_indexing_signal");
     fs::write(
@@ -930,6 +962,40 @@ fn common_project_config_is_an_indexing_signal() {
             .positive_signals
             .contains(&"project marker package.json".to_string())
     );
+}
+
+#[test]
+fn mis_cased_project_marker_is_reported_as_case_sensitive_near_miss() {
+    let root = temp_root("mis_cased_project_marker_is_reported");
+    fs::write(root.join("cargo.toml"), "[package]\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(
+        snapshot
+            .indexing_decision
+            .negative_signals
+            .iter()
+            .any(|signal| {
+                signal.contains("project marker case differs")
+                    && signal.contains("Cargo.toml")
+                    && signal.contains("cargo.toml")
+            }),
+        "{:?}",
+        snapshot.indexing_decision.negative_signals
+    );
+    if snapshot.indexing_decision.should_index {
+        assert!(
+            snapshot
+                .indexing_decision
+                .positive_signals
+                .contains(&"project marker Cargo.toml".to_string()),
+            "case-insensitive filesystems may still accept the marker: {:?}",
+            snapshot.indexing_decision.positive_signals
+        );
+    }
 }
 
 #[test]

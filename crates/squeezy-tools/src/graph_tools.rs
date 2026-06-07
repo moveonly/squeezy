@@ -763,6 +763,16 @@ pub(crate) fn graph_payload(
             json!(manager.pending_changed_count()),
         );
     }
+    let watcher = manager.watcher_status();
+    payload.insert(
+        "indexing".to_string(),
+        json!({
+            "watcher_mode": watcher.mode.as_str(),
+            "watcher_backend": watcher.backend,
+            "pending_events": manager.pending_changed_count(),
+            "fallback_reason": watcher.fallback_reason,
+        }),
+    );
     payload
 }
 
@@ -4486,6 +4496,15 @@ mod graph_payload_refresh_status_tests {
         assert_eq!(
             payload.get("graph_available"),
             Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            payload.get("indexing"),
+            Some(&serde_json::json!({
+                "watcher_mode": "disabled",
+                "watcher_backend": "none",
+                "pending_events": 0,
+                "fallback_reason": null,
+            }))
         );
         assert!(payload.get("refresh_incomplete").is_none());
         assert!(payload.get("stale_pending").is_none());

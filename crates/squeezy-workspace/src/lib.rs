@@ -446,14 +446,32 @@ impl WorkspaceCrawler {
                 continue;
             }
             let path = entry.into_path();
-            let relative_path = relative_path(&root, &path)?;
+            let relative_path = match relative_path(&root, &path) {
+                Ok(relative_path) => relative_path,
+                Err(err) => {
+                    record_walk_error(&mut walk_errors, &path, err);
+                    continue;
+                }
+            };
 
-            let metadata = fs::metadata(&path)?;
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    record_walk_error(&mut walk_errors, &path, err);
+                    continue;
+                }
+            };
             if !metadata.is_file() {
                 continue;
             }
             if file_type.is_symlink() {
-                let target = fs::canonicalize(&path)?;
+                let target = match fs::canonicalize(&path) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        record_walk_error(&mut walk_errors, &path, err);
+                        continue;
+                    }
+                };
                 if !target.starts_with(&root) {
                     continue;
                 }
@@ -502,7 +520,13 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            let bytes = fs::read(&path)?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    record_walk_error(&mut walk_errors, &path, err);
+                    continue;
+                }
+            };
             if looks_binary(&bytes) {
                 if self.compiled_policy.includes_class(ExclusionReason::Binary) {
                     unsupported.push(unsupported_file(
@@ -597,6 +621,10 @@ impl WorkspaceCrawler {
             indexing_decision,
         })
     }
+}
+
+fn record_walk_error(walk_errors: &mut Vec<String>, path: &Path, err: impl std::fmt::Display) {
+    walk_errors.push(format!("{}: {err}", path.display()));
 }
 
 fn keep_entry(
@@ -782,6 +810,9 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         has_strong_positive = true;
         positive_signals.push(marker);
     }
+    for near_miss in workspace_signals.project_marker_case_mismatches {
+        negative_signals.push(near_miss);
+    }
     for source in workspace_signals.shallow_source_markers {
         has_strong_positive = true;
         positive_signals.push(source);
@@ -808,6 +839,14 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
     {
         "indexing skipped: README alone is a weak signal without repository, project config, or shallow source files"
             .to_string()
+    } else if negative_signals
+        .iter()
+        .any(|signal| signal.contains("case differs from expected project marker"))
+    {
+        format!(
+            "indexing skipped: no exact project marker or shallow source file; {}",
+            negative_signals.join(", ")
+        )
     } else {
         "indexing skipped: no VCS marker, project config, or shallow source file".to_string()
     };
@@ -832,11 +871,13 @@ fn is_protected_root(root: &Path) -> bool {
         "/bin",
         "/dev",
         "/etc",
-        "/opt",
         "/private",
+        "/boot",
+        "/proc",
+        "/run",
         "/sbin",
-        "/usr",
-        "/var",
+        "/snap",
+        "/sys",
     ];
     PROTECTED.iter().any(|path| Path::new(path) == root)
 }
@@ -878,6 +919,7 @@ fn vcs_marker_at(path: &Path) -> Option<&'static str> {
 struct WorkspaceSignalScan {
     has_readme: bool,
     project_markers: Vec<String>,
+    project_marker_case_mismatches: Vec<String>,
     shallow_source_markers: Vec<String>,
     code_directory_markers: Vec<String>,
 }
@@ -893,6 +935,8 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
     let root_entry_names = root_entry_names(&root_entries);
     let has_readme = root_entries.iter().any(is_readme_entry);
     let project_markers = project_markers_from_root(root, Some((&root_entry_names, &root_entries)));
+    let project_marker_case_mismatches =
+        project_marker_case_mismatches(&root_entry_names, &root_entries);
 
     let mut source_scan = SourceMarkerScan::default();
     collect_source_markers_from_entries(&root_entries, 0, None, &mut source_scan);
@@ -903,6 +947,7 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
     WorkspaceSignalScan {
         has_readme,
         project_markers,
+        project_marker_case_mismatches,
         shallow_source_markers: source_scan.signals,
         code_directory_markers,
     }
@@ -961,6 +1006,51 @@ fn project_marker_exists(
     root_entry_names
         .map(|names| names.contains(std::ffi::OsStr::new(marker)) || root.join(marker).exists())
         .unwrap_or_else(|| root.join(marker).exists())
+}
+
+fn project_marker_case_mismatches(
+    root_entry_names: &BTreeSet<OsString>,
+    entries: &[fs::DirEntry],
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    for marker in CODE_PROJECT_MARKERS.iter().copied() {
+        if marker.contains('/') || root_entry_names.contains(std::ffi::OsStr::new(marker)) {
+            continue;
+        }
+        if let Some(actual) = root_entry_names
+            .iter()
+            .filter_map(|name| name.to_str())
+            .find(|name| name.eq_ignore_ascii_case(marker))
+        {
+            mismatches.push(format!(
+                "project marker case differs from expected project marker {marker}: found {actual}"
+            ));
+        }
+    }
+    for entry in entries {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let extension = Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        let expected_extension = match extension.to_ascii_lowercase().as_str() {
+            "csproj" => "csproj",
+            "sln" => "sln",
+            "slnx" => "slnx",
+            _ => continue,
+        };
+        if extension != expected_extension {
+            mismatches.push(format!(
+                "project marker case differs from expected .{expected_extension} extension: found {name}"
+            ));
+        }
+    }
+    mismatches.sort();
+    mismatches.dedup();
+    mismatches
 }
 
 fn dotnet_project_markers(root: &Path, entries: Option<&[fs::DirEntry]>) -> Vec<String> {

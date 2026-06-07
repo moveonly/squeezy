@@ -88,12 +88,17 @@ scan to depth two with a small entry cap and include every `LanguageFamily` in
 files. Common code directories such as `src`, `lib`, `app`,
 `packages`, `crates`, `cmd`, `pkg`, `internal`, and `include` are positive only
 when they contain shallow source files. The user's home directory and protected
-system roots such as `/`, `/System`, `/Library`, `/Users`, `/usr`, and `/var`
-are blocking negative signals. Personal folder names such as `Desktop`,
-`Documents`, and `Downloads` are weak negative signals, but real project markers
-can override them. If there is no strong positive signal, or the root is a
-blocked system/home root, Squeezy returns an empty graph with the indexing
-decision instead of walking a likely non-code or dangerous directory.
+system roots such as `/`, `/System`, `/Library`, `/Users`, `/proc`, `/sys`,
+`/run`, `/boot`, and `/snap` are blocking negative signals. Broad Linux package
+and source roots such as `/opt`, `/usr`, and `/var` are not blocked solely by
+name; they still need a strong project or source signal before indexing starts.
+Personal folder names such as `Desktop`, `Documents`, and `Downloads` are weak
+negative signals, but real project markers can override them. On case-sensitive
+filesystems, near-miss project markers such as `cargo.toml` when `Cargo.toml`
+was expected are reported as negative diagnostics instead of being silently
+ignored. If there is no strong positive signal, or the root is a blocked
+system/home root, Squeezy returns an empty graph with the indexing decision
+instead of walking a likely non-code or dangerous directory.
 
 - Direct calls resolve when the target is same-file, explicitly imported, or
   syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
@@ -134,17 +139,21 @@ Defaults:
 - per-tool refresh budget: 250 ms
 
 Refresh is pending-event-first when callers provide authoritative changed
-paths, with a polling fallback otherwise. Callers that know paths changed can
-call `record_changed_path`; the next graph query refreshes immediately after
-debounce. `GraphManager::open_watching` can attach the
-`squeezy-graph::watcher::FileWatcher`, which uses
-`notify-debouncer-full` and OS-native backends (FSEvents, inotify, or
+paths, with a bounded recrawl fallback otherwise. Callers that know paths
+changed can call `record_changed_path`; the next graph query refreshes
+immediately after debounce. Long-lived tool registries open the graph with
+`GraphManager::open_watching`, which attaches the
+`squeezy-graph::watcher::FileWatcher`. The watcher uses
+`notify-debouncer-full` and OS-native backends (FSEvents, Linux inotify, or
 ReadDirectoryChangesW) to queue debounced changed paths into the same pending
-set. The default tool registry still opens the graph with `open_with_store`
-instead of `open_watching`, so normal tool calls rely on refresh calls and the
-15 second polling safety net rather than an always-on OS watcher. Refresh
-recrawls tracked files, compares stable hashes, reparses changed files only,
-removes deleted files, and preserves unchanged graph partitions.
+set. If native watcher registration fails, for example because Linux inotify
+watch limits are exhausted or a mount cannot be watched recursively, Squeezy
+falls back to a polling watcher and records the fallback reason. Graph tool
+payloads expose the active `watcher_mode`, `watcher_backend`, and pending event
+count so users and agents can distinguish native event refresh from fallback or
+one-shot crawl-only graph managers. Refresh recrawls tracked files, compares
+stable hashes, reparses changed files only, removes deleted files, and preserves
+unchanged graph partitions.
 
 The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
 yields with `budget_exhausted=true` on the refresh report once the budget is

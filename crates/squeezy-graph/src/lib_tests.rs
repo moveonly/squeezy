@@ -1805,6 +1805,35 @@ fn graph_manager_refresh_keeps_pending_when_budget_exhausted() {
     }
 }
 
+#[test]
+fn graph_manager_open_watching_records_active_watcher_status() {
+    let root = temp_root("graph-manager-watching-status");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn ready() {}\n").unwrap();
+
+    let manager = GraphManager::open_watching(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_secs(30),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+        CrawlOptions::default(),
+        None,
+        watcher::WatcherConfig {
+            src_dirs: vec![root.clone()],
+            debounce_ms: 50,
+        },
+    )
+    .unwrap();
+
+    let status = manager.watcher_status();
+    assert_ne!(status.mode, WatcherMode::Disabled);
+    assert_ne!(status.backend, "none");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// `call_chain` must honor the same `max_depth` bound as the BFS call-graph
 /// listing (`bfs_call_packets` in squeezy-tools): a target reachable in exactly
 /// `d` call edges is found iff `max_depth >= d`, never one edge further. Locks

@@ -2026,6 +2026,31 @@ pub struct RefreshReport {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WatcherMode {
+    #[default]
+    Disabled,
+    Native,
+    PollingFallback,
+}
+
+impl WatcherMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Native => "native",
+            Self::PollingFallback => "polling_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatcherStatus {
+    pub mode: WatcherMode,
+    pub backend: &'static str,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
     pub c_files: usize,
     pub csharp_files: usize,
@@ -2068,6 +2093,7 @@ pub struct GraphManager {
     /// manager. `RAII` drop stops it. `None` for one-shot CLI callers that
     /// open the graph without watching the filesystem.
     _watcher: Option<watcher::FileWatcher>,
+    watcher_status: WatcherStatus,
 }
 
 impl GraphManager {
@@ -2129,14 +2155,50 @@ impl GraphManager {
     ) -> Result<Self> {
         let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
         let handle = Arc::clone(&manager.pending_changed_paths);
-        let file_watcher = watcher::FileWatcher::start(watcher_config, move |batch| {
+        let watcher_result = watcher::FileWatcher::start(watcher_config.clone(), move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
                     paths.insert(path);
                 }
             }
-        })?;
+        });
+        let (file_watcher, watcher_status) = match watcher_result {
+            Ok(file_watcher) => (
+                file_watcher,
+                WatcherStatus {
+                    mode: WatcherMode::Native,
+                    backend: watcher::native_backend_name(),
+                    fallback_reason: None,
+                },
+            ),
+            Err(native_err) => {
+                let fallback_reason = native_err.to_string();
+                let handle = Arc::clone(&manager.pending_changed_paths);
+                let file_watcher =
+                    watcher::FileWatcher::start_polling(watcher_config, move |batch| {
+                        if let Ok(mut paths) = handle.lock() {
+                            for path in batch.modified.into_iter().chain(batch.removed) {
+                                paths.insert(path);
+                            }
+                        }
+                    })
+                    .map_err(|poll_err| {
+                        SqueezyError::Tool(format!(
+                            "watcher: native backend failed ({fallback_reason}); polling fallback failed ({poll_err})"
+                        ))
+                    })?;
+                (
+                    file_watcher,
+                    WatcherStatus {
+                        mode: WatcherMode::PollingFallback,
+                        backend: watcher::polling_backend_name(),
+                        fallback_reason: Some(fallback_reason),
+                    },
+                )
+            }
+        };
         manager._watcher = Some(file_watcher);
+        manager.watcher_status = watcher_status;
         Ok(manager)
     }
 
@@ -2206,6 +2268,11 @@ impl GraphManager {
             build_report,
             pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
             _watcher: None,
+            watcher_status: WatcherStatus {
+                mode: WatcherMode::Disabled,
+                backend: "none",
+                fallback_reason: None,
+            },
         })
     }
 
@@ -2248,6 +2315,10 @@ impl GraphManager {
             .lock()
             .map(|paths| paths.len())
             .unwrap_or(0)
+    }
+
+    pub fn watcher_status(&self) -> WatcherStatus {
+        self.watcher_status.clone()
     }
 
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {

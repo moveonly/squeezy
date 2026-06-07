@@ -54,6 +54,24 @@ impl Default for WatcherConfig {
     }
 }
 
+/// Native watcher backend used on this platform.
+pub fn native_backend_name() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "inotify"
+    } else if cfg!(target_os = "macos") {
+        "fsevents"
+    } else if cfg!(target_os = "windows") {
+        "read_directory_changes"
+    } else {
+        "native"
+    }
+}
+
+/// Polling fallback backend used when the native watcher cannot be registered.
+pub fn polling_backend_name() -> &'static str {
+    "polling"
+}
+
 /// Batch of file-system changes delivered when the debounce window expires.
 #[derive(Debug, Default, Clone)]
 pub struct ChangeBatch {
@@ -116,8 +134,11 @@ impl FileWatcher {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn start_polling_for_tests<F>(config: WatcherConfig, on_change: F) -> Result<Self>
+    /// Start a polling watcher. This is slower than the OS-native backend, but
+    /// it keeps long-lived indexing alive when native registration fails, for
+    /// example when Linux inotify watch limits are exhausted or a recursive
+    /// watch cannot be installed on a FUSE/NFS mount.
+    pub fn start_polling<F>(config: WatcherConfig, on_change: F) -> Result<Self>
     where
         F: Fn(ChangeBatch) + Send + 'static,
     {
@@ -180,6 +201,7 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
     let mut modified = Vec::new();
     let mut removed = Vec::new();
     for path in all_paths {
+        let path = normalize_event_path(path);
         // Partition by existence rather than EventKind: on macOS FSEvents
         // may fire a Modify event for a deletion (the file is already gone
         // when we check). The post-debounce existence check is the most
@@ -193,6 +215,10 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
 
     let batch = ChangeBatch { modified, removed };
     if batch.is_empty() { None } else { Some(batch) }
+}
+
+fn normalize_event_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 fn classify_event(kind: EventKind, paths: &[PathBuf], all_paths: &mut Vec<PathBuf>) {
