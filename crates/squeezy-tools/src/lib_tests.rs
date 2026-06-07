@@ -6370,6 +6370,15 @@ async fn shell_returns_bounded_output_and_exit_code() {
     let _ = fs::remove_dir_all(root);
 }
 
+// On Windows the default sandbox posture runs through the restricted-token
+// tier, whose runtime enforcement is environment-dependent and validated by a
+// manual QA checklist (see docs/internal/windows-sandbox-qa.md), not hosted
+// CI runners (where the token's write grant is unreliable and reads can hang).
+// macOS/Linux exercise the real sandbox-exec/Landlock backends here.
+#[cfg_attr(
+    windows,
+    ignore = "restricted-token sandbox runtime is validated by manual QA on a real Windows host; see docs/internal/windows-sandbox-qa.md"
+)]
 #[tokio::test]
 async fn shell_default_sandbox_runs_benign_command() {
     let root = temp_workspace("shell_default_sandbox");

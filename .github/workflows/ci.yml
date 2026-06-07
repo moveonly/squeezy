@@ -194,8 +194,12 @@ jobs:
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             scripts/test_clean_env.sh --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
           elif [[ "${{ matrix.platform }}" == "windows" ]]; then
-            export RUST_MIN_STACK=8388608
-            SQUEEZY_SHELL=gitbash scripts/test_clean_env.sh --workspace --all-targets --profile ci
+            # Windows' default test-thread stack (~1 MiB) overflows on the
+            # deepest async agent/harness tests; give libtest threads a
+            # generous stack so the whole class is covered, not one test at a
+            # time. (test_clean_env.sh execs nextest, which forwards this env
+            # to each test process.)
+            RUST_MIN_STACK=16777216 SQUEEZY_SHELL=gitbash scripts/test_clean_env.sh --workspace --all-targets --profile ci
           else
             scripts/test_clean_env.sh --workspace --all-targets --profile ci
           fi
