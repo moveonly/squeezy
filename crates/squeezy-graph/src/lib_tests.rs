@@ -799,6 +799,122 @@ fn persistent_graph_warm_start_skips_unchanged_parsing() {
 }
 
 #[test]
+fn resolver_cache_partial_miss_skips_stale_entries() {
+    let root = temp_root("resolver-cache-partial-miss");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+    fs::write(root.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+
+    // First open: cold build, should write resolver cache entries for both files.
+    let first = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(first.build_report().parsed_files > 0);
+    assert_eq!(first.build_report().resolver_entries_loaded, 0);
+    drop(first);
+
+    // Second open: warm start — both files unchanged, resolver cache should load.
+    let second = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(second.build_report().resolver_entries_loaded > 0);
+    assert_eq!(second.build_report().resolver_entries_missed, 0);
+    drop(second);
+
+    // Modify one file to trigger a fingerprint mismatch.
+    thread::sleep(Duration::from_millis(10));
+    fs::write(root.join("src/other.rs"), "pub fn other_v2() {}\n").unwrap();
+
+    // Third open: one file changed; the whole resolver cache should be skipped
+    // (no stale entries inserted) and `resolver_entries_missed > 0`.
+    let third = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(third.build_report().resolver_entries_loaded, 0);
+    assert!(third.build_report().resolver_entries_missed > 0);
+    assert!(!third.build_report().resolver_import_graph_loaded);
+    // Graph is still correct — rebuilt from ASTs.
+    assert!(
+        third
+            .graph()
+            .find_symbol_by_name("stable")
+            .iter()
+            .any(|s| s.name == "stable")
+    );
+    assert!(
+        third
+            .graph()
+            .find_symbol_by_name("other_v2")
+            .iter()
+            .any(|s| s.name == "other_v2")
+    );
+}
+
+#[test]
+fn resolver_cache_cold_build_persisted_and_consumed_on_warm_start() {
+    // Explicitly verify that a cold build (no graph.redb) writes resolver
+    // entries that are then consumed on the next open.
+    let root = temp_root("resolver-cache-cold-warm");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+    // Cold build.
+    let cold = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(cold.build_report().parsed_files > 0);
+    assert_eq!(cold.build_report().persisted_files_loaded, 0);
+    assert_eq!(cold.build_report().resolver_entries_loaded, 0);
+    drop(cold);
+
+    // Warm start: resolver entries from the cold build should be loaded.
+    let warm = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(warm.build_report().parsed_files, 0);
+    assert!(warm.build_report().persisted_files_loaded > 0);
+    assert!(warm.build_report().resolver_entries_loaded > 0);
+    assert!(warm.build_report().resolver_import_graph_loaded);
+    assert_eq!(warm.build_report().resolver_entries_missed, 0);
+    assert!(
+        warm.graph()
+            .find_symbol_by_name("alpha")
+            .iter()
+            .any(|s| s.name == "alpha")
+    );
+}
+
+#[test]
 fn persistent_graph_refresh_updates_changed_partitions() {
     let root = temp_root("persistent-refresh");
     fs::write(

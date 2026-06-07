@@ -558,7 +558,11 @@ impl SqueezyStore {
                 self.path.with_file_name(GRAPH_FILE_NAME),
             )?);
         }
-        action(guard.as_ref().expect("graph store initialized"))
+        action(
+            guard
+                .as_ref()
+                .ok_or_else(|| SqueezyError::Tool("graph store unavailable after init".into()))?,
+        )
     }
 }
 

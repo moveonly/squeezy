@@ -2663,51 +2663,77 @@ fn load_resolver_cache(
         .collect::<Vec<_>>();
     let entries = store.resolver_entries_for::<resolver_cache::ResolverFileEntry>(&ids)?;
     let mut by_id = entries.into_iter().collect::<HashMap<_, _>>();
-    let mut report = ResolverCacheLoadReport::default();
+
+    // Pass 1: validate all entries without mutating the graph. If any entry is
+    // missing or has a stale fingerprint the whole cache is unusable (because
+    // rebuild_resolver_slots would clear resolver_slots immediately), so we bail
+    // early rather than inserting matched entries that would be discarded anyway.
+    let mut slots = Vec::with_capacity(records.len());
+    let mut entries_missed: usize = 0;
     for record in records {
         let Some(entry) = by_id.remove(&record.id) else {
-            report.entries_missed += 1;
+            entries_missed += 1;
             continue;
         };
         if entry.fingerprint.modified_unix_millis != record.modified_unix_millis
             || entry.fingerprint.size_bytes != record.size_bytes
         {
-            report.entries_missed += 1;
+            entries_missed += 1;
             continue;
         }
-        graph.resolver_slots.insert(
+        slots.push((
             record.id.clone(),
             cross_file::ResolverSlot {
                 exports: entry.exports,
                 imports: entry.imports,
                 supertypes: entry.supertypes,
             },
-        );
-        report.entries_loaded += 1;
+        ));
     }
-    if report.entries_missed == 0
-        && let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()?
-    {
-        let known = graph.files.keys().cloned().collect::<HashSet<_>>();
-        let mut importers_by_file = HashMap::new();
-        for (target, importers) in snapshot.importers_by_file {
-            let target = FileId::new(target);
-            if !known.contains(&target) {
-                continue;
-            }
-            let importers = importers
-                .into_iter()
-                .map(FileId::new)
-                .filter(|id| known.contains(id) && id != &target)
-                .collect::<Vec<_>>();
-            if !importers.is_empty() {
-                importers_by_file.insert(target, importers);
-            }
-        }
-        graph.importers_by_file = importers_by_file;
-        report.import_graph_loaded = true;
+
+    if entries_missed > 0 {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed,
+            import_graph_loaded: false,
+        });
     }
-    Ok(report)
+
+    // Pass 2: all entries matched — commit into the graph.
+    let entries_loaded = slots.len();
+    for (id, slot) in slots {
+        graph.resolver_slots.insert(id, slot);
+    }
+
+    let import_graph_loaded =
+        if let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()? {
+            let known = graph.files.keys().cloned().collect::<HashSet<_>>();
+            let mut importers_by_file = HashMap::new();
+            for (target, importers) in snapshot.importers_by_file {
+                let target = FileId::new(target);
+                if !known.contains(&target) {
+                    continue;
+                }
+                let importers = importers
+                    .into_iter()
+                    .map(FileId::new)
+                    .filter(|id| known.contains(id) && id != &target)
+                    .collect::<Vec<_>>();
+                if !importers.is_empty() {
+                    importers_by_file.insert(target, importers);
+                }
+            }
+            graph.importers_by_file = importers_by_file;
+            true
+        } else {
+            false
+        };
+
+    Ok(ResolverCacheLoadReport {
+        entries_loaded,
+        entries_missed: 0,
+        import_graph_loaded,
+    })
 }
 
 fn load_persisted_partitions(
