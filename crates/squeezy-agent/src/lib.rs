@@ -5984,6 +5984,15 @@ impl TurnRuntime {
             .or(self.configured_model_context_window)
     }
 
+    async fn provider_live_context_window_for_model(&self, model: &str) -> Option<u64> {
+        match &self.config.provider {
+            ProviderConfig::Ollama(ollama) => {
+                fetch_ollama_context_window(&ollama.base_url, model).await
+            }
+            _ => None,
+        }
+    }
+
     /// Fan out a `HookPayload::PreTurn` to every registered handler.
     ///
     /// Returns the concatenation of every handler's
@@ -7365,6 +7374,9 @@ impl TurnRuntime {
             };
             let mut limit_input = ContextLimitInput::new(self.provider.name(), &request_model);
             limit_input.user_override = self.context_window_override_for_model(&request_model);
+            limit_input.provider_live_window = self
+                .provider_live_context_window_for_model(&request_model)
+                .await;
             limit_input.observed_ceiling = observed_ceiling;
             limit_input.models_dev = squeezy_llm::cached_models_dev_view();
             limit_input.effective_percent_override = self

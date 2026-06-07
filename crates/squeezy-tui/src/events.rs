@@ -475,6 +475,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
                     }
+                    app.clear_status_context_request_tokens();
                     let mut message = "cancelled; edit prompt or retry".to_string();
                     if app.last_turn_had_edits {
                         append_edit_recovery_hint(&mut message, app);
@@ -516,6 +517,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
                     }
+                    app.clear_status_context_request_tokens();
                     let mut status = format_error_status(&error);
                     if app.last_turn_had_edits {
                         append_edit_recovery_hint(&mut status, app);

@@ -1898,6 +1898,79 @@ async fn status_line_context_ticks_live_mid_turn() {
 }
 
 #[tokio::test]
+async fn cancelled_turn_clears_live_status_context() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 1_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 100,
+        ..ContextEstimate::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::ContextUsageUpdate {
+        turn_id: TurnId::new(1),
+        input_tokens: 500,
+        context_window_tokens: Some(2_000),
+    })
+    .await
+    .expect("send context update");
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+
+    assert_eq!(used, "ctx 10% used");
+    assert_eq!(app.status_context_input_tokens, None);
+}
+
+#[tokio::test]
+async fn failed_turn_clears_live_status_context() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_window_tokens = 1_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 100,
+        ..ContextEstimate::default()
+    };
+
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::ContextUsageUpdate {
+        turn_id: TurnId::new(1),
+        input_tokens: 500,
+        context_window_tokens: Some(2_000),
+    })
+    .await
+    .expect("send context update");
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: squeezy_core::SqueezyError::Agent("boom".to_string()),
+        session_cost: None,
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let used = status::resolve_status_item(&app, status::StatusLineItem::ContextUsed)
+        .expect("context used");
+
+    assert_eq!(used, "ctx 10% used");
+    assert_eq!(app.status_context_input_tokens, None);
+}
+
+#[tokio::test]
 async fn status_line_cost_not_clobbered_by_no_broker_failure() {
     let mut app = test_app(SessionMode::Build);
     app.cost = CostSnapshot {
