@@ -138,7 +138,18 @@ jobs:
               ;;
           esac
 
-          cargo build --profile dist -p squeezy --target "${{ matrix.target }}"
+          # On Windows also build the elevated-sandbox setup helper; the
+          # squeezy-win-sandbox elevated tier resolves squeezy-sandbox-setup.exe
+          # next to squeezy.exe (helper_materialization), so it must ship in the
+          # archive or `squeezy doctor --sandbox-setup` fails.
+          case "${{ matrix.target }}" in
+            *-windows-msvc)
+              cargo build --profile dist -p squeezy -p squeezy-win-sandbox --target "${{ matrix.target }}"
+              ;;
+            *)
+              cargo build --profile dist -p squeezy --target "${{ matrix.target }}"
+              ;;
+          esac
 
       - name: Smoke-test release binary
         shell: bash
@@ -206,7 +217,9 @@ jobs:
           case "$target" in
             *-windows-*)
               cp "$binary" "dist/package/squeezy.exe"
-              powershell -Command "Compress-Archive -Path dist/package/squeezy.exe -DestinationPath dist/$archive -Force"
+              # Ship the elevated-sandbox setup helper alongside squeezy.exe.
+              cp "$(dirname "$binary")/squeezy-sandbox-setup.exe" "dist/package/squeezy-sandbox-setup.exe"
+              powershell -Command "Compress-Archive -Path dist/package/squeezy.exe,dist/package/squeezy-sandbox-setup.exe -DestinationPath dist/$archive -Force"
               sha=$(powershell -Command "(Get-FileHash -Algorithm SHA256 dist/$archive).Hash.ToLower()")
               printf '%s  %s\n' "$sha" "$archive" > "dist/$archive.sha256"
               ;;
