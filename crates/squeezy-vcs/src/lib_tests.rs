@@ -721,6 +721,48 @@ fn checkpoint_rollback_recreates_deleted_executable_with_mode() {
 
 #[cfg(unix)]
 #[test]
+fn checkpoint_rollback_preserves_hardlinked_regular_files() {
+    let root = temp_repo("checkpoint_hardlink_restore");
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    fs::write(&alpha, "before\n").expect("write alpha");
+    fs::hard_link(&alpha, &beta).expect("hardlink beta");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(&alpha, "after\n").expect("write through hardlink");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    let expected_group = vec!["alpha.txt".to_string(), "beta.txt".to_string()];
+    assert!(
+        record
+            .files
+            .iter()
+            .any(|file| file.before_hardlink_paths.as_ref() == Some(&expected_group))
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback hardlink");
+
+    assert!(rollback.applied);
+    assert!(rollback.conflicts.is_empty());
+    assert_eq!(fs::read_to_string(&alpha).unwrap(), "before\n");
+    assert_eq!(fs::read_to_string(&beta).unwrap(), "before\n");
+    assert!(same_inode(&alpha, &beta).expect("same inode"));
+    assert!(rollback.file_actions.iter().any(|action| {
+        action.action == RollbackFileActionKind::RestoreHardlink
+            && action.path == "beta.txt"
+            && action.verified_after_rollback
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
 fn checkpoint_rollback_restores_chmod_only_change() {
     use std::os::unix::fs::PermissionsExt;
 

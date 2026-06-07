@@ -17,8 +17,9 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `group_id` — the agent turn that produced the write. Every record
   emitted while handling one user turn shares this value.
 - `tool_name`, `call_id`, `status`, `before_tree`, `after_tree`, per-file
-  `before_sha256` / `after_sha256`, POSIX file type, Git mode, and symlink
-  targets when the tree entry is a symlink.
+  `before_sha256` / `after_sha256`, POSIX file type, Git mode, symlink
+  targets when the tree entry is a symlink, and Unix hardlink peer paths when a
+  changed regular file belongs to a link group.
 - `files`, `skipped_files`, `summary`, `coverage_warnings`, and
   `created_at_ms`.
 
@@ -73,9 +74,15 @@ fsync. Git executable modes are reapplied from the before tree. Symlink entries
 are restored as symlinks from the Git symlink blob instead of by writing the
 target text into a regular file, and conflict preflight hashes the symlink
 target without following it. Deletes unlink the workspace entry itself and
-refuse to remove directories. The rollback receipt includes a per-file
-`file_actions` list with `restore_regular`, `restore_symlink`, or `delete`,
-the mode/file type when relevant, and a `verified_after_rollback` boolean.
+refuse to remove directories. Hardlinked regular files are restored to the
+before snapshot and then relinked so the recorded link group shares one inode;
+unchanged peers are preflighted before relinking so rollback does not overwrite
+user edits made after the checkpoint. The rollback receipt includes a per-file
+`file_actions` list with `restore_regular`, `restore_symlink`,
+`restore_hardlink`, or `delete`, the mode/file type when relevant, and a
+`verified_after_rollback` boolean. Restores fail if post-rollback verification
+does not match the expected content hash, file type, Git mode, or hardlink
+identity.
 
 Checkpoint coverage is explicit. Files that exceed the checkpoint size limit
 are reported in `skipped_files` and add a coverage warning; rollback will not

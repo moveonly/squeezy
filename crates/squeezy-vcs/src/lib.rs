@@ -82,6 +82,7 @@ pub struct CheckpointStore {
 pub struct WorkspaceSnapshot {
     pub tree: String,
     pub large_files: Vec<LargeFileFingerprint>,
+    pub hardlinks: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +233,10 @@ pub struct CheckpointFile {
     pub before_symlink_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_hardlink_paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_hardlink_paths: Option<Vec<String>>,
     pub before_sha256: Option<String>,
     pub after_sha256: Option<String>,
     pub additions: u64,
@@ -356,6 +361,7 @@ pub struct RollbackFileAction {
 pub enum RollbackFileActionKind {
     RestoreRegular,
     RestoreSymlink,
+    RestoreHardlink,
     Delete,
 }
 
@@ -972,9 +978,14 @@ impl CheckpointStore {
             rm_args.extend(large_files.iter().map(|file| file.path.clone()));
             let _ = self.git_vec(rm_args);
         }
+        let hardlinks = self.hardlink_groups()?;
         let output = self.git(["write-tree"])?;
         let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(WorkspaceSnapshot { tree, large_files })
+        Ok(WorkspaceSnapshot {
+            tree,
+            large_files,
+            hardlinks,
+        })
     }
 
     pub fn create_checkpoint(
@@ -994,6 +1005,8 @@ impl CheckpointStore {
         let (files, skipped_files) = self.checkpoint_files(
             &before.tree,
             &after.tree,
+            &before.hardlinks,
+            &after.hardlinks,
             &after.large_files,
             &changed_large_paths,
         )?;
@@ -1191,6 +1204,8 @@ impl CheckpointStore {
         &self,
         before_tree: &str,
         after_tree: &str,
+        before_hardlinks: &BTreeMap<String, Vec<String>>,
+        after_hardlinks: &BTreeMap<String, Vec<String>>,
         large_after: &[LargeFileFingerprint],
         changed_large_paths: &[String],
     ) -> Result<(Vec<CheckpointFile>, Vec<SkippedCheckpointFile>)> {
@@ -1305,6 +1320,8 @@ impl CheckpointStore {
                     .filter(|entry| entry.is_symlink())
                     .and(after.as_deref())
                     .map(symlink_target_display),
+                before_hardlink_paths: hardlink_paths_for(before_hardlinks, before_lookup),
+                after_hardlink_paths: hardlink_paths_for(after_hardlinks, &path),
                 before_sha256: before.as_deref().map(sha256_hex),
                 after_sha256: after.as_deref().map(sha256_hex),
                 additions: stat.additions,
@@ -1332,6 +1349,15 @@ impl CheckpointStore {
     fn preflight_conflicts(&self, records: &[CheckpointRecord]) -> Result<Vec<RollbackConflict>> {
         let mut conflicts = Vec::new();
         let mut virtual_states = BTreeMap::<String, WorkspaceEntryState>::new();
+        let mut planned_paths = BTreeSet::new();
+        for record in records {
+            for file in &record.files {
+                planned_paths.insert(file.path.clone());
+                if let Some(from_path) = file.from_path.as_deref() {
+                    planned_paths.insert(from_path.to_string());
+                }
+            }
+        }
         for record in records {
             for file in &record.files {
                 let path = safe_workspace_path(&self.root, &file.path)?;
@@ -1346,6 +1372,10 @@ impl CheckpointStore {
                 if let Some(conflict) =
                     self.rollback_conflict(record, file, &file.path, &current_state)?
                 {
+                    conflicts.push(conflict);
+                    continue;
+                }
+                if let Some(conflict) = self.hardlink_peer_conflict(record, file, &planned_paths)? {
                     conflicts.push(conflict);
                     continue;
                 }
@@ -1378,6 +1408,40 @@ impl CheckpointStore {
             }
         }
         Ok(conflicts)
+    }
+
+    fn hardlink_peer_conflict(
+        &self,
+        record: &CheckpointRecord,
+        file: &CheckpointFile,
+        planned_paths: &BTreeSet<String>,
+    ) -> Result<Option<RollbackConflict>> {
+        let Some(group) = file.before_hardlink_paths.as_ref() else {
+            return Ok(None);
+        };
+        let expected = file.before_entry_state();
+        for peer in group {
+            if peer == &file.path || file.from_path.as_deref() == Some(peer.as_str()) {
+                continue;
+            }
+            if planned_paths.contains(peer) {
+                continue;
+            }
+            let peer_path = safe_workspace_path(&self.root, peer)?;
+            let current = workspace_entry_state(&peer_path)?;
+            if current != expected {
+                return Ok(Some(RollbackConflict {
+                    checkpoint_id: record.id.clone(),
+                    path: file.path.clone(),
+                    expected_sha256: expected.sha256.clone(),
+                    current_sha256: current.sha256,
+                    reason: format!(
+                        "hardlink peer {peer} changed after checkpoint; leaving current content untouched"
+                    ),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     fn rollback_record(
@@ -1432,6 +1496,72 @@ impl CheckpointStore {
                     mode: None,
                     file_type: None,
                     verified_after_rollback: !path_exists_no_follow(&path),
+                });
+            }
+        }
+        self.restore_record_hardlinks(record, result)?;
+        Ok(())
+    }
+
+    fn restore_record_hardlinks(
+        &self,
+        record: &CheckpointRecord,
+        result: &mut RollbackResult,
+    ) -> Result<()> {
+        let mut groups = BTreeSet::<Vec<String>>::new();
+        for file in &record.files {
+            if rollback_file_has_conflict(result, record, file) {
+                continue;
+            }
+            if let Some(group) = file.before_hardlink_paths.as_ref()
+                && group.len() > 1
+            {
+                groups.insert(group.clone());
+            }
+        }
+
+        for group in groups {
+            for rel in &group {
+                let Some(entry) = self.tree_entry(&record.before_tree, rel)? else {
+                    continue;
+                };
+                if entry.object_type != "blob" || entry.is_symlink() {
+                    continue;
+                }
+                let path = safe_workspace_path(&self.root, rel)?;
+                let bytes = self.blob_bytes(&record.before_tree, rel).map_err(|err| {
+                    SqueezyError::Tool(format!("checkpoint object for {rel} is missing: {err}"))
+                })?;
+                let expected = WorkspaceEntryState {
+                    sha256: Some(sha256_hex(&bytes)),
+                    file_type: Some(entry.checkpoint_file_type()),
+                    mode: Some(entry.mode),
+                };
+                if workspace_entry_state(&path)? != expected
+                    && let Some(action) = self.restore_tree_path(&record.before_tree, rel)?
+                {
+                    result.restored_files.push(rel.clone());
+                    result.file_actions.push(RollbackFileAction {
+                        checkpoint_id: record.id.clone(),
+                        ..action
+                    });
+                }
+            }
+
+            let relinked = restore_hardlink_group(&self.root, &group)?;
+            for rel in relinked {
+                let Some(entry) = self.tree_entry(&record.before_tree, &rel)? else {
+                    continue;
+                };
+                let file_type = entry.checkpoint_file_type();
+                let mode = entry.mode;
+                result.file_actions.push(RollbackFileAction {
+                    checkpoint_id: record.id.clone(),
+                    path: rel,
+                    action: RollbackFileActionKind::RestoreHardlink,
+                    mode: Some(mode),
+                    file_type: Some(file_type),
+                    verified_after_rollback: verify_hardlink_group(&self.root, &group)?,
                 });
             }
         }
@@ -1528,7 +1658,15 @@ impl CheckpointStore {
             action,
             mode: Some(entry.mode),
             file_type: Some(file_type),
-            verified_after_rollback: workspace_entry_hash(&path)? == Some(sha256_hex(&bytes)),
+            verified_after_rollback: verify_restored_entry(
+                rel,
+                &path,
+                &WorkspaceEntryState {
+                    sha256: Some(sha256_hex(&bytes)),
+                    file_type: Some(file_type),
+                    mode: Some(entry.mode),
+                },
+            )?,
         }))
     }
 
@@ -1624,6 +1762,56 @@ impl CheckpointStore {
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
+    }
+
+    #[cfg(unix)]
+    fn hardlink_groups(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let output = self.git_vec(vec![
+            "ls-files".to_string(),
+            "-z".to_string(),
+            "--cached".to_string(),
+            "--others".to_string(),
+            "--exclude-standard".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).squeezy".to_string(),
+        ])?;
+        let mut by_inode = BTreeMap::<(u64, u64), Vec<String>>::new();
+        for rel in nul_fields(&output.stdout) {
+            if rel.is_empty() || rel == ".squeezy" || rel.starts_with(".squeezy/") {
+                continue;
+            }
+            let path = safe_workspace_path(&self.root, &rel)?;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_file() && metadata.nlink() > 1 {
+                by_inode
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_default()
+                    .push(rel);
+            }
+        }
+
+        let mut by_path = BTreeMap::new();
+        for mut paths in by_inode.into_values() {
+            paths.sort();
+            paths.dedup();
+            if paths.len() < 2 {
+                continue;
+            }
+            for path in &paths {
+                by_path.insert(path.clone(), paths.clone());
+            }
+        }
+        Ok(by_path)
+    }
+
+    #[cfg(not(unix))]
+    fn hardlink_groups(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        Ok(BTreeMap::new())
     }
 
     fn protect_checkpoint_trees(&self, record: &CheckpointRecord) -> Result<()> {
@@ -1879,8 +2067,19 @@ fn parse_tree_entry(output: &[u8]) -> Result<Option<TreeEntry>> {
     }))
 }
 
-fn workspace_entry_hash(path: &Path) -> Result<Option<String>> {
-    Ok(workspace_entry_state(path)?.sha256)
+fn hardlink_paths_for(groups: &BTreeMap<String, Vec<String>>, path: &str) -> Option<Vec<String>> {
+    groups.get(path).filter(|paths| paths.len() > 1).cloned()
+}
+
+fn verify_restored_entry(rel: &str, path: &Path, expected: &WorkspaceEntryState) -> Result<bool> {
+    let actual = workspace_entry_state(path)?;
+    if &actual != expected {
+        return Err(SqueezyError::Tool(format!(
+            "checkpoint rollback verification failed for {rel}: expected {:?}, got {:?}",
+            expected, actual
+        )));
+    }
+    Ok(true)
 }
 
 fn workspace_entry_state(path: &Path) -> Result<WorkspaceEntryState> {
@@ -2045,6 +2244,79 @@ fn remove_workspace_file(path: &Path) -> Result<bool> {
     fs::remove_file(path)?;
     sync_parent_dir(path);
     Ok(true)
+}
+
+#[cfg(unix)]
+fn restore_hardlink_group(root: &Path, group: &[String]) -> Result<Vec<String>> {
+    let Some(source_rel) = group.first() else {
+        return Ok(Vec::new());
+    };
+    let source = safe_workspace_path(root, source_rel)?;
+    let mut relinked = Vec::new();
+    for rel in group.iter().skip(1) {
+        let target = safe_workspace_path(root, rel)?;
+        if same_inode(&source, &target)? {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if path_exists_no_follow(&target) {
+            remove_workspace_file(&target)?;
+        }
+        fs::hard_link(&source, &target)?;
+        sync_parent_dir(&target);
+        relinked.push(rel.clone());
+    }
+    if !verify_hardlink_group(root, group)? {
+        return Err(SqueezyError::Tool(format!(
+            "checkpoint rollback hardlink verification failed for {:?}",
+            group
+        )));
+    }
+    Ok(relinked)
+}
+
+#[cfg(not(unix))]
+fn restore_hardlink_group(_root: &Path, _group: &[String]) -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn verify_hardlink_group(root: &Path, group: &[String]) -> Result<bool> {
+    let Some(first) = group.first() else {
+        return Ok(true);
+    };
+    let first_path = safe_workspace_path(root, first)?;
+    for rel in group.iter().skip(1) {
+        let path = safe_workspace_path(root, rel)?;
+        if !same_inode(&first_path, &path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn verify_hardlink_group(_root: &Path, _group: &[String]) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn same_inode(left: &Path, right: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = match fs::symlink_metadata(left) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let right = match fs::symlink_metadata(right) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
 fn rollback_file_has_conflict(
