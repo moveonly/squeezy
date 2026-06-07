@@ -1,6 +1,7 @@
 use super::*;
 use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport, ProviderSettings};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 // env::set_var/remove_var is process-global; serialize these tests so a parallel
@@ -356,6 +357,38 @@ fn state_store_check_opens_redb_in_tempdir() {
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("opened"));
+}
+
+#[test]
+fn graph_store_check_opens_redb_in_tempdir() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-graph-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    let check = graph_store_check(&config);
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("graph.redb"));
+}
+
+#[test]
+fn user_global_storage_warns_for_synced_workspace_with_default_cache() {
+    let mut config = AppConfig::from_env();
+    config.workspace_root = PathBuf::from(r"C:\Users\dev\OneDrive\repo");
+    config.cache.root = None;
+    let check = user_global_storage_check(&config);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(check.detail.contains("synced folder"));
+    assert!(check.detail.contains("[cache].root"));
 }
 
 #[test]

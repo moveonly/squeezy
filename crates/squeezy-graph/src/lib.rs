@@ -2096,9 +2096,19 @@ impl GraphManager {
         cache_root: Option<PathBuf>,
     ) -> Result<Self> {
         let root_path = root.as_ref().to_path_buf();
-        let store = GraphStore::open(&root_path, cache_root.as_deref())
-            .ok()
-            .map(Arc::new);
+        let store = match GraphStore::open(&root_path, cache_root.as_deref()) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                let cache_dir = squeezy_store::cache_dir_path(&root_path, cache_root.as_deref());
+                tracing::warn!(
+                    target: "squeezy::graph",
+                    cache_dir = %cache_dir.display(),
+                    error = %error,
+                    "graph persistence disabled after graph.redb open failed",
+                );
+                None
+            }
+        };
         Self::open_with_optional_store(root_path, config, crawl_options, store)
     }
 

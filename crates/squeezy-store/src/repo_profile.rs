@@ -13,6 +13,8 @@ use squeezy_workspace::{
     CrawlOptions, ExclusionReason, IndexingPolicy, WorkspaceCrawler, WorkspaceSnapshot,
 };
 
+use crate::fs_util;
+
 pub const REPO_REGISTRY_VERSION: u32 = 1;
 
 const MARKER_FILES: &[&str] = &[
@@ -106,15 +108,7 @@ impl RepoRegistry {
         {
             fs::create_dir_all(parent)?;
         }
-        let temp_path = path.with_file_name(format!(
-            ".{}.{}.tmp",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("repos.toml"),
-            std::process::id()
-        ));
-        fs::write(&temp_path, self.to_toml())?;
-        fs::rename(&temp_path, path)?;
+        fs_util::write_bytes_atomically(path, self.to_toml().as_bytes())?;
         Ok(())
     }
 

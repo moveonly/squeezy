@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -563,10 +562,7 @@ fn write_checksum(field: &mut [u8], value: u64) {
 
 fn random_uuid_like() -> String {
     let mut bytes = [0u8; 16];
-    if fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_err()
-    {
+    if getrandom::fill(&mut bytes).is_err() {
         let fallback = now_ms().to_le_bytes();
         bytes[..fallback.len()].copy_from_slice(&fallback);
     }

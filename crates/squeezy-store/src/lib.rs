@@ -16,6 +16,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -23,11 +24,13 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError};
 
+mod fs_util;
 pub mod migrations;
 pub mod repo_profile;
 pub mod reports;
 pub mod sessions;
 
+pub use fs_util::user_squeezy_dir_detail;
 pub use migrations::{
     Migration, MigrationRegistry, default_registry, run_migrations, run_registry,
 };
@@ -83,6 +86,7 @@ pub fn crate_name() -> &'static str {
 pub struct SqueezyStore {
     path: PathBuf,
     database: Database,
+    graph_store: Mutex<Option<Arc<GraphStore>>>,
 }
 
 #[derive(Debug)]
@@ -100,7 +104,7 @@ impl SqueezyStore {
         }
         if oversized_state_needs_fast_rotate(&path)? {
             let backup = backup_path_with_label(&path, "oversized-state");
-            fs::rename(&path, &backup)?;
+            fs_util::rotate_file(&path, &backup)?;
             bootstrap_store(workspace_root, cache_root)?;
             tracing::warn!(
                 target: "squeezy::store",
@@ -109,7 +113,11 @@ impl SqueezyStore {
                 "state.redb exceeded the split-cache threshold; existing cache backed up without opening redb",
             );
             let database = open_database(&path)?;
-            return Ok(Self { path, database });
+            return Ok(Self {
+                path,
+                database,
+                graph_store: Mutex::new(None),
+            });
         }
         let initial = open_database(&path)?;
         // Three cases:
@@ -124,7 +132,7 @@ impl SqueezyStore {
             Some(on_disk_version) => {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
-                fs::rename(&path, &backup)?;
+                fs_util::rotate_file(&path, &backup)?;
                 bootstrap_store(workspace_root, cache_root)?;
                 copy_state_tables(&backup, &path)?;
                 tracing::warn!(
@@ -142,7 +150,11 @@ impl SqueezyStore {
                 open_database(&path)?
             }
         };
-        Ok(Self { path, database })
+        Ok(Self {
+            path,
+            database,
+            graph_store: Mutex::new(None),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -538,8 +550,19 @@ impl SqueezyStore {
         self.database.begin_write().map_err(store_error)
     }
 
-    fn graph_store(&self) -> Result<GraphStore> {
-        GraphStore::open_path(self.path.with_file_name(GRAPH_FILE_NAME))
+    fn graph_store(&self) -> Result<Arc<GraphStore>> {
+        let mut cached = self
+            .graph_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(store) = cached.as_ref() {
+            return Ok(Arc::clone(store));
+        }
+        let store = Arc::new(GraphStore::open_path(
+            self.path.with_file_name(GRAPH_FILE_NAME),
+        )?);
+        *cached = Some(Arc::clone(&store));
+        Ok(store)
     }
 }
 
@@ -560,7 +583,7 @@ impl GraphStore {
             Some(on_disk_version) => {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
-                fs::rename(&path, &backup)?;
+                fs_util::rotate_file(&path, &backup)?;
                 tracing::warn!(
                     target: "squeezy::store",
                     on_disk_version,
@@ -911,6 +934,7 @@ pub struct CacheDiagnostics {
 pub struct CachePruneReport {
     pub removed_files: Vec<CacheFileReport>,
     pub removed_bytes: u64,
+    pub failed_files: Vec<(PathBuf, String)>,
 }
 
 pub fn cache_diagnostics(
@@ -938,20 +962,22 @@ pub fn prune_cache_backups(
 ) -> Result<CachePruneReport> {
     let diagnostics = cache_diagnostics(workspace_root, cache_root)?;
     let mut removed_files = Vec::new();
+    let mut failed_files = Vec::new();
     let mut removed_bytes = 0;
     for backup in diagnostics.backups {
-        match fs::remove_file(&backup.path) {
+        match fs_util::remove_file(&backup.path) {
             Ok(()) => {
                 removed_bytes += backup.size_bytes;
                 removed_files.push(backup);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+            Err(SqueezyError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failed_files.push((backup.path.clone(), err.to_string())),
         }
     }
     Ok(CachePruneReport {
         removed_files,
         removed_bytes,
+        failed_files,
     })
 }
 
@@ -1176,7 +1202,10 @@ fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
 }
 
 fn store_error(error: impl std::fmt::Display) -> SqueezyError {
-    SqueezyError::Tool(format!("store error: {error}"))
+    SqueezyError::Tool(format!(
+        "store error: {}",
+        fs_util::windows_storage_hint(&error)
+    ))
 }
 
 fn receipt_key(tool_name: &str, stable_output_sha256: &str) -> String {

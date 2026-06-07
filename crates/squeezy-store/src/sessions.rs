@@ -14,6 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -21,6 +22,8 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload,
     ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
 };
+
+use crate::fs_util;
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -131,15 +134,13 @@ impl SessionStore {
         write_json(&self.calibration_path(), calibration)
     }
 
-    /// Path to the user-global memory file. Returns `None` when `HOME` is
-    /// unset — the same condition under which the agent's prompt-side
-    /// ingestion (`ingest_user_memory`) declines to do anything. The file
-    /// itself is the single static memory store described in
+    /// Path to the user-global memory file. Uses `HOME/.squeezy` when
+    /// available and falls back to native Windows profile/app-data roots when
+    /// `HOME` is unset. The file itself is the single static memory store described in
     /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
     /// new directory or partition scheme.
     pub fn memory_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+        Some(fs_util::user_squeezy_dir()?.join("memory.md"))
     }
 
     /// Append one normalized line to the user-global memory file
@@ -159,9 +160,10 @@ impl SessionStore {
             return Ok(0);
         }
         let Some(path) = Self::memory_path() else {
-            return Err(SqueezyError::Agent(
-                "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
-            ));
+            return Err(SqueezyError::Agent(format!(
+                "remember requires a user profile directory to be set ({})",
+                fs_util::user_squeezy_dir_detail()
+            )));
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -188,8 +190,8 @@ impl SessionStore {
     /// Matches the semantics of the agent's prompt-side
     /// `ingest_user_memory` so call sites can rely on a single source of
     /// truth for the recall shape. Returns `None` when ingestion is
-    /// disabled (`max_bytes == 0`), `HOME` is unset, or the file is
-    /// absent / empty / unreadable. Errors are silent on purpose — recall
+    /// disabled (`max_bytes == 0`), no user-global directory can be resolved,
+    /// or the file is absent / empty / unreadable. Errors are silent on purpose — recall
     /// is best-effort enrichment, never load-bearing.
     pub fn recall(max_bytes: usize) -> Option<String> {
         if max_bytes == 0 {
@@ -214,16 +216,12 @@ impl SessionStore {
     }
 
     /// Path to the cross-project session index, an append-only JSONL file
-    /// at `~/.squeezy/sessions/index.jsonl`. Per-project session roots
+    /// under the user-global Squeezy directory. Per-project session roots
     /// live under each workspace, so a global index is the only way the
     /// resume picker can show sessions started from sibling repos.
-    /// Returns `None` when `HOME` is unset — same condition under which
-    /// the user-global memory file declines to operate.
     pub fn global_index_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
         Some(
-            PathBuf::from(home)
-                .join(".squeezy")
+            fs_util::user_squeezy_dir()?
                 .join("sessions")
                 .join("index.jsonl"),
         )
@@ -245,10 +243,8 @@ impl SessionStore {
             return;
         };
         payload.push(b'\n');
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
-            return;
-        };
-        let _ = file.write_all(&payload);
+        let mut ignored_size = 0;
+        let _ = append_payload_with_recovery(&path, &payload, &mut ignored_size);
     }
 
     /// Read the cross-project session index, deduping by `session_id` and
@@ -560,7 +556,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        fs::rename(&src, &dest)?;
+        fs_util::move_path(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -593,7 +589,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        fs::rename(&src, &dest)?;
+        fs_util::move_path(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -1266,21 +1262,30 @@ fn append_payload_once(
         .append(true)
         .open(path)
         .map_err(|error| (0, error))?;
+    file.lock_exclusive().map_err(|error| (0, error))?;
     let mut written = 0;
-    while written < payload.len() {
-        match file.write(&payload[written..]) {
-            Ok(0) => {
-                return Err((
-                    written,
-                    std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
-                ));
+    let result = (|| {
+        while written < payload.len() {
+            match file.write(&payload[written..]) {
+                Ok(0) => {
+                    return Err((
+                        written,
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
+                    ));
+                }
+                Ok(bytes) => written += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err((written, error)),
             }
-            Ok(bytes) => written += bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err((written, error)),
         }
+        Ok(written)
+    })();
+    if let Err(error) = file.unlock()
+        && result.is_ok()
+    {
+        return Err((written, error));
     }
-    Ok(written)
+    result
 }
 
 fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
@@ -1570,8 +1575,8 @@ impl SessionHandle {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(&payload)?;
+        let mut tracked_size = current_size;
+        append_payload_with_recovery(&path, &payload, &mut tracked_size)?;
         Ok(())
     }
 
@@ -2812,45 +2817,22 @@ fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
 }
 
 /// Serialize `value` to `path` atomically: write to a sibling temp file,
-/// `sync_all`, then `fs::rename` over the target. A reader (and a crash)
+/// `sync_all`, then replace the target. A reader (and a crash)
 /// therefore only ever observes the previous complete file or the new
 /// complete file, never a truncated/torn one. This matters because
 /// `metadata.json` is rewritten on essentially every turn; a non-atomic
 /// in-place write left a torn metadata file that silently hid an
 /// otherwise-recoverable session from `list()`/`resume()`. Mirrors the
-/// tmp + `sync_all` + `rename` pattern in [`rewrite_global_index`].
+/// tmp + `sync_all` + replace pattern in [`rewrite_global_index`].
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    // Per-pid temp name so concurrent writers to the same path don't
-    // clobber each other's in-flight temp file before the rename.
-    let tmp = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
-        None => path.with_extension("tmp"),
-    };
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    Ok(())
+    fs_util::write_json_atomically(path, value)
 }
 
 /// Heuristic guard for [`SessionStore::record_global_index`].
 ///
 /// Returns `true` only when the workspace_root resolves under the system
-/// temp directory AND `HOME` does not. That combination is overwhelmingly
-/// a `cargo test` setup that created its session store via
+/// temp directory AND the user-global Squeezy directory does not. That
+/// combination is overwhelmingly a `cargo test` setup that created its session store via
 /// `temp_root(..)` but never redirected `HOME` to a test sandbox — i.e.
 /// the test is not exercising the global index and a write would pollute
 /// the developer's real `~/.squeezy/sessions/index.jsonl`.
@@ -2871,11 +2853,11 @@ fn skip_global_index_for_test_workspace(workspace_root: &str) -> bool {
     if !workspace_under_temp {
         return false;
     }
-    let home_under_temp = env::var_os("HOME")
-        .and_then(|home| Path::new(&home).canonicalize().ok())
+    let user_global_under_temp = fs_util::user_squeezy_dir()
+        .and_then(|path| path.canonicalize().ok())
         .map(|canonical| canonical.starts_with(&temp_dir))
         .unwrap_or(false);
-    !home_under_temp
+    !user_global_under_temp
 }
 
 fn global_index_cache() -> &'static StdMutex<Option<GlobalIndexCache>> {
@@ -2919,20 +2901,16 @@ fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
 }
 
 /// Replace the global session index file with the supplied entries via a
-/// tmp + rename so concurrent readers never see a half-written file. The
+/// unique tmp + replace so concurrent readers never see a half-written file. The
 /// caller chooses the iteration order; readers re-sort by
 /// `started_at_ms`.
 fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
+    let tmp = fs_util::unique_temp_path(path);
     {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
+        let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
         for entry in entries {
             let mut payload = match serde_json::to_vec(entry) {
                 Ok(payload) => payload,
@@ -2943,7 +2921,11 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         }
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    if let Err(error) = fs_util::replace_file(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

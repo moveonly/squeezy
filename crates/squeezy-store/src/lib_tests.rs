@@ -7,7 +7,7 @@ use squeezy_core::FileId;
 
 use crate::{
     CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
-    SqueezyStore, graph_path, sessions::ResumeItem, state_path,
+    SqueezyStore, fs_util, graph_path, sessions::ResumeItem, state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -38,6 +38,45 @@ fn open_graph_store(label: &str) -> (PathBuf, GraphStore) {
     let root = temp_root(label);
     let store = GraphStore::open(&root, None).expect("open graph store");
     (root, store)
+}
+
+#[test]
+fn atomic_write_replaces_existing_file() {
+    let root = temp_root("atomic-replace-existing");
+    let path = root.join("metadata.json");
+    fs_util::write_bytes_atomically(&path, br#"{"value":"first"}"#).expect("first write");
+    fs_util::write_bytes_atomically(&path, br#"{"value":"second"}"#).expect("replace write");
+    let body = std::fs::read_to_string(&path).expect("read replaced file");
+    assert_eq!(body, r#"{"value":"second"}"#);
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .expect("read temp root")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".tmp"))
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn squeezy_store_reuses_lazy_graph_store_handle() {
+    let (root, store) = open_store("lazy-graph-handle");
+    let file_id = FileId("src/lib.rs".to_string());
+    store
+        .put_graph_partition(&file_id, &json!({ "symbols": ["one"] }))
+        .expect("first graph write");
+    store
+        .put_graph_partition(&file_id, &json!({ "symbols": ["two"] }))
+        .expect("second graph write through cached handle");
+    let stored: serde_json::Value = store
+        .graph_partition(&file_id)
+        .expect("read graph partition")
+        .expect("partition exists");
+    assert_eq!(stored["symbols"][0], "two");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 fn sample_checkpoint(replacement_id: &str, created: u128) -> CompactionCheckpoint {

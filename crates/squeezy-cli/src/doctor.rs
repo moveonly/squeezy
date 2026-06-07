@@ -10,7 +10,8 @@ use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
 };
 use squeezy_store::{
-    SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
+    GraphStore, SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile,
+    prune_cache_backups, user_squeezy_dir_detail,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use tokio_util::sync::CancellationToken;
@@ -232,7 +233,9 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         }
         checks.push(skills_check(config));
         checks.push(session_store_check(config));
+        checks.push(user_global_storage_check(config));
         checks.push(state_store_check(config));
+        checks.push(graph_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
     }
 
@@ -439,6 +442,54 @@ fn state_store_check(config: &AppConfig) -> Check {
     }
 }
 
+fn graph_store_check(config: &AppConfig) -> Check {
+    match GraphStore::open(&config.workspace_root, config.cache.root.as_deref()) {
+        Ok(store) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Ok,
+            detail: format!("opened: {}", store.path().display()),
+        },
+        Err(error) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "{error}; graph persistence will be disabled until graph.redb can be opened"
+            ),
+        },
+    }
+}
+
+fn user_global_storage_check(config: &AppConfig) -> Check {
+    let mut detail = user_squeezy_dir_detail();
+    if cfg!(windows) && env::var_os("HOME").is_none() {
+        detail.push_str(
+            "; HOME is unset, using native Windows profile/app-data fallback if available",
+        );
+    }
+    if workspace_looks_synced(&config.workspace_root) && config.cache.root.is_none() {
+        detail.push_str(
+            "; workspace appears to be under a synced folder, consider a short local [cache].root",
+        );
+        return Check {
+            name: "user_global_storage".to_string(),
+            status: Status::Warn,
+            detail,
+        };
+    }
+    Check {
+        name: "user_global_storage".to_string(),
+        status: Status::Ok,
+        detail,
+    }
+}
+
+fn workspace_looks_synced(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        name.contains("onedrive") || name.contains("dropbox")
+    })
+}
+
 fn cache_check(config: &AppConfig, prune: bool) -> Check {
     let diagnostics = match cache_diagnostics(&config.workspace_root, config.cache.root.as_deref())
     {
@@ -480,8 +531,19 @@ fn cache_check(config: &AppConfig, prune: bool) -> Check {
                     report.removed_files.len(),
                     format_bytes(report.removed_bytes)
                 ));
+                if !report.failed_files.is_empty() {
+                    status = Status::Warn;
+                    let failed = report
+                        .failed_files
+                        .iter()
+                        .map(|(path, error)| format!("{} ({error})", path.display()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    detail.push_str(&format!("; failed to prune: {failed}"));
+                }
                 if diagnostics.state.size_bytes <= STATE_CACHE_WARN_BYTES
                     && diagnostics.graph.size_bytes <= GRAPH_CACHE_WARN_BYTES
+                    && report.failed_files.is_empty()
                 {
                     status = Status::Ok;
                 }
