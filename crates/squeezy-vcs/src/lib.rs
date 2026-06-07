@@ -1360,7 +1360,14 @@ impl CheckpointStore {
         let rolled_back = journal
             .rollbacks
             .iter()
-            .filter(|rollback| rollback.result.applied && rollback.result.conflicts.is_empty())
+            .filter(|rollback| {
+                // A rollback that applied at least one file with no conflicts is fully consumed.
+                // A rollback where all checkpoint files were skipped (planned_files == 0) is also
+                // consumed: the files were too large to store, so subsequent Latest selections
+                // would loop forever returning 0 restored/deleted rather than moving on.
+                (rollback.result.applied || rollback.result.planned_files == 0)
+                    && rollback.result.conflicts.is_empty()
+            })
             .flat_map(|rollback| rollback.result.checkpoint_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
         let records = journal.checkpoints;
@@ -1755,7 +1762,7 @@ impl CheckpointStore {
                 path: from_path.clone(),
                 expected_sha256: None,
                 current_sha256,
-                reason: "file changed after checkpoint; leaving current content untouched"
+                reason: "file exists at rename source path; rollback would overwrite it"
                     .to_string(),
             }));
         }

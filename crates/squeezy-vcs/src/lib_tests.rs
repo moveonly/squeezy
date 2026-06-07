@@ -694,6 +694,45 @@ fn large_files_are_reported_as_skipped_and_not_restored() {
 }
 
 #[test]
+fn repeated_latest_rollback_skips_after_all_files_are_large_skipped() {
+    let root = temp_repo("checkpoint_large_consumed");
+    let store = CheckpointStore::open_with_options(
+        &root,
+        CheckpointStoreOptions {
+            max_file_bytes: 4,
+            cleanup_interval_secs: 0,
+            ..CheckpointStoreOptions::default()
+        },
+    )
+    .expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+    fs::write(root.join("big.txt"), "12345").expect("write over custom limit");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert!(record.files.is_empty(), "all files should be skipped");
+
+    // First rollback: nothing to restore, applied=false
+    let first = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("first rollback");
+    assert!(!first.applied);
+    assert!(first.conflicts.is_empty());
+
+    // Second rollback: checkpoint is now consumed, returns nothing-to-undo
+    let second = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("second rollback");
+    assert!(
+        second.skipped,
+        "second undo should find no unreverted checkpoint after all-skipped attempt"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn binary_files_restore_without_patch_text() {
     let root = temp_repo("checkpoint_binary");
     fs::write(root.join("image.bin"), [0, 159, 146, 150]).expect("write binary");
