@@ -37,7 +37,7 @@ fn collects_identity_file_paths() {
         "config itself should be present"
     );
     assert!(
-        result.iter().any(|p| p.ends_with(".keys/id_ed25519")),
+        result.contains(&key_file),
         "IdentityFile should be collected; got {result:?}"
     );
 
@@ -61,7 +61,7 @@ fn missing_config_returns_config_path_only() {
 
     // Should contain just the config path even when it doesn't exist.
     assert_eq!(result.len(), 1);
-    assert!(result[0].ends_with(".ssh/config"));
+    assert_eq!(result[0], home.join(".ssh").join("config"));
 
     cleanup(&tmp);
 }
@@ -85,11 +85,11 @@ fn recursively_follows_include_directives() {
     let result = ssh_config_dependency_paths(Some(&home));
 
     assert!(
-        result.iter().any(|p| p.ends_with("devbox.conf")),
+        result.contains(&conf_d.join("devbox.conf")),
         "included file should be collected; got {result:?}"
     );
     assert!(
-        result.iter().any(|p| p.ends_with(".included_key")),
+        result.contains(&key),
         "IdentityFile from included config should be collected; got {result:?}"
     );
 
