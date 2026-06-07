@@ -1251,9 +1251,15 @@ fn shadow_repo_open_rejects_concurrent_process_lock() {
         message.contains("shadow-repo lock"),
         "expected lock-held error, got: {message}"
     );
+    // On Unix, the lock-file body is readable while the lock is held (advisory
+    // locks don't block reads), so we expect the pid/timestamp diagnostics.
+    // On Windows, exclusive file locking prevents the second opener from
+    // reading the file, so the implementation falls back to
+    // "holder details unavailable".
+    #[cfg(unix)]
     assert!(
         message.contains("holder pid=") && message.contains("locked_at_ms="),
-        "expected lock-held error to include Linux diagnostics, got: {message}"
+        "expected lock-held error to include Unix diagnostics, got: {message}"
     );
 
     drop(first);
