@@ -1352,7 +1352,7 @@ fn classify_filesystem(fs_type: &str) -> StorageMountClassification {
         "nfs" | "nfs4" | "cifs" | "smb" | "smb2" | "smb3" | "sshfs" | "9p" | "afs" | "ceph"
         | "glusterfs" | "davfs" => StorageMountClassification::Network,
         "fuse" | "fuseblk" | "fuse.sshfs" | "overlay" | "overlayfs" | "aufs" | "unionfs"
-        | "virtiofs" => StorageMountClassification::Virtual,
+        | "virtiofs" | "proc" => StorageMountClassification::Virtual,
         "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "apfs" | "hfs" | "hfsplus" | "zfs"
         | "tmpfs" | "f2fs" | "ufs" => StorageMountClassification::Local,
         _ => StorageMountClassification::Unknown,

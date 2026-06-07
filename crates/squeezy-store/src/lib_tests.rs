@@ -219,7 +219,8 @@ fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
     let entries = super::parse_linux_mountinfo(
         "31 23 0:27 / / rw,relatime - ext4 /dev/sda1 rw\n\
          32 23 0:28 / /mnt/share rw,relatime - nfs4 server:/share rw\n\
-         33 23 0:29 / /work rw,relatime - overlay overlay rw\n",
+         33 23 0:29 / /work rw,relatime - overlay overlay rw\n\
+         34 23 0:30 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
     );
 
     let nfs = entries
@@ -236,6 +237,14 @@ fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
         .expect("overlay mount");
     assert_eq!(
         super::classify_filesystem(&overlay.fs_type),
+        StorageMountClassification::Virtual
+    );
+    let procfs = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/proc"))
+        .expect("proc mount");
+    assert_eq!(
+        super::classify_filesystem(&procfs.fs_type),
         StorageMountClassification::Virtual
     );
 }
