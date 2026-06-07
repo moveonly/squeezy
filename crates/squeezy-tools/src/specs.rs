@@ -115,6 +115,21 @@ pub(crate) fn checkpoint_list_spec() -> ToolSpec {
     }
 }
 
+pub(crate) fn checkpoint_doctor_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_doctor".to_string(),
+        description: "Run checkpoint diagnostics and smoke validation: shadow Git path/config, gitattributes/eol risk, lock writability, protected-ref create/delete capability, and a temporary CRLF checkpoint/rollback probe.".to_string(),
+        capability: PermissionCapability::Read,
+        parallel_safe: false,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        })),
+        prepare_arguments: None,
+    }
+}
+
 pub(crate) fn checkpoint_undo_spec() -> ToolSpec {
     ToolSpec {
         name: "checkpoint_undo".to_string(),

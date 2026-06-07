@@ -370,7 +370,57 @@ fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
         .expect("rollback latest");
 
     assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(
+        rollback.conflicts[0].reason_code,
+        Some(RollbackConflictReason::WorktreeChanged)
+    );
+    assert_eq!(
+        rollback.conflicts[0].expected_hash_basis.as_deref(),
+        Some("checkpoint worktree byte hash")
+    );
+    assert_eq!(
+        rollback.conflicts[0].current_hash_basis.as_deref(),
+        Some("current worktree byte hash")
+    );
     assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_rollback_restores_raw_crlf_worktree_bytes_despite_gitattributes() {
+    let root = temp_repo("checkpoint_crlf_gitattributes");
+    fs::write(root.join(".gitattributes"), "*.txt text eol=lf\n").expect("write attributes");
+    fs::write(root.join("a.txt"), b"before\r\n").expect("write crlf before");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), b"agent\r\n").expect("agent edit crlf");
+    let record = store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    let file = &record.files[0];
+    assert_ne!(
+        file.after_sha256, file.after_worktree_sha256,
+        "Git blob hash should be normalized while the worktree hash keeps CRLF bytes"
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback latest");
+
+    assert!(rollback.applied);
+    assert!(rollback.conflicts.is_empty());
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"before\r\n");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -888,6 +938,9 @@ fn shadow_repo_open_cleans_stale_orphan_dirs() {
     fs::write(stale_dir.join("payload"), b"old").expect("write orphan payload");
     let stale_lock = checkpoints_dir.join("crashed-process.lock");
     fs::write(&stale_lock, b"99999\n").expect("write stale lock");
+    let raw_blobs = checkpoints_dir.join("raw-blobs");
+    fs::create_dir_all(raw_blobs.join("aa")).expect("create raw blobs dir");
+    fs::write(raw_blobs.join("aa").join("payload"), b"raw").expect("write raw blob");
     let recent_dir = checkpoints_dir.join("recent-scratch");
     fs::create_dir_all(&recent_dir).expect("create recent orphan dir");
 
@@ -923,6 +976,10 @@ fn shadow_repo_open_cleans_stale_orphan_dirs() {
     assert!(
         checkpoints_dir.join("git").exists(),
         "shadow `git/` directory must survive cleanup"
+    );
+    assert!(
+        raw_blobs.exists(),
+        "raw worktree byte blobs are checkpoint data and must survive cleanup"
     );
     drop(store);
 

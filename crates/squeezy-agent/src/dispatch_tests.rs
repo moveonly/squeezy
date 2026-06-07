@@ -319,6 +319,10 @@ fn parse_session_family() {
 #[test]
 fn parse_checkpoint_family() {
     assert_eq!(parse("/checkpoints").unwrap(), DispatchCommand::Checkpoints);
+    assert_eq!(
+        parse("/checkpoints doctor").unwrap(),
+        DispatchCommand::CheckpointsDoctor
+    );
     assert!(matches!(
         parse("/checkpoint").unwrap_err(),
         DispatchCommandParseError::Usage { .. }

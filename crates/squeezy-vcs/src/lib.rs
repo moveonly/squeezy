@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -26,6 +26,7 @@ const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const SHADOW_LOCK_FILENAME: &str = "shadow.lock";
 const SHADOW_STALE_DIR_RETENTION_DAYS: u64 = 14;
+const CHECKPOINT_CLEANUP_MIN_INTERVAL_MS: u128 = 10 * 60 * 1_000;
 static SHADOW_REPO_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CHECKPOINT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -68,8 +69,11 @@ pub struct GitVcs {
 pub struct CheckpointStore {
     root: PathBuf,
     git_dir: PathBuf,
+    raw_blob_dir: PathBuf,
     journal_path: PathBuf,
     lock_path: PathBuf,
+    raw_cache: Mutex<BTreeMap<String, CachedRawFile>>,
+    cleanup_last_run_ms: Mutex<Option<u128>>,
     /// OS-advisory lock held for the lifetime of the store. Dropping the
     /// [`File`] releases the lock; the [`Drop`] impl also unlinks
     /// [`Self::lock_path`] so a fresh process sees a clean directory.
@@ -80,6 +84,7 @@ pub struct CheckpointStore {
 pub struct WorkspaceSnapshot {
     pub tree: String,
     pub large_files: Vec<LargeFileFingerprint>,
+    pub raw_files: BTreeMap<String, RawFileSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +93,22 @@ pub struct LargeFileFingerprint {
     pub size_bytes: u64,
     pub mtime_secs: i64,
     pub mtime_nanos: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawFileSnapshot {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedRawFile {
+    size_bytes: u64,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -220,6 +241,10 @@ pub struct CheckpointFile {
     pub from_path: Option<String>,
     pub before_sha256: Option<String>,
     pub after_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_worktree_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_worktree_sha256: Option<String>,
     pub additions: u64,
     pub deletions: u64,
     pub binary: bool,
@@ -311,7 +336,57 @@ pub struct RollbackConflict {
     pub path: String,
     pub expected_sha256: Option<String>,
     pub current_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_hash_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<RollbackConflictReason>,
+    #[serde(default)]
+    pub retryable: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackConflictReason {
+    WorktreeChanged,
+    GitFilterOrEolMismatch,
+    CheckpointObjectMissing,
+    AccessDenied,
+    PermissionDenied,
+    WouldBlock,
+    ReadOnly,
+    FileInUse,
+    Filesystem,
+    ShadowRefreshFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointDoctorReport {
+    pub platform: String,
+    pub workspace_root: String,
+    pub workspace_root_slash: String,
+    pub shadow_git_dir: String,
+    pub shadow_git_dir_slash: String,
+    pub git_path_mode: String,
+    pub core_autocrlf: Option<String>,
+    pub core_ignorecase: Option<String>,
+    pub core_longpaths: Option<String>,
+    pub gitattributes: Vec<String>,
+    pub lock_file_writable: bool,
+    pub protected_ref_roundtrip: bool,
+    pub smoke: CheckpointSmokeReport,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointSmokeReport {
+    pub ran: bool,
+    pub passed: bool,
+    pub crlf_preserved: bool,
+    pub git_filter_or_eol_mismatch_detected: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,9 +936,11 @@ impl CheckpointStore {
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let dir = root.join(".squeezy").join("checkpoints");
         let git_dir = dir.join("git");
+        let raw_blob_dir = dir.join("raw-blobs");
         let journal_path = dir.join("journal.jsonl");
         let lock_path = dir.join(SHADOW_LOCK_FILENAME);
         fs::create_dir_all(&git_dir)?;
+        fs::create_dir_all(&raw_blob_dir)?;
         // Acquire the per-workspace shadow-repo lock before any cleanup or
         // git work — two squeezy processes pointed at the same workspace
         // must not race on `git add --all` + `write-tree`.
@@ -872,8 +949,11 @@ impl CheckpointStore {
         let store = Self {
             root,
             git_dir,
+            raw_blob_dir,
             journal_path,
             lock_path,
+            raw_cache: Mutex::new(BTreeMap::new()),
+            cleanup_last_run_ms: Mutex::new(None),
             _lock: Some(lock),
         };
         store.ensure_shadow_repo()?;
@@ -883,7 +963,10 @@ impl CheckpointStore {
 
     pub fn track_tree(&self) -> Result<WorkspaceSnapshot> {
         self.ensure_shadow_repo()?;
-        let large_files = self.large_file_fingerprints()?;
+        let WorkspaceFileFingerprints {
+            large_files,
+            raw_files,
+        } = self.workspace_file_fingerprints()?;
         let mut add_args = vec![
             "add".to_string(),
             "--all".to_string(),
@@ -920,7 +1003,11 @@ impl CheckpointStore {
         }
         let output = self.git(["write-tree"])?;
         let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(WorkspaceSnapshot { tree, large_files })
+        Ok(WorkspaceSnapshot {
+            tree,
+            large_files,
+            raw_files,
+        })
     }
 
     pub fn create_checkpoint(
@@ -940,6 +1027,8 @@ impl CheckpointStore {
         let (files, skipped_files) = self.checkpoint_files(
             &before.tree,
             &after.tree,
+            &before.raw_files,
+            &after.raw_files,
             &after.large_files,
             &changed_large_paths,
         )?;
@@ -986,7 +1075,7 @@ impl CheckpointStore {
             "kind": "checkpoint",
             "record": record,
         }))?;
-        self.cleanup_old_checkpoints(DEFAULT_CHECKPOINT_RETENTION_DAYS)?;
+        self.cleanup_old_checkpoints_throttled(DEFAULT_CHECKPOINT_RETENTION_DAYS)?;
         Ok(Some(record))
     }
 
@@ -1038,6 +1127,97 @@ impl CheckpointStore {
             .find(|record| record.id == id))
     }
 
+    pub fn doctor(&self) -> Result<CheckpointDoctorReport> {
+        self.ensure_shadow_repo()?;
+        let mut warnings = Vec::new();
+        let snapshot = match self.track_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warnings.push(format!("no-op shadow snapshot failed: {err}"));
+                WorkspaceSnapshot {
+                    tree: String::new(),
+                    large_files: Vec::new(),
+                    raw_files: BTreeMap::new(),
+                }
+            }
+        };
+        let protected_ref_roundtrip = if snapshot.tree.is_empty() {
+            false
+        } else {
+            let probe_ref = checkpoint_ref(&format!("doctor-{}", now_ms()), "probe");
+            let created = self.git_vec(vec![
+                "update-ref".to_string(),
+                probe_ref.clone(),
+                snapshot.tree.clone(),
+            ]);
+            let deleted = self.git_vec(vec![
+                "update-ref".to_string(),
+                "-d".to_string(),
+                probe_ref.clone(),
+            ]);
+            if let Err(err) = &created {
+                warnings.push(format!(
+                    "protected-ref create failed for {probe_ref}: {err}"
+                ));
+            }
+            if created.is_ok()
+                && let Err(err) = &deleted
+            {
+                warnings.push(format!(
+                    "protected-ref delete failed for {probe_ref}: {err}"
+                ));
+            }
+            created.is_ok() && deleted.is_ok()
+        };
+        let lock_file_writable = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.lock_path)
+            .is_ok();
+        if !lock_file_writable {
+            warnings.push(format!(
+                "shadow lock file is not writable: {}",
+                self.lock_path.display()
+            ));
+        }
+        let gitattributes = collect_gitattributes(&self.root);
+        if !gitattributes.is_empty() {
+            warnings.push(
+                "workspace has .gitattributes; checkpoint rollback uses worktree byte hashes \
+                 for safety and keeps Git blob hashes for object diagnostics"
+                    .to_string(),
+            );
+        }
+        let smoke = run_checkpoint_smoke();
+        if !smoke.passed {
+            warnings.push(format!(
+                "checkpoint smoke failed: {}",
+                smoke.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        Ok(CheckpointDoctorReport {
+            platform: std::env::consts::OS.to_string(),
+            workspace_root: self.root.to_string_lossy().to_string(),
+            workspace_root_slash: slash_path(&self.root),
+            shadow_git_dir: self.git_dir.to_string_lossy().to_string(),
+            shadow_git_dir_slash: slash_path(&self.git_dir),
+            git_path_mode: if cfg!(windows) {
+                "windows-legacy"
+            } else {
+                "native"
+            }
+            .to_string(),
+            core_autocrlf: self.git_config_value("core.autocrlf"),
+            core_ignorecase: self.git_config_value("core.ignorecase"),
+            core_longpaths: self.git_config_value("core.longpaths"),
+            gitattributes,
+            lock_file_writable,
+            protected_ref_roundtrip,
+            smoke,
+            warnings,
+        })
+    }
+
     pub fn rollback(
         &self,
         target: RollbackTarget<'_>,
@@ -1085,11 +1265,44 @@ impl CheckpointStore {
             }))?;
             return Ok(result);
         }
-        for record in &selected {
-            self.rollback_record(record, &mut result)?;
+        if mode == RollbackMode::Atomic {
+            result
+                .conflicts
+                .extend(self.preflight_filesystem_conflicts(&selected, &result.conflicts)?);
+            if !result.conflicts.is_empty() {
+                self.append_journal(json!({
+                    "kind": "rollback",
+                    "created_at_ms": now_ms(),
+                    "result": result,
+                }))?;
+                return Ok(result);
+            }
         }
-        self.track_tree()?;
-        result.applied = true;
+        for record in &selected {
+            self.rollback_record(record, &mut result);
+        }
+        result.applied = !result.restored_files.is_empty() || !result.deleted_files.is_empty();
+        if result.applied
+            && let Err(err) = self.track_tree()
+        {
+            result.conflicts.push(RollbackConflict {
+                checkpoint_id: result
+                    .checkpoint_ids
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                path: ".".to_string(),
+                expected_sha256: None,
+                current_sha256: None,
+                expected_hash_basis: None,
+                current_hash_basis: None,
+                reason_code: Some(RollbackConflictReason::ShadowRefreshFailed),
+                retryable: true,
+                reason: format!(
+                    "rollback changed files, but refreshing the shadow checkpoint tree failed: {err}"
+                ),
+            });
+        }
         self.append_journal(json!({
             "kind": "rollback",
             "created_at_ms": now_ms(),
@@ -1132,6 +1345,8 @@ impl CheckpointStore {
         &self,
         before_tree: &str,
         after_tree: &str,
+        before_raw: &BTreeMap<String, RawFileSnapshot>,
+        after_raw: &BTreeMap<String, RawFileSnapshot>,
         large_after: &[LargeFileFingerprint],
         changed_large_paths: &[String],
     ) -> Result<(Vec<CheckpointFile>, Vec<SkippedCheckpointFile>)> {
@@ -1211,6 +1426,10 @@ impl CheckpointStore {
             let before_lookup = from_path.as_deref().unwrap_or(path.as_str());
             let before = self.blob_bytes(before_tree, before_lookup).ok();
             let after = self.blob_bytes(after_tree, &path).ok();
+            let before_worktree_sha256 = before_raw
+                .get(before_lookup)
+                .map(|file| file.sha256.clone());
+            let after_worktree_sha256 = after_raw.get(&path).map(|file| file.sha256.clone());
             let patch = match status {
                 DiffFileStatus::Renamed => match (&from_path, &before, &after) {
                     (Some(_old), Some(_), Some(_)) => self
@@ -1232,6 +1451,8 @@ impl CheckpointStore {
                 from_path,
                 before_sha256: before.as_deref().map(sha256_hex),
                 after_sha256: after.as_deref().map(sha256_hex),
+                before_worktree_sha256,
+                after_worktree_sha256,
                 additions: stat.additions,
                 deletions: stat.deletions,
                 binary: stat.binary,
@@ -1259,7 +1480,8 @@ impl CheckpointStore {
         let mut virtual_hashes = BTreeMap::<String, Option<String>>::new();
         for record in records {
             for file in &record.files {
-                let current_sha256 = match virtual_hashes.get(&file.path) {
+                let identity = path_identity_key(&file.path);
+                let current_sha256 = match virtual_hashes.get(&identity) {
                     Some(hash) => hash.clone(),
                     None => {
                         let path = self.root.join(&file.path);
@@ -1268,25 +1490,31 @@ impl CheckpointStore {
                         } else {
                             None
                         };
-                        virtual_hashes.insert(file.path.clone(), hash.clone());
+                        virtual_hashes.insert(identity.clone(), hash.clone());
                         hash
                     }
                 };
                 if let Some(conflict) = self.rollback_conflict(record, file, current_sha256)? {
                     conflicts.push(conflict);
                 } else {
-                    virtual_hashes.insert(file.path.clone(), file.before_sha256.clone());
+                    if file.status == DiffFileStatus::Renamed {
+                        virtual_hashes.insert(identity, None);
+                        if let Some(from_path) = file.from_path.as_deref() {
+                            virtual_hashes.insert(
+                                path_identity_key(from_path),
+                                rollback_before_virtual_hash(file),
+                            );
+                        }
+                    } else {
+                        virtual_hashes.insert(identity, rollback_before_virtual_hash(file));
+                    }
                 }
             }
         }
         Ok(conflicts)
     }
 
-    fn rollback_record(
-        &self,
-        record: &CheckpointRecord,
-        result: &mut RollbackResult,
-    ) -> Result<()> {
+    fn rollback_record(&self, record: &CheckpointRecord, result: &mut RollbackResult) {
         for file in &record.files {
             if result
                 .conflicts
@@ -1301,39 +1529,83 @@ impl CheckpointStore {
                 // Reverse a rename: remove the new path, restore the source path
                 // (whose original content is at `from_path` in the before tree).
                 if path.exists() {
-                    fs::remove_file(&path)?;
-                }
-                result.deleted_files.push(file.path.clone());
-                if let Some(from_path) = file.from_path.as_deref()
-                    && let Ok(bytes) = self.blob_bytes(&record.before_tree, from_path)
-                {
-                    let restore_path = self.root.join(from_path);
-                    if let Some(parent) = restore_path.parent() {
-                        fs::create_dir_all(parent)?;
+                    if let Err(err) = fs::remove_file(&path) {
+                        result.conflicts.push(filesystem_rollback_conflict(
+                            &record.id,
+                            &file.path,
+                            err,
+                            "delete renamed destination",
+                        ));
+                        continue;
                     }
-                    fs::write(&restore_path, bytes)?;
-                    result.restored_files.push(from_path.to_string());
+                    result.deleted_files.push(file.path.clone());
+                }
+                if let Some(from_path) = file.from_path.as_deref() {
+                    match self.restore_bytes(
+                        file.before_worktree_sha256.as_deref(),
+                        &record.before_tree,
+                        from_path,
+                    ) {
+                        Ok(bytes) => {
+                            let restore_path = self.root.join(from_path);
+                            if let Err(err) = write_rollback_file(&restore_path, &bytes) {
+                                result.conflicts.push(filesystem_rollback_conflict(
+                                    &record.id,
+                                    from_path,
+                                    err,
+                                    "restore renamed source",
+                                ));
+                            } else {
+                                result.restored_files.push(from_path.to_string());
+                            }
+                        }
+                        Err(err) => result
+                            .conflicts
+                            .push(checkpoint_object_conflict(&record.id, from_path, err)),
+                    }
                 }
                 continue;
             }
 
-            match self.blob_bytes(&record.before_tree, &file.path) {
+            match self.restore_bytes(
+                file.before_worktree_sha256.as_deref(),
+                &record.before_tree,
+                &file.path,
+            ) {
                 Ok(bytes) => {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
+                    if let Err(err) = write_rollback_file(&path, &bytes) {
+                        result.conflicts.push(filesystem_rollback_conflict(
+                            &record.id,
+                            &file.path,
+                            err,
+                            "restore file",
+                        ));
+                    } else {
+                        result.restored_files.push(file.path.clone());
                     }
-                    fs::write(&path, bytes)?;
-                    result.restored_files.push(file.path.clone());
                 }
                 Err(_) => {
-                    if path.exists() {
-                        fs::remove_file(&path)?;
+                    if file.before_sha256.is_some() || file.before_worktree_sha256.is_some() {
+                        result.conflicts.push(checkpoint_object_conflict(
+                            &record.id,
+                            &file.path,
+                            "checkpoint object is missing".to_string(),
+                        ));
+                    } else if path.exists() {
+                        if let Err(err) = fs::remove_file(&path) {
+                            result.conflicts.push(filesystem_rollback_conflict(
+                                &record.id,
+                                &file.path,
+                                err,
+                                "delete added file",
+                            ));
+                            continue;
+                        }
+                        result.deleted_files.push(file.path.clone());
                     }
-                    result.deleted_files.push(file.path.clone());
                 }
             }
         }
-        Ok(())
     }
 
     fn rollback_conflict(
@@ -1342,30 +1614,105 @@ impl CheckpointStore {
         file: &CheckpointFile,
         current_sha256: Option<String>,
     ) -> Result<Option<RollbackConflict>> {
-        if current_sha256 != file.after_sha256 {
+        let expected_sha256 = file
+            .after_worktree_sha256
+            .clone()
+            .or_else(|| file.after_sha256.clone());
+        let expected_basis = if file.after_worktree_sha256.is_some() {
+            "checkpoint worktree byte hash"
+        } else {
+            "checkpoint git blob hash"
+        };
+        let current_basis = "current worktree byte hash";
+        if current_sha256 != expected_sha256 {
+            let reason_code = if file.after_worktree_sha256.is_none() && file.after_sha256.is_some()
+            {
+                RollbackConflictReason::GitFilterOrEolMismatch
+            } else {
+                RollbackConflictReason::WorktreeChanged
+            };
             return Ok(Some(RollbackConflict {
                 checkpoint_id: record.id.clone(),
                 path: file.path.clone(),
-                expected_sha256: file.after_sha256.clone(),
+                expected_sha256,
                 current_sha256,
-                reason: "file changed after checkpoint; leaving current content untouched"
-                    .to_string(),
+                expected_hash_basis: Some(expected_basis.to_string()),
+                current_hash_basis: Some(current_basis.to_string()),
+                reason_code: Some(reason_code),
+                retryable: false,
+                reason: if reason_code == RollbackConflictReason::GitFilterOrEolMismatch {
+                    "checkpoint git blob hash differs from current worktree bytes, likely because \
+                     Git filters or eol normalization changed the byte basis; leaving current \
+                     content untouched"
+                        .to_string()
+                } else {
+                    "file changed after checkpoint; leaving current content untouched".to_string()
+                },
             }));
         }
-        if self.tree_has_path(&record.before_tree, &file.path)? {
-            let blob = self.blob_bytes(&record.before_tree, &file.path);
+        let before_lookup = file.from_path.as_deref().unwrap_or(file.path.as_str());
+        if self.tree_has_path(&record.before_tree, before_lookup)? {
+            let blob = self.blob_bytes(&record.before_tree, before_lookup);
             if blob.is_err() {
                 return Ok(Some(RollbackConflict {
                     checkpoint_id: record.id.clone(),
                     path: file.path.clone(),
                     expected_sha256: file.after_sha256.clone(),
                     current_sha256,
+                    expected_hash_basis: Some("checkpoint git blob hash".to_string()),
+                    current_hash_basis: Some("current worktree byte hash".to_string()),
+                    reason_code: Some(RollbackConflictReason::CheckpointObjectMissing),
+                    retryable: false,
                     reason: "checkpoint object is missing; leaving current content untouched"
                         .to_string(),
                 }));
             }
         }
         Ok(None)
+    }
+
+    fn preflight_filesystem_conflicts(
+        &self,
+        records: &[CheckpointRecord],
+        existing_conflicts: &[RollbackConflict],
+    ) -> Result<Vec<RollbackConflict>> {
+        let mut conflicts = Vec::new();
+        for record in records {
+            for file in &record.files {
+                if existing_conflicts
+                    .iter()
+                    .chain(conflicts.iter())
+                    .any(|conflict| {
+                        conflict.checkpoint_id == record.id && conflict.path == file.path
+                    })
+                {
+                    continue;
+                }
+                for path in rollback_write_paths(file) {
+                    let absolute = self.root.join(&path);
+                    if let Some(conflict) =
+                        filesystem_preflight_conflict(&record.id, &path, &absolute)
+                    {
+                        conflicts.push(conflict);
+                    }
+                }
+            }
+        }
+        Ok(conflicts)
+    }
+
+    fn restore_bytes(
+        &self,
+        worktree_sha256: Option<&str>,
+        tree: &str,
+        path: &str,
+    ) -> std::result::Result<Vec<u8>, String> {
+        if let Some(sha256) = worktree_sha256
+            && let Ok(bytes) = fs::read(self.raw_blob_path(sha256))
+        {
+            return Ok(bytes);
+        }
+        self.blob_bytes(tree, path)
     }
 
     fn tree_has_path(&self, tree: &str, path: &str) -> Result<bool> {
@@ -1427,59 +1774,126 @@ impl CheckpointStore {
         .map_err(SqueezyError::Tool)
     }
 
-    fn large_file_fingerprints(&self) -> Result<Vec<LargeFileFingerprint>> {
-        let mut files = Vec::new();
-        self.collect_large_file_fingerprints(&self.root, &mut files)?;
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(files)
+    fn workspace_file_fingerprints(&self) -> Result<WorkspaceFileFingerprints> {
+        let mut entries = Vec::new();
+        collect_workspace_file_entries(&self.root, &self.root, &mut entries)?;
+        let ignored = self.git_ignored_paths(entries.iter().map(|entry| entry.rel.as_str()))?;
+        let mut large_files = Vec::new();
+        let mut raw_files = BTreeMap::new();
+        for entry in entries {
+            if ignored.contains(entry.rel.as_str()) {
+                continue;
+            }
+            if entry.size_bytes > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
+                large_files.push(LargeFileFingerprint {
+                    path: entry.rel,
+                    size_bytes: entry.size_bytes,
+                    mtime_secs: entry.mtime_secs,
+                    mtime_nanos: entry.mtime_nanos,
+                });
+                continue;
+            }
+            let raw = self.raw_file_snapshot(&entry)?;
+            raw_files.insert(entry.rel, raw);
+        }
+        large_files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(WorkspaceFileFingerprints {
+            large_files,
+            raw_files,
+        })
     }
 
-    fn collect_large_file_fingerprints(
+    fn git_ignored_paths<'a>(
         &self,
-        dir: &Path,
-        files: &mut Vec<LargeFileFingerprint>,
-    ) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|name| matches!(name, ".git" | ".squeezy"))
-            {
-                continue;
-            }
-            if self.is_git_ignored(&path)? {
-                continue;
-            }
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                self.collect_large_file_fingerprints(&path, files)?;
-            } else if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
-                let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
-                files.push(LargeFileFingerprint {
-                    path: rel_path(&self.root, &path),
-                    size_bytes: metadata.len(),
-                    mtime_secs,
-                    mtime_nanos,
-                });
-            }
+        paths: impl Iterator<Item = &'a str>,
+    ) -> Result<BTreeSet<String>> {
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
         }
+        if input.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let output = self.git_vec_with_stdin_allow_status(
+            vec![
+                "check-ignore".to_string(),
+                "-z".to_string(),
+                "--stdin".to_string(),
+            ],
+            input,
+            &[0, 1],
+        )?;
+        Ok(nul_fields(&output.stdout).into_iter().collect())
+    }
+
+    fn raw_file_snapshot(&self, entry: &WorkspaceFileEntry) -> Result<RawFileSnapshot> {
+        let mut cache = self
+            .raw_cache
+            .lock()
+            .map_err(|err| SqueezyError::Tool(format!("checkpoint raw cache poisoned: {err}")))?;
+        if let Some(cached) = cache.get(&entry.rel)
+            && cached.size_bytes == entry.size_bytes
+            && cached.mtime_secs == entry.mtime_secs
+            && cached.mtime_nanos == entry.mtime_nanos
+            && self.raw_blob_path(&cached.sha256).exists()
+        {
+            return Ok(RawFileSnapshot {
+                sha256: cached.sha256.clone(),
+                size_bytes: cached.size_bytes,
+                mtime_secs: cached.mtime_secs,
+                mtime_nanos: cached.mtime_nanos,
+            });
+        }
+        let bytes = fs::read(&entry.absolute)?;
+        let sha256 = sha256_hex(&bytes);
+        self.write_raw_blob(&sha256, &bytes)?;
+        cache.insert(
+            entry.rel.clone(),
+            CachedRawFile {
+                size_bytes: entry.size_bytes,
+                mtime_secs: entry.mtime_secs,
+                mtime_nanos: entry.mtime_nanos,
+                sha256: sha256.clone(),
+            },
+        );
+        Ok(RawFileSnapshot {
+            sha256,
+            size_bytes: entry.size_bytes,
+            mtime_secs: entry.mtime_secs,
+            mtime_nanos: entry.mtime_nanos,
+        })
+    }
+
+    fn write_raw_blob(&self, sha256: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.raw_blob_path(sha256);
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, bytes)?;
         Ok(())
     }
 
-    fn is_git_ignored(&self, path: &Path) -> Result<bool> {
-        let rel = rel_path(&self.root, path);
-        let output = self.git_vec_allow_status(
-            vec![
-                "check-ignore".to_string(),
-                "--quiet".to_string(),
-                "--".to_string(),
-                rel,
-            ],
-            &[0, 1],
-        )?;
-        Ok(output.status.code() == Some(0))
+    fn raw_blob_path(&self, sha256: &str) -> PathBuf {
+        let prefix = sha256.get(0..2).unwrap_or("xx");
+        self.raw_blob_dir.join(prefix).join(sha256)
+    }
+
+    fn git_config_value(&self, key: &str) -> Option<String> {
+        let output = self
+            .git_vec_allow_status(
+                vec!["config".to_string(), "--get".to_string(), key.to_string()],
+                &[0, 1],
+            )
+            .ok()?;
+        if output.status.code() != Some(0) {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!value.is_empty()).then_some(value)
     }
 
     fn protect_checkpoint_trees(&self, record: &CheckpointRecord) -> Result<()> {
@@ -1497,6 +1911,9 @@ impl CheckpointStore {
     }
 
     fn cleanup_old_checkpoints(&self, retention_days: u64) -> Result<()> {
+        if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
+            *last_run = Some(now_ms());
+        }
         let journal = self.read_journal()?;
         if journal.checkpoints.is_empty() {
             return Ok(());
@@ -1509,20 +1926,53 @@ impl CheckpointStore {
         if prune.is_empty() {
             return Ok(());
         }
+        let mut keep = keep;
+        let mut pruned_any = false;
         for record in &prune {
-            let _ = self.git_vec(vec![
+            let before_deleted = self.git_vec(vec![
                 "update-ref".to_string(),
                 "-d".to_string(),
                 checkpoint_ref(&record.id, "before"),
             ]);
-            let _ = self.git_vec(vec![
+            let after_deleted = self.git_vec(vec![
                 "update-ref".to_string(),
                 "-d".to_string(),
                 checkpoint_ref(&record.id, "after"),
             ]);
+            if before_deleted.is_ok() && after_deleted.is_ok() {
+                pruned_any = true;
+            } else {
+                let mut retained = record.clone();
+                retained.journal_warnings += 1;
+                retained.coverage_warnings.push(
+                    "retention cleanup could not delete one or more protected checkpoint refs; \
+                     keeping this journal record so shadow refs are still auditable"
+                        .to_string(),
+                );
+                keep.push(retained);
+            }
         }
+        keep.sort_by_key(|record| record.created_at_ms);
         self.rewrite_checkpoint_journal(&keep)?;
-        let _ = self.git(["gc", "--prune=now"]);
+        if pruned_any {
+            let _ = self.git(["gc", "--prune=now"]);
+        }
+        Ok(())
+    }
+
+    fn cleanup_old_checkpoints_throttled(&self, retention_days: u64) -> Result<()> {
+        let now = now_ms();
+        let should_run = self
+            .cleanup_last_run_ms
+            .lock()
+            .map(|last_run| match *last_run {
+                Some(last) => now.saturating_sub(last) >= CHECKPOINT_CLEANUP_MIN_INTERVAL_MS,
+                None => true,
+            })
+            .unwrap_or(true);
+        if should_run {
+            self.cleanup_old_checkpoints(retention_days)?;
+        }
         Ok(())
     }
 
@@ -1641,6 +2091,22 @@ impl CheckpointStore {
             .collect();
         git_output_vec_allow_status(&self.root, full_args, success).map_err(SqueezyError::Tool)
     }
+
+    fn git_vec_with_stdin_allow_status(
+        &self,
+        args: Vec<String>,
+        stdin: Vec<u8>,
+        success: &[i32],
+    ) -> Result<Output> {
+        let full_args = std::iter::once("--git-dir".to_string())
+            .chain(std::iter::once(self.git_dir.to_string_lossy().to_string()))
+            .chain(std::iter::once("--work-tree".to_string()))
+            .chain(std::iter::once(self.root.to_string_lossy().to_string()))
+            .chain(args)
+            .collect();
+        git_output_vec_with_stdin_allow_status(&self.root, full_args, stdin, success)
+            .map_err(SqueezyError::Tool)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1654,6 +2120,21 @@ struct FileStat {
 struct Patch {
     text: String,
     truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceFileEntry {
+    rel: String,
+    absolute: PathBuf,
+    size_bytes: u64,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceFileFingerprints {
+    large_files: Vec<LargeFileFingerprint>,
+    raw_files: BTreeMap<String, RawFileSnapshot>,
 }
 
 fn git_text<const N: usize>(cwd: &Path, args: [&str; N]) -> std::result::Result<String, String> {
@@ -1678,7 +2159,17 @@ fn git_output_vec_allow_status(
     args: Vec<String>,
     success: &[i32],
 ) -> std::result::Result<Output, String> {
-    let output = Command::new("git")
+    git_output_vec_with_stdin_allow_status(cwd, args, Vec::new(), success)
+}
+
+fn git_output_vec_with_stdin_allow_status(
+    cwd: &Path,
+    args: Vec<String>,
+    stdin: Vec<u8>,
+    success: &[i32],
+) -> std::result::Result<Output, String> {
+    let mut command = Command::new("git");
+    command
         .args([
             "--no-optional-locks",
             "-c",
@@ -1689,9 +2180,25 @@ fn git_output_vec_allow_status(
             "core.quotepath=false",
         ])
         .args(args)
-        .current_dir(cwd)
-        .output()
+        .current_dir(cwd);
+    if !stdin.is_empty() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| format!("git failed to start: {err}"))?;
+    if !stdin.is_empty()
+        && let Some(mut handle) = child.stdin.take()
+    {
+        handle
+            .write_all(&stdin)
+            .map_err(|err| format!("git stdin write failed: {err}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("git wait failed: {err}"))?;
     let code = output.status.code().unwrap_or(-1);
     if success.contains(&code) {
         Ok(output)
@@ -1808,7 +2315,10 @@ fn cleanup_stale_shadow_dirs(checkpoints_dir: &Path, retention_days: u64) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if matches!(name, "git" | "journal.jsonl" | SHADOW_LOCK_FILENAME) {
+        if matches!(
+            name,
+            "git" | "raw-blobs" | "journal.jsonl" | SHADOW_LOCK_FILENAME
+        ) {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -1824,6 +2334,314 @@ fn cleanup_stale_shadow_dirs(checkpoints_dir: &Path, retention_days: u64) {
             let _ = fs::remove_dir_all(&path);
         } else {
             let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn run_checkpoint_smoke() -> CheckpointSmokeReport {
+    match run_checkpoint_smoke_inner() {
+        Ok(report) => report,
+        Err(err) => CheckpointSmokeReport {
+            ran: true,
+            passed: false,
+            crlf_preserved: false,
+            git_filter_or_eol_mismatch_detected: false,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn run_checkpoint_smoke_inner() -> Result<CheckpointSmokeReport> {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-checkpoint-smoke-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let result = (|| {
+        fs::create_dir_all(&root)?;
+        fs::write(root.join(".gitattributes"), "*.txt text eol=lf\n")?;
+        fs::write(root.join("crlf.txt"), b"before\r\n")?;
+        let store = CheckpointStore::open(&root)?;
+        let before = store.track_tree()?;
+        fs::write(root.join("crlf.txt"), b"agent\r\n")?;
+        let Some(record) = store.create_checkpoint(
+            &before,
+            "checkpoint_doctor",
+            "smoke",
+            "doctor",
+            "success",
+            Vec::new(),
+        )?
+        else {
+            return Err(SqueezyError::Tool(
+                "checkpoint smoke did not create a checkpoint".to_string(),
+            ));
+        };
+        let file = record
+            .files
+            .iter()
+            .find(|file| file.path == "crlf.txt")
+            .ok_or_else(|| {
+                SqueezyError::Tool("checkpoint smoke did not record crlf.txt".to_string())
+            })?;
+        let mismatch = file.after_sha256 != file.after_worktree_sha256;
+        let rollback = store.rollback(RollbackTarget::Latest, RollbackMode::Atomic)?;
+        let bytes = fs::read(root.join("crlf.txt"))?;
+        let crlf_preserved = bytes == b"before\r\n";
+        let passed = rollback.applied && rollback.conflicts.is_empty() && crlf_preserved;
+        Ok(CheckpointSmokeReport {
+            ran: true,
+            passed,
+            crlf_preserved,
+            git_filter_or_eol_mismatch_detected: mismatch,
+            error: (!passed).then(|| {
+                format!(
+                    "applied={} conflicts={} crlf_preserved={crlf_preserved}",
+                    rollback.applied,
+                    rollback.conflicts.len()
+                )
+            }),
+        })
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+fn collect_workspace_file_entries(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<WorkspaceFileEntry>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| matches!(name, ".git" | ".squeezy"))
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_workspace_file_entries(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
+            entries.push(WorkspaceFileEntry {
+                rel: rel_path(root, &path),
+                absolute: path,
+                size_bytes: metadata.len(),
+                mtime_secs,
+                mtime_nanos,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn rollback_write_paths(file: &CheckpointFile) -> Vec<String> {
+    if file.status == DiffFileStatus::Renamed {
+        let mut paths = vec![file.path.clone()];
+        if let Some(from_path) = file.from_path.clone() {
+            paths.push(from_path);
+        }
+        paths
+    } else {
+        vec![file.path.clone()]
+    }
+}
+
+fn rollback_before_virtual_hash(file: &CheckpointFile) -> Option<String> {
+    file.before_worktree_sha256
+        .clone()
+        .or_else(|| file.before_sha256.clone())
+}
+
+fn filesystem_preflight_conflict(
+    checkpoint_id: &str,
+    path: &str,
+    absolute: &Path,
+) -> Option<RollbackConflict> {
+    if let Ok(metadata) = fs::metadata(absolute) {
+        if metadata.permissions().readonly() {
+            return Some(RollbackConflict {
+                checkpoint_id: checkpoint_id.to_string(),
+                path: path.to_string(),
+                expected_sha256: None,
+                current_sha256: None,
+                expected_hash_basis: None,
+                current_hash_basis: None,
+                reason_code: Some(RollbackConflictReason::ReadOnly),
+                retryable: true,
+                reason: windows_retry_message(
+                    "file is read-only; rollback would not be able to overwrite or delete it",
+                ),
+            });
+        }
+        if metadata.is_file()
+            && let Err(err) = OpenOptions::new().write(true).open(absolute)
+        {
+            return Some(filesystem_rollback_conflict(
+                checkpoint_id,
+                path,
+                err,
+                "preflight file writability",
+            ));
+        }
+    }
+    if let Some(parent) = absolute.parent()
+        && let Some(conflict) = parent_writability_conflict(checkpoint_id, path, parent)
+    {
+        return Some(conflict);
+    }
+    None
+}
+
+fn parent_writability_conflict(
+    checkpoint_id: &str,
+    path: &str,
+    parent: &Path,
+) -> Option<RollbackConflict> {
+    let mut current = parent;
+    while !current.exists() {
+        current = current.parent()?;
+    }
+    let metadata = fs::metadata(current).ok()?;
+    if metadata.permissions().readonly() {
+        return Some(RollbackConflict {
+            checkpoint_id: checkpoint_id.to_string(),
+            path: path.to_string(),
+            expected_sha256: None,
+            current_sha256: None,
+            expected_hash_basis: None,
+            current_hash_basis: None,
+            reason_code: Some(RollbackConflictReason::ReadOnly),
+            retryable: true,
+            reason: windows_retry_message(
+                "parent directory is read-only; rollback cannot create or replace the file",
+            ),
+        });
+    }
+    None
+}
+
+fn write_rollback_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)
+}
+
+fn filesystem_rollback_conflict(
+    checkpoint_id: &str,
+    path: &str,
+    err: std::io::Error,
+    operation: &str,
+) -> RollbackConflict {
+    let reason_code = rollback_io_reason(&err);
+    RollbackConflict {
+        checkpoint_id: checkpoint_id.to_string(),
+        path: path.to_string(),
+        expected_sha256: None,
+        current_sha256: None,
+        expected_hash_basis: None,
+        current_hash_basis: None,
+        reason_code: Some(reason_code),
+        retryable: matches!(
+            reason_code,
+            RollbackConflictReason::AccessDenied
+                | RollbackConflictReason::PermissionDenied
+                | RollbackConflictReason::WouldBlock
+                | RollbackConflictReason::ReadOnly
+                | RollbackConflictReason::FileInUse
+                | RollbackConflictReason::Filesystem
+        ),
+        reason: windows_retry_message(&format!("{operation} failed: {err}")),
+    }
+}
+
+fn checkpoint_object_conflict(checkpoint_id: &str, path: &str, err: String) -> RollbackConflict {
+    RollbackConflict {
+        checkpoint_id: checkpoint_id.to_string(),
+        path: path.to_string(),
+        expected_sha256: None,
+        current_sha256: None,
+        expected_hash_basis: Some("checkpoint worktree byte hash or git blob hash".to_string()),
+        current_hash_basis: None,
+        reason_code: Some(RollbackConflictReason::CheckpointObjectMissing),
+        retryable: false,
+        reason: format!("checkpoint object is missing; leaving current content untouched: {err}"),
+    }
+}
+
+fn rollback_io_reason(err: &std::io::Error) -> RollbackConflictReason {
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            if cfg!(windows) {
+                match err.raw_os_error() {
+                    Some(5) => RollbackConflictReason::AccessDenied,
+                    Some(32) | Some(33) => RollbackConflictReason::FileInUse,
+                    _ => RollbackConflictReason::PermissionDenied,
+                }
+            } else {
+                RollbackConflictReason::PermissionDenied
+            }
+        }
+        std::io::ErrorKind::WouldBlock => RollbackConflictReason::WouldBlock,
+        _ => RollbackConflictReason::Filesystem,
+    }
+}
+
+fn windows_retry_message(detail: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "{detail}; close editors or terminals holding the file, pause OneDrive/Defender sync if applicable, then retry /undo or inspect the file list with checkpoint_show"
+        )
+    } else {
+        detail.to_string()
+    }
+}
+
+fn path_identity_key(path: &str) -> String {
+    let slash = path.replace('\\', "/");
+    if cfg!(windows) {
+        slash.to_ascii_lowercase()
+    } else {
+        slash
+    }
+}
+
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn collect_gitattributes(root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_gitattributes_inner(root, root, &mut paths);
+    paths.sort();
+    paths
+}
+
+fn collect_gitattributes_inner(root: &Path, dir: &Path, paths: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| matches!(name, ".git" | ".squeezy"))
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_gitattributes_inner(root, &path, paths);
+        } else if metadata.is_file() && name.to_str() == Some(".gitattributes") {
+            paths.push(rel_path(root, &path));
         }
     }
 }

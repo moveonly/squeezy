@@ -3928,6 +3928,7 @@ impl Agent {
             | DispatchCommand::SessionExportHtml { .. }
             | DispatchCommand::Pin { .. }
             | DispatchCommand::Checkpoints
+            | DispatchCommand::CheckpointsDoctor
             | DispatchCommand::Checkpoint { .. }
             | DispatchCommand::RevertTurn { .. }
             | DispatchCommand::Help { .. }
@@ -14439,6 +14440,7 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
         | DispatchCommand::Parent => SlashArgShape::None,
+        DispatchCommand::CheckpointsDoctor => SlashArgShape::FixedSubcommand,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
             if option_has_text(prompt.as_ref()) {

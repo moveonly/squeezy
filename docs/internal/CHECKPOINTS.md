@@ -17,7 +17,8 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `group_id` — the agent turn that produced the write. Every record
   emitted while handling one user turn shares this value.
 - `tool_name`, `call_id`, `status`, `before_tree`, `after_tree`, per-file
-  `before_sha256` / `after_sha256`.
+  Git blob hashes (`before_sha256` / `after_sha256`) plus raw worktree byte
+  hashes (`before_worktree_sha256` / `after_worktree_sha256`).
 - `files`, `skipped_files`, `summary`, `coverage_warnings`, and
   `created_at_ms`.
 
@@ -31,6 +32,12 @@ Both `Atomic` and `BestEffort` rollback modes accept any of the three
 targets; the sha256 gate is identical in all cases. `checkpoint_undo` targets
 `Latest`; `checkpoint_revert` requires exactly one of `group_id` or
 `checkpoint_id`.
+
+Rollback safety is checked against the raw worktree byte hash when the
+checkpoint recorded one. Git blob hashes remain in the record for object
+integrity and display diagnostics, but they are not used as the only safety
+gate because `.gitattributes`, CRLF conversion, and clean filters can make a
+Git blob differ from the bytes a Windows editor actually left on disk.
 
 ## Why `Group(group_id)` Is Load-Bearing
 
@@ -71,10 +78,25 @@ pretend those files are protected. Malformed journal lines are counted as
 `journal_warnings` and ignored rather than making the whole checkpoint list
 unreadable.
 
+Rollback attempts are journaled even when only some paths are restored.
+`BestEffort` mode converts per-file filesystem errors into structured
+conflicts and continues with later files. `Atomic` mode preflights conflict
+and filesystem writability checks before mutating. This matters on Windows,
+where read-only attributes, editor locks, antivirus scanners, and sync tools
+can reject one write/delete while other paths are still safe.
+
+`checkpoint_doctor` (also reachable from `/checkpoints doctor`) performs a
+no-op shadow snapshot and reports the normalized workspace/shadow paths, Git
+path mode, relevant shadow Git config, discovered `.gitattributes`, lock-file
+writability, protected-ref create/delete capability, and a temporary CRLF
+checkpoint/mutate/rollback smoke result. The smoke workspace is created outside
+the user's project and removed after the report.
+
 ## What This Document Is Not
 
 This is not a user manual. The agent-visible tools (`checkpoint_list`,
-`checkpoint_show`, `checkpoint_undo`, `checkpoint_revert`) are
+`checkpoint_doctor`, `checkpoint_show`, `checkpoint_undo`,
+`checkpoint_revert`) are
 documented in their own specs under `crates/squeezy-tools/src/`. This
 file records *why* the `group_id` axis exists so a future refactor
 does not pare it down to `Latest` + `Checkpoint(id)` on the grounds
