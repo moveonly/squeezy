@@ -1257,12 +1257,12 @@ fn append_payload_once(
     path: &Path,
     payload: &[u8],
 ) -> std::result::Result<usize, (usize, std::io::Error)> {
+    let lock = lock_append_path(path).map_err(|error| (0, error))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| (0, error))?;
-    file.lock_exclusive().map_err(|error| (0, error))?;
     let mut written = 0;
     let result = (|| {
         while written < payload.len() {
@@ -1280,7 +1280,7 @@ fn append_payload_once(
         }
         Ok(written)
     })();
-    if let Err(error) = file.unlock()
+    if let Err(error) = lock.unlock()
         && result.is_ok()
     {
         return Err((written, error));
@@ -1293,6 +1293,27 @@ fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -
     let mut metadata = read_session_metadata(&path)?;
     update(&mut metadata);
     write_json(&path, &metadata)
+}
+
+fn lock_append_path(path: &Path) -> std::io::Result<fs::File> {
+    let lock_path = append_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+fn append_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("append");
+    path.with_file_name(format!(".{name}.lock"))
 }
 
 impl SessionHandle {
@@ -2908,10 +2929,32 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let lock = lock_append_path(path)?;
+    let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+    for entry in read_global_index_entries(path)? {
+        match by_id.get(&entry.session_id) {
+            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+            _ => {
+                by_id.insert(entry.session_id.clone(), entry);
+            }
+        }
+    }
+    for entry in entries {
+        match by_id.get(&entry.session_id) {
+            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+            _ => {
+                by_id.insert(entry.session_id.clone(), (*entry).clone());
+            }
+        }
+    }
+    let mut compacted: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+    compacted.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
+    compacted.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+    compacted.sort_by_key(|entry| entry.started_at_ms);
     let tmp = fs_util::unique_temp_path(path);
     {
         let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-        for entry in entries {
+        for entry in &compacted {
             let mut payload = match serde_json::to_vec(entry) {
                 Ok(payload) => payload,
                 Err(_) => continue,
@@ -2925,7 +2968,35 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
+    lock.unlock()?;
     Ok(())
+}
+
+fn read_global_index_entries(path: &Path) -> std::io::Result<Vec<GlobalSessionIndexEntry>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut entries = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

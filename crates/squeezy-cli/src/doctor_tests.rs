@@ -360,9 +360,9 @@ fn state_store_check_opens_redb_in_tempdir() {
 }
 
 #[test]
-fn graph_store_check_opens_redb_in_tempdir() {
+fn graph_store_check_reports_absent_without_creating_redb() {
     let workspace = std::env::temp_dir().join(format!(
-        "squeezy-doctor-graph-{}-{}",
+        "squeezy-doctor-graph-absent-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -375,9 +375,37 @@ fn graph_store_check_opens_redb_in_tempdir() {
     config.workspace_root = workspace.clone();
     config.cache.root = None;
     let check = graph_store_check(&config);
+    let graph = squeezy_store::graph_path(&workspace, None);
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
-    assert!(check.detail.contains("graph.redb"));
+    assert!(check.detail.contains("absent"));
+    assert!(
+        !graph.exists(),
+        "doctor graph probe must not create graph.redb"
+    );
+}
+
+#[test]
+fn graph_store_check_opens_existing_redb_in_tempdir() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-graph-existing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let store = squeezy_store::GraphStore::open(&workspace, None).expect("seed graph store");
+    drop(store);
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    let check = graph_store_check(&config);
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("readable"));
 }
 
 #[test]

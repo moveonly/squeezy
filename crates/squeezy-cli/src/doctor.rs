@@ -10,8 +10,8 @@ use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
 };
 use squeezy_store::{
-    GraphStore, SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile,
-    prune_cache_backups, user_squeezy_dir_detail,
+    GRAPH_SCHEMA_VERSION, GraphStore, SessionStore, SqueezyStore, cache_diagnostics,
+    ensure_repo_profile, graph_path, prune_cache_backups, user_squeezy_dir_detail,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use tokio_util::sync::CancellationToken;
@@ -443,11 +443,29 @@ fn state_store_check(config: &AppConfig) -> Check {
 }
 
 fn graph_store_check(config: &AppConfig) -> Check {
-    match GraphStore::open(&config.workspace_root, config.cache.root.as_deref()) {
-        Ok(store) => Check {
+    let path = graph_path(&config.workspace_root, config.cache.root.as_deref());
+    if !path.exists() {
+        return Check {
             name: "graph_store".to_string(),
             status: Status::Ok,
-            detail: format!("opened: {}", store.path().display()),
+            detail: format!("absent: {} (graph cache not created yet)", path.display()),
+        };
+    }
+    match GraphStore::probe_path_read_only(&path) {
+        Ok(probe) if probe.schema_version == Some(GRAPH_SCHEMA_VERSION) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Ok,
+            detail: format!("readable: {}", probe.path.display()),
+        },
+        Ok(probe) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "readable with schema {:?}, expected {}; graph persistence will reinitialize on next write: {}",
+                probe.schema_version,
+                GRAPH_SCHEMA_VERSION,
+                probe.path.display()
+            ),
         },
         Err(error) => Check {
             name: "graph_store".to_string(),

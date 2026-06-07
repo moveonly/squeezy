@@ -20,7 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError};
 
@@ -93,6 +93,12 @@ pub struct SqueezyStore {
 pub struct GraphStore {
     path: PathBuf,
     database: Database,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphStoreProbe {
+    pub path: PathBuf,
+    pub schema_version: Option<u64>,
 }
 
 impl SqueezyStore {
@@ -607,6 +613,16 @@ impl GraphStore {
         &self.path
     }
 
+    pub fn probe_path_read_only(path: impl Into<PathBuf>) -> Result<GraphStoreProbe> {
+        let path = path.into();
+        let database = ReadOnlyDatabase::open(&path).map_err(store_error)?;
+        let schema_version = current_schema_version(&database)?;
+        Ok(GraphStoreProbe {
+            path,
+            schema_version,
+        })
+    }
+
     pub fn set_graph_metadata(&self, metadata: &GraphStoreMetadata) -> Result<()> {
         let write = self.begin_write()?;
         {
@@ -1052,7 +1068,7 @@ pub(crate) fn initialize_graph_schema(database: &Database) -> Result<()> {
     write.commit().map_err(store_error)
 }
 
-pub(crate) fn current_schema_version(database: &Database) -> Result<Option<u64>> {
+pub(crate) fn current_schema_version(database: &impl ReadableDatabase) -> Result<Option<u64>> {
     let read = database.begin_read().map_err(store_error)?;
     let table = match read.open_table(META) {
         Ok(table) => table,
