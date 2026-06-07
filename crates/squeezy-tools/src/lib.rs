@@ -95,6 +95,8 @@ mod truncate;
 mod web;
 #[cfg(windows)]
 mod win_job;
+#[cfg(windows)]
+mod win_sandbox_spec;
 mod windows_cmd;
 
 pub use checkpoint_provider::{
@@ -157,6 +159,54 @@ use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
     prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
+pub use shell_sandbox::{ShellSandboxDoctor, shell_sandbox_doctor};
+
+/// Provision the Windows elevated sandbox tier (one-time, prompts for UAC):
+/// creates the hidden local sandbox users and installs the persistent WFP
+/// egress-block filters. Windows-only; returns an explanatory error on other
+/// platforms. Drives `squeezy doctor --sandbox-setup`.
+pub fn windows_sandbox_setup(
+    config: &squeezy_core::ShellSandboxConfig,
+    workspace_root: &std::path::Path,
+) -> std::result::Result<String, String> {
+    #[cfg(windows)]
+    {
+        let spec = win_sandbox_spec::build_setup_spec(config, workspace_root);
+        squeezy_win_sandbox::run_elevated_setup(&spec)
+            .map(|()| {
+                "Windows sandbox elevated tier provisioned: sandbox users created and WFP egress-block filters installed.".to_string()
+            })
+            .map_err(|err| err.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (config, workspace_root);
+        Err("the Windows sandbox elevated tier is only available on Windows".to_string())
+    }
+}
+
+/// Remove all persistent Windows elevated-tier machine state (sandbox users,
+/// WFP filters, registry hide entries, secrets/marker). Windows-only. Drives
+/// `squeezy doctor --sandbox-teardown`.
+pub fn windows_sandbox_teardown() -> std::result::Result<String, String> {
+    #[cfg(windows)]
+    {
+        let state_dir = win_sandbox_spec::win_state_dir();
+        squeezy_win_sandbox::teardown_machine_state(&state_dir)
+            .map(|report| {
+                format!(
+                    "Windows sandbox teardown complete: removed {} user(s), {} WFP filter(s).",
+                    report.users_removed.len(),
+                    report.wfp_filters_removed
+                )
+            })
+            .map_err(|err| err.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("the Windows sandbox elevated tier is only available on Windows".to_string())
+    }
+}
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 use shell_sandbox::{
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
