@@ -6374,6 +6374,11 @@ async fn shell_returns_bounded_output_and_exit_code() {
 async fn shell_default_sandbox_runs_benign_command() {
     let root = temp_workspace("shell_default_sandbox");
     let registry = ToolRegistry::new(&root).expect("registry");
+    let command = if cfg!(windows) {
+        "echo ok"
+    } else {
+        "printf ok"
+    };
 
     let result = registry
         .execute(
@@ -6381,7 +6386,7 @@ async fn shell_default_sandbox_runs_benign_command() {
                 call_id: "call_default_shell".to_string(),
                 name: "shell".to_string(),
                 arguments: json!({
-                    "command": "printf ok",
+                    "command": command,
                     "description": "check default shell sandbox posture"
                 }),
             },
@@ -6389,8 +6394,8 @@ async fn shell_default_sandbox_runs_benign_command() {
         )
         .await;
 
-    assert_eq!(result.status, ToolStatus::Success);
-    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["stdout"].as_str().unwrap_or("").trim(), "ok");
     let audit = fs::read_to_string(root.join(".squeezy/audit/shell.jsonl")).expect("audit log");
     assert!(audit.contains("\"mode\":\"best_effort\""));
 

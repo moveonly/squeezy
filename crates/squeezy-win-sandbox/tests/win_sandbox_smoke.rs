@@ -114,7 +114,7 @@ fn write_inside_workspace_allowed() {
     let workspace = fresh_workspace("write_inside");
     let out_file = workspace.join("out.txt");
 
-    let cmdline = format!(r#"echo hi > "{}""#, out_file.display());
+    let cmdline = "echo hi > out.txt";
     let Some(output) = run_cmd(&workspace, &cmdline) else {
         return;
     };
@@ -172,7 +172,7 @@ fn append_inside_allowed() {
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
-    let cmdline = format!(r#"echo line2 >> "{}""#, target.display());
+    let cmdline = "echo line2 >> append.txt";
     let Some(output) = run_cmd(&workspace, &cmdline) else {
         return;
     };
@@ -200,7 +200,7 @@ fn delete_inside_allowed() {
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
-    let cmdline = format!(r#"del /q "{}""#, target.display());
+    let cmdline = "del /q delme.txt";
     let Some(output) = run_cmd(&workspace, &cmdline) else {
         return;
     };
@@ -231,7 +231,7 @@ fn read_system_still_works() {
     // can fill the pipe before the process exits.
     let Some(output) = run_cmd(
         &workspace,
-        r#"if exist "C:\Windows\System32\cmd.exe" (exit /b 0) else (exit /b 1)"#,
+        r#"if exist C:\Windows\System32\cmd.exe (exit /b 0) else (exit /b 1)"#,
     ) else {
         return;
     };
