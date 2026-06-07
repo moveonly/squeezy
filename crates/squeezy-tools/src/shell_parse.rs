@@ -1390,6 +1390,7 @@ fn is_plan_mode_read_only_shell_segment(segment: &str) -> bool {
     is_read_only_shell_segment(segment)
         || is_plan_mode_read_only_find_segment(segment)
         || is_plan_mode_read_only_filter_segment(segment)
+        || is_plan_mode_read_only_sed_segment(segment)
         || is_plan_mode_read_only_python_filter_segment(segment)
         || is_sonar_context_read_only_segment(segment)
         || is_plan_mode_read_only_git_segment(segment)
@@ -1463,8 +1464,34 @@ fn dynamic_shell_text_contains_mutator(command: &str) -> bool {
 fn is_plan_mode_mutating_shell_segment(segment: &str) -> bool {
     is_destructive_shell_segment(segment)
         || is_safe_metadata_write_segment(segment)
+        || is_plan_mode_mutating_filter_segment(segment)
         || is_plan_mode_mutating_compiler_segment(segment)
         || is_plan_mode_mutating_git_segment(segment)
+}
+
+fn is_plan_mode_mutating_filter_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    let Some(first) = tokens.first().map(|token| dequote_token(token)) else {
+        return false;
+    };
+    match first {
+        "sed" => tokens.iter().skip(1).any(|token| {
+            let token = dequote_token(token);
+            token == "--in-place" || token.starts_with("-i")
+        }),
+        "base64" => tokens.iter().skip(1).any(|token| {
+            let token = dequote_token(token);
+            matches!(token, "-o" | "--output")
+                || token.starts_with("-o")
+                || token.starts_with("--output=")
+        }),
+        "sort" => tokens.iter().skip(1).any(|token| {
+            let token = dequote_token(token);
+            matches!(token, "-o" | "--output" | "--output-document")
+                || token.starts_with("--output=")
+        }),
+        _ => false,
+    }
 }
 
 /// Classify a shell command for Plan mode's additional mutation boundary.
@@ -1510,17 +1537,26 @@ pub fn plan_mode_shell_command_is_read_only(command: &str) -> bool {
 pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
     matches!(
         shell_command_prefix(segment).as_str(),
-        "ls" | "pwd"
-            | "echo"
-            | "cat"
-            | "head"
-            | "tail"
-            | "wc"
-            | "file"
-            | "stat"
+        "cat"
             | "du"
+            | "echo"
+            | "file"
             | "grep"
+            | "head"
+            | "id"
+            | "ls"
+            | "nl"
+            | "paste"
+            | "pwd"
+            | "rev"
             | "rg"
+            | "seq"
+            | "stat"
+            | "tail"
+            | "uname"
+            | "wc"
+            | "which"
+            | "whoami"
     )
 }
 
@@ -1558,6 +1594,12 @@ fn is_plan_mode_read_only_filter_segment(segment: &str) -> bool {
     };
     match first {
         "true" | "cut" | "tr" | "jq" => true,
+        "base64" => !tokens.iter().skip(1).any(|token| {
+            let token = dequote_token(token);
+            matches!(token, "-o" | "--output")
+                || token.starts_with("-o")
+                || token.starts_with("--output=")
+        }),
         "sort" => !tokens.iter().skip(1).any(|token| {
             matches!(
                 dequote_token(token),
@@ -1573,6 +1615,46 @@ fn is_plan_mode_read_only_filter_segment(segment: &str) -> bool {
             positionals <= 1
         }
         _ => false,
+    }
+}
+
+fn is_plan_mode_read_only_sed_segment(segment: &str) -> bool {
+    let tokens = tokenize_shell_segment(segment);
+    if tokens.first().map(|token| dequote_token(token)) != Some("sed") {
+        return false;
+    }
+    let mut args = tokens.iter().skip(1).map(|token| dequote_token(token));
+    if args.next() != Some("-n") {
+        return false;
+    }
+    let Some(script) = args.next() else {
+        return false;
+    };
+    if args.any(|arg| arg.starts_with('-')) {
+        return false;
+    }
+    sed_print_script_is_read_only(script)
+}
+
+fn sed_print_script_is_read_only(script: &str) -> bool {
+    let Some(rest) = script.strip_suffix('p') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let mut parts = rest.split(',');
+    let Some(start) = parts.next() else {
+        return false;
+    };
+    if start.is_empty() || !start.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(end) => {
+            !end.is_empty() && end.chars().all(|ch| ch.is_ascii_digit()) && parts.next().is_none()
+        }
     }
 }
 
