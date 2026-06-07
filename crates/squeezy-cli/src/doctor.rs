@@ -1215,6 +1215,15 @@ async fn probe_ollama(client: &reqwest::Client, base_url: &str) -> (Status, Stri
     }
 }
 
+// TODO: `squeezy cache move` — relocate state.redb, graph.redb, and session
+// cache roots safely, with lock checks before moving and rollback on failure.
+// See Category10_linux.md "Linux new features" / squeezy-cache-move.
+
+// TODO: `squeezy cache verify` — open both redb stores, validate schema
+// versions, count graph/resolver rows, and report whether backups are
+// restorable or prune-only.
+// See Category10_linux.md "Linux new features" / squeezy-cache-verify.
+
 #[cfg(test)]
 #[path = "doctor_tests.rs"]
 mod tests;

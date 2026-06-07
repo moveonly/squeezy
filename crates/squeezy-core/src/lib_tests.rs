@@ -4324,6 +4324,40 @@ durability = "forever"
 }
 
 #[test]
+fn cache_durability_serde_and_parse_are_consistent() {
+    for variant in [
+        CacheDurability::Fast,
+        CacheDurability::Turn,
+        CacheDurability::Strict,
+    ] {
+        let name = variant.as_str();
+
+        // `parse` round-trip
+        assert_eq!(
+            CacheDurability::parse(name),
+            Some(variant),
+            "parse({name:?}) should return {variant:?}"
+        );
+
+        // serde round-trip: JSON value produced by Serialize must re-produce the
+        // same variant through Deserialize, confirming the two paths stay in sync.
+        let json = serde_json::to_value(variant).expect("serialize");
+        let back: CacheDurability = serde_json::from_value(json.clone()).expect("deserialize");
+        assert_eq!(
+            back, variant,
+            "serde round-trip for {variant:?} failed (got JSON {json})"
+        );
+
+        // The serde snake_case representation must match `as_str`/`parse`.
+        let serde_str = json.as_str().expect("serialized as string");
+        assert_eq!(
+            serde_str, name,
+            "serde name {serde_str:?} diverges from parse name {name:?}"
+        );
+    }
+}
+
+#[test]
 fn load_settings_from_paths_merges_user_then_project() {
     let dir = std::env::temp_dir().join(format!(
         "squeezy_config_paths_{}_{}_{}",

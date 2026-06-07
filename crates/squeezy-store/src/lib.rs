@@ -541,6 +541,8 @@ impl SqueezyStore {
         self.database.begin_write().map_err(store_error)
     }
 
+    /// Opens `graph.redb` on every call.  Use `apply_graph_batch` for bulk
+    /// mutations to avoid repeated open/close and fsync overhead.
     fn graph_store(&self) -> Result<GraphStore> {
         GraphStore::open_path(self.path.with_file_name(GRAPH_FILE_NAME))
     }
@@ -826,7 +828,8 @@ impl GraphWriteBatch {
     }
 
     pub fn len(&self) -> usize {
-        self.upserts.len()
+        usize::from(self.metadata.is_some())
+            + self.upserts.len()
             + self.removals.len()
             + self.resolver_upserts.len()
             + self.resolver_removals.len()
@@ -1231,6 +1234,13 @@ fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// Atomically replace `path` with `bytes`.
+///
+/// Writes to a unique sibling temp file, calls `sync_all` on it, then
+/// `rename`s it over the destination.  On Linux, also fsyncs the parent
+/// directory so the directory entry survives a crash; on other platforms the
+/// parent fsync is a no-op (APFS provides equivalent rename durability without
+/// it).
 pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1354,7 +1364,11 @@ fn classify_filesystem(fs_type: &str) -> StorageMountClassification {
         "fuse" | "fuseblk" | "fuse.sshfs" | "overlay" | "overlayfs" | "aufs" | "unionfs"
         | "virtiofs" | "proc" => StorageMountClassification::Virtual,
         "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "apfs" | "hfs" | "hfsplus" | "zfs"
-        | "tmpfs" | "f2fs" | "ufs" => StorageMountClassification::Local,
+        | "f2fs" | "ufs" => StorageMountClassification::Local,
+        // tmpfs is RAM-backed and volatile: contents are lost on reboot/unmount.
+        // Classify it alongside virtual/container filesystems so the durability
+        // warning fires when cache or session paths land on a tmpfs mount.
+        "tmpfs" => StorageMountClassification::Virtual,
         _ => StorageMountClassification::Unknown,
     }
 }
@@ -1382,7 +1396,7 @@ fn mount_for_path(path: &Path) -> Option<MountEntry> {
         entries
             .into_iter()
             .filter(|entry| canonical.starts_with(&entry.mount_point))
-            .max_by_key(|entry| entry.mount_point.to_string_lossy().len())
+            .max_by_key(|entry| entry.mount_point.as_os_str().len())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1420,7 +1434,9 @@ fn parse_linux_mountinfo_line(line: &str) -> Option<MountEntry> {
 
 #[cfg(target_os = "linux")]
 fn unescape_mountinfo_path(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
+    // Accumulate raw bytes so multi-byte UTF-8 sequences encoded as consecutive
+    // octal escapes (e.g. \303\251 for 'é') are decoded correctly.
+    let mut raw: Vec<u8> = Vec::with_capacity(value.len());
     let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\\' {
@@ -1437,16 +1453,19 @@ fn unescape_mountinfo_path(value: &str) -> String {
             if octal.len() == 3
                 && let Ok(byte) = u8::from_str_radix(&octal, 8)
             {
-                out.push(byte as char);
+                raw.push(byte);
                 continue;
             }
-            out.push(ch);
-            out.push_str(&octal);
+            // Not a valid octal escape — emit the backslash and any digits we consumed.
+            raw.push(b'\\');
+            raw.extend_from_slice(octal.as_bytes());
         } else {
-            out.push(ch);
+            // ASCII-only char in mountinfo field names; push its UTF-8 byte(s).
+            let mut buf = [0u8; 4];
+            raw.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
         }
     }
-    out
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 fn insert_json<T: Serialize>(

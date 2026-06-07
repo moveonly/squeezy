@@ -1,4 +1,25 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Serialises tests that mutate `XDG_CACHE_HOME` to avoid data races in
+/// parallel test threads (Rust 2024: `env::set_var` is `unsafe`).
+static XDG_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_xdg_cache_home<R>(xdg: &Path, body: impl FnOnce() -> R) -> R {
+    let _guard = XDG_LOCK.lock().expect("XDG_CACHE_HOME lock");
+    let previous = std::env::var_os("XDG_CACHE_HOME");
+    // SAFETY: XDG_LOCK above serialises mutations of XDG_CACHE_HOME across
+    // all tests in this module.
+    unsafe { std::env::set_var("XDG_CACHE_HOME", xdg) };
+    let result = body();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+    result
+}
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
@@ -180,21 +201,9 @@ fn oversized_state_file_rotates_without_redb_open() {
 fn xdg_cache_root_resolves_under_xdg_cache_home_with_repo_id() {
     let root = temp_root("xdg-cache-root");
     let xdg = temp_root("xdg-cache-home");
-    let previous = std::env::var_os("XDG_CACHE_HOME");
-    unsafe {
-        std::env::set_var("XDG_CACHE_HOME", &xdg);
-    }
 
-    let resolved = cache_dir_path(&root, Some(Path::new("xdg")));
+    let resolved = with_xdg_cache_home(&xdg, || cache_dir_path(&root, Some(Path::new("xdg"))));
 
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("XDG_CACHE_HOME", value);
-        },
-        None => unsafe {
-            std::env::remove_var("XDG_CACHE_HOME");
-        },
-    }
     assert!(
         resolved.starts_with(&xdg),
         "resolved={}",
