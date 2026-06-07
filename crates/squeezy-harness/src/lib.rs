@@ -654,10 +654,12 @@ async fn run_agent_with_config(
                 break;
             }
             AgentEvent::Failed { error, .. } => {
+                agent.shutdown().await;
                 let _ = fs::remove_dir_all(&root);
                 return Err(error);
             }
             AgentEvent::Cancelled { .. } => {
+                agent.shutdown().await;
                 let _ = fs::remove_dir_all(&root);
                 return Err(SqueezyError::Agent("task was cancelled".to_string()));
             }
@@ -690,6 +692,7 @@ async fn run_agent_with_config(
             | AgentEvent::TurnRouted { .. } => {}
         }
     }
+    agent.shutdown().await;
     let _ = fs::remove_dir_all(&root);
     metrics.output_bytes = final_answer.len() as u64;
 

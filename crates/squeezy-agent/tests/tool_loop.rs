@@ -2325,6 +2325,7 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
     ]));
     let first_agent = Agent::new(config_for(root.clone()), first_provider);
     drain_turn(first_agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+    first_agent.shutdown().await;
     drop(first_agent);
 
     let second_provider = Arc::new(ScriptedProvider::new(vec![
@@ -2366,6 +2367,9 @@ async fn repeated_read_result_returns_receipt_stub_across_sessions() {
         "first_session_read"
     );
     assert!(outputs[0].1["content"]["content"].is_null());
+
+    second_agent.shutdown().await;
+    drop(second_agent);
 
     let _ = fs::remove_dir_all(root);
 }
