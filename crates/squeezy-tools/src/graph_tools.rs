@@ -4510,4 +4510,45 @@ mod graph_payload_refresh_status_tests {
         assert!(payload.get("stale_pending").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn payload_surfaces_freshness_mode_and_fallback_reason() {
+        // `freshness_mode` must always be present in the payload. When the
+        // manager is in polling-fallback mode, `freshness_fallback_reason` must
+        // also be present with the exact reason string.
+        let root = temp_root("freshness");
+        std::fs::write(root.join("src").join("a.rs"), "fn a() {}\n").expect("write source");
+        let mut manager = GraphManager::open(&root).expect("open graph");
+        let report = manager.refresh_before_query().expect("refresh");
+
+        // Default mode is polling — no fallback reason.
+        let payload = graph_payload("repo_map", &manager, &report);
+        assert_eq!(
+            payload.get("freshness_mode"),
+            Some(&serde_json::json!("polling")),
+            "default freshness_mode must be 'polling'"
+        );
+        assert!(
+            payload.get("freshness_fallback_reason").is_none(),
+            "no fallback reason expected for default polling mode"
+        );
+
+        // After marking polling fallback the reason must propagate to payload.
+        manager.mark_polling_fallback("watcher startup failed: test");
+        let report2 = manager
+            .refresh_before_query()
+            .expect("refresh after fallback");
+        let payload2 = graph_payload("repo_map", &manager, &report2);
+        assert_eq!(
+            payload2.get("freshness_mode"),
+            Some(&serde_json::json!("polling")),
+        );
+        assert_eq!(
+            payload2.get("freshness_fallback_reason"),
+            Some(&serde_json::json!("watcher startup failed: test")),
+            "fallback reason must appear in payload after mark_polling_fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

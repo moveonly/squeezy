@@ -2151,7 +2151,7 @@ fn graph_manager_returns_config_error_for_invalid_policy_glob() {
 }
 
 #[test]
-fn watcher_paths_skip_squeezy_cache_and_default_pruned_dirs() {
+fn watcher_paths_skip_vcs_and_squeezy_cache_only() {
     let root = PathBuf::from("/workspace/project");
 
     assert!(watcher_path_should_enqueue(&root, &root.join("src/lib.rs")));

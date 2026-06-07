@@ -706,7 +706,7 @@ fn parse_language_selector(language: &str) -> Result<Vec<LanguageKind>> {
     match raw.as_str() {
         "c#" => return Ok(LanguageFamily::CSharp.kinds().to_vec()),
         "c++" => return Ok(vec![LanguageKind::Cpp]),
-        "c/c++" | "c-c++" | "c_family" => return Ok(LanguageFamily::CFamily.kinds().to_vec()),
+        "c/c++" | "c-c++" => return Ok(LanguageFamily::CFamily.kinds().to_vec()),
         _ => {}
     }
     let normalized = language_selector_key(language);
@@ -756,23 +756,25 @@ fn language_enabled(language: LanguageKind, enabled: &HashSet<LanguageKind>) -> 
 }
 
 fn apply_language_allowlist(
-    files: &mut [FileRecord],
+    files: &mut Vec<FileRecord>,
     enabled: &HashSet<LanguageKind>,
     unsupported: &mut Vec<UnsupportedFile>,
 ) {
-    for file in files {
+    let mut kept = Vec::with_capacity(files.len());
+    for file in files.drain(..) {
         if language_enabled(file.language, enabled) {
-            continue;
+            kept.push(file);
+        } else {
+            unsupported.push(unsupported_file(
+                &file.path,
+                file.relative_path.clone(),
+                extension_string(&file.path),
+                file.size_bytes,
+                UnsupportedReason::LanguageDisabled,
+            ));
         }
-        unsupported.push(unsupported_file(
-            &file.path,
-            file.relative_path.clone(),
-            extension_string(&file.path),
-            file.size_bytes,
-            UnsupportedReason::LanguageDisabled,
-        ));
-        file.language = LanguageKind::Unsupported;
     }
+    *files = kept;
 }
 
 fn extension_string(path: &Path) -> Option<String> {
@@ -809,9 +811,11 @@ fn refine_c_family_header_languages(files: &mut [FileRecord]) {
         if !is_plain_c_header(&file.relative_path) {
             continue;
         }
-        if file.language != LanguageKind::Cpp {
-            continue;
-        }
+        debug_assert_eq!(
+            file.language,
+            LanguageKind::Cpp,
+            "classify_language always assigns Cpp to .h files before refinement"
+        );
         let Some(stem) = path_without_extension(&file.relative_path) else {
             file.language = project_default;
             continue;

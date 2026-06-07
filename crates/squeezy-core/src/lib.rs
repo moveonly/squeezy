@@ -8986,9 +8986,7 @@ pub struct GraphConfig {
 impl GraphConfig {
     fn from_settings(settings: GraphSettings) -> Self {
         Self {
-            languages: settings
-                .languages
-                .unwrap_or_else(|| vec!["rust".to_string(), "python".to_string()]),
+            languages: settings.languages.unwrap_or_default(),
             max_file_bytes: settings.max_file_bytes.unwrap_or(1_000_000),
             include_hidden: settings.include_hidden.unwrap_or(false),
             require_indexing_signal: settings.require_indexing_signal.unwrap_or(true),
@@ -10211,7 +10209,7 @@ pub fn project_settings_template() -> &'static str {
 # external MCP tools that are discovered before each agent turn.
 
 # [graph]
-# languages = ["rust", "python"]
+# languages = ["rust", "python"]  # empty or absent means all supported languages
 # max_file_bytes = 1000000
 # include_hidden = false
 # require_indexing_signal = true

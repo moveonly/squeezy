@@ -114,8 +114,8 @@ fn crawler_does_not_read_large_files_into_memory() {
 }
 
 #[test]
-fn language_allowlist_keeps_disabled_languages_as_fallback_records() {
-    let root = temp_root("language_allowlist_keeps_disabled_languages_as_fallback_records");
+fn language_allowlist_moves_disabled_languages_to_unsupported() {
+    let root = temp_root("language_allowlist_moves_disabled_languages_to_unsupported");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "fn rust() {}\n").unwrap();
     fs::write(root.join("src/app.py"), "def python():\n    pass\n").unwrap();
@@ -129,27 +129,34 @@ fn language_allowlist_keeps_disabled_languages_as_fallback_records() {
     .crawl(&root)
     .unwrap();
 
+    // Allowed language stays in files.
     let rust = snapshot
         .files
         .iter()
         .find(|file| file.relative_path == "src/lib.rs")
         .expect("rust file indexed");
     assert_eq!(rust.language, LanguageKind::Rust);
-    let python = snapshot
-        .files
-        .iter()
-        .find(|file| file.relative_path == "src/app.py")
-        .expect("disabled python file retained");
-    assert_eq!(python.language, LanguageKind::Unsupported);
+
+    // Disabled files must NOT appear in snapshot.files at all.
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .all(|file| file.relative_path != "src/app.py"),
+        "disabled python file must not be in snapshot.files"
+    );
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .all(|file| file.relative_path != "src/native.h"),
+        "disabled C header must not be in snapshot.files"
+    );
+
+    // Disabled files must appear exactly once in snapshot.unsupported.
     assert!(snapshot.unsupported.iter().any(|file| {
         file.relative_path == "src/app.py" && file.reason == UnsupportedReason::LanguageDisabled
     }));
-    let header = snapshot
-        .files
-        .iter()
-        .find(|file| file.relative_path == "src/native.h")
-        .expect("disabled C header retained");
-    assert_eq!(header.language, LanguageKind::Unsupported);
     assert!(snapshot.unsupported.iter().any(|file| {
         file.relative_path == "src/native.h" && file.reason == UnsupportedReason::LanguageDisabled
     }));

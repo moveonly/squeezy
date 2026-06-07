@@ -2081,8 +2081,6 @@ pub struct GraphManager {
     store_metadata: Option<GraphStoreMetadata>,
     last_refresh: Instant,
     build_report: GraphBuildReport,
-    freshness_mode: GraphFreshnessMode,
-    freshness_fallback_reason: Option<String>,
     /// Paths the next `refresh_now` should treat as authoritatively changed.
     /// Wrapped in `Arc<Mutex<>>` so a background [`watcher::FileWatcher`]
     /// can push paths from its own thread; writers push, the single reader
@@ -2164,20 +2162,15 @@ impl GraphManager {
                 }
             }
         })?;
-        manager.freshness_mode = GraphFreshnessMode::Watcher;
         manager.build_report.freshness_mode = GraphFreshnessMode::Watcher;
-        manager.freshness_fallback_reason = None;
         manager.build_report.freshness_fallback_reason = None;
         manager._watcher = Some(file_watcher);
         Ok(manager)
     }
 
     pub fn mark_polling_fallback(&mut self, reason: impl Into<String>) {
-        let reason = reason.into();
-        self.freshness_mode = GraphFreshnessMode::Polling;
-        self.freshness_fallback_reason = Some(reason.clone());
         self.build_report.freshness_mode = GraphFreshnessMode::Polling;
-        self.build_report.freshness_fallback_reason = Some(reason);
+        self.build_report.freshness_fallback_reason = Some(reason.into());
     }
 
     fn open_with_optional_store(
@@ -2247,8 +2240,6 @@ impl GraphManager {
             store_metadata,
             last_refresh: Instant::now(),
             build_report,
-            freshness_mode: GraphFreshnessMode::Polling,
-            freshness_fallback_reason: None,
             pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
             _watcher: None,
         })
@@ -2267,11 +2258,11 @@ impl GraphManager {
     }
 
     pub fn freshness_mode(&self) -> GraphFreshnessMode {
-        self.freshness_mode
+        self.build_report.freshness_mode
     }
 
     pub fn freshness_fallback_reason(&self) -> Option<&str> {
-        self.freshness_fallback_reason.as_deref()
+        self.build_report.freshness_fallback_reason.as_deref()
     }
 
     /// Per-language file counts derived from the current graph state.
