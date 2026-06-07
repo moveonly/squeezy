@@ -3070,6 +3070,13 @@ fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<
     Ok(value)
 }
 
+#[cfg(test)]
+fn session_replay_for_cli(tape: SessionReplayTape) -> squeezy_core::Result<serde_json::Value> {
+    let mut session_id_map = BTreeMap::new();
+    add_public_session_id_mapping(&mut session_id_map, &tape.session_id);
+    session_replay_for_cli_with_mapping(tape, &mut session_id_map)
+}
+
 fn session_replay_for_cli_with_mapping(
     tape: SessionReplayTape,
     session_id_map: &mut BTreeMap<String, String>,
