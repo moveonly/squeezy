@@ -4459,13 +4459,13 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         reasoning: 0,
         image: 0,
         attachments: 0,
-        system: 2_100,
+        overhead: 2_100,
         ..ContextSourceTokens::default()
     });
     assert_eq!(recs.len(), 2, "{recs:?}");
     assert_eq!(
         recs[0],
-        "largest: tool_outputs 48% → narrow reads (read_slice / signature spans), prefer grep counts, or enable output dedup",
+        "largest actionable: tool_outputs 48% → narrow reads (read_slice / signature spans), prefer grep counts, or enable output dedup",
         "{recs:?}"
     );
     assert_eq!(
@@ -4481,13 +4481,23 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
         reasoning: 1_000,
         image: 1_000,
         attachments: 1_000,
-        system: 1_000,
+        overhead: 1_000,
         ..ContextSourceTokens::default()
     });
     assert!(balanced.is_empty(), "{balanced:?}");
 
     // An empty/fresh session has nothing actionable to say.
     assert!(context_source_recommendations(&ContextSourceTokens::default()).is_empty());
+
+    // Fixed request overhead can dominate short sessions, but it is mostly
+    // Squeezy-owned instructions and tool advertising. Keep it in the
+    // percentage denominator without presenting it as user cleanup work.
+    let overhead_only = context_source_recommendations(&ContextSourceTokens {
+        overhead: 9_000,
+        tool_outputs: 1_000,
+        ..ContextSourceTokens::default()
+    });
+    assert!(overhead_only.is_empty(), "{overhead_only:?}");
 }
 
 #[test]
