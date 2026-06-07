@@ -1861,17 +1861,22 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
         SessionsCommand::List(args) => {
             let sessions = store.list(&session_query_from_args(args)?)?;
             if args.json {
+                let body = sessions
+                    .iter()
+                    .map(session_metadata_for_cli)
+                    .collect::<squeezy_core::Result<Vec<_>>>()?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&sessions).map_err(|err| {
+                    serde_json::to_string_pretty(&body).map_err(|err| {
                         SqueezyError::Parse(format!("failed to serialize sessions: {err}"))
                     })?
                 );
             } else {
                 for session in sessions {
+                    let handle = PublicSessionHandle::from_store_session_id(&session.session_id);
                     println!(
                         "{}\t{}\t{}\t{}\t{}\t{}",
-                        session.session_id,
+                        handle,
                         session.status.as_str(),
                         session.started_at_ms,
                         session.branch.unwrap_or_else(|| "-".to_string()),
@@ -1889,14 +1894,25 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
         SessionsCommand::Show { id, json } => {
             let record = store.show(id)?;
             if *json {
+                let metadata = session_metadata_for_cli(&record.metadata)?;
+                let body = serde_json::json!({
+                    "metadata": metadata,
+                    "events": record.events,
+                    "event_warnings": record.event_warnings,
+                    "resume_state": record.resume_state,
+                    "attachments": record.attachments,
+                    "replay": record.replay,
+                });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&record).map_err(|err| {
+                    serde_json::to_string_pretty(&body).map_err(|err| {
                         SqueezyError::Parse(format!("failed to serialize session: {err}"))
                     })?
                 );
             } else {
-                println!("id={}", record.metadata.session_id);
+                let handle =
+                    PublicSessionHandle::from_store_session_id(&record.metadata.session_id);
+                println!("id={handle}");
                 println!("status={}", record.metadata.status.as_str());
                 println!("started_at_ms={}", record.metadata.started_at_ms);
                 println!(
@@ -2986,6 +3002,50 @@ fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
             "invalid session status {value:?}; expected running, archived, completed, cancelled, failed, or truncated"
         ))),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicSessionHandle(String);
+
+impl PublicSessionHandle {
+    fn from_store_session_id(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Display for PublicSessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for PublicSessionHandle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(metadata).map_err(|err| {
+        SqueezyError::Parse(format!("failed to serialize session metadata: {err}"))
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(SqueezyError::Parse(
+            "session metadata did not serialize to an object".to_string(),
+        ));
+    };
+    object.remove("session_id");
+    object.insert(
+        "id".to_string(),
+        serde_json::to_value(PublicSessionHandle::from_store_session_id(
+            &metadata.session_id,
+        ))
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize session id: {err}")))?,
+    );
+    Ok(value)
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {
