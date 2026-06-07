@@ -671,6 +671,7 @@ async fn run_agent_with_config(
             | AgentEvent::McpElicitationRequested { .. }
             | AgentEvent::RequestUserInputRequested { .. }
             | AgentEvent::ContextCompacted { .. }
+            | AgentEvent::ContextUsageUpdate { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentActivity { .. }
             | AgentEvent::SubagentToolResult { .. }
