@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -18,6 +19,34 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
+static TEST_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+struct ScopedEnvVar {
+    name: &'static str,
+    original: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn remove(name: &'static str) -> Self {
+        let original = std::env::var_os(name);
+        unsafe {
+            std::env::remove_var(name);
+        }
+        Self { name, original }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
@@ -6372,6 +6401,9 @@ async fn shell_returns_bounded_output_and_exit_code() {
 
 #[tokio::test]
 async fn shell_default_sandbox_runs_benign_command() {
+    let _env_lock = TEST_ENV_LOCK.lock().expect("lock test env");
+    #[cfg(not(windows))]
+    let _shell_env = ScopedEnvVar::remove("SQUEEZY_SHELL");
     let root = temp_workspace("shell_default_sandbox");
     #[cfg(windows)]
     // Windows CI runs the test process with SQUEEZY_SHELL=gitbash so POSIX
