@@ -1481,7 +1481,9 @@ fn is_plan_mode_mutating_filter_segment(segment: &str) -> bool {
         }),
         "base64" => tokens.iter().skip(1).any(|token| {
             let token = dequote_token(token);
-            matches!(token, "-o" | "--output") || token.starts_with("--output=")
+            matches!(token, "-o" | "--output")
+                || token.starts_with("-o")
+                || token.starts_with("--output=")
         }),
         "sort" => tokens.iter().skip(1).any(|token| {
             let token = dequote_token(token);
@@ -1594,7 +1596,9 @@ fn is_plan_mode_read_only_filter_segment(segment: &str) -> bool {
         "true" | "cut" | "tr" | "jq" => true,
         "base64" => !tokens.iter().skip(1).any(|token| {
             let token = dequote_token(token);
-            matches!(token, "-o" | "--output") || token.starts_with("--output=")
+            matches!(token, "-o" | "--output")
+                || token.starts_with("-o")
+                || token.starts_with("--output=")
         }),
         "sort" => !tokens.iter().skip(1).any(|token| {
             matches!(
@@ -1626,6 +1630,9 @@ fn is_plan_mode_read_only_sed_segment(segment: &str) -> bool {
     let Some(script) = args.next() else {
         return false;
     };
+    if args.any(|arg| arg.starts_with('-')) {
+        return false;
+    }
     sed_print_script_is_read_only(script)
 }
 

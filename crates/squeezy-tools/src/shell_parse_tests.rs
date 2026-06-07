@@ -177,6 +177,14 @@ fn plan_mode_rejects_mutating_sed_in_place() {
 }
 
 #[test]
+fn plan_mode_does_not_treat_sed_extra_scripts_as_read_only() {
+    assert_eq!(
+        super::classify_plan_mode_shell_command("sed -n '1p' -e 's/a/b/w out.txt' input.txt"),
+        PlanModeShellSafety::NeedsApproval
+    );
+}
+
+#[test]
 fn plan_mode_treats_codex_style_read_only_family_as_read_only() {
     for command in [
         "nl file.txt",
@@ -198,10 +206,17 @@ fn plan_mode_treats_codex_style_read_only_family_as_read_only() {
 
 #[test]
 fn plan_mode_rejects_base64_file_output() {
-    assert_eq!(
-        super::classify_plan_mode_shell_command("base64 file.bin --output out.txt"),
-        PlanModeShellSafety::Mutating
-    );
+    for command in [
+        "base64 file.bin --output out.txt",
+        "base64 file.bin --output=out.txt",
+        "base64 file.bin -oout.txt",
+    ] {
+        assert_eq!(
+            super::classify_plan_mode_shell_command(command),
+            PlanModeShellSafety::Mutating,
+            "{command} should be treated as a file-output command"
+        );
+    }
 }
 
 #[test]
