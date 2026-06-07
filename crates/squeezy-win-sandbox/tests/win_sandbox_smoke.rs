@@ -73,11 +73,11 @@ fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStat
 
     let status = rt.block_on(async {
         match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-            Ok(status) => status.expect("wait failed"),
+            Ok(status) => Some(status.expect("wait failed")),
             Err(_) => {
                 child.kill();
                 eprintln!("[skip] sandboxed command timed out: {cmdline_arg}");
-                return None;
+                None
             }
         }
     })?;
