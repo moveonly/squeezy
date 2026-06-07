@@ -21,7 +21,8 @@ The current implementation:
 - Fails closed when a required sandbox backend is unavailable: macOS denies if
   `sandbox-exec` isn't on disk or if the kernel refuses to apply the profile;
   Linux denies if `unprivileged_userns_clone` is `0` or `/proc/self/ns/user`
-  doesn't exist.
+  doesn't exist; Windows denies if `windows_sandbox_level = "elevated"` but the
+  one-time setup has not been run (and if `windows_sandbox_level = "disabled"`).
 - Uses `tree-sitter-bash` to classify shell commands before approval.
 - Recursively unwraps shell wrappers (`sh -c "X"`, `bash -lc "Y"`,
   `env BAR=v cmd`, `nohup cmd`, `nice -n N cmd`, `timeout N cmd`,
@@ -72,18 +73,45 @@ Sensitive paths are denied on top of the default deny. In `default` and
 `allow_when_approved`: network opens only for commands classified as network
 after the permission policy has allowed the command.
 
-On **Windows**, Squeezy launches shell commands directly (PowerShell 7
-preferred, then Windows PowerShell, then `cmd.exe`, configurable via
-`SQUEEZY_SHELL`) and binds the child plus every descendant into a Win32
-Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. This gives
-reliable process-tree termination on timeout or cancellation, the
-Windows analog of `setpgid` + SIGKILL on a Unix process group. It does
-not provide filesystem or network isolation: the audit record reports
-`filesystem = "best_effort_unavailable"` and `network =
-"denied_best_effort"` (or whatever the configured policy was, with a
-`fallback_reason` flag clarifying it is never enforced). `mode =
-"required"` therefore denies the command pre-spawn on Windows; use `mode
-= "best_effort"` or `mode = "external"`.
+On **Windows**, the backend is selected by `windows_sandbox_level`
+(`restricted_token` by default, `elevated`, or `disabled`). The shell is
+PowerShell 7 (preferred), Windows PowerShell, or `cmd.exe` (configurable via
+`SQUEEZY_SHELL`), and every descendant is still bound into a Win32 Job Object
+(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for reliable process-tree termination —
+the Windows analog of `setpgid` + SIGKILL.
+
+- **`restricted_token` (default, no admin).** The command runs under a
+  `CreateRestrictedToken` token (`WRITE_RESTRICTED | LUA_TOKEN |
+  DISABLE_MAX_PRIVILEGE`) whose write access is gated by a random per-workspace
+  *capability SID*. On-disk ACLs grant that SID write on the workspace and
+  configured write roots, deny write on read-only carve-outs and protected
+  metadata (`.git`, `.squeezy`, `.agents`, …), and a world-writable audit denies
+  the cap SID on pre-existing world-writable directories to close escape
+  vectors. This enforces **filesystem writes** — the audit reports `filesystem =
+  "enforced_writes_only"`. Because `WRITE_RESTRICTED` tokens do not gate *reads*,
+  sensitive-path read-deny and network egress are NOT enforced on this tier
+  (`network = "not_enforced"`); reads use the user's normal access.
+- **`elevated` (opt-in, one-time UAC).** Run `squeezy doctor --sandbox-setup`
+  once: it provisions two hidden low-privilege local users
+  (`SqueezySandboxOffline` / `SqueezySandboxOnline`, DPAPI-encrypted credentials,
+  hidden from the login screen) and installs persistent WFP egress-block filters
+  scoped to the offline account's SID. Commands then run as the sandbox user via
+  `CreateProcessWithLogonW`; that user's SID has no access to the real user's
+  files beyond the roots setup grants, so this enforces **full read + write
+  isolation** (`filesystem = "enforced"`) plus sensitive-path read-deny. A
+  network-denied command runs as the offline user (WFP blocks ICMP / DNS / DNS-
+  over-TLS / SMB egress → `network = "enforced"`); a network-approved command
+  runs as the online user (no WFP filters). `squeezy doctor --sandbox-teardown`
+  removes the users, WFP filters, and registry entries.
+- **`disabled`.** Job Object process-tree cleanup only; no FS/network isolation
+  (`filesystem = "best_effort_unavailable"`).
+
+`mode = "required"` is satisfied on Windows whenever a backend is available: the
+`restricted_token` tier (always available, enforcing writes) or a provisioned
+`elevated` tier. Selecting `elevated` in `required` mode before running
+`--sandbox-setup` denies pre-spawn with a clear message. The interactive
+ConPTY/runner layer of the elevated tier is not yet wired, so `tty = true`
+degrades to pipes on the Windows sandboxed path.
 
 On **Linux**, Squeezy uses a direct syscall backend. The pre-spawn probe checks
 `/proc/sys/kernel/unprivileged_userns_clone`, `/proc/self/ns/user`, and
@@ -244,6 +272,7 @@ write_roots = []
 protected_metadata_names = [".git", ".squeezy", ".agents"]
 sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
 # replace_sensitive_path_patterns = false  # default; user list EXTENDS the floor above.
+# windows_sandbox_level = "restricted_token"  # Windows only: restricted_token (default) | elevated | disabled
 ```
 
 `network = "allow_when_approved"` opens the network namespace **only** when
@@ -286,6 +315,12 @@ project-specific entries cannot accidentally disable the `.ssh/**`, `.aws/**`,
 `kill_grace_ms` accepts values in the range `10..=60_000`. Out-of-range values
 fail loudly at config load.
 
+`windows_sandbox_level` (Windows only; ignored elsewhere) selects the Windows
+backend: `restricted_token` (default — per-spawn filesystem-write isolation, no
+admin), `elevated` (sandbox-user isolation + WFP network egress control, after a
+one-time `squeezy doctor --sandbox-setup` UAC prompt), or `disabled` (Job Object
+process-tree cleanup only). See the Windows paragraph above.
+
 ## Limits
 
 The sandbox is intentionally local and deterministic. **It is not a substitute
@@ -314,6 +349,15 @@ Known limits:
   disabled: Docker containers with the default seccomp profile, locked-down
   enterprise Linux distributions, WSL1. In `required` mode Squeezy denies
   pre-spawn; in `best_effort` the command runs without OS isolation.
+- Windows: the default `restricted_token` tier enforces filesystem **writes**
+  only — reads run with the user's normal access and network is not enforced
+  (`WRITE_RESTRICTED` tokens do not gate reads, and egress cannot be scoped
+  without a distinct user). Full read isolation + network egress blocking
+  require the opt-in `elevated` tier (`squeezy doctor --sandbox-setup`), which
+  provisions persistent local sandbox users + WFP filters (removed by
+  `--sandbox-teardown`). The elevated tier's interactive ConPTY/runner layer is
+  not yet wired, so `tty = true` degrades to pipes. Windows isolation cannot be
+  validated by macOS/Linux CI; it is verified by a Windows host QA checklist.
 - The classifier is parser-backed but conservative. Truly dynamic constructs
   (`$(...)`, `${...}`, backticks, process substitution, parse errors) always
   classify as `Shell` with risk `High`, even if the inner command would look

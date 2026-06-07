@@ -7208,6 +7208,125 @@ fn approval_menu_renders_below_prompt_without_border_box() {
     assert!(!output.contains("Deny for this session"), "{output}");
     assert!(!output.contains("Approval required"), "{output}");
     assert!(!output.contains('┌'), "{output}");
+    // The keybind hint is folded into the block, not stranded on the status line.
+    assert!(output.contains("approve once"), "{output}");
+}
+
+fn tall_shell_approval() -> ToolApprovalRequest {
+    let mut req = sample_approval_request();
+    req.tool_name = "shell".to_string();
+    req.permission.tool_name = "shell".to_string();
+    req.permission.capability = PermissionCapability::Shell;
+    req.permission.risk = PermissionRisk::High;
+    req.context = Some(
+        "Validate the full Rust workspace end to end before reporting back, \
+         including the integration suites and the doc tests, so the change is \
+         known-good across every crate and target in the repository."
+            .to_string(),
+    );
+    req.permission.metadata.insert(
+        "command".to_string(),
+        "cargo test --workspace --all-features -- --include-ignored --nocapture".to_string(),
+    );
+    req
+}
+
+#[test]
+fn approval_options_stay_visible_on_short_terminal() {
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: tall_shell_approval(),
+        decision_tx,
+    });
+    set_input(&mut app, "approve?".to_string());
+
+    // Heights where the full block overflows; pre-fix the option rows were
+    // clipped behind the status line. All three options must stay painted in
+    // both render paths.
+    for height in [12u16, 16, 20] {
+        let out = render_to_string(&app, 80, height);
+        assert!(out.contains("Approve"), "render h={height}:\n{out}");
+        assert!(
+            out.contains("Always approve this command in this repo"),
+            "render h={height}:\n{out}"
+        );
+        assert!(out.contains("Deny"), "render h={height}:\n{out}");
+
+        let inline = render_inline_to_string(&app, 80, height);
+        assert!(inline.contains("Approve"), "inline h={height}:\n{inline}");
+        assert!(
+            inline.contains("Always approve this command in this repo"),
+            "inline h={height}:\n{inline}"
+        );
+        assert!(inline.contains("Deny"), "inline h={height}:\n{inline}");
+    }
+}
+
+#[test]
+fn approval_keybind_hint_lives_in_block_not_status() {
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+
+    let block = lines_to_plain_text(&approval_block_capped(
+        &app.pending_approval.as_ref().unwrap().request,
+        0,
+        100,
+        100,
+    ));
+    assert!(block.contains("approve once"), "{block}");
+    assert!(block.contains("always approve repo"), "{block}");
+
+    // The status hint row no longer carries the approval keybindings.
+    let hints = format_status_hints(&app);
+    assert!(!hints.contains("always approve repo"), "{hints}");
+    assert!(!hints.contains("approve once"), "{hints}");
+}
+
+#[test]
+fn approval_block_capped_always_keeps_options() {
+    let mut req = sample_approval_request();
+    req.tool_name = "shell".to_string();
+    req.permission.tool_name = "shell".to_string();
+    req.permission.capability = PermissionCapability::Shell;
+    req.context = Some("validate ".repeat(60));
+    req.permission.metadata.insert(
+        "command".to_string(),
+        "cargo test --workspace --all-features".to_string(),
+    );
+
+    // Short tokens that survive label truncation at narrow widths.
+    let labels = ["Approve", "Always", "Deny"];
+
+    // Narrow widths wrap the option labels; the capped block must still never
+    // exceed its row budget, or ratatui clips a decision off the bottom.
+    for width in [80u16, 50, 30, 24] {
+        let full_rows = visual_line_count(&approval_block_full(&req, 0), width);
+        for max in 4u16..=full_rows + 2 {
+            let lines = approval_block_capped(&req, 0, max, width);
+            let rows = visual_line_count(&lines, width);
+            assert!(rows <= max, "width={width} max={max} produced {rows} rows");
+            let text = lines_to_plain_text(&lines);
+            for label in labels {
+                assert!(
+                    text.contains(label),
+                    "width={width} max={max} missing '{label}':\n{text}"
+                );
+            }
+        }
+    }
+
+    // With room, the full untruncated labels and the folded footer are present.
+    let roomy = lines_to_plain_text(&approval_block_capped(&req, 0, 100, 80));
+    assert!(
+        roomy.contains("Always approve this command in this repo"),
+        "{roomy}"
+    );
+    assert!(roomy.contains("approve once"), "{roomy}");
 }
 
 #[test]

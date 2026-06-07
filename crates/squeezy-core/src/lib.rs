@@ -6817,6 +6817,8 @@ pub struct ShellSandboxSettings {
     /// floor so a config that lists a single project pattern still keeps
     /// the `.ssh/**`, `.aws/**`, `.netrc`, etc. denials.
     pub replace_sensitive_path_patterns: Option<bool>,
+    /// Windows-only: `disabled`, `restricted_token` (default), or `elevated`.
+    pub windows_sandbox_level: Option<String>,
 }
 
 impl ShellSandboxSettings {
@@ -6834,6 +6836,7 @@ impl ShellSandboxSettings {
                 "protected_metadata_names",
                 "sensitive_path_patterns",
                 "replace_sensitive_path_patterns",
+                "windows_sandbox_level",
             ],
             source,
             path,
@@ -6884,6 +6887,12 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "replace_sensitive_path_patterns"),
             )?,
+            windows_sandbox_level: string_value(
+                table,
+                "windows_sandbox_level",
+                source,
+                &field(path, "windows_sandbox_level"),
+            )?,
         })
     }
 
@@ -6907,6 +6916,7 @@ impl ShellSandboxSettings {
             &mut self.replace_sensitive_path_patterns,
             next.replace_sensitive_path_patterns,
         );
+        replace_if_some(&mut self.windows_sandbox_level, next.windows_sandbox_level);
     }
 }
 
@@ -6962,6 +6972,44 @@ impl ShellSandboxNetworkPolicy {
     }
 }
 
+/// Which Windows sandbox backend the shell sandbox should use. Ignored on
+/// non-Windows platforms (macOS/Linux have their own backends).
+///
+/// * `RestrictedToken` (default) — per-spawn restricted-token filesystem
+///   isolation; no admin required. Enforces filesystem *writes* and write
+///   carve-outs. Reads and network are not enforced on this tier.
+/// * `Elevated` — opt-in tier provisioned by `squeezy doctor --sandbox-setup`
+///   (one-time UAC): runs commands as a dedicated sandbox user with full
+///   read-deny and WFP network egress control. Falls back to `RestrictedToken`
+///   (best-effort) or denies (required) when setup has not been completed.
+/// * `Disabled` — no OS isolation; Job Object process-tree cleanup only (the
+///   historical Windows behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowsSandboxLevel {
+    Disabled,
+    RestrictedToken,
+    Elevated,
+}
+
+impl WindowsSandboxLevel {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "off" | "none" => Some(Self::Disabled),
+            "restricted_token" | "restricted-token" | "restricted" => Some(Self::RestrictedToken),
+            "elevated" => Some(Self::Elevated),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::RestrictedToken => "restricted_token",
+            Self::Elevated => "elevated",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellSandboxConfig {
     pub mode: ShellSandboxMode,
@@ -6973,6 +7021,9 @@ pub struct ShellSandboxConfig {
     pub write_roots: Vec<PathBuf>,
     pub protected_metadata_names: Vec<String>,
     pub sensitive_path_patterns: Vec<String>,
+    /// Windows-only backend selection. Defaults to `RestrictedToken` so Windows
+    /// shells get filesystem isolation with no configuration. Ignored elsewhere.
+    pub windows_sandbox_level: WindowsSandboxLevel,
 }
 
 impl Default for ShellSandboxConfig {
@@ -6987,6 +7038,7 @@ impl Default for ShellSandboxConfig {
             write_roots: Vec::new(),
             protected_metadata_names: default_protected_metadata_names(),
             sensitive_path_patterns: default_sensitive_path_patterns(),
+            windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
         }
     }
 }
@@ -7102,6 +7154,13 @@ impl ShellSandboxConfig {
         if let Some(protected_metadata_names) = settings.protected_metadata_names {
             config.protected_metadata_names =
                 validate_protected_metadata_names(protected_metadata_names, source)?;
+        }
+        if let Some(level) = settings.windows_sandbox_level {
+            config.windows_sandbox_level = WindowsSandboxLevel::parse(&level).ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.windows_sandbox_level invalid value {level:?}; expected disabled, restricted_token, or elevated"
+                ))
+            })?;
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)
@@ -9637,6 +9696,27 @@ pub fn default_projects_dir() -> PathBuf {
         return config.join("squeezy").join("projects");
     }
     PathBuf::from(".squeezy/projects")
+}
+
+/// Per-user global directory for Windows shell-sandbox state: the
+/// capability-SID map (restricted-token tier, keyed by workspace path within
+/// the file), and the elevated tier's sandbox-user secrets, setup marker, and
+/// deny-read ACL state. It is global rather than per-workspace so the
+/// machine-level elevated tier (local users + WFP filters) is provisioned and
+/// torn down once per user, not duplicated — and a `--sandbox-teardown` in one
+/// workspace does not delete users another workspace relies on. Windows-only in
+/// practice, but defined cross-platform so callers need no `cfg`.
+pub fn default_win_sandbox_state_dir() -> PathBuf {
+    if let Some(custom) = env::var_os("SQUEEZY_WIN_SANDBOX_DIR") {
+        return PathBuf::from(custom);
+    }
+    if let Some(home) = home_squeezy_subpath("win-sandbox") {
+        return home;
+    }
+    if let Some(data) = dirs::data_dir() {
+        return data.join("squeezy").join("win-sandbox");
+    }
+    PathBuf::from(".squeezy/win-sandbox")
 }
 
 fn home_squeezy_subpath(name: &str) -> Option<PathBuf> {
