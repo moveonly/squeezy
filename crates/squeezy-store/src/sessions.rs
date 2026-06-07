@@ -122,6 +122,11 @@ impl SessionStore {
             .index_db
             .lock()
             .map_err(|_| SqueezyError::Tool("session index lock poisoned".into()))?;
+        // If the underlying file was removed externally (e.g. cleanup or tests),
+        // drop the cached handle so open_session_index recreates it on next access.
+        if guard.is_some() && !self.session_index_path().exists() {
+            *guard = None;
+        }
         if guard.is_none() {
             *guard = Some(open_session_index(&self.session_index_path())?);
         }
