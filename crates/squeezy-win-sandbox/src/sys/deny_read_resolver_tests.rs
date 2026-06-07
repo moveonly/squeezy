@@ -46,7 +46,7 @@ fn relative_glob_expands_under_home() {
 
     // id_rsa should be found under home/.ssh/
     assert!(
-        result.iter().any(|p| p.ends_with("id_rsa")),
+        result.contains(&id_rsa),
         "expected id_rsa in result; got {result:?}"
     );
 
@@ -63,7 +63,7 @@ fn duplicates_are_deduped() {
     let patterns = vec!["dup.txt".to_string()];
     let result = resolve_deny_read_paths(&patterns, std::slice::from_ref(&f), None, &tmp);
 
-    let count = result.iter().filter(|p| p.ends_with("dup.txt")).count();
+    let count = result.iter().filter(|p| p.as_path() == f.as_path()).count();
     assert_eq!(
         count, 1,
         "expected exactly one entry for dup.txt; got {result:?}"

@@ -5,7 +5,7 @@
 //! `split_whitespace`.
 
 use super::{
-    CommandUnit, Redirect, analyze_shell_command, extract_command_units,
+    CommandUnit, PlanModeShellSafety, Redirect, analyze_shell_command, extract_command_units,
     extract_shell_write_targets, shell_segment_has_destructive_redirect,
 };
 use crate::PermissionCapability;
@@ -151,6 +151,72 @@ fn sonar_cli_is_not_destructive() {
         "sonar CLI reads must not be flagged destructive: {analysis:?}",
     );
     assert_ne!(analysis.capability, PermissionCapability::Destructive);
+}
+
+#[test]
+fn plan_mode_treats_sed_print_slices_as_read_only() {
+    for command in [
+        "sed -n '1,5p' file.txt",
+        "sed -n 1,5p file.txt",
+        "cat -n file.txt | sed -n '50,200p'",
+    ] {
+        assert_eq!(
+            super::classify_plan_mode_shell_command(command),
+            PlanModeShellSafety::ReadOnly,
+            "{command} should be a read-only Plan Mode probe"
+        );
+    }
+}
+
+#[test]
+fn plan_mode_rejects_mutating_sed_in_place() {
+    assert_eq!(
+        super::classify_plan_mode_shell_command("sed -i 's/a/b/' file.txt"),
+        PlanModeShellSafety::Mutating
+    );
+}
+
+#[test]
+fn plan_mode_does_not_treat_sed_extra_scripts_as_read_only() {
+    assert_eq!(
+        super::classify_plan_mode_shell_command("sed -n '1p' -e 's/a/b/w out.txt' input.txt"),
+        PlanModeShellSafety::NeedsApproval
+    );
+}
+
+#[test]
+fn plan_mode_treats_codex_style_read_only_family_as_read_only() {
+    for command in [
+        "nl file.txt",
+        "paste a.txt b.txt",
+        "rev file.txt",
+        "seq 1 10",
+        "uname -a",
+        "which cargo",
+        "whoami",
+        "base64 file.bin",
+    ] {
+        assert_eq!(
+            super::classify_plan_mode_shell_command(command),
+            PlanModeShellSafety::ReadOnly,
+            "{command} should be a read-only Plan Mode probe"
+        );
+    }
+}
+
+#[test]
+fn plan_mode_rejects_base64_file_output() {
+    for command in [
+        "base64 file.bin --output out.txt",
+        "base64 file.bin --output=out.txt",
+        "base64 file.bin -oout.txt",
+    ] {
+        assert_eq!(
+            super::classify_plan_mode_shell_command(command),
+            PlanModeShellSafety::Mutating,
+            "{command} should be treated as a file-output command"
+        );
+    }
 }
 
 #[test]
