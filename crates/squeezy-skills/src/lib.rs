@@ -1441,26 +1441,42 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             continue;
         }
 
-        // A `- matcher: ...` clause opens a new matcher under the
-        // current event. The matcher indent is locked on first sight
-        // so later `command:`/`once:` lines can be told apart from a
-        // sibling matcher reliably.
+        // A matcher item opens a new hook group under the current
+        // event. `- matcher: ...` installs a tool-name filter;
+        // `- hooks:` is the documented shorthand for an omitted matcher
+        // and therefore matches every payload for the event. The
+        // matcher indent is locked on first sight so later
+        // `command:`/`once:` lines can be told apart from a sibling
+        // matcher reliably.
         if let Some(item) = trimmed.strip_prefix("- ")
             && let Some((key, value)) = item.split_once(':')
-            && key.trim() == "matcher"
+            && matcher_indent.map_or(true, |m| indent <= m)
         {
-            matcher_indent = Some(indent);
-            let raw_match = unquote(value.trim()).to_string();
-            let matcher = if raw_match.is_empty() || raw_match == "*" {
-                None
-            } else {
-                Some(raw_match)
-            };
-            current_matchers.push(SkillHookMatcher {
-                matcher,
-                hooks: Vec::new(),
-            });
-            continue;
+            match key.trim() {
+                "matcher" => {
+                    matcher_indent = Some(indent);
+                    let raw_match = unquote(value.trim()).to_string();
+                    let matcher = if raw_match.is_empty() || raw_match == "*" {
+                        None
+                    } else {
+                        Some(raw_match)
+                    };
+                    current_matchers.push(SkillHookMatcher {
+                        matcher,
+                        hooks: Vec::new(),
+                    });
+                    continue;
+                }
+                "hooks" if value.trim().is_empty() => {
+                    matcher_indent = Some(indent);
+                    current_matchers.push(SkillHookMatcher {
+                        matcher: None,
+                        hooks: Vec::new(),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         // A `- type: command` (or any `- key: value`) at indent
