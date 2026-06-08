@@ -1349,6 +1349,42 @@ fn config_explain_resolves_wildcard_sources_with_concrete_path() {
 }
 
 #[test]
+fn config_explain_displays_concrete_wildcard_values() {
+    let mut config = AppConfig::default();
+    config.providers.insert(
+        "anthropic".to_string(),
+        squeezy_core::ProviderSettings {
+            cheap_model: Some("custom-haiku".to_string()),
+            ..Default::default()
+        },
+    );
+    config.model_limits.insert(
+        "anthropic:claude-sonnet-4-6".to_string(),
+        squeezy_core::ModelLimitOverride {
+            context_window: Some(123_456),
+        },
+    );
+
+    let provider_path = ["providers", "anthropic", "cheap_model"];
+    let provider_field = find_config_field_for_path(&provider_path).expect("provider field");
+    assert_eq!(
+        explain_effective_value(&config, provider_field, &provider_path),
+        "custom-haiku"
+    );
+
+    let model_limit_path = [
+        "model_limits",
+        "anthropic:claude-sonnet-4-6",
+        "context_window",
+    ];
+    let model_limit_field = find_config_field_for_path(&model_limit_path).expect("limit field");
+    assert_eq!(
+        explain_effective_value(&config, model_limit_field, &model_limit_path),
+        "123456"
+    );
+}
+
+#[test]
 fn skills_upsert_entry_inserts_when_no_match() {
     let mut entries = toml_edit::ArrayOfTables::new();
     let selector = SkillsSelector {

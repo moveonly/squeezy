@@ -1098,7 +1098,7 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                 )));
             };
             let config = config_from_cli(cli)?;
-            let effective_value = (field_meta.get)(&config).as_display();
+            let effective_value = explain_effective_value(&config, field_meta, &parts);
             let sources = load_separated_settings_sources()
                 .map_err(|e| SqueezyError::Config(format!("failed to load settings tiers: {e}")))?;
             let winning_source = resolve_explain_field_source(&sources, field_meta, &parts);
@@ -1244,6 +1244,94 @@ fn resolve_explain_field_source(
         return FieldSource::User;
     }
     FieldSource::Default
+}
+
+fn explain_effective_value(
+    config: &AppConfig,
+    field: &squeezy_core::config_schema::FieldMeta,
+    requested_path: &[&str],
+) -> String {
+    concrete_explain_value(config, field.toml_path, requested_path)
+        .unwrap_or_else(|| (field.get)(config).as_display())
+}
+
+fn concrete_explain_value(
+    config: &AppConfig,
+    schema_path: &[&str],
+    requested_path: &[&str],
+) -> Option<String> {
+    match (schema_path, requested_path) {
+        (["providers", "*", key], ["providers", provider, _]) => {
+            provider_explain_value(config, provider, key)
+        }
+        (["model_limits", "*", "context_window"], ["model_limits", model_key, _]) => Some(
+            config
+                .model_limits
+                .get(*model_key)
+                .and_then(|entry| entry.context_window)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
+        ),
+        _ => None,
+    }
+}
+
+fn provider_explain_value(config: &AppConfig, provider: &str, key: &str) -> Option<String> {
+    match key {
+        "cheap_model" => {
+            Some(provider_cheap_model(config, provider).unwrap_or_else(|| "—".to_string()))
+        }
+        "judge_model" => Some(provider_judge_model(config, provider)),
+        "judge_prompt" => Some(provider_judge_prompt(config, provider)),
+        "expensive_models" => Some(squeezy_core::resolved_reroute_filter(config, provider)),
+        _ => None,
+    }
+}
+
+fn provider_cheap_model(config: &AppConfig, provider: &str) -> Option<String> {
+    let model = config
+        .providers
+        .get(provider)
+        .and_then(|p| p.cheap_model.clone())
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| config.small_fast_model.clone())
+        .or_else(|| squeezy_core::judge_model_for_provider(provider).map(str::to_string))
+        .or_else(|| {
+            (provider == "ollama").then(|| squeezy_core::DEFAULT_OLLAMA_MODEL.to_string())
+        })?;
+    Some(resolve_model_alias_for_display(provider, model))
+}
+
+fn provider_judge_model(config: &AppConfig, provider: &str) -> String {
+    if let Some(model) = config
+        .providers
+        .get(provider)
+        .and_then(|p| p.judge_model.clone())
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| config.routing.judge_model.clone())
+    {
+        return resolve_model_alias_for_display(provider, model);
+    }
+    squeezy_core::judge_model_for_provider(provider)
+        .map(str::to_string)
+        .or_else(|| provider_cheap_model(config, provider))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn provider_judge_prompt(config: &AppConfig, provider: &str) -> String {
+    config
+        .providers
+        .get(provider)
+        .and_then(|p| p.judge_prompt.clone())
+        .filter(|prompt| !prompt.trim().is_empty())
+        .or_else(|| config.routing.judge_prompt.clone())
+        .unwrap_or_else(|| squeezy_core::default_judge_prompt(provider).to_string())
+}
+
+fn resolve_model_alias_for_display(provider: &str, model: String) -> String {
+    squeezy_core::resolve_model_alias(provider, &model)
+        .unwrap_or(&model)
+        .to_string()
 }
 
 /// Reads `path` and returns each non-comment line that has a string value
