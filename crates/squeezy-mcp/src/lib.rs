@@ -1916,9 +1916,22 @@ impl Drop for ElicitationPauseGuard {
 struct StdioProcessHandle {
     pid: u32,
     terminated: AtomicBool,
+    /// On Windows, the process is assigned to a Job Object with
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so the whole process tree
+    /// (including grandchildren spawned by wrapper launchers such as
+    /// `cmd.exe`, PowerShell, `npx`, etc.) is terminated when this handle
+    /// drops. Direct `TerminateProcess` is used as a fallback if Job Object
+    /// assignment fails.
+    ///
+    /// This field exists purely for its Drop side-effect (RAII guard); the
+    /// value itself is never read after construction.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    win_job: Option<win_job::McpJob>,
 }
 
 impl StdioProcessHandle {
+    #[cfg(not(windows))]
     fn new(pid: u32) -> Self {
         Self {
             pid,
@@ -1926,10 +1939,30 @@ impl StdioProcessHandle {
         }
     }
 
+    #[cfg(windows)]
+    fn new(pid: u32, win_job: Option<win_job::McpJob>) -> Self {
+        Self {
+            pid,
+            terminated: AtomicBool::new(false),
+            win_job,
+        }
+    }
+
     fn terminate(&self) {
         if self.terminated.swap(true, Ordering::SeqCst) {
             return;
         }
+        // On Windows, primary cleanup is the Job Object (win_job field):
+        // dropping it closes the handle, firing KILL_ON_JOB_CLOSE and killing
+        // the entire process tree. Only fall back to direct PID termination
+        // when Job Object assignment failed at spawn time (win_job == None).
+        // The field drop happens after this method returns (Rust struct drop
+        // order: body runs first, then fields in declaration order).
+        #[cfg(windows)]
+        if self.win_job.is_none() {
+            terminate_process_group(self.pid);
+        }
+        #[cfg(not(windows))]
         terminate_process_group(self.pid);
     }
 }
@@ -1958,8 +1991,13 @@ async fn start_stdio_service(
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
+    if let Some(cwd) = &server.cwd {
+        process.current_dir(cwd);
+    }
     #[cfg(unix)]
     process.process_group(0);
+    #[cfg(windows)]
+    warn_duplicate_env_keys(server_name, &server.env);
     let (transport, stderr) = TokioChildProcess::builder(process)
         .stderr(Stdio::piped())
         .spawn()
@@ -1967,7 +2005,34 @@ async fn start_stdio_service(
             server: server_name.to_string(),
             message: err.to_string(),
         })?;
+    #[cfg(not(windows))]
     let process_handle = transport.id().map(StdioProcessHandle::new);
+    #[cfg(windows)]
+    let process_handle = {
+        let pid = transport.id();
+        // NOTE: There is an inherent race window between process spawn and
+        // `AssignProcessToJobObject`. Grandchildren spawned by the child before
+        // assignment completes (e.g. `cmd.exe` immediately launching `node`)
+        // will not be members of the job and will survive cleanup. The proper
+        // fix (CREATE_SUSPENDED + assign + ResumeThread) is not accessible
+        // through `tokio::process::Command`, so this best-effort coverage is
+        // the best we can do without a custom spawn helper. The window is
+        // typically a few microseconds in practice.
+        let job = pid.and_then(|pid| match win_job::McpJob::new_and_assign(pid) {
+            Ok(job) => Some(job),
+            Err(err) => {
+                tracing::warn!(
+                    target: "squeezy::mcp",
+                    server = %server_name,
+                    error = %err,
+                    "failed to assign MCP stdio process to Job Object; \
+                     process-tree cleanup will fall back to direct PID termination"
+                );
+                None
+            }
+        });
+        pid.map(|pid| StdioProcessHandle::new(pid, job))
+    };
     if let Some(stderr) = stderr {
         let server_name = server_name.to_string();
         tokio::spawn(async move {
@@ -2834,6 +2899,7 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "command": &server.command,
         "args": &server.args,
         "url": &server.url,
+        "cwd": &server.cwd,
         "timeout_ms": server.timeout_ms,
         "discovery_timeout_ms": server.discovery_timeout_ms,
         "tool_call_timeout_ms": server.tool_call_timeout_ms,
@@ -2900,13 +2966,10 @@ fn terminate_process_group(pid: u32) {
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
-    // Windows has no process-group / signal equivalent. The MCP transport
-    // spawns a single stdio server child; TerminateProcess on its PID is
-    // the closest analog to the Unix SIGKILL-on-pgid path. Grandchildren
-    // spawned by the server are not transitively killed — a Job Object
-    // wrapper would be needed for that, which `squeezy-tools::win_job`
-    // provides for shell sandboxing but is intentionally not adopted here
-    // because MCP stdio servers are typically single-process.
+    // Primary cleanup happens through the Job Object held by StdioProcessHandle
+    // (which has KILL_ON_JOB_CLOSE and kills the full process tree when dropped).
+    // This direct TerminateProcess call is a belt-and-suspenders fallback for
+    // the direct child PID when Job Object assignment failed at spawn time.
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) };
     if handle.is_null() {
         return;
@@ -2919,6 +2982,108 @@ fn terminate_process_group(pid: u32) {
 
 #[cfg(not(any(unix, windows)))]
 fn terminate_process_group(_pid: u32) {}
+
+/// On Windows, warn if the stdio server's env map contains keys that differ
+/// only in case. Windows env lookup is case-insensitive at the OS level, so
+/// two entries like `Path` and `PATH` can silently shadow each other and cause
+/// unexpected behavior at process startup.
+#[cfg(windows)]
+fn warn_duplicate_env_keys(server_name: &str, env: &std::collections::BTreeMap<String, String>) {
+    let mut lower: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for key in env.keys() {
+        let lower_key = key.to_lowercase();
+        if let Some(existing) = lower.insert(lower_key, key.as_str()) {
+            tracing::warn!(
+                target: "squeezy::mcp",
+                server = %server_name,
+                key_a = %existing,
+                key_b = %key,
+                "MCP server env contains keys that differ only in case; \
+                 Windows env lookup is case-insensitive and one will shadow the other"
+            );
+        }
+    }
+}
+
+/// Windows Job Object wrapper for MCP stdio process-tree cleanup.
+///
+/// Mirrors the shell sandbox's `squeezy-tools::win_job::ShellJob` design:
+/// the Job Object is created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so
+/// the entire spawned process tree — including grandchildren launched by
+/// `cmd.exe`, PowerShell, `npx`, or other wrapper launchers — is terminated
+/// when this handle drops.
+#[cfg(windows)]
+mod win_job {
+    use std::{io, mem};
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    pub(super) struct McpJob {
+        handle: HANDLE,
+    }
+
+    impl McpJob {
+        /// Create a Job Object with `KILL_ON_JOB_CLOSE` and immediately assign
+        /// the process with the given PID to it.
+        pub(super) fn new_and_assign(pid: u32) -> io::Result<Self> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let result = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if result == 0 {
+                let err = io::Error::last_os_error();
+                unsafe { CloseHandle(handle) };
+                return Err(err);
+            }
+            let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SET_QUOTA, FALSE, pid) };
+            if process.is_null() {
+                let err = io::Error::last_os_error();
+                unsafe { CloseHandle(handle) };
+                return Err(err);
+            }
+            let assigned = unsafe { AssignProcessToJobObject(handle, process) };
+            unsafe { CloseHandle(process) };
+            if assigned == 0 {
+                let err = io::Error::last_os_error();
+                unsafe { CloseHandle(handle) };
+                return Err(err);
+            }
+            Ok(Self { handle })
+        }
+    }
+
+    impl Drop for McpJob {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    impl std::fmt::Debug for McpJob {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("McpJob").finish_non_exhaustive()
+        }
+    }
+
+    unsafe impl Send for McpJob {}
+    unsafe impl Sync for McpJob {}
+}
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

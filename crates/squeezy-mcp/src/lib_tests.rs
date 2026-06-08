@@ -34,6 +34,7 @@ fn fixture_server(enabled: bool, command: Option<&str>) -> McpServerConfig {
         bearer_token_env_var: None,
         http_headers: BTreeMap::new(),
         env_http_headers: BTreeMap::new(),
+        cwd: None,
     }
 }
 
@@ -739,6 +740,7 @@ fn http_fixture_server() -> McpServerConfig {
         bearer_token_env_var: None,
         http_headers: BTreeMap::new(),
         env_http_headers: BTreeMap::new(),
+        cwd: None,
     }
 }
 
