@@ -373,3 +373,208 @@ hardens perf/signals/term-matrix/Windows in parallel. The critical path is
 `SizeSource → carve → fullscreen lifecycle → delete inline`; everything else hangs off greenfield and
 runs concurrently. Every wave keeps `cargo test -p squeezy-tui` and `-p squeezy-eval` green, and
 `squeezy-eval` (which already drives the fullscreen `render()`) is the free regression net.
+
+---
+
+## 8. §12 future-improvement specs — parallelization
+
+§12 of the companion plan is **post-core capability work**: it is *not* on the critical path and adds
+no new constraint to the spine (`SizeSource → carve → fullscreen lifecycle → delete inline`). Every
+§12 subsection layers on the *same* module boundaries the migration already carves out — the shared
+row model (`transcript_surface.rs`), scroll/anchor math (`scroll.rs`), selection/copy
+(`selection.rs` + `clipboard.rs`), search (`search.rs`), and the interaction framework
+(`interaction.rs`, `queue_surface.rs`, `modal.rs`). That is the whole point of front-loading the
+extraction: once the hot zones are evacuated and the greenfield files exist with stable ids and copy
+ranges, the ten §12 themes become **additive lanes in mostly-new files** that fan out the moment their
+dependency phase lands. They never re-enter Z1/Z2, and they touch `lib.rs` only through the same cheap
+additive integration points (a `mod x;` line, append-only `keymap.rs` `Action` variants, and
+self-contained `handle_*` functions a per-wave Z3 owner wires in). In short: §12 is Wave 3+ greenfield
+fan-out, scheduled by dependency, not a new spine.
+
+### 8.1 Dependency table (subsection → core phase → owning module(s) → size → parallel)
+
+| §12 subsection | Depends-on core phase(s) | Owning module(s) | Size | Parallel w/ core |
+|---|---|---|---|---|
+| 12.1 Interaction Polish | 1, 3, 4, 5, 7, **7B** | `interaction.rs`, `selection.rs`, `search.rs`, `clipboard.rs`; NEW `command_palette.rs`, `breadcrumb_model.rs`, `hints.rs`, `label.rs` | L | yes (7B is the gate) |
+| 12.2 Reading & Comprehension | 3, 4, 5, 7 | `transcript_surface.rs`, `interaction.rs`; NEW `outline_surface.rs`, `lanes_surface.rs`, `pinned_view.rs`, `bookmarks.rs`, `annotations.rs`, `timeline_surface.rs` | L | yes |
+| 12.3 Workflow Acceleration | 3, 4, 5, **7B**, §11.6 queue | `queue_surface.rs`, `interaction.rs`, `selection.rs`, `clipboard.rs`; NEW `workflow.rs`, `scratchpad.rs` | L | yes (queue lanes after §11.6) |
+| 12.4 Layout Intelligence | 1, 3, 4 (+ stable row/pane ids) | `render/layout`, `render/main`, `interaction.rs`, `modal.rs` | L | yes (Wave 2.5 if focus model promoted to core) |
+| 12.5 Transcript Intelligence | 3, 5, 7 | `transcript_surface.rs`, `search.rs`, `clipboard.rs`; NEW `relations.rs` | L | yes |
+| 12.6 Clipboard, Paste & External Handoff | 1, 2, 3, 4, 5 | `clipboard.rs`, `selection.rs`, `search.rs`, `interaction.rs`, `transcript_surface.rs`, `terminal_guard.rs`, `queue_surface.rs`, `modal.rs` | L | yes (after Phase 5) |
+| 12.7 Personalization | 1, 3, 4, **7B**, 8 | `interaction.rs`, `render` (GlyphSet); NEW `keybinding_editor`, `theme_editor`, `terminal_profiles`, `workspace_profile`, `gesture_recognizer` | XL | yes (editors W3, profiles/glyph W5) |
+| 12.8 Collaboration & Multi-Agent | 2, 3, 4, 5, **7B** | `transcript_surface.rs`, `scroll.rs`, `selection.rs`, `interaction.rs`, `queue_surface.rs`; NEW `subagent_surface.rs` | L | yes |
+| 12.9 Reliability & Self-Healing | 1, 3, 4, 5, 7 | `terminal_guard.rs`; NEW `health_and_recovery.rs`, `degradation.rs`, `state_checkpoint.rs`; `render/*` fallback frame | L | yes (Wave 5, after Phase 9) |
+| 12.10 Measurement & Quality Gates | 3, 4, 5, 7, 8, 9, **0B** | `termsim`, `render`, `metrics`, `accessibility` | L | yes (alongside framework, once render output stable) |
+
+**Reading the "depends-on" column:** a §12 lane is *eligible to start* the moment all listed core
+phases have landed (the green gate of the wave that owns the last dependency). Phase 7B (direct
+manipulation, hit-test registry, focus model, gesture recognizer) is the single most common
+prerequisite — it gates 12.1, 12.3, 12.7, and 12.8 — so promoting/stabilizing 7B early is the highest-
+leverage unlock for the §12 backlog, exactly as `SizeSource`/carve were for the core.
+
+### 8.2 Wave assignment (extends §2's schedule)
+
+§12 grafts onto the existing waves as **themed parallel lanes that light up as their dependency phase
+lands** — no new serial spine. The grouping below extends §2.0's DAG; each theme is a `parallel`
+fan-out over its `parallel_units` against the now-stable module boundaries, verified per-lane, then a
+single Z3 integration owner per wave wires the self-contained `handle_*` fns into
+`handle_key`/`handle_mouse` and `keymap.rs` (additive).
+
+```
+… (Wave 2 fullscreen core lands: row model + scroll UX + 7B foundations) …
+                                       │
+WAVE 3  Product completeness + §12 greenfield fan-out ───────────────────┐  (peak parallelism)
+  core §3:  clipboard · selection · search · interaction · queue · modal · export · Ctrl+T
+  ── as Phase 5 lands ──────────────────────────────────────────────────
+  ├─ §12.6 Clipboard/Paste/Handoff   (clipboard.rs + terminal_guard editor handoff)
+  ── as Phase 3/7 land ─────────────────────────────────────────────────
+  ├─ §12.5 Transcript Intelligence   (transcript_surface index/folds + relations.rs + search filters)
+  ├─ §12.2 Reading & Comprehension   (outline/lanes/pinned/bookmarks/annotations/timeline surfaces)
+  ── as Phase 7B lands (highest-leverage §12 unlock) ───────────────────
+  ├─ §12.1 Interaction Polish        (command_palette · breadcrumb · hints · label · multi-cursor)
+  ├─ §12.8 Collaboration/Multi-Agent (subagent_surface timeline/compare/promote/board/attention)
+  ├─ §12.3 Workflow Acceleration     (tool-action + snippet/scratchpad now; queue-themed lanes → 3B)
+  ── as Phase 4 + 7B land ──────────────────────────────────────────────
+  ├─ §12.4 Layout Intelligence       (adaptive density/zen/presentation now; split-solver/dock pair)
+  └─ §12.7 (editors)  Keybinding · Theme · Gesture editors (after interaction framework)
+        + ONE Z3 integration owner per landing wires keymap arms + handle_* fns
+        gate: per-lane adversarial verify; insta snapshots; no Z1/Z2 re-entry
+                                       │
+WAVE 3B  Queue-themed §12 lanes (after §11.6 queue row model) ───────────┐
+  └─ §12.3 queue-groups · conditional-items · templates · macros
+        single Z3 owner wires all into handle_key/queue dispatch after per-lane verify
+                                       │
+… (Wave 4 inline deletion tail — unaffected by §12) …
+                                       │
+WAVE 5  Hardening + §12 reliability/measurement/profiles ────────────────┐
+  ├─ §12.9 Reliability & Self-Healing (after Phase 9: watchdog · terminal-reset CLI · fallback
+  │                                    layout · degraded-mode suggestions · auto-save checkpoints)
+  ├─ §12.10 Measurement & Quality Gates (alongside 0B/8 term-matrix: latency budgets · benchmark
+  │                                      suite · telemetry counters · visual-diff dashboard · a11y)
+  └─ §12.7 (profiles) Terminal/Workspace profiles + Minimal Glyph Mode (parallel w/ perf/signals)
+        gate: full term-matrix green; latency budgets met; a11y gate green; checkpoint crash-sim
+                                       │
+WAVE 6  Post-core polish backlog (12.2 extensions, residual L/XL items)
+```
+
+**Rationale for the grouping.** Most §12 work is greenfield layered on the Phase 3/4/5/7 modules, so
+it is scheduled *by dependency*, not crammed into one wave: clipboard/handoff (§12.6) opens the moment
+Phase 5's selection/copy math is stable; transcript-intelligence (§12.5) and reading (§12.2) ride the
+Phase 3/7 row-model + search; interaction (§12.1) + layout (§12.4) + multi-agent (§12.8) + the
+workflow/queue lanes (§12.3) light up behind Phase 4/7B; reliability (§12.9) waits for Phase 9's
+signal/teardown machinery and lands in Wave 5; and measurement (§12.10) attaches to the Phase 0B/8
+term-matrix and can begin **alongside** the framework as soon as render output is stable. §12.3's
+queue-themed sub-lanes (groups/conditional/templates/macros) depend on the §11.6 queue row model, so
+they slot into a Wave 3B sub-fan-out after §11.6, with one integration owner wiring all of them into
+the queue dispatch.
+
+### 8.3 Workflow sketch — §12 themed fan-out (runnable orchestrations)
+
+Mirrors §6's style: a **meta** with dependency-gated phases, **`parallel`** for the greenfield theme
+lanes, per-lane **verify**, and a single **Z3 integration owner** per landing. The driver
+(`W3_THEMES`) fans out a theme only after its `gate` phases report green, so the script naturally
+schedules each §12 theme as its dependency phase lands.
+
+```js
+export const meta = {
+  name: 'tui-altscreen-w3-s12-fanout',
+  description: '§12 greenfield fan-out: schedule each theme as its core dependency phase lands',
+  phases: [
+    { title: 'After Phase 5' }, { title: 'After Phase 3/7' },
+    { title: 'After Phase 7B' }, { title: 'After Phase 4' },
+    { title: 'Integrate (Z3)' }, { title: 'Verify' },
+  ],
+}
+
+// theme → { gate phase, parallel_units (each becomes one greenfield lane) }
+const W3_THEMES = [
+  { key: '12.6-clipboard', phase: 'After Phase 5', units: [
+    'clipboard.rs core: history ring buffer + OSC52 (limit/chunk) + pbcopy/wl-copy/xclip/clip.exe + temp-file provider chain, trace-testable without a live clipboard',
+    'paste detection heuristics (diff/json/log/code/path) + transform preview modal (plain/quote/code/attach/queue/cancel) via interaction+modal; bracketed-paste safe',
+    'large-paste staging: threshold + temp-backed store + overlay (byte/line/token estimates) + insert/quote/code/tempfile/attach/queue/split/summarize actions',
+    'export request/format/destination + atomic writers + redaction pass + preview modal (text/md/json/html) over transcript_surface rows',
+    'external editor handoff in terminal_guard.rs: leave alt-screen, restore modes, spawn $VISUAL/$EDITOR (POSIX+Windows PATHEXT), diff/summary re-import, signal/panic cleanup',
+    'session bundle: manifest schema + isolated atomic writer + checksum + sanitization + preview modal' ] },
+
+  { key: '12.5-transcript-intel', phase: 'After Phase 3/7', units: [
+    'local index keyed by entry id/revision (normalized text/paths/commands/tools/statuses/langs/errors/health) in transcript_surface.rs; append/update/clear',
+    'semantic filter parser + validation + row-visibility state in search.rs; Ctrl+T filter controls',
+    'relations.rs (NEW): related-entry graph builder + relation types + confidence/provenance model',
+    'duplicate-output folding: detection + raw-content retention + folded-row projection; errors stay visible',
+    'error lenses: rustc/cargo/test/permission/network/panic/sandbox detectors + styled spans, structured-event preferred',
+    'transcript health markers state + display (stale context, compaction, truncation, unresolved approvals, degraded caps)' ] },
+
+  { key: '12.2-reading', phase: 'After Phase 3/7', units: [
+    'outline_surface.rs: OutlineIndex extraction + rail/overlay render + click-to-jump + incremental rebuild',
+    'lanes_surface.rs: per-entry lane folding (TranscriptLane/LaneId), fold state by (entry_id,lane_id), lane click targets + copy modes',
+    'pinned_view.rs: PinnedViewState + split/overlay/tab layout solver + line-based clean-text diff + independent scroll/search/copy per pane',
+    'bookmarks.rs: semantic anchors resilient to resize/fold/filter/resume + create/rename/delete/list/next/prev',
+    'annotations.rs: Annotation CRUD + badges + modal editor + include/omit in export/search (never model-visible)',
+    'timeline_surface.rs: TimelineEvent extraction + filters + rail/list render + jump-back-to-row' ] },
+
+  { key: '12.1-interaction-polish', phase: 'After Phase 7B', units: [
+    'command_palette.rs (NEW): CommandRegistry + ActionContext + universal/contextual fullscreen palette + fuzzy filter + disabled-reason + keybinding display + parameterized 2nd step',
+    'breadcrumb_model.rs (NEW): BreadcrumbModel from focus/search/session/queue + jump commands + keyboard traversal + middle-truncation + hit-test rects',
+    'selection.rs multi-cursor: SelectionSet keyed by entry/row ids + add/remove/merge/order + extended copy/export formatters; logical across resize/fold/filter',
+    'hover intent + preview: HoverIntentState + delay timer + gesture suppression during scroll/drag/selection + visual-only render (no layout change)',
+    'double-click activation: PointerActivationPolicy per hit-target kind + click-count tracking via gesture recognizer; keyboard parity (Enter/Space)',
+    'label.rs (NEW): LabelTargetId + InlineEditState (reuse composer primitives) + session-only metadata; surface in breadcrumbs/rails/search/exports',
+    'hints.rs (NEW): HintEngine trigger tracking + dismissal/cooldown/max-display + toast/status surface',
+    'platform pointer shapes: capability-gated cursor-shape adapter with terminal-aware degradation' ] },
+
+  { key: '12.8-collab', phase: 'After Phase 7B', units: [
+    'subagent timeline panel: extend SubagentRecord (status/activity/elapsed/tool-count/cost/attention) + route events + app-owned scroll render',
+    'hover/click: hit-test targets + SubagentActivationTarget + focus/scroll anchors + jump+back command + semantic style tokens',
+    'compare outputs: SubagentCompareState + per-subagent cache + tabs/cols layout solver + independent scroll per pane + copy/quote/promote',
+    'promote result: command + plain-text projection + source metadata + composer fill (idle) / queue (active turn), never auto-submit',
+    'live review board: queued/running/reviewing/blocked/completed lane classification + board layout + id routing + cap/rejection visibility',
+    'attention routing: SubagentAttentionKind quiet/warning/error classification + status/toast/title routing + log/eval preservation' ] },
+
+  { key: '12.3-workflow', phase: 'After Phase 7B', units: [
+    'workflow.rs (NEW): tool-action dispatcher (retry/edit/copy/open/jump) + command/cwd/exit/approval/sandbox metadata preservation + path/location parsers',
+    'scratchpad.rs (NEW): session-scoped buffer + append-quote/insert-link/send-to-composer/queue/export/clear + persistence',
+    'snippet builders in selection.rs: selection→quote/queue-item/bug-note/plan-refinement with provenance/source-link' ] },
+
+  { key: '12.4-layout', phase: 'After Phase 4', units: [
+    'adaptive density: policy+resolver selecting compact/default/expanded, preserving scroll anchor/selection/focus/queue/composer',
+    'zen mode: layout-suppression policy keeping search/copy/queue/error/help reachable; toggle restores prior visibility',
+    'presentation mode: spacious cards + reduced/redacted metadata + one-shot reveal + non-mutating display policy',
+    'smart split panes + layout solver (interdependent pair): place side panes only when width permits, degrade to stacked/modal/inline',
+    'focus-preserving resize: logical id resolution so focus/selection/scroll/drag/active-action survive split↔stacked↔modal↔compact↔expanded',
+    'dockable panels: panel state machine (task/queue/diff/outline/diagnostics/clipboard) + tabbed containers + persisted prefs (depends on palette/modal)' ] },
+
+  { key: '12.7-editors', phase: 'After Phase 7B', units: [
+    'keybinding_editor (NEW): CommandId registry + layered KeymapResolver + key/chord capture + conflict detection + delta-only persistence',
+    'theme_editor (NEW): semantic Theme tokens + live preview + truecolor/256/no-color palette mapping + GlyphSet separation + versioned storage',
+    'gesture_recognizer (NEW): centralized recognizer + double/triple/Shift-click/drag/wheel/hover/edge-scroll tuning + per-surface bindings + reduced-motion + test panel',
+    'shared modal infra for both editors (centered-block surface, reuse modal.rs)' ] },
+]
+
+// One generative lane per parallel_unit; one adversarial verify per lane; one Z3 owner per landing.
+for (const theme of W3_THEMES) {
+  phase(theme.phase)
+  const lanes = await parallel(theme.units.map((u, i) => () =>
+    agent(`Build §${theme.key} lane ${i + 1}: ${u}\n`
+      + `Deliver the module/struct + its own unit tests + a self-contained handle_* fn for the Z3 owner to wire. `
+      + `Do NOT edit handle_key or re-enter the RENDER (Z1) / GUARD (Z2) zones. Return files changed + how to verify.`,
+      { label: `s12:${theme.key}:${i + 1}`, phase: theme.phase })))
+  await parallel(lanes.filter(Boolean).map((_, i) => () =>
+    agent(`Adversarially verify §${theme.key} lane ${i + 1}: compiles standalone, tests pass, `
+      + `range/copy/search/anchor math correct on wrapped+wide-glyph+folded rows; logical ids survive resize/fold/filter; `
+      + `no keyboard op lacks a mouse equivalent and vice-versa. Report defects.`,
+      { label: `s12:verify:${theme.key}:${i + 1}`, phase: 'Verify' })))
+}
+
+// Single Z3 integration owner: additive keymap arms + wire each handle_* fn, build green, snapshots.
+phase('Integrate (Z3)')
+await agent('Z3 integration owner for the landed §12 themes: add append-only keymap.rs Action variants and '
+  + 'wire each lane\'s self-contained handle_* fn into handle_key/handle_mouse + TuiApp struct fields, single pass. '
+  + 'cargo build+test -p squeezy-tui AND -p squeezy-eval green; refresh insta snapshots.',
+  { label: 's12:integrate', phase: 'Integrate (Z3)' })
+```
+
+Queue-themed §12.3 (groups, conditional items, templates, macros) and the Wave-5 themes (§12.9
+reliability, §12.10 measurement, §12.7 profiles + Minimal Glyph Mode) follow the identical
+shape — `parallel` over `parallel_units`, verify-per-lane, single integration owner — but gated on
+§11.6 (queue row model) and Phase 9 / Phase 0B-8 respectively, so they run as a Wave 3B sub-fan-out
+and inside the Wave 5 `tui-altscreen-w5-harden` workflow rather than the Wave 3 driver above.
