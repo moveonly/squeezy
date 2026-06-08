@@ -122,13 +122,14 @@ pub(crate) fn match_slash_command_prefix(text: &str) -> Option<usize> {
 }
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
-    // `/help` answers locally from bundled docs; falls back to the model only
+    // `/help` answers locally from bundled docs; falls back to the model (network)
     // for topics without local coverage.
-    slash_args(
+    slash_args_caps(
         "/help",
         "show local Squeezy help topics (falls back to model for unknown topics)",
         true,
         "[topic|/slash-command]",
+        &[PermissionCapability::Network],
     ),
     slash_args_caps(
         "/config",

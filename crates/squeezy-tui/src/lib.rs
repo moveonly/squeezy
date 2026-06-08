@@ -3504,18 +3504,27 @@ fn save_status_line(
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
             app.status = format!("status line saved to {}", target_path.display());
+            let project_note = if matches!(scope, status_line_setup::SaveScope::Project) {
+                "\n\nNote: a `status_line` entry in your user settings (~/.squeezy/settings.toml) \
+                 takes precedence over this project setting on restart. Remove it there if you \
+                 want the project layout to apply to your sessions."
+            } else {
+                ""
+            };
             let summary = if slug_list.is_empty() {
                 format!(
-                    "status line cleared (colors {}); written to {}",
+                    "status line cleared (colors {}); written to {}{}",
                     if use_colors { "on" } else { "off" },
                     target_path.display(),
+                    project_note,
                 )
             } else {
                 format!(
-                    "status line saved: {} (colors {}); written to {}",
+                    "status line saved: {} (colors {}); written to {}{}",
                     slug_list.join(", "),
                     if use_colors { "on" } else { "off" },
                     target_path.display(),
+                    project_note,
                 )
             };
             app.push_transcript_item(TranscriptItem::system(summary));
@@ -3531,12 +3540,12 @@ fn save_status_line(
 /// Whether the transcript should show a styled banner for this slash
 /// command's invocation. Commands that open their own UI overlay
 /// (`/config`, `/statusline`, …) are silenced — the overlay is the
-/// affordance. Commands that route through `start_user_turn` and
-/// already produce a user-message bubble (`/help`) are also silenced
-/// to avoid duplication. `/tool-verbosity` reports when called bare but
-/// silently applies a value when given an arg — echo only the second form.
-/// Unrecognized commands are not echoed: they fall through to be sent as
-/// regular user prompts.
+/// affordance. `/help` is silenced: for answered topics it pushes a system
+/// transcript card directly; for unknown topics the `start_user_turn` fallback
+/// produces a user-message bubble — echo in either case would duplicate output.
+/// `/tool-verbosity` reports when called bare but silently applies a value when
+/// given an arg — echo only the second form. Unrecognized commands are not
+/// echoed: they fall through to be sent as regular user prompts.
 fn should_echo_slash_command(command: &str, rest: &str) -> bool {
     if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
         return false;
@@ -4868,6 +4877,11 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
     // sending the turn to the model. Pass the redacted config inspect so the
     // local answer can include relevant config sections, matching the quality
     // of the agent-level `resolve_help_turn` path.
+    //
+    // `answer_for_input` always returns `Some` for `/help`-prefixed input
+    // (parse_help_command always matches). A `None` result or `Unsupported`
+    // status means the topic isn't covered locally; both fall through to the
+    // model turn so the agent's doc-help subagent can handle broader questions.
     let config_inspect = agent.config_snapshot().inspect_redacted();
     let help = SqueezyHelp::new(config_inspect);
     if let Some(answer) = help.answer_for_input(&prompt)
@@ -4877,7 +4891,7 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
         app.status = format!("help: {}", answer.topic);
         return;
     }
-    // Topic not covered locally — fall back to a model turn.
+    // Topic not covered locally — fall back to a model turn (network).
     start_user_turn(app, agent, prompt);
 }
 

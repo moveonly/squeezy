@@ -3079,6 +3079,97 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
     );
 }
 
+#[test]
+fn statusline_picker_tab_toggles_scope() {
+    // Open the picker and verify the default scope is user. Tab should
+    // switch to project. A second Tab should switch back to user.
+    use crate::status_line_setup;
+    let mut state = status_line_setup::StatusLineSetupState::new(None, true);
+    assert_eq!(
+        state.scope,
+        status_line_setup::SaveScope::User,
+        "default scope should be User"
+    );
+    let outcome = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(
+        matches!(outcome, status_line_setup::KeyOutcome::Continue),
+        "Tab should return Continue"
+    );
+    assert_eq!(
+        state.scope,
+        status_line_setup::SaveScope::Project,
+        "after one Tab scope should be Project"
+    );
+    let outcome2 = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(outcome2, status_line_setup::KeyOutcome::Continue));
+    assert_eq!(
+        state.scope,
+        status_line_setup::SaveScope::User,
+        "after two Tabs scope should wrap back to User"
+    );
+}
+
+#[tokio::test]
+async fn statusline_picker_project_scope_save_writes_project_note() {
+    // Open the picker, Tab to project scope, then save. The transcript
+    // summary must mention the project note about user-level override.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("statusline_project_scope");
+    let settings_path = dir.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
+    // Override workspace_root so find_project_settings_path can locate a
+    // squeezy.toml inside the temp dir.
+    let project_settings = dir.join("squeezy.toml");
+    std::fs::write(&project_settings, "").expect("create squeezy.toml");
+    app.workspace_root = dir.clone();
+
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    assert!(app.status_line_setup.is_some());
+
+    // Tab switches to project scope.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("tab scope");
+    assert_eq!(
+        app.status_line_setup.as_ref().expect("picker open").scope,
+        crate::status_line_setup::SaveScope::Project,
+        "scope should be Project after Tab"
+    );
+
+    // Enter saves.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(app.status_line_setup.is_none(), "picker should close");
+
+    let content = last_message_content(&app).expect("save transcript");
+    assert!(
+        content.contains("squeezy.toml"),
+        "summary should mention the project file; got: {content}"
+    );
+    assert!(
+        content.contains("Note:"),
+        "project-scope save should include user-override note; got: {content}"
+    );
+}
+
 #[tokio::test]
 async fn slash_model_opens_config_at_models_section() {
     let mut agent = test_agent(SessionMode::Build);
@@ -4134,21 +4225,21 @@ fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
 #[test]
 fn slash_suggestion_line_contents_match_command_capabilities() {
     // Build the menu lines directly and assert the badge follows the
-    // declared capabilities — covers both presence (`/compact` → `net`) and
-    // absence (`/cost` → no badge). `/help` is local-first so it no longer
-    // carries a network badge.
+    // declared capabilities — covers both presence (`/help` → `net`) and
+    // absence (`/cost` → no badge). `/help` retains the network badge because
+    // it falls back to the model for unknown topics.
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/compact".to_string());
+    set_input(&mut app, "/help".to_string());
     let lines = slash_suggestion_lines(&app, 120);
     let serialised = lines
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect::<Vec<String>>();
-    let compact_line = serialised
+    let help_line = serialised
         .iter()
-        .find(|line| line.contains("/compact"))
-        .expect("rendered /compact line");
-    assert!(compact_line.contains("[net]"), "{compact_line}");
+        .find(|line| line.contains("/help"))
+        .expect("rendered /help line");
+    assert!(help_line.contains("[net]"), "{help_line}");
 
     set_input(&mut app, "/cost".to_string());
     let lines = slash_suggestion_lines(&app, 120);

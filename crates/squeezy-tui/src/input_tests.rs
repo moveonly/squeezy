@@ -48,8 +48,12 @@ fn find_command(name: &str) -> &'static SlashCommand {
 fn slash_commands_declare_expected_capabilities() {
     // Anchors the audited capability mapping so future edits to the catalog
     // stay deliberate rather than accidentally silent.
-    // `/help` is local-first: no network capability badge.
-    assert_eq!(find_command("/help").capabilities, &[]);
+    // `/help` is local-first for known topics, but the model fallback for
+    // unknown topics is still network-capable.
+    assert_eq!(
+        find_command("/help").capabilities,
+        &[PermissionCapability::Network]
+    );
     assert_eq!(
         find_command("/compact").capabilities,
         &[PermissionCapability::Network]
