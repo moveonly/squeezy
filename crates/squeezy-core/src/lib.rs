@@ -9811,6 +9811,16 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 pub fn default_squeezy_skills_dir() -> PathBuf {
+    // On Windows HOME is typically absent; prefer stable profile-relative paths.
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("squeezy").join("skills");
+        }
+        if let Some(userprofile) = env::var_os("USERPROFILE") {
+            return PathBuf::from(userprofile).join(".squeezy").join("skills");
+        }
+    }
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
@@ -9818,6 +9828,21 @@ pub fn default_squeezy_skills_dir() -> PathBuf {
 }
 
 pub fn default_agent_compat_skills_dir() -> PathBuf {
+    // On Windows HOME is typically absent; prefer stable profile-relative paths.
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("squeezy").join("agent-skills");
+        }
+        if let Some(userprofile) = env::var_os("USERPROFILE") {
+            // Use the same `.squeezy` namespace as the APPDATA path so that
+            // skills installed under one profile location remain visible if
+            // APPDATA becomes available (roaming profiles, new machine).
+            return PathBuf::from(userprofile)
+                .join(".squeezy")
+                .join("agent-skills");
+        }
+    }
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))

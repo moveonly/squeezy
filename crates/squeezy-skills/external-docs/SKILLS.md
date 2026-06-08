@@ -115,6 +115,55 @@ When a `skill.toml` sidecar declares `tool_deps`, activation now checks each ent
 
 `hooks:` blocks declared in skill frontmatter only fire when the user sets `[skills] hooks_enabled = true`. Hook commands run via `sh -c` with the same privileges as the Squeezy process — treat enabling hooks for a skill catalog as equivalent to letting that catalog run the `shell` tool, and keep the gate off for untrusted skills.
 
+## Windows
+
+On Windows, skill discovery uses `%APPDATA%\squeezy\skills` for the native user
+root and `%APPDATA%\squeezy\agent-skills` for the compat user root when `HOME`
+is not set (the common case in PowerShell and Windows Terminal). The settings
+file lives at `%APPDATA%\squeezy\settings.toml`.
+
+Use `squeezy skills list` to confirm which roots are actually scanned on your machine.
+
+### Windows PowerShell configuration
+
+Set the user skill directory for the current session:
+
+```powershell
+$env:SQUEEZY_SKILLS_USER_DIR = "$env:APPDATA\squeezy\skills"
+```
+
+Override it permanently in `$PROFILE`:
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("SQUEEZY_SKILLS_USER_DIR", "$env:APPDATA\squeezy\skills", "User")
+```
+
+Disable a specific skill from PowerShell:
+
+```powershell
+squeezy skills disable --path "$env:APPDATA\squeezy\skills\risky-skill" --user
+```
+
+Install the bundled sample skills into the configured user directory:
+
+```powershell
+squeezy skills install
+```
+
+Override the user skill directory in `%APPDATA%\squeezy\settings.toml`:
+
+```toml
+[skills]
+user_dir = 'C:\Users\alice\AppData\Roaming\squeezy\skills'
+compat_user_dir = 'C:\Users\alice\AppData\Roaming\squeezy\agent-skills'
+```
+
+### Windows note on hooks
+
+Skill hooks run through **`sh -c`** on all platforms. On Windows, `sh` must be
+available in `PATH` (Git for Windows, MSYS2, or WSL). PowerShell-native hook
+execution (`pwsh -File ...`) is on the roadmap. See `HOOKS.md` for details.
+
 ## CLI
 
 ```sh

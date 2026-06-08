@@ -245,13 +245,33 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.subagents, SubagentConfig::default());
     assert_eq!(config.telemetry, TelemetryConfig::default());
-    assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
-    assert!(
-        config
-            .skills
-            .compat_user_dir
-            .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
-    );
+    // On Windows the defaults are under %APPDATA%\squeezy\ rather than
+    // ~\.squeezy\, so the path suffix is different. Assert both platforms
+    // produce a non-empty, non-relative default.
+    #[cfg(not(windows))]
+    {
+        assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
+        assert!(
+            config
+                .skills
+                .compat_user_dir
+                .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+        );
+    }
+    #[cfg(windows)]
+    {
+        let user_dir = config.skills.user_dir.to_string_lossy();
+        let compat_dir = config.skills.compat_user_dir.to_string_lossy();
+        assert!(
+            user_dir.contains("squeezy") && user_dir.contains("skills"),
+            "unexpected user_dir on Windows: {user_dir}"
+        );
+        // Both APPDATA and USERPROFILE fallbacks now use the .squeezy namespace.
+        assert!(
+            compat_dir.contains("squeezy") && compat_dir.contains("skills"),
+            "unexpected compat_user_dir on Windows: {compat_dir}"
+        );
+    }
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
@@ -5979,4 +5999,45 @@ fn session_metrics_merge_turn_folds_model_ledger() {
         .find(|b| b.model == "gpt-5.5")
         .expect("gpt-5.5 bucket");
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
+}
+
+#[cfg(windows)]
+#[test]
+fn default_squeezy_skills_dir_uses_appdata_on_windows() {
+    // Simulate a Windows environment where HOME is absent but APPDATA is set.
+    // We use a temp approach: just verify the function returns an APPDATA-relative
+    // path when APPDATA is present in the environment (standard CI runner).
+    // If neither APPDATA nor USERPROFILE is set, the function falls through to HOME.
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let dir = default_squeezy_skills_dir();
+        let expected = std::path::PathBuf::from(&appdata)
+            .join("squeezy")
+            .join("skills");
+        assert_eq!(dir, expected);
+    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        let dir = default_squeezy_skills_dir();
+        let expected = std::path::PathBuf::from(&userprofile)
+            .join(".squeezy")
+            .join("skills");
+        assert_eq!(dir, expected);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn default_agent_compat_skills_dir_uses_appdata_on_windows() {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let dir = default_agent_compat_skills_dir();
+        let expected = std::path::PathBuf::from(&appdata)
+            .join("squeezy")
+            .join("agent-skills");
+        assert_eq!(dir, expected);
+    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
+        let dir = default_agent_compat_skills_dir();
+        // USERPROFILE fallback uses .squeezy namespace for consistency with APPDATA path.
+        let expected = std::path::PathBuf::from(&userprofile)
+            .join(".squeezy")
+            .join("agent-skills");
+        assert_eq!(dir, expected);
+    }
 }

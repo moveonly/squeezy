@@ -918,6 +918,13 @@ fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> C
         // warn in doctor whenever this high-trust mode is active so
         // operators notice it in CI smoke runs.
         detail.push_str(" (hooks run with Squeezy process privileges)");
+        // On Windows, skill hooks run through `sh -c`. If `sh` is not in
+        // PATH (no Git Bash / MSYS), hooks will fail to spawn; warn early
+        // before the first dispatch.
+        #[cfg(windows)]
+        if which_sh_missing() {
+            detail.push_str("; `sh` not found in PATH (add sh via Git for Windows or MSYS2, or add `failure_policy: deny` to policy hooks)");
+        }
         return Check {
             name: "skills".to_string(),
             status: Status::Warn,
@@ -981,6 +988,22 @@ fn hooks_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Op
         status,
         detail,
     })
+}
+
+/// Returns `true` when `sh.exe` or `sh` is not found in any directory on
+/// the current `PATH`. Uses filesystem `try_exists` probes so no child
+/// process is spawned, keeping `skills_check` stat-only.
+#[cfg(windows)]
+fn which_sh_missing() -> bool {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.join("sh.exe").try_exists().unwrap_or(false)
+            || dir.join("sh").try_exists().unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Pull the result of `update::check_for_update()` into a doctor row. Newer

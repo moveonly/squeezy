@@ -2360,6 +2360,7 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
                         timeout_secs: None,
                         fail_open: true,
                         kind_valid: true,
+                        failure_policy: HookFailurePolicy::Allow,
                     },
                     SkillHookSpec {
                         command: "true".to_string(),
@@ -2367,6 +2368,7 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
                         timeout_secs: None,
                         fail_open: true,
                         kind_valid: true,
+                        failure_policy: HookFailurePolicy::Allow,
                     },
                 ],
             }],
@@ -2452,6 +2454,7 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
         timeout_secs: None,
         fail_open: true,
         kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2515,6 +2518,7 @@ fn skill_hook_once_self_removes_after_first_run() {
         timeout_secs: None,
         fail_open: true,
         kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2561,6 +2565,7 @@ fn skill_hook_once_claims_concurrent_dispatches_atomically() {
         timeout_secs: None,
         fail_open: true,
         kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2631,6 +2636,7 @@ fn skill_hook_once_retries_after_failed_first_run() {
         timeout_secs: None,
         fail_open: true,
         kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),

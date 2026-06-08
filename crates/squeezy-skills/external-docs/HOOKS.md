@@ -128,6 +128,19 @@ In addition to `command` and `once`, each hook spec accepts:
 - `fail_open` — when `false` (fail-closed), a spawn error (e.g. `/bin/sh` not
   found, file-descriptor exhaustion) returns a deny result instead of silently
   allowing execution. Defaults to `true` for backward compatibility.
+- `failure_policy` — set to `deny` to make spawn failures deny the action.
+  Defaults to `allow` for backward compatibility.
+
+### Windows note
+
+Skill hook scripts run through **`sh -c`** on all platforms, including Windows.
+This means `.ps1` scripts cannot be used as hooks directly, even though implicit
+activation recognises PowerShell scripts. On Windows, `sh` must be available in
+`PATH` (provided by Git for Windows, MSYS2, or similar) for hooks to fire.
+
+If `sh` is absent and `hooks_enabled = true`, Squeezy will warn in `squeezy doctor`
+and hook dispatch will fail to spawn. To make a policy hook deny the action on
+spawn failure, add `failure_policy: deny` to the hook spec:
 
 ```yaml
 hooks:
@@ -138,7 +151,12 @@ hooks:
           command: scripts/audit-shell.sh
           timeout: 10
           fail_open: false
+          failure_policy: deny
 ```
+
+Without `failure_policy: deny`, a spawn failure silently allows the action
+(backward-compatible default). PowerShell-native hook support (`pwsh -File ...`)
+is on the roadmap.
 
 ## Environment Variables In Hook Scripts
 
