@@ -11243,10 +11243,10 @@ async fn run_subagent_rounds(
                         // ordinary `TextDelta` rather than `Refusal` deltas;
                         // fall back to `assistant_message` when the dedicated
                         // refusal buffer is empty so the summary is never blank.
-                        let refusal_prose = if refusal_text.is_empty() {
-                            &assistant_message
+                        let refusal_prose: &str = if refusal_text.is_empty() {
+                            assistant_message.as_str()
                         } else {
-                            &refusal_text
+                            refusal_text.as_str()
                         };
                         let detail = if refusal_prose.is_empty() {
                             "subagent model refused the request".to_string()
