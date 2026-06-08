@@ -88,6 +88,7 @@ fn mcp_status_icon_picks_glyph_per_server_state() {
             bearer_token_env_var: None,
             http_headers: std::collections::BTreeMap::new(),
             env_http_headers: std::collections::BTreeMap::new(),
+            cwd: None,
         }
     }
 
@@ -181,6 +182,7 @@ fn mcp_status_text_distinguishes_stopping_from_starting() {
         bearer_token_env_var: None,
         http_headers: std::collections::BTreeMap::new(),
         env_http_headers: std::collections::BTreeMap::new(),
+        cwd: None,
     };
     assert_eq!(
         format_mcp_row_status_for_server(&server, &squeezy_tools::McpServerStatus::Starting),
