@@ -2348,7 +2348,7 @@ pub fn catalog_hook_issues(catalog: &SkillCatalog) -> Vec<HookDoctorIssue> {
             Ok(l) => l,
             Err(_) => continue,
         };
-        for (_event, matchers) in &loaded.hooks {
+        for matchers in loaded.hooks.values() {
             for matcher in matchers {
                 for spec in &matcher.hooks {
                     let trimmed = spec.command.trim();
@@ -2356,10 +2356,7 @@ pub fn catalog_hook_issues(catalog: &SkillCatalog) -> Vec<HookDoctorIssue> {
                         continue;
                     }
                     // Classify the command: inline snippet vs file path.
-                    let is_inline_snippet = trimmed
-                        .contains(|c| matches!(c, '|' | ';' | '>' | '<' | '&' | '(' | ')'))
-                        || trimmed.contains("&&")
-                        || trimmed.contains("||")
+                    let is_inline_snippet = trimmed.contains(['|', ';', '>', '<', '&', '(', ')'])
                         || trimmed.contains('\n');
                     if is_inline_snippet {
                         issues.push(HookDoctorIssue {
