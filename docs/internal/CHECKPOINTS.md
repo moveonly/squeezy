@@ -38,6 +38,10 @@ checkpoint recorded one. Git blob hashes remain in the record for object
 integrity and display diagnostics, but they are not used as the only safety
 gate because `.gitattributes`, CRLF conversion, and clean filters can make a
 Git blob differ from the bytes a Windows editor actually left on disk.
+Checkpoints created before this change have no
+`before_worktree_sha256` / `after_worktree_sha256` field and continue to
+use the Git blob hash as their only safety gate; run a fresh checkpoint
+through the agent to get raw-byte safety.
 
 ## Why `Group(group_id)` Is Load-Bearing
 
@@ -80,10 +84,17 @@ unreadable.
 
 Rollback attempts are journaled even when only some paths are restored.
 `BestEffort` mode converts per-file filesystem errors into structured
-conflicts and continues with later files. `Atomic` mode preflights conflict
-and filesystem writability checks before mutating. This matters on Windows,
-where read-only attributes, editor locks, antivirus scanners, and sync tools
-can reject one write/delete while other paths are still safe.
+conflicts and continues with later files. `Atomic` mode preflights
+read-only attributes and write-handle availability before mutating, so
+many obvious conflicts surface before any byte is touched. The probe
+opens each planned-write target with the OS's default share mode, so an
+exclusive-share editor lock (e.g. a legacy editor that opens with
+`dwShareMode = 0`, or an antivirus scanner) can still slip past the
+preflight and produce a per-file conflict during the actual rollback,
+which is then journaled as an applied-with-conflicts row. This matters
+on Windows, where read-only attributes, editor locks, antivirus
+scanners, and sync tools can reject one write/delete while other paths
+are still safe.
 
 `checkpoint_doctor` (also reachable from `/checkpoints doctor`) performs a
 no-op shadow snapshot and reports the normalized workspace/shadow paths, Git

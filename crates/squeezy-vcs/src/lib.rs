@@ -374,7 +374,7 @@ pub struct CheckpointDoctorReport {
     pub core_ignorecase: Option<String>,
     pub core_longpaths: Option<String>,
     pub gitattributes: Vec<String>,
-    pub lock_file_writable: bool,
+    pub checkpoints_dir_writable: bool,
     pub protected_ref_roundtrip: bool,
     pub smoke: CheckpointSmokeReport,
     pub warnings: Vec<String>,
@@ -1144,7 +1144,12 @@ impl CheckpointStore {
         let protected_ref_roundtrip = if snapshot.tree.is_empty() {
             false
         } else {
-            let probe_ref = checkpoint_ref(&format!("doctor-{}", now_ms()), "probe");
+            // Use a dedicated `refs/squeezy/doctor/` namespace so a leaked
+            // probe ref (e.g. when the second `update-ref -d` fails) is
+            // distinguishable from a real checkpoint ref. A future doctor
+            // run can sweep this namespace for orphans without risking
+            // genuine `refs/squeezy/checkpoints/<id>` refs.
+            let probe_ref = doctor_probe_ref(now_ms());
             let created = self.git_vec(vec![
                 "update-ref".to_string(),
                 probe_ref.clone(),
@@ -1172,11 +1177,12 @@ impl CheckpointStore {
         // Test writability via a probe file in the checkpoints directory rather
         // than re-opening the lock file — the same process already holds the
         // lock, so reopening it always succeeds and tells us nothing useful.
+        // The field name reflects what is actually probed.
         let checkpoints_dir = self.lock_path.parent().unwrap_or(&self.root);
         let probe_path = checkpoints_dir.join(".squeezy-doctor-probe");
-        let lock_file_writable = fs::write(&probe_path, b"").is_ok();
+        let checkpoints_dir_writable = fs::write(&probe_path, b"").is_ok();
         let _ = fs::remove_file(&probe_path);
-        if !lock_file_writable {
+        if !checkpoints_dir_writable {
             warnings.push(format!(
                 "checkpoints directory is not writable: {}",
                 checkpoints_dir.display()
@@ -1213,7 +1219,7 @@ impl CheckpointStore {
             core_ignorecase: self.git_config_value("core.ignorecase"),
             core_longpaths: self.git_config_value("core.longpaths"),
             gitattributes,
-            lock_file_writable,
+            checkpoints_dir_writable,
             protected_ref_roundtrip,
             smoke,
             warnings,
@@ -1731,10 +1737,15 @@ impl CheckpointStore {
         tree: &str,
         path: &str,
     ) -> std::result::Result<Vec<u8>, String> {
-        if let Some(sha256) = worktree_sha256
-            && let Ok(bytes) = fs::read(self.raw_blob_path(sha256))
-        {
-            return Ok(bytes);
+        if let Some(sha256) = worktree_sha256 {
+            // The checkpoint promised raw worktree bytes for this path, so
+            // silently falling back to the Git blob would re-introduce the
+            // exact CRLF/normalization surprise the worktree-hash store is
+            // designed to prevent. Surface the missing blob so the caller
+            // converts it into a `CheckpointObjectMissing` conflict instead.
+            return fs::read(self.raw_blob_path(sha256)).map_err(|err| {
+                format!("raw worktree byte blob {sha256} for {path} unreadable: {err}")
+            });
         }
         self.blob_bytes(tree, path)
     }
@@ -1909,7 +1920,15 @@ impl CheckpointStore {
     }
 
     fn raw_blob_path(&self, sha256: &str) -> PathBuf {
-        let prefix = sha256.get(0..2).unwrap_or("xx");
+        // `sha256_hex` always returns a 64-hex string, so the slice is safe in
+        // every path that goes through `write_raw_blob` / `restore_bytes`. The
+        // debug assertion keeps a future caller honest if they try to thread a
+        // truncated digest through here.
+        debug_assert!(
+            sha256.len() >= 2,
+            "raw_blob_path called with truncated sha256 {sha256:?}"
+        );
+        let prefix = &sha256[..2];
         self.raw_blob_dir.join(prefix).join(sha256)
     }
 
@@ -1944,6 +1963,9 @@ impl CheckpointStore {
     fn cleanup_old_checkpoints(&self, retention_days: u64) -> Result<()> {
         let journal = self.read_journal()?;
         if journal.checkpoints.is_empty() {
+            // No journal entries means every raw blob on disk is an orphan
+            // (e.g. a stale `.squeezy/` from a previous workspace lifetime).
+            self.prune_orphan_raw_blobs(&[]);
             if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
                 *last_run = Some(now_ms());
             }
@@ -1955,6 +1977,11 @@ impl CheckpointStore {
             .into_iter()
             .partition(|record| record.created_at_ms >= cutoff);
         if prune.is_empty() {
+            // Even when no journal records aged out, blobs can be orphaned by
+            // a previous partial cleanup (e.g. a crash between journal rewrite
+            // and blob unlink). Re-run the orphan sweep so leaked blobs do not
+            // accumulate forever.
+            self.prune_orphan_raw_blobs(&keep);
             if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
                 *last_run = Some(now_ms());
             }
@@ -1976,6 +2003,10 @@ impl CheckpointStore {
             if before_deleted.is_ok() && after_deleted.is_ok() {
                 pruned_any = true;
             } else {
+                // `journal_warnings` is overloaded here: the journal itself is
+                // fine — it's the protected-ref deletion that failed. We bump
+                // the counter so the warning is auditable in `checkpoint_list`,
+                // and append a `coverage_warning` carrying the actual reason.
                 let mut retained = record.clone();
                 retained.journal_warnings += 1;
                 retained.coverage_warnings.push(
@@ -1990,13 +2021,73 @@ impl CheckpointStore {
         // Update the throttle timestamp only after successfully rewriting the
         // journal, so a failed rewrite does not suppress the next retry.
         self.rewrite_checkpoint_journal(&keep)?;
+        // Walk `raw-blobs/` and remove any blob whose sha256 is not referenced
+        // by a kept record. Without this sweep the content-addressed raw byte
+        // store grows without bound: every distinct before/after worktree byte
+        // body the agent has ever seen would otherwise live forever, surviving
+        // both `update-ref -d` and `git gc --prune=now` because raw blobs sit
+        // outside the Git object store.
+        self.prune_orphan_raw_blobs(&keep);
         if let Ok(mut last_run) = self.cleanup_last_run_ms.lock() {
             *last_run = Some(now_ms());
         }
         if pruned_any {
+            // Skip `git gc --prune=now` when no record actually pruned: gc on
+            // a packed shadow repo can take minutes, and reclaiming nothing
+            // means the cost would be pure waste against the cleanup hot path.
             let _ = self.git(["gc", "--prune=now"]);
         }
         Ok(())
+    }
+
+    /// Walk `raw-blobs/<aa>/<sha256>` and unlink any blob whose sha256 is not
+    /// referenced by `keep`'s `before_worktree_sha256` / `after_worktree_sha256`.
+    /// Failures are best-effort: the journal is the authoritative reference
+    /// set, so a transient unlink failure can be retried at the next cleanup
+    /// pass without compromising rollback.
+    fn prune_orphan_raw_blobs(&self, keep: &[CheckpointRecord]) {
+        if !self.raw_blob_dir.exists() {
+            return;
+        }
+        let mut referenced = BTreeSet::new();
+        for record in keep {
+            for file in &record.files {
+                if let Some(sha) = file.before_worktree_sha256.as_deref() {
+                    referenced.insert(sha.to_string());
+                }
+                if let Some(sha) = file.after_worktree_sha256.as_deref() {
+                    referenced.insert(sha.to_string());
+                }
+            }
+        }
+        let Ok(prefix_entries) = fs::read_dir(&self.raw_blob_dir) else {
+            return;
+        };
+        for prefix_entry in prefix_entries.flatten() {
+            let prefix_path = prefix_entry.path();
+            if !prefix_path.is_dir() {
+                continue;
+            }
+            let Ok(blob_entries) = fs::read_dir(&prefix_path) else {
+                continue;
+            };
+            for blob_entry in blob_entries.flatten() {
+                let blob_path = blob_entry.path();
+                let Some(name) = blob_path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                // Skip mid-write temp blobs (`<sha>.tmp`) so a concurrent
+                // `write_raw_blob` does not race with the cleanup.
+                if name.ends_with(".tmp") {
+                    continue;
+                }
+                if referenced.contains(name) {
+                    continue;
+                }
+                let _ = fs::remove_file(&blob_path);
+            }
+            let _ = fs::remove_dir(&prefix_path);
+        }
     }
 
     fn cleanup_old_checkpoints_throttled(&self, retention_days: u64) -> Result<()> {
@@ -2281,6 +2372,10 @@ fn checkpoint_id() -> String {
 
 fn checkpoint_ref(id: &str, side: &str) -> String {
     format!("refs/squeezy/checkpoints/{id}/{side}")
+}
+
+fn doctor_probe_ref(now_ms_value: u128) -> String {
+    format!("refs/squeezy/doctor/probe-{now_ms_value}")
 }
 
 fn hooks_off_value() -> &'static str {
@@ -2645,7 +2740,13 @@ fn windows_retry_message(detail: &str) -> String {
 fn path_identity_key(path: &str) -> String {
     let slash = path.replace('\\', "/");
     if cfg!(windows) {
-        slash.to_ascii_lowercase()
+        // Use Unicode-aware lowering so non-ASCII paths (e.g. `Über.rs`,
+        // `café/index.tsx`) collapse to the same identity. NTFS's default
+        // case-insensitivity uses Windows's upper-mapping rather than full
+        // Unicode case folding, but `to_lowercase()` is a safe superset for
+        // identity-only purposes (we only ever compare keys to other keys
+        // produced by this function, never to OS-derived names).
+        slash.to_lowercase()
     } else {
         slash
     }

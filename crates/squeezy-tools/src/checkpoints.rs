@@ -116,7 +116,7 @@ impl ToolRegistry {
         match checkpoints.doctor() {
             Ok(report) => {
                 let ok = report.protected_ref_roundtrip
-                    && report.lock_file_writable
+                    && report.checkpoints_dir_writable
                     && report.warnings.is_empty();
                 make_result(
                     call,

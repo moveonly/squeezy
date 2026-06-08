@@ -1,5 +1,6 @@
 //! On-disk DACL editing: add allow / deny-write / deny-read ACEs.
 
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
@@ -10,8 +11,8 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
 };
 
 use super::winutil::{OwnedSid, to_wide_path};
@@ -122,6 +123,18 @@ fn apply_ace(
     Ok(())
 }
 
+/// True for any entry whose attributes include `FILE_ATTRIBUTE_REPARSE_POINT`.
+///
+/// `std::fs::FileType::is_symlink` returns `false` for NTFS junctions
+/// (`mklink /J`), AppExec stubs, and OneDrive cloud reparse points: those
+/// surface as `is_dir() = true` to Rust even though following them takes us
+/// outside the workspace boundary. Granting capability ACEs through such an
+/// entry would be a sandbox escape, so the recursion must stop at every
+/// reparse point regardless of its specific tag.
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 fn apply_ace_recursive(
     path: &Path,
     sid_str: &str,
@@ -129,6 +142,12 @@ fn apply_ace_recursive(
     mode: ACCESS_MODE,
 ) -> crate::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
+    if is_reparse_point(&metadata) {
+        // Apply the ACE to the reparse point itself but never traverse into
+        // the target — the target may resolve to an arbitrary host path.
+        apply_ace(path, sid_str, access_mask, mode, false)?;
+        return Ok(());
+    }
     apply_ace(
         path,
         sid_str,
@@ -143,8 +162,8 @@ fn apply_ace_recursive(
 
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        let child_type = entry.file_type()?;
-        if child_type.is_symlink() {
+        let child_metadata = entry.metadata()?;
+        if is_reparse_point(&child_metadata) {
             continue;
         }
         apply_ace_recursive(&entry.path(), sid_str, access_mask, mode)?;
