@@ -1450,7 +1450,7 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
         // matcher reliably.
         if let Some(item) = trimmed.strip_prefix("- ")
             && let Some((key, value)) = item.split_once(':')
-            && matcher_indent.map_or(true, |m| indent <= m)
+            && matcher_indent.is_none_or(|m| indent <= m)
         {
             match key.trim() {
                 "matcher" => {
