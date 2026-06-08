@@ -1411,11 +1411,12 @@ fn cross_project_resume_prompt_fires_for_different_windows_paths() {
 
 #[test]
 fn resolve_resume_session_continue_matches_with_drive_case() {
-    use squeezy_store::SessionMetadata;
-    let mut meta = SessionMetadata::default();
-    meta.session_id = "abc123".to_string();
-    meta.cwd = r"C:\Repo".to_string();
-    meta.resume_available = true;
+    let meta = SessionMetadata {
+        session_id: "abc123".to_string(),
+        cwd: r"C:\Repo".to_string(),
+        resume_available: true,
+        ..SessionMetadata::default()
+    };
     // Querying with lower-case drive letter (but same directory name case) should still match.
     let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\Repo");
     assert_eq!(
