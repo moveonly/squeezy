@@ -33,18 +33,18 @@ const MCP_STATUS_COLUMN_WIDTH: usize = 36;
 /// resolved home path and a config-file path built from a separate source.
 fn display_path(path: &std::path::Path) -> String {
     let full = path.display().to_string();
-    if let Some(home) = squeezy_core::cached_home_dir() {
-        if path.starts_with(&home) {
-            let rest = path
-                .strip_prefix(&home)
-                .map(|r| r.display().to_string())
-                .unwrap_or_default();
-            return if rest.is_empty() {
-                "~".to_string()
-            } else {
-                format!("~{}{rest}", std::path::MAIN_SEPARATOR)
-            };
-        }
+    if let Some(home) = squeezy_core::cached_home_dir()
+        && path.starts_with(&home)
+    {
+        let rest = path
+            .strip_prefix(&home)
+            .map(|r| r.display().to_string())
+            .unwrap_or_default();
+        return if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+        };
     }
     full
 }
