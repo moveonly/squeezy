@@ -1038,12 +1038,12 @@ fn project_marker_case_mismatches(
         if marker.contains('/') || root_entry_names.contains(std::ffi::OsStr::new(marker)) {
             continue;
         }
-        if let Some(actual_os) = lower_to_actual.get(&marker.to_ascii_lowercase()) {
-            if let Some(actual) = actual_os.to_str() {
-                mismatches.push(format!(
-                    "project marker case differs from expected project marker {marker}: found {actual}"
-                ));
-            }
+        if let Some(actual_os) = lower_to_actual.get(&marker.to_ascii_lowercase())
+            && let Some(actual) = actual_os.to_str()
+        {
+            mismatches.push(format!(
+                "project marker case differs from expected project marker {marker}: found {actual}"
+            ));
         }
     }
     for entry in entries {
