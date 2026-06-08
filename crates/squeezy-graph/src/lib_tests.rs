@@ -8842,13 +8842,57 @@ void main() {
     );
 }
 
+#[test]
+fn detect_case_collisions_empty_when_no_collisions() {
+    // Use the graph record helper to build minimal FileRecord values.
+    let files = vec![
+        record("src/lib.rs", ""),
+        record("src/main.rs", ""),
+        record("README.md", ""),
+    ];
+    let collisions = detect_case_collisions(&files);
+    assert!(
+        collisions.is_empty(),
+        "no case collisions expected, got: {collisions:?}"
+    );
+}
+
+#[test]
+fn detect_case_collisions_finds_pair() {
+    let files = vec![record("src/Lib.rs", ""), record("src/lib.rs", "")];
+    let collisions = detect_case_collisions(&files);
+    assert_eq!(collisions.len(), 1);
+    let pair = &collisions[0];
+    assert!(
+        (pair[0] == "src/Lib.rs" && pair[1] == "src/lib.rs")
+            || (pair[0] == "src/lib.rs" && pair[1] == "src/Lib.rs"),
+        "unexpected pair: {pair:?}"
+    );
+}
+
+#[test]
+fn detect_case_collisions_finds_all_pairs_for_three_way_collision() {
+    // Three files that all fold to "src/lib.rs": must yield C(3,2) = 3 pairs.
+    let files = vec![
+        record("src/lib.rs", ""),
+        record("src/Lib.rs", ""),
+        record("src/LIB.rs", ""),
+    ];
+    let collisions = detect_case_collisions(&files);
+    assert_eq!(
+        collisions.len(),
+        3,
+        "three-way collision must yield 3 pairs, got: {collisions:?}"
+    );
+}
+
 /// Absolute path tests use Unix-style paths so are only run on Unix.
 #[cfg(unix)]
 #[test]
 fn normalize_cargo_file_id_strips_workspace_prefix() {
     let root = std::path::Path::new("/workspace/myproject");
     assert_eq!(
-        normalize_cargo_file_id(root, "/workspace/myproject/src/main.rs"),
+        normalize_cargo_file_id(root, None, "/workspace/myproject/src/main.rs"),
         Some("src/main.rs".to_string()),
     );
 }
@@ -8857,7 +8901,7 @@ fn normalize_cargo_file_id_strips_workspace_prefix() {
 fn normalize_cargo_file_id_passes_through_relative_path() {
     let root = std::path::Path::new("myproject");
     assert_eq!(
-        normalize_cargo_file_id(root, "src/main.rs"),
+        normalize_cargo_file_id(root, None, "src/main.rs"),
         Some("src/main.rs".to_string()),
     );
 }
@@ -8865,8 +8909,11 @@ fn normalize_cargo_file_id_passes_through_relative_path() {
 #[test]
 fn normalize_cargo_file_id_returns_none_for_angle_bracket_paths() {
     let root = std::path::Path::new("myproject");
-    assert_eq!(normalize_cargo_file_id(root, "<anon>"), None);
-    assert_eq!(normalize_cargo_file_id(root, "<macro expansion>"), None);
+    assert_eq!(normalize_cargo_file_id(root, None, "<anon>"), None);
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "<macro expansion>"),
+        None
+    );
 }
 
 /// Absolute path test: an absolute path outside the workspace root should
@@ -8877,7 +8924,7 @@ fn normalize_cargo_file_id_returns_none_for_angle_bracket_paths() {
 fn normalize_cargo_file_id_returns_none_for_path_outside_workspace() {
     let root = std::path::Path::new("/workspace/myproject");
     assert_eq!(
-        normalize_cargo_file_id(root, "/other/repo/src/lib.rs"),
+        normalize_cargo_file_id(root, None, "/other/repo/src/lib.rs"),
         None,
     );
 }
@@ -8903,8 +8950,12 @@ fn normalize_cargo_file_id_fallback_via_symlink() {
     // cargo emits the path under the symlinked root; squeezy was opened
     // with the real root. The exact prefix check fails; the canonical
     // fallback must succeed.
-    let result =
-        normalize_cargo_file_id(&real_root, &sym_root.join("src/main.rs").to_string_lossy());
+    let canonical_real = std::fs::canonicalize(&real_root).ok();
+    let result = normalize_cargo_file_id(
+        &real_root,
+        canonical_real.as_deref(),
+        &sym_root.join("src/main.rs").to_string_lossy(),
+    );
     assert_eq!(
         result,
         Some("src/main.rs".to_string()),

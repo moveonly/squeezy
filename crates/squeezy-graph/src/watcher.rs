@@ -210,8 +210,11 @@ fn linux_inotify_hint(err_str: &str) -> &'static str {
     #[cfg(target_os = "linux")]
     {
         let lower = err_str.to_ascii_lowercase();
-        if lower.contains("no space left") || lower.contains("enospc") || lower.contains("inotify")
-        {
+        // Only trigger for the two ENOSPC-specific patterns. A plain "inotify"
+        // substring could appear in unrelated error messages (e.g. "inotify
+        // backend not supported") and the hint text about watch limits would be
+        // actively misleading for those cases.
+        if lower.contains("no space left") || lower.contains("enospc") {
             return " (Linux inotify: watch limit exhausted; run \
                 `sysctl fs.inotify.max_user_watches` to see the current limit and \
                 consider raising it with \

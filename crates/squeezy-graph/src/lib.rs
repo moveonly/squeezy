@@ -2375,6 +2375,7 @@ impl GraphManager {
         }
 
         let snapshot = self.crawler.crawl(&self.root)?;
+        warn_case_collisions(&snapshot.files);
         let files_seen = snapshot.files.len();
         let coverage = snapshot.coverage.clone();
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
@@ -2478,40 +2479,43 @@ impl GraphManager {
             .iter()
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
+        // Pre-compute canonical paths for all changed (supported + metadata +
+        // unsupported) and removed records once. The same Vec is reused for
+        // both the `changed_paths_from_events` count and the
+        // `event_changed_or_removed` count, avoiding double canonicalization.
+        // Non-metadata unsupported files are included so that a watcher event
+        // for a changed .txt/.json file is not falsely reported as unmatched.
+        let all_changed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = changed_records
+            .iter()
+            .chain(
+                unsupported_changed_records
+                    .iter()
+                    .filter(|r| !metadata_changed_records.iter().any(|m| m.id == r.id)),
+            )
+            .map(|r| (r.path.clone(), std::fs::canonicalize(&r.path).ok()))
+            .collect();
         let changed_paths_from_events = changed_records
             .iter()
             .filter(|record| {
-                let rec_can = std::fs::canonicalize(&record.path).ok();
-                pending_canonicals.matches_record(&record.path, rec_can.as_ref())
+                all_changed_canonicals
+                    .iter()
+                    .find(|(raw, _)| raw == &record.path)
+                    .map(|(raw, rec_can)| pending_canonicals.matches_record(raw, rec_can.as_ref()))
+                    .unwrap_or(false)
             })
             .count();
         let changed_paths_from_polling = changed_records
             .len()
             .saturating_sub(changed_paths_from_events);
         let event_changed_or_removed = {
-            // Pre-compute canonical paths for all current and removed record
-            // paths to avoid re-canonicalizing them per pending entry.
-            let changed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = changed_records
-                .iter()
-                .map(|r| (r.path.clone(), std::fs::canonicalize(&r.path).ok()))
-                .collect();
             let removed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = removed_files_all
                 .iter()
                 .filter_map(|id| self.graph.files.get(id))
                 .map(|old| (old.path.clone(), std::fs::canonicalize(&old.path).ok()))
                 .collect();
-            pending_canonicals
-                .entries
-                .iter()
-                .filter(|(raw, canon)| {
-                    changed_canonicals.iter().any(|(rec_raw, rec_can)| {
-                        raw == rec_raw
-                            || canon
-                                .as_ref()
-                                .zip(rec_can.as_ref())
-                                .map(|(l, r)| l == r)
-                                .unwrap_or(false)
-                    }) || removed_canonicals.iter().any(|(rec_raw, rec_can)| {
+            let path_pair_matches =
+                |raw: &PathBuf, canon: &Option<PathBuf>, vec: &[(PathBuf, Option<PathBuf>)]| {
+                    vec.iter().any(|(rec_raw, rec_can)| {
                         raw == rec_raw
                             || canon
                                 .as_ref()
@@ -2519,6 +2523,13 @@ impl GraphManager {
                                 .map(|(l, r)| l == r)
                                 .unwrap_or(false)
                     })
+                };
+            pending_canonicals
+                .entries
+                .iter()
+                .filter(|(raw, canon)| {
+                    path_pair_matches(raw, canon, &all_changed_canonicals)
+                        || path_pair_matches(raw, canon, &removed_canonicals)
                 })
                 .count()
         };
@@ -2918,6 +2929,8 @@ fn parse_cargo_metadata(
     provenance: &CargoFactProvenance,
     root: &Path,
 ) -> Result<CargoCompilerFacts> {
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let canonical_root = canonical_root.as_deref();
     let metadata = serde_json::from_str::<CargoMetadataJson>(metadata_json).map_err(|err| {
         SqueezyError::Graph(format!("failed to parse cargo metadata JSON: {err}"))
     })?;
@@ -2925,8 +2938,12 @@ fn parse_cargo_metadata(
     nodes.push(CargoFactNode {
         id: "cargo:workspace".to_string(),
         kind: CargoFactNodeKind::Workspace,
-        name: normalize_optional_cargo_path(root, metadata.workspace_root.as_deref())
-            .unwrap_or_else(|| ".".to_string()),
+        name: normalize_optional_cargo_path(
+            root,
+            canonical_root,
+            metadata.workspace_root.as_deref(),
+        )
+        .unwrap_or_else(|| ".".to_string()),
         package_id: None,
         manifest_path: None,
         source_path: None,
@@ -2945,7 +2962,8 @@ fn parse_cargo_metadata(
         if !workspace_members.is_empty() && !workspace_members.contains(&package.id) {
             continue;
         }
-        let manifest_path = normalize_optional_cargo_path(root, package.manifest_path.as_deref());
+        let manifest_path =
+            normalize_optional_cargo_path(root, canonical_root, package.manifest_path.as_deref());
         nodes.push(CargoFactNode {
             id: format!("cargo:package:{}", package.id),
             kind: CargoFactNodeKind::Package,
@@ -2963,7 +2981,11 @@ fn parse_cargo_metadata(
                 name: target.name,
                 package_id: Some(package.id.clone()),
                 manifest_path: manifest_path.clone(),
-                source_path: normalize_optional_cargo_path(root, target.src_path.as_deref()),
+                source_path: normalize_optional_cargo_path(
+                    root,
+                    canonical_root,
+                    target.src_path.as_deref(),
+                ),
                 target_kinds: target.kind,
                 provenance: Provenance::new("cargo metadata", "package target"),
             });
@@ -2984,8 +3006,16 @@ fn parse_cargo_metadata(
     nodes.sort_by(|left, right| left.id.cmp(&right.id));
 
     Ok(CargoCompilerFacts {
-        workspace_root: normalize_optional_cargo_path(root, metadata.workspace_root.as_deref()),
-        target_directory: normalize_optional_cargo_path(root, metadata.target_directory.as_deref()),
+        workspace_root: normalize_optional_cargo_path(
+            root,
+            canonical_root,
+            metadata.workspace_root.as_deref(),
+        ),
+        target_directory: normalize_optional_cargo_path(
+            root,
+            canonical_root,
+            metadata.target_directory.as_deref(),
+        ),
         nodes,
         diagnostics: Vec::new(),
         provenance: provenance.clone(),
@@ -2998,6 +3028,10 @@ fn parse_cargo_diagnostics(
     provenance: &CargoFactProvenance,
     root: &Path,
 ) -> Result<Vec<CargoDiagnostic>> {
+    // Compute once so the fallback path in normalize_cargo_file_id does not
+    // repeat the stat/readlink syscalls for every diagnostic span.
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let canonical_root = canonical_root.as_deref();
     let mut diagnostics = Vec::new();
     for line in diagnostics_json.lines() {
         let line = line.trim();
@@ -3037,7 +3071,8 @@ fn parse_cargo_diagnostics(
             let line_end = span.line_end.saturating_sub(1);
             let column_start = span.column_start.saturating_sub(1);
             let column_end = span.column_end.saturating_sub(1);
-            let file_id = normalize_cargo_file_id(root, &span.file_name).map(FileId::new);
+            let file_id =
+                normalize_cargo_file_id(root, canonical_root, &span.file_name).map(FileId::new);
             // When the path cannot be mapped to a workspace-relative FileId,
             // keep the raw compiler path so callers can report both the raw
             // diagnostic path and the workspace root spelling, helping users
@@ -3096,11 +3131,25 @@ fn primary_or_first_spans(spans: &[RustcSpanJson]) -> Vec<&RustcSpanJson> {
     }
 }
 
-fn normalize_optional_cargo_path(root: &Path, path: Option<&str>) -> Option<String> {
-    path.and_then(|path| normalize_cargo_file_id(root, path))
+fn normalize_optional_cargo_path(
+    root: &Path,
+    canonical_root: Option<&Path>,
+    path: Option<&str>,
+) -> Option<String> {
+    path.and_then(|path| normalize_cargo_file_id(root, canonical_root, path))
 }
 
-fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
+/// Map a cargo compiler span path to a workspace-relative slash-joined string
+/// suitable for use as a `FileId`.
+///
+/// `canonical_root` should be the pre-computed `canonicalize(root)` result,
+/// passed in by the caller so that the fallback path does not repeat the
+/// syscall once per diagnostic span.
+fn normalize_cargo_file_id(
+    root: &Path,
+    canonical_root: Option<&Path>,
+    path: &str,
+) -> Option<String> {
     if path.starts_with('<') {
         return None;
     }
@@ -3110,16 +3159,14 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
         if let Ok(rel) = path.strip_prefix(root) {
             rel.to_path_buf()
         } else {
-            // Fallback: canonicalize both sides and retry. This handles
-            // symlinked workspaces, bind-mounted build environments, and
-            // container setups where cargo emits a different path spelling
-            // than the workspace root squeezy was opened with.
-            let canonical_root = std::fs::canonicalize(root).ok()?;
+            // Fallback: canonicalize the diagnostic path and retry against the
+            // pre-computed canonical root. This handles symlinked workspaces,
+            // bind-mounted build environments, and container setups where cargo
+            // emits a different path spelling than the workspace root squeezy
+            // was opened with.
+            let cr = canonical_root?;
             let canonical_path = std::fs::canonicalize(path).ok()?;
-            canonical_path
-                .strip_prefix(&canonical_root)
-                .ok()?
-                .to_path_buf()
+            canonical_path.strip_prefix(cr).ok()?.to_path_buf()
         }
     } else {
         path.to_path_buf()
@@ -3808,27 +3855,47 @@ pub(crate) fn crate_underscore_alias_for_relative_path(path: &str) -> Option<Str
     Some(crate_dir.replace('-', "_"))
 }
 
-/// Warn when two indexed paths differ only in case. Linux filesystems
+/// Detect indexed file paths that differ only in case. Linux filesystems
 /// preserve exact case-sensitive identity, so both paths are indexed
 /// correctly on ext4/xfs/btrfs. However, the same spellings may collide
 /// on macOS/Windows or on Linux case-insensitive mounts, and persisted
 /// cache entries keyed by the exact `FileId` string will be unusable after
-/// a checkout on those platforms. Emit one warning per collision pair at
-/// graph-build time so the information surfaces without halting indexing.
-fn warn_case_collisions(files: &[squeezy_workspace::FileRecord]) {
-    let mut lower_to_path: HashMap<String, &str> = HashMap::with_capacity(files.len());
+/// a checkout on those platforms.
+///
+/// Returns one `[a, b]` pair for every distinct colliding combination so
+/// an N-way collision yields C(N,2) pairs. Returning the pairs makes the
+/// function testable without a tracing subscriber.
+fn detect_case_collisions(files: &[squeezy_workspace::FileRecord]) -> Vec<[String; 2]> {
+    let mut lower_to_paths: HashMap<String, Vec<&str>> = HashMap::with_capacity(files.len());
     for file in files {
-        let lower = file.relative_path.to_lowercase();
-        if let Some(existing) = lower_to_path.get(&lower) {
-            tracing::warn!(
-                "squeezy: case-collision: '{}' and '{}' fold to the same lowercase path; \
-                 cross-platform checkout or cached-entry reuse may be unreliable",
-                existing,
-                file.relative_path,
-            );
-        } else {
-            lower_to_path.insert(lower, &file.relative_path);
+        lower_to_paths
+            .entry(file.relative_path.to_lowercase())
+            .or_default()
+            .push(&file.relative_path);
+    }
+    let mut collisions = Vec::new();
+    for paths in lower_to_paths.values() {
+        if paths.len() >= 2 {
+            for i in 0..paths.len() {
+                for j in (i + 1)..paths.len() {
+                    collisions.push([paths[i].to_string(), paths[j].to_string()]);
+                }
+            }
         }
+    }
+    collisions
+}
+
+/// Emit a `tracing::warn!` for each case-colliding path pair detected by
+/// [`detect_case_collisions`].
+fn warn_case_collisions(files: &[squeezy_workspace::FileRecord]) {
+    for [a, b] in detect_case_collisions(files) {
+        tracing::warn!(
+            "squeezy: case-collision: '{}' and '{}' fold to the same lowercase path; \
+             cross-platform checkout or cached-entry reuse may be unreliable",
+            a,
+            b,
+        );
     }
 }
 

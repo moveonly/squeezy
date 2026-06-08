@@ -453,26 +453,42 @@ impl WorkspaceCrawler {
             let path = entry.into_path();
             let relative_path = relative_path(&root, &path)?;
 
-            let metadata = fs::metadata(&path)?;
+            // `fs::metadata` follows symlinks; it returns an error for dangling
+            // symlinks (target missing). Treat that gracefully: skip the entry
+            // rather than aborting the whole crawl. For non-symlink entries we
+            // still propagate the error because it indicates a genuine I/O problem.
+            let metadata = if file_type.is_symlink() {
+                match fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue, // dangling symlink: skip silently
+                }
+            } else {
+                fs::metadata(&path)?
+            };
             if !metadata.is_file() {
                 continue;
             }
             let size_bytes = metadata.len();
             if file_type.is_symlink() {
-                let target = fs::canonicalize(&path)?;
-                if !target.starts_with(&root) {
-                    // Symlink target lies outside the workspace root. Record it
-                    // in coverage so callers can explain why the file is absent,
-                    // rather than silently omitting it from the index.
-                    record_excluded_file(
-                        &mut excluded,
-                        &mut coverage,
-                        &path,
-                        relative_path,
-                        size_bytes,
-                        ExclusionReason::ExternalSymlink,
-                    );
-                    continue;
+                // `canonicalize` also fails for dangling symlinks; handle the same
+                // way as the metadata failure above.
+                match fs::canonicalize(&path) {
+                    Ok(target) if !target.starts_with(&root) => {
+                        // Symlink target lies outside the workspace root. Record it
+                        // in coverage so callers can explain why the file is absent,
+                        // rather than silently omitting it from the index.
+                        record_excluded_file(
+                            &mut excluded,
+                            &mut coverage,
+                            &path,
+                            relative_path,
+                            size_bytes,
+                            ExclusionReason::ExternalSymlink,
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}         // target is inside root; fall through to index
+                    Err(_) => continue, // dangling symlink: skip silently
                 }
             }
             let language = classify_language(&path);
