@@ -1,7 +1,6 @@
 use super::*;
 use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport, ProviderSettings};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 // env::set_var/remove_var is process-global; serialize these tests so a parallel
