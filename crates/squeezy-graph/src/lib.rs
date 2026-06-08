@@ -1211,16 +1211,16 @@ impl SemanticGraph {
                 slot.supertypes = entry.supertypes;
             }
         }
-        if let Some(snap) = snapshot {
-            if !snap.imports_by_file.is_empty() || !snap.importers_by_file.is_empty() {
-                self.importers_by_file.clear();
-                for (target_str, importer_strs) in &snap.importers_by_file {
-                    let target = FileId(target_str.clone());
-                    let importers: Vec<FileId> =
-                        importer_strs.iter().map(|s| FileId(s.clone())).collect();
-                    if !importers.is_empty() {
-                        self.importers_by_file.insert(target, importers);
-                    }
+        if let Some(snap) = snapshot
+            && (!snap.imports_by_file.is_empty() || !snap.importers_by_file.is_empty())
+        {
+            self.importers_by_file.clear();
+            for (target_str, importer_strs) in &snap.importers_by_file {
+                let target = FileId(target_str.clone());
+                let importers: Vec<FileId> =
+                    importer_strs.iter().map(|s| FileId(s.clone())).collect();
+                if !importers.is_empty() {
+                    self.importers_by_file.insert(target, importers);
                 }
             }
         }
@@ -2359,10 +2359,10 @@ impl GraphManager {
         // re-parses), attempt to restore resolver-slot and importer-index state
         // from the V2 resolver-cache tables. Fingerprint mismatches are silently
         // skipped so a stale entry never corrupts the in-memory graph.
-        if let Some(store) = store.as_deref() {
-            if let Ok((entries, snap)) = load_resolver_cache(store, &snapshot.files) {
-                graph.apply_warm_resolver_cache(entries, snap);
-            }
+        if let Some(store) = store.as_deref()
+            && let Ok((entries, snap)) = load_resolver_cache(store, &snapshot.files)
+        {
+            graph.apply_warm_resolver_cache(entries, snap);
         }
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
@@ -2801,17 +2801,18 @@ struct LoadedPartitions {
     rebuilt: bool,
 }
 
+/// Per-file entries plus the single-blob import-graph snapshot returned by
+/// [`load_resolver_cache`].
+type ResolverCacheLoad = (
+    Vec<(FileId, resolver_cache::ResolverFileEntry)>,
+    Option<resolver_cache::ResolverSnapshot>,
+);
+
 /// Attempt to load V2 resolver-cache data for a warm start. Returns per-file
 /// `ResolverFileEntry` values (fingerprint will be checked by the caller) and
 /// the optional single-blob `ResolverSnapshot`. Both results are best-effort:
 /// missing or undecodable entries are silently omitted.
-fn load_resolver_cache(
-    store: &GraphStore,
-    records: &[FileRecord],
-) -> Result<(
-    Vec<(FileId, resolver_cache::ResolverFileEntry)>,
-    Option<resolver_cache::ResolverSnapshot>,
-)> {
+fn load_resolver_cache(store: &GraphStore, records: &[FileRecord]) -> Result<ResolverCacheLoad> {
     let file_ids: Vec<FileId> = records.iter().map(|r| r.id.clone()).collect();
     let entries = store
         .resolver_entries_for::<resolver_cache::ResolverFileEntry>(&file_ids)
