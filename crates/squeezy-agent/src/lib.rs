@@ -7809,16 +7809,17 @@ impl TurnRuntime {
                     // annotations, xAI Live Search citations) as a
                     // first-class agent event so the TUI / transcript can
                     // surface source attribution when the provider supplies
-                    // it.
+                    // it. Use try_send to keep this arm non-async — the
+                    // stream loop runs inside a very large state machine
+                    // and extra await points increase its size; citation
+                    // events may be silently dropped if the channel is full
+                    // (acceptable — they are advisory source annotations).
                     LlmEvent::Citation { text_index, source } => {
-                        let _ = self
-                            .tx
-                            .send(AgentEvent::Citation {
-                                turn_id: self.turn_id,
-                                text_index,
-                                source,
-                            })
-                            .await;
+                        let _ = self.tx.try_send(AgentEvent::Citation {
+                            turn_id: self.turn_id,
+                            text_index,
+                            source,
+                        });
                     }
                     // `LlmEvent` is `#[non_exhaustive]`; unknown future
                     // variants flow past without disturbing the turn — they
@@ -12850,14 +12851,14 @@ async fn execute_tool_calls(
             let result = handle_task_state_call(&context, call).await;
             // Emit a compact trace event so debuggers and eval replay can
             // observe task-state mutations without a full tool card.
-            let _ = context
-                .tx
-                .send(AgentEvent::ControlToolTrace {
-                    turn_id: context.turn_id,
-                    tool_name: TASK_STATE_TOOL_NAME.to_string(),
-                    label: "task state updated".to_string(),
-                })
-                .await;
+            // Use try_send to avoid adding a suspend point to this large
+            // async function's state machine; trace events may be silently
+            // dropped if the channel is full (acceptable for debug signals).
+            let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
+                turn_id: context.turn_id,
+                tool_name: TASK_STATE_TOOL_NAME.to_string(),
+                label: "task state updated".to_string(),
+            });
             results[index] = Some(result);
             recorded[index] = true;
             continue;
@@ -12866,6 +12867,7 @@ async fn execute_tool_calls(
             let result = handle_load_tool_schema_call(&context, call).await;
             // Build a compact label showing which tool schema was loaded (or
             // why it was refused), so debugging lazy-schema turns is easier.
+            // Use try_send for the same state-machine-size reason as above.
             let schema_name = call
                 .arguments
                 .get("name")
@@ -12876,14 +12878,11 @@ async fn execute_tool_calls(
             } else {
                 format!("schema load failed: {schema_name}")
             };
-            let _ = context
-                .tx
-                .send(AgentEvent::ControlToolTrace {
-                    turn_id: context.turn_id,
-                    tool_name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
-                    label,
-                })
-                .await;
+            let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
+                turn_id: context.turn_id,
+                tool_name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
+                label,
+            });
             results[index] = Some(result);
             recorded[index] = true;
             continue;
