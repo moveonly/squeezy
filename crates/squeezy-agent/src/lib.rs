@@ -4494,6 +4494,7 @@ impl Agent {
         let configured_model_context_window = self.configured_model_context_window;
 
         let turn_done = Arc::new(Notify::new());
+        let turn_finished = CancellationToken::new();
         let panic_tx = tx.clone();
         let panic_session_log = session_log.clone();
         let panic_redactor = redactor.clone();
@@ -4511,6 +4512,7 @@ impl Agent {
                 redactor: panic_redactor,
                 telemetry: panic_telemetry,
                 active_turn: active_turn.clone(),
+                turn_finished: turn_finished.clone(),
             },
             async move {
                 let redacted_input = redactor.redact(&input);
@@ -4534,6 +4536,17 @@ impl Agent {
                 {
                     return;
                 }
+                refresh_mcp_tools_on_list_changed_in_background(McpListChangedRefreshContext {
+                    tools: tools.clone(),
+                    cancel: cancel.clone(),
+                    session_log: session_log.clone(),
+                    redactor: redactor.clone(),
+                    tx: tx.clone(),
+                    turn_id,
+                    turn_finished: turn_finished.clone(),
+                    background_tasks: background_tasks.clone(),
+                    telemetry: telemetry.clone(),
+                });
                 if let Some((call, exclude_from_context)) = local_shell_command_call(&task_title) {
                     complete_local_tool_turn(
                         turn_id,
@@ -4771,6 +4784,7 @@ struct ObservedTurnContext {
     redactor: Arc<Redactor>,
     telemetry: TelemetryClient,
     active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
+    turn_finished: CancellationToken,
 }
 
 fn spawn_observed_turn<F>(context: ObservedTurnContext, future: F) -> tokio::task::JoinHandle<()>
@@ -4785,6 +4799,7 @@ where
         redactor,
         telemetry,
         active_turn,
+        turn_finished,
     } = context;
     tokio::spawn(async move {
         let outcome = AssertUnwindSafe(future).catch_unwind().await;
@@ -4817,6 +4832,7 @@ where
                 .await;
         }
         clear_active_turn_if_current(&active_turn, turn_id);
+        turn_finished.cancel();
         done.notify_waiters();
     })
 }
@@ -5497,6 +5513,18 @@ struct McpRefreshContext {
     telemetry: TelemetryClient,
 }
 
+struct McpListChangedRefreshContext {
+    tools: ToolRegistry,
+    cancel: CancellationToken,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+    turn_finished: CancellationToken,
+    background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
+    telemetry: TelemetryClient,
+}
+
 fn refresh_mcp_tools_in_background(ctx: McpRefreshContext) {
     let McpRefreshContext {
         tools,
@@ -5510,57 +5538,138 @@ fn refresh_mcp_tools_in_background(ctx: McpRefreshContext) {
     } = ctx;
     let task = async move {
         let outcome = tools.refresh_mcp_tools(cancel).await;
-        // Fire MCP discovery telemetry if the outcome has stats.
-        if let Some(stats) = &outcome.discovery_stats {
-            let (has_resources, has_elicitation, has_experimental) =
-                tools.aggregate_mcp_capabilities().await;
-            let mut error_kind_counts = std::collections::BTreeMap::new();
-            for kind in &stats.error_kind_tokens {
-                *error_kind_counts.entry(kind.clone()).or_default() += 1u64;
-            }
-            telemetry.spawn(TelemetryEvent::mcp_discovery(McpDiscoveryReport {
-                servers_stdio: stats.servers_stdio,
-                servers_http: stats.servers_http,
-                servers_sse: stats.servers_sse,
-                servers_enabled: stats.servers_enabled,
-                servers_disabled: stats.servers_disabled,
-                tools_discovered: stats.tools_discovered,
-                tools_cached: stats.tools_cached,
-                tools_stale_retained: stats.tools_stale_retained,
-                tools_dropped_disabled: stats.tools_dropped_disabled,
-                discovery_errors: stats.discovery_errors,
-                error_kind_counts,
-                has_resources,
-                has_elicitation,
-                has_experimental,
-                duration_ms: stats.duration_ms,
-            }));
-        }
-        log_session_event(
+        publish_mcp_refresh_outcome(
+            &tools,
+            outcome,
+            &telemetry,
             session_log.as_ref(),
             &redactor,
-            "mcp_status_updated",
-            Some(turn_id),
-            None,
-            serde_json::to_value(&outcome.status).unwrap_or_else(|_| json!({})),
-        );
-        let _ = tx
-            .send(AgentEvent::McpStatusUpdated {
-                turn_id,
-                snapshot: outcome.status.clone(),
-            })
-            .await;
-        for error in outcome.errors {
-            log_session_event(
-                session_log.as_ref(),
-                &redactor,
-                "mcp_discovery_error",
-                Some(turn_id),
-                Some(error.clone()),
-                json!({ "error": error }),
-            );
+            &tx,
+            turn_id,
+        )
+        .await;
+    };
+    spawn_tracked_mcp_task(background_tasks, task);
+}
+
+fn refresh_mcp_tools_on_list_changed_in_background(ctx: McpListChangedRefreshContext) {
+    let McpListChangedRefreshContext {
+        tools,
+        cancel,
+        session_log,
+        redactor,
+        tx,
+        turn_id,
+        turn_finished,
+        background_tasks,
+        telemetry,
+    } = ctx;
+    let notify = tools.mcp_tool_list_changed_notify();
+    let task = async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = turn_finished.cancelled() => break,
+                _ = notify.notified() => {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let refresh_cancel = cancel.child_token();
+                    let refresh = tools.refresh_mcp_tools(refresh_cancel.clone());
+                    tokio::pin!(refresh);
+                    let outcome = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            refresh_cancel.cancel();
+                            break;
+                        }
+                        _ = turn_finished.cancelled() => {
+                            refresh_cancel.cancel();
+                            break;
+                        }
+                        outcome = &mut refresh => outcome,
+                    };
+                    publish_mcp_refresh_outcome(
+                        &tools,
+                        outcome,
+                        &telemetry,
+                        session_log.as_ref(),
+                        &redactor,
+                        &tx,
+                        turn_id,
+                    )
+                    .await;
+                }
+            }
         }
     };
+    spawn_tracked_mcp_task(background_tasks, task);
+}
+
+async fn publish_mcp_refresh_outcome(
+    tools: &ToolRegistry,
+    outcome: squeezy_tools::McpRefreshOutcome,
+    telemetry: &TelemetryClient,
+    session_log: Option<&SessionHandle>,
+    redactor: &Redactor,
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+) {
+    // Fire MCP discovery telemetry if the outcome has stats.
+    if let Some(stats) = &outcome.discovery_stats {
+        let (has_resources, has_elicitation, has_experimental) =
+            tools.aggregate_mcp_capabilities().await;
+        let mut error_kind_counts = std::collections::BTreeMap::new();
+        for kind in &stats.error_kind_tokens {
+            *error_kind_counts.entry(kind.clone()).or_default() += 1u64;
+        }
+        telemetry.spawn(TelemetryEvent::mcp_discovery(McpDiscoveryReport {
+            servers_stdio: stats.servers_stdio,
+            servers_http: stats.servers_http,
+            servers_sse: stats.servers_sse,
+            servers_enabled: stats.servers_enabled,
+            servers_disabled: stats.servers_disabled,
+            tools_discovered: stats.tools_discovered,
+            tools_cached: stats.tools_cached,
+            tools_stale_retained: stats.tools_stale_retained,
+            tools_dropped_disabled: stats.tools_dropped_disabled,
+            discovery_errors: stats.discovery_errors,
+            error_kind_counts,
+            has_resources,
+            has_elicitation,
+            has_experimental,
+            duration_ms: stats.duration_ms,
+        }));
+    }
+    log_session_event(
+        session_log,
+        redactor,
+        "mcp_status_updated",
+        Some(turn_id),
+        None,
+        serde_json::to_value(&outcome.status).unwrap_or_else(|_| json!({})),
+    );
+    let _ = tx
+        .send(AgentEvent::McpStatusUpdated {
+            turn_id,
+            snapshot: outcome.status.clone(),
+        })
+        .await;
+    for error in outcome.errors {
+        log_session_event(
+            session_log,
+            redactor,
+            "mcp_discovery_error",
+            Some(turn_id),
+            Some(error.clone()),
+            json!({ "error": error }),
+        );
+    }
+}
+
+fn spawn_tracked_mcp_task<F>(background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     // Hand the spawn to a tracked `JoinSet` so `Agent::shutdown` can
     // wait for the spawn to drop its `Arc<SqueezyStore>` clone before
     // the agent's owner re-opens the redb store. Mutex contention here

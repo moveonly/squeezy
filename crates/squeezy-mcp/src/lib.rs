@@ -450,9 +450,8 @@ impl McpClientRegistry {
 
     /// Returns the `Notify` that is signalled whenever **any** connected
     /// server sends a `tools/list_changed` notification.  The notification
-    /// carries no server identity — callers that need to know which server
-    /// changed should diff `status_snapshot()` before and after, or iterate
-    /// all stale entries and call `refresh_one_server_tools` for each.
+    /// carries no server identity; callers that need a precise refresh should
+    /// maintain their own server mapping, otherwise run a full discovery pass.
     /// `notify_one()` is used so the signal survives a brief gap between
     /// `notified()` calls; at most one permit is queued at a time.
     pub fn tool_list_changed_notify(&self) -> Arc<Notify> {
@@ -463,9 +462,9 @@ impl McpClientRegistry {
     /// the shared cache and status snapshot.  Intended for handling
     /// `tools/list_changed` notifications: call this instead of the full
     /// `refresh_tools` to avoid unnecessary work on unchanged servers.
-    /// Because `tool_list_changed_notify()` carries no server identity,
-    /// callers that respond to that signal should iterate the stale entries
-    /// in `status_snapshot()` and call this method for each affected server.
+    /// Because `tool_list_changed_notify()` carries no server identity, this
+    /// helper is only useful to callers that learned the changed server from
+    /// another source.
     ///
     /// If the server is not configured or is disabled the call is a no-op.
     /// On discovery failure the server entry is moved to `Stale` using the

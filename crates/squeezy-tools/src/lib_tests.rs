@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
@@ -9101,6 +9101,21 @@ async fn tool_registry_specs_returns_same_arc_until_refresh() {
         !Arc::ptr_eq(&first, &third),
         "specs() reused stale Arc after refresh_mcp_tools"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn mcp_tool_list_changed_notify_reuses_registry_signal() {
+    let root = temp_workspace("mcp_tool_list_changed_notify");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let observed = registry.mcp_tool_list_changed_notify();
+    registry.mcp_tool_list_changed_notify().notify_one();
+
+    tokio::time::timeout(Duration::from_millis(50), observed.notified())
+        .await
+        .expect("tool_list_changed signal should be shared");
 
     let _ = fs::remove_dir_all(root);
 }

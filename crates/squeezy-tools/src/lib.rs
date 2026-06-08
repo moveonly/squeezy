@@ -49,7 +49,7 @@ use squeezy_vcs::{
     canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// One connected MCP tool's contribution to the request framing, surfaced by
 /// [`ToolRegistry::mcp_tool_schema_infos`] for the `/context` accounting view.
@@ -2110,6 +2110,10 @@ impl ToolRegistry {
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
         self.mcp.status_snapshot()
+    }
+
+    pub fn mcp_tool_list_changed_notify(&self) -> Arc<Notify> {
+        self.mcp.tool_list_changed_notify()
     }
 
     /// Per-tool accounting view for `/context`: every connected MCP tool with
