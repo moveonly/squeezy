@@ -1718,6 +1718,161 @@ fn input_edit_crlf_multiline_points_match_reference() {
 }
 
 #[test]
+fn parse_source_crlf_produces_stable_symbols() {
+    // Verify that tree-sitter parses CRLF source correctly: the second symbol
+    // must start on row 1 (after the first `\r\n` line ending).
+    let source = "pub fn foo() {}\r\npub fn bar() {}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none(), "CRLF source should parse");
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "foo"),
+        "foo not found in CRLF source"
+    );
+    let bar = parsed
+        .symbols
+        .iter()
+        .find(|s| s.name == "bar")
+        .expect("bar not found in CRLF source");
+    assert_eq!(
+        bar.span.start.line, 1,
+        "bar should start on line 1 (row 1) after CRLF; got line {}",
+        bar.span.start.line
+    );
+}
+
+#[test]
+fn incremental_parse_crlf_produces_changed_ranges() {
+    // An incremental edit inside a CRLF file must produce non-empty changed
+    // ranges, confirming that the edit-point coordinates are valid for
+    // tree-sitter's incremental re-parser.
+    let first = "pub fn foo() {}\r\npub fn bar() {}\r\n";
+    let second = "pub fn foo() { let x = 1; }\r\npub fn bar() {}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", first);
+
+    parser.parse_source(&record, first.to_string()).unwrap();
+
+    record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
+    let updated = parser.parse_source(&record, second.to_string()).unwrap();
+
+    assert!(
+        !updated.changed_ranges.is_empty(),
+        "CRLF incremental edit must produce changed ranges"
+    );
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_for_csharp() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}class Main {{}}\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = csharp_record("src/Main.cs", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(
+        parsed.unsupported.is_none(),
+        "C# BOM-prefixed source should parse; {:?}",
+        parsed.unsupported
+    );
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "Main"),
+        "Main class should be extracted from BOM-prefixed C# source"
+    );
+    assert!(
+        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
+        "BOM diagnostic should be emitted for C# source"
+    );
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_for_typescript() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}const x: number = 1;\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record("src/app.ts", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(
+        parsed.unsupported.is_none(),
+        "TypeScript BOM-prefixed source should parse; {:?}",
+        parsed.unsupported
+    );
+    assert!(
+        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
+        "BOM diagnostic should be emitted for TypeScript source"
+    );
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_for_python() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}def hello():\n    pass\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = python_record("src/app.py", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(
+        parsed.unsupported.is_none(),
+        "Python BOM-prefixed source should parse; {:?}",
+        parsed.unsupported
+    );
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "hello"),
+        "hello should be extracted from BOM-prefixed Python source"
+    );
+    assert!(
+        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
+        "BOM diagnostic should be emitted for Python source"
+    );
+}
+
+#[test]
+fn parallel_parse_utf16_le_returns_encoding_hint() {
+    // Exercises the parallel path (parse_record_with_cache) for UTF-16
+    // encoding detection.  The threshold is PARALLEL_PARSE_THRESHOLD = 8,
+    // so we create 8 records where one is a UTF-16LE file.
+    let mut records: Vec<FileRecord> = (0..7)
+        .map(|i| record(&format!("src/file{i}.rs"), "pub fn f() {}\n"))
+        .collect();
+
+    // The UTF-16LE record is placed at a non-zero index so it ends up in the
+    // parallel scatter, not the serial fallback.
+    let mut utf16_record = record("src/utf16.rs", "");
+    let utf16_bytes: &[u8] = b"\xFF\xFE\x66\x00\x6E\x00";
+    fs::write(&utf16_record.path, utf16_bytes).unwrap();
+    utf16_record.hash = ContentHash::new(stable_content_hash(utf16_bytes));
+    utf16_record.size_bytes = utf16_bytes.len() as u64;
+    records.push(utf16_record);
+
+    let mut parser = LanguageParser::new().unwrap();
+    let (parsed, _summary) = parser.parse_records(&records).unwrap();
+
+    let utf16_result = parsed
+        .iter()
+        .find(|p| p.file.relative_path == "src/utf16.rs")
+        .unwrap();
+    assert!(utf16_result.unsupported.is_some());
+    let reason = &utf16_result.unsupported.as_ref().unwrap().reason;
+    assert!(
+        reason.contains("UTF-16LE"),
+        "parallel path should surface UTF-16LE hint; got: {reason:?}"
+    );
+}
+
+#[test]
 fn parser_classifies_associated_functions_and_unsafe_impl_names() {
     let source = r#"
 pub struct Runner;

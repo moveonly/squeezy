@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet, hash_map::Entry},
     fs,
 };
@@ -510,25 +509,21 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
     }
 }
 
-// Worker-local parser pools are stored in thread-local storage so that the
-// same OS thread reuses already-loaded grammar objects across parallel batches.
-// With `std::thread::scope` each batch spawns fresh threads, so today the
-// benefit is scoped to one `parse_records_parallel` call.  When a persistent
-// thread pool is introduced the reuse will extend across workspace refreshes,
-// which is where grammar initialisation cost on Windows is most visible.
-thread_local! {
-    static WORKER_POOL: RefCell<ParserPool> = RefCell::new(ParserPool::default());
-}
-
+// `parse_job_chunk` uses a chunk-local `ParserPool` so that grammar objects
+// are reused across the files in each parallel chunk.  Reuse across separate
+// `parse_records_parallel` calls is not currently possible because
+// `std::thread::scope` spawns a brand-new OS thread per call, discarding any
+// thread-local state from previous calls.  When a persistent worker-thread
+// pool is introduced the pool should be stored in thread-local storage so
+// that grammar initialisation (an FFI operation, more expensive on Windows)
+// is amortised across workspace refreshes.
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
-    WORKER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        let mut outputs = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            outputs.push(parse_record_with_cache(&mut pool, job)?);
-        }
-        Ok(outputs)
-    })
+    let mut pool = ParserPool::default();
+    let mut outputs = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        outputs.push(parse_record_with_cache(&mut pool, job)?);
+    }
+    Ok(outputs)
 }
 
 fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<ParseOutput> {
@@ -951,19 +946,16 @@ fn strip_utf8_bom(source: String) -> (String, bool) {
 }
 
 /// Returns a [`ParseDiagnostic`] that identifies a UTF-8 BOM at the start of
-/// the file and advises the user to save without BOM.
+/// the file and advises the user to save without BOM.  The span is `None`
+/// because the BOM has already been stripped: any byte offset in this
+/// `ParsedFile` is relative to the BOM-stripped content, so a span pointing
+/// at byte 0 would incorrectly identify the first real character of code.
 fn utf8_bom_diagnostic() -> ParseDiagnostic {
-    const BOM_LEN: u32 = "\u{FEFF}".len() as u32;
     ParseDiagnostic {
         message: "UTF-8 BOM at start of file; save as UTF-8 without BOM for reliable \
                   parsing; byte offsets are relative to BOM-stripped content"
             .to_string(),
-        span: Some(SourceSpan::new(
-            0,
-            BOM_LEN,
-            SourcePoint::new(0, 0),
-            SourcePoint::new(0, BOM_LEN),
-        )),
+        span: None,
         confidence: Confidence::Partial,
     }
 }
