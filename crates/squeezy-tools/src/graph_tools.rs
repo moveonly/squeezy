@@ -780,6 +780,16 @@ pub(crate) fn graph_payload(
             json!(manager.pending_changed_count()),
         );
     }
+    // Surface unmatched watcher events: events that were pending but did not
+    // correspond to any changed or removed file in the crawl. On Linux these
+    // are a practical signal for path-spelling, symlink, or bind-mount
+    // mismatches in event reconciliation.
+    if refresh.unchanged_event_paths > 0 {
+        payload.insert(
+            "unmatched_watcher_events".to_string(),
+            json!(refresh.unchanged_event_paths),
+        );
+    }
     payload
 }
 
@@ -825,18 +835,38 @@ fn cargo_freshness_json(freshness: &CargoFactFreshness) -> Value {
 
 fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
     let diagnostic = &hit.diagnostic;
-    json!({
-        "level": diagnostic.level,
-        "message": diagnostic.message,
-        "code": diagnostic.code,
-        "path": diagnostic.file_id.as_ref().map(|id| id.0.clone()),
-        "span": diagnostic.span.map(span_json),
-        "label": diagnostic.label,
-        "package_id": diagnostic.package_id,
-        "target_name": diagnostic.target_name,
-        "freshness": cargo_freshness_json(&hit.freshness),
-        "provenance": provenance_json(diagnostic.provenance.clone()),
-    })
+    let mut map = serde_json::Map::new();
+    map.insert("level".to_string(), json!(diagnostic.level));
+    map.insert("message".to_string(), json!(diagnostic.message));
+    map.insert("code".to_string(), json!(diagnostic.code));
+    map.insert(
+        "path".to_string(),
+        json!(diagnostic.file_id.as_ref().map(|id| id.0.clone())),
+    );
+    map.insert("span".to_string(), json!(diagnostic.span.map(span_json)));
+    map.insert("label".to_string(), json!(diagnostic.label));
+    map.insert("package_id".to_string(), json!(diagnostic.package_id));
+    map.insert("target_name".to_string(), json!(diagnostic.target_name));
+    map.insert(
+        "freshness".to_string(),
+        cargo_freshness_json(&hit.freshness),
+    );
+    map.insert(
+        "provenance".to_string(),
+        provenance_json(diagnostic.provenance.clone()),
+    );
+    // When the compiler path could not be mapped to a workspace-relative
+    // FileId, include the raw path so users can diagnose container, symlink,
+    // or bind-mount spelling mismatches between cargo's output and the
+    // workspace root squeezy was opened with.
+    if let Some(raw) = &diagnostic.raw_path {
+        map.insert("raw_path".to_string(), json!(raw));
+        map.insert(
+            "raw_path_hint".to_string(),
+            json!("path not matched to workspace; check for container/symlink/bind-mount mismatch"),
+        );
+    }
+    Value::Object(map)
 }
 
 fn graph_language_counts_json(graph: &squeezy_graph::SemanticGraph) -> Value {

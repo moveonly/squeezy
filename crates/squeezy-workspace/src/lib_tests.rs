@@ -725,6 +725,48 @@ fn crawler_classifies_go_files() {
 
 #[cfg(unix)]
 #[test]
+fn crawler_reports_external_symlink_in_coverage() {
+    // Create a source file outside the workspace root and symlink it in.
+    let root = temp_root("crawler_reports_external_symlink_in_coverage");
+    let outside_dir = temp_root("crawler_reports_external_symlink_outside");
+    fs::write(outside_dir.join("external.go"), "package ext\n").unwrap();
+    // Need a Cargo.toml so the indexing decision is positive.
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::os::unix::fs::symlink(outside_dir.join("external.go"), root.join("external.go")).unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    // The file must NOT appear in indexed files.
+    assert!(
+        !snapshot
+            .files
+            .iter()
+            .any(|f| f.relative_path == "external.go"),
+        "external symlink should not be indexed"
+    );
+    // It MUST appear in the excluded list with ExternalSymlink reason.
+    assert!(
+        snapshot
+            .excluded
+            .iter()
+            .any(|e| e.relative_path == "external.go"
+                && e.reason == ExclusionReason::ExternalSymlink),
+        "external symlink should be in excluded coverage"
+    );
+    // Coverage counters must reflect it.
+    assert!(
+        snapshot
+            .coverage
+            .reasons
+            .contains_key(ExclusionReason::ExternalSymlink.as_str()),
+        "external_symlink coverage reason must be tracked"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn crawler_indexes_internal_symlinked_source_files() {
     let root = temp_root("crawler_indexes_internal_symlinked_source_files");
     fs::create_dir_all(root.join("real")).unwrap();

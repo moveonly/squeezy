@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{ChangeBatch, FileWatcher, WatcherConfig};
+use super::{ChangeBatch, FileWatcher, WatcherConfig, linux_inotify_hint};
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
@@ -70,5 +70,53 @@ fn watcher_emits_change_batch_after_debounce_window() {
     assert!(
         has_path,
         "expected debounced batch to contain the touched file, got {batches:?}",
+    );
+}
+
+/// `linux_inotify_hint` is only meaningful on Linux, but the function exists
+/// on all platforms (returning "" on non-Linux). Test the platform-portable
+/// contract first: the hint must be empty for generic unrelated errors.
+#[test]
+fn linux_inotify_hint_empty_for_unrelated_errors() {
+    assert_eq!(linux_inotify_hint("permission denied"), "");
+    assert_eq!(linux_inotify_hint("connection refused"), "");
+    assert_eq!(linux_inotify_hint(""), "");
+}
+
+/// On non-Linux the hint is always empty regardless of the error string.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn linux_inotify_hint_always_empty_on_non_linux() {
+    assert_eq!(linux_inotify_hint("No space left on device"), "");
+    assert_eq!(linux_inotify_hint("ENOSPC"), "");
+}
+
+/// On Linux the hint fires only for ENOSPC-pattern errors, not for generic
+/// "inotify" mentions.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_inotify_hint_fires_on_enospc_patterns() {
+    assert!(
+        !linux_inotify_hint("No space left on device").is_empty(),
+        "hint must fire for 'No space left on device'"
+    );
+    assert!(
+        !linux_inotify_hint("ENOSPC").is_empty(),
+        "hint must fire for 'ENOSPC'"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_inotify_hint_does_not_fire_for_bare_inotify_mention() {
+    assert_eq!(
+        linux_inotify_hint("inotify backend not supported"),
+        "",
+        "hint must NOT fire for a non-ENOSPC inotify error"
+    );
+    assert_eq!(
+        linux_inotify_hint("bad file descriptor (inotify)"),
+        "",
+        "hint must NOT fire when 'inotify' appears but ENOSPC does not"
     );
 }

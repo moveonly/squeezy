@@ -1970,7 +1970,11 @@ fn graph_manager_refresh_converges_for_csharp_changes_and_ignores_unsupported_on
     assert!(!unsupported.refreshed);
     assert_eq!(unsupported.reparsed_files, 0);
     assert_eq!(unsupported.changed_paths_from_events, 0);
-    assert_eq!(unsupported.unchanged_event_paths, 1);
+    // notes.txt changed and its event path matched the changed unsupported record,
+    // so it is NOT reported as an unmatched event path. An unchanged_event_paths > 0
+    // signals a genuine path-spelling or symlink mismatch, not a changed-but-
+    // non-supported file.
+    assert_eq!(unsupported.unchanged_event_paths, 0);
 
     thread::sleep(Duration::from_millis(2));
     fs::write(
@@ -8840,4 +8844,129 @@ void main() {
             .unwrap_or(false),
         "app.dart must NOT attach to the unrelated c/d/thing.dart that only shares the leaf",
     );
+}
+
+#[test]
+fn detect_case_collisions_empty_when_no_collisions() {
+    // Use the graph record helper to build minimal FileRecord values.
+    let files = vec![
+        record("src/lib.rs", ""),
+        record("src/main.rs", ""),
+        record("README.md", ""),
+    ];
+    let collisions = detect_case_collisions(&files);
+    assert!(
+        collisions.is_empty(),
+        "no case collisions expected, got: {collisions:?}"
+    );
+}
+
+#[test]
+fn detect_case_collisions_finds_pair() {
+    let files = vec![record("src/Lib.rs", ""), record("src/lib.rs", "")];
+    let collisions = detect_case_collisions(&files);
+    assert_eq!(collisions.len(), 1);
+    let pair = &collisions[0];
+    assert!(
+        (pair[0] == "src/Lib.rs" && pair[1] == "src/lib.rs")
+            || (pair[0] == "src/lib.rs" && pair[1] == "src/Lib.rs"),
+        "unexpected pair: {pair:?}"
+    );
+}
+
+#[test]
+fn detect_case_collisions_finds_all_pairs_for_three_way_collision() {
+    // Three files that all fold to "src/lib.rs": must yield C(3,2) = 3 pairs.
+    let files = vec![
+        record("src/lib.rs", ""),
+        record("src/Lib.rs", ""),
+        record("src/LIB.rs", ""),
+    ];
+    let collisions = detect_case_collisions(&files);
+    assert_eq!(
+        collisions.len(),
+        3,
+        "three-way collision must yield 3 pairs, got: {collisions:?}"
+    );
+}
+
+/// Absolute path tests use Unix-style paths so are only run on Unix.
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_strips_workspace_prefix() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "/workspace/myproject/src/main.rs"),
+        Some("src/main.rs".to_string()),
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_passes_through_relative_path() {
+    let root = std::path::Path::new("myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "src/main.rs"),
+        Some("src/main.rs".to_string()),
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_returns_none_for_angle_bracket_paths() {
+    let root = std::path::Path::new("myproject");
+    assert_eq!(normalize_cargo_file_id(root, None, "<anon>"), None);
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "<macro expansion>"),
+        None
+    );
+}
+
+/// Absolute path test: an absolute path outside the workspace root should
+/// return None. Only meaningful on Unix where the test paths are valid
+/// absolute paths.
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_returns_none_for_path_outside_workspace() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "/other/repo/src/lib.rs"),
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_fallback_via_symlink() {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    // Set up a real workspace dir and a symlink root that points to it.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let real_root = std::env::temp_dir().join(format!("squeezy-cargo-norm-real-{nonce}"));
+    let sym_root = std::env::temp_dir().join(format!("squeezy-cargo-norm-sym-{nonce}"));
+    fs::create_dir_all(real_root.join("src")).unwrap();
+    fs::write(real_root.join("src").join("main.rs"), "fn main() {}").unwrap();
+    std::os::unix::fs::symlink(&real_root, &sym_root).unwrap();
+
+    // cargo emits the path under the symlinked root; squeezy was opened
+    // with the real root. The exact prefix check fails; the canonical
+    // fallback must succeed.
+    let canonical_real = std::fs::canonicalize(&real_root).ok();
+    let result = normalize_cargo_file_id(
+        &real_root,
+        canonical_real.as_deref(),
+        &sym_root.join("src/main.rs").to_string_lossy(),
+    );
+    assert_eq!(
+        result,
+        Some("src/main.rs".to_string()),
+        "canonical fallback must resolve symlinked cargo path"
+    );
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&real_root);
+    let _ = fs::remove_file(&sym_root);
 }

@@ -107,7 +107,12 @@ impl FileWatcher {
             debouncer
                 .watch(&real_dir, RecursiveMode::Recursive)
                 .map_err(|err| {
-                    SqueezyError::Tool(format!("watcher: failed to watch {}: {err}", dir.display()))
+                    SqueezyError::Tool(format!(
+                        "watcher: failed to watch {}: {}{}",
+                        dir.display(),
+                        err,
+                        linux_inotify_hint(&err.to_string()),
+                    ))
                 })?;
         }
 
@@ -193,6 +198,33 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
 
     let batch = ChangeBatch { modified, removed };
     if batch.is_empty() { None } else { Some(batch) }
+}
+
+/// Return a Linux-specific hint when an inotify watch error looks like an
+/// exhausted watch-limit (`ENOSPC` / "No space left on device"). On Linux
+/// this error has nothing to do with disk space; it means either
+/// `fs.inotify.max_user_watches` or `fs.inotify.max_user_instances` is too
+/// low for the number of directories being watched. Returns an empty string
+/// on non-Linux platforms or when the error does not match.
+fn linux_inotify_hint(err_str: &str) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        let lower = err_str.to_ascii_lowercase();
+        // Only trigger for the two ENOSPC-specific patterns. A plain "inotify"
+        // substring could appear in unrelated error messages (e.g. "inotify
+        // backend not supported") and the hint text about watch limits would be
+        // actively misleading for those cases.
+        if lower.contains("no space left") || lower.contains("enospc") {
+            return " (Linux inotify: watch limit exhausted; run \
+                `sysctl fs.inotify.max_user_watches` to see the current limit and \
+                consider raising it with \
+                `sudo sysctl -w fs.inotify.max_user_watches=524288`; \
+                similarly check `fs.inotify.max_user_instances`)";
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = err_str;
+    ""
 }
 
 fn classify_event(kind: EventKind, paths: &[PathBuf], all_paths: &mut Vec<PathBuf>) {
