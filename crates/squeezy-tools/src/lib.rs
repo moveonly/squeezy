@@ -121,7 +121,7 @@ pub use schema::{
     parse_lossy_tool_parameters, parse_strict_tool_parameters,
 };
 pub use shell::direct_user_shell_nonce;
-pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellKillMeta, ShellRunOutcome};
+pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};
 #[cfg(test)]
 pub(crate) use shell::{
     shell_command_needs_checkpoint, shell_command_references_sensitive_path,
