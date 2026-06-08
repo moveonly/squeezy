@@ -73,3 +73,36 @@ fn sort_key_orders_higher_overlap_first() {
     };
     assert!(high.sort_key() < low.sort_key());
 }
+
+// ── Windows path tests ───────────────────────────────────────────────────────
+
+#[test]
+fn path_rank_handles_windows_backslash_query() {
+    // A query using `\` separators tokenizes the same as `/` separators,
+    // so `src\foo` should produce the same overlap as `src/foo`.
+    let rank_slash = path_rank("src/foo/bar.rs", "src/foo");
+    let rank_backslash = path_rank("src/foo/bar.rs", "src\\foo");
+    assert_eq!(rank_slash.overlap, rank_backslash.overlap);
+    assert_eq!(rank_slash.overlap, 2);
+}
+
+#[test]
+fn path_rank_windows_csharp_query() {
+    // Common Windows source paths.
+    let rank = path_rank("src/Program.cs", "src\\Program");
+    assert!(rank.overlap >= 1);
+}
+
+#[test]
+fn rank_paths_is_deterministic_with_path_tiebreaker() {
+    // When (overlap, trigram) is identical, paths are sorted lexicographically
+    // to avoid nondeterministic ordering on Windows where HashMap enumeration
+    // order may differ from Linux/macOS.
+    let paths = ["zzz/widget.rs", "aaa/widget.rs"];
+    let ranked = rank_paths(&paths, "widget");
+    // Both paths have equal rank; `aaa` < `zzz` lexicographically.
+    assert_eq!(
+        paths[ranked[0].0], "aaa/widget.rs",
+        "lexicographic tiebreaker must place aaa before zzz; ranked={ranked:?}"
+    );
+}

@@ -80,8 +80,12 @@ fn path_rank_with_context(path: &str, context: &PathQueryContext) -> PathRank {
 }
 
 /// Rank a slice of paths against `query`, returning `(index, PathRank)`
-/// pairs sorted best-first. Stable: paths with identical ranks keep
-/// their original relative order.
+/// pairs sorted best-first.
+///
+/// Sort key priority: `(-overlap, -trigram)` → `path` (lexicographic) →
+/// `original index`. The path tiebreaker keeps results deterministic on
+/// Windows repos where two candidates may have equal rank scores but differ
+/// only by case or separator representation.
 pub fn rank_paths(paths: &[&str], query: &str) -> Vec<(usize, PathRank)> {
     let context = PathQueryContext::new(query);
     let mut scored: Vec<(usize, PathRank)> = paths
@@ -89,7 +93,12 @@ pub fn rank_paths(paths: &[&str], query: &str) -> Vec<(usize, PathRank)> {
         .enumerate()
         .map(|(idx, path)| (idx, path_rank_with_context(path, &context)))
         .collect();
-    scored.sort_by(|a, b| a.1.sort_key().cmp(&b.1.sort_key()).then(a.0.cmp(&b.0)));
+    scored.sort_by(|a, b| {
+        a.1.sort_key()
+            .cmp(&b.1.sort_key())
+            .then_with(|| paths[a.0].cmp(paths[b.0]))
+            .then(a.0.cmp(&b.0))
+    });
     scored
 }
 

@@ -51,3 +51,28 @@ fn camel_snake_split_breaks_compound_identifiers() {
 fn camel_snake_split_handles_digits() {
     assert_eq!(camel_snake_split("BM25Rerank"), vec!["bm", "25", "rerank"]);
 }
+
+#[test]
+fn fuzzy_score_handles_multichar_lowercase_expansion() {
+    // U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE lowercases to two code
+    // points: U+0069 (i) + U+0307 (combining dot above).  The scorer must
+    // match both expanded chars against consecutive needle positions rather
+    // than silently dropping the second expansion char.
+    let score = fuzzy_score("\u{0130}stanbul", "i\u{0307}stanbul");
+    assert!(
+        score.is_some(),
+        "multi-char lowercase expansion must produce a match"
+    );
+    // The expanded match starts at byte 0, so the prefix bonus applies.
+    assert!(
+        score.unwrap() < 0,
+        "prefix match score should be negative (bonus applied)"
+    );
+}
+
+#[test]
+fn fuzzy_path_score_handles_backslash_query() {
+    // Windows-pasted queries with `\` separators normalise the same as `/`,
+    // so `src\foo` should find `src/foo/bar.rs`.
+    assert!(fuzzy_path_score("src/foo/bar.rs", "src\\foo").is_some());
+}

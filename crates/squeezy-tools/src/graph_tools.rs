@@ -560,26 +560,43 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
     path_matches_filter(symbol.file_id.0.as_str(), filter)
 }
 
+/// Normalise Windows-style backslash separators in a user-supplied filter to
+/// forward slashes. Graph paths are always slash-normalised by workspace
+/// discovery, so this lets users paste paths from Explorer, PowerShell,
+/// `cargo` output, or MSBuild output without learning the internal convention.
+///
+/// Returns the input unchanged (zero allocation) when it contains no `\`.
+fn normalize_filter(filter: &str) -> std::borrow::Cow<'_, str> {
+    if filter.contains('\\') {
+        std::borrow::Cow::Owned(filter.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(filter)
+    }
+}
+
 /// Match `path` against a model-supplied `filter`.
 ///
-/// Filters that look like a directory path (contain `/`) match by strict
-/// prefix with a directory boundary — `gson/src/main/java` matches files
-/// under that tree but not siblings like `gson/src/test/java/...`. This is
-/// what the model intuitively means when it writes a multi-segment path.
+/// Filters that look like a directory path (contain `/` or `\`) match by
+/// strict prefix with a directory boundary — `gson/src/main/java` matches
+/// files under that tree but not siblings like `gson/src/test/java/...`.
+/// Windows-pasted filters such as `gson\src\main\java` are normalised to
+/// forward slashes first so they match the slash-normalised graph paths.
 ///
-/// Single-token filters (no `/`, e.g. `squeezy_graph`) keep the loose
+/// Single-token filters (no directory separator) keep the loose
 /// trailing-segment + fuzzy fallback so casual "find a crate" queries
 /// still resolve. The fuzzy path was the source of cross-tree noise only
-/// when the model already wrote a real prefix; gating on `/` removes that
-/// noise without regressing the bareword UX.
+/// when the model already wrote a real prefix; gating on separators removes
+/// that noise without regressing the bareword UX.
 fn path_matches_filter(path: &str, filter: &str) -> bool {
-    if filter.contains('/') {
-        let filter = filter.trim_end_matches('/');
-        if filter.is_empty() {
+    if filter.contains('/') || filter.contains('\\') {
+        let norm = normalize_filter(filter);
+        let norm_trimmed = norm.trim_end_matches('/');
+        if norm_trimmed.is_empty() {
             return true;
         }
-        return path == filter
-            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'));
+        return path == norm_trimmed
+            || (path.starts_with(norm_trimmed)
+                && path.as_bytes().get(norm_trimmed.len()) == Some(&b'/'));
     }
     if path_matches_exact_or_suffix(path, filter) {
         return true;
@@ -1374,7 +1391,7 @@ fn graph_zero_hit_fallback(
     if packet_count > 0 {
         return Value::Null;
     }
-    let (path_value, language_value, reason) = match path {
+    let (path_value, language_value, reason, windows_hint) = match path {
         Some(path) => {
             let file = graph
                 .files
@@ -1391,19 +1408,36 @@ fn graph_zero_hit_fallback(
                         Value::String(file.relative_path.clone()),
                         Value::String(file.language.display_name().to_string()),
                         reason,
+                        None,
                     )
                 }
-                None => (Value::String(path.to_string()), Value::Null, "path_unknown"),
+                None => {
+                    // When no file matched and the supplied path looks like a
+                    // Windows-pasted path, include the slash-normalised form as
+                    // a compact hint so the caller can correct the filter
+                    // without reading the source.
+                    let hint = path.contains('\\').then(|| path.replace('\\', "/"));
+                    (
+                        Value::String(path.to_string()),
+                        Value::Null,
+                        "path_unknown",
+                        hint,
+                    )
+                }
             }
         }
-        None => (Value::Null, Value::Null, "no_path_scope"),
+        None => (Value::Null, Value::Null, "no_path_scope", None),
     };
-    json!({
+    let mut packet = json!({
         "status": "no_graph_evidence",
         "reason": reason,
         "path": path_value,
         "language": language_value,
-    })
+    });
+    if let Some(norm) = windows_hint {
+        packet["normalized_path"] = Value::String(norm);
+    }
+    packet
 }
 
 fn graph_status_for_language(language: LanguageKind) -> &'static str {
@@ -1594,6 +1628,10 @@ fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
 }
 
 fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
+    // Normalise Windows separators so `src\lib.rs` suffix-matches the
+    // slash-normalised graph path `src/lib.rs`.
+    let norm = normalize_filter(filter);
+    let filter = norm.as_ref();
     path == filter
         || path
             .strip_suffix(filter)
@@ -4285,6 +4323,68 @@ mod path_filter_tests {
         assert!(!path_matches_filter(
             "crates/squeezy-graph/src/lib.rs",
             "zzzznope",
+        ));
+    }
+
+    // ── Windows separator tests ──────────────────────────────────────────────
+
+    #[test]
+    fn windows_backslash_filter_acts_as_directory_prefix() {
+        // A filter pasted from Windows Explorer or PowerShell that uses `\`
+        // must behave identically to the equivalent `/` filter.
+        assert!(path_matches_filter("src/main/foo.rs", "src\\main",));
+        // Sibling outside the subtree must not match.
+        assert!(!path_matches_filter("src/main_extra/foo.rs", "src\\main",));
+    }
+
+    #[test]
+    fn windows_backslash_filter_respects_exact_and_trailing_slash() {
+        // Exact match with backslash separator.
+        assert!(path_matches_filter("src/main/foo.rs", "src\\main\\foo.rs",));
+        // Trailing backslash is tolerated like trailing forward slash.
+        assert!(path_matches_filter("src/main/foo.rs", "src\\main\\",));
+    }
+
+    #[test]
+    fn mixed_separator_filter_normalizes_correctly() {
+        // Filters that mix `/` and `\` (e.g. copy-pasted from mixed toolchain
+        // output) are normalised before matching.
+        assert!(path_matches_filter(
+            "gson/src/main/java/Foo.java",
+            "gson\\src/main\\java",
+        ));
+        assert!(!path_matches_filter(
+            "gson/src/test/java/Foo.java",
+            "gson\\src/main\\java",
+        ));
+    }
+
+    #[test]
+    fn windows_csharp_paths_match() {
+        // Common Windows-heavy source names pasted from Visual Studio or
+        // Explorer.
+        assert!(path_matches_filter("src/Program.cs", "src\\Program.cs",));
+        assert!(path_matches_filter(
+            "Properties/AssemblyInfo.cs",
+            "Properties\\AssemblyInfo.cs",
+        ));
+        assert!(path_matches_filter(
+            "Views/Home/Index.cshtml",
+            "Views\\Home\\Index.cshtml",
+        ));
+        // appsettings single-token without separator still resolves via
+        // suffix / fuzzy match.
+        assert!(path_matches_filter(
+            "appsettings.Development.json",
+            "appsettings.Development.json",
+        ));
+    }
+
+    #[test]
+    fn windows_cmake_path_matches() {
+        assert!(path_matches_filter(
+            "src/CMakeLists.txt",
+            "src\\CMakeLists.txt",
         ));
     }
 }
