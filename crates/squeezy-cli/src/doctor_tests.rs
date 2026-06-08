@@ -260,14 +260,64 @@ fn skills_check_warns_on_ambiguous_same_precedence_names() {
 fn mcp_check_is_ok_when_fields_match_transport() {
     let mut servers = BTreeMap::new();
     let mut stdio = mcp_fixture(true, McpTransport::Stdio);
-    stdio.command = Some("/usr/bin/example-server".to_string());
+    // Use the running test binary itself — guaranteed to exist and be
+    // executable on every CI platform, so the PATH/exec-bit check passes.
+    let test_exe = std::env::current_exe()
+        .expect("current_exe")
+        .to_string_lossy()
+        .into_owned();
+    stdio.command = Some(test_exe);
     servers.insert("local".to_string(), stdio);
     let mut http = mcp_fixture(true, McpTransport::Sse);
     http.url = Some("https://example.test/mcp".to_string());
     servers.insert("remote".to_string(), http);
     let check = mcp_check(&servers);
-    assert_eq!(check.status, Status::Ok);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("enabled=2"));
+}
+
+#[test]
+fn mcp_check_warns_when_stdio_command_not_on_path() {
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some("squeezy-doctor-no-such-mcp-binary-xyzzy-abc".to_string());
+    servers.insert("missing".to_string(), server);
+    let check = mcp_check(&servers);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not found on PATH"),
+        "detail: {}",
+        check.detail
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_check_warns_when_stdio_command_not_executable() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-mcp-check-noexec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let noexec = dir.join("noexec-server");
+    fs::write(&noexec, b"#!/bin/sh\nexit 0\n").expect("write script");
+    // Leave execute bit unset.
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some(noexec.to_string_lossy().into_owned());
+    servers.insert("noexec".to_string(), server);
+    let check = mcp_check(&servers);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not executable"),
+        "detail: {}",
+        check.detail
+    );
 }
 
 #[test]
