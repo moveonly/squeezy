@@ -723,6 +723,7 @@ fn apply_mcp_overlay(
             bearer_token_env_var: None,
             http_headers: std::collections::BTreeMap::new(),
             env_http_headers: std::collections::BTreeMap::new(),
+            cwd: None,
         };
         config.mcp_servers.insert(name.clone(), server);
     }
