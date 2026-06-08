@@ -16,10 +16,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
-    ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
-    SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    per_repo_settings_path, project_settings_template, user_settings_template,
+    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpServerConfig,
+    McpTransport, ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode,
+    ReasoningEffort, SessionMode, SettingsFile, SqueezyError, default_settings_path,
+    find_project_settings_path, per_repo_settings_path, project_settings_template,
+    user_settings_template,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -136,7 +137,18 @@ struct Cli {
     #[arg(
         long = "health",
         hide = true,
-        help = "Hidden compatibility alias for `squeezy doctor`"
+        // `--health` short-circuits the dispatch table and runs doctor
+        // with `DoctorArgs::default()`. Pairing it with one of the
+        // top-level print-mode / list flags would silently drop the
+        // other flag's behavior; reject those combinations at parse
+        // time so the deviation is loud instead of mysterious. The
+        // subcommand-with-`--health` combination is rejected at
+        // runtime in `run()` because the subcommand group does not
+        // expose a conflict-friendly arg id in clap derive. Use
+        // `squeezy doctor --json` (and other doctor flags) for non-
+        // default behavior; `--health` is a compatibility alias only.
+        conflicts_with_all = ["prompt", "list_providers", "list_models"],
+        help = "Hidden compatibility alias for `squeezy doctor` (no extra flags accepted; use `squeezy doctor` for --json/--probe/--only)"
     )]
     health: bool,
     #[arg(
@@ -608,6 +620,20 @@ async fn run() -> squeezy_core::Result<()> {
         ));
     }
     if cli.health {
+        // Clap's `conflicts_with_all` on `--health` already rejects
+        // `--prompt`, `--list-providers`, and `--list-models`, but the
+        // subcommand group is not addressable from `conflicts_with*`
+        // in the derive macro, so we surface that conflict here. The
+        // failure mode we are preventing is `squeezy --health doctor
+        // --probe` silently running plain doctor and dropping the
+        // subcommand's flags.
+        if cli.command.is_some() {
+            return Err(SqueezyError::Config(
+                "--health is a compatibility alias for `squeezy doctor` and cannot be combined with a subcommand; \
+                 drop --health, or run `squeezy doctor` directly to pass --json/--probe/--only"
+                    .to_string(),
+            ));
+        }
         let report = doctor::run(&DoctorArgs::default()).await?;
         report.print();
         let code = report.exit_code;
@@ -732,17 +758,20 @@ async fn run() -> squeezy_core::Result<()> {
     telemetry.spawn(TelemetryEvent::app_started(&config));
     squeezy_core::startup_trace::mark("telemetry_spawned");
 
-    // Resolve `--session <prefix>` against the on-disk session store
-    // before any downstream code sees it, so the user can pass a short
-    // unique prefix (`squeezy --session abc12`) the same way `squeezy
-    // sessions resume abc12` works. Ambiguous and unknown prefixes
-    // fail fast with a clear message instead of being forwarded into a
-    // generic "session not found" later.
+    // Resolve `--session <input>` against the on-disk session store
+    // before any downstream code sees it. The user can pass:
+    //   * the opaque `sess_<16hex>` handle printed by `squeezy
+    //     sessions list` (the documented surface),
+    //   * a short unique raw-id prefix (the same way `squeezy sessions
+    //     resume abc12` works), or
+    //   * the full raw id.
+    // Ambiguous and unknown values fail fast with a clear message
+    // instead of being forwarded into a generic "session not found"
+    // later.
     let session_store = SessionStore::open(&config);
     let resolved_session_id: Option<String> = match cli.session.as_deref() {
         Some(id) => Some(
-            session_store
-                .resolve_session_id_prefix(id)
+            resolve_session_input(&session_store, id)
                 .map_err(|err| SqueezyError::Tool(format!("--session: {err}")))?,
         ),
         None => None,
@@ -1105,9 +1134,21 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
                     "MCP server {name:?} is not configured"
                 )));
             };
+            // `mcp test` is an explicit operator action ("probe this
+            // server now"), so we honor it even when `enabled = false`
+            // in settings — running `squeezy mcp disable foo &&
+            // squeezy mcp test foo` should still report whether `foo`
+            // would handshake. The probe is one-shot and uses a
+            // throwaway registry, so this never persists `enabled =
+            // true`; we just surface the override in both human and
+            // JSON output so the operator is not surprised when the
+            // probe succeeds against a `disabled` server.
+            let enabled_in_config = server.enabled;
+            let server = McpServerConfig {
+                enabled: true,
+                ..server
+            };
             let mut servers = BTreeMap::new();
-            let mut server = server;
-            server.enabled = true;
             servers.insert(name.clone(), server);
             const MCP_TEST_TIMEOUT_SECS: u64 = 30;
             let registry = McpClientRegistry::new(servers);
@@ -1161,13 +1202,23 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
                     }
                 }
             };
+            let detail_with_note = if enabled_in_config {
+                detail.clone()
+            } else {
+                format!("(server was disabled in config; re-enabled for probe) {detail}")
+            };
             if *json {
                 let body = serde_json::json!({
                     "name": name,
                     "status": status_label,
-                    "detail": &detail,
+                    "detail": &detail_with_note,
                     "tools_count": tools_count,
+                    "enabled_in_config": enabled_in_config,
                 });
+                // Emit the JSON body before any potential error return
+                // below so machine consumers always receive a parseable
+                // payload, even on `fail`. The non-zero exit still
+                // signals failure for shell-level callers.
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&body).map_err(|err| {
@@ -1175,10 +1226,10 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
                     })?
                 );
             } else {
-                println!("[{status_label}] mcp:{name}  {detail}");
+                println!("[{status_label}] mcp:{name}  {detail_with_note}");
             }
             if status_label == "fail" {
-                return Err(SqueezyError::Tool(detail));
+                return Err(SqueezyError::Tool(detail_with_note));
             }
             Ok(())
         }
@@ -1907,7 +1958,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             Ok(())
         }
         SessionsCommand::Show { id, json } => {
-            let resolved = resolve_session_show_id(&store, id)?;
+            let resolved = resolve_session_input(&store, id)?;
             let record = store.show(&resolved)?;
             if *json {
                 let mut session_id_map = public_session_id_map_for_metadata(&record.metadata);
@@ -1977,15 +2028,12 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             id,
             force_cross_project,
         } => {
-            // Pi-style prefix resolution: the user can type a short
-            // unique prefix of a session id (e.g. `squeezy sessions
-            // resume abc12`) and the store expands it to the full id
-            // before we hand it to the TUI. Ambiguous and unknown
-            // prefixes surface as actionable errors instead of being
-            // forwarded as-is into a "session not found" downstream.
-            let resolved = store
-                .resolve_session_id_prefix(id)
-                .map_err(|err| SqueezyError::Tool(err.to_string()))?;
+            // Accept either the opaque `sess_<16hex>` handle published
+            // by `squeezy sessions list` or a raw id / raw-id prefix.
+            // Ambiguous and unknown values surface as actionable errors
+            // instead of being forwarded as-is into a "session not
+            // found" downstream.
+            let resolved = resolve_session_input(&store, id)?;
             // F07: when the recorded `metadata.cwd` differs from the
             // caller's current directory, gate the resume behind a y/N
             // prompt so a stray `squeezy sessions resume <id>` from an
@@ -2006,15 +2054,17 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             // on disk, then drop into the TUI resuming the child. The
             // parent session is preserved so `squeezy sessions resume
             // <parent>` still works.
+            let resolved = resolve_session_input(&store, id)?;
             let provider = provider_from_app_config(&config);
             let child_metadata = SessionMetadata::new(&config, provider.name());
-            let child = store.fork_session(id, child_metadata)?;
+            let child = store.fork_session(&resolved, child_metadata)?;
             let child_id = child.session_id().to_string();
             drop(child);
             squeezy_tui::resume(config, provider, child_id).await
         }
         SessionsCommand::Replay { id, json } => {
-            let report = Agent::replay_session(config, id).await?;
+            let resolved = resolve_session_input(&store, id)?;
+            let report = Agent::replay_session(config, &resolved).await?;
             if *json {
                 println!(
                     "{}",
@@ -2043,23 +2093,33 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             } else {
                 CleanupMode::Archive
             };
-            let report = store.cleanup_with(ids, None, mode)?;
+            let resolved_ids = ids
+                .iter()
+                .map(|id| resolve_session_input(&store, id))
+                .collect::<squeezy_core::Result<Vec<_>>>()?;
+            let report = store.cleanup_with(&resolved_ids, None, mode)?;
             for id in report.archived {
-                println!("archived {id}");
+                let handle = PublicSessionHandle::for_store_id(&id);
+                println!("archived {handle}");
             }
             for id in report.removed {
-                println!("removed {id}");
+                let handle = PublicSessionHandle::for_store_id(&id);
+                println!("removed {handle}");
             }
             Ok(())
         }
         SessionsCommand::Archive { id } => {
-            store.archive_session(id)?;
-            println!("archived {id}");
+            let resolved = resolve_session_input(&store, id)?;
+            store.archive_session(&resolved)?;
+            let handle = PublicSessionHandle::for_store_id(&resolved);
+            println!("archived {handle}");
             Ok(())
         }
         SessionsCommand::Unarchive { id } => {
-            store.unarchive_session(id)?;
-            println!("unarchived {id}");
+            let resolved = resolve_session_input(&store, id)?;
+            store.unarchive_session(&resolved)?;
+            let handle = PublicSessionHandle::for_store_id(&resolved);
+            println!("unarchived {handle}");
             Ok(())
         }
     }
@@ -2094,23 +2154,30 @@ fn handle_session_export_command(
     store: &SessionStore,
     args: &SessionExportArgs,
 ) -> squeezy_core::Result<()> {
+    let resolved = resolve_session_input(store, &args.id)?;
     if args.html {
-        let record = store.show(&args.id)?;
+        let record = store.show(&resolved)?;
         let opts = squeezy_agent::ExportOpts {
             include_tool_outputs: !args.no_tool_outputs,
             theme: args.theme.to_theme(),
         };
         let html = squeezy_agent::export_session_to_html(&record, &opts)
             .map_err(|err| SqueezyError::Tool(format!("failed to render session html: {err}")))?;
+        // Public handle keeps the default filename safe to share without
+        // leaking the raw `<ms>-<pid>-<counter>` id.
+        let default_name = format!(
+            "squeezy-session-{}.html",
+            PublicSessionHandle::for_store_id(&resolved)
+        );
         let target = args
             .output
             .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{}.html", args.id)));
+            .unwrap_or_else(|| PathBuf::from(default_name));
         fs::write(&target, &html)?;
         println!("wrote {} ({} bytes)", target.display(), html.len());
         return Ok(());
     }
-    let value = store.export(&args.id)?;
+    let value = store.export(&resolved)?;
     let json = serde_json::to_string_pretty(&value)
         .map_err(|err| SqueezyError::Tool(format!("failed to serialize session export: {err}")))?;
     if let Some(target) = args.output.as_ref() {
@@ -2132,7 +2199,9 @@ async fn handle_session_report_command(
         max_section_bytes: config.session_logs.max_event_bytes,
         max_archive_bytes: config.feedback.max_report_bytes,
     };
-    let bundle = SessionStore::open(config).build_bug_report(config, &args.id, options)?;
+    let store = SessionStore::open(config);
+    let resolved = resolve_session_input(&store, &args.id)?;
+    let bundle = store.build_bug_report(config, &resolved, options)?;
     if args.preview || args.send {
         print!("{}", bundle.preview_text());
     }
@@ -2170,10 +2239,15 @@ async fn handle_session_report_command(
             }
         }
     }
+    // Use the public handle for the default filename so the on-disk
+    // bug-report artifact also avoids leaking the raw
+    // `<ms>-<pid>-<counter>` id. `default_bug_report_path` already
+    // sanitizes input for filesystem-safe characters.
+    let handle = PublicSessionHandle::for_store_id(&resolved);
     let path = args
         .output
         .clone()
-        .unwrap_or_else(|| default_bug_report_path(config, &args.id));
+        .unwrap_or_else(|| default_bug_report_path(config, handle.as_ref()));
     bundle.write_archive(&path)?;
     println!("report archive: {}", path.display());
     Ok(())
@@ -3029,6 +3103,25 @@ fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
     }
 }
 
+/// Opaque, stable pseudonym derived from a raw `<ms>-<pid>-<counter>`
+/// session id. CLI output uses this form everywhere a session id would
+/// otherwise be logged (CodeQL's "cleartext logging of sensitive
+/// information" heuristic flags the raw shape), and
+/// [`resolve_session_input`] reverses it when the user passes a
+/// `sess_…` value back in.
+///
+/// **Wire format:** `sess_<16 lowercase hex>` (8 bytes / 64 bits of the
+/// SHA-256 digest). 64 bits is astronomically collision-resistant for a
+/// local single-user session store — even at a few hundred thousand
+/// sessions the expected collision count stays well below 1 — and the
+/// `v1` tag in the domain-separation key (`squeezy-public-session-id-v1\0`)
+/// reserves room to lengthen the digest without changing the prefix if
+/// future use lengthens the address space.
+///
+/// **Hash choice:** the cryptographic strength of SHA-256 is not load-
+/// bearing here (this is a pseudonym, not credential material). A
+/// cheaper hash with the same 64-bit pre-image property would be a
+/// drop-in replacement; the only consumer is this file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublicSessionHandle(String);
 
@@ -3182,7 +3275,9 @@ fn sanitize_session_ids_in_value(
     session_id_map: &BTreeMap<String, String>,
 ) {
     let mut replacements: Vec<(&String, &String)> = session_id_map.iter().collect();
-    replacements.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+    // Longest raw id first so a shorter id that is a substring of a
+    // longer one cannot clobber the longer one's match.
+    replacements.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
     sanitize_session_ids_in_value_inner(value, &replacements);
 }
 
@@ -3212,22 +3307,81 @@ fn sanitize_session_ids_in_value_inner(
     }
 }
 
-fn resolve_session_show_id(store: &SessionStore, id: &str) -> squeezy_core::Result<String> {
-    if store.read_metadata(id).is_ok() {
-        return Ok(id.to_string());
+/// Translate a user-supplied session identifier into a raw on-disk
+/// `<ms>-<pid>-<counter>` session id that the store layer accepts.
+///
+/// CLI output exposes only the opaque [`PublicSessionHandle`] form
+/// (`sess_<16hex>`) so the raw id is never written to a log surface that
+/// CodeQL flags as cleartext-sensitive, but the inputs the user actually
+/// types still have to round-trip back to a real session — otherwise
+/// `sessions list | xargs sessions resume` and friends silently break.
+/// This resolver is the single source of truth for that translation and
+/// is shared by every session-id-consuming subcommand and by
+/// `--session <id>` at startup.
+///
+/// Resolution order (first match wins):
+///
+/// 1. **Exact raw id**: if the input names an existing session
+///    directory (live or archived) directly, return it unchanged. This
+///    is the cheap happy path and also keeps backwards compatibility
+///    with scripts that already capture raw ids from `events.jsonl`
+///    or `.squeezy/sessions/<id>/` directly.
+/// 2. **Public handle**: if the input looks like a [`PublicSessionHandle`]
+///    (`sess_<16hex>`) we linear-scan the live and archived sessions and
+///    return the underlying raw id whose handle matches. The scan
+///    excludes archived sessions when the live root already produced a
+///    match, but this code path is dominated by the disk read so
+///    excluding archived first would not be a meaningful speedup.
+/// 3. **Prefix**: otherwise we hand the input to
+///    [`SessionStore::resolve_session_id_prefix`], which handles
+///    raw-id prefix matching with its own ambiguity diagnostics.
+///
+/// The function is intentionally infallible by default for valid public
+/// handles: callers should not need to know whether the user typed the
+/// public form or the raw form. For the prefix path it surfaces the
+/// store's ambiguity / not-found errors verbatim, prefixed by the
+/// caller's context where applicable.
+fn resolve_session_input(store: &SessionStore, input: &str) -> squeezy_core::Result<String> {
+    if input.is_empty() {
+        return Err(SqueezyError::Tool(
+            "session id is required; pass an id from `squeezy sessions list`".to_string(),
+        ));
     }
 
-    let query = SessionQuery {
-        include_archived: true,
-        ..Default::default()
-    };
-    for metadata in store.list(&query)? {
-        if PublicSessionHandle::for_store_id(&metadata.session_id).0 == id {
-            return Ok(metadata.session_id);
+    if store.read_metadata(input).is_ok() {
+        return Ok(input.to_string());
+    }
+
+    if looks_like_public_session_handle(input) {
+        let query = SessionQuery {
+            include_archived: true,
+            ..Default::default()
+        };
+        for metadata in store.list(&query)? {
+            if PublicSessionHandle::for_store_id(&metadata.session_id).0 == input {
+                return Ok(metadata.session_id);
+            }
         }
+        return Err(SqueezyError::Tool(format!(
+            "no session found for handle {input:?}; the handle is published by `squeezy sessions list`"
+        )));
     }
 
-    Err(SqueezyError::Tool(format!("no session found for {id:?}")))
+    store
+        .resolve_session_id_prefix(input)
+        .map_err(|err| SqueezyError::Tool(err.to_string()))
+}
+
+/// Return true when `value` matches the [`PublicSessionHandle`] shape
+/// (`sess_<16hex>`). Used by [`resolve_session_input`] to decide whether
+/// to scan the on-disk session list or treat the value as a raw prefix.
+/// The check is intentionally cheap; mismatches fall through to prefix
+/// resolution rather than erroring out.
+fn looks_like_public_session_handle(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("sess_") else {
+        return false;
+    };
+    suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {
@@ -3435,7 +3589,10 @@ where
                         }
                         let _ = decision_tx.send(ToolApprovalDecision::Denied);
                         result = Err(SqueezyError::Tool(
-                            "non-interactive prompt requested permission; rerun with --prompt-permission-mode auto-approve-ask or configure an explicit permission rule"
+                            "non-interactive prompt requested permission; \
+                             rerun with --prompt-permission-mode auto-approve-ask for a one-shot bypass, \
+                             or add a matching `[permissions]` default / `[[permissions.rules]]` entry \
+                             in settings.toml for a persistent allow"
                                 .to_string(),
                         ));
                         break;

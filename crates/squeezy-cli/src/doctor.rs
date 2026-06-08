@@ -309,7 +309,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     // such but do not fail the command: smoke tests in CI / brew test run in
     // environments where keys are absent and still need the binary to come up
     // green. Only hard failures (config load broken, session store unwritable)
-    // produce a non-zero exit, matching the old `--health` contract.
+    // produce a non-zero exit, matching the `--health` compatibility alias.
     let (warnings, failures) = check_counts(&checks);
     let exit_code = exit_code_for_checks(&checks);
     let mut checks = filter_checks(args, checks);
@@ -382,36 +382,62 @@ fn unmatched_selector_checks(
     checks: &[Check],
     config_failed: bool,
 ) -> Vec<Check> {
-    let unmatched = args
-        .only
-        .iter()
-        .filter_map(|selector| {
-            let selector = selector.trim();
-            if selector.is_empty()
-                || checks
-                    .iter()
-                    .any(|check| check_name_matches(selector, &check.name))
-                || (selector == "update" && args.skip_update)
-                || (config_failed && !matches!(selector, "sandbox" | "update"))
-            {
-                None
-            } else {
-                Some(selector.to_string())
-            }
-        })
-        .collect::<Vec<_>>();
-    if unmatched.is_empty() {
-        Vec::new()
-    } else {
-        vec![Check {
+    // Split the unmatched selectors into two buckets:
+    //   * `unknown` -- typos / unrecognised selector names. These are
+    //     hard failures and tell the user to fix the command line.
+    //   * `skipped_due_to_config` -- selectors that *would* have been
+    //     evaluated, but config failed to load so the underlying check
+    //     never ran (e.g. `--only providers` against a corrupt
+    //     `settings.toml`). These are not user errors; they are a
+    //     downstream consequence of the `config` row already failing,
+    //     so we surface them as a single `selector` warn note instead
+    //     of silently dropping them.
+    let mut unknown = Vec::new();
+    let mut skipped_due_to_config = Vec::new();
+    for selector in &args.only {
+        let selector = selector.trim();
+        if selector.is_empty()
+            || checks
+                .iter()
+                .any(|check| check_name_matches(selector, &check.name))
+            || (selector == "update" && args.skip_update)
+        {
+            continue;
+        }
+        if config_failed && !matches!(selector, "sandbox" | "update") {
+            skipped_due_to_config.push(selector.to_string());
+        } else {
+            unknown.push(selector.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    if !unknown.is_empty() {
+        out.push(Check {
             name: "selector".to_string(),
             status: Status::Fail,
-            detail: format!(
-                "unknown doctor --only selector(s): {}",
-                unmatched.join(", ")
-            ),
-        }]
+            detail: format!("unknown doctor --only selector(s): {}", unknown.join(", ")),
+        });
     }
+    if !skipped_due_to_config.is_empty() {
+        // Distinct name so the "always re-include selector failures
+        // after status filtering" loop in `run()` does not treat this
+        // warn row and the `selector` fail row above as the same entry.
+        out.push(Check {
+            name: "selector:skipped".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "unable to evaluate {} because the `config` row failed to load; \
+                 fix the configuration to re-enable {}",
+                skipped_due_to_config.join(", "),
+                if skipped_due_to_config.len() == 1 {
+                    "this check"
+                } else {
+                    "these checks"
+                }
+            ),
+        });
+    }
+    out
 }
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {

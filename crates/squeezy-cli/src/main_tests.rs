@@ -335,6 +335,133 @@ fn session_cli_events_discover_session_ids_from_payload_fields() {
 }
 
 #[test]
+fn looks_like_public_session_handle_recognises_well_formed_handles() {
+    // Known-good handle shape (`sess_` + 16 hex). We accept upper and
+    // lowercase hex so the user pasting a handle from a chat or doc
+    // surface still routes to the handle-aware resolver (and gets a
+    // clear "no session found for handle …" message) rather than
+    // falling through to the prefix resolver and getting a generic
+    // "no session matches the id prefix" error.
+    assert!(looks_like_public_session_handle("sess_0123456789abcdef"));
+    assert!(looks_like_public_session_handle("sess_0123456789ABCDEF"));
+    // Wrong length / wrong characters / wrong prefix must fall through
+    // to prefix resolution so existing raw-id callers are unaffected.
+    assert!(!looks_like_public_session_handle("sess_short"));
+    assert!(!looks_like_public_session_handle(
+        "sess_0123456789abcdef_extra"
+    ));
+    assert!(!looks_like_public_session_handle("sess_0123456789abcdeg"));
+    assert!(!looks_like_public_session_handle("not_a_handle"));
+    assert!(!looks_like_public_session_handle(""));
+    assert!(!looks_like_public_session_handle("1700000000000-12345-0"));
+}
+
+#[test]
+fn resolve_session_input_round_trips_through_public_handle() {
+    // The regression we're locking down: `sessions list` prints opaque
+    // `sess_<16hex>` handles, but `sessions resume` / `--session` /
+    // `sessions fork` / etc. used to require the raw on-disk
+    // `<ms>-<pid>-<counter>` id. If the resolver doesn't unwrap the
+    // handle back into the raw id, every session-id-consuming
+    // subcommand silently breaks for users who copy/paste from
+    // `sessions list` output.
+    let root = temp_dir("resolve-session-input-handle");
+    let raw_id = "1700000000000-12345-0";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let handle = PublicSessionHandle::for_store_id(raw_id);
+    let resolved = resolve_session_input(&store, handle.as_ref())
+        .expect("handle must round-trip back to the raw id");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_accepts_exact_raw_id() {
+    let root = temp_dir("resolve-session-input-raw");
+    let raw_id = "1700000000001-12345-1";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let resolved = resolve_session_input(&store, raw_id).expect("exact raw id resolves");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_accepts_raw_id_prefix() {
+    let root = temp_dir("resolve-session-input-prefix");
+    let raw_id = "1700000000002-12345-2";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let resolved = resolve_session_input(&store, "1700000000002")
+        .expect("unique prefix resolves to the raw id");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_rejects_unknown_handle_with_actionable_error() {
+    let root = temp_dir("resolve-session-input-unknown-handle");
+    plant_session_metadata(&root, "1700000000003-12345-3", "/some/cwd");
+    let store = open_store_at(&root);
+
+    // Well-formed handle shape, but no live session generates it. The
+    // error must name the handle, not silently delegate to the prefix
+    // resolver which would otherwise yield a generic "no session
+    // matches" message that does not mention the public handle.
+    let bogus = "sess_deadbeefdeadbeef";
+    let err = resolve_session_input(&store, bogus).expect_err("unknown handle errors");
+    let msg = err.to_string();
+    assert!(msg.contains("sess_deadbeefdeadbeef"), "got: {msg}");
+    assert!(msg.contains("handle"), "got: {msg}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_empty_input_is_explicit_error() {
+    // Defence in depth: an empty value must not silently match the
+    // first session on disk via prefix resolution. The store layer
+    // already rejects empty prefixes, but we surface a more specific
+    // message at the CLI boundary so the user knows the issue is at
+    // their command line, not on disk.
+    let root = temp_dir("resolve-session-input-empty");
+    let store = open_store_at(&root);
+    let err = resolve_session_input(&store, "").expect_err("empty input must error");
+    let msg = err.to_string();
+    assert!(msg.contains("session id"), "got: {msg}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cli_health_conflicts_with_subcommands_and_print_mode() {
+    // `--health` short-circuits to `doctor` with `DoctorArgs::default()`,
+    // so pairing it with `--prompt`, `--list-providers`, `--list-models`,
+    // or any subcommand previously dropped the other flag's behavior
+    // silently. Clap's `conflicts_with_all` must reject these
+    // combinations at parse time. Subcommands aren't named arg ids in
+    // the derive macro, so we don't pin them via clap here; the dispatch
+    // table is responsible for that ordering. The flag combinations
+    // below are the ones we explicitly forbid.
+    Cli::try_parse_from(["squeezy", "--health", "--prompt", "hi"])
+        .expect_err("--health + --prompt must be rejected");
+    Cli::try_parse_from(["squeezy", "--health", "--list-providers"])
+        .expect_err("--health + --list-providers must be rejected");
+    Cli::try_parse_from(["squeezy", "--health", "--list-models"])
+        .expect_err("--health + --list-models must be rejected");
+    // Plain `--health` still parses (the compatibility alias).
+    let cli = Cli::try_parse_from(["squeezy", "--health"]).expect("parse plain --health");
+    assert!(cli.health);
+}
+
+#[test]
 fn cli_doctor_and_mcp_test_flags_parse() {
     let cli = Cli::try_parse_from([
         "squeezy",

@@ -44,6 +44,16 @@ squeezy sessions report <session_id> --send
 squeezy sessions cleanup
 ```
 
+CLI surfaces (`sessions list`, `sessions show`, `sessions list --json`,
+and `sessions show --json`) publish session identifiers as opaque
+`sess_<16hex>` public handles. Every command that consumes a
+`<session_id>` accepts that public handle directly, so the
+`sessions list → sessions resume/fork/show/replay/export/report/archive`
+workflow round-trips without exposing the raw on-disk
+`<timestamp_ms>-<pid>-<counter>` form. The same commands continue to
+accept the raw id and short raw-id prefixes for compatibility with
+scripts that already capture them from `.squeezy/sessions/<id>/`.
+
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
 <session_id>`, `/session rename <title>`, `/session label <label>`,
 `/session-export <session_id>`, `/session-export-html <session_id>`, `/fork`,
