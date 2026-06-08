@@ -140,6 +140,11 @@ pub(crate) struct ShellSandboxPlan {
     /// (which then drives telemetry + a one-shot TUI warning) describe
     /// the degradation without a side channel.
     pub(crate) best_effort_fallback: Option<BestEffortFallback>,
+    /// Short display name of the shell that will execute the command.
+    /// Populated for Windows plans (`"pwsh"`, `"powershell"`, `"cmd.exe"`,
+    /// `"gitbash"`, or a custom basename). `None` on Unix (where the shell is
+    /// always `sh` or a sandbox wrapper and is implicit from the backend).
+    pub(crate) selected_shell: Option<String>,
 }
 
 /// Side-table that accompanies a best_effort fallback plan. The agent
@@ -179,6 +184,7 @@ impl ShellSandboxPlan {
         best_effort: Option<(&'static str, ShellSandboxFallbackRecord)>,
     ) -> Self {
         let shell = ShellProgram::for_command(command);
+        let selected_shell = windows_shell_display_name(&shell);
         Self {
             program: shell.program,
             args: shell.args,
@@ -197,11 +203,13 @@ impl ShellSandboxPlan {
                 fallback_count: record.fallback_count,
                 first_in_session: record.first_in_session,
             }),
+            selected_shell,
         }
     }
 
     pub(crate) fn external(command: &str, config: &ShellSandboxConfig) -> Self {
         let shell = ShellProgram::for_command(command);
+        let selected_shell = windows_shell_display_name(&shell);
         Self {
             program: shell.program,
             args: shell.args,
@@ -216,6 +224,7 @@ impl ShellSandboxPlan {
             filesystem_write_roots: Vec::new(),
             fallback_reason: None,
             best_effort_fallback: None,
+            selected_shell,
         }
     }
 
@@ -230,6 +239,11 @@ impl ShellSandboxPlan {
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
         });
+        if let Some(shell) = &self.selected_shell
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("selected_shell".to_string(), serde_json::json!(shell));
+        }
         if let Some(record) = self.best_effort_fallback
             && let Some(object) = payload.as_object_mut()
         {
@@ -598,6 +612,20 @@ fn windows_writable_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathB
     roots
 }
 
+/// Return the shell display name for inclusion in Windows plan metadata.
+/// Always returns `None` on non-Windows so the field stays absent there.
+fn windows_shell_display_name(shell: &ShellProgram) -> Option<String> {
+    #[cfg(windows)]
+    {
+        Some(shell.display_name.clone())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = shell;
+        None
+    }
+}
+
 /// Build a restricted-token-tier plan: filesystem *writes* (and write
 /// carve-outs) are enforced via the restricted token + on-disk ACLs, but reads
 /// and network are not enforceable on this tier (a `WRITE_RESTRICTED` token
@@ -614,6 +642,7 @@ fn windows_restricted_plan(
     fallback_reason: Option<String>,
 ) -> ShellSandboxPlan {
     let shell = ShellProgram::for_command(command);
+    let selected_shell = Some(shell.display_name.clone());
     ShellSandboxPlan {
         program: shell.program,
         args: shell.args,
@@ -628,6 +657,7 @@ fn windows_restricted_plan(
         filesystem_write_roots: windows_writable_roots(root, config),
         fallback_reason,
         best_effort_fallback: None,
+        selected_shell,
     }
 }
 
@@ -704,6 +734,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 filesystem_write_roots: Vec::new(),
                 fallback_reason: None,
                 best_effort_fallback: None,
+                selected_shell: None,
             });
         }
         let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
@@ -763,6 +794,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 },
                 fallback_reason: None,
                 best_effort_fallback: None,
+                selected_shell: None,
             });
         }
     }
@@ -780,6 +812,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                     );
                 }
                 let shell = ShellProgram::for_command(command);
+                let selected_shell = Some(shell.display_name.clone());
                 Ok(ShellSandboxPlan {
                     program: shell.program,
                     args: shell.args,
@@ -800,6 +833,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                         "windows: windows_sandbox_level=disabled; process-tree cleanup via Job Object only; no FS/network isolation".to_string(),
                     ),
                     best_effort_fallback: None,
+                    selected_shell,
                 })
             }
             WindowsSandboxLevel::Elevated
@@ -808,6 +842,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 ) =>
             {
                 let shell = ShellProgram::for_command(command);
+                let selected_shell = Some(shell.display_name.clone());
                 Ok(ShellSandboxPlan {
                     program: shell.program,
                     args: shell.args,
@@ -825,6 +860,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                     filesystem_write_roots: windows_writable_roots(root, config),
                     fallback_reason: None,
                     best_effort_fallback: None,
+                    selected_shell,
                 })
             }
             WindowsSandboxLevel::Elevated => {

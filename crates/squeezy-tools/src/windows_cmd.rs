@@ -13,18 +13,45 @@
 pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
 
-    // PowerShell cmdlets where the dangerous shape is unambiguous in the
-    // raw text. Each needle is a contiguous substring that does not appear
-    // inside benign commands.
+    // PowerShell cmdlets / aliases where the dangerous shape is unambiguous
+    // in the raw text. Each needle is a contiguous substring that does not
+    // appear inside benign commands.
+    //
+    // `ri` is the built-in alias for `Remove-Item`.  We only flag it when
+    // combined with recurse/force so that `ri` alone (tab completion, etc.)
+    // is not a false positive.
     for needle in [
+        // Remove-Item / ri — standard and LiteralPath forms
         "remove-item -recurse -force",
         "remove-item -r -force",
         "remove-item -force -recurse",
         "remove-item -force -r",
+        "remove-item -literalpath",
+        "remove-item -path",
+        "ri -recurse -force",
+        "ri -r -force",
+        "ri -force -recurse",
+        "ri -force -r",
+        // Execution policy change
         "set-executionpolicy",
+        // User / identity mutation
         "new-localuser",
+        "remove-localuser",
+        "disable-localuser",
+        // Storage / volume destruction
         "clear-recyclebin",
         "format-volume",
+        // Elevation via Start-Process
+        "start-process powershell -verb runas",
+        "start-process pwsh -verb runas",
+        "start-process cmd -verb runas",
+        "start-process cmd.exe -verb runas",
+        // Shutdown / restart (destructive at the session level)
+        "stop-computer",
+        "restart-computer",
+        // Service and scheduled-task deletion
+        "remove-service",
+        "unregister-scheduledtask",
     ] {
         if lower.contains(needle) {
             return true;
@@ -47,6 +74,18 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         }
         "reg" => return flag_matches("delete"),
         "cipher" => return flag_matches("/w"),
+        // Service deletion via sc.exe / net stop+delete
+        "sc" | "sc.exe" => return flag_matches("delete"),
+        // Scheduled task deletion
+        "schtasks" | "schtasks.exe" => return flag_matches("/delete"),
+        // Shutdown / restart from cmd
+        "shutdown" => {
+            return flag_matches("/s")
+                || flag_matches("/r")
+                || flag_matches("/h")
+                || flag_matches("-s")
+                || flag_matches("-r");
+        }
         _ => {}
     }
 

@@ -34,7 +34,9 @@ The current implementation:
   prefix for policy matching.
 - Closes stdin for non-TTY shell runs so tools cannot accidentally read from
   the agent terminal; `tty = true` attaches the process to a PTY and captures
-  PTY output as stdout.
+  PTY output as stdout. On Windows, ConPTY is not yet wired; `tty = true`
+  degrades to pipe-backed stdio and the tool result includes a `tty_note`
+  field explaining the degradation.
 - Splits the retained output budget between stdout and stderr, then rebalances
   unused capacity so a noisy stream cannot starve the other one.
 - Runs shell commands in their own process group and terminates the whole group
@@ -75,10 +77,23 @@ after the permission policy has allowed the command.
 
 On **Windows**, the backend is selected by `windows_sandbox_level`
 (`restricted_token` by default, `elevated`, or `disabled`). The shell is
-PowerShell 7 (preferred), Windows PowerShell, or `cmd.exe` (configurable via
-`SQUEEZY_SHELL`), and every descendant is still bound into a Win32 Job Object
-(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for reliable process-tree termination —
-the Windows analog of `setpgid` + SIGKILL.
+PowerShell 7 (`pwsh`, preferred), Windows PowerShell (`powershell`), or
+`cmd.exe` in that priority order, resolved via `PATH` at startup and cached
+per process. Set `SQUEEZY_SHELL=gitbash` to use Git Bash instead — this is
+a compatibility and CI testing override, not the production default. Any other
+value of `SQUEEZY_SHELL` is treated as the absolute path of a shell binary.
+Every shell child and all its descendants are bound into a Win32 Job Object
+(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for reliable process-tree termination
+— the Windows analog of `setpgid` + SIGKILL. The selected shell name is
+recorded in sandbox audit metadata (`selected_shell`).
+
+**Windows sandbox isolation:** process-tree cleanup is not the same as
+filesystem or network isolation. The `disabled` level (Job Object only) and
+the `windows-job-object` backend provide **no** filesystem or network
+confinement. Network policy values in the audit (`denied_best_effort`,
+`allowed_approved`) reflect the configured posture and classifier outcome,
+not an enforced OS boundary. Use `restricted_token` or `elevated` for
+actual isolation guarantees.
 
 - **`restricted_token` (default, no admin).** The command runs under a
   `CreateRestrictedToken` token (`WRITE_RESTRICTED | LUA_TOKEN |
@@ -356,8 +371,22 @@ Known limits:
   require the opt-in `elevated` tier (`squeezy doctor --sandbox-setup`), which
   provisions persistent local sandbox users + WFP filters (removed by
   `--sandbox-teardown`). The elevated tier's interactive ConPTY/runner layer is
-  not yet wired, so `tty = true` degrades to pipes. Windows isolation cannot be
-  validated by macOS/Linux CI; it is verified by a Windows host QA checklist.
+  not yet wired, so `tty = true` degrades to pipes on all Windows backends.
+  The `disabled` level (Job Object only) provides **no** filesystem or network
+  isolation at all; the audit fields `filesystem = "best_effort_unavailable"`
+  and `network = "denied_best_effort"` reflect the posture, not an enforced
+  boundary. Do not rely on the network audit value as evidence of enforcement
+  on Windows when using `disabled` or `restricted_token`. Windows isolation
+  cannot be validated by macOS/Linux CI; it is verified by a Windows host QA
+  checklist.
+- Windows Job Object process-tree cleanup: on the `disabled` backend (non-sandbox
+  tokio path), the Job Object is created and the child process is assigned after
+  spawn. There is a narrow spawn-before-assign race where grandchildren launched
+  before assignment completes may not be covered. The sandbox tiers
+  (`restricted_token`, `elevated`) avoid this via `CREATE_SUSPENDED` inside
+  `squeezy-win-sandbox`. The `windows_process_tree.job_object` field in the
+  tool result reports whether assignment succeeded (`"assigned"`,
+  `"not_assigned"`, or `"creation_failed"`).
 - The classifier is parser-backed but conservative. Truly dynamic constructs
   (`$(...)`, `${...}`, backticks, process substitution, parse errors) always
   classify as `Shell` with risk `High`, even if the inner command would look

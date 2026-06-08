@@ -69,6 +69,17 @@ pub(crate) struct ShellRunOutcome {
     /// sidecar when the hard byte cap dropped bytes the in-memory capture
     /// could not keep. `None` when output stayed under the cap.
     pub(crate) raw_spillover: Option<ShellSpilloverInfo>,
+    /// Windows Job Object process-tree cleanup status for the non-sandbox
+    /// tokio path. `Some("assigned")` = created and process assigned;
+    /// `Some("not_assigned")` = created but `assign_process` failed (process
+    /// may have exited before assignment); `Some("creation_failed")` = Job
+    /// Object could not be created; `None` = not applicable (non-Windows, or
+    /// Windows sandbox backend which manages its own Job Object).
+    pub(crate) windows_job_status: Option<&'static str>,
+    /// True when `tty = true` was requested but the platform degraded to
+    /// non-TTY pipes (Windows without ConPTY). The caller surfaces this as a
+    /// note in the tool result.
+    pub(crate) tty_degraded: bool,
 }
 
 struct ShellRunRequest<'a> {
@@ -398,6 +409,8 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            windows_job_status,
+            tty_degraded,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -496,6 +509,29 @@ impl ToolRegistry {
                 &mut raw_content,
                 "sandbox",
                 json!({ "best_effort_fallback": fallback }),
+            );
+        }
+        // Expose Windows Job Object process-tree cleanup status so the audit
+        // and the model can distinguish genuine cleanup from a degraded state.
+        // "assigned" = process covered; "not_assigned" = assignment failed
+        // (process may have raced to exit before assignment); "creation_failed"
+        // = Job Object could not be created at all.
+        if let Some(job_status) = windows_job_status {
+            insert_content_field(
+                &mut raw_content,
+                "windows_process_tree",
+                json!({ "job_object": job_status }),
+            );
+        }
+        // Surface a note when tty=true was requested but the platform degraded
+        // to non-TTY pipe-backed stdio (Windows without ConPTY wired up).
+        if tty_degraded {
+            insert_content_field(
+                &mut raw_content,
+                "tty_note",
+                json!(
+                    "tty=true requested; ConPTY unavailable on this platform; ran with pipe-backed stdio"
+                ),
             );
         }
         if let Some(summary) = implicit_skill {
@@ -605,6 +641,9 @@ impl ToolRegistry {
         let pty_master: Option<std::fs::File>;
         let ask_server: Option<ShellAskServer>;
         let mut child: ShellChild;
+        // Mutable tracking vars initialized here so both branches can set them.
+        let mut tty_degraded = false;
+        let mut windows_job_status_out: Option<&'static str> = None;
 
         if win_sandbox_backend {
             #[cfg(windows)]
@@ -668,6 +707,8 @@ impl ToolRegistry {
                     // Windows non-sandbox path: ConPTY is not yet wired up;
                     // degrade to non-TTY pipes. The shell still runs with the
                     // requested backend, just without a controlling terminal.
+                    // The outcome records `tty_degraded = true` so the caller
+                    // can surface a note to the user.
                     command
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -681,6 +722,15 @@ impl ToolRegistry {
                     .stderr(Stdio::piped());
                 None
             };
+            // On non-Unix platforms, tty=true degrades to pipes because
+            // ConPTY is not yet wired. Record this so the caller can surface
+            // a user-visible note.
+            if tty {
+                #[cfg(not(unix))]
+                {
+                    tty_degraded = true;
+                }
+            }
             configure_shell_process_group(&mut command);
             configure_linux_shell_sandbox(&mut command, sandbox_plan);
             apply_shell_environment_policy(&mut command, &self.shell_sandbox);
@@ -735,18 +785,36 @@ impl ToolRegistry {
         // job down via `WinSandboxChild::kill`. So we only need a `ShellJob`
         // here for the non-sandboxed tokio path (e.g. windows_sandbox_level =
         // "disabled"); assigning one to a sandbox child would be redundant.
+        //
+        // NOTE: There is an inherent spawn-before-assign race: the child is
+        // already running by the time `assign_process` is called, so a fast
+        // shell may launch grandchildren before they are covered. The sandbox
+        // tiers (restricted-token / elevated) avoid this via CREATE_SUSPENDED
+        // inside `squeezy-win-sandbox`; the non-sandbox path here cannot use
+        // that approach through `tokio::process::Command`. Assignment failures
+        // are surfaced in the `windows_job_status` outcome field rather than
+        // silently ignored, so the audit record honestly reflects whether
+        // process-tree cleanup is actually active.
         #[cfg(windows)]
         let shell_job: Option<ShellJob> = if win_sandbox_backend {
+            // The Windows sandbox backends own their own Job Objects; no
+            // outer Job needed here.
             None
         } else {
             match ShellJob::new() {
                 Ok(job) => {
-                    if let Some(pid) = child.id() {
-                        let _ = job.assign_process(pid);
-                    }
+                    let assigned = child
+                        .id()
+                        .map(|pid| job.assign_process(pid).is_ok())
+                        .unwrap_or(false);
+                    windows_job_status_out =
+                        Some(if assigned { "assigned" } else { "not_assigned" });
                     Some(job)
                 }
-                Err(_) => None,
+                Err(_) => {
+                    windows_job_status_out = Some("creation_failed");
+                    None
+                }
             }
         };
 
@@ -848,6 +916,8 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            windows_job_status: windows_job_status_out,
+            tty_degraded,
         })
     }
 }

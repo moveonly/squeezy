@@ -4,10 +4,15 @@
 //! their own `cfg(target_os = ...)` blocks; this module covers everything
 //! else.
 
+use std::sync::OnceLock;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ShellProgram {
     pub program: String,
     pub args: Vec<String>,
+    /// Short display name for diagnostics (e.g. `"pwsh"`, `"powershell"`,
+    /// `"cmd.exe"`, `"gitbash"`, `"sh"`, or the custom path basename).
+    pub display_name: String,
 }
 
 impl ShellProgram {
@@ -15,6 +20,9 @@ impl ShellProgram {
     ///
     /// Honors `SQUEEZY_SHELL` first:
     /// - `gitbash` — search `PROGRAMFILES`-style locations for Git Bash.
+    ///   Note: `SQUEEZY_SHELL=gitbash` is a compatibility and CI testing
+    ///   choice, not the production default. Production Windows defaults to
+    ///   `pwsh` → `powershell` → `cmd.exe`.
     /// - any other value — treat as the absolute path of the shell binary.
     ///
     /// Without an override:
@@ -23,6 +31,10 @@ impl ShellProgram {
     ///   resolved via `which::which`. The shell call follows each shell's
     ///   convention (`-NoLogo -NoProfile -Command` for PowerShell variants,
     ///   `/D /S /C` for cmd).
+    ///
+    /// On Windows the default resolution result is cached per process via a
+    /// `OnceLock` so repeated calls (e.g. in shell-heavy sessions) do not
+    /// probe `which` on every plan.
     pub(crate) fn for_command(command: &str) -> Self {
         if let Ok(custom) = std::env::var("SQUEEZY_SHELL") {
             return Self::resolve_override(&custom, command);
@@ -47,6 +59,7 @@ impl ShellProgram {
         Self {
             program: "sh".to_string(),
             args: vec!["-lc".to_string(), command.to_string()],
+            display_name: "sh".to_string(),
         }
     }
 
@@ -62,61 +75,81 @@ impl ShellProgram {
         // its argument shape. Otherwise default to `-lc` which most POSIX
         // shells understand.
         let lowered = path.to_ascii_lowercase();
-        let args = if lowered.ends_with("pwsh.exe") || lowered.ends_with("powershell.exe") {
+        let (args, display_name) =
+            if lowered.ends_with("pwsh.exe") || lowered.ends_with("powershell.exe") {
+                (
+                    vec![
+                        "-NoLogo".to_string(),
+                        "-NoProfile".to_string(),
+                        "-Command".to_string(),
+                        command.to_string(),
+                    ],
+                    std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path)
+                        .to_string(),
+                )
+            } else if lowered.ends_with("cmd.exe") {
+                (
+                    vec![
+                        "/D".to_string(),
+                        "/S".to_string(),
+                        "/C".to_string(),
+                        command.to_string(),
+                    ],
+                    "cmd.exe".to_string(),
+                )
+            } else {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string();
+                (vec!["-lc".to_string(), command.to_string()], name)
+            };
+        Self {
+            program: path.to_string(),
+            args,
+            display_name,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_default(command: &str) -> Self {
+        // Resolve and cache the default shell binary per process.  `which`
+        // probes PATH on every call; caching the resolved path avoids repeated
+        // filesystem lookups in shell-heavy sessions while still picking up a
+        // newly installed shell after a restart.
+        static CACHED: OnceLock<(String, &'static str)> = OnceLock::new();
+        let (program, display_name) = CACHED.get_or_init(|| {
+            if let Ok(pwsh) = which::which("pwsh") {
+                return (pwsh.to_string_lossy().into_owned(), "pwsh");
+            }
+            if let Ok(powershell) = which::which("powershell") {
+                return (powershell.to_string_lossy().into_owned(), "powershell");
+            }
+            ("cmd.exe".to_string(), "cmd.exe")
+        });
+        let args = if display_name.starts_with("pwsh") || display_name.starts_with("powershell") {
             vec![
                 "-NoLogo".to_string(),
                 "-NoProfile".to_string(),
                 "-Command".to_string(),
                 command.to_string(),
             ]
-        } else if lowered.ends_with("cmd.exe") {
+        } else {
             vec![
                 "/D".to_string(),
                 "/S".to_string(),
                 "/C".to_string(),
                 command.to_string(),
             ]
-        } else {
-            vec!["-lc".to_string(), command.to_string()]
         };
         Self {
-            program: path.to_string(),
+            program: program.clone(),
             args,
-        }
-    }
-
-    #[cfg(windows)]
-    fn windows_default(command: &str) -> Self {
-        if let Ok(pwsh) = which::which("pwsh") {
-            return Self {
-                program: pwsh.to_string_lossy().into_owned(),
-                args: vec![
-                    "-NoLogo".to_string(),
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    command.to_string(),
-                ],
-            };
-        }
-        if let Ok(powershell) = which::which("powershell") {
-            return Self {
-                program: powershell.to_string_lossy().into_owned(),
-                args: vec![
-                    "-NoLogo".to_string(),
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    command.to_string(),
-                ],
-            };
-        }
-        Self {
-            program: "cmd.exe".to_string(),
-            args: vec![
-                "/D".to_string(),
-                "/S".to_string(),
-                "/C".to_string(),
-                command.to_string(),
-            ],
+            display_name: display_name.to_string(),
         }
     }
 
@@ -128,6 +161,7 @@ impl ShellProgram {
             return Some(Self {
                 program: path,
                 args: vec!["-lc".to_string(), command.to_string()],
+                display_name: "gitbash".to_string(),
             });
         }
         #[cfg(windows)]
@@ -140,6 +174,7 @@ impl ShellProgram {
                     return Some(Self {
                         program: candidate.to_string(),
                         args: vec!["-lc".to_string(), command.to_string()],
+                        display_name: "gitbash".to_string(),
                     });
                 }
             }
@@ -148,6 +183,7 @@ impl ShellProgram {
             return Some(Self {
                 program: bash.to_string_lossy().into_owned(),
                 args: vec!["-lc".to_string(), command.to_string()],
+                display_name: "gitbash".to_string(),
             });
         }
         let _ = command;
