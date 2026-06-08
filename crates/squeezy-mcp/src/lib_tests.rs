@@ -850,6 +850,7 @@ async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint(
         elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     let (auth_header, custom_headers) =
         resolve_http_auth_and_headers("sse-server", &server, |name| match name {
@@ -965,6 +966,7 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     // The serve call will fail because we hang up after one round trip — that
     // is fine, we only need it to issue the initialize POST so the listener
@@ -1168,6 +1170,7 @@ fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     let info = ClientHandler::get_info(&handler);
     assert_eq!(info.client_info.name, env!("CARGO_PKG_NAME"));
@@ -1270,6 +1273,7 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         pause_state: ElicitationPauseState::default(),
         resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+        tool_list_changed: Arc::new(tokio::sync::Notify::new()),
     };
     let (auth_header, custom_headers) = resolve_http_auth_and_headers("fixture", &server, |_| None);
     let worker =
