@@ -3117,25 +3117,14 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
         if let Ok(rel) = path.strip_prefix(root) {
             rel.to_path_buf()
         } else {
-            // Case-insensitive prefix strip: use lowercase for *comparison* only,
-            // then slice the original slash-normalized path so relative-path
-            // casing (e.g. `src/MyModule.cs`) is preserved in the FileId.
-            let path_str = path.to_string_lossy();
-            let path_norm = path_str.replace('\\', "/");
-            let root_str = root.to_string_lossy();
-            let root_norm = root_str.replace('\\', "/");
-            let path_lower = path_norm.to_ascii_lowercase();
-            let root_lower = root_norm.to_ascii_lowercase();
-            let root_prefix = if root_lower.ends_with('/') {
-                root_lower.clone()
-            } else {
-                format!("{root_lower}/")
-            };
-            // Verify the match, then use the prefix length to slice the
-            // original (correctly-cased) normalized path.
-            path_lower.strip_prefix(&root_prefix)?;
-            let remainder = &path_norm[root_prefix.len()..];
-            Path::new(remainder).to_path_buf()
+            #[cfg(windows)]
+            {
+                case_insensitive_relative_path(root, path)?
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
         }
     } else {
         path.to_path_buf()
@@ -3150,6 +3139,29 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join("/");
     (!normalized.is_empty()).then_some(normalized)
+}
+
+#[cfg(any(windows, test))]
+fn case_insensitive_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    // Use lowercase for comparison only, then slice the original
+    // slash-normalized path so relative-path casing (e.g. `src/MyModule.cs`)
+    // is preserved in the FileId.
+    let path_str = path.to_string_lossy();
+    let path_norm = path_str.replace('\\', "/");
+    let root_str = root.to_string_lossy();
+    let root_norm = root_str.replace('\\', "/");
+    let path_lower = path_norm.to_ascii_lowercase();
+    let root_lower = root_norm.to_ascii_lowercase();
+    let root_prefix = if root_lower.ends_with('/') {
+        root_lower.clone()
+    } else {
+        format!("{root_lower}/")
+    };
+    // Verify the match, then use the prefix length to slice the original
+    // normalized path.
+    path_lower.strip_prefix(&root_prefix)?;
+    let remainder = &path_norm[root_prefix.len()..];
+    Some(Path::new(remainder).to_path_buf())
 }
 
 fn file_symbol(file: &FileRecord) -> GraphSymbol {

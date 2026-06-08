@@ -8982,9 +8982,19 @@ fn normalize_cargo_file_id_case_insensitive_fallback() {
     if upper_root != root_norm {
         let case_mismatch_path = format!("{upper_root}/src/MyModule.cs");
         assert_eq!(
+            super::case_insensitive_relative_path(&root, std::path::Path::new(&case_mismatch_path)),
+            Some(std::path::PathBuf::from("src/MyModule.cs")),
+            "case-insensitive helper must preserve the relative path's original casing"
+        );
+        let expected = if cfg!(windows) {
+            Some("src/MyModule.cs".to_string())
+        } else {
+            None
+        };
+        assert_eq!(
             super::normalize_cargo_file_id(&root, &case_mismatch_path),
-            Some("src/MyModule.cs".to_string()),
-            "case-insensitive fallback must preserve the relative path's original casing"
+            expected,
+            "case-insensitive absolute-prefix fallback must be Windows-only"
         );
     }
 }
